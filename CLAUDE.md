@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Worktree Rules (HARD GATE)
+
+See [.claude/rules/worktree-isolation.md](.claude/rules/worktree-isolation.md) for the mandatory worktree isolation policy. All writes require an isolated git worktree.
+
 ## Project Overview
 
 An out-of-tree MLIR compiler for tiled CPU LLM kernels (SwiGLU, RoPE, Attention). Progressive lowering through 7 MLIR stages: LLK dialect → Linalg → tiled/fused → Vector SIMD → memref → CF+runtime → ORC JIT. First target: fused SwiGLU with BF16, FP32 accumulation, x86-64 AVX2.
