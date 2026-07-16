@@ -30,7 +30,7 @@ def LLK_FusedSwiGLUOp : LLK_Op<"fused_swiglu", [
         TensorOf<[BF16]>:$wg,
         TensorOf<[BF16]>:$wu,
         TensorOf<[BF16]>:$init,
-        TypeAttr:$accumulator_type,
+        AnyAttr:$accumulator_type,
         LLK_ActivationAttr:$activation,
         LLK_MathModeAttr:$math_mode
     );

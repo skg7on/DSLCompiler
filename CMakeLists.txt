@@ -14,6 +14,10 @@ message(STATUS "MLIR include dir: ${MLIR_INCLUDE_DIRS}")
 # Ensure MLIR include dirs are available for tablegen
 include_directories(${MLIR_INCLUDE_DIRS})
 
+# Add project source and binary dirs for headers and generated .inc files
+include_directories(${CMAKE_SOURCE_DIR}/include)
+include_directories(${CMAKE_BINARY_DIR}/include)
+
 # Set up LLVM/MLIR tablegen macros
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
@@ -80,7 +84,7 @@ get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
 get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
 
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses ${dialect_libs} ${conversion_libs})
+target_link_libraries(llk-opt PRIVATE LLKPasses MLIRMlirOptMain ${dialect_libs} ${conversion_libs})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
