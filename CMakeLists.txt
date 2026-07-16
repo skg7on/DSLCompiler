@@ -11,8 +11,9 @@ find_package(LLVM REQUIRED CONFIG)
 message(STATUS "LLVM version: ${LLVM_PACKAGE_VERSION}")
 message(STATUS "MLIR include dir: ${MLIR_INCLUDE_DIRS}")
 
-# Ensure MLIR include dirs are available for tablegen
+# Ensure MLIR/LLVM include dirs are available for tablegen and compilation
 include_directories(${MLIR_INCLUDE_DIRS})
+include_directories(${LLVM_INCLUDE_DIRS})
 
 # Add project source and binary dirs for headers and generated .inc files
 include_directories(${CMAKE_SOURCE_DIR}/include)
