@@ -31,12 +31,14 @@ mlir_tablegen(include/LLK/Dialect/LLKAttributes.cpp.inc -gen-attrdef-defs -attrd
 add_public_tablegen_target(LLKDialectGen)
 
 set(LLVM_TARGET_DEFINITIONS include/LLK/Dialect/LLKOps.td)
-mlir_tablegen(include/LLK/Dialect/LLKOps.h.inc -gen-op-decls)
-mlir_tablegen(include/LLK/Dialect/LLKOps.cpp.inc -gen-op-defs)
-mlir_tablegen(include/LLK/Dialect/LLKOpsDialect.h.inc -gen-dialect-decls -dialect=llk)
-mlir_tablegen(include/LLK/Dialect/LLKOpsDialect.cpp.inc -gen-dialect-defs -dialect=llk)
-mlir_tablegen(include/LLK/Dialect/LLKEnums.h.inc -gen-enum-decls)
-mlir_tablegen(include/LLK/Dialect/LLKEnums.cpp.inc -gen-enum-defs)
+mlir_tablegen(include/LLK/Dialect/LLKOps.h.inc -gen-op-decls
+  EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect)
+mlir_tablegen(include/LLK/Dialect/LLKOps.cpp.inc -gen-op-defs
+  EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect)
+mlir_tablegen(include/LLK/Dialect/LLKOpsDialect.h.inc -gen-dialect-decls -dialect=llk
+  EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect)
+mlir_tablegen(include/LLK/Dialect/LLKOpsDialect.cpp.inc -gen-dialect-defs -dialect=llk
+  EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect)
 add_public_tablegen_target(LLKOpsGen)
 
 # Library: LLK dialect

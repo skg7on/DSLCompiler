@@ -2,7 +2,6 @@
 #define LLK_DIALECT_TD
 
 include "mlir/IR/OpBase.td"
-include "mlir/IR/AttrTypeBase.td"
 include "mlir/IR/EnumAttr.td"
 
 def LLK_Dialect : Dialect {
