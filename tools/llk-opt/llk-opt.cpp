@@ -11,6 +11,7 @@
 
 // Include the LLK dialect declaration to register it.
 #include "LLK/Dialect/LLKDialect.h.inc"
+#include "LLK/Conversion/LLKToLinalg.h"
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
@@ -23,7 +24,14 @@ int main(int argc, char **argv) {
 
   // Register all built-in MLIR passes.
   mlir::registerAllPasses();
-  // LLKToLinalg pass registration will be added in Task 1.5.
+
+  // Register the LLK-to-Linalg lowering pass.
+  mlir::PassPipelineRegistration<> llkToLinalgPipeline(
+      "llk-to-linalg-pipeline",
+      "Full LLK-to-Linalg lowering pipeline",
+      [](mlir::OpPassManager &pm) {
+        pm.addPass(mlir::llk::createLLKToLinalgPass());
+      });
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "LLK optimizer driver\n", registry));

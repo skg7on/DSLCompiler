@@ -123,7 +123,10 @@ endfunction()
 
 if(FILECHECK_BIN)
   add_llk_filecheck_test(DialectOps test/Dialect/ops.mlir)
-  add_llk_filecheck_test(LLKToLinalgConversion test/Conversion/llk_to_linalg.mlir)
+  # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
+  add_test(NAME LLKToLinalgConversion
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
+  )
 endif()
 
 # Test for ops_invalid.mlir: runs llk-opt with --verify-diagnostics.
