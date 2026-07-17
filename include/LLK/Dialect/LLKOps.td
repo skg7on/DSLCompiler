@@ -48,6 +48,22 @@ def LLK_FusedSwiGLUOp : LLK_Op<"fused_swiglu", [
 
     let hasVerifier = 1;
     let hasCustomAssemblyFormat = 1;
+
+    let extraClassDeclaration = [{
+      // TilingInterface methods (overrides of default implementations).
+      ::mlir::SmallVector<::mlir::utils::IteratorType> getLoopIteratorTypes();
+      ::mlir::SmallVector<::mlir::Range> getIterationDomain(::mlir::OpBuilder &b);
+      ::mlir::FailureOr<::mlir::TilingResult> getTiledImplementation(
+          ::mlir::OpBuilder &b,
+          ::mlir::ArrayRef<::mlir::OpFoldResult> offsets,
+          ::mlir::ArrayRef<::mlir::OpFoldResult> sizes);
+      ::llvm::LogicalResult getResultTilePosition(
+          ::mlir::OpBuilder &b, unsigned resultNumber,
+          ::mlir::ArrayRef<::mlir::OpFoldResult> offsets,
+          ::mlir::ArrayRef<::mlir::OpFoldResult> sizes,
+          ::mlir::SmallVector<::mlir::OpFoldResult> &resultOffsets,
+          ::mlir::SmallVector<::mlir::OpFoldResult> &resultSizes);
+    }];
 }
 
 #endif

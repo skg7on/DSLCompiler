@@ -51,7 +51,8 @@ add_mlir_dialect_library(LLKDialect
     lib/Dialect/LLK/LLKDialect.cpp
     lib/Dialect/LLK/LLKOps.cpp
     DEPENDS LLKDialectGen LLKOpsGen
-    LINK_LIBS PUBLIC MLIRIR MLIRDialect MLIRSupport
+    LINK_LIBS PUBLIC MLIRIR MLIRDialect MLIRSupport MLIRArithDialect
+                     MLIRTensorDialect
 )
 
 # Library: LLKToLinalg conversion
@@ -122,6 +123,14 @@ endfunction()
 
 if(FILECHECK_BIN)
   add_llk_filecheck_test(DialectOps test/Dialect/ops.mlir)
-  add_llk_filecheck_test(DialectOpsInvalid test/Dialect/ops_invalid.mlir)
   add_llk_filecheck_test(LLKToLinalgConversion test/Conversion/llk_to_linalg.mlir)
 endif()
+
+# Test for ops_invalid.mlir: runs llk-opt with --verify-diagnostics.
+# The test file itself contains `expected-error` markers that the verifier
+# must match.  A non-zero exit code from llk-opt (due to verification
+# failures) is expected and treated as success by --verify-diagnostics.
+add_test(NAME DialectOpsInvalid
+    COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+            ${CMAKE_SOURCE_DIR}/test/Dialect/ops_invalid.mlir
+)
