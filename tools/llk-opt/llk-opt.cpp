@@ -7,10 +7,12 @@
 
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllPasses.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
-// Include the LLK dialect declaration to register it.
-#include "LLK/Dialect/LLKDialect.h.inc"
+// Include the LLK dialect public header to register it.
+#include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Conversion/LLKToLinalg.h"
 
 int main(int argc, char **argv) {

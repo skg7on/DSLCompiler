@@ -1,19 +1,20 @@
 // RUN: llk-opt --llk-to-linalg %s | FileCheck %s
 
-// Test lowering of llk.fused_swiglu to scalar loop nests.
-// M1 produces scf.for + arith + math + tensor ops.
-// CHECK-DAG is used because ops appear in multiple regions
-// (matmul bodies vs elementwise body).
+// Test lowering of llk.fused_swiglu to linalg named ops + generic.
+// M1 produces:
+//   - linalg.fill   (accumulator init)
+//   - linalg.matmul (gate projection)
+//   - linalg.matmul (up projection)
+//   - linalg.generic (SiLU, computed in f32, trunc to bf16)
 
 // CHECK-LABEL: module
-// CHECK-DAG: scf.for
-// CHECK-DAG: arith.mulf
-// CHECK-DAG: arith.addf
-// CHECK-DAG: arith.extf
-// CHECK-DAG: math.exp
-// CHECK-DAG: arith.truncf
-// CHECK-DAG: arith.divf
-// CHECK-DAG: arith.negf
+// CHECK: linalg.fill
+// CHECK: linalg.matmul
+// CHECK: linalg.matmul
+// CHECK: linalg.generic
+// CHECK: arith.extf
+// CHECK: math.exp
+// CHECK: arith.truncf
 
 module {
   %x = tensor.empty() : tensor<2x4xbf16>
