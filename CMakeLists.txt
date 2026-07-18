@@ -99,7 +99,7 @@ enable_testing()
 
 function(add_llk_test test_name test_file)
     add_llvm_executable(${test_name} ${test_file})
-    target_link_libraries(${test_name} PRIVATE LLKPasses LLKRuntime GTest::GTest
+    target_link_libraries(${test_name} PRIVATE LLKPasses LLKRuntime GTest::gtest_main
                           ${dialect_libs} ${conversion_libs})
     add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
