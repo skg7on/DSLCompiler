@@ -82,15 +82,12 @@ add_mlir_library(LLKPasses
     LINK_LIBS PUBLIC LLKToLinalg
 )
 
-get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
-get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
-
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
 target_link_libraries(llk-opt PRIVATE LLKPasses MLIRMlirOptMain)
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
-target_link_libraries(llk-compile PRIVATE LLKPasses LLKRuntime ${dialect_libs} ${conversion_libs})
+target_link_libraries(llk-compile PRIVATE LLKPasses LLKRuntime)
 
 # Tests
 include(CTest)
@@ -99,8 +96,7 @@ enable_testing()
 
 function(add_llk_test test_name test_file)
     add_llvm_executable(${test_name} ${test_file})
-    target_link_libraries(${test_name} PRIVATE LLKPasses LLKRuntime GTest::gtest_main
-                          ${dialect_libs} ${conversion_libs})
+    target_link_libraries(${test_name} PRIVATE LLKPasses LLKRuntime GTest::gtest_main)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 
