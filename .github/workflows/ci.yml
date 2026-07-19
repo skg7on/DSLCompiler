@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 90
 
     env:
-      LLVM_VERSION: 22.1.8
+      LLVM_VERSION: 20.1.8
       LLVM_DIR: ${{ github.workspace }}/llvm
 
     steps:
