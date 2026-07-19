@@ -32,7 +32,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.LLVM_DIR }}
-          key: llvm-${{ env.LLVM_VERSION }}-linux-x64-v2
+          key: llvm-${{ env.LLVM_VERSION }}-linux-x64-v3
+          restore-keys: |
+            llvm-${{ env.LLVM_VERSION }}-linux-x64-
 
       - name: Download LLVM
         if: steps.cache-llvm.outputs.cache-hit != 'true'
