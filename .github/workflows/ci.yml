@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 90
 
     env:
-      LLVM_VERSION: 20.1.8
+      LLVM_VERSION: 22.1.8
       LLVM_DIR: ${{ github.workspace }}/llvm
 
     steps:
@@ -32,18 +32,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.LLVM_DIR }}
-          key: llvm-${{ env.LLVM_VERSION }}-x86-64-ubuntu-24.04-v1
+          key: llvm-${{ env.LLVM_VERSION }}-linux-x64-v1
 
       - name: Download LLVM
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
-          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-24.04.tar.xz"
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
           echo "Downloading $URL"
-          curl -fsSL -o llvm.tar.xz "$URL" || {
-            echo "Ubuntu 24.04 tarball not found, trying 22.04..."
-            URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
-            curl -fsSL -o llvm.tar.xz "$URL"
-          }
+          curl -fsSL -o llvm.tar.xz "$URL"
           mkdir -p $LLVM_DIR
           tar xf llvm.tar.xz -C $LLVM_DIR --strip-components=1
           rm llvm.tar.xz
