@@ -119,12 +119,16 @@ enable_testing()
 
 function(add_llk_test test_name test_file)
     add_llvm_executable(${test_name} ${test_file})
-    target_link_libraries(${test_name} PRIVATE LLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+    target_link_libraries(${test_name} PRIVATE GTest::gtest_main)
     add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 
 add_llk_test(SwigluReference test/Execution/swiglu_reference.cpp)
-add_llk_test(SwigluScalar test/Execution/swiglu_scalar.cpp)
+
+add_llvm_executable(SwigluScalar test/Execution/swiglu_scalar.cpp)
+target_link_libraries(SwigluScalar PRIVATE LLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME SwigluScalar COMMAND SwigluScalar)
+
 add_llk_test(EdgeCases test/Execution/edge_cases.cpp)
 
 # FileCheck tests
