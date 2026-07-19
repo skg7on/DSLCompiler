@@ -52,7 +52,9 @@ jobs:
           cmake .. -G Ninja \
             -DMLIR_DIR=$LLVM_DIR/lib/cmake/mlir \
             -DLLVM_DIR=$LLVM_DIR/lib/cmake/llvm \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLK_BUILD_TOOLS=OFF \
+            -DLLK_BUILD_E2E_TESTS=OFF
 
       - name: Build
         # SwigluReference + EdgeCases only — SwigluScalar/llk-opt/llk-compile

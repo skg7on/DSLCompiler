@@ -4,6 +4,9 @@ project(llk-compiler LANGUAGES CXX C)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(LLK_BUILD_TOOLS "Build llk-opt and llk-compile tools" ON)
+option(LLK_BUILD_E2E_TESTS "Build end-to-end JIT tests (requires LLVMOrcJIT)" ON)
+
 # Locate LLVM/MLIR installation or build directory
 find_package(MLIR REQUIRED CONFIG)
 find_package(LLVM REQUIRED CONFIG)
@@ -105,12 +108,14 @@ set(LLK_MLIR_EXEC_LIBS
     MLIRTransforms
 )
 
+if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
 target_link_libraries(llk-opt PRIVATE LLKPasses MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
 target_link_libraries(llk-compile PRIVATE LLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+endif()
 
 # Tests
 include(CTest)
@@ -125,9 +130,11 @@ endfunction()
 
 add_llk_test(SwigluReference test/Execution/swiglu_reference.cpp)
 
+if(LLK_BUILD_E2E_TESTS)
 add_llvm_executable(SwigluScalar test/Execution/swiglu_scalar.cpp)
 target_link_libraries(SwigluScalar PRIVATE LLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwigluScalar COMMAND SwigluScalar)
+endif()
 
 add_llk_test(EdgeCases test/Execution/edge_cases.cpp)
 
@@ -153,10 +160,10 @@ if(FILECHECK_BIN)
 endif()
 
 # Test for ops_invalid.mlir: runs llk-opt with --verify-diagnostics.
-# The test file itself contains `expected-error` markers that the verifier
-# must match.  A non-zero exit code from llk-opt (due to verification
-# failures) is expected and treated as success by --verify-diagnostics.
+# Only registered when llk-opt is built (LLK_BUILD_TOOLS=ON).
+if(LLK_BUILD_TOOLS)
 add_test(NAME DialectOpsInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
             ${CMAKE_SOURCE_DIR}/test/Dialect/ops_invalid.mlir
 )
+endif()
