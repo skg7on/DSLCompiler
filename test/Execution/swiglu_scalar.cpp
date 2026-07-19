@@ -258,7 +258,7 @@ TEST(SwiGLUScalar, OneShotBufferize) {
   mlir::PassManager pm(&ctx);
   pm.addPass(mlir::llk::createLLKToLinalgPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  mlir::bufferization::OneShotBufferizePassOptions bufOpts;
+  mlir::bufferization::OneShotBufferizeOptions bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
   ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
@@ -284,7 +284,7 @@ TEST(SwiGLUScalar, JitCompilationSmoke) {
   mlir::PassManager pm(&ctx);
   pm.addPass(mlir::llk::createLLKToLinalgPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  mlir::bufferization::OneShotBufferizePassOptions bufOpts;
+  mlir::bufferization::OneShotBufferizeOptions bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
   ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
@@ -324,7 +324,7 @@ TEST(SwiGLUScalar, MultipleShapeConfigurations) {
     mlir::PassManager pm(&ctx);
     pm.addPass(mlir::llk::createLLKToLinalgPass());
     pm.addPass(mlir::createCanonicalizerPass());
-    mlir::bufferization::OneShotBufferizePassOptions bufOpts;
+    mlir::bufferization::OneShotBufferizeOptions bufOpts;
     bufOpts.bufferizeFunctionBoundaries = true;
     pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
 
@@ -358,7 +358,7 @@ TEST(SwiGLUScalar, E2EWithAbiWrapper) {
   mlir::PassManager pm(&ctx);
   pm.addPass(mlir::llk::createLLKToLinalgPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  mlir::bufferization::OneShotBufferizePassOptions bufOpts;
+  mlir::bufferization::OneShotBufferizeOptions bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
   ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
