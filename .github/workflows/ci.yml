@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: macos-15
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     env:
@@ -25,7 +25,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install ninja googletest
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtest-dev
 
       - name: Cache LLVM build
         id: cache-llvm
@@ -35,9 +36,9 @@ jobs:
             ${{ env.LLVM_BUILD }}/lib/cmake
             ${{ env.LLVM_BUILD }}/include
             ${{ env.LLVM_BUILD }}/bin
-            ${{ env.LLVM_BUILD }}/lib/*.dylib
+            ${{ env.LLVM_BUILD }}/lib/*.so*
             ${{ env.LLVM_BUILD }}/CMakeCache.txt
-          key: llvm-${{ env.LLVM_COMMIT }}-v1
+          key: llvm-${{ env.LLVM_COMMIT }}-linux-v1
 
       - name: Checkout LLVM
         if: steps.cache-llvm.outputs.cache-hit != 'true'
@@ -54,14 +55,12 @@ jobs:
           mkdir -p $LLVM_BUILD && cd $LLVM_BUILD
           cmake $LLVM_DIR/llvm -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
             -DLLVM_ENABLE_PROJECTS="mlir" \
             -DLLVM_BUILD_LLVM_DYLIB=ON \
             -DLLVM_LINK_LLVM_DYLIB=ON \
             -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
-            -DLLVM_INSTALL_GTEST=OFF \
-            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            -DLLVM_INSTALL_GTEST=OFF
           ninja mlir-opt llc
 
       - name: Configure project
