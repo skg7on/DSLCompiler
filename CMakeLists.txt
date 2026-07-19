@@ -10,12 +10,12 @@ option(LLK_BUILD_E2E_TESTS "Build end-to-end JIT tests (requires LLVMOrcJIT)" ON
 # Path to llvm-project build directory.
 # All other LLVM/MLIR paths are inferred from this.
 # When set, find_package searches ONLY this directory (not system paths).
-set(LLVM_PROJECT_DIR "" CACHE PATH "Path to llvm-project build directory")
-if(LLVM_PROJECT_DIR)
+set(LLVM_PROJECT_BUILD_DIR "" CACHE PATH "Path to llvm-project build directory")
+if(LLVM_PROJECT_BUILD_DIR)
   find_package(MLIR REQUIRED CONFIG NO_DEFAULT_PATH
-    PATHS "${LLVM_PROJECT_DIR}/lib/cmake/mlir")
+    PATHS "${LLVM_PROJECT_BUILD_DIR}/lib/cmake/mlir")
   find_package(LLVM REQUIRED CONFIG NO_DEFAULT_PATH
-    PATHS "${LLVM_PROJECT_DIR}/lib/cmake/llvm")
+    PATHS "${LLVM_PROJECT_BUILD_DIR}/lib/cmake/llvm")
 else()
   find_package(MLIR REQUIRED CONFIG)
   find_package(LLVM REQUIRED CONFIG)

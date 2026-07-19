@@ -92,14 +92,14 @@ cd DSLCompiler
 
 # Build (requires LLVM/MLIR built from source)
 mkdir build && cd build
-cmake .. -G Ninja -DLLVM_PROJECT_DIR=/path/to/llvm-project/build
+cmake .. -G Ninja -DLLVM_PROJECT_BUILD_DIR=/path/to/llvm-project/build
 ninja
 
 # Run tests
 ninja check-llk
 ```
 
-When `LLVM_PROJECT_DIR` is set, `MLIR_DIR` and `LLVM_DIR` are inferred and
+When `LLVM_PROJECT_BUILD_DIR` is set, `MLIR_DIR` and `LLVM_DIR` are inferred and
 system-installed LLVM/MLIR are ignored. If omitted, `find_package` searches
 the standard CMake prefixes.
 

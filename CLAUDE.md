@@ -14,7 +14,7 @@ An out-of-tree MLIR compiler for tiled CPU LLM kernels (SwiGLU, RoPE, Attention)
 
 ```bash
 mkdir -p build && cd build
-cmake .. -G Ninja -DLLVM_PROJECT_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build
+cmake .. -G Ninja -DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build
 ninja                            # Build all targets
 ninja llk-opt                    # Build IR tool only
 ninja check-llk                  # Run all tests
