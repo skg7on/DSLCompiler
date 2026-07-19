@@ -16,9 +16,8 @@ jobs:
     timeout-minutes: 90
 
     env:
-      LLVM_COMMIT: f9bda52e57a7ca7d2aa3d32f8383fb9e3c3e1e2b
-      LLVM_DIR: ${{ github.workspace }}/llvm-project
-      LLVM_BUILD: ${{ github.workspace }}/llvm-project/build
+      LLVM_VERSION: 20.1.8
+      LLVM_DIR: ${{ github.workspace }}/llvm
 
     steps:
       - uses: actions/checkout@v4
@@ -28,47 +27,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build libgtest-dev
 
-      - name: Cache LLVM build
+      - name: Cache LLVM
         id: cache-llvm
         uses: actions/cache@v4
         with:
-          path: |
-            ${{ env.LLVM_BUILD }}/lib/cmake
-            ${{ env.LLVM_BUILD }}/include
-            ${{ env.LLVM_BUILD }}/bin
-            ${{ env.LLVM_BUILD }}/lib/*.so*
-            ${{ env.LLVM_BUILD }}/CMakeCache.txt
-          key: llvm-${{ env.LLVM_COMMIT }}-linux-v1
+          path: ${{ env.LLVM_DIR }}
+          key: llvm-${{ env.LLVM_VERSION }}-x86-64-ubuntu-24.04-v1
 
-      - name: Checkout LLVM
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: llvm/llvm-project
-          path: llvm-project
-          ref: ${{ env.LLVM_COMMIT }}
-          fetch-depth: 1
-
-      - name: Build LLVM
+      - name: Download LLVM
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
-          mkdir -p $LLVM_BUILD && cd $LLVM_BUILD
-          cmake $LLVM_DIR/llvm -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_TARGETS_TO_BUILD="X86" \
-            -DLLVM_ENABLE_PROJECTS="mlir" \
-            -DLLVM_BUILD_LLVM_DYLIB=ON \
-            -DLLVM_LINK_LLVM_DYLIB=ON \
-            -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
-            -DLLVM_INSTALL_GTEST=OFF
-          ninja mlir-opt llc
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-24.04.tar.xz"
+          echo "Downloading $URL"
+          curl -fsSL -o llvm.tar.xz "$URL" || {
+            echo "Ubuntu 24.04 tarball not found, trying 22.04..."
+            URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/clang+llvm-${LLVM_VERSION}-x86_64-linux-gnu-ubuntu-22.04.tar.xz"
+            curl -fsSL -o llvm.tar.xz "$URL"
+          }
+          mkdir -p $LLVM_DIR
+          tar xf llvm.tar.xz -C $LLVM_DIR --strip-components=1
+          rm llvm.tar.xz
 
       - name: Configure project
         run: |
           mkdir -p build && cd build
           cmake .. -G Ninja \
-            -DMLIR_DIR=$LLVM_BUILD/lib/cmake/mlir \
-            -DLLVM_DIR=$LLVM_BUILD/lib/cmake/llvm \
+            -DMLIR_DIR=$LLVM_DIR/lib/cmake/mlir \
+            -DLLVM_DIR=$LLVM_DIR/lib/cmake/llvm \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
