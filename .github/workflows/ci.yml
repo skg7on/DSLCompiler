@@ -16,8 +16,9 @@ jobs:
     timeout-minutes: 90
 
     env:
-      LLVM_VERSION: 20.1.8
-      LLVM_DIR: ${{ github.workspace }}/llvm
+      LLVM_COMMIT: f9bda52e57a7ca7d2aa3d32f8383fb9e3c3e1e2b
+      LLVM_SOURCE: ${{ github.workspace }}/llvm-project
+      LLVM_INSTALL: ${{ github.workspace }}/llvm-install
 
     steps:
       - uses: actions/checkout@v4
@@ -25,31 +26,49 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libgtest-dev
+          sudo apt-get install -y ninja-build libgtest-dev ccache
 
-      - name: Cache LLVM
+      - name: Cache LLVM build
         id: cache-llvm
         uses: actions/cache@v4
         with:
-          path: ${{ env.LLVM_DIR }}
-          key: llvm-${{ env.LLVM_VERSION }}-linux-x64-v1
+          path: ${{ env.LLVM_INSTALL }}
+          key: llvm-${{ env.LLVM_COMMIT }}-x86-64-v2
 
-      - name: Download LLVM
+      - name: Checkout LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/llvm-project
+          path: llvm-project
+          ref: ${{ env.LLVM_COMMIT }}
+          fetch-depth: 1
+
+      - name: Build and install LLVM
         if: steps.cache-llvm.outputs.cache-hit != 'true'
         run: |
-          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
-          echo "Downloading $URL"
-          curl -fsSL -o llvm.tar.xz "$URL"
-          mkdir -p $LLVM_DIR
-          tar xf llvm.tar.xz -C $LLVM_DIR --strip-components=1
-          rm llvm.tar.xz
+          mkdir -p llvm-build && cd llvm-build
+          cmake $LLVM_SOURCE/llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=$LLVM_INSTALL \
+            -DLLVM_TARGETS_TO_BUILD="X86" \
+            -DLLVM_ENABLE_PROJECTS="mlir" \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
+            -DLLVM_INSTALL_GTEST=OFF \
+            -DLLVM_CCACHE_BUILD=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          ninja install
+          rm -rf llvm-build
 
       - name: Configure project
         run: |
           mkdir -p build && cd build
           cmake .. -G Ninja \
-            -DMLIR_DIR=$LLVM_DIR/lib/cmake/mlir \
-            -DLLVM_DIR=$LLVM_DIR/lib/cmake/llvm \
+            -DMLIR_DIR=$LLVM_INSTALL/lib/cmake/mlir \
+            -DLLVM_DIR=$LLVM_INSTALL/lib/cmake/llvm \
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
