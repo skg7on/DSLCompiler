@@ -32,7 +32,7 @@ namespace llk {
 // ---------------------------------------------------------------------------
 static void addLoweringPasses(mlir::PassManager &pm) {
     // Lower structured control flow (scf) to basic-block control flow (cf).
-    pm.addPass(mlir::createSCFToControlFlowPass());
+    pm.addPass(mlir::createConvertSCFToCFPass());
     // Lower control flow to LLVM dialect.
     pm.addPass(mlir::createConvertControlFlowToLLVMPass());
     // Lower arithmetic ops to LLVM dialect.
