@@ -23,8 +23,9 @@ jobs:
       contents: read
 
     env:
-      LLVM_VERSION: 20.1.8
-      LLVM_DIR: ${{ github.workspace }}/llvm
+      LLVM_VERSION: 22.1.8
+      LLVM_SOURCE: ${{ github.workspace }}/llvm-project
+      LLVM_BUILD: ${{ github.workspace }}/llvm-build
 
     steps:
       - uses: actions/checkout@v4
@@ -34,24 +35,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build libgtest-dev
 
-      - name: Cache LLVM
-        id: cache-llvm
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.LLVM_DIR }}
-          key: llvm-${{ env.LLVM_VERSION }}-linux-x64-codeql-v2
-          restore-keys: |
-            llvm-${{ env.LLVM_VERSION }}-linux-x64-
-
-      - name: Download LLVM
-        if: steps.cache-llvm.outputs.cache-hit != 'true'
+      - name: Download LLVM source
         run: |
-          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz"
           echo "Downloading $URL"
           curl -fsSL -o llvm.tar.xz "$URL"
-          mkdir -p $LLVM_DIR
-          tar xf llvm.tar.xz -C $LLVM_DIR --strip-components=1
+          mkdir -p $LLVM_SOURCE
+          tar xf llvm.tar.xz -C $LLVM_SOURCE --strip-components=1
           rm llvm.tar.xz
+
+      - name: Cache LLVM build
+        id: cache-llvm-build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_BUILD }}
+          key: llvm-build-${{ env.LLVM_VERSION }}-v1
+
+      - name: Build LLVM
+        if: steps.cache-llvm-build.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p $LLVM_BUILD && cd $LLVM_BUILD
+          cmake $LLVM_SOURCE/llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS=mlir \
+            -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DMLIR_INCLUDE_TESTS=OFF \
+            -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF
+          ninja
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -63,8 +80,7 @@ jobs:
         run: |
           mkdir -p build && cd build
           cmake .. -G Ninja \
-            -DMLIR_DIR=$LLVM_DIR/lib/cmake/mlir \
-            -DLLVM_DIR=$LLVM_DIR/lib/cmake/llvm \
+            -DLLVM_PROJECT_BUILD_DIR=$LLVM_BUILD \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLK_BUILD_TOOLS=OFF \
             -DLLK_BUILD_E2E_TESTS=OFF
