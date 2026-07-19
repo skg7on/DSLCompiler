@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    env:
+      LLVM_COMMIT: f9bda52e57a7ca7d2aa3d32f8383fb9e3c3e1e2b
+      LLVM_DIR: ${{ github.workspace }}/llvm-project
+      LLVM_BUILD: ${{ github.workspace }}/llvm-project/build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          brew install ninja googletest
+
+      - name: Cache LLVM build
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.LLVM_BUILD }}/lib/cmake
+            ${{ env.LLVM_BUILD }}/include
+            ${{ env.LLVM_BUILD }}/bin
+            ${{ env.LLVM_BUILD }}/lib/*.dylib
+            ${{ env.LLVM_BUILD }}/CMakeCache.txt
+          key: llvm-${{ env.LLVM_COMMIT }}-v1
+
+      - name: Checkout LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/llvm-project
+          path: llvm-project
+          ref: ${{ env.LLVM_COMMIT }}
+          fetch-depth: 1
+
+      - name: Build LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p $LLVM_BUILD && cd $LLVM_BUILD
+          cmake $LLVM_DIR/llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_ENABLE_PROJECTS="mlir" \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
+            -DLLVM_INSTALL_GTEST=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          ninja mlir-opt llc
+
+      - name: Configure project
+        run: |
+          mkdir -p build && cd build
+          cmake .. -G Ninja \
+            -DMLIR_DIR=$LLVM_BUILD/lib/cmake/mlir \
+            -DLLVM_DIR=$LLVM_BUILD/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cd build && ninja llk-opt llk-compile SwigluReference EdgeCases SwigluScalar
+
+      - name: Run tests
+        run: cd build && ctest --output-on-failure
