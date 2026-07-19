@@ -66,8 +66,9 @@ jobs:
             -DMLIR_DIR=$LLVM_DIR/lib/cmake/mlir \
             -DLLVM_DIR=$LLVM_DIR/lib/cmake/llvm \
             -DCMAKE_BUILD_TYPE=Release
-          ninja llk-opt SwigluReference EdgeCases SwigluScalar
-          # llk-compile excluded: links LLVMOrcJIT not in pre-built tarball
+          # Test targets only — llk-opt/llk-compile excluded due to
+          # MLIRMlirOptMain/LLVMOrcJIT link issues with pre-built tarball.
+          ninja SwigluReference EdgeCases SwigluScalar
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3
