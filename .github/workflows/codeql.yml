@@ -66,7 +66,7 @@ jobs:
             -DMLIR_DIR=$LLVM_DIR/lib/cmake/mlir \
             -DLLVM_DIR=$LLVM_DIR/lib/cmake/llvm \
             -DCMAKE_BUILD_TYPE=Release
-          ninja
+          ninja llk-opt llk-compile SwigluReference EdgeCases SwigluScalar
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3

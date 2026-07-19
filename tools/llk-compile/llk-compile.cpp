@@ -14,12 +14,6 @@
 
 #include "llvm/Config/llvm-config.h"
 #include "mlir/Conversion/Passes.h"
-
-#if LLVM_VERSION_MAJOR >= 21
-using BufOpts = mlir::bufferization::OneShotBufferizePassOptions;
-#else
-using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
-#endif
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
@@ -39,6 +33,12 @@ using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/raw_ostream.h"
+
+#if LLVM_VERSION_MAJOR >= 21
+using BufOpts = mlir::bufferization::OneShotBufferizePassOptions;
+#else
+using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
+#endif
 
 namespace cl = llvm::cl;
 
