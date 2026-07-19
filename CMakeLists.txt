@@ -95,6 +95,14 @@ target_link_libraries(LLKRuntime PUBLIC
     LLVMAArch64AsmParser LLVMAArch64Disassembler
 )
 
+# Library: X86 target feature detection
+add_library(LLKTargetX86 STATIC
+    lib/Target/X86/TargetAVX2.cpp
+)
+target_include_directories(LLKTargetX86 PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # Tool: llk-opt
 add_mlir_library(LLKPasses
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -164,6 +172,8 @@ add_test(NAME SwigluScalar COMMAND SwigluScalar)
 endif()
 
 add_llk_test(EdgeCases test/Execution/edge_cases.cpp)
+add_llk_test(CpuFeaturesTest test/Execution/cpu_features_test.cpp)
+target_link_libraries(CpuFeaturesTest PRIVATE LLKTargetX86)
 
 # FileCheck tests
 find_program(FILECHECK_BIN FileCheck)
