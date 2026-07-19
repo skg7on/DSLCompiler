@@ -7,9 +7,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(LLK_BUILD_TOOLS "Build llk-opt and llk-compile tools" ON)
 option(LLK_BUILD_E2E_TESTS "Build end-to-end JIT tests (requires LLVMOrcJIT)" ON)
 
-# Locate LLVM/MLIR installation or build directory
-find_package(MLIR REQUIRED CONFIG)
-find_package(LLVM REQUIRED CONFIG)
+# Path to llvm-project build directory.
+# All other LLVM/MLIR paths are inferred from this.
+# When set, find_package searches ONLY this directory (not system paths).
+set(LLVM_PROJECT_DIR "" CACHE PATH "Path to llvm-project build directory")
+if(LLVM_PROJECT_DIR)
+  find_package(MLIR REQUIRED CONFIG NO_DEFAULT_PATH
+    PATHS "${LLVM_PROJECT_DIR}/lib/cmake/mlir")
+  find_package(LLVM REQUIRED CONFIG NO_DEFAULT_PATH
+    PATHS "${LLVM_PROJECT_DIR}/lib/cmake/llvm")
+else()
+  find_package(MLIR REQUIRED CONFIG)
+  find_package(LLVM REQUIRED CONFIG)
+endif()
 
 message(STATUS "LLVM version: ${LLVM_PACKAGE_VERSION}")
 message(STATUS "MLIR include dir: ${MLIR_INCLUDE_DIRS}")
