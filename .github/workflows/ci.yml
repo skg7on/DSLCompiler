@@ -55,8 +55,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cd build && ninja llk-opt SwigluReference EdgeCases SwigluScalar
-        # llk-compile excluded: links LLVMOrcJIT which may not be in pre-built LLVM tarball
+        run: cd build && ninja SwigluReference EdgeCases SwigluScalar
 
       - name: Run tests
         run: cd build && ctest --output-on-failure
