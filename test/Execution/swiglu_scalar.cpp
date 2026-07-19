@@ -117,16 +117,21 @@ static mlir::DialectRegistry buildRegistry() {
 }
 
 static std::string generateSwiGLUIR(int64_t M, int64_t N, int64_t K) {
-  // Use the same IR format that llk-opt (LLVM 24) accepts.
-  // In LLVM 20 Homebrew, func.func custom format is broken, so
-  // parseSourceString may fail. Tests handle this gracefully.
+  // Use generic MLIR form so parsing works regardless of func.func custom
+  // parser availability (both LLVM 20 Homebrew and LLVM 24 from source).
   std::ostringstream ss;
   ss << "module {\n"
-     << "  func.func @llk_swiglu(%arg0: tensor<" << M << "x" << K << "xbf16>, "
+     << "  \"func.func\"() {function_type = ("
+     << "tensor<" << M << "x" << K << "xbf16>, "
+     << "tensor<" << K << "x" << N << "xbf16>, "
+     << "tensor<" << K << "x" << N << "xbf16>, "
+     << "tensor<" << M << "x" << N << "xbf16>"
+     << ") -> tensor<" << M << "x" << N << "xbf16>, "
+     << "sym_name = \"llk_swiglu\"} ({\n"
+     << "  ^bb0(%arg0: tensor<" << M << "x" << K << "xbf16>, "
      << "%arg1: tensor<" << K << "x" << N << "xbf16>, "
      << "%arg2: tensor<" << K << "x" << N << "xbf16>, "
-     << "%arg3: tensor<" << M << "x" << N << "xbf16>) -> tensor<" << M << "x"
-     << N << "xbf16> {\n"
+     << "%arg3: tensor<" << M << "x" << N << "xbf16>):\n"
      << "    %0 = llk.fused_swiglu ins(%arg0, %arg1, %arg2 : "
      << "tensor<" << M << "x" << K << "xbf16>, "
      << "tensor<" << K << "x" << N << "xbf16>, "
@@ -135,8 +140,8 @@ static std::string generateSwiGLUIR(int64_t M, int64_t N, int64_t K) {
      << "{accumulator_type = f32, activation = #llk.activation<silu>, "
      << "math_mode = #llk.math_mode<bounded_fast>} "
      << "-> tensor<" << M << "x" << N << "xbf16>\n"
-     << "    return %0 : tensor<" << M << "x" << N << "xbf16>\n"
-     << "  }\n"
+     << "    \"func.return\"(%0) : (tensor<" << M << "x" << N << "xbf16>) -> ()\n"
+     << "  }) : () -> ()\n"
      << "}\n";
   return ss.str();
 }
