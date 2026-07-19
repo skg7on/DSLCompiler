@@ -12,7 +12,14 @@
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Runtime/JitCache.h"
 
+#include "llvm/Config/llvm-config.h"
 #include "mlir/Conversion/Passes.h"
+
+#if LLVM_VERSION_MAJOR >= 21
+using BufOpts = mlir::bufferization::OneShotBufferizePassOptions;
+#else
+using BufOpts = mlir::bufferization::OneShotBufferizeOptions;
+#endif
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
@@ -56,7 +63,7 @@ static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
     pm.addPass(mlir::createCanonicalizerPass(mlir::GreedyRewriteConfig()));
 
     // Step 3: One-Shot Bufferize (tensor → memref).
-    mlir::bufferization::OneShotBufferizeOptions bufOpts;
+    BufOpts bufOpts;
     bufOpts.bufferizeFunctionBoundaries = true;
     pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
 

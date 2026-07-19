@@ -42,7 +42,14 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Error.h"
+
+#if LLVM_VERSION_MAJOR >= 21
+using BufOpts = mlir::bufferization::OneShotBufferizePassOptions;
+#else
+using BufOpts = mlir::bufferization::OneShotBufferizeOptions;
+#endif
 
 #include <gtest/gtest.h>
 
@@ -258,7 +265,7 @@ TEST(SwiGLUScalar, OneShotBufferize) {
   mlir::PassManager pm(&ctx);
   pm.addPass(mlir::llk::createLLKToLinalgPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  mlir::bufferization::OneShotBufferizeOptions bufOpts;
+  BufOpts bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
   ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
@@ -284,7 +291,7 @@ TEST(SwiGLUScalar, JitCompilationSmoke) {
   mlir::PassManager pm(&ctx);
   pm.addPass(mlir::llk::createLLKToLinalgPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  mlir::bufferization::OneShotBufferizeOptions bufOpts;
+  BufOpts bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
   ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
@@ -324,7 +331,7 @@ TEST(SwiGLUScalar, MultipleShapeConfigurations) {
     mlir::PassManager pm(&ctx);
     pm.addPass(mlir::llk::createLLKToLinalgPass());
     pm.addPass(mlir::createCanonicalizerPass());
-    mlir::bufferization::OneShotBufferizeOptions bufOpts;
+    BufOpts bufOpts;
     bufOpts.bufferizeFunctionBoundaries = true;
     pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
 
@@ -358,7 +365,7 @@ TEST(SwiGLUScalar, E2EWithAbiWrapper) {
   mlir::PassManager pm(&ctx);
   pm.addPass(mlir::llk::createLLKToLinalgPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  mlir::bufferization::OneShotBufferizeOptions bufOpts;
+  BufOpts bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
   ASSERT_TRUE(mlir::succeeded(pm.run(*module)));

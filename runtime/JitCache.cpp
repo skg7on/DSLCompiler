@@ -16,6 +16,7 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
 
+#include "llvm/Config/llvm-config.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -32,7 +33,11 @@ namespace llk {
 // ---------------------------------------------------------------------------
 static void addLoweringPasses(mlir::PassManager &pm) {
     // Lower structured control flow (scf) to basic-block control flow (cf).
+#if LLVM_VERSION_MAJOR >= 21
+    pm.addPass(mlir::createSCFToControlFlowPass());
+#else
     pm.addPass(mlir::createConvertSCFToCFPass());
+#endif
     // Lower control flow to LLVM dialect.
     pm.addPass(mlir::createConvertControlFlowToLLVMPass());
     // Lower arithmetic ops to LLVM dialect.
