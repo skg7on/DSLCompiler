@@ -194,6 +194,11 @@ if(FILECHECK_BIN)
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
   )
+  # Schedule parse test: verify the transform dialect schedule parses correctly
+  # and the named sequence round-trips through llk-opt.
+  add_test(NAME ScheduleBF16Check
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_bf16_check.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_bf16_check.mlir"
+  )
 endif()
 
 # Test for ops_invalid.mlir: runs llk-opt with --verify-diagnostics.
