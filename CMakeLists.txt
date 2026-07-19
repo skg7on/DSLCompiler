@@ -59,6 +59,11 @@ mlir_tablegen(include/LLK/Dialect/LLKOpsDialect.cpp.inc -gen-dialect-defs -diale
   EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect)
 add_public_tablegen_target(LLKOpsGen)
 
+# TableGen for LLK transform passes
+set(LLVM_TARGET_DEFINITIONS include/LLK/Transforms/Passes.td)
+mlir_tablegen(include/LLK/Transforms/Passes.h.inc -gen-pass-decls -name=LLK)
+add_public_tablegen_target(LLKTransformsGen)
+
 # Library: LLK dialect
 add_mlir_dialect_library(LLKDialect
     lib/Dialect/LLK/LLKDialect.cpp
@@ -72,7 +77,7 @@ add_mlir_dialect_library(LLKDialect
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
     DEPENDS LLKDialect
-    LINK_LIBS PUBLIC MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
+    LINK_LIBS PUBLIC LLKDialect MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
                      MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
@@ -86,6 +91,8 @@ target_include_directories(LLKRuntime PUBLIC
 )
 target_link_libraries(LLKRuntime PUBLIC
     LLVMOrcJIT MLIRExecutionEngine
+    LLVMAArch64CodeGen LLVMAArch64Info LLVMAArch64Desc
+    LLVMAArch64AsmParser LLVMAArch64Disassembler
 )
 
 # Tool: llk-opt
@@ -101,20 +108,30 @@ add_mlir_library(LLKPasses
 # pre-built LLVM binary releases (which may have missing libs).
 set(LLK_MLIR_EXEC_LIBS
     MLIRArithDialect
+    MLIRArithToLLVM
     MLIRArithTransforms
     MLIRBufferizationDialect
     MLIRBufferizationTransforms
+    MLIRControlFlowToLLVM
     MLIRFuncDialect
+    MLIRFuncToLLVM
     MLIRFuncTransforms
     MLIRIR
     MLIRLinalgDialect
+    MLIRLinalgTransforms
     MLIRMathDialect
+    MLIRMathToLLVM
     MLIRMemRefDialect
+    MLIRMemRefToLLVM
     MLIRParser
     MLIRPass
+    MLIRReconcileUnrealizedCasts
     MLIRSCFDialect
+    MLIRSCFToControlFlow
+    MLIRSCFTransforms
     MLIRSupport
     MLIRTensorDialect
+    MLIRTensorTransforms
     MLIRTransforms
 )
 
