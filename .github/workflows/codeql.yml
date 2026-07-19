@@ -67,6 +67,7 @@ jobs:
             -DLLVM_DIR=$LLVM_DIR/lib/cmake/llvm \
             -DCMAKE_BUILD_TYPE=Release
           ninja llk-opt SwigluReference EdgeCases SwigluScalar
+          # llk-compile excluded: links LLVMOrcJIT not in pre-built tarball
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3

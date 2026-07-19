@@ -82,12 +82,35 @@ add_mlir_library(LLKPasses
     LINK_LIBS PUBLIC LLKToLinalg
 )
 
+# MLIR libraries needed by executables that use our project libraries.
+# Listed explicitly rather than using the global MLIR_DIALECT_LIBS /
+# MLIR_CONVERSION_LIBS to avoid linking 200+ libraries when using
+# pre-built LLVM binary releases (which may have missing libs).
+set(LLK_MLIR_EXEC_LIBS
+    MLIRArithDialect
+    MLIRArithTransforms
+    MLIRBufferizationDialect
+    MLIRBufferizationTransforms
+    MLIRFuncDialect
+    MLIRFuncTransforms
+    MLIRIR
+    MLIRLinalgDialect
+    MLIRMathDialect
+    MLIRMemRefDialect
+    MLIRParser
+    MLIRPass
+    MLIRSCFDialect
+    MLIRSupport
+    MLIRTensorDialect
+    MLIRTransforms
+)
+
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses MLIRMlirOptMain)
+target_link_libraries(llk-opt PRIVATE LLKPasses MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
-target_link_libraries(llk-compile PRIVATE LLKPasses LLKRuntime)
+target_link_libraries(llk-compile PRIVATE LLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
 
 # Tests
 include(CTest)
@@ -96,7 +119,7 @@ enable_testing()
 
 function(add_llk_test test_name test_file)
     add_llvm_executable(${test_name} ${test_file})
-    target_link_libraries(${test_name} PRIVATE LLKPasses LLKRuntime GTest::gtest_main)
+    target_link_libraries(${test_name} PRIVATE LLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
     add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 
