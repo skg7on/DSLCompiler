@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      LLVM_VERSION: 20.1.8
+      LLVM_DIR: ${{ github.workspace }}/llvm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtest-dev
+
+      - name: Cache LLVM
+        id: cache-llvm
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_DIR }}
+          key: llvm-${{ env.LLVM_VERSION }}-linux-x64-v3
+          restore-keys: |
+            llvm-${{ env.LLVM_VERSION }}-linux-x64-
+
+      - name: Download LLVM
+        if: steps.cache-llvm.outputs.cache-hit != 'true'
+        run: |
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz"
+          echo "Downloading $URL"
+          curl -fsSL -o llvm.tar.xz "$URL"
+          mkdir -p $LLVM_DIR
+          tar xf llvm.tar.xz -C $LLVM_DIR --strip-components=1
+          rm llvm.tar.xz
+
+      - name: Configure project
+        run: |
+          mkdir -p build && cd build
+          cmake .. -G Ninja \
+            -DMLIR_DIR=$LLVM_DIR/lib/cmake/mlir \
+            -DLLVM_DIR=$LLVM_DIR/lib/cmake/llvm \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLK_BUILD_TOOLS=OFF \
+            -DLLK_BUILD_E2E_TESTS=OFF
+
+      - name: Build
+        # SwigluReference + EdgeCases only — SwigluScalar/llk-opt/llk-compile
+        # excluded due to MLIRMlirOptMain/LLVMOrcJIT linking issues with
+        # the pre-built LLVM 20.1.8 tarball.
+        run: cd build && ninja SwigluReference EdgeCases
+
+      - name: Run tests
+        run: cd build && ctest --output-on-failure

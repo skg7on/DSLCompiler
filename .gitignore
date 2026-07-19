@@ -5,3 +5,4 @@ __pycache__/
 *.o
 *.a
 *.so
+.claude/worktrees/

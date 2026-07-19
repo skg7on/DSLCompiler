@@ -1,0 +1,40 @@
+//===- llk-opt.cpp - LLK optimizer driver ---------------------------------===//
+//
+// Main entry point for the LLK optimizer tool. Parses MLIR input, runs
+// optimization passes, and emits the result.
+//
+//===----------------------------------------------------------------------===//
+
+#include "mlir/InitAllDialects.h"
+#include "mlir/InitAllPasses.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
+#include "mlir/Tools/mlir-opt/MlirOptMain.h"
+
+// Include the LLK dialect public header to register it.
+#include "LLK/Dialect/LLKDialect.h"
+#include "LLK/Conversion/LLKToLinalg.h"
+
+int main(int argc, char **argv) {
+  mlir::DialectRegistry registry;
+
+  // Register all built-in MLIR dialects.
+  mlir::registerAllDialects(registry);
+
+  // Register the LLK dialect.
+  registry.insert<mlir::llk::LLKDialect>();
+
+  // Register all built-in MLIR passes.
+  mlir::registerAllPasses();
+
+  // Register the LLK-to-Linalg lowering pass.
+  mlir::PassPipelineRegistration<> llkToLinalgPipeline(
+      "llk-to-linalg-pipeline",
+      "Full LLK-to-Linalg lowering pipeline",
+      [](mlir::OpPassManager &pm) {
+        pm.addPass(mlir::llk::createLLKToLinalgPass());
+      });
+
+  return mlir::asMainReturnCode(
+      mlir::MlirOptMain(argc, argv, "LLK optimizer driver\n", registry));
+}
