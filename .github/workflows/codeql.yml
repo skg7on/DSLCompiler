@@ -65,10 +65,10 @@ jobs:
           cmake .. -G Ninja \
             -DMLIR_DIR=$LLVM_DIR/lib/cmake/mlir \
             -DLLVM_DIR=$LLVM_DIR/lib/cmake/llvm \
-            -DCMAKE_BUILD_TYPE=Release
-          # Test targets only — llk-opt/llk-compile excluded due to
-          # MLIRMlirOptMain/LLVMOrcJIT link issues with pre-built tarball.
-          ninja SwigluReference EdgeCases SwigluScalar
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLK_BUILD_TOOLS=OFF \
+            -DLLK_BUILD_E2E_TESTS=OFF
+          ninja LLKDialect LLKToLinalg LLKRuntime SwigluReference EdgeCases
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3
