@@ -17,7 +17,7 @@
 #include <unordered_map>
 #include <shared_mutex>
 
-/// Stable C ABI: 2D tensor descriptor used by compiled kernels.
+/// Stable C ABI: 2D tensor descriptor used to construct kernel inputs/outputs.
 /// Matches the memory layout expected by the ORC JIT entry point.
 struct Tensor2D {
     void* data;
@@ -26,6 +26,26 @@ struct Tensor2D {
     int64_t stride0;
     int64_t stride1;
 };
+
+/// MLIR-compatible 2D memref descriptor used as the JIT kernel calling ABI.
+///
+/// Layout must match the LLVM struct produced by MLIR's LLVM lowering of
+/// memref<MxNxT>: {T*, T*, i64, [2 x i64], [2 x i64]}.
+/// sizeof(MemRef2D) == 56 bytes on 64-bit systems.
+struct MemRef2D {
+    void* allocated;
+    void* aligned;
+    int64_t offset;
+    int64_t size0;
+    int64_t size1;
+    int64_t stride0;
+    int64_t stride1;
+};
+
+/// Helper: populate a MemRef2D from a Tensor2D that holds row-major data.
+inline MemRef2D makeMemRef2D(const Tensor2D& t) {
+    return MemRef2D{t.data, t.data, 0, t.dim0, t.dim1, t.stride0, t.stride1};
+}
 
 /// Stable C ABI: scratch and context pointer for compiled kernels.
 struct KernelContext {
@@ -43,8 +63,13 @@ namespace llk {
 /// On cache miss, lowers the MLIR module to LLVM IR and JIT-compiles it.
 class JitCache {
 public:
-    using KernelFn = void(*)(const Tensor2D*, const Tensor2D*, const Tensor2D*,
-                              Tensor2D*, KernelContext*);
+    /// Five MemRef2D arguments: x, wg, wu, init, result.
+    /// Matches the MLIR function signature after OneShotBufferize:
+    ///   func.func @llk_swiglu(
+    ///       memref<MxKxbf16>, memref<KxNxbf16>, memref<KxNxbf16>,
+    ///       memref<MxNxbf16>, memref<MxNxbf16>)
+    using KernelFn = void(*)(MemRef2D*, MemRef2D*, MemRef2D*, MemRef2D*,
+                              MemRef2D*);
 
     /// Constructs the JIT cache, creating an ORC LLJIT instance.
     explicit JitCache();

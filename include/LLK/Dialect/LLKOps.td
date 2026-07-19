@@ -47,7 +47,6 @@ def LLK_FusedSwiGLUOp : LLK_Op<"fused_swiglu", [
     }];
 
     let hasVerifier = 1;
-    let hasCustomAssemblyFormat = 1;
 
     let extraClassDeclaration = [{
       // TilingInterface methods (overrides of default implementations).
