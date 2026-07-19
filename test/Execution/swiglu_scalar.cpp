@@ -48,7 +48,7 @@
 #if LLVM_VERSION_MAJOR >= 21
 using BufOpts = mlir::bufferization::OneShotBufferizePassOptions;
 #else
-using BufOpts = mlir::bufferization::OneShotBufferizeOptions;
+using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
 #endif
 
 #include <gtest/gtest.h>

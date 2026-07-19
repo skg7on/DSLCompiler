@@ -18,7 +18,7 @@
 #if LLVM_VERSION_MAJOR >= 21
 using BufOpts = mlir::bufferization::OneShotBufferizePassOptions;
 #else
-using BufOpts = mlir::bufferization::OneShotBufferizeOptions;
+using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
 #endif
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
