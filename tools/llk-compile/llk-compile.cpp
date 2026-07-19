@@ -56,7 +56,7 @@ static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
     pm.addPass(mlir::createCanonicalizerPass(mlir::GreedyRewriteConfig()));
 
     // Step 3: One-Shot Bufferize (tensor → memref).
-    mlir::bufferization::OneShotBufferizationOptions bufOpts;
+    mlir::bufferization::OneShotBufferizePassOptions bufOpts;
     bufOpts.bufferizeFunctionBoundaries = true;
     pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
 

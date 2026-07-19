@@ -51,6 +51,13 @@ struct LLKToLinalgPass
     return "Lower LLK ops to Linalg + Arith + Math";
   }
 
+  void getDependentDialects(::mlir::DialectRegistry &registry) const override {
+    registry.insert<mlir::arith::ArithDialect>();
+    registry.insert<mlir::math::MathDialect>();
+    registry.insert<mlir::linalg::LinalgDialect>();
+    registry.insert<mlir::tensor::TensorDialect>();
+  }
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
 

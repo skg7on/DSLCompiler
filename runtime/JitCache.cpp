@@ -20,6 +20,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -31,7 +32,7 @@ namespace llk {
 // ---------------------------------------------------------------------------
 static void addLoweringPasses(mlir::PassManager &pm) {
     // Lower structured control flow (scf) to basic-block control flow (cf).
-    pm.addPass(mlir::createConvertSCFToCFPass());
+    pm.addPass(mlir::createSCFToControlFlowPass());
     // Lower control flow to LLVM dialect.
     pm.addPass(mlir::createConvertControlFlowToLLVMPass());
     // Lower arithmetic ops to LLVM dialect.
@@ -51,6 +52,11 @@ static void addLoweringPasses(mlir::PassManager &pm) {
 // ---------------------------------------------------------------------------
 
 JitCache::JitCache() {
+    // Initialize native target support required by ORC JIT.
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    llvm::InitializeNativeTargetAsmParser();
+
     // Create an ORC LLJIT instance with default settings.
     auto jitBuilder = llvm::orc::LLJITBuilder();
     auto jitOrErr = jitBuilder.create();

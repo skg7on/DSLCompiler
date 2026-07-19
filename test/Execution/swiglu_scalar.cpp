@@ -21,8 +21,13 @@
 #include "LLK/Runtime/JitCache.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -113,25 +118,24 @@ static mlir::DialectRegistry buildRegistry() {
                   mlir::arith::ArithDialect,
                   mlir::math::MathDialect,
                   mlir::memref::MemRefDialect>();
+  // Register bufferization interfaces required by One-Shot Bufferize.
+  mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
   return registry;
 }
 
 static std::string generateSwiGLUIR(int64_t M, int64_t N, int64_t K) {
-  // Use generic MLIR form so parsing works regardless of func.func custom
-  // parser availability (both LLVM 20 Homebrew and LLVM 24 from source).
+  // Use custom func.func format — works with LLVM 24.
   std::ostringstream ss;
   ss << "module {\n"
-     << "  \"func.func\"() {function_type = ("
-     << "tensor<" << M << "x" << K << "xbf16>, "
-     << "tensor<" << K << "x" << N << "xbf16>, "
-     << "tensor<" << K << "x" << N << "xbf16>, "
-     << "tensor<" << M << "x" << N << "xbf16>"
-     << ") -> tensor<" << M << "x" << N << "xbf16>, "
-     << "sym_name = \"llk_swiglu\"} ({\n"
-     << "  ^bb0(%arg0: tensor<" << M << "x" << K << "xbf16>, "
+     << "  func.func @llk_swiglu(%arg0: tensor<" << M << "x" << K << "xbf16>, "
      << "%arg1: tensor<" << K << "x" << N << "xbf16>, "
      << "%arg2: tensor<" << K << "x" << N << "xbf16>, "
-     << "%arg3: tensor<" << M << "x" << N << "xbf16>):\n"
+     << "%arg3: tensor<" << M << "x" << N << "xbf16>) -> tensor<" << M << "x"
+     << N << "xbf16> {\n"
      << "    %0 = llk.fused_swiglu ins(%arg0, %arg1, %arg2 : "
      << "tensor<" << M << "x" << K << "xbf16>, "
      << "tensor<" << K << "x" << N << "xbf16>, "
@@ -140,8 +144,8 @@ static std::string generateSwiGLUIR(int64_t M, int64_t N, int64_t K) {
      << "{accumulator_type = f32, activation = #llk.activation<silu>, "
      << "math_mode = #llk.math_mode<bounded_fast>} "
      << "-> tensor<" << M << "x" << N << "xbf16>\n"
-     << "    \"func.return\"(%0) : (tensor<" << M << "x" << N << "xbf16>) -> ()\n"
-     << "  }) : () -> ()\n"
+     << "    return %0 : tensor<" << M << "x" << N << "xbf16>\n"
+     << "  }\n"
      << "}\n";
   return ss.str();
 }
@@ -254,7 +258,7 @@ TEST(SwiGLUScalar, OneShotBufferize) {
   mlir::PassManager pm(&ctx);
   pm.addPass(mlir::llk::createLLKToLinalgPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  mlir::bufferization::OneShotBufferizationOptions bufOpts;
+  mlir::bufferization::OneShotBufferizePassOptions bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
   ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
@@ -280,7 +284,7 @@ TEST(SwiGLUScalar, JitCompilationSmoke) {
   mlir::PassManager pm(&ctx);
   pm.addPass(mlir::llk::createLLKToLinalgPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  mlir::bufferization::OneShotBufferizationOptions bufOpts;
+  mlir::bufferization::OneShotBufferizePassOptions bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
   ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
@@ -320,7 +324,7 @@ TEST(SwiGLUScalar, MultipleShapeConfigurations) {
     mlir::PassManager pm(&ctx);
     pm.addPass(mlir::llk::createLLKToLinalgPass());
     pm.addPass(mlir::createCanonicalizerPass());
-    mlir::bufferization::OneShotBufferizationOptions bufOpts;
+    mlir::bufferization::OneShotBufferizePassOptions bufOpts;
     bufOpts.bufferizeFunctionBoundaries = true;
     pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
 
@@ -354,7 +358,7 @@ TEST(SwiGLUScalar, E2EWithAbiWrapper) {
   mlir::PassManager pm(&ctx);
   pm.addPass(mlir::llk::createLLKToLinalgPass());
   pm.addPass(mlir::createCanonicalizerPass());
-  mlir::bufferization::OneShotBufferizationOptions bufOpts;
+  mlir::bufferization::OneShotBufferizePassOptions bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
   ASSERT_TRUE(mlir::succeeded(pm.run(*module)));
