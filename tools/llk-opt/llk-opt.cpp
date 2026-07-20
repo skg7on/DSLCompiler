@@ -12,8 +12,9 @@
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
 // Include the LLK dialect public header to register it.
-#include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Conversion/LLKToLinalg.h"
+#include "LLK/Dialect/LLKDialect.h"
+#include "LLK/Transforms/FuseDoubleContraction.h"
 #include "LLK/Transforms/TileAndVectorize.h"
 
 int main(int argc, char **argv) {
@@ -30,11 +31,15 @@ int main(int argc, char **argv) {
 
   // Register the LLK-to-Linalg lowering pass.
   mlir::PassPipelineRegistration<> llkToLinalgPipeline(
-      "llk-to-linalg-pipeline",
-      "Full LLK-to-Linalg lowering pipeline",
+      "llk-to-linalg-pipeline", "Full LLK-to-Linalg lowering pipeline",
       [](mlir::OpPassManager &pm) {
         pm.addPass(mlir::llk::createLLKToLinalgPass());
       });
+
+  // Register the FuseDoubleContraction pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createFuseDoubleContractionPass();
+  });
 
   // Register the TileAndVectorize pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {

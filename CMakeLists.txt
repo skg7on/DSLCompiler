@@ -112,6 +112,14 @@ add_mlir_library(LLKTransforms
                      MLIRFuncDialect MLIRTensorDialect MLIRArithDialect MLIRPass
 )
 
+# Library: FuseDoubleContraction
+add_mlir_library(LLKFuseDoubleContraction
+    lib/Transforms/FuseDoubleContraction.cpp
+    DEPENDS LLKDialect LLKToLinalg
+    LINK_LIBS PUBLIC LLKToLinalg MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
+                     MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
+)
+
 # Tool: llk-opt
 add_mlir_library(LLKPasses
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -155,7 +163,7 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -225,6 +233,18 @@ if(FILECHECK_BIN)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --tile-and-vectorize \
         ${CMAKE_SOURCE_DIR}/test/Transforms/mask_gen.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/mask_gen.mlir"
+  )
+  # FuseDoubleContraction test
+  add_test(NAME FuseDoubleContraction
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --fuse-double-contraction \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_double_contraction.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_double_contraction.mlir"
+  )
+  # FuseReject test: different X operands -> no fusion
+  add_test(NAME FuseReject
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --fuse-double-contraction \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_reject.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_reject.mlir"
   )
 endif()
 
