@@ -19,6 +19,6 @@ func.func @swiglu_vectorize(%x: tensor<64x128xbf16>, %wg: tensor<128x256xbf16>, 
 // CHECK-LABEL: func.func @swiglu_vectorize
 // CHECK: scf.forall
 // CHECK: scf.for
-// CHECK: vector.contract
+// CHECK: vector.multi_reduction
 // CHECK: vector.transfer_read
 // CHECK: vector.transfer_write

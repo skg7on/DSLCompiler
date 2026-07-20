@@ -150,6 +150,7 @@ set(LLK_MLIR_EXEC_LIBS
     MLIRTensorDialect
     MLIRTensorTransforms
     MLIRTransforms
+    MLIRVectorToLLVMPass
 )
 
 if(LLK_BUILD_TOOLS)
@@ -213,6 +214,12 @@ if(FILECHECK_BIN)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --tile-and-vectorize \
         ${CMAKE_SOURCE_DIR}/test/Transforms/tile_and_vectorize.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/tile_and_vectorize.mlir"
+  )
+  # MaskGen test: verify vector.create_mask and vector.mask for N=127 tail
+  add_test(NAME MaskGen
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --tile-and-vectorize \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/mask_gen.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/mask_gen.mlir"
   )
 endif()
 

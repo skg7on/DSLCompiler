@@ -125,17 +125,68 @@ struct TileAndVectorizePass
       auto tiledOp = cast<TilingInterface>(kTiled->tiledOps.front());
       auto mnTiled = scf::tileUsingSCF(rewriter, tiledOp, mnOpts);
       if (succeeded(mnTiled) && !mnTiled->tiledOps.empty()) {
-        // 3c. Vectorize the innermost matmul tile (auto-detect sizes).
-        auto vecResult = linalg::vectorize(rewriter,
-                                           mnTiled->tiledOps.front());
-        if (succeeded(vecResult)) {
-          rewriter.replaceOp(mnTiled->tiledOps.front(),
-                             vecResult->replacements);
+        // 3c. Vectorize the innermost matmul tile.
+        auto *tiledOp = mnTiled->tiledOps.front();
+        auto linalgOp = cast<linalg::LinalgOp>(tiledOp);
+
+        // Check if any operand has dynamic shapes (from affine.min tail).
+        bool hasDynamic = false;
+        for (auto operand : linalgOp->getOperands()) {
+          auto shapedTy = dyn_cast<ShapedType>(operand.getType());
+          if (shapedTy && !shapedTy.hasStaticShape()) {
+            hasDynamic = true;
+            break;
+          }
+        }
+
+        if (hasDynamic) {
+          // Dynamic shapes: inner-tile M and N to VM/VN first, then vectorize
+          // with explicit sizes so masking can be generated for the tail.
+          auto innerOp = cast<TilingInterface>(tiledOp);
+
+          // Inner M tile: scf.for step VM=4.
+          scf::SCFTilingOptions mInnerOpts;
+          mInnerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+          mInnerOpts.setTileSizes(
+              {rewriter.getI64IntegerAttr(kVM), rewriter.getI64IntegerAttr(0),
+               rewriter.getI64IntegerAttr(0)});
+          auto mInnerTiled = scf::tileUsingSCF(rewriter, innerOp, mInnerOpts);
+          if (failed(mInnerTiled) || mInnerTiled->tiledOps.empty())
+            continue;
+
+          // Inner N tile: scf.for step VN=8.
+          auto innerMOp =
+              cast<TilingInterface>(mInnerTiled->tiledOps.front());
+          scf::SCFTilingOptions nInnerOpts;
+          nInnerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+          nInnerOpts.setTileSizes(
+              {rewriter.getI64IntegerAttr(0), rewriter.getI64IntegerAttr(kVN),
+               rewriter.getI64IntegerAttr(0)});
+          auto nInnerTiled =
+              scf::tileUsingSCF(rewriter, innerMOp, nInnerOpts);
+          if (succeeded(nInnerTiled) && !nInnerTiled->tiledOps.empty()) {
+            SmallVector<bool> scalableDims(3, false);
+            auto vecResult = linalg::vectorize(rewriter,
+                                               nInnerTiled->tiledOps.front(),
+                                               {kVM, kVN, kBK},
+                                               scalableDims);
+            if (succeeded(vecResult)) {
+              rewriter.replaceOp(nInnerTiled->tiledOps.front(),
+                                 vecResult->replacements);
+            }
+          }
+        } else {
+          // Static shapes: vectorize directly (original code path).
+          auto vecResult = linalg::vectorize(rewriter, tiledOp);
+          if (succeeded(vecResult)) {
+            rewriter.replaceOp(tiledOp, vecResult->replacements);
+          }
         }
       }
     }
 
-    // Step 4: Tile generic M/N with scf.forall and vectorize.
+    // Step 4: Tile generic M/N with scf.forall, then inner-tile to VM/VN,
+    //         then vectorize.
     for (auto generic : generics) {
       scf::SCFTilingOptions opts;
       opts.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
@@ -145,11 +196,56 @@ struct TileAndVectorizePass
                                       cast<TilingInterface>(generic.getOperation()),
                                       opts);
       if (succeeded(tiled) && !tiled->tiledOps.empty()) {
-        auto vecResult = linalg::vectorize(rewriter,
-                                           tiled->tiledOps.front());
-        if (succeeded(vecResult)) {
-          rewriter.replaceOp(tiled->tiledOps.front(),
-                             vecResult->replacements);
+        auto *tiledOp = tiled->tiledOps.front();
+        auto linalgOp = cast<linalg::LinalgOp>(tiledOp);
+
+        // Check if any operand has dynamic shapes.
+        bool hasDynamic = false;
+        for (auto operand : linalgOp->getOperands()) {
+          auto shapedTy = dyn_cast<ShapedType>(operand.getType());
+          if (shapedTy && !shapedTy.hasStaticShape()) {
+            hasDynamic = true;
+            break;
+          }
+        }
+
+        if (hasDynamic) {
+          // Dynamic shapes: inner-tile M and N to VM/VN first.
+          auto innerOp = cast<TilingInterface>(tiledOp);
+
+          scf::SCFTilingOptions mInnerOpts;
+          mInnerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+          mInnerOpts.setTileSizes(
+              {rewriter.getI64IntegerAttr(kVM), rewriter.getI64IntegerAttr(0)});
+          auto mInnerTiled = scf::tileUsingSCF(rewriter, innerOp, mInnerOpts);
+          if (failed(mInnerTiled) || mInnerTiled->tiledOps.empty())
+            continue;
+
+          auto innerMOp =
+              cast<TilingInterface>(mInnerTiled->tiledOps.front());
+          scf::SCFTilingOptions nInnerOpts;
+          nInnerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
+          nInnerOpts.setTileSizes(
+              {rewriter.getI64IntegerAttr(0), rewriter.getI64IntegerAttr(kVN)});
+          auto nInnerTiled =
+              scf::tileUsingSCF(rewriter, innerMOp, nInnerOpts);
+          if (succeeded(nInnerTiled) && !nInnerTiled->tiledOps.empty()) {
+            SmallVector<bool> scalableDims(2, false);
+            auto vecResult = linalg::vectorize(rewriter,
+                                               nInnerTiled->tiledOps.front(),
+                                               {kVM, kVN},
+                                               scalableDims);
+            if (succeeded(vecResult)) {
+              rewriter.replaceOp(nInnerTiled->tiledOps.front(),
+                                 vecResult->replacements);
+            }
+          }
+        } else {
+          // Static shapes: vectorize directly (original code path).
+          auto vecResult = linalg::vectorize(rewriter, tiledOp);
+          if (succeeded(vecResult)) {
+            rewriter.replaceOp(tiledOp, vecResult->replacements);
+          }
         }
       }
     }

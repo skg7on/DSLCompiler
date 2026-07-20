@@ -10,6 +10,7 @@
 #include "LLK/Runtime/JitCache.h"
 
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
@@ -32,6 +33,9 @@ namespace llk {
 // Lowering pipeline: progressively lower MLIR dialects to LLVM dialect.
 // ---------------------------------------------------------------------------
 static void addLoweringPasses(mlir::PassManager &pm) {
+    // Lower vector dialect ops to LLVM dialect (must run before SCF→CF
+    // lowering because vector.mask may contain scf ops).
+    pm.addPass(mlir::createConvertVectorToLLVMPass());
     // Lower structured control flow (scf) to basic-block control flow (cf).
 #if LLVM_VERSION_MAJOR >= 21
     pm.addPass(mlir::createSCFToControlFlowPass());
