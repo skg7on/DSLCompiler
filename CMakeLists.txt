@@ -59,6 +59,11 @@ mlir_tablegen(include/LLK/Dialect/LLKOpsDialect.cpp.inc -gen-dialect-defs -diale
   EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect)
 add_public_tablegen_target(LLKOpsGen)
 
+# TableGen for LLK transform passes
+set(LLVM_TARGET_DEFINITIONS include/LLK/Transforms/Passes.td)
+mlir_tablegen(include/LLK/Transforms/Passes.h.inc -gen-pass-decls -name=LLK)
+add_public_tablegen_target(LLKTransformsGen)
+
 # Library: LLK dialect
 add_mlir_dialect_library(LLKDialect
     lib/Dialect/LLK/LLKDialect.cpp
@@ -72,7 +77,7 @@ add_mlir_dialect_library(LLKDialect
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
     DEPENDS LLKDialect
-    LINK_LIBS PUBLIC MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
+    LINK_LIBS PUBLIC LLKDialect MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
                      MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
@@ -86,6 +91,25 @@ target_include_directories(LLKRuntime PUBLIC
 )
 target_link_libraries(LLKRuntime PUBLIC
     LLVMOrcJIT MLIRExecutionEngine
+    LLVMAArch64CodeGen LLVMAArch64Info LLVMAArch64Desc
+    LLVMAArch64AsmParser LLVMAArch64Disassembler
+)
+
+# Library: X86 target feature detection
+add_library(LLKTargetX86 STATIC
+    lib/Target/X86/TargetAVX2.cpp
+)
+target_include_directories(LLKTargetX86 PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# Library: LLK Transforms (TileAndVectorize)
+add_mlir_library(LLKTransforms
+    lib/Transforms/TileAndVectorize.cpp
+    DEPENDS LLKDialect LLKToLinalg LLKTransformsGen
+    LINK_LIBS PUBLIC LLKToLinalg MLIRLinalgDialect MLIRLinalgTransforms
+                     MLIRVectorDialect MLIRSCFDialect MLIRSCFTransforms
+                     MLIRFuncDialect MLIRTensorDialect MLIRArithDialect MLIRPass
 )
 
 # Tool: llk-opt
@@ -101,26 +125,37 @@ add_mlir_library(LLKPasses
 # pre-built LLVM binary releases (which may have missing libs).
 set(LLK_MLIR_EXEC_LIBS
     MLIRArithDialect
+    MLIRArithToLLVM
     MLIRArithTransforms
     MLIRBufferizationDialect
     MLIRBufferizationTransforms
+    MLIRControlFlowToLLVM
     MLIRFuncDialect
+    MLIRFuncToLLVM
     MLIRFuncTransforms
     MLIRIR
     MLIRLinalgDialect
+    MLIRLinalgTransforms
     MLIRMathDialect
+    MLIRMathToLLVM
     MLIRMemRefDialect
+    MLIRMemRefToLLVM
     MLIRParser
     MLIRPass
+    MLIRReconcileUnrealizedCasts
     MLIRSCFDialect
+    MLIRSCFToControlFlow
+    MLIRSCFTransforms
     MLIRSupport
     MLIRTensorDialect
+    MLIRTensorTransforms
     MLIRTransforms
+    MLIRVectorToLLVMPass
 )
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -144,9 +179,16 @@ if(LLK_BUILD_E2E_TESTS)
 add_llvm_executable(SwigluScalar test/Execution/swiglu_scalar.cpp)
 target_link_libraries(SwigluScalar PRIVATE LLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwigluScalar COMMAND SwigluScalar)
+
+add_llvm_executable(SwiGLUVector test/Execution/swiglu_vector_avx2.cpp)
+target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
 endif()
 
+add_llk_test(VectorVsScalar test/Numerical/vector_vs_scalar.cpp)
 add_llk_test(EdgeCases test/Execution/edge_cases.cpp)
+add_llk_test(CpuFeaturesTest test/Execution/cpu_features_test.cpp)
+target_link_libraries(CpuFeaturesTest PRIVATE LLKTargetX86)
 
 # FileCheck tests
 find_program(FILECHECK_BIN FileCheck)
@@ -166,6 +208,23 @@ if(FILECHECK_BIN)
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
+  )
+  # Schedule parse test: verify the transform dialect schedule parses correctly
+  # and the named sequence round-trips through llk-opt.
+  add_test(NAME ScheduleBF16Check
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_bf16_check.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_bf16_check.mlir"
+  )
+  # TileAndVectorize test: run llk-opt with LLK-to-Linalg + TileAndVectorize, then FileCheck
+  add_test(NAME TileAndVectorize
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --tile-and-vectorize \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/tile_and_vectorize.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/tile_and_vectorize.mlir"
+  )
+  # MaskGen test: verify vector.create_mask and vector.mask for N=127 tail
+  add_test(NAME MaskGen
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --tile-and-vectorize \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/mask_gen.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/mask_gen.mlir"
   )
 endif()
 

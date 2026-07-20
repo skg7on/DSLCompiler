@@ -15,7 +15,7 @@ concurrency:
 jobs:
   analyze:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     permissions:
       security-events: write
@@ -84,7 +84,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLK_BUILD_TOOLS=OFF \
             -DLLK_BUILD_E2E_TESTS=OFF
-          ninja LLKDialect LLKToLinalg LLKRuntime SwigluReference EdgeCases
+          ninja LLKDialect LLKToLinalg LLKRuntime LLKTransforms LLKTargetX86 SwigluReference EdgeCases VectorVsScalar CpuFeaturesTest
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3
