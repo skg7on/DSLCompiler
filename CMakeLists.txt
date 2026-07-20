@@ -179,8 +179,13 @@ if(LLK_BUILD_E2E_TESTS)
 add_llvm_executable(SwigluScalar test/Execution/swiglu_scalar.cpp)
 target_link_libraries(SwigluScalar PRIVATE LLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwigluScalar COMMAND SwigluScalar)
+
+add_llvm_executable(SwiGLUVector test/Execution/swiglu_vector_avx2.cpp)
+target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
 endif()
 
+add_llk_test(VectorVsScalar test/Numerical/vector_vs_scalar.cpp)
 add_llk_test(EdgeCases test/Execution/edge_cases.cpp)
 add_llk_test(CpuFeaturesTest test/Execution/cpu_features_test.cpp)
 target_link_libraries(CpuFeaturesTest PRIVATE LLKTargetX86)

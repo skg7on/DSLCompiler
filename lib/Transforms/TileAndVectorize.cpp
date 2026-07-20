@@ -166,6 +166,7 @@ struct TileAndVectorizePass
               scf::tileUsingSCF(rewriter, innerMOp, nInnerOpts);
           if (succeeded(nInnerTiled) && !nInnerTiled->tiledOps.empty()) {
             SmallVector<bool> scalableDims(3, false);
+#if LLVM_VERSION_MAJOR >= 21
             auto vecResult = linalg::vectorize(rewriter,
                                                nInnerTiled->tiledOps.front(),
                                                {kVM, kVN, kBK},
@@ -174,13 +175,23 @@ struct TileAndVectorizePass
               rewriter.replaceOp(nInnerTiled->tiledOps.front(),
                                  vecResult->replacements);
             }
+#else
+            (void)linalg::vectorize(rewriter,
+                                    nInnerTiled->tiledOps.front(),
+                                    {kVM, kVN, kBK},
+                                    scalableDims);
+#endif
           }
         } else {
           // Static shapes: vectorize directly (original code path).
+#if LLVM_VERSION_MAJOR >= 21
           auto vecResult = linalg::vectorize(rewriter, tiledOp);
           if (succeeded(vecResult)) {
             rewriter.replaceOp(tiledOp, vecResult->replacements);
           }
+#else
+          (void)linalg::vectorize(rewriter, tiledOp);
+#endif
         }
       }
     }
@@ -231,6 +242,7 @@ struct TileAndVectorizePass
               scf::tileUsingSCF(rewriter, innerMOp, nInnerOpts);
           if (succeeded(nInnerTiled) && !nInnerTiled->tiledOps.empty()) {
             SmallVector<bool> scalableDims(2, false);
+#if LLVM_VERSION_MAJOR >= 21
             auto vecResult = linalg::vectorize(rewriter,
                                                nInnerTiled->tiledOps.front(),
                                                {kVM, kVN},
@@ -239,13 +251,23 @@ struct TileAndVectorizePass
               rewriter.replaceOp(nInnerTiled->tiledOps.front(),
                                  vecResult->replacements);
             }
+#else
+            (void)linalg::vectorize(rewriter,
+                                    nInnerTiled->tiledOps.front(),
+                                    {kVM, kVN},
+                                    scalableDims);
+#endif
           }
         } else {
           // Static shapes: vectorize directly (original code path).
+#if LLVM_VERSION_MAJOR >= 21
           auto vecResult = linalg::vectorize(rewriter, tiledOp);
           if (succeeded(vecResult)) {
             rewriter.replaceOp(tiledOp, vecResult->replacements);
           }
+#else
+          (void)linalg::vectorize(rewriter, tiledOp);
+#endif
         }
       }
     }
