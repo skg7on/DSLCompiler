@@ -24,12 +24,12 @@ LLVM target code              ←  ORC JIT → machine code
 
 ## Project Status
 
-**Phase:** Design & planning complete. Implementation starting.
+**Phase:** M1 (scalar pipeline) and M2 (AVX2 vector) in progress.
 
 | Milestone | Status |
 |-----------|--------|
-| M1: Scalar end-to-end pipeline | Design approved |
-| M2: Explicit vector path (AVX2) | Design approved |
+| M1: Scalar end-to-end pipeline | In progress |
+| M2: Explicit vector path (AVX2) | In progress |
 | M3: Fused memory lowering | Design approved |
 | M4: Parallel execution | Design approved |
 | M5: Specialization & tuning | Design approved |
@@ -83,7 +83,7 @@ Physical Memory  →  CF + Runtime  →  LLVM IR  →  ORC JIT
 - **FileCheck** for MLIR IR tests
 - **PyTorch** for numerical reference implementations (test dependency only)
 
-## Getting Started (Future)
+## Getting Started
 
 ```bash
 # Clone
@@ -92,14 +92,16 @@ cd DSLCompiler
 
 # Build (requires LLVM/MLIR built from source)
 mkdir build && cd build
-cmake .. -G Ninja \
-  -DMLIR_DIR=$HOME/llvm-project/build/lib/cmake/mlir \
-  -DLLVM_DIR=$HOME/llvm-project/build/lib/cmake/llvm
+cmake .. -G Ninja -DLLVM_PROJECT_BUILD_DIR=/path/to/llvm-project/build
 ninja
 
 # Run tests
 ninja check-llk
 ```
+
+When `LLVM_PROJECT_BUILD_DIR` is set, `MLIR_DIR` and `LLVM_DIR` are inferred and
+system-installed LLVM/MLIR are ignored. If omitted, `find_package` searches
+the standard CMake prefixes.
 
 ## Engineering Rules
 

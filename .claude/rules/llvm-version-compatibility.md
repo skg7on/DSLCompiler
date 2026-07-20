@@ -10,7 +10,7 @@ This project builds against two different LLVM/MLIR environments and MUST compil
 | Environment | LLVM Version | Source |
 |---|---|---|
 | Local development (macOS) | LLVM 24+ | `/Users/skg7on/Workspace/Projects/llvm-project/build` (built from `main`) |
-| CI (Ubuntu 24.04) | LLVM 20.1.8 | Pre-built release tarball from GitHub releases |
+| CI (Ubuntu 24.04) | LLVM 22.1.8 | Built from source (llvm-project release tarball) |
 
 ## Conditional Compilation
 

@@ -1,0 +1,32 @@
+#!/bin/bash
+# Pre-commit hook: run clang-format on staged C/C++ files
+
+set -e
+
+if ! command -v clang-format &>/dev/null; then
+  echo "WARNING: clang-format not found, skipping formatting check."
+  exit 0
+fi
+
+# Collect staged C/C++ files
+STAGED=$(git diff --cached --name-only --diff-filter=ACM -- '*.cpp' '*.h' '*.c' '*.hpp' '*.cc' '*.cxx' '*.hxx')
+
+if [ -z "$STAGED" ]; then
+  exit 0
+fi
+
+HAS_ERRORS=0
+
+for FILE in $STAGED; do
+  if ! clang-format --dry-run --Werror "$FILE" 2>/dev/null; then
+    echo "clang-format would reformat: $FILE"
+    HAS_ERRORS=1
+  fi
+done
+
+if [ $HAS_ERRORS -ne 0 ]; then
+  echo ""
+  echo "Rejected: clang-format reported style violations."
+  echo "Run 'clang-format -i' on the files above and stage the changes."
+  exit 1
+fi
