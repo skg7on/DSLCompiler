@@ -1,7 +1,8 @@
 //===- swiglu_vector_avx2.cpp - E2E vector-pipeline JIT tests -------------===//
 //
 // Tests the full M2 vector pipeline end-to-end:
-//   1. Build SwiGLU module programmatically (avoiding func.func text-parse issues)
+//   1. Build SwiGLU module programmatically (avoiding func.func text-parse
+//   issues)
 //   2. Lower: LLKToLinalg → TileAndVectorize → Canonicalize → OneShotBufferize
 //   3. JIT compile via JitCache
 //   4. Execute JIT-compiled kernel and validate against FP64 reference
@@ -33,15 +34,15 @@
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
-#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
@@ -90,8 +91,8 @@ static uint16_t f32_to_bf16(float f) {
 // Y = SiLU(X @ Wg^T) * (X @ Wu^T)
 // ---------------------------------------------------------------------------
 
-static void swiglu_fp64(const double* x, const double* wg, const double* wu,
-                        double* y, int64_t M, int64_t N, int64_t K) {
+static void swiglu_fp64(const double *x, const double *wg, const double *wu,
+                        double *y, int64_t M, int64_t N, int64_t K) {
   std::vector<double> gate(M * N, 0.0);
   std::vector<double> up(M * N, 0.0);
 
@@ -120,20 +121,17 @@ static void swiglu_fp64(const double* x, const double* wg, const double* wu,
 
 static mlir::DialectRegistry buildRegistry() {
   mlir::DialectRegistry registry;
-  registry.insert<mlir::llk::LLKDialect,
-                  mlir::func::FuncDialect,
-                  mlir::linalg::LinalgDialect,
-                  mlir::tensor::TensorDialect,
-                  mlir::scf::SCFDialect,
-                  mlir::arith::ArithDialect,
-                  mlir::math::MathDialect,
-                  mlir::memref::MemRefDialect>();
+  registry.insert<mlir::llk::LLKDialect, mlir::func::FuncDialect,
+                  mlir::linalg::LinalgDialect, mlir::tensor::TensorDialect,
+                  mlir::scf::SCFDialect, mlir::arith::ArithDialect,
+                  mlir::math::MathDialect, mlir::memref::MemRefDialect>();
   // Register bufferization interfaces required by One-Shot Bufferize.
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
-  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
+      registry);
   return registry;
 }
 
@@ -152,8 +150,8 @@ static void loadRequiredDialects(mlir::MLIRContext &ctx) {
 
 /// Build a SwiGLU module programmatically using OpBuilder.
 /// Avoids func.func custom assembly text-parsing issues.
-static mlir::OwningOpRef<mlir::ModuleOp> buildSwiGLUModule(
-    mlir::OpBuilder &builder, int64_t M, int64_t N, int64_t K) {
+static mlir::OwningOpRef<mlir::ModuleOp>
+buildSwiGLUModule(mlir::OpBuilder &builder, int64_t M, int64_t N, int64_t K) {
   auto loc = builder.getUnknownLoc();
   auto module = builder.create<mlir::ModuleOp>(loc);
   auto bf16Type = builder.getBF16Type();
@@ -161,23 +159,27 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildSwiGLUModule(
   auto wType = mlir::RankedTensorType::get({K, N}, bf16Type);
   auto outType = mlir::RankedTensorType::get({M, N}, bf16Type);
 
-  auto funcType = builder.getFunctionType({xType, wType, wType, outType}, {outType});
+  auto funcType =
+      builder.getFunctionType({xType, wType, wType, outType}, {outType});
   auto func = builder.create<mlir::func::FuncOp>(loc, "llk_swiglu", funcType);
   auto *entry = func.addEntryBlock();
   builder.setInsertionPointToStart(entry);
 
-  auto fusedOp = builder.create<mlir::llk::FusedSwiGLUOp>(loc, outType,
-      entry->getArgument(0), entry->getArgument(1), entry->getArgument(2),
-      entry->getArgument(3),
+  auto fusedOp = builder.create<mlir::llk::FusedSwiGLUOp>(
+      loc, outType, entry->getArgument(0), entry->getArgument(1),
+      entry->getArgument(2), entry->getArgument(3),
       mlir::TypeAttr::get(builder.getF32Type()),
-      mlir::llk::ActivationAttr::get(builder.getContext(), mlir::llk::Activation::silu),
-      mlir::llk::MathModeAttr::get(builder.getContext(), mlir::llk::MathMode::bounded_fast));
+      mlir::llk::ActivationAttr::get(builder.getContext(),
+                                     mlir::llk::Activation::silu),
+      mlir::llk::MathModeAttr::get(builder.getContext(),
+                                   mlir::llk::MathMode::bounded_fast));
 
-  mlir::func::ReturnOp::create(builder, loc, fusedOp.getResult());
+  builder.create<mlir::func::ReturnOp>(loc, fusedOp.getResult());
   return module;
 }
 
-/// Run the M2 vector pipeline: LLKToLinalg → TileAndVectorize → Canonicalize → Bufferize.
+/// Run the M2 vector pipeline: LLKToLinalg → TileAndVectorize → Canonicalize →
+/// Bufferize.
 static bool runVectorPipeline(mlir::ModuleOp module) {
   mlir::PassManager pm(module->getContext());
   pm.addPass(mlir::llk::createLLKToLinalgPass());
@@ -210,9 +212,9 @@ TEST(SwiGLUVectorAVX2, PipelineSmoke) {
 TEST(SwiGLUVectorAVX2, Correctness) {
   // End-to-end correctness: build, lower, JIT, execute, validate.
   std::vector<std::tuple<int64_t, int64_t, int64_t>> shapes = {
-      {32, 128, 256},  // typical LLM shapes
-      {16, 512, 512},  // large projections
-      {32, 256, 127},  // 127 tests N-tail (not multiple of VN=8)
+      {32, 128, 256}, // typical LLM shapes
+      {16, 512, 512}, // large projections
+      {32, 256, 127}, // 127 tests N-tail (not multiple of VN=8)
   };
 
   for (auto [M, N, K] : shapes) {
@@ -227,8 +229,8 @@ TEST(SwiGLUVectorAVX2, Correctness) {
 
     // Run the vector lowering pipeline.
     ASSERT_TRUE(runVectorPipeline(*module))
-        << "Vector pipeline should succeed for M=" << M
-        << " N=" << N << " K=" << K;
+        << "Vector pipeline should succeed for M=" << M << " N=" << N
+        << " K=" << K;
 
     // JIT compile.
     ::llk::JitCache cache;
@@ -284,8 +286,8 @@ TEST(SwiGLUVectorAVX2, Correctness) {
 
     // Compute FP64 reference.
     std::vector<double> y_ref(M * N);
-    swiglu_fp64(x_ref.data(), wg_ref.data(), wu_ref.data(), y_ref.data(),
-                M, N, K);
+    swiglu_fp64(x_ref.data(), wg_ref.data(), wu_ref.data(), y_ref.data(), M, N,
+                K);
 
     // Validate: BF16 tolerance is 1e-2.
     float max_err = 0.0f;
@@ -293,11 +295,12 @@ TEST(SwiGLUVectorAVX2, Correctness) {
       float result = bf16_to_f32(y_bf16[i]);
       float expected = static_cast<float>(y_ref[i]);
       float abs_err = std::abs(result - expected);
-      if (abs_err > max_err) max_err = abs_err;
+      if (abs_err > max_err)
+        max_err = abs_err;
     }
 
     EXPECT_LT(max_err, 1e-2f)
-        << "M=" << M << " N=" << N << " K=" << K
-        << ": max absolute error " << max_err << " exceeds 1e-2 tolerance";
+        << "M=" << M << " N=" << N << " K=" << K << ": max absolute error "
+        << max_err << " exceeds 1e-2 tolerance";
   }
 }
