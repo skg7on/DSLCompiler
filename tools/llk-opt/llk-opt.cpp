@@ -14,6 +14,7 @@
 // Include the LLK dialect public header to register it.
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Conversion/LLKToLinalg.h"
+#include "LLK/Transforms/TileAndVectorize.h"
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
@@ -34,6 +35,11 @@ int main(int argc, char **argv) {
       [](mlir::OpPassManager &pm) {
         pm.addPass(mlir::llk::createLLKToLinalgPass());
       });
+
+  // Register the TileAndVectorize pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createTileAndVectorizePass();
+  });
 
   return mlir::asMainReturnCode(
       mlir::MlirOptMain(argc, argv, "LLK optimizer driver\n", registry));

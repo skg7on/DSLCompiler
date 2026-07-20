@@ -103,6 +103,15 @@ target_include_directories(LLKTargetX86 PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# Library: LLK Transforms (TileAndVectorize)
+add_mlir_library(LLKTransforms
+    lib/Transforms/TileAndVectorize.cpp
+    DEPENDS LLKDialect LLKToLinalg LLKTransformsGen
+    LINK_LIBS PUBLIC LLKToLinalg MLIRLinalgDialect MLIRLinalgTransforms
+                     MLIRVectorDialect MLIRSCFDialect MLIRSCFTransforms
+                     MLIRFuncDialect MLIRTensorDialect MLIRArithDialect MLIRPass
+)
+
 # Tool: llk-opt
 add_mlir_library(LLKPasses
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -145,7 +154,7 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -198,6 +207,12 @@ if(FILECHECK_BIN)
   # and the named sequence round-trips through llk-opt.
   add_test(NAME ScheduleBF16Check
       COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_bf16_check.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_bf16_check.mlir"
+  )
+  # TileAndVectorize test: run llk-opt with LLK-to-Linalg + TileAndVectorize, then FileCheck
+  add_test(NAME TileAndVectorize
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --tile-and-vectorize \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/tile_and_vectorize.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/tile_and_vectorize.mlir"
   )
 endif()
 
