@@ -164,8 +164,14 @@ endif()
 
 # Tests
 include(CTest)
-find_package(GTest REQUIRED)
 enable_testing()
+
+# Build GoogleTest from vendored source (never the system package) to avoid
+# ABI incompatibilities with prebuilt system libgtest packages.
+# googletest's cxx_library() macro auto-creates the GTest::gtest_main ALIAS.
+set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/googletest)
 
 function(add_llk_test test_name test_file)
     add_llvm_executable(${test_name} ${test_file})
