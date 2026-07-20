@@ -240,9 +240,15 @@ if(FILECHECK_BIN)
         ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_double_contraction.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_double_contraction.mlir"
   )
-  # FuseReject test: different X operands -> no fusion
-  add_test(NAME FuseReject
+  # FuseIndependent test: independent swiglus with different X are each fused
+  add_test(NAME FuseIndependent
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --fuse-double-contraction \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_independent.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_independent.mlir"
+  )
+  # FuseReject test: two matmuls sharing X with non-SiLU consumer -> no fusion
+  add_test(NAME FuseReject
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --fuse-double-contraction \
         ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_reject.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_reject.mlir"
   )

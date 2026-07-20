@@ -68,6 +68,42 @@ struct FuseDoubleMatmulWithSiLU : public OpRewritePattern<linalg::GenericOp> {
     if (!gateVal.hasOneUse() || !upVal.hasOneUse())
       return failure();
 
+    //=== Verify consumer body is actually a SiLU pattern ===
+
+    // Check identity indexing maps (elementwise)
+    for (AffineMap map : consumer.getIndexingMapsArray()) {
+      if (!map.isIdentity())
+        return failure();
+    }
+
+    // Check output type is bf16 (SiLU epilogue truncates to bf16)
+    for (Value result : consumer.getResults()) {
+      auto resultTy = mlir::dyn_cast<RankedTensorType>(result.getType());
+      if (!resultTy || !resultTy.getElementType().isBF16())
+        return failure();
+    }
+
+    // Verify body contains SiLU operations
+    Block &body = consumer->getRegion(0).front();
+    bool hasNegf = false, hasExp = false, hasAddf = false;
+    bool hasDivf = false, hasMulf = false, hasTruncf = false;
+    for (Operation &op : body) {
+      if (isa<arith::NegFOp>(op))
+        hasNegf = true;
+      if (isa<math::ExpOp>(op))
+        hasExp = true;
+      if (isa<arith::AddFOp>(op))
+        hasAddf = true;
+      if (isa<arith::DivFOp>(op))
+        hasDivf = true;
+      if (isa<arith::MulFOp>(op))
+        hasMulf = true;
+      if (isa<arith::TruncFOp>(op))
+        hasTruncf = true;
+    }
+    if (!hasNegf || !hasExp || !hasAddf || !hasDivf || !hasMulf || !hasTruncf)
+      return failure();
+
     // Build fused operation
     Location loc = consumer.getLoc();
     Value x = xGate;
@@ -128,12 +164,11 @@ struct FuseDoubleMatmulWithSiLU : public OpRewritePattern<linalg::GenericOp> {
           Value xEl = b.create<arith::ExtFOp>(loc, f32Type, args[0]);
           Value wgEl = b.create<arith::ExtFOp>(loc, f32Type, args[1]);
           Value wuEl = b.create<arith::ExtFOp>(loc, f32Type, args[2]);
-          Value gAcc = b.create<arith::ExtFOp>(loc, f32Type, args[3]);
-          Value uAcc = b.create<arith::ExtFOp>(loc, f32Type, args[4]);
+          // args[3] and args[4] are already f32 (init tensors)
           Value gNew = b.create<arith::AddFOp>(
-              loc, gAcc, b.create<arith::MulFOp>(loc, xEl, wgEl));
+              loc, args[3], b.create<arith::MulFOp>(loc, xEl, wgEl));
           Value uNew = b.create<arith::AddFOp>(
-              loc, uAcc, b.create<arith::MulFOp>(loc, xEl, wuEl));
+              loc, args[4], b.create<arith::MulFOp>(loc, xEl, wuEl));
           b.create<linalg::YieldOp>(loc, ValueRange{gNew, uNew});
         });
 
