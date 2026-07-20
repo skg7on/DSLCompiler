@@ -73,7 +73,7 @@ jobs:
             -DLLK_BUILD_E2E_TESTS=OFF
 
       - name: Build
-        run: cd build && ninja SwigluReference EdgeCases
+        run: cd build && ninja SwigluReference EdgeCases VectorVsScalar CpuFeaturesTest
 
       - name: Run tests
         run: cd build && ctest --output-on-failure
