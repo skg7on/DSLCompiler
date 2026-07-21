@@ -81,7 +81,10 @@ static bool hasReductionDim(linalg::GenericOp genericOp, unsigned operandIdx) {
   AffineMap map = maps[operandIdx];
   auto iterators = genericOp.getIteratorTypesArray();
   for (unsigned d = 0; d < map.getNumResults(); ++d) {
-    unsigned dimPos = mlir::cast<AffineDimExpr>(map.getResult(d)).getPosition();
+    auto dimExpr = dyn_cast<AffineDimExpr>(map.getResult(d));
+    if (!dimExpr)
+      continue;
+    unsigned dimPos = dimExpr.getPosition();
     if (dimPos < iterators.size() &&
         iterators[dimPos] == utils::IteratorType::reduction) {
       return true;

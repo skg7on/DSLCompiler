@@ -39,7 +39,5 @@ PackedWeights packWeightMatrix(const Tensor2D &W, int64_t BK) {
 }
 
 void repack(PackedWeights &pw, const Tensor2D &W) {
-  PackedWeights packed = packWeightMatrix(W, pw.BK);
-  free(pw.data);
-  pw = std::move(packed);
+  pw = packWeightMatrix(W, pw.BK);
 }
