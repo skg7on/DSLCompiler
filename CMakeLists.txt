@@ -89,10 +89,14 @@ target_include_directories(LLKRuntime PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
 )
+# Resolve native target libraries dynamically for the build host.
+# Equivalent to: llvm-config --libs native
+# On x86_64 → LLVMX86{CodeGen,Info,Desc,AsmParser,AsmPrinter,Disassembler}
+# On AArch64 → LLVMAArch64{CodeGen,Info,Desc,AsmParser,AsmPrinter,Disassembler}
+llvm_map_components_to_libnames(LLVM_NATIVE_TARGET_LIBS native)
 target_link_libraries(LLKRuntime PUBLIC
     LLVMOrcJIT MLIRExecutionEngine
-    LLVMAArch64CodeGen LLVMAArch64Info LLVMAArch64Desc
-    LLVMAArch64AsmParser LLVMAArch64Disassembler
+    ${LLVM_NATIVE_TARGET_LIBS}
 )
 
 # Library: X86 target feature detection
