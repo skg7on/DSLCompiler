@@ -5,6 +5,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllPasses.h"
 #include "mlir/Pass/PassManager.h"
@@ -12,8 +13,8 @@
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 
 // Include the LLK dialect public header to register it.
-#include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Conversion/LLKToLinalg.h"
+#include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Transforms/TileAndVectorize.h"
 
 int main(int argc, char **argv) {
@@ -25,13 +26,16 @@ int main(int argc, char **argv) {
   // Register the LLK dialect.
   registry.insert<mlir::llk::LLKDialect>();
 
+  // Register Linalg transform dialect extensions (e.g.
+  // transform.structured.match).
+  mlir::linalg::registerTransformDialectExtension(registry);
+
   // Register all built-in MLIR passes.
   mlir::registerAllPasses();
 
   // Register the LLK-to-Linalg lowering pass.
   mlir::PassPipelineRegistration<> llkToLinalgPipeline(
-      "llk-to-linalg-pipeline",
-      "Full LLK-to-Linalg lowering pipeline",
+      "llk-to-linalg-pipeline", "Full LLK-to-Linalg lowering pipeline",
       [](mlir::OpPassManager &pm) {
         pm.addPass(mlir::llk::createLLKToLinalgPass());
       });
