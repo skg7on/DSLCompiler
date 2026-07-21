@@ -81,9 +81,10 @@ add_mlir_library(LLKToLinalg
                      MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
-# Library: JIT cache runtime
+# Library: JIT cache runtime + weight packing
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
+    runtime/PackedWeights.cpp
 )
 target_include_directories(LLKRuntime PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -114,6 +115,27 @@ add_mlir_library(LLKTransforms
     LINK_LIBS PUBLIC LLKToLinalg MLIRLinalgDialect MLIRLinalgTransforms
                      MLIRVectorDialect MLIRSCFDialect MLIRSCFTransforms
                      MLIRFuncDialect MLIRTensorDialect MLIRArithDialect MLIRPass
+)
+
+# Library: FuseDoubleContraction
+add_mlir_library(LLKFuseDoubleContraction
+    lib/Transforms/FuseDoubleContraction.cpp
+    DEPENDS LLKDialect LLKToLinalg
+    LINK_LIBS PUBLIC LLKToLinalg MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
+                     MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
+)
+
+# Library: PackWeights weight annotation pass
+add_mlir_library(LLKPackWeights
+    lib/Transforms/PackWeights.cpp
+    DEPENDS LLKDialect
+    LINK_LIBS PUBLIC MLIRLinalgDialect MLIRFuncDialect MLIRTensorDialect MLIRPass
+)
+
+# Library: ScratchAnalysis memory auditing pass
+add_mlir_library(LLKScratchAnalysis
+    lib/Transforms/ScratchAnalysis.cpp
+    LINK_LIBS PUBLIC MLIRMemRefDialect MLIRFuncDialect MLIRPass
 )
 
 # Tool: llk-opt
@@ -160,7 +182,7 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -194,6 +216,10 @@ add_test(NAME SwigluScalar COMMAND SwigluScalar)
 add_llvm_executable(SwiGLUVector test/Execution/swiglu_vector_avx2.cpp)
 target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
+
+add_llvm_executable(SwiGLUFusedMemory test/Execution/swiglu_fused_memory.cpp)
+target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME SwiGLUFusedMemory COMMAND SwiGLUFusedMemory)
 endif()
 
 add_llk_test(VectorVsScalar test/Numerical/vector_vs_scalar.cpp)
@@ -238,6 +264,30 @@ if(FILECHECK_BIN)
         ${CMAKE_SOURCE_DIR}/test/Transforms/mask_gen.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/mask_gen.mlir"
   )
+  # FuseDoubleContraction test
+  add_test(NAME FuseDoubleContraction
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --fuse-double-contraction \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_double_contraction.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_double_contraction.mlir"
+  )
+  # FuseIndependent test: independent swiglus with different X are each fused
+  add_test(NAME FuseIndependent
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --fuse-double-contraction \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_independent.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_independent.mlir"
+  )
+  # FuseReject test: two matmuls sharing X with non-SiLU consumer -> no fusion
+  add_test(NAME FuseReject
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --fuse-double-contraction \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_reject.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_reject.mlir"
+  )
+  # PackWeights test: annotate weight operands with packed_layout attribute
+  add_test(NAME PackWeights
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --pack-weights \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/pack_weights.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/pack_weights.mlir"
+  )
 endif()
 
 # Test for ops_invalid.mlir: runs llk-opt with --verify-diagnostics.
@@ -246,5 +296,10 @@ if(LLK_BUILD_TOOLS)
 add_test(NAME DialectOpsInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
             ${CMAKE_SOURCE_DIR}/test/Dialect/ops_invalid.mlir
+)
+# ScratchAnalysis test: verify-diagnostics validates expected-warning comments
+add_test(NAME ScratchAnalysis
+    COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --scratch-analysis --split-input-file
+            ${CMAKE_SOURCE_DIR}/test/Transforms/scratch_analysis.mlir
 )
 endif()
