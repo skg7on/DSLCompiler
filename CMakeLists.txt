@@ -81,9 +81,10 @@ add_mlir_library(LLKToLinalg
                      MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
-# Library: JIT cache runtime
+# Library: JIT cache runtime + weight packing
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
+    runtime/PackedWeights.cpp
 )
 target_include_directories(LLKRuntime PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -118,6 +119,13 @@ add_mlir_library(LLKFuseDoubleContraction
     DEPENDS LLKDialect LLKToLinalg
     LINK_LIBS PUBLIC LLKToLinalg MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
                      MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
+)
+
+# Library: PackWeights weight annotation pass
+add_mlir_library(LLKPackWeights
+    lib/Transforms/PackWeights.cpp
+    DEPENDS LLKDialect
+    LINK_LIBS PUBLIC MLIRLinalgDialect MLIRFuncDialect MLIRTensorDialect MLIRPass
 )
 
 # Tool: llk-opt
@@ -163,7 +171,7 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)

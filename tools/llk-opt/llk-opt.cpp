@@ -15,6 +15,7 @@
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Transforms/FuseDoubleContraction.h"
+#include "LLK/Transforms/PackWeights.h"
 #include "LLK/Transforms/TileAndVectorize.h"
 
 int main(int argc, char **argv) {
@@ -44,6 +45,11 @@ int main(int argc, char **argv) {
   // Register the TileAndVectorize pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createTileAndVectorizePass();
+  });
+
+  // Register the PackWeights pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createPackWeightsPass();
   });
 
   return mlir::asMainReturnCode(
