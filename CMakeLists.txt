@@ -90,10 +90,14 @@ target_include_directories(LLKRuntime PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
 )
+# Resolve native target libraries dynamically for the build host.
+# Equivalent to: llvm-config --libs native
+# On x86_64 → LLVMX86{CodeGen,Info,Desc,AsmParser,AsmPrinter,Disassembler}
+# On AArch64 → LLVMAArch64{CodeGen,Info,Desc,AsmParser,AsmPrinter,Disassembler}
+llvm_map_components_to_libnames(LLVM_NATIVE_TARGET_LIBS native)
 target_link_libraries(LLKRuntime PUBLIC
     LLVMOrcJIT MLIRExecutionEngine
-    LLVMAArch64CodeGen LLVMAArch64Info LLVMAArch64Desc
-    LLVMAArch64AsmParser LLVMAArch64Disassembler
+    ${LLVM_NATIVE_TARGET_LIBS}
 )
 
 # Library: X86 target feature detection
@@ -165,6 +169,7 @@ set(LLK_MLIR_EXEC_LIBS
     MLIRParser
     MLIRPass
     MLIRReconcileUnrealizedCasts
+    MLIRRegisterAllPasses
     MLIRSCFDialect
     MLIRSCFToControlFlow
     MLIRSCFTransforms
@@ -186,8 +191,14 @@ endif()
 
 # Tests
 include(CTest)
-find_package(GTest REQUIRED)
 enable_testing()
+
+# Build GoogleTest from vendored source (never the system package) to avoid
+# ABI incompatibilities with prebuilt system libgtest packages.
+# googletest's cxx_library() macro auto-creates the GTest::gtest_main ALIAS.
+set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/googletest)
 
 function(add_llk_test test_name test_file)
     add_llvm_executable(${test_name} ${test_file})
@@ -221,11 +232,12 @@ find_program(FILECHECK_BIN FileCheck)
 # llk-opt is built as part of this project; referenced at test time via $<TARGET_FILE>
 
 function(add_llk_filecheck_test test_name input_file)
+    # Use sh -c to properly handle input redirection (CMake's add_test
+    # COMMAND mode does not support < redirection natively).
+    # Execute the RUN line: llk-opt %s | llk-opt | FileCheck %s
+    # This round-trips the IR through llk-opt twice to verify parse+print stability.
     add_test(NAME ${test_name}
-        COMMAND ${FILECHECK_BIN} ${input_file} < ${input_file}
-    )
-    set_tests_properties(${test_name} PROPERTIES
-        ENVIRONMENT "LLK_OPT=$<TARGET_FILE:llk-opt>"
+        COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
     )
 endfunction()
 

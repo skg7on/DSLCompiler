@@ -5,6 +5,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllPasses.h"
 #include "mlir/Pass/PassManager.h"
@@ -27,6 +28,10 @@ int main(int argc, char **argv) {
 
   // Register the LLK dialect.
   registry.insert<mlir::llk::LLKDialect>();
+
+  // Register Linalg transform dialect extensions (e.g.
+  // transform.structured.match).
+  mlir::linalg::registerTransformDialectExtension(registry);
 
   // Register all built-in MLIR passes.
   mlir::registerAllPasses();
