@@ -143,6 +143,7 @@ set(LLK_MLIR_EXEC_LIBS
     MLIRParser
     MLIRPass
     MLIRReconcileUnrealizedCasts
+    MLIRRegisterAllPasses
     MLIRSCFDialect
     MLIRSCFToControlFlow
     MLIRSCFTransforms
@@ -201,11 +202,12 @@ find_program(FILECHECK_BIN FileCheck)
 # llk-opt is built as part of this project; referenced at test time via $<TARGET_FILE>
 
 function(add_llk_filecheck_test test_name input_file)
+    # Use sh -c to properly handle input redirection (CMake's add_test
+    # COMMAND mode does not support < redirection natively).
+    # Execute the RUN line: llk-opt %s | llk-opt | FileCheck %s
+    # This round-trips the IR through llk-opt twice to verify parse+print stability.
     add_test(NAME ${test_name}
-        COMMAND ${FILECHECK_BIN} ${input_file} < ${input_file}
-    )
-    set_tests_properties(${test_name} PROPERTIES
-        ENVIRONMENT "LLK_OPT=$<TARGET_FILE:llk-opt>"
+        COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
     )
 endfunction()
 
