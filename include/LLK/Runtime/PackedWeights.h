@@ -1,14 +1,14 @@
 #ifndef LLK_RUNTIME_PACKEDWEIGHTS_H
 #define LLK_RUNTIME_PACKEDWEIGHTS_H
 
+#include "LLK/Runtime/JitCache.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
 enum class DType : uint8_t { BF16 = 0, FP16 = 1, FP32 = 2 };
-
-struct Tensor2D; // forward decl
 
 struct PackedWeights {
   void *data = nullptr;

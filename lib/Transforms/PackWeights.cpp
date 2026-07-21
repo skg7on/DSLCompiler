@@ -28,7 +28,6 @@
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Value.h"
-#include "llvm/Config/llvm-config.h"
 
 /// Declare isa/cast/dyn_cast for AffineExpr.
 using namespace mlir;

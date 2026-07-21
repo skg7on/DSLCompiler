@@ -207,7 +207,7 @@ target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GT
 add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
 
 add_llvm_executable(SwiGLUFusedMemory test/Execution/swiglu_fused_memory.cpp)
-target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwiGLUFusedMemory COMMAND SwiGLUFusedMemory)
 endif()
 
@@ -269,6 +269,12 @@ if(FILECHECK_BIN)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --fuse-double-contraction \
         ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_reject.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/fuse_reject.mlir"
+  )
+  # PackWeights test: annotate weight operands with packed_layout attribute
+  add_test(NAME PackWeights
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --pack-weights \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/pack_weights.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/pack_weights.mlir"
   )
 endif()
 

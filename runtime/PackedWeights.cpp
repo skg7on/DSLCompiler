@@ -2,12 +2,6 @@
 
 #include <algorithm>
 
-struct Tensor2D {
-  void *data;
-  int64_t dim0, dim1;
-  int64_t stride0, stride1;
-};
-
 PackedWeights packWeightMatrix(const Tensor2D &W, int64_t BK) {
   PackedWeights pw;
   pw.N = W.dim1;

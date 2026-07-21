@@ -229,7 +229,7 @@ struct FuseDoubleContractionPass
     RewritePatternSet patterns(&getContext());
     patterns.add<FuseDoubleMatmulWithSiLU>(&getContext());
     if (failed(
-#if LLVM_VERSION_MAJOR >= 24
+#if LLVM_VERSION_MAJOR >= 21
             applyPatternsGreedily(getOperation(), std::move(patterns))
 #else
             applyPatternsAndFoldGreedily(getOperation(), std::move(patterns))
