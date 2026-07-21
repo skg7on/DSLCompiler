@@ -128,6 +128,12 @@ add_mlir_library(LLKPackWeights
     LINK_LIBS PUBLIC MLIRLinalgDialect MLIRFuncDialect MLIRTensorDialect MLIRPass
 )
 
+# Library: ScratchAnalysis memory auditing pass
+add_mlir_library(LLKScratchAnalysis
+    lib/Transforms/ScratchAnalysis.cpp
+    LINK_LIBS PUBLIC MLIRMemRefDialect MLIRFuncDialect MLIRPass
+)
+
 # Tool: llk-opt
 add_mlir_library(LLKPasses
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -171,7 +177,7 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -268,5 +274,10 @@ if(LLK_BUILD_TOOLS)
 add_test(NAME DialectOpsInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
             ${CMAKE_SOURCE_DIR}/test/Dialect/ops_invalid.mlir
+)
+# ScratchAnalysis test: verify-diagnostics validates expected-warning comments
+add_test(NAME ScratchAnalysis
+    COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --scratch-analysis --split-input-file
+            ${CMAKE_SOURCE_DIR}/test/Transforms/scratch_analysis.mlir
 )
 endif()
