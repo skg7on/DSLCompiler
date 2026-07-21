@@ -205,6 +205,10 @@ add_test(NAME SwigluScalar COMMAND SwigluScalar)
 add_llvm_executable(SwiGLUVector test/Execution/swiglu_vector_avx2.cpp)
 target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
+
+add_llvm_executable(SwiGLUFusedMemory test/Execution/swiglu_fused_memory.cpp)
+target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME SwiGLUFusedMemory COMMAND SwiGLUFusedMemory)
 endif()
 
 add_llk_test(VectorVsScalar test/Numerical/vector_vs_scalar.cpp)
