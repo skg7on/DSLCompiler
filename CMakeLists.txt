@@ -259,6 +259,10 @@ add_llvm_executable(SwiGLUSmallShape test/Execution/swiglu_small_shape.cpp)
 target_link_libraries(SwiGLUSmallShape PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME SwiGLUSmallShape COMMAND SwiGLUSmallShape)
 
+add_llvm_executable(JitCacheHit test/Execution/jit_cache_hit.cpp)
+target_link_libraries(JitCacheHit PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME JitCacheHit COMMAND JitCacheHit)
+
 # FileCheck tests
 find_program(FILECHECK_BIN FileCheck)
 # llk-opt is built as part of this project; referenced at test time via $<TARGET_FILE>
