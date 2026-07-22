@@ -19,8 +19,10 @@
 #include "LLK/Transforms/FuseDoubleContraction.h"
 #include "LLK/Transforms/LinearizeForall.h"
 #include "LLK/Transforms/PackWeights.h"
+#include "LLK/Transforms/ScheduleSelection.h"
 #include "LLK/Transforms/ScratchAnalysis.h"
 #include "LLK/Transforms/SerialParallelDispatch.h"
+#include "LLK/Transforms/ShapeSpecialization.h"
 #include "LLK/Transforms/TileAndVectorize.h"
 
 int main(int argc, char **argv) {
@@ -74,6 +76,16 @@ int main(int argc, char **argv) {
   // Register the ForallToLLRT pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createForallToLLRTPass();
+  });
+
+  // Register the ShapeSpecialization pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createShapeSpecializationPass();
+  });
+
+  // Register the ScheduleSelection pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createScheduleSelectionPass();
   });
 
   // Register the ScratchAnalysis pass.
