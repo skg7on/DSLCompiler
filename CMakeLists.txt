@@ -251,6 +251,14 @@ add_llvm_executable(ThreadPoolStress test/Execution/thread_pool_stress.cpp)
 target_link_libraries(ThreadPoolStress PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME ThreadPoolStress COMMAND ThreadPoolStress)
 
+add_llvm_executable(SwiGLUParallelScaling test/Execution/swiglu_parallel_scaling.cpp)
+target_link_libraries(SwiGLUParallelScaling PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME SwiGLUParallelScaling COMMAND SwiGLUParallelScaling)
+
+add_llvm_executable(SwiGLUSmallShape test/Execution/swiglu_small_shape.cpp)
+target_link_libraries(SwiGLUSmallShape PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME SwiGLUSmallShape COMMAND SwiGLUSmallShape)
+
 # FileCheck tests
 find_program(FILECHECK_BIN FileCheck)
 # llk-opt is built as part of this project; referenced at test time via $<TARGET_FILE>
