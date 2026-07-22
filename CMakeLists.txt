@@ -221,6 +221,14 @@ target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContr
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
 target_link_libraries(llk-compile PRIVATE LLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+
+# Tool: llk-bench (benchmarking harness)
+add_llvm_executable(llk-bench tools/llk-bench/llk-bench.cpp)
+target_link_libraries(llk-bench PRIVATE LLKRuntime)
+
+# Tool: llk-tune (autotuning grid search)
+add_llvm_executable(llk-tune tools/llk-tune/llk-tune.cpp)
+target_link_libraries(llk-tune PRIVATE LLKRuntime)
 endif()
 
 # Tests
