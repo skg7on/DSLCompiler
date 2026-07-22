@@ -22,12 +22,17 @@ All worktree branches MUST follow the pattern `category/short-description` using
 - `refactor` — code restructuring without functional change
 - `exp` — experiments, spikes, prototypes
 
-**Examples:**
+**Good Examples:**
 - `feat/llk-dialect-verifier`
 - `docs/architecture-overview`
 - `fix/scratch-analysis-false-positive`
 - `refactor/extract-shared-tiling-utils`
 - `exp/amx-tile-config-benchmark`
+
+**Bad Examples (DO NOT use):**
+- `worktree-feat+m1-scalar-pipeline` — ❌ `worktree-` prefix and `+` separator. Use `feat/m1-scalar-pipeline`
+- `worktree-fix+cmake-native-target-libs` — ❌ same pattern. Use `fix/cmake-native-target-libs`
+- `worktree-docs+m4-parallel-design` — ❌ same pattern. Use `docs/m4-parallel-design`
 
 ## Lifecycle
 
