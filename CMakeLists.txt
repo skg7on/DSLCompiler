@@ -85,6 +85,7 @@ add_mlir_library(LLKToLinalg
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
     runtime/PackedWeights.cpp
+    runtime/ThreadPool.cpp
 )
 target_include_directories(LLKRuntime PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -138,6 +139,25 @@ add_mlir_library(LLKScratchAnalysis
     LINK_LIBS PUBLIC MLIRMemRefDialect MLIRFuncDialect MLIRPass
 )
 
+# Library: LinearizeForall pass
+add_mlir_library(LLKLinearizeForall
+    lib/Transforms/LinearizeForall.cpp
+    DEPENDS LLKDialect
+    LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRTensorDialect MLIRPass
+)
+
+# Library: SerialParallelDispatch pass
+add_mlir_library(LLKSerialParallelDispatch
+    lib/Transforms/SerialParallelDispatch.cpp
+    LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRPass
+)
+
+# Library: ForallToLLRT pass
+add_mlir_library(LLKForallToLLRT
+    lib/Transforms/ForallToLLRT.cpp
+    LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRPass
+)
+
 # Tool: llk-opt
 add_mlir_library(LLKPasses
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -182,7 +202,7 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -226,6 +246,18 @@ add_llk_test(VectorVsScalar test/Numerical/vector_vs_scalar.cpp)
 add_llk_test(EdgeCases test/Execution/edge_cases.cpp)
 add_llk_test(CpuFeaturesTest test/Execution/cpu_features_test.cpp)
 target_link_libraries(CpuFeaturesTest PRIVATE LLKTargetX86)
+
+add_llvm_executable(ThreadPoolStress test/Execution/thread_pool_stress.cpp)
+target_link_libraries(ThreadPoolStress PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME ThreadPoolStress COMMAND ThreadPoolStress)
+
+add_llvm_executable(SwiGLUParallelScaling test/Execution/swiglu_parallel_scaling.cpp)
+target_link_libraries(SwiGLUParallelScaling PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME SwiGLUParallelScaling COMMAND SwiGLUParallelScaling)
+
+add_llvm_executable(SwiGLUSmallShape test/Execution/swiglu_small_shape.cpp)
+target_link_libraries(SwiGLUSmallShape PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME SwiGLUSmallShape COMMAND SwiGLUSmallShape)
 
 # FileCheck tests
 find_program(FILECHECK_BIN FileCheck)
@@ -287,6 +319,24 @@ if(FILECHECK_BIN)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --pack-weights \
         ${CMAKE_SOURCE_DIR}/test/Transforms/pack_weights.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/pack_weights.mlir"
+  )
+  # LinearizeForall test: multi-D scf.forall → 1D
+  add_test(NAME LinearizeForall
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --linearize-forall \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/linearize_forall.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/linearize_forall.mlir"
+  )
+  # SerialParallelDispatch test: threshold-based serial/parallel
+  add_test(NAME SerialDispatch
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --serial-parallel-dispatch \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/serial_dispatch.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/serial_dispatch.mlir"
+  )
+  # ForallToLLRT test: scf.forall → runtime call with worker outline
+  add_test(NAME ForallToLLRT
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --forall-to-llrt \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_llrt.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_llrt.mlir"
   )
 endif()
 

@@ -15,9 +15,12 @@
 // Include the LLK dialect public header to register it.
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"
+#include "LLK/Transforms/ForallToLLRT.h"
 #include "LLK/Transforms/FuseDoubleContraction.h"
+#include "LLK/Transforms/LinearizeForall.h"
 #include "LLK/Transforms/PackWeights.h"
 #include "LLK/Transforms/ScratchAnalysis.h"
+#include "LLK/Transforms/SerialParallelDispatch.h"
 #include "LLK/Transforms/TileAndVectorize.h"
 
 int main(int argc, char **argv) {
@@ -56,6 +59,21 @@ int main(int argc, char **argv) {
   // Register the PackWeights pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createPackWeightsPass();
+  });
+
+  // Register the LinearizeForall pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createLinearizeForallPass();
+  });
+
+  // Register the SerialParallelDispatch pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createSerialParallelDispatchPass();
+  });
+
+  // Register the ForallToLLRT pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createForallToLLRTPass();
   });
 
   // Register the ScratchAnalysis pass.
