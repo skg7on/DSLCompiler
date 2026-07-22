@@ -19,6 +19,7 @@
 #include "LLK/Transforms/LinearizeForall.h"
 #include "LLK/Transforms/PackWeights.h"
 #include "LLK/Transforms/ScratchAnalysis.h"
+#include "LLK/Transforms/SerialParallelDispatch.h"
 #include "LLK/Transforms/TileAndVectorize.h"
 
 int main(int argc, char **argv) {
@@ -62,6 +63,11 @@ int main(int argc, char **argv) {
   // Register the LinearizeForall pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createLinearizeForallPass();
+  });
+
+  // Register the SerialParallelDispatch pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createSerialParallelDispatchPass();
   });
 
   // Register the ScratchAnalysis pass.
