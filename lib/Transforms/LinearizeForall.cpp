@@ -9,6 +9,7 @@
 #include "LLK/Transforms/LinearizeForall.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
@@ -49,26 +50,30 @@ private:
     SmallVector<OpFoldResult> ub = forall.getMixedUpperBound();
     int64_t numDims = forall.getRank();
 
+    // This pass requires static upper bounds. The tiling pipeline always
+    // produces constant tile counts, so dynamic bounds indicate a pipeline
+    // ordering issue.
+    for (int64_t i = 0; i < numDims; i++) {
+      assert(ub[i].is<Attribute>() &&
+             isa<IntegerAttr>(ub[i].get<Attribute>()) &&
+             "linearize-forall requires static upper bounds; "
+             "run after tiling with constant tile sizes");
+    }
+
     // Compute total_tiles = product of all upper bounds
-    Value totalTiles = getValueOrCreateConstantIndex(builder, loc, ub[0]);
+    // NOTE: Overflow possible for extreme tile counts (e.g., >2^31 each).
+    // In practice tile sizes are small (e.g., BM=32, BN=64) so this is safe.
+    Value totalTiles = getValueOrCreateConstantIndexOp(builder, loc, ub[0]);
     for (int64_t i = 1; i < numDims; i++) {
-      Value ubVal = getValueOrCreateConstantIndex(builder, loc, ub[i]);
+      Value ubVal = getValueOrCreateConstantIndexOp(builder, loc, ub[i]);
       totalTiles = builder.create<arith::MulIOp>(loc, totalTiles, ubVal);
     }
 
-    // Compute strides for each dimension (product of extents of dims to the
-    // right)
+    // Compute strides: stride[i] = product of ub[j] for j > i
     SmallVector<int64_t> strides(numDims, 1);
     for (int64_t i = numDims - 2; i >= 0; i--) {
-      OpFoldResult nextUb = ub[i + 1];
-      if (nextUb.is<Attribute>()) {
-        auto intAttr = dyn_cast<IntegerAttr>(nextUb.get<Attribute>());
-        if (intAttr) {
-          strides[i] = strides[i + 1] * intAttr.getInt();
-          continue;
-        }
-      }
-      strides[i] = -1;
+      auto intAttr = cast<IntegerAttr>(ub[i + 1].get<Attribute>());
+      strides[i] = strides[i + 1] * intAttr.getInt();
     }
 
     // Create 1D forall using builder
@@ -85,21 +90,17 @@ private:
     Block *oldBody = forall.getBody();
     IRMapping mapper;
 
-    Value remaining = tid;
     for (int64_t i = 0; i < numDims; i++) {
       Value iv;
-      Value dimSize = getValueOrCreateConstantIndex(builder, loc, ub[i]);
+      Value dimSize = getValueOrCreateConstantIndexOp(builder, loc, ub[i]);
 
       if (i == numDims - 1) {
-        iv = builder.create<arith::RemSIOp>(loc, remaining, dimSize);
-      } else if (strides[i] > 1) {
+        iv = builder.create<arith::RemSIOp>(loc, tid, dimSize);
+      } else {
         Value strideVal =
             builder.create<arith::ConstantIndexOp>(loc, strides[i]);
-        Value divided =
-            builder.create<arith::DivSIOp>(loc, remaining, strideVal);
+        Value divided = builder.create<arith::DivSIOp>(loc, tid, strideVal);
         iv = builder.create<arith::RemSIOp>(loc, divided, dimSize);
-      } else {
-        iv = builder.create<arith::RemSIOp>(loc, remaining, dimSize);
       }
       mapper.map(oldBody->getArgument(i), iv);
     }
@@ -122,14 +123,6 @@ private:
     }
 
     forall.erase();
-  }
-
-  Value getValueOrCreateConstantIndex(OpBuilder &builder, Location loc,
-                                      OpFoldResult ofr) {
-    if (ofr.is<Value>())
-      return ofr.get<Value>();
-    int64_t constVal = cast<IntegerAttr>(ofr.get<Attribute>()).getInt();
-    return builder.create<arith::ConstantIndexOp>(loc, constVal);
   }
 };
 

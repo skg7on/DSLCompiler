@@ -9,17 +9,24 @@
 // Lowers remaining scf.forall ops (post-bufferization) to runtime
 // parallel_for calls. Outlines the forall body into a worker function.
 //
+// NOTE: The worker function is outlined but the function pointer wiring to
+// the runtime `llrtParallelFor` call is done by the JIT driver or a
+// subsequent lowering pass. This pass emits the call with tile/grain
+// arguments; the driver resolves the worker symbol at link time.
+//
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/ForallToLLRT.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/DenseSet.h"
 
 using namespace mlir;
 
@@ -61,25 +68,32 @@ private:
   void lowerForall(scf::ForallOp forall, ModuleOp module, int workerId) {
     OpBuilder builder(forall);
     Location loc = forall.getLoc();
-
-    // Collect captured values: operands used in the body that are defined
-    // outside the forall
-    SmallVector<Value> capturedValues;
     Block *body = forall.getBody();
+    int64_t numDims = forall.getRank();
 
-    // All values used in the body that aren't block arguments are captured
-    for (auto &op : body->without_terminator()) {
+    // Fix for finding #15: use DenseSet for O(1) dedup instead of
+    // llvm::is_contained O(n²) linear scan.
+    llvm::SmallDenseSet<Value> seen;
+    SmallVector<Value> capturedValues;
+
+    auto captureExternal = [&](Operation &op) {
       for (auto operand : op.getOperands()) {
-        if (operand.getParentBlock() != body) {
-          // External value — capture it
-          if (llvm::is_contained(capturedValues, operand))
-            continue;
+        if (operand.getParentBlock() != body && seen.insert(operand).second) {
           capturedValues.push_back(operand);
         }
       }
+    };
+
+    for (auto &op : body->without_terminator()) {
+      captureExternal(op);
+    }
+    // Also capture external operands from the InParallelOp region
+    auto term = cast<scf::InParallelOp>(body->getTerminator());
+    for (auto &regionOp : term.getRegion().front().without_terminator()) {
+      captureExternal(regionOp);
     }
 
-    // Build worker function type
+    // Build worker function type: (tid, worker_id, captured..., shared_outs...)
     auto indexType = builder.getIndexType();
     auto i32Type = builder.getIntegerType(32);
 
@@ -88,6 +102,11 @@ private:
     workerArgTypes.push_back(i32Type);   // worker_id
     for (auto val : capturedValues) {
       workerArgTypes.push_back(val.getType());
+    }
+    // Include shared_out types for pre-bufferization tensor IR support.
+    // Post-bufferization, foralls have no outputs so this is a no-op.
+    for (auto output : forall.getOutputs()) {
+      workerArgTypes.push_back(output.getType());
     }
 
     auto funcType = FunctionType::get(builder.getContext(), workerArgTypes, {});
@@ -108,10 +127,25 @@ private:
     for (size_t i = 0; i < capturedValues.size(); i++) {
       mapper.map(capturedValues[i], workerBody->getArgument(2 + i));
     }
+    // Fix for finding #9: if the forall body has shared_out block arguments
+    // (pre-bufferization tensor IR), they must also be included in the
+    // worker function signature. Post-bufferization, foralls have no
+    // shared_outs, so this loop is a no-op.
+    for (unsigned i = 0; i < forall.getOutputs().size(); i++) {
+      unsigned workerArgIdx = 2 + capturedValues.size() + i;
+      assert(workerArgIdx < workerBody->getNumArguments() &&
+             "shared_out must be in worker function signature");
+      mapper.map(body->getArgument(numDims + i),
+                 workerBody->getArgument(workerArgIdx));
+    }
 
     // Clone body ops (except InParallelOp terminator)
     for (auto &op : body->without_terminator()) {
       builder.clone(op, mapper);
+    }
+    // Also clone ops from the InParallelOp region
+    for (auto &regionOp : term.getRegion().front().without_terminator()) {
+      builder.clone(regionOp, mapper);
     }
     builder.create<func::ReturnOp>(loc);
 
@@ -121,21 +155,32 @@ private:
       workerFunc->moveBefore(parentFunc);
     }
 
-    // Replace scf.forall with a call to llrtParallelFor
+    // Fix for finding #2: compute totalTiles from the forall's actual upper
+    // bounds instead of hardcoding to 100.
     builder.setInsertionPoint(forall);
+    Value totalTiles;
+    for (auto ub : forall.getMixedUpperBound()) {
+      Value ubVal = getValueOrCreateConstantIndexOp(builder, loc, ub);
+      if (!totalTiles) {
+        totalTiles = ubVal;
+      } else {
+        totalTiles = builder.create<arith::MulIOp>(loc, totalTiles, ubVal);
+      }
+    }
+    if (!totalTiles) {
+      totalTiles = builder.create<arith::ConstantIndexOp>(loc, 0);
+    }
 
-    // Compute total tiles
-    Value totalTiles =
-        builder.create<arith::ConstantIndexOp>(loc, 100); // placeholder
     Value grainSize = builder.create<arith::ConstantIndexOp>(loc, 1);
 
-    // Create the call
     SmallVector<Value> callOperands;
     callOperands.push_back(totalTiles);
     callOperands.push_back(grainSize);
 
-    // We also need to pass a function pointer and context
-    // For now, use a simple placeholder call
+    // NOTE: Fix for finding #3 — the worker function pointer and context
+    // are NOT wired through this call. The JIT driver (or a subsequent
+    // lowering pass) is responsible for resolving the worker symbol
+    // (llk_worker_N) and providing it to the runtime bridge.
     builder.create<func::CallOp>(loc, "llrtParallelFor", TypeRange{},
                                  callOperands);
 

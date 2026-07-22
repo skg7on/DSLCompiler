@@ -8,11 +8,14 @@ thread_local int ThreadPool::current_worker_id_ = -1;
 ThreadPool::ThreadPool(int num_threads) {
   if (num_threads < 1)
     num_threads = 1;
+  num_workers_ = num_threads;
   barrier_target_ = num_threads;
   workers_.reserve(num_threads);
+  running_.reset(new std::atomic<bool>[num_threads]);
+  worker_done_.reset(new std::atomic<bool>[num_threads]);
   for (int i = 0; i < num_threads; i++) {
-    running_.emplace_back(true);
-    worker_done_.emplace_back(false);
+    running_[i] = true;
+    worker_done_[i] = false;
     Worker w;
     w.id = i;
     w.thread = std::thread(&ThreadPool::workerLoop, this, i);
@@ -21,7 +24,7 @@ ThreadPool::ThreadPool(int num_threads) {
 }
 
 ThreadPool::~ThreadPool() {
-  for (size_t i = 0; i < running_.size(); i++)
+  for (int i = 0; i < num_workers_; i++)
     running_[i] = false;
   cv_work_.notify_all();
   for (auto &w : workers_) {
@@ -52,7 +55,8 @@ void ThreadPool::workerLoop(int worker_id) {
       }
     }
 
-    // Signal done exactly once per parallelFor invocation
+    // Signal done under mutex to prevent lost wakeup (finding #7)
+    lock.lock();
     worker_done_[worker_id] = true;
     cv_done_.notify_one();
   }
@@ -67,11 +71,14 @@ void ThreadPool::parallelFor(int64_t total_tiles, int64_t grain_size,
   grain_size_ = std::max(int64_t(1), grain_size);
   next_tile_ = 0;
 
-  // Reset done flags
-  for (size_t i = 0; i < worker_done_.size(); i++)
-    worker_done_[i] = false;
-
-  callback_ = &callback;
+  // Reset done flags and set callback under mutex to prevent races
+  // (findings #1, #8)
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (int i = 0; i < num_workers_; i++)
+      worker_done_[i] = false;
+    callback_ = &callback;
+  }
   cv_work_.notify_all();
 
   // Caller thread also participates
@@ -88,7 +95,7 @@ void ThreadPool::parallelFor(int64_t total_tiles, int64_t grain_size,
   // Wait for all worker threads to finish
   std::unique_lock<std::mutex> lock(mutex_);
   cv_done_.wait(lock, [&] {
-    for (size_t i = 0; i < worker_done_.size(); i++)
+    for (int i = 0; i < num_workers_; i++)
       if (!worker_done_[i])
         return false;
     return true;
@@ -118,6 +125,10 @@ void *ThreadPool::getScratch(int worker_id) {
 void ThreadPool::setScratch(int worker_id, void *ptr, size_t size) {
   if (worker_id < 0 || worker_id >= static_cast<int>(workers_.size()))
     return;
+  // NOTE: The old scratch pointer is freed with free().
+  // Callers MUST allocate scratch with malloc/calloc/realloc or pass nullptr.
+  // Passing a pointer from new[], mmap, or any other allocator is UB.
+  // free(nullptr) is safe per the C standard.
   free(workers_[worker_id].scratch);
   workers_[worker_id].scratch = ptr;
   workers_[worker_id].scratch_size = size;

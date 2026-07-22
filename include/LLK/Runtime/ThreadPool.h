@@ -4,8 +4,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -42,8 +42,11 @@ private:
   void workerLoop(int worker_id);
 
   std::vector<Worker> workers_;
-  std::deque<std::atomic<bool>> running_;
-  std::deque<std::atomic<bool>> worker_done_;
+  // Use unique_ptr<T[]> instead of vector<T> because std::atomic<bool>
+  // is not Cpp17MoveInsertable on all STL implementations (libc++).
+  std::unique_ptr<std::atomic<bool>[]> running_;
+  std::unique_ptr<std::atomic<bool>[]> worker_done_;
+  int num_workers_{0};
   std::mutex mutex_;
   std::condition_variable cv_work_;
   std::condition_variable cv_done_;

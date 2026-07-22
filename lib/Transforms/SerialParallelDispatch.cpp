@@ -37,6 +37,8 @@ struct SerialParallelDispatchPass
   }
 
   void runOnOperation() override {
+    // Note: This threshold should come from the schedule database in M5
+    // rather than probing the compile host.
     int threshold = std::thread::hardware_concurrency();
 
     SmallVector<scf::ForallOp> toProcess;
@@ -44,6 +46,12 @@ struct SerialParallelDispatchPass
         [&](scf::ForallOp forall) { toProcess.push_back(forall); });
 
     for (auto forall : toProcess) {
+      // Skip foralls with tensor results — these need bufferization before
+      // serialization can work (scf.for has different iter_args semantics).
+      // Fix for finding #4: foralls with shared_outs are left parallel.
+      if (forall.getNumResults() > 0)
+        continue;
+
       // Compute total tiles from the upper bound
       int64_t totalTiles = 1;
       bool allStatic = true;
@@ -92,6 +100,14 @@ private:
     // Clone all ops except the InParallelOp terminator
     for (auto &op : oldBody->without_terminator()) {
       builder.clone(op, mapper);
+    }
+
+    // Also clone ops from inside the InParallelOp terminator region,
+    // if any (finding #5). These are typically tensor.parallel_insert_slice
+    // ops in tensor IR; in memref IR the region is empty.
+    auto term = cast<scf::InParallelOp>(oldBody->getTerminator());
+    for (auto &regionOp : term.getRegion().front().without_terminator()) {
+      builder.clone(regionOp, mapper);
     }
 
     forall.erase();
