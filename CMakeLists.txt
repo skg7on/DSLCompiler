@@ -158,6 +158,20 @@ add_mlir_library(LLKForallToLLRT
     LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRPass
 )
 
+# Library: ShapeSpecialization pass
+add_mlir_library(LLKShapeSpecialization
+    lib/Transforms/ShapeSpecialization.cpp
+    DEPENDS LLKDialect
+    LINK_LIBS PUBLIC MLIRFuncDialect MLIRPass
+)
+
+# Library: ScheduleSelection pass
+add_mlir_library(LLKScheduleSelection
+    lib/Transforms/ScheduleSelection.cpp
+    DEPENDS LLKDialect
+    LINK_LIBS PUBLIC MLIRFuncDialect MLIRPass
+)
+
 # Tool: llk-opt
 add_mlir_library(LLKPasses
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -202,11 +216,19 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
 target_link_libraries(llk-compile PRIVATE LLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+
+# Tool: llk-bench (benchmarking harness)
+add_llvm_executable(llk-bench tools/llk-bench/llk-bench.cpp)
+target_link_libraries(llk-bench PRIVATE LLKRuntime)
+
+# Tool: llk-tune (autotuning grid search)
+add_llvm_executable(llk-tune tools/llk-tune/llk-tune.cpp)
+target_link_libraries(llk-tune PRIVATE LLKRuntime)
 endif()
 
 # Tests
@@ -258,6 +280,10 @@ add_test(NAME SwiGLUParallelScaling COMMAND SwiGLUParallelScaling)
 add_llvm_executable(SwiGLUSmallShape test/Execution/swiglu_small_shape.cpp)
 target_link_libraries(SwiGLUSmallShape PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME SwiGLUSmallShape COMMAND SwiGLUSmallShape)
+
+add_llvm_executable(JitCacheHit test/Execution/jit_cache_hit.cpp)
+target_link_libraries(JitCacheHit PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME JitCacheHit COMMAND JitCacheHit)
 
 # FileCheck tests
 find_program(FILECHECK_BIN FileCheck)
@@ -337,6 +363,24 @@ if(FILECHECK_BIN)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --forall-to-llrt \
         ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_llrt.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_llrt.mlir"
+  )
+  # ShapeSpecialization test: check M bucket classification
+  add_test(NAME ShapeSpecialization
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --shape-specialize \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/shape_specialization.mlir \
+        2>&1 | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/shape_specialization.mlir"
+  )
+  # ScheduleSelection test: check correct schedule is chosen
+  add_test(NAME ScheduleSelection
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --select-schedule \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_selection.mlir \
+        2>&1 | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_selection.mlir"
+  )
+  # ScheduleFallback test: check fallback behavior for unknown (N,K)
+  add_test(NAME ScheduleFallback
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --select-schedule \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_fallback.mlir \
+        2>&1 | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_fallback.mlir"
   )
 endif()
 

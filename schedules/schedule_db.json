@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "operation": "fused_swiglu",
+      "target": "x86-avx2",
+      "shape": { "M_bucket": 0, "N": 4096, "K": 4096 },
+      "dtype": "bf16",
+      "math_mode": "bounded_fast",
+      "schedule": {
+        "BM": 1, "BN": 64, "BK": 64,
+        "VM": 1, "VN": 8,
+        "vector_width": 8,
+        "num_threads": 8,
+        "parallel_axis": "n",
+        "grain_size": 1
+      }
+    },
+    {
+      "operation": "fused_swiglu",
+      "target": "x86-avx2",
+      "shape": { "M_bucket": 1, "N": 4096, "K": 4096 },
+      "dtype": "bf16",
+      "math_mode": "bounded_fast",
+      "schedule": {
+        "BM": 4, "BN": 64, "BK": 64,
+        "VM": 1, "VN": 8,
+        "vector_width": 8,
+        "num_threads": 4,
+        "parallel_axis": "n",
+        "grain_size": 1
+      }
+    },
+    {
+      "operation": "fused_swiglu",
+      "target": "x86-avx2",
+      "shape": { "M_bucket": 2, "N": 4096, "K": 4096 },
+      "dtype": "bf16",
+      "math_mode": "bounded_fast",
+      "schedule": {
+        "BM": 8, "BN": 64, "BK": 64,
+        "VM": 2, "VN": 8,
+        "vector_width": 8,
+        "num_threads": 8,
+        "parallel_axis": "m",
+        "grain_size": 2
+      }
+    },
+    {
+      "operation": "fused_swiglu",
+      "target": "x86-avx2",
+      "shape": { "M_bucket": 3, "N": 4096, "K": 4096 },
+      "dtype": "bf16",
+      "math_mode": "bounded_fast",
+      "schedule": {
+        "BM": 16, "BN": 64, "BK": 64,
+        "VM": 4, "VN": 8,
+        "vector_width": 8,
+        "num_threads": 8,
+        "parallel_axis": "m",
+        "grain_size": 2
+      }
+    },
+    {
+      "operation": "fused_swiglu",
+      "target": "x86-avx2",
+      "shape": { "M_bucket": 4, "N": 4096, "K": 4096 },
+      "dtype": "bf16",
+      "math_mode": "bounded_fast",
+      "schedule": {
+        "BM": 32, "BN": 64, "BK": 64,
+        "VM": 4, "VN": 8,
+        "vector_width": 8,
+        "num_threads": 8,
+        "parallel_axis": "m",
+        "grain_size": 4
+      }
+    }
+  ]
+}
