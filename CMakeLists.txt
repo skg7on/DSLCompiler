@@ -85,6 +85,7 @@ add_mlir_library(LLKToLinalg
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
     runtime/PackedWeights.cpp
+    runtime/ThreadPool.cpp
 )
 target_include_directories(LLKRuntime PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -226,6 +227,10 @@ add_llk_test(VectorVsScalar test/Numerical/vector_vs_scalar.cpp)
 add_llk_test(EdgeCases test/Execution/edge_cases.cpp)
 add_llk_test(CpuFeaturesTest test/Execution/cpu_features_test.cpp)
 target_link_libraries(CpuFeaturesTest PRIVATE LLKTargetX86)
+
+add_llvm_executable(ThreadPoolStress test/Execution/thread_pool_stress.cpp)
+target_link_libraries(ThreadPoolStress PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME ThreadPoolStress COMMAND ThreadPoolStress)
 
 # FileCheck tests
 find_program(FILECHECK_BIN FileCheck)
