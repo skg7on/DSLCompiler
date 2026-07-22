@@ -84,7 +84,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLK_BUILD_TOOLS=OFF \
             -DLLK_BUILD_E2E_TESTS=OFF
-          ninja LLKDialect LLKToLinalg LLKRuntime LLKTransforms LLKTargetX86 SwigluReference EdgeCases VectorVsScalar CpuFeaturesTest
+          ninja
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3
