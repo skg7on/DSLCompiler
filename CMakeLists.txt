@@ -139,6 +139,13 @@ add_mlir_library(LLKScratchAnalysis
     LINK_LIBS PUBLIC MLIRMemRefDialect MLIRFuncDialect MLIRPass
 )
 
+# Library: LinearizeForall pass
+add_mlir_library(LLKLinearizeForall
+    lib/Transforms/LinearizeForall.cpp
+    DEPENDS LLKDialect
+    LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRTensorDialect MLIRPass
+)
+
 # Tool: llk-opt
 add_mlir_library(LLKPasses
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -183,7 +190,7 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -292,6 +299,12 @@ if(FILECHECK_BIN)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg --pack-weights \
         ${CMAKE_SOURCE_DIR}/test/Transforms/pack_weights.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/pack_weights.mlir"
+  )
+  # LinearizeForall test: multi-D scf.forall → 1D
+  add_test(NAME LinearizeForall
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --linearize-forall \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/linearize_forall.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/linearize_forall.mlir"
   )
 endif()
 
