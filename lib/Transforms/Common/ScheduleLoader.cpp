@@ -29,7 +29,8 @@ int classifyM(int64_t M) {
 }
 
 std::vector<ScheduleEntry> loadScheduleDB(llvm::StringRef dbPath, int M_bucket,
-                                          int64_t N, int64_t K) {
+                                          int64_t N, int64_t K,
+                                          llvm::StringRef opName) {
   std::vector<ScheduleEntry> matches;
 
   auto buf = llvm::MemoryBuffer::getFile(dbPath);
@@ -58,7 +59,7 @@ std::vector<ScheduleEntry> loadScheduleDB(llvm::StringRef dbPath, int M_bucket,
       continue;
 
     auto opStr = entryObj->getString("operation");
-    if (!opStr)
+    if (!opStr || *opStr != opName)
       continue;
 
     auto *shape = entryObj->getObject("shape");

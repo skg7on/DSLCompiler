@@ -83,14 +83,16 @@ struct FuseDoubleMatmulWithSiLU : public OpRewritePattern<linalg::GenericOp> {
         return failure();
     }
 
-    // Verify body contains SiLU operations
+    // Verify body contains SiLU operations.
+    // Accept both math::ExpOp (strict mode) and math::Exp2Op (bounded_fast
+    // mode).
     Block &body = consumer->getRegion(0).front();
     bool hasNegf = false, hasExp = false, hasAddf = false;
     bool hasDivf = false, hasMulf = false, hasTruncf = false;
     for (Operation &op : body) {
       if (isa<arith::NegFOp>(op))
         hasNegf = true;
-      if (isa<math::ExpOp>(op))
+      if (isa<math::ExpOp>(op) || isa<math::Exp2Op>(op))
         hasExp = true;
       if (isa<arith::AddFOp>(op))
         hasAddf = true;

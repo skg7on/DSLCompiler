@@ -147,9 +147,17 @@ LogicalResult RoPEOp::verify() {
   if (!posType.hasRank() || posType.getRank() != 1)
     return emitOpError("position_ids must be a 1D tensor [L]");
 
+  int64_t L = xType.getDimSize(2);
   int64_t D = xType.getDimSize(3);
   if (!ShapedType::isDynamic(D) && D % 2 != 0)
     return emitOpError("D dimension must be even, got ") << D;
+
+  // Check position_ids length matches L.
+  int64_t posLen = posType.getDimSize(0);
+  if (!ShapedType::isDynamic(L) && !ShapedType::isDynamic(posLen) &&
+      L != posLen)
+    return emitOpError("position_ids length=")
+           << posLen << " does not match X dim(2)=" << L;
 
   return success();
 }
@@ -179,12 +187,45 @@ LogicalResult AttentionOp::verify() {
   if (!vType.hasRank() || vType.getRank() != 4)
     return emitOpError("V must be a 4D tensor [B, H, Lk, D]");
 
+  int64_t qB = qType.getDimSize(0);
+  int64_t qH = qType.getDimSize(1);
   int64_t qD = qType.getDimSize(3);
+  int64_t qLq = qType.getDimSize(2);
+  int64_t kB = kType.getDimSize(0);
+  int64_t kH = kType.getDimSize(1);
   int64_t kD = kType.getDimSize(3);
+  int64_t vB = vType.getDimSize(0);
+  int64_t vH = vType.getDimSize(1);
   int64_t vD = vType.getDimSize(3);
+  int64_t initB = initType.getDimSize(0);
+  int64_t initH = initType.getDimSize(1);
   int64_t initD = initType.getDimSize(3);
   int64_t kL = kType.getDimSize(2);
   int64_t vL = vType.getDimSize(2);
+  int64_t initLq = initType.getDimSize(2);
+
+  // B and H consistency.
+  if (!ShapedType::isDynamic(qB) && !ShapedType::isDynamic(kB) && qB != kB)
+    return emitOpError("B dimension mismatch: Q=") << qB << " vs K=" << kB;
+  if (!ShapedType::isDynamic(qB) && !ShapedType::isDynamic(vB) && qB != vB)
+    return emitOpError("B dimension mismatch: Q=") << qB << " vs V=" << vB;
+  if (!ShapedType::isDynamic(qB) && !ShapedType::isDynamic(initB) &&
+      qB != initB)
+    return emitOpError("B dimension mismatch: Q=")
+           << qB << " vs init=" << initB;
+  if (!ShapedType::isDynamic(qH) && !ShapedType::isDynamic(kH) && qH != kH)
+    return emitOpError("H dimension mismatch: Q=") << qH << " vs K=" << kH;
+  if (!ShapedType::isDynamic(qH) && !ShapedType::isDynamic(vH) && qH != vH)
+    return emitOpError("H dimension mismatch: Q=") << qH << " vs V=" << vH;
+  if (!ShapedType::isDynamic(qH) && !ShapedType::isDynamic(initH) &&
+      qH != initH)
+    return emitOpError("H dimension mismatch: Q=")
+           << qH << " vs init=" << initH;
+  // Lq consistency (Q vs init).
+  if (!ShapedType::isDynamic(qLq) && !ShapedType::isDynamic(initLq) &&
+      qLq != initLq)
+    return emitOpError("Lq dimension mismatch: Q=")
+           << qLq << " vs init=" << initLq;
 
   if (!ShapedType::isDynamic(qD) && !ShapedType::isDynamic(kD) && qD != kD)
     return emitOpError("D dimension mismatch: Q=") << qD << " vs K=" << kD;

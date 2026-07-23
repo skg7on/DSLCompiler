@@ -8,6 +8,8 @@
 #ifndef LLK_TRANSFORMS_COMMON_SCHEDULELOADER_H
 #define LLK_TRANSFORMS_COMMON_SCHEDULELOADER_H
 
+#include "llvm/ADT/StringRef.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -33,7 +35,8 @@ struct ScheduleEntry {
 /// Returns all entries that match (M_bucket, N, K) — the caller selects
 /// the best among them.
 std::vector<ScheduleEntry> loadScheduleDB(llvm::StringRef dbPath, int M_bucket,
-                                          int64_t N, int64_t K);
+                                          int64_t N, int64_t K,
+                                          llvm::StringRef opName = "");
 
 /// Classify M into one of 5 buckets: {1}, [2,4], [5,16], [17,64], ≥65.
 int classifyM(int64_t M);

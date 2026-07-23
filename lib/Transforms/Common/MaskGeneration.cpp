@@ -19,10 +19,8 @@ namespace llk {
 Value createVectorMask(OpBuilder &b, Location loc, int64_t numElements,
                        int64_t vectorWidth) {
   Value numElems = b.create<arith::ConstantIndexOp>(loc, numElements);
-  Value dim = b.create<arith::ConstantIndexOp>(loc, vectorWidth);
   return b.create<vector::CreateMaskOp>(
-      loc, VectorType::get({vectorWidth}, b.getI1Type()),
-      ValueRange{numElems, dim});
+      loc, VectorType::get({vectorWidth}, b.getI1Type()), ValueRange{numElems});
 }
 
 } // namespace llk

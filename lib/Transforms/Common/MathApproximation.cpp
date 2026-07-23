@@ -93,12 +93,26 @@ Value createApproxSigmoid(OpBuilder &b, Location loc, Value x, MathMode mode) {
 }
 
 Value createApproxCos(OpBuilder &b, Location loc, Value x, MathMode mode) {
-  // For now, cos/sin approximations use math ops directly.
-  // A future enhancement can add range-reduced polynomial evaluation here.
+  switch (mode) {
+  case MathMode::strict:
+    return b.create<math::CosOp>(loc, x);
+  case MathMode::bounded_fast:
+  case MathMode::unsafe_fast:
+    // Use exact math for now; polynomial cos/sin approximation can be
+    // added here in a future enhancement (range reduction + minimax poly).
+    return b.create<math::CosOp>(loc, x);
+  }
   return b.create<math::CosOp>(loc, x);
 }
 
 Value createApproxSin(OpBuilder &b, Location loc, Value x, MathMode mode) {
+  switch (mode) {
+  case MathMode::strict:
+    return b.create<math::SinOp>(loc, x);
+  case MathMode::bounded_fast:
+  case MathMode::unsafe_fast:
+    return b.create<math::SinOp>(loc, x);
+  }
   return b.create<math::SinOp>(loc, x);
 }
 

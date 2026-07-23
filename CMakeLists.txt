@@ -76,8 +76,8 @@ add_mlir_dialect_library(LLKDialect
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
-    DEPENDS LLKDialect
-    LINK_LIBS PUBLIC LLKDialect MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
+    DEPENDS LLKDialect LLKCommon
+    LINK_LIBS PUBLIC LLKDialect LLKCommon MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
                      MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
 )
 

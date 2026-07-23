@@ -8,6 +8,7 @@
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/LLKEnums.h"
+#include "LLK/Transforms/Common/MathApproximation.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -85,6 +86,8 @@ void LLKToLinalgPass::lowerSwiGLU(OpBuilder &builder,
     return;
   }
 
+  llk::MathMode mode = op.getMathMode();
+
   auto bf16Type = builder.getBF16Type();
   auto f32Type = builder.getF32Type();
   auto gateUpType = RankedTensorType::get({M, N}, bf16Type);
@@ -139,7 +142,7 @@ void LLKToLinalgPass::lowerSwiGLU(OpBuilder &builder,
 
                 // SiLU(g) = g * sigmoid(g) = g / (1 + exp(-g))
                 Value neg = b.create<arith::NegFOp>(l, gF32);
-                Value exp = b.create<math::ExpOp>(l, neg);
+                Value exp = llk::createApproxExp(b, l, neg, mode);
                 Value f32One = b.create<arith::ConstantOp>(
                     l, f32Type, b.getF32FloatAttr(1.0));
                 Value den = b.create<arith::AddFOp>(l, f32One, exp);
@@ -168,6 +171,11 @@ void LLKToLinalgPass::lowerRoPE(OpBuilder &builder, mlir::llk::RoPEOp op) {
   double theta = op.getTheta().convertToDouble();
 
   auto xType = mlir::cast<RankedTensorType>(x.getType());
+  if (!xType.hasStaticShape()) {
+    op.emitError("RoPE requires static shapes");
+    signalPassFailure();
+    return;
+  }
   int64_t B = xType.getDimSize(0);
   int64_t H = xType.getDimSize(1);
   int64_t L = xType.getDimSize(2);
@@ -180,6 +188,8 @@ void LLKToLinalgPass::lowerRoPE(OpBuilder &builder, mlir::llk::RoPEOp op) {
   AffineMap idMap1D = AffineMap::getMultiDimIdentityMap(1, &getContext());
   AffineMap idMap2D = AffineMap::getMultiDimIdentityMap(2, &getContext());
   AffineMap idMap4D = AffineMap::getMultiDimIdentityMap(4, &getContext());
+
+  llk::MathMode mode = op.getMathMode();
 
   // Step 1: Precompute frequency table freqs[i] = theta^(-2i/D) as f64.
   auto freqType = RankedTensorType::get({halfD}, f64Type);
@@ -246,9 +256,8 @@ void LLKToLinalgPass::lowerRoPE(OpBuilder &builder, mlir::llk::RoPEOp op) {
             [&](OpBuilder &b, Location l, ValueRange args) {
               Value aF64 = args[0];
               Value aF32 = b.create<arith::TruncFOp>(l, f32Type, aF64);
-              Value trigVal = isCos
-                                  ? b.create<math::CosOp>(l, aF32).getResult()
-                                  : b.create<math::SinOp>(l, aF32).getResult();
+              Value trigVal = isCos ? llk::createApproxCos(b, l, aF32, mode)
+                                    : llk::createApproxSin(b, l, aF32, mode);
               b.create<linalg::YieldOp>(l, ValueRange{trigVal});
             })
         .getResult(0);
@@ -369,6 +378,8 @@ void LLKToLinalgPass::lowerAttention(OpBuilder &builder,
 
   auto f32Type = builder.getF32Type();
 
+  llk::MathMode mode = op.getMathMode();
+
   // Collapse B,H into a single batch dimension: [B, H, ...] → [B*H, ...].
   SmallVector<ReassociationIndices> collapse3D = {{0, 1}, {2}, {3}};
   auto q3DType = RankedTensorType::get({BH, Lq, D}, f32Type);
@@ -474,8 +485,8 @@ void LLKToLinalgPass::lowerAttention(OpBuilder &builder,
                 Value s = args[0];
                 Value scaledS = b.create<arith::MulFOp>(l, s, scaleVal);
                 if (causal) {
-                  Value kIdx = b.create<linalg::IndexOp>(l, 1);
-                  Value qIdx = b.create<linalg::IndexOp>(l, 0);
+                  Value qIdx = b.create<linalg::IndexOp>(l, 1);
+                  Value kIdx = b.create<linalg::IndexOp>(l, 2);
                   Value kGtQ = b.create<arith::CmpIOp>(
                       l, arith::CmpIPredicate::sgt, kIdx, qIdx);
                   Value result =
@@ -548,7 +559,7 @@ void LLKToLinalgPass::lowerAttention(OpBuilder &builder,
                 Value m = args[1];
                 Value acc = args[2];
                 Value shifted = b.create<arith::SubFOp>(l, s, m);
-                Value expVal = b.create<math::ExpOp>(l, shifted);
+                Value expVal = llk::createApproxExp(b, l, shifted, mode);
                 Value sum = b.create<arith::AddFOp>(l, expVal, acc);
                 b.create<linalg::YieldOp>(l, ValueRange{sum});
               })
@@ -573,7 +584,7 @@ void LLKToLinalgPass::lowerAttention(OpBuilder &builder,
                 Value m = args[1];
                 Value d = args[2];
                 Value shifted = b.create<arith::SubFOp>(l, s, m);
-                Value expVal = b.create<math::ExpOp>(l, shifted);
+                Value expVal = llk::createApproxExp(b, l, shifted, mode);
                 Value softmaxVal = b.create<arith::DivFOp>(l, expVal, d);
                 b.create<linalg::YieldOp>(l, ValueRange{softmaxVal});
               })
