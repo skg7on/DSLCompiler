@@ -121,19 +121,17 @@ struct FuseDoubleMatmulWithSiLU : public OpRewritePattern<linalg::GenericOp> {
     auto upTy = mlir::cast<RankedTensorType>(upInit.getType());
     auto f32GateTy = RankedTensorType::get(gateTy.getShape(), f32Type);
     auto f32UpTy = RankedTensorType::get(upTy.getShape(), f32Type);
-    Value f32Zero = rewriter.create<arith::ConstantOp>(
-        loc, f32Type, rewriter.getF32FloatAttr(0.0));
+    Value f32Zero = arith::ConstantOp::create(rewriter, loc, f32Type,
+                                              rewriter.getF32FloatAttr(0.0));
     Value f32GateInit =
-        rewriter.create<tensor::EmptyOp>(loc, f32GateTy, ValueRange{});
-    f32GateInit = rewriter
-                      .create<linalg::FillOp>(loc, ValueRange{f32Zero},
-                                              ValueRange{f32GateInit})
+        tensor::EmptyOp::create(rewriter, loc, f32GateTy, ValueRange{});
+    f32GateInit = linalg::FillOp::create(rewriter, loc, ValueRange{f32Zero},
+                                         ValueRange{f32GateInit})
                       .getResult(0);
     Value f32UpInit =
-        rewriter.create<tensor::EmptyOp>(loc, f32UpTy, ValueRange{});
-    f32UpInit = rewriter
-                    .create<linalg::FillOp>(loc, ValueRange{f32Zero},
-                                            ValueRange{f32UpInit})
+        tensor::EmptyOp::create(rewriter, loc, f32UpTy, ValueRange{});
+    f32UpInit = linalg::FillOp::create(rewriter, loc, ValueRange{f32Zero},
+                                       ValueRange{f32UpInit})
                     .getResult(0);
 
     SmallVector<AffineMap> indexingMaps = {
@@ -154,32 +152,32 @@ struct FuseDoubleMatmulWithSiLU : public OpRewritePattern<linalg::GenericOp> {
             rewriter.getContext()), // up_acc: (m,n)
     };
 
-    auto fused = rewriter.create<linalg::GenericOp>(
-        loc, TypeRange{f32GateTy, f32UpTy}, // 2 f32 results
-        ValueRange{x, wg, wu},              // 3 inputs
-        ValueRange{f32GateInit, f32UpInit}, // 2 f32 inits
+    auto fused = linalg::GenericOp::create(
+        rewriter, loc, TypeRange{f32GateTy, f32UpTy}, // 2 f32 results
+        ValueRange{x, wg, wu},                        // 3 inputs
+        ValueRange{f32GateInit, f32UpInit},           // 2 f32 inits
         indexingMaps,
         SmallVector<utils::IteratorType>{utils::IteratorType::parallel,
                                          utils::IteratorType::parallel,
                                          utils::IteratorType::reduction},
         [&](OpBuilder &b, Location loc, ValueRange args) {
-          Value xEl = b.create<arith::ExtFOp>(loc, f32Type, args[0]);
-          Value wgEl = b.create<arith::ExtFOp>(loc, f32Type, args[1]);
-          Value wuEl = b.create<arith::ExtFOp>(loc, f32Type, args[2]);
+          Value xEl = arith::ExtFOp::create(b, loc, f32Type, args[0]);
+          Value wgEl = arith::ExtFOp::create(b, loc, f32Type, args[1]);
+          Value wuEl = arith::ExtFOp::create(b, loc, f32Type, args[2]);
           // args[3] and args[4] are already f32 (init tensors)
-          Value gNew = b.create<arith::AddFOp>(
-              loc, args[3], b.create<arith::MulFOp>(loc, xEl, wgEl));
-          Value uNew = b.create<arith::AddFOp>(
-              loc, args[4], b.create<arith::MulFOp>(loc, xEl, wuEl));
-          b.create<linalg::YieldOp>(loc, ValueRange{gNew, uNew});
+          Value gNew = arith::AddFOp::create(
+              b, loc, args[3], arith::MulFOp::create(b, loc, xEl, wgEl));
+          Value uNew = arith::AddFOp::create(
+              b, loc, args[4], arith::MulFOp::create(b, loc, xEl, wuEl));
+          linalg::YieldOp::create(b, loc, ValueRange{gNew, uNew});
         });
 
     // Build SiLU epilogue on the two accumulators
     auto bf16Type = rewriter.getBF16Type();
-    Value cstOne = rewriter.create<arith::ConstantOp>(
-        loc, f32Type, rewriter.getF32FloatAttr(1.0f));
-    auto epilogue = rewriter.create<linalg::GenericOp>(
-        loc, consumer.getResultTypes(),
+    Value cstOne = arith::ConstantOp::create(rewriter, loc, f32Type,
+                                             rewriter.getF32FloatAttr(1.0f));
+    auto epilogue = linalg::GenericOp::create(
+        rewriter, loc, consumer.getResultTypes(),
         ValueRange{fused.getResult(0), fused.getResult(1)},
         consumer.getDpsInitOperand(0)->get(),
         ArrayRef<AffineMap>{rewriter.getMultiDimIdentityMap(2),
@@ -190,14 +188,14 @@ struct FuseDoubleMatmulWithSiLU : public OpRewritePattern<linalg::GenericOp> {
         [&](OpBuilder &b, Location loc, ValueRange args) {
           Value g = args[0];
           Value u = args[1];
-          Value neg = b.create<arith::NegFOp>(loc, g);
-          Value exp = b.create<math::ExpOp>(loc, neg);
-          Value den = b.create<arith::AddFOp>(loc, cstOne, exp);
-          Value sigmoid = b.create<arith::DivFOp>(loc, cstOne, den);
-          Value silu = b.create<arith::MulFOp>(loc, g, sigmoid);
-          Value r = b.create<arith::MulFOp>(loc, silu, u);
-          Value cast = b.create<arith::TruncFOp>(loc, bf16Type, r);
-          b.create<linalg::YieldOp>(loc, cast);
+          Value neg = arith::NegFOp::create(b, loc, g);
+          Value exp = math::ExpOp::create(b, loc, neg);
+          Value den = arith::AddFOp::create(b, loc, cstOne, exp);
+          Value sigmoid = arith::DivFOp::create(b, loc, cstOne, den);
+          Value silu = arith::MulFOp::create(b, loc, g, sigmoid);
+          Value r = arith::MulFOp::create(b, loc, silu, u);
+          Value cast = arith::TruncFOp::create(b, loc, bf16Type, r);
+          linalg::YieldOp::create(b, loc, cast);
         });
 
     rewriter.replaceOp(consumer, epilogue.getResult(0));

@@ -36,34 +36,34 @@ static Value approxExpBoundedFast(OpBuilder &b, Location loc, Value x) {
 
   // log2(e)
   Value log2e =
-      b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(1.44269504089f));
+      arith::ConstantOp::create(b, loc, f32, b.getF32FloatAttr(1.44269504089f));
 
   // x * log2(e)
-  Value xLog2e = b.create<arith::MulFOp>(loc, x, log2e);
+  Value xLog2e = arith::MulFOp::create(b, loc, x, log2e);
 
   // n = round(x * log2(e))
-  Value n = b.create<math::RoundOp>(loc, xLog2e);
+  Value n = math::RoundOp::create(b, loc, xLog2e);
 
   // r = x * log2(e) - n    (fractional part)
-  Value r = b.create<arith::SubFOp>(loc, xLog2e, n);
+  Value r = arith::SubFOp::create(b, loc, xLog2e, n);
 
   // P(r) = r + r² * (c2 + r * c3)
-  Value c2 = b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(0.5f));
+  Value c2 = arith::ConstantOp::create(b, loc, f32, b.getF32FloatAttr(0.5f));
   Value c3 =
-      b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(0.16666667f));
-  Value r2 = b.create<arith::MulFOp>(loc, r, r);
+      arith::ConstantOp::create(b, loc, f32, b.getF32FloatAttr(0.16666667f));
+  Value r2 = arith::MulFOp::create(b, loc, r, r);
   Value inner =
-      b.create<arith::AddFOp>(loc, c2, b.create<arith::MulFOp>(loc, c3, r));
-  Value poly =
-      b.create<arith::AddFOp>(loc, r, b.create<arith::MulFOp>(loc, r2, inner));
+      arith::AddFOp::create(b, loc, c2, arith::MulFOp::create(b, loc, c3, r));
+  Value poly = arith::AddFOp::create(b, loc, r,
+                                     arith::MulFOp::create(b, loc, r2, inner));
 
   // 2^n:  use math.exp2 on integer n ← exact result.
-  Value pow2 = b.create<math::Exp2Op>(loc, n);
+  Value pow2 = math::Exp2Op::create(b, loc, n);
 
   // 2^n * (1 + P(r)) = pow2 + pow2 * poly
-  Value one = b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(1.0f));
-  Value mantissa = b.create<arith::AddFOp>(loc, one, poly);
-  Value result = b.create<arith::MulFOp>(loc, pow2, mantissa);
+  Value one = arith::ConstantOp::create(b, loc, f32, b.getF32FloatAttr(1.0f));
+  Value mantissa = arith::AddFOp::create(b, loc, one, poly);
+  Value result = arith::MulFOp::create(b, loc, pow2, mantissa);
 
   return result;
 }
@@ -75,45 +75,45 @@ static Value approxExpBoundedFast(OpBuilder &b, Location loc, Value x) {
 Value createApproxExp(OpBuilder &b, Location loc, Value x, MathMode mode) {
   switch (mode) {
   case MathMode::strict:
-    return b.create<math::ExpOp>(loc, x);
+    return math::ExpOp::create(b, loc, x);
   case MathMode::bounded_fast:
   case MathMode::unsafe_fast:
     return approxExpBoundedFast(b, loc, x);
   }
-  return b.create<math::ExpOp>(loc, x);
+  return math::ExpOp::create(b, loc, x);
 }
 
 Value createApproxSigmoid(OpBuilder &b, Location loc, Value x, MathMode mode) {
   auto f32 = b.getF32Type();
-  Value one = b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(1.0f));
-  Value negX = b.create<arith::NegFOp>(loc, x);
+  Value one = arith::ConstantOp::create(b, loc, f32, b.getF32FloatAttr(1.0f));
+  Value negX = arith::NegFOp::create(b, loc, x);
   Value expNegX = createApproxExp(b, loc, negX, mode);
-  Value denom = b.create<arith::AddFOp>(loc, one, expNegX);
-  return b.create<arith::DivFOp>(loc, one, denom);
+  Value denom = arith::AddFOp::create(b, loc, one, expNegX);
+  return arith::DivFOp::create(b, loc, one, denom);
 }
 
 Value createApproxCos(OpBuilder &b, Location loc, Value x, MathMode mode) {
   switch (mode) {
   case MathMode::strict:
-    return b.create<math::CosOp>(loc, x);
+    return math::CosOp::create(b, loc, x);
   case MathMode::bounded_fast:
   case MathMode::unsafe_fast:
     // Use exact math for now; polynomial cos/sin approximation can be
     // added here in a future enhancement (range reduction + minimax poly).
-    return b.create<math::CosOp>(loc, x);
+    return math::CosOp::create(b, loc, x);
   }
-  return b.create<math::CosOp>(loc, x);
+  return math::CosOp::create(b, loc, x);
 }
 
 Value createApproxSin(OpBuilder &b, Location loc, Value x, MathMode mode) {
   switch (mode) {
   case MathMode::strict:
-    return b.create<math::SinOp>(loc, x);
+    return math::SinOp::create(b, loc, x);
   case MathMode::bounded_fast:
   case MathMode::unsafe_fast:
-    return b.create<math::SinOp>(loc, x);
+    return math::SinOp::create(b, loc, x);
   }
-  return b.create<math::SinOp>(loc, x);
+  return math::SinOp::create(b, loc, x);
 }
 
 } // namespace llk

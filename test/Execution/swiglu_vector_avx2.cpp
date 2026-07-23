@@ -153,7 +153,7 @@ static void loadRequiredDialects(mlir::MLIRContext &ctx) {
 static mlir::OwningOpRef<mlir::ModuleOp>
 buildSwiGLUModule(mlir::OpBuilder &builder, int64_t M, int64_t N, int64_t K) {
   auto loc = builder.getUnknownLoc();
-  auto module = builder.create<mlir::ModuleOp>(loc);
+  auto module = mlir::ModuleOp::create(builder, loc);
   auto bf16Type = builder.getBF16Type();
   auto xType = mlir::RankedTensorType::get({M, K}, bf16Type);
   auto wType = mlir::RankedTensorType::get({K, N}, bf16Type);
@@ -161,12 +161,12 @@ buildSwiGLUModule(mlir::OpBuilder &builder, int64_t M, int64_t N, int64_t K) {
 
   auto funcType =
       builder.getFunctionType({xType, wType, wType, outType}, {outType});
-  auto func = builder.create<mlir::func::FuncOp>(loc, "llk_swiglu", funcType);
+  auto func = mlir::func::FuncOp::create(builder, loc, "llk_swiglu", funcType);
   auto *entry = func.addEntryBlock();
   builder.setInsertionPointToStart(entry);
 
-  auto fusedOp = builder.create<mlir::llk::FusedSwiGLUOp>(
-      loc, outType, entry->getArgument(0), entry->getArgument(1),
+  auto fusedOp = mlir::llk::FusedSwiGLUOp::create(
+      builder, loc, outType, entry->getArgument(0), entry->getArgument(1),
       entry->getArgument(2), entry->getArgument(3),
       mlir::TypeAttr::get(builder.getF32Type()),
       mlir::llk::ActivationAttr::get(builder.getContext(),
@@ -174,7 +174,7 @@ buildSwiGLUModule(mlir::OpBuilder &builder, int64_t M, int64_t N, int64_t K) {
       mlir::llk::MathModeAttr::get(builder.getContext(),
                                    mlir::llk::MathMode::bounded_fast));
 
-  builder.create<mlir::func::ReturnOp>(loc, fusedOp.getResult());
+  mlir::func::ReturnOp::create(builder, loc, fusedOp.getResult());
   return module;
 }
 

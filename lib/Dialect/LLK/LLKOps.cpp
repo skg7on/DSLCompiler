@@ -101,11 +101,11 @@ SmallVector<utils::IteratorType> FusedSwiGLUOp::getLoopIteratorTypes() {
 
 SmallVector<Range> FusedSwiGLUOp::getIterationDomain(OpBuilder &b) {
   Location loc = getLoc();
-  Value zero = b.create<arith::ConstantIndexOp>(loc, 0);
-  Value one = b.create<arith::ConstantIndexOp>(loc, 1);
-  Value mDim = b.create<tensor::DimOp>(loc, getX(), zero);
-  Value nDim = b.create<tensor::DimOp>(loc, getWg(), one);
-  Value kDim = b.create<tensor::DimOp>(loc, getX(), one);
+  Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+  Value one = arith::ConstantIndexOp::create(b, loc, 1);
+  Value mDim = tensor::DimOp::create(b, loc, getX(), zero);
+  Value nDim = tensor::DimOp::create(b, loc, getWg(), one);
+  Value kDim = tensor::DimOp::create(b, loc, getX(), one);
   return {Range{zero, mDim, one}, Range{zero, nDim, one},
           Range{zero, kDim, one}};
 }

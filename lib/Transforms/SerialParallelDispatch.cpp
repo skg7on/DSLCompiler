@@ -80,11 +80,11 @@ private:
     OpBuilder builder(forall);
     Location loc = forall.getLoc();
 
-    Value lb = builder.create<arith::ConstantIndexOp>(loc, 0);
-    Value ub = builder.create<arith::ConstantIndexOp>(loc, totalTiles);
-    Value step = builder.create<arith::ConstantIndexOp>(loc, 1);
+    Value lb = arith::ConstantIndexOp::create(builder, loc, 0);
+    Value ub = arith::ConstantIndexOp::create(builder, loc, totalTiles);
+    Value step = arith::ConstantIndexOp::create(builder, loc, 1);
 
-    auto forOp = builder.create<scf::ForOp>(loc, lb, ub, step);
+    auto forOp = scf::ForOp::create(builder, loc, lb, ub, step);
 
     // Clone body from forall into for
     Block *oldBody = forall.getBody();

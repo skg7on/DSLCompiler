@@ -51,8 +51,8 @@ struct ForallToLLRTPass
       OpBuilder modBuilder(module.getBodyRegion());
       auto runtimeFuncType =
           FunctionType::get(&getContext(), {indexType, indexType}, {});
-      auto runtimeFunc = modBuilder.create<func::FuncOp>(
-          module.getLoc(), "llrtParallelFor", runtimeFuncType);
+      auto runtimeFunc = func::FuncOp::create(
+          modBuilder, module.getLoc(), "llrtParallelFor", runtimeFuncType);
       runtimeFunc.setPrivate();
     }
 
@@ -113,7 +113,7 @@ private:
 
     // Create worker function
     std::string funcName = "llk_worker_" + std::to_string(workerId);
-    auto workerFunc = builder.create<func::FuncOp>(loc, funcName, funcType);
+    auto workerFunc = func::FuncOp::create(builder, loc, funcName, funcType);
     workerFunc.setPrivate();
 
     Block *workerBody = workerFunc.addEntryBlock();
@@ -147,7 +147,7 @@ private:
     for (auto &regionOp : term.getRegion().front().without_terminator()) {
       builder.clone(regionOp, mapper);
     }
-    builder.create<func::ReturnOp>(loc);
+    func::ReturnOp::create(builder, loc);
 
     // Put worker function before the parent function
     auto parentFunc = forall->getParentOfType<func::FuncOp>();
@@ -164,14 +164,14 @@ private:
       if (!totalTiles) {
         totalTiles = ubVal;
       } else {
-        totalTiles = builder.create<arith::MulIOp>(loc, totalTiles, ubVal);
+        totalTiles = arith::MulIOp::create(builder, loc, totalTiles, ubVal);
       }
     }
     if (!totalTiles) {
-      totalTiles = builder.create<arith::ConstantIndexOp>(loc, 0);
+      totalTiles = arith::ConstantIndexOp::create(builder, loc, 0);
     }
 
-    Value grainSize = builder.create<arith::ConstantIndexOp>(loc, 1);
+    Value grainSize = arith::ConstantIndexOp::create(builder, loc, 1);
 
     SmallVector<Value> callOperands;
     callOperands.push_back(totalTiles);
@@ -181,8 +181,8 @@ private:
     // are NOT wired through this call. The JIT driver (or a subsequent
     // lowering pass) is responsible for resolving the worker symbol
     // (llk_worker_N) and providing it to the runtime bridge.
-    builder.create<func::CallOp>(loc, "llrtParallelFor", TypeRange{},
-                                 callOperands);
+    func::CallOp::create(builder, loc, "llrtParallelFor", TypeRange{},
+                         callOperands);
 
     forall.erase();
   }
