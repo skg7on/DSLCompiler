@@ -305,6 +305,14 @@ if(FILECHECK_BIN)
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
   )
+  # RoPE lowering: verify llk.rope → cos/sin + even/odd interleave
+  add_test(NAME RoPELowering
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir"
+  )
+  # Attention lowering: verify llk.attention → Q@K^T + softmax + @V
+  add_test(NAME AttentionLowering
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/attention_lowering.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/attention_lowering.mlir"
+  )
   # Schedule parse test: verify the transform dialect schedule parses correctly
   # and the named sequence round-trips through llk-opt.
   add_test(NAME ScheduleBF16Check
@@ -381,6 +389,18 @@ if(FILECHECK_BIN)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --select-schedule \
         ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_fallback.mlir \
         2>&1 | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_fallback.mlir"
+  )
+  # Online softmax: verify max reduction + exp + div pattern in attention lowering
+  add_test(NAME OnlineSoftmax
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/online_softmax.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/online_softmax.mlir"
+  )
+  # RoPE vector shuffle: verify even/odd slice + interleave
+  add_test(NAME RoPEVectorShuffle
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir"
+  )
+  # Causal mask: verify cmp + select pattern for upper-triangular -inf
+  add_test(NAME CausalMask
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir"
   )
 endif()
 
