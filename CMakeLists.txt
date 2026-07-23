@@ -109,6 +109,17 @@ target_include_directories(LLKTargetX86 PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# Library: Common utilities shared across all kernels
+add_mlir_library(LLKCommon
+    lib/Transforms/Common/TilingUtils.cpp
+    lib/Transforms/Common/VectorizationUtils.cpp
+    lib/Transforms/Common/ScheduleLoader.cpp
+    lib/Transforms/Common/MaskGeneration.cpp
+    lib/Transforms/Common/MathApproximation.cpp
+    DEPENDS LLKDialect
+    LINK_LIBS PUBLIC MLIRArithDialect MLIRMathDialect MLIRVectorDialect MLIRPass
+)
+
 # Library: LLK Transforms (TileAndVectorize)
 add_mlir_library(LLKTransforms
     lib/Transforms/TileAndVectorize.cpp

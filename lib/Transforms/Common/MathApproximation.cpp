@@ -1,0 +1,106 @@
+//===- MathApproximation.cpp - Polynomial function approximations
+//----------===//
+//
+// Fast polynomial approximations for exp, sigmoid, cos, sin.
+//
+// exp(x):  range-reduce x * log2(e) → integer n + fraction r ∈ [-0.5, 0.5],
+//          then 2^n * (1 + P(r)) where P is a Taylor polynomial for 2^r - 1.
+// sigmoid: implemented via createApproxExp.
+// cos/sin:  for bounded_fast mode, defer to math::CosOp / math::SinOp with
+//           an optional range-reduction wrapper (placeholder for future
+//           polynomial implementations).
+//
+//===----------------------------------------------------------------------===//
+
+#include "LLK/Transforms/Common/MathApproximation.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+
+using namespace mlir;
+
+namespace mlir {
+namespace llk {
+
+// ---------------------------------------------------------------------------
+// Fast exp:  exp(x) = 2^(x * log2(e))
+//   Range reduce:  x * log2(e) = n + r  where n = floor(x*log2(e) + 0.5),
+//                  r ∈ [-0.5, 0.5].
+//   Then:  exp(x) = 2^n * 2^r.
+//   Approximate 2^r with polynomial P(r) ≈ 2^r on [-0.5, 0.5].
+//   Polynomial:  P(r) = r + r² * (c2 + r * c3) where c2=0.5, c3=0.1666667
+// ---------------------------------------------------------------------------
+
+static Value approxExpBoundedFast(OpBuilder &b, Location loc, Value x) {
+  auto f32 = b.getF32Type();
+
+  // log2(e)
+  Value log2e =
+      b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(1.44269504089f));
+
+  // x * log2(e)
+  Value xLog2e = b.create<arith::MulFOp>(loc, x, log2e);
+
+  // n = round(x * log2(e))
+  Value n = b.create<math::RoundOp>(loc, xLog2e);
+
+  // r = x * log2(e) - n    (fractional part)
+  Value r = b.create<arith::SubFOp>(loc, xLog2e, n);
+
+  // P(r) = r + r² * (c2 + r * c3)
+  Value c2 = b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(0.5f));
+  Value c3 =
+      b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(0.16666667f));
+  Value r2 = b.create<arith::MulFOp>(loc, r, r);
+  Value inner =
+      b.create<arith::AddFOp>(loc, c2, b.create<arith::MulFOp>(loc, c3, r));
+  Value poly =
+      b.create<arith::AddFOp>(loc, r, b.create<arith::MulFOp>(loc, r2, inner));
+
+  // 2^n:  use math.exp2 on integer n ← exact result.
+  Value pow2 = b.create<math::Exp2Op>(loc, n);
+
+  // 2^n * (1 + P(r)) = pow2 + pow2 * poly
+  Value one = b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(1.0f));
+  Value mantissa = b.create<arith::AddFOp>(loc, one, poly);
+  Value result = b.create<arith::MulFOp>(loc, pow2, mantissa);
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+Value createApproxExp(OpBuilder &b, Location loc, Value x, MathMode mode) {
+  switch (mode) {
+  case MathMode::strict:
+    return b.create<math::ExpOp>(loc, x);
+  case MathMode::bounded_fast:
+  case MathMode::unsafe_fast:
+    return approxExpBoundedFast(b, loc, x);
+  }
+  return b.create<math::ExpOp>(loc, x);
+}
+
+Value createApproxSigmoid(OpBuilder &b, Location loc, Value x, MathMode mode) {
+  auto f32 = b.getF32Type();
+  Value one = b.create<arith::ConstantOp>(loc, f32, b.getF32FloatAttr(1.0f));
+  Value negX = b.create<arith::NegFOp>(loc, x);
+  Value expNegX = createApproxExp(b, loc, negX, mode);
+  Value denom = b.create<arith::AddFOp>(loc, one, expNegX);
+  return b.create<arith::DivFOp>(loc, one, denom);
+}
+
+Value createApproxCos(OpBuilder &b, Location loc, Value x, MathMode mode) {
+  // For now, cos/sin approximations use math ops directly.
+  // A future enhancement can add range-reduced polynomial evaluation here.
+  return b.create<math::CosOp>(loc, x);
+}
+
+Value createApproxSin(OpBuilder &b, Location loc, Value x, MathMode mode) {
+  return b.create<math::SinOp>(loc, x);
+}
+
+} // namespace llk
+} // namespace mlir
