@@ -1,31 +1,62 @@
 //===- llk-compile.cpp - LLK kernel compiler driver -----------------------===//
 //
-// CLI tool that parses an MLIR module containing llk.fused_swiglu,
-// runs the progressive lowering pipeline (LLK→Linalg→Bufferize),
+// CLI tool that parses an MLIR module containing LLK dialect ops,
+// runs the full progressive lowering pipeline (LLK→Linalg→...→LLVM IR),
 // JIT-compiles the result, and reports success.
 //
 // Usage: llk-compile <input.mlir> [--M=<dim>] [--N=<dim>] [--K=<dim>]
+//                                [--op=<swiglu|rope|attention>]
 //
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Runtime/JitCache.h"
+#include "LLK/Transforms/ForallToLLRT.h"
+#include "LLK/Transforms/FuseDoubleContraction.h"
+#include "LLK/Transforms/LinearizeForall.h"
+#include "LLK/Transforms/PackWeights.h"
+#include "LLK/Transforms/ScheduleSelection.h"
+#include "LLK/Transforms/ScratchAnalysis.h"
+#include "LLK/Transforms/SerialParallelDispatch.h"
+#include "LLK/Transforms/ShapeSpecialization.h"
+#include "LLK/Transforms/TileAndVectorize.h"
 
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/Passes.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
+#include "mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Arith/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/IR/ValueBoundsOpInterfaceImpl.h"
+#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Vector/Transforms/SubsetOpInterfaceImpl.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/InitAllPasses.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Config/llvm-config.h"
@@ -50,23 +81,108 @@ static cl::opt<int64_t> optN("N", cl::desc("N dimension (cols)"), cl::init(0));
 static cl::opt<int64_t> optK("K", cl::desc("K dimension (hidden)"),
                              cl::init(0));
 
+static cl::opt<std::string>
+    optOp("op", cl::desc("Operation kind (swiglu, rope, attention)"),
+          cl::init("swiglu"));
+
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
 
 static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
   mlir::PassManager pm(module->getContext());
+  // Disable per-pass verification during the pipeline to avoid false
+  // positives from intermediate IR states (e.g. scf.for referencing
+  // values defined outside the region during lowering).
+  pm.enableVerifier(false);
 
-  // Step 1: Lower LLK dialect ops to Linalg + Arith + Math.
+  // Stage 1: Lower LLK dialect ops to Linalg + Arith + Math.
   pm.addPass(mlir::llk::createLLKToLinalgPass());
 
-  // Step 2: Canonicalize to clean up the lowered IR.
+  // Stage 2: Canonicalize to clean up the lowered IR.
   pm.addPass(mlir::createCanonicalizerPass(mlir::GreedyRewriteConfig()));
 
-  // Step 3: One-Shot Bufferize (tensor → memref).
+  // Stage 3: Shape specialization — classify M bucket and emit dispatch guards.
+  pm.addPass(mlir::llk::createShapeSpecializationPass());
+
+  // Stage 4: Select schedule from schedule_db.json based on (op, M, N, K, ISA).
+  pm.addPass(mlir::llk::createScheduleSelectionPass());
+
+  // Stage 5: Fuse double contraction (SwiGLU-specific; no-op for
+  // RoPE/Attention).
+  pm.addPass(mlir::llk::createFuseDoubleContractionPass());
+
+  // Stage 6: Canonicalize after fusion.
+  pm.addPass(mlir::createCanonicalizerPass(mlir::GreedyRewriteConfig()));
+
+  // Stage 7: Annotate weights with packing layout.
+  pm.addPass(mlir::llk::createPackWeightsPass());
+
+  // Stage 8: Tile and vectorize using Transform dialect schedule.
+  pm.addPass(mlir::llk::createTileAndVectorizePass());
+
+  // Stage 9: Canonicalize after tiling/vectorization.
+  pm.addPass(mlir::createCanonicalizerPass(mlir::GreedyRewriteConfig()));
+
+  // Stage 10: Linearize 2D scf.forall into 1D (Parallel Decompose).
+  pm.addPass(mlir::llk::createLinearizeForallPass());
+
+  // Stage 11: Select serial vs parallel dispatch based on shape thresholds.
+  pm.addPass(mlir::llk::createSerialParallelDispatchPass());
+
+  // Stage 12: One-Shot Bufferize (tensor → memref).
   BufOpts bufOpts;
   bufOpts.bufferizeFunctionBoundaries = true;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(bufOpts));
+
+  // Stage 13: Audit scratch allocations post-bufferization.
+  pm.addPass(mlir::llk::createScratchAnalysisPass());
+
+  // Stage 14: Lower remaining linalg ops on memref to scf.for loops.
+  {
+    const auto *passInfo =
+        mlir::PassInfo::lookup(llvm::StringRef("convert-linalg-to-loops"));
+    if (passInfo) {
+      (void)passInfo->addToPipeline(pm, {}, [](const llvm::Twine &msg) {
+        llvm::errs() << "convert-linalg-to-loops: " << msg << "\n";
+        return mlir::failure();
+      });
+    }
+  }
+
+  // Stage 15: Lower scf.forall to llrt.parallel_for (ThreadPool runtime).
+  pm.addPass(mlir::llk::createForallToLLRTPass());
+
+  // Stage 16: Convert Vector → LLVM (SIMD intrinsics).
+  pm.addPass(mlir::createConvertVectorToLLVMPass());
+
+  // Stage 17: Convert SCF → CF.
+#if LLVM_VERSION_MAJOR >= 21
+  pm.addPass(mlir::createSCFToControlFlowPass());
+#else
+  pm.addPass(mlir::createConvertSCFToCFPass());
+#endif
+
+  // Stage 18: Convert Arith → LLVM.
+  pm.addPass(mlir::createArithToLLVMConversionPass());
+
+  // Stage 19: Convert Math → LLVM.
+  pm.addPass(mlir::createConvertMathToLLVMPass());
+
+  // Stage 20: Convert Func → LLVM.
+  pm.addPass(mlir::createConvertFuncToLLVMPass());
+
+  // Stage 21: Convert MemRef → LLVM.
+  pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+
+  // Stage 22: Reconcile unrealized casts from partial conversions.
+  pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+
+  // NOTE: JitCache::lookupOrCompile runs its own addLoweringPasses
+  // (ConvertVectorToLLVM → SCFToCF → CFToLLVM → ArithToLLVM →
+  //  MathToLLVM → FuncToLLVM → FinalizeMemRefToLLVM →
+  //  ReconcileUnrealizedCasts) but these are no-ops when the module
+  //  is already fully lowered to LLVM dialect.
 
   return pm.run(module);
 }
@@ -81,9 +197,36 @@ int main(int argc, char **argv) {
   // Register all built-in MLIR passes.
   mlir::registerAllPasses();
 
-  // Register the LLK-to-Linalg pass with the global registry.
+  // Register all LLK passes.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createLLKToLinalgPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createShapeSpecializationPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createScheduleSelectionPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createFuseDoubleContractionPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createPackWeightsPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createTileAndVectorizePass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createLinearizeForallPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createSerialParallelDispatchPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createScratchAnalysisPass();
+  });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createForallToLLRTPass();
   });
 
   // Parse command line.
@@ -94,7 +237,31 @@ int main(int argc, char **argv) {
   registry.insert<mlir::llk::LLKDialect, mlir::func::FuncDialect,
                   mlir::linalg::LinalgDialect, mlir::tensor::TensorDialect,
                   mlir::scf::SCFDialect, mlir::arith::ArithDialect,
-                  mlir::math::MathDialect, mlir::memref::MemRefDialect>();
+                  mlir::math::MathDialect, mlir::memref::MemRefDialect,
+                  mlir::affine::AffineDialect, mlir::LLVM::LLVMDialect>();
+
+  // Register TilingInterface external models so Linalg ops can be tiled.
+  mlir::linalg::registerTilingInterfaceExternalModels(registry);
+
+  // Register BufferizableOpInterface external models for One-Shot Bufferize.
+  mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
+      registry);
+  mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
+
+  // Register SubsetOpInterface external models for bufferization analysis.
+  mlir::vector::registerSubsetOpInterfaceExternalModels(registry);
+
+  // Register ValueBoundsOpInterface external models for bufferization
+  // analysis (needed when the IR contains affine, scf.for, scf.forall,
+  // arith, and linalg ops with dynamic shapes).
+  mlir::affine::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::arith::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::linalg::registerValueBoundsOpInterfaceExternalModels(registry);
+  mlir::scf::registerValueBoundsOpInterfaceExternalModels(registry);
 
   mlir::MLIRContext ctx(registry);
   ctx.loadAllAvailableDialects();

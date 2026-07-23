@@ -195,6 +195,7 @@ add_mlir_library(LLKPasses
 # MLIR_CONVERSION_LIBS to avoid linking 200+ libraries when using
 # pre-built LLVM binary releases (which may have missing libs).
 set(LLK_MLIR_EXEC_LIBS
+    MLIRAffineDialect
     MLIRArithDialect
     MLIRArithToLLVM
     MLIRArithTransforms
@@ -231,7 +232,7 @@ target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContr
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
-target_link_libraries(llk-compile PRIVATE LLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-compile PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection LLKRuntime ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-bench (benchmarking harness)
 add_llvm_executable(llk-bench tools/llk-bench/llk-bench.cpp)
