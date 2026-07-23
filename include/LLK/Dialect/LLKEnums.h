@@ -86,6 +86,30 @@ inline std::optional<SoftmaxMode> symbolizeSoftmaxMode(llvm::StringRef str) {
       .Default(std::nullopt);
 }
 
+// Weight memory layout enum
+enum Layout : uint32_t {
+  row_major = 0,
+  packed_kn = 1,
+};
+
+// Stringification / symbolization for Layout
+inline llvm::StringRef stringifyLayout(Layout val) {
+  switch (val) {
+  case row_major:
+    return "row_major";
+  case packed_kn:
+    return "packed_kn";
+  }
+  return "";
+}
+
+inline std::optional<Layout> symbolizeLayout(llvm::StringRef str) {
+  return llvm::StringSwitch<std::optional<Layout>>(str)
+      .Case("row_major", row_major)
+      .Case("packed_kn", packed_kn)
+      .Default(std::nullopt);
+}
+
 } // namespace mlir::llk
 
 #endif // LLK_DIALECT_LLKENUMS_H

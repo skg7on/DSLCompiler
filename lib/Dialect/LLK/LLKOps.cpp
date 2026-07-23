@@ -171,6 +171,22 @@ MutableOperandRange AttentionOp::getDpsInitsMutable() {
 }
 
 //===----------------------------------------------------------------------===//
+// DestinationStyleOpInterface: return the mutable init operands for AssumeOp.
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange AssumeOp::getDpsInitsMutable() { return getInitMutable(); }
+
+//===----------------------------------------------------------------------===//
+// SymbolUserOpInterface: verify symbol uses for DispatchOp.
+//===----------------------------------------------------------------------===//
+
+LogicalResult DispatchOp::verifySymbolUses(SymbolTableCollection &) {
+  // DispatchOp uses region-based dispatch; no explicit symbol references
+  // to verify at this stage.
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Custom verifier for AttentionOp.
 //===----------------------------------------------------------------------===//
 
@@ -239,4 +255,34 @@ LogicalResult AttentionOp::verify() {
            << qD << " vs init=" << initD;
 
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// AssumeOp verifier
+//===----------------------------------------------------------------------===//
+
+mlir::LogicalResult llk::AssumeOp::verify() {
+  if (getDivisibleDims().size() != getDivisibleFactors().size())
+    return emitOpError("divisible_dims and divisible_factors must have "
+                       "the same number of elements");
+  for (auto factor : getDivisibleFactors())
+    if (factor <= 0)
+      return emitOpError("divisible_factors must all be positive");
+  return mlir::success();
+}
+
+//===----------------------------------------------------------------------===//
+// DispatchOp verifier
+//===----------------------------------------------------------------------===//
+
+mlir::LogicalResult llk::DispatchOp::verify() {
+  if (getVariants().empty())
+    return emitOpError("must have at least one variant region");
+  // The last variant is the "otherwise" fallback and has no condition.
+  for (size_t i = 0; i < getVariants().size() - 1; ++i) {
+    auto &region = getVariants()[i];
+    if (region.empty())
+      return emitOpError("variant ") << i << " has an empty body";
+  }
+  return mlir::success();
 }

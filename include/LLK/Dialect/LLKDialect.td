@@ -56,4 +56,17 @@ def LLK_SoftmaxModeAttr : EnumAttr<LLK_Dialect, LLK_SoftmaxMode, "softmax_mode">
     let assemblyFormat = "`<` $value `>`";
 }
 
+// Layout enum
+def LLK_RowMajor : I32EnumAttrCase<"row_major", 0, "row_major">;
+def LLK_PackedKN : I32EnumAttrCase<"packed_kn", 1, "packed_kn">;
+def LLK_Layout : I32EnumAttr<"Layout", "Weight memory layout", [
+    LLK_RowMajor, LLK_PackedKN
+]> {
+    let cppNamespace = "::mlir::llk";
+    let genSpecializedAttr = 0;
+}
+def LLK_LayoutAttr : EnumAttr<LLK_Dialect, LLK_Layout, "layout"> {
+    let assemblyFormat = "`<` $value `>`";
+}
+
 #endif
