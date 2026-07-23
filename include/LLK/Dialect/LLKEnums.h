@@ -66,6 +66,26 @@ inline std::optional<MathMode> symbolizeMathMode(llvm::StringRef str) {
       .Default(std::nullopt);
 }
 
+// Softmax algorithm enum
+enum SoftmaxMode : uint32_t {
+  online = 0,
+};
+
+// Stringification / symbolization for SoftmaxMode
+inline llvm::StringRef stringifySoftmaxMode(SoftmaxMode val) {
+  switch (val) {
+  case online:
+    return "online";
+  }
+  return "";
+}
+
+inline std::optional<SoftmaxMode> symbolizeSoftmaxMode(llvm::StringRef str) {
+  return llvm::StringSwitch<std::optional<SoftmaxMode>>(str)
+      .Case("online", online)
+      .Default(std::nullopt);
+}
+
 } // namespace mlir::llk
 
 #endif // LLK_DIALECT_LLKENUMS_H

@@ -44,4 +44,16 @@ def LLK_MathModeAttr : EnumAttr<LLK_Dialect, LLK_MathMode, "math_mode"> {
     let assemblyFormat = "`<` $value `>`";
 }
 
+// Softmax mode enum
+def LLK_OnlineSoftmax : I32EnumAttrCase<"online", 0, "online">;
+def LLK_SoftmaxMode : I32EnumAttr<"SoftmaxMode", "Softmax algorithm", [
+    LLK_OnlineSoftmax
+]> {
+    let cppNamespace = "::mlir::llk";
+    let genSpecializedAttr = 0;
+}
+def LLK_SoftmaxModeAttr : EnumAttr<LLK_Dialect, LLK_SoftmaxMode, "softmax_mode"> {
+    let assemblyFormat = "`<` $value `>`";
+}
+
 #endif

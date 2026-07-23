@@ -7,4 +7,4 @@ func.func @swiglu_M2_N8192_K8192(%x: tensor<2x8192xbf16>, %wg: tensor<8192x8192x
       -> tensor<2x8192xbf16>
   return %y : tensor<2x8192xbf16>
 }
-// CHECK: selected schedule: BM={{.*}} BN={{.*}} BK={{.*}}
+// CHECK: selected schedule for fused_swiglu: BM={{.*}} BN={{.*}} BK={{.*}}

@@ -25,15 +25,15 @@
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
-#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
@@ -87,8 +87,8 @@ static uint16_t f32_to_bf16(float f) {
 // Y = SiLU(X @ Wg^T) * (X @ Wu^T)
 // ---------------------------------------------------------------------------
 
-static void swiglu_fp64(const double* x, const double* wg, const double* wu,
-                        double* y, int64_t M, int64_t N, int64_t K) {
+static void swiglu_fp64(const double *x, const double *wg, const double *wu,
+                        double *y, int64_t M, int64_t N, int64_t K) {
   std::vector<double> gate(M * N, 0.0);
   std::vector<double> up(M * N, 0.0);
 
@@ -117,20 +117,17 @@ static void swiglu_fp64(const double* x, const double* wg, const double* wu,
 
 static mlir::DialectRegistry buildRegistry() {
   mlir::DialectRegistry registry;
-  registry.insert<mlir::llk::LLKDialect,
-                  mlir::func::FuncDialect,
-                  mlir::linalg::LinalgDialect,
-                  mlir::tensor::TensorDialect,
-                  mlir::scf::SCFDialect,
-                  mlir::arith::ArithDialect,
-                  mlir::math::MathDialect,
-                  mlir::memref::MemRefDialect>();
+  registry.insert<mlir::llk::LLKDialect, mlir::func::FuncDialect,
+                  mlir::linalg::LinalgDialect, mlir::tensor::TensorDialect,
+                  mlir::scf::SCFDialect, mlir::arith::ArithDialect,
+                  mlir::math::MathDialect, mlir::memref::MemRefDialect>();
   // Register bufferization interfaces required by One-Shot Bufferize.
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
-  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
+      registry);
   return registry;
 }
 
@@ -157,8 +154,8 @@ static std::string generateSwiGLUIR(int64_t M, int64_t N, int64_t K) {
   return ss.str();
 }
 
-static mlir::OwningOpRef<mlir::ModuleOp> parseSwiGLUModule(
-    mlir::MLIRContext* ctx, int64_t M, int64_t N, int64_t K) {
+static mlir::OwningOpRef<mlir::ModuleOp>
+parseSwiGLUModule(mlir::MLIRContext *ctx, int64_t M, int64_t N, int64_t K) {
   std::string ir = generateSwiGLUIR(M, N, K);
   return mlir::parseSourceString<mlir::ModuleOp>(ir, ctx);
 }
@@ -177,7 +174,7 @@ TEST(SwiGLUScalar, ParseAndVerify) {
   mlir::MLIRContext ctx(registry);
 
   // Dialect load check (always works).
-  auto* dialect = ctx.getOrLoadDialect<mlir::llk::LLKDialect>();
+  auto *dialect = ctx.getOrLoadDialect<mlir::llk::LLKDialect>();
   ASSERT_NE(dialect, nullptr) << "LLK dialect must be loadable";
   EXPECT_EQ(dialect->getNamespace(), "llk");
 
@@ -193,7 +190,7 @@ TEST(SwiGLUScalar, ParseAndVerify) {
   // Verify the module contains the expected ops.
   bool foundFunc = false;
   bool foundSwiGLU = false;
-  module->walk([&](mlir::Operation* op) {
+  module->walk([&](mlir::Operation *op) {
     if (op->getName().getStringRef() == "func.func") {
       auto nameAttr = op->getAttrOfType<mlir::StringAttr>(
           mlir::SymbolTable::getSymbolAttrName());
@@ -224,8 +221,9 @@ TEST(SwiGLUScalar, LLKToLinalgLowering) {
 
   // No llk.fused_swiglu ops should remain
   int swigluCount = 0;
-  module->walk([&](mlir::Operation* op) {
-    if (op->getName().getStringRef() == "llk.fused_swiglu") swigluCount++;
+  module->walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef() == "llk.fused_swiglu")
+      swigluCount++;
   });
   EXPECT_EQ(swigluCount, 0) << "llk.fused_swiglu should be fully lowered";
 
@@ -239,15 +237,19 @@ TEST(SwiGLUScalar, LLKToLinalgLowering) {
   module->walk([&](mlir::linalg::GenericOp op) { genericCount++; });
   EXPECT_EQ(genericCount, 1) << "Should produce 1 linalg.generic op";
 
-  // The linalg.generic should contain arith.extf, math.exp, arith.truncf
+  // The linalg.generic should contain arith.extf, exp, arith.truncf.
+  // For bounded_fast mode, createApproxExp emits math.exp2 instead of math.exp.
   int extfCount = 0, expCount = 0, truncfCount = 0;
-  module->walk([&](mlir::Operation* op) {
-    if (mlir::isa<mlir::arith::ExtFOp>(op)) extfCount++;
-    if (mlir::isa<mlir::math::ExpOp>(op)) expCount++;
-    if (mlir::isa<mlir::arith::TruncFOp>(op)) truncfCount++;
+  module->walk([&](mlir::Operation *op) {
+    if (mlir::isa<mlir::arith::ExtFOp>(op))
+      extfCount++;
+    if (mlir::isa<mlir::math::ExpOp>(op) || mlir::isa<mlir::math::Exp2Op>(op))
+      expCount++;
+    if (mlir::isa<mlir::arith::TruncFOp>(op))
+      truncfCount++;
   });
   EXPECT_GE(extfCount, 2) << "Should have bf16->f32 promotions";
-  EXPECT_GE(expCount, 1) << "Should have math.exp for SiLU";
+  EXPECT_GE(expCount, 1) << "Should have exp for SiLU";
   EXPECT_GE(truncfCount, 1) << "Should have f32->bf16 truncation";
 }
 
@@ -313,9 +315,9 @@ TEST(SwiGLUScalar, MultipleShapeConfigurations) {
     int64_t M, N, K;
   };
   std::vector<Shape> shapes = {
-      {1, 1, 1},    // unit
-      {1, 128, 1},  // K=1, wide N
-      {16, 1, 64},  // N=1, wide K
+      {1, 1, 1},   // unit
+      {1, 128, 1}, // K=1, wide N
+      {16, 1, 64}, // N=1, wide K
       {32, 64, 128},
   };
 
@@ -325,7 +327,8 @@ TEST(SwiGLUScalar, MultipleShapeConfigurations) {
     mlir::MLIRContext ctx(registry);
 
     auto module = parseSwiGLUModule(&ctx, M, N, K);
-    if (!module) continue;
+    if (!module)
+      continue;
     anyParsed = true;
 
     mlir::PassManager pm(&ctx);
@@ -421,8 +424,8 @@ TEST(SwiGLUScalar, E2EWithAbiWrapper) {
 
   // --- Compute FP64 reference ---
   std::vector<double> y_ref(M * N);
-  swiglu_fp64(x_ref.data(), wg_ref.data(), wu_ref.data(), y_ref.data(),
-              M, N, K);
+  swiglu_fp64(x_ref.data(), wg_ref.data(), wu_ref.data(), y_ref.data(), M, N,
+              K);
 
   // --- Validate ---
   float max_err = 0.0f;
@@ -430,10 +433,10 @@ TEST(SwiGLUScalar, E2EWithAbiWrapper) {
     float result = bf16_to_f32(y_bf16[i]);
     float expected = static_cast<float>(y_ref[i]);
     float abs_err = std::abs(result - expected);
-    if (abs_err > max_err) max_err = abs_err;
+    if (abs_err > max_err)
+      max_err = abs_err;
   }
 
-  EXPECT_LT(max_err, 1e-2f)
-      << "BF16 SwiGLU E2E: max absolute error " << max_err
-      << " exceeds 1e-2 tolerance";
+  EXPECT_LT(max_err, 1e-2f) << "BF16 SwiGLU E2E: max absolute error " << max_err
+                            << " exceeds 1e-2 tolerance";
 }

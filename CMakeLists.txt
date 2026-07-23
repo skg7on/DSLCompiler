@@ -76,8 +76,8 @@ add_mlir_dialect_library(LLKDialect
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
-    DEPENDS LLKDialect
-    LINK_LIBS PUBLIC LLKDialect MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
+    DEPENDS LLKDialect LLKCommon
+    LINK_LIBS PUBLIC LLKDialect LLKCommon MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
                      MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
@@ -107,6 +107,17 @@ add_library(LLKTargetX86 STATIC
 )
 target_include_directories(LLKTargetX86 PUBLIC
     ${CMAKE_SOURCE_DIR}/include
+)
+
+# Library: Common utilities shared across all kernels
+add_mlir_library(LLKCommon
+    lib/Transforms/Common/TilingUtils.cpp
+    lib/Transforms/Common/VectorizationUtils.cpp
+    lib/Transforms/Common/ScheduleLoader.cpp
+    lib/Transforms/Common/MaskGeneration.cpp
+    lib/Transforms/Common/MathApproximation.cpp
+    DEPENDS LLKDialect
+    LINK_LIBS PUBLIC MLIRArithDialect MLIRMathDialect MLIRVectorDialect MLIRPass
 )
 
 # Library: LLK Transforms (TileAndVectorize)
@@ -266,6 +277,11 @@ endif()
 
 add_llk_test(VectorVsScalar test/Numerical/vector_vs_scalar.cpp)
 add_llk_test(EdgeCases test/Execution/edge_cases.cpp)
+add_llk_test(RoPECorrectness test/Execution/rope_correctness.cpp)
+add_llk_test(AttentionCorrectness test/Execution/attention_correctness.cpp)
+add_llk_test(AttentionStability test/Execution/attention_stability.cpp)
+add_llk_test(RoPEPrecision test/Numerical/rope_precision.cpp)
+add_llk_test(SharedPipeline test/Execution/shared_pipeline.cpp)
 add_llk_test(CpuFeaturesTest test/Execution/cpu_features_test.cpp)
 target_link_libraries(CpuFeaturesTest PRIVATE LLKTargetX86)
 
@@ -304,6 +320,14 @@ if(FILECHECK_BIN)
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
+  )
+  # RoPE lowering: verify llk.rope → cos/sin + even/odd interleave
+  add_test(NAME RoPELowering
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir"
+  )
+  # Attention lowering: verify llk.attention → Q@K^T + softmax + @V
+  add_test(NAME AttentionLowering
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/attention_lowering.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/attention_lowering.mlir"
   )
   # Schedule parse test: verify the transform dialect schedule parses correctly
   # and the named sequence round-trips through llk-opt.
@@ -381,6 +405,18 @@ if(FILECHECK_BIN)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --select-schedule \
         ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_fallback.mlir \
         2>&1 | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/schedule_fallback.mlir"
+  )
+  # Online softmax: verify max reduction + exp + div pattern in attention lowering
+  add_test(NAME OnlineSoftmax
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/online_softmax.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/online_softmax.mlir"
+  )
+  # RoPE vector shuffle: verify even/odd slice + interleave
+  add_test(NAME RoPEVectorShuffle
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir"
+  )
+  # Causal mask: verify cmp + select pattern for upper-triangular -inf
+  add_test(NAME CausalMask
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir"
   )
 endif()
 
