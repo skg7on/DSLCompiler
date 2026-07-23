@@ -277,6 +277,11 @@ endif()
 
 add_llk_test(VectorVsScalar test/Numerical/vector_vs_scalar.cpp)
 add_llk_test(EdgeCases test/Execution/edge_cases.cpp)
+add_llk_test(RoPECorrectness test/Execution/rope_correctness.cpp)
+add_llk_test(AttentionCorrectness test/Execution/attention_correctness.cpp)
+add_llk_test(AttentionStability test/Execution/attention_stability.cpp)
+add_llk_test(RoPEPrecision test/Numerical/rope_precision.cpp)
+add_llk_test(SharedPipeline test/Execution/shared_pipeline.cpp)
 add_llk_test(CpuFeaturesTest test/Execution/cpu_features_test.cpp)
 target_link_libraries(CpuFeaturesTest PRIVATE LLKTargetX86)
 
