@@ -40,6 +40,11 @@ include(AddLLVM)
 include(AddMLIR)
 include(HandleLLVMOptions)
 
+# Treat deprecated API usage as errors
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  add_compile_options(-Werror=deprecated-declarations)
+endif()
+
 # TableGen for LLK dialect
 set(LLVM_TARGET_DEFINITIONS include/LLK/Dialect/LLKDialect.td)
 mlir_tablegen(include/LLK/Dialect/LLKDialect.h.inc -gen-dialect-decls -dialect=llk)

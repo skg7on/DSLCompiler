@@ -136,5 +136,6 @@ Exclude generated `.inc` files from all audit results.
 
 1. Write new code using only the recommended API forms
 2. When touching a line that uses a deprecated form, update it in the same commit
-3. Build with `ninja` and fix any deprecation warnings before committing
-4. Run the audit commands above before finalizing a PR
+3. The project compiles with `-Werror=deprecated-declarations` — any deprecated API usage is a **hard build error**, not a warning
+4. Build with `ninja` and resolve all errors before committing
+5. Run the audit commands above before finalizing a PR
