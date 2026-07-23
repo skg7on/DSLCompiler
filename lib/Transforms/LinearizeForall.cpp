@@ -66,7 +66,7 @@ private:
     Value totalTiles = getValueOrCreateConstantIndexOp(builder, loc, ub[0]);
     for (int64_t i = 1; i < numDims; i++) {
       Value ubVal = getValueOrCreateConstantIndexOp(builder, loc, ub[i]);
-      totalTiles = builder.create<arith::MulIOp>(loc, totalTiles, ubVal);
+      totalTiles = arith::MulIOp::create(builder, loc, totalTiles, ubVal);
     }
 
     // Compute strides: stride[i] = product of ub[j] for j > i
@@ -77,9 +77,9 @@ private:
     }
 
     // Create 1D forall using builder
-    auto newForall = builder.create<scf::ForallOp>(
-        loc, SmallVector<OpFoldResult>{totalTiles}, forall.getOutputs(),
-        forall.getMapping());
+    auto newForall = scf::ForallOp::create(
+        builder, loc, SmallVector<OpFoldResult>{totalTiles},
+        forall.getOutputs(), forall.getMapping());
 
     // Populate the new body
     Block *newBody = newForall.getBody();
@@ -95,12 +95,12 @@ private:
       Value dimSize = getValueOrCreateConstantIndexOp(builder, loc, ub[i]);
 
       if (i == numDims - 1) {
-        iv = builder.create<arith::RemSIOp>(loc, tid, dimSize);
+        iv = arith::RemSIOp::create(builder, loc, tid, dimSize);
       } else {
         Value strideVal =
-            builder.create<arith::ConstantIndexOp>(loc, strides[i]);
-        Value divided = builder.create<arith::DivSIOp>(loc, tid, strideVal);
-        iv = builder.create<arith::RemSIOp>(loc, divided, dimSize);
+            arith::ConstantIndexOp::create(builder, loc, strides[i]);
+        Value divided = arith::DivSIOp::create(builder, loc, tid, strideVal);
+        iv = arith::RemSIOp::create(builder, loc, divided, dimSize);
       }
       mapper.map(oldBody->getArgument(i), iv);
     }
