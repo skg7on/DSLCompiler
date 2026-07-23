@@ -1,4 +1,5 @@
-//===- LLKOps.cpp - LLK dialect operations ---------------------------------===//
+//===- LLKOps.cpp - LLK dialect operations
+//---------------------------------===//
 //
 // Implements the LLK dialect operations.
 //
@@ -74,8 +75,7 @@ LogicalResult FusedSwiGLUOp::verify() {
   if (!ShapedType::isDynamic(xK) && !ShapedType::isDynamic(wuK) && xK != wuK)
     return emitOpError("K dimension mismatch between X=")
            << xK << " and Wu=" << wuK;
-  if (!ShapedType::isDynamic(wgN) && !ShapedType::isDynamic(wuN) &&
-      wgN != wuN)
+  if (!ShapedType::isDynamic(wgN) && !ShapedType::isDynamic(wuN) && wgN != wuN)
     return emitOpError("N dimension mismatch between Wg=")
            << wgN << " and Wu=" << wuN;
 
@@ -83,7 +83,7 @@ LogicalResult FusedSwiGLUOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
-// DestinationStyleOpInterface: return the mutable init operands.
+// DestinationStyleOpInterface: return the mutable init operands for SwiGLU.
 //===----------------------------------------------------------------------===//
 
 MutableOperandRange FusedSwiGLUOp::getDpsInitsMutable() {
@@ -110,9 +110,10 @@ SmallVector<Range> FusedSwiGLUOp::getIterationDomain(OpBuilder &b) {
           Range{zero, kDim, one}};
 }
 
-FailureOr<TilingResult> FusedSwiGLUOp::getTiledImplementation(
-    OpBuilder &b, ArrayRef<OpFoldResult> offsets,
-    ArrayRef<OpFoldResult> sizes) {
+FailureOr<TilingResult>
+FusedSwiGLUOp::getTiledImplementation(OpBuilder &b,
+                                      ArrayRef<OpFoldResult> offsets,
+                                      ArrayRef<OpFoldResult> sizes) {
   // For M1: return failure to signal no tiling support yet (M2 will implement).
   return failure();
 }
@@ -124,5 +125,77 @@ LogicalResult FusedSwiGLUOp::getResultTilePosition(
   // Output uses M,N parallel dims (indices 0,1).
   resultOffsets = {offsets[0], offsets[1]};
   resultSizes = {sizes[0], sizes[1]};
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// DestinationStyleOpInterface: return the mutable init operands for RoPE.
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange RoPEOp::getDpsInitsMutable() { return getInitMutable(); }
+
+//===----------------------------------------------------------------------===//
+// Custom verifier for RoPEOp.
+//===----------------------------------------------------------------------===//
+
+LogicalResult RoPEOp::verify() {
+  auto xType = mlir::cast<ShapedType>(getX().getType());
+  auto posType = mlir::cast<ShapedType>(getPositionIds().getType());
+
+  if (!xType.hasRank() || xType.getRank() != 4)
+    return emitOpError("X must be a 4D tensor [B, H, L, D]");
+  if (!posType.hasRank() || posType.getRank() != 1)
+    return emitOpError("position_ids must be a 1D tensor [L]");
+
+  int64_t D = xType.getDimSize(3);
+  if (!ShapedType::isDynamic(D) && D % 2 != 0)
+    return emitOpError("D dimension must be even, got ") << D;
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// DestinationStyleOpInterface: return the mutable init operands for Attention.
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange AttentionOp::getDpsInitsMutable() {
+  return getInitMutable();
+}
+
+//===----------------------------------------------------------------------===//
+// Custom verifier for AttentionOp.
+//===----------------------------------------------------------------------===//
+
+LogicalResult AttentionOp::verify() {
+  auto qType = mlir::cast<ShapedType>(getQ().getType());
+  auto kType = mlir::cast<ShapedType>(getK().getType());
+  auto vType = mlir::cast<ShapedType>(getV().getType());
+  auto initType = mlir::cast<ShapedType>(getInit().getType());
+
+  if (!qType.hasRank() || qType.getRank() != 4)
+    return emitOpError("Q must be a 4D tensor [B, H, Lq, D]");
+  if (!kType.hasRank() || kType.getRank() != 4)
+    return emitOpError("K must be a 4D tensor [B, H, Lk, D]");
+  if (!vType.hasRank() || vType.getRank() != 4)
+    return emitOpError("V must be a 4D tensor [B, H, Lk, D]");
+
+  int64_t qD = qType.getDimSize(3);
+  int64_t kD = kType.getDimSize(3);
+  int64_t vD = vType.getDimSize(3);
+  int64_t initD = initType.getDimSize(3);
+  int64_t kL = kType.getDimSize(2);
+  int64_t vL = vType.getDimSize(2);
+
+  if (!ShapedType::isDynamic(qD) && !ShapedType::isDynamic(kD) && qD != kD)
+    return emitOpError("D dimension mismatch: Q=") << qD << " vs K=" << kD;
+  if (!ShapedType::isDynamic(kD) && !ShapedType::isDynamic(vD) && kD != vD)
+    return emitOpError("D dimension mismatch: K=") << kD << " vs V=" << vD;
+  if (!ShapedType::isDynamic(kL) && !ShapedType::isDynamic(vL) && kL != vL)
+    return emitOpError("Lk dimension mismatch: K=") << kL << " vs V=" << vL;
+  if (!ShapedType::isDynamic(qD) && !ShapedType::isDynamic(initD) &&
+      qD != initD)
+    return emitOpError("D dimension mismatch: Q=")
+           << qD << " vs init=" << initD;
+
   return success();
 }

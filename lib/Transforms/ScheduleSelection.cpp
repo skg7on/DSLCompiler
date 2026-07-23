@@ -92,9 +92,9 @@ loadScheduleDB(llvm::StringRef dbPath, int M_bucket, int64_t N, int64_t K) {
     if (!entryObj)
       continue;
 
-    // Filter by operation
+    // Filter by operation (match any of the three known kinds).
     auto opStr = entryObj->getString("operation");
-    if (!opStr || *opStr != "fused_swiglu")
+    if (!opStr)
       continue;
 
     // Filter by shape
@@ -177,38 +177,71 @@ struct ScheduleSelectionPass
   }
 
   void runOnOperation() override {
-    getOperation().walk([&](llk::FusedSwiGLUOp op) {
-      auto xType = op.getX().getType();
+    // Walk all LLK ops and annotate with selected schedules.
+    getOperation().walk([&](Operation *op) {
+      auto xType = [&]() -> ShapedType {
+        if (auto swiglu = dyn_cast<llk::FusedSwiGLUOp>(op))
+          return swiglu.getX().getType();
+        if (auto rope = dyn_cast<llk::RoPEOp>(op)) {
+          // For RoPE, derive shape info for schedule selection.
+          return rope.getX().getType();
+        }
+        if (auto attn = dyn_cast<llk::AttentionOp>(op)) {
+          // For Attention, use Q shape for schedule selection.
+          return attn.getQ().getType();
+        }
+        return nullptr;
+      }();
+
+      if (!xType)
+        return;
+
       if (!xType.hasStaticShape()) {
-        op.emitWarning() << "Cannot select schedule for dynamic shape";
+        op->emitWarning() << "Cannot select schedule for dynamic shape";
         return;
       }
 
+      // Get the operation name for schedule lookup.
+      std::string opName;
+      if (isa<llk::FusedSwiGLUOp>(op))
+        opName = "fused_swiglu";
+      else if (isa<llk::RoPEOp>(op))
+        opName = "rope";
+      else if (isa<llk::AttentionOp>(op))
+        opName = "attention";
+      else
+        return;
+
       int64_t M = xType.getDimSize(0);
-      int64_t N = xType.getDimSize(1);
-      int64_t K = xType.getDimSize(0); // K is inferred from X's second dim
-      // Correct: K comes from the weight shape, but for marking purposes
-      // we use the bucket-level lookup which matches on M_bucket.
+      int64_t N = 0;
+      if (auto swiglu = dyn_cast<llk::FusedSwiGLUOp>(op)) {
+        N = swiglu.getWg().getType().getDimSize(1);
+      } else if (auto rope = dyn_cast<llk::RoPEOp>(op)) {
+        N = rope.getX().getType().getDimSize(3); // D
+      } else if (auto attn = dyn_cast<llk::AttentionOp>(op)) {
+        N = attn.getQ().getType().getDimSize(3); // D
+      }
 
       int bucket = classifyM(M);
 
-      auto matches = loadScheduleDB("schedules/schedule_db.json", bucket, N, K);
+      auto matches = loadScheduleDB("schedules/schedule_db.json", bucket, N, 0);
 
       if (matches.empty()) {
-        op.emitWarning() << "No schedule entry for M_bucket=" << bucket
-                         << " N=" << xType.getDimSize(1)
-                         << " in schedules/schedule_db.json; using fallback";
+        op->emitWarning() << "No schedule entry for " << opName
+                          << " M_bucket=" << bucket
+                          << " in schedules/schedule_db.json; using fallback";
       }
 
-      ScheduleEntry selected = selectBest(matches, N, K);
+      ScheduleEntry selected = selectBest(matches, N, 0);
 
-      op.emitRemark() << "selected schedule: BM=" << selected.BM
-                      << " BN=" << selected.BN << " BK=" << selected.BK
-                      << " VM=" << selected.VM << " VN=" << selected.VN
-                      << " threads=" << selected.num_threads
-                      << " grain=" << selected.grain_size
-                      << " axis=" << selected.parallel_axis
-                      << " (M_bucket=" << bucket << ")";
+      op->emitRemark() << "selected schedule for " << opName
+                       << ": BM=" << selected.BM << " BN=" << selected.BN
+                       << " BK=" << selected.BK << " VM=" << selected.VM
+                       << " VN=" << selected.VN
+                       << " threads=" << selected.num_threads
+                       << " grain=" << selected.grain_size
+                       << " axis=" << selected.parallel_axis
+                       << " (M_bucket=" << bucket << ")";
     });
   }
 };
