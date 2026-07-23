@@ -56,8 +56,8 @@ struct SerialParallelDispatchPass
       int64_t totalTiles = 1;
       bool allStatic = true;
       for (auto ub : forall.getMixedUpperBound()) {
-        if (ub.is<Attribute>()) {
-          auto intAttr = dyn_cast<IntegerAttr>(ub.get<Attribute>());
+        if (isa<Attribute>(ub)) {
+          auto intAttr = dyn_cast<IntegerAttr>(cast<Attribute>(ub));
           if (intAttr) {
             totalTiles *= intAttr.getInt();
             continue;

@@ -54,8 +54,8 @@ private:
     // produces constant tile counts, so dynamic bounds indicate a pipeline
     // ordering issue.
     for (int64_t i = 0; i < numDims; i++) {
-      assert(ub[i].is<Attribute>() &&
-             isa<IntegerAttr>(ub[i].get<Attribute>()) &&
+      assert(isa<Attribute>(ub[i]) &&
+             isa<IntegerAttr>(cast<Attribute>(ub[i])) &&
              "linearize-forall requires static upper bounds; "
              "run after tiling with constant tile sizes");
     }
@@ -72,7 +72,7 @@ private:
     // Compute strides: stride[i] = product of ub[j] for j > i
     SmallVector<int64_t> strides(numDims, 1);
     for (int64_t i = numDims - 2; i >= 0; i--) {
-      auto intAttr = cast<IntegerAttr>(ub[i + 1].get<Attribute>());
+      auto intAttr = cast<IntegerAttr>(cast<Attribute>(ub[i + 1]));
       strides[i] = strides[i + 1] * intAttr.getInt();
     }
 
