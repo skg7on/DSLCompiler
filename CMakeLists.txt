@@ -301,6 +301,10 @@ add_llvm_executable(JitCacheHit test/Execution/jit_cache_hit.cpp)
 target_link_libraries(JitCacheHit PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME JitCacheHit COMMAND JitCacheHit)
 
+add_llvm_executable(CacheEviction test/Execution/cache_eviction.cpp)
+target_link_libraries(CacheEviction PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME CacheEviction COMMAND CacheEviction)
+
 # FileCheck tests
 find_program(FILECHECK_BIN FileCheck)
 # llk-opt is built as part of this project; referenced at test time via $<TARGET_FILE>
