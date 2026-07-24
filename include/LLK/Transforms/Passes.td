@@ -23,4 +23,19 @@ def TileAndVectorize : Pass<"tile-and-vectorize", "mlir::ModuleOp"> {
     ];
 }
 
+def ForallToOpenMP : Pass<"forall-to-openmp", "mlir::ModuleOp"> {
+    let summary = "Lower scf.forall to OpenMP parallel loops";
+    let description = [{
+        Prototype parallel lowering path: scf.forall -> scf.parallel -> OpenMP
+        (omp.parallel + omp.wsloop). Uses MLIR's built-in conversion chain.
+        For production use, prefer the LLRT thread pool path (ForallToLLRT).
+    }];
+    let constructor = "mlir::llk::createForallToOpenMPPass()";
+    let dependentDialects = [
+        "scf::SCFDialect",
+        "omp::OpenMPDialect",
+        "LLVM::LLVMDialect"
+    ];
+}
+
 #endif

@@ -169,6 +169,13 @@ add_mlir_library(LLKForallToLLRT
     LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRPass
 )
 
+# Library: ForallToOpenMP pass (prototype)
+add_mlir_library(LLKForallToOpenMP
+    lib/Transforms/ForallToOpenMP.cpp
+    DEPENDS LLKTransformsGen
+    LINK_LIBS PUBLIC MLIRSCFDialect MLIRSCFTransforms MLIRSCFToOpenMP MLIROpenMPDialect MLIRPass
+)
+
 # Library: ShapeSpecialization pass
 add_mlir_library(LLKShapeSpecialization
     lib/Transforms/ShapeSpecialization.cpp
@@ -211,12 +218,14 @@ set(LLK_MLIR_EXEC_LIBS
     MLIRMathToLLVM
     MLIRMemRefDialect
     MLIRMemRefToLLVM
+    MLIROpenMPDialect
     MLIRParser
     MLIRPass
     MLIRReconcileUnrealizedCasts
     MLIRRegisterAllPasses
     MLIRSCFDialect
     MLIRSCFToControlFlow
+    MLIRSCFToOpenMP
     MLIRSCFTransforms
     MLIRSupport
     MLIRTensorDialect
@@ -227,7 +236,7 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -391,6 +400,12 @@ if(FILECHECK_BIN)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --forall-to-llrt \
         ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_llrt.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_llrt.mlir"
+  )
+  # ForallToOpenMP test: scf.forall → omp.parallel + omp.wsloop
+  add_test(NAME ForallToOpenMP
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --forall-to-openmp \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_openmp.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_openmp.mlir"
   )
   # ShapeSpecialization test: check M bucket classification
   add_test(NAME ShapeSpecialization
