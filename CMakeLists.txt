@@ -109,6 +109,14 @@ target_include_directories(LLKTargetX86 PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# Library: AArch64 target feature detection (SVE/SVE2/NEON)
+add_library(LLKTargetAArch64 STATIC
+    lib/Target/AArch64/TargetSVE.cpp
+)
+target_include_directories(LLKTargetAArch64 PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # Library: Common utilities shared across all kernels
 add_mlir_library(LLKCommon
     lib/Transforms/Common/TilingUtils.cpp
