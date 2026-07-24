@@ -195,7 +195,6 @@ add_mlir_library(LLKPasses
 # MLIR_CONVERSION_LIBS to avoid linking 200+ libraries when using
 # pre-built LLVM binary releases (which may have missing libs).
 set(LLK_MLIR_EXEC_LIBS
-    MLIRAffineDialect
     MLIRArithDialect
     MLIRArithToLLVM
     MLIRArithTransforms

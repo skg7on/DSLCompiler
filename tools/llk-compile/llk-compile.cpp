@@ -5,7 +5,6 @@
 // JIT-compiles the result, and reports success.
 //
 // Usage: llk-compile <input.mlir> [--M=<dim>] [--N=<dim>] [--K=<dim>]
-//                                [--op=<swiglu|rope|attention>]
 //
 //===----------------------------------------------------------------------===//
 
@@ -29,8 +28,7 @@
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Affine/IR/ValueBoundsOpInterfaceImpl.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/IR/ValueBoundsOpInterfaceImpl.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
@@ -81,20 +79,12 @@ static cl::opt<int64_t> optN("N", cl::desc("N dimension (cols)"), cl::init(0));
 static cl::opt<int64_t> optK("K", cl::desc("K dimension (hidden)"),
                              cl::init(0));
 
-static cl::opt<std::string>
-    optOp("op", cl::desc("Operation kind (swiglu, rope, attention)"),
-          cl::init("swiglu"));
-
 // ---------------------------------------------------------------------------
 // Pipeline
 // ---------------------------------------------------------------------------
 
 static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
   mlir::PassManager pm(module->getContext());
-  // Disable per-pass verification during the pipeline to avoid false
-  // positives from intermediate IR states (e.g. scf.for referencing
-  // values defined outside the region during lowering).
-  pm.enableVerifier(false);
 
   // Stage 1: Lower LLK dialect ops to Linalg + Arith + Math.
   pm.addPass(mlir::llk::createLLKToLinalgPass());
@@ -138,15 +128,22 @@ static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
   // Stage 13: Audit scratch allocations post-bufferization.
   pm.addPass(mlir::llk::createScratchAnalysisPass());
 
-  // Stage 14: Lower remaining linalg ops on memref to scf.for loops.
+  // Stage 14: Lower residual linalg ops on memref to scf.for loops.
+  // This handles linalg.generic and linalg.fill ops that survive past
+  // TileAndVectorize (which only tiles matmul/contraction ops).
+  // Uses the built-in MLIR pass "convert-linalg-to-loops".
   {
-    const auto *passInfo =
-        mlir::PassInfo::lookup(llvm::StringRef("convert-linalg-to-loops"));
+    const auto *passInfo = mlir::PassInfo::lookup("convert-linalg-to-loops");
     if (passInfo) {
-      (void)passInfo->addToPipeline(pm, {}, [](const llvm::Twine &msg) {
-        llvm::errs() << "convert-linalg-to-loops: " << msg << "\n";
+      if (mlir::failed(
+              passInfo->addToPipeline(pm, {}, [](const llvm::Twine &msg) {
+                llvm::errs() << "convert-linalg-to-loops: " << msg << "\n";
+                return mlir::failure();
+              }))) {
+        llvm::errs()
+            << "ERROR: convert-linalg-to-loops failed to add to pipeline\n";
         return mlir::failure();
-      });
+      }
     }
   }
 
@@ -178,11 +175,9 @@ static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
   // Stage 22: Reconcile unrealized casts from partial conversions.
   pm.addPass(mlir::createReconcileUnrealizedCastsPass());
 
-  // NOTE: JitCache::lookupOrCompile runs its own addLoweringPasses
-  // (ConvertVectorToLLVM → SCFToCF → CFToLLVM → ArithToLLVM →
-  //  MathToLLVM → FuncToLLVM → FinalizeMemRefToLLVM →
-  //  ReconcileUnrealizedCasts) but these are no-ops when the module
-  //  is already fully lowered to LLVM dialect.
+  // NOTE: JitCache::lookupOrCompile runs its own lowering passes
+  // inside the cache miss path; these are no-ops when the module
+  // is already fully lowered to LLVM dialect.
 
   return pm.run(module);
 }
@@ -238,7 +233,7 @@ int main(int argc, char **argv) {
                   mlir::linalg::LinalgDialect, mlir::tensor::TensorDialect,
                   mlir::scf::SCFDialect, mlir::arith::ArithDialect,
                   mlir::math::MathDialect, mlir::memref::MemRefDialect,
-                  mlir::affine::AffineDialect, mlir::LLVM::LLVMDialect>();
+                  mlir::LLVM::LLVMDialect>();
 
   // Register TilingInterface external models so Linalg ops can be tiled.
   mlir::linalg::registerTilingInterfaceExternalModels(registry);
@@ -256,9 +251,8 @@ int main(int argc, char **argv) {
   mlir::vector::registerSubsetOpInterfaceExternalModels(registry);
 
   // Register ValueBoundsOpInterface external models for bufferization
-  // analysis (needed when the IR contains affine, scf.for, scf.forall,
+  // analysis (needed when the IR contains scf.for, scf.forall,
   // arith, and linalg ops with dynamic shapes).
-  mlir::affine::registerValueBoundsOpInterfaceExternalModels(registry);
   mlir::arith::registerValueBoundsOpInterfaceExternalModels(registry);
   mlir::linalg::registerValueBoundsOpInterfaceExternalModels(registry);
   mlir::scf::registerValueBoundsOpInterfaceExternalModels(registry);
