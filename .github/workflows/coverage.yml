@@ -1,0 +1,104 @@
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      CC: gcc
+      CXX: g++
+      LLVM_VERSION: 22.1.8
+      LLVM_SOURCE: ${{ github.workspace }}/llvm-project
+      LLVM_BUILD: ${{ github.workspace }}/llvm-build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgtest-dev
+          pip install gcovr
+
+      - name: Download LLVM source
+        run: |
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz"
+          echo "Downloading $URL"
+          curl -fsSL -o llvm.tar.xz "$URL"
+          mkdir -p $LLVM_SOURCE
+          tar xf llvm.tar.xz -C $LLVM_SOURCE --strip-components=1
+          rm llvm.tar.xz
+
+      - name: Cache LLVM build
+        id: cache-llvm-build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LLVM_BUILD }}
+          key: llvm-build-${{ env.LLVM_VERSION }}-v1
+
+      - name: Build LLVM
+        if: steps.cache-llvm-build.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p $LLVM_BUILD && cd $LLVM_BUILD
+          cmake $LLVM_SOURCE/llvm -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS=mlir \
+            -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DMLIR_INCLUDE_TESTS=OFF \
+            -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF
+          ninja
+
+      - name: Configure project
+        run: |
+          mkdir -p build && cd build
+          cmake .. -G Ninja \
+            -DLLVM_PROJECT_BUILD_DIR=$LLVM_BUILD \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="--coverage" \
+            -DCMAKE_C_FLAGS="--coverage" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage" \
+            -DCMAKE_SHARED_LINKER_FLAGS="--coverage"
+
+      - name: Build
+        run: cd build && ninja
+
+      - name: Run tests
+        run: cd build && ctest --output-on-failure
+
+      - name: Generate coverage report
+        run: |
+          cd build
+          gcovr \
+            --root .. \
+            --exclude 'test/.*' \
+            --exclude 'third_party/.*' \
+            --exclude 'build/.*' \
+            --exclude '.*\.inc\..*' \
+            --html-details coverage.html \
+            --print-summary
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: build/coverage*.html
+          retention-days: 7
