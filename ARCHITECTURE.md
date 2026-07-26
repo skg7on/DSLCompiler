@@ -89,10 +89,10 @@ A **small, focused** dialect that only retains domain information unavailable in
 | `llk.fused_swiglu` | SiLU-gated double projection: `SiLU(X·Wg) ⊙ (X·Wu)` | ✅ Implemented | [m1](docs/design/m1-scalar-pipeline.md), [m3](docs/design/m3-fused-memory.md) |
 | `llk.rope` | Rotary Position Embedding with pairwise permutation | ✅ Implemented | [m6](docs/design/m6-multi-kernel.md) |
 | `llk.attention` | Simplified attention with online softmax | ✅ Implemented | [m6](docs/design/m6-multi-kernel.md) |
-| `llk.assume` | Divisibility and alignment hints | 🔨 Planned (post-M6) | [m1](docs/design/m1-scalar-pipeline.md) |
-| `llk.dispatch` | Multi-variant dispatch guard for shape specialization | 🔨 Planned (post-M6) | [m5](docs/design/m5-specialization-tuning.md) |
+| `llk.assume` | Divisibility and alignment hints | ✅ Implemented | [m1](docs/design/m1-scalar-pipeline.md) |
+| `llk.dispatch` | Multi-variant dispatch guard for shape specialization | ✅ Implemented | [m5](docs/design/m5-specialization-tuning.md) |
 
-**Attributes:** `#llk.activation<silu>` ✅, `#llk.math_mode<strict|bounded_fast|unsafe_fast>` ✅, `#llk.softmax_mode<online>` ✅, `#llk.layout<row_major|packed_kn>` 🔨 Planned (post-M6)
+**Attributes:** `#llk.activation<silu>` ✅, `#llk.math_mode<strict|bounded_fast|unsafe_fast>` ✅, `#llk.softmax_mode<online>` ✅, `#llk.layout<row_major|packed_kn>` ✅ Implemented
 
 ### 2.2 Python Frontend (Milestone 7+)
 
