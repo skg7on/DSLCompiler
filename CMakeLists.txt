@@ -302,6 +302,20 @@ add_llk_test(SharedPipeline test/Execution/shared_pipeline.cpp)
 add_llk_test(CpuFeaturesTest test/Execution/cpu_features_test.cpp)
 target_link_libraries(CpuFeaturesTest PRIVATE LLKTargetX86)
 
+add_llk_test(PackedVsUnpacked test/Execution/packed_vs_unpacked.cpp)
+add_llk_test(SpecializationDispatch test/Execution/specialization_dispatch.cpp)
+add_llk_test(ScheduleDeterminism test/Execution/schedule_determinism.cpp)
+
+add_llvm_executable(AffinityTest test/Execution/affinity_test.cpp)
+target_link_libraries(AffinityTest PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME AffinityTest COMMAND AffinityTest)
+
+add_llvm_executable(JitCacheMiss test/Execution/jit_cache_miss.cpp)
+target_link_libraries(JitCacheMiss PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME JitCacheMiss COMMAND JitCacheMiss)
+
+add_llk_test(ScheduleRegression benchmark/schedule_regression.cpp)
+
 add_llvm_executable(ThreadPoolStress test/Execution/thread_pool_stress.cpp)
 target_link_libraries(ThreadPoolStress PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME ThreadPoolStress COMMAND ThreadPoolStress)
@@ -440,6 +454,10 @@ if(FILECHECK_BIN)
   # RoPE vector shuffle: verify even/odd slice + interleave
   add_test(NAME RoPEVectorShuffle
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir"
+  )
+  # RoPE broadcast: verify cos/sin tables broadcast across BxH dimensions
+  add_test(NAME RoPEBroadcast
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir"
   )
   # Causal mask: verify cmp + select pattern for upper-triangular -inf
   add_test(NAME CausalMask
