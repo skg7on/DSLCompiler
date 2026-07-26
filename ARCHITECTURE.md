@@ -84,15 +84,15 @@ Each arrow is a lowering pass. Each stage can be dumped, inspected, and FileChec
 
 A **small, focused** dialect that only retains domain information unavailable in generic MLIR. Does NOT recreate tensor, linalg, vector, or memref.
 
-| Op | Purpose | Detailed in |
-|----|---------|-------------|
-| `llk.fused_swiglu` | SiLU-gated double projection: `SiLU(X·Wg) ⊙ (X·Wu)` | [m1](docs/design/m1-scalar-pipeline.md), [m3](docs/design/m3-fused-memory.md) |
-| `llk.rope` | Rotary Position Embedding with pairwise permutation | [m6](docs/design/m6-multi-kernel.md) |
-| `llk.attention` | Simplified attention with online softmax | [m6](docs/design/m6-multi-kernel.md) |
-| `llk.assume` | Divisibility and alignment hints | [m1](docs/design/m1-scalar-pipeline.md) |
-| `llk.dispatch` | Multi-variant dispatch guard for shape specialization | [m5](docs/design/m5-specialization-tuning.md) |
+| Op | Purpose | Status | Detailed in |
+|----|---------|--------|-------------|
+| `llk.fused_swiglu` | SiLU-gated double projection: `SiLU(X·Wg) ⊙ (X·Wu)` | ✅ Implemented | [m1](docs/design/m1-scalar-pipeline.md), [m3](docs/design/m3-fused-memory.md) |
+| `llk.rope` | Rotary Position Embedding with pairwise permutation | ✅ Implemented | [m6](docs/design/m6-multi-kernel.md) |
+| `llk.attention` | Simplified attention with online softmax | ✅ Implemented | [m6](docs/design/m6-multi-kernel.md) |
+| `llk.assume` | Divisibility and alignment hints | 🔨 Planned (post-M6) | [m1](docs/design/m1-scalar-pipeline.md) |
+| `llk.dispatch` | Multi-variant dispatch guard for shape specialization | 🔨 Planned (post-M6) | [m5](docs/design/m5-specialization-tuning.md) |
 
-**Attributes:** `#llk.activation<silu>`, `#llk.math_mode<strict|bounded_fast|unsafe_fast>`, `#llk.softmax_mode<online>`, `#llk.layout<row_major|packed_kn>`
+**Attributes:** `#llk.activation<silu>` ✅, `#llk.math_mode<strict|bounded_fast|unsafe_fast>` ✅, `#llk.softmax_mode<online>` ✅, `#llk.layout<row_major|packed_kn>` 🔨 Planned (post-M6)
 
 ### 2.2 Python Frontend (Milestone 7+)
 
@@ -217,11 +217,14 @@ llk-compiler/
 ├── CMakeLists.txt
 ├── include/LLK/
 │   ├── Dialect/         # LLKDialect.td, LLKOps.td, LLKAttributes.td
-│   ├── Conversion/      # LLKToLinalg.h, LinalgToCPU.h
+│   ├── Conversion/      # LLKToLinalg.h
 │   ├── Transforms/      # TileAndVectorize.h, FuseDoubleContraction.h, PackWeights.h,
-│   │                      ShapeSpecialization.h, ScheduleSelection.h, MathApproximation.h,
-│   │                      ParallelDecompose.h, ScratchAnalysis.h
-│   ├── Target/          # X86/TargetAVX2.h, AArch64/TargetSVE.h
+│   │                      ShapeSpecialization.h, ScheduleSelection.h,
+│   │                      LinearizeForall.h, SerialParallelDispatch.h,
+│   │                      ForallToLLRT.h, ForallToOpenMP.h, ScratchAnalysis.h
+│   │                      Common/ (TilingUtils, VectorizationUtils, ScheduleLoader,
+│   │                               MaskGeneration, MathApproximation)
+│   ├── Target/          # X86/TargetAVX2.h, AArch64/TargetSVE.h (stub)
 │   └── Runtime/         # ThreadPool.h, JitCache.h, PackedWeights.h, CpuFeatures.h
 ├── lib/
 │   ├── Dialect/LLK/
@@ -254,6 +257,11 @@ llk-compiler/
     ├── design/          # Per-milestone detailed design docs
     └── superpowers/     # Brainstorming + planning artifacts
 ```
+
+**Note:** `LinalgToCPU.h` from the original design was replaced by the explicit pass
+pipeline in llk-compile (see §7). AArch64/TargetSVE.h is a post-M6 stub for future
+SVE support. Attributes (`#llk.activation`, `#llk.math_mode`, etc.) are defined in
+`include/LLK/Dialect/LLKDialect.td`, not in a standalone attributes file.
 
 ---
 
