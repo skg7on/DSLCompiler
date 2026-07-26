@@ -89,12 +89,11 @@ jobs:
       - name: Generate coverage report
         run: |
           cd build
-          gcovr \
+          gcovr . \
             --root .. \
             --exclude 'test/.*' \
             --exclude 'third_party/.*' \
             --exclude 'build/.*' \
-            --exclude 'llvm-project/.*' \
             --exclude '.*\.inc$' \
             --html-details coverage.html \
             --print-summary
@@ -109,7 +108,7 @@ jobs:
       - name: Extract coverage percentage
         id: coverage-pct
         run: |
-          LINE_COV=$(cd build && gcovr --root .. --exclude 'test/.*' --exclude 'third_party/.*' --exclude 'build/.*' --exclude 'llvm-project/.*' --exclude '.*\.inc$' --print-summary 2>&1 | grep -oP 'lines: \K[\d.]+')
+          LINE_COV=$(cd build && gcovr . --root .. --exclude 'test/.*' --exclude 'third_party/.*' --exclude 'build/.*' --exclude '.*\.inc$' --print-summary 2>&1 | grep -oP 'lines: \K[\d.]+')
           echo "line=${LINE_COV}" >> $GITHUB_OUTPUT
           echo "Line coverage: ${LINE_COV}%"
 
