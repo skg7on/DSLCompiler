@@ -129,7 +129,7 @@ jobs:
             --exclude 'test/.*' \
             --exclude 'third_party/.*' \
             --exclude 'build/.*' \
-            --exclude '.*\.inc\..*' \
+            --exclude '.*\.inc$' \
             --html-details coverage.html \
             --print-summary
 
