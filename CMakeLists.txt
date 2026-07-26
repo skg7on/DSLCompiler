@@ -103,6 +103,14 @@ target_include_directories(LLKRuntime PUBLIC
 llvm_map_components_to_libnames(LLVM_NATIVE_TARGET_LIBS native)
 target_link_libraries(LLKRuntime PUBLIC
     LLVMOrcJIT MLIRExecutionEngine
+    MLIRArithToLLVM
+    MLIRControlFlowToLLVM
+    MLIRFuncToLLVM
+    MLIRMathToLLVM
+    MLIRMemRefToLLVM
+    MLIRReconcileUnrealizedCasts
+    MLIRSCFToControlFlow
+    MLIRVectorToLLVMPass
     ${LLVM_NATIVE_TARGET_LIBS}
 )
 

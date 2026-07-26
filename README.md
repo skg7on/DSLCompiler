@@ -1,5 +1,8 @@
 # DSLCompiler — Domain-Specific LLM Kernel Compiler
 
+[![CI](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml/badge.svg)](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/skg7on/DSLCompiler/main/badges/coverage.json)](https://github.com/skg7on/DSLCompiler/actions/workflows/coverage.yml)
+
 An out-of-tree [MLIR](https://mlir.llvm.org/) compiler that takes computationally dense LLM operations (SwiGLU, RoPE, Attention) and aggressively optimizes their memory and compute lowering to produce high-performance CPU kernels — essentially a miniature, CPU-focused version of [Triton](https://triton-lang.org/).
 
 ## Core Concept
