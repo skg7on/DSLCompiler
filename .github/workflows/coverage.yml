@@ -15,6 +15,8 @@ jobs:
   coverage:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    permissions:
+      contents: write
 
     env:
       CC: gcc
@@ -102,3 +104,28 @@ jobs:
           name: coverage-report
           path: build/coverage*.html
           retention-days: 7
+
+      - name: Extract coverage percentage
+        id: coverage-pct
+        run: |
+          LINE_COV=$(cd build && gcovr --root .. --exclude 'test/.*' --exclude 'third_party/.*' --exclude 'build/.*' --exclude '.*\.inc$' --print-summary 2>&1 | grep -oP 'lines: \K[\d.]+')
+          echo "line=${LINE_COV}" >> $GITHUB_OUTPUT
+          echo "Line coverage: ${LINE_COV}%"
+
+      - name: Update coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          LINE="${{ steps.coverage-pct.outputs.line }}"
+          mkdir -p badges
+          python3 -c "
+          import json
+          p = float('${LINE}')
+          color = 'green' if p >= 80 else 'yellow' if p >= 60 else 'red'
+          data = {'schemaVersion': 1, 'label': 'coverage', 'message': f'{p:.1f}%', 'color': color}
+          json.dump(data, open('badges/coverage.json', 'w'))
+          "
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add badges/coverage.json
+          git diff --staged --quiet || git commit -m "ci: update coverage badge [skip ci]"
+          git push
