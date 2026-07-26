@@ -208,8 +208,20 @@ JitCache::lookupOrCompile(const std::string &cache_key, mlir::ModuleOp module) {
     return llvm::make_error<llvm::StringError>("LLVM IR translation failed",
                                                llvm::inconvertibleErrorCode());
 
-  // Record the module name for symbol lookup.
-  std::string moduleName = llvmModule->getModuleIdentifier();
+  // Record exported symbol names before moving the module.
+  // We need to find the kernel entry point dynamically since the symbol
+  // name varies by operation type.
+  std::string entrySymbol;
+  for (auto &func : *llvmModule) {
+    if (!func.isDeclaration() && func.hasExternalLinkage()) {
+      entrySymbol = func.getName().str();
+      break;
+    }
+  }
+  if (entrySymbol.empty())
+    return llvm::make_error<llvm::StringError>(
+        "No exported kernel entry point found in module",
+        llvm::inconvertibleErrorCode());
 
   // Add the LLVM module to the JIT.
   // ThreadSafeModule takes ownership of both the Module and its LLVMContext.
@@ -218,7 +230,7 @@ JitCache::lookupOrCompile(const std::string &cache_key, mlir::ModuleOp module) {
     return std::move(err);
 
   // Look up the compiled entry-point function.
-  auto sym = jit_->lookup("llk_swiglu");
+  auto sym = jit_->lookup(entrySymbol);
   if (!sym)
     return sym.takeError();
 

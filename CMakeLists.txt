@@ -122,6 +122,14 @@ target_include_directories(LLKTargetX86 PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 
+# Library: AArch64 target feature detection (SVE/SVE2/NEON)
+add_library(LLKTargetAArch64 STATIC
+    lib/Target/AArch64/TargetSVE.cpp
+)
+target_include_directories(LLKTargetAArch64 PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+
 # Library: Common utilities shared across all kernels
 add_mlir_library(LLKCommon
     lib/Transforms/Common/TilingUtils.cpp
@@ -182,6 +190,13 @@ add_mlir_library(LLKForallToLLRT
     LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRPass
 )
 
+# Library: ForallToOpenMP pass (prototype)
+add_mlir_library(LLKForallToOpenMP
+    lib/Transforms/ForallToOpenMP.cpp
+    DEPENDS LLKTransformsGen
+    LINK_LIBS PUBLIC MLIRSCFDialect MLIRSCFTransforms MLIRSCFToOpenMP MLIROpenMPDialect MLIRPass
+)
+
 # Library: ShapeSpecialization pass
 add_mlir_library(LLKShapeSpecialization
     lib/Transforms/ShapeSpecialization.cpp
@@ -224,12 +239,14 @@ set(LLK_MLIR_EXEC_LIBS
     MLIRMathToLLVM
     MLIRMemRefDialect
     MLIRMemRefToLLVM
+    MLIROpenMPDialect
     MLIRParser
     MLIRPass
     MLIRReconcileUnrealizedCasts
     MLIRRegisterAllPasses
     MLIRSCFDialect
     MLIRSCFToControlFlow
+    MLIRSCFToOpenMP
     MLIRSCFTransforms
     MLIRSupport
     MLIRTensorDialect
@@ -240,11 +257,11 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
-target_link_libraries(llk-compile PRIVATE LLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-compile PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection LLKRuntime ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-bench (benchmarking harness)
 add_llvm_executable(llk-bench tools/llk-bench/llk-bench.cpp)
@@ -298,6 +315,20 @@ add_llk_test(SharedPipeline test/Execution/shared_pipeline.cpp)
 add_llk_test(CpuFeaturesTest test/Execution/cpu_features_test.cpp)
 target_link_libraries(CpuFeaturesTest PRIVATE LLKTargetX86)
 
+add_llk_test(PackedVsUnpacked test/Execution/packed_vs_unpacked.cpp)
+add_llk_test(SpecializationDispatch test/Execution/specialization_dispatch.cpp)
+add_llk_test(ScheduleDeterminism test/Execution/schedule_determinism.cpp)
+
+add_llvm_executable(AffinityTest test/Execution/affinity_test.cpp)
+target_link_libraries(AffinityTest PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME AffinityTest COMMAND AffinityTest)
+
+add_llvm_executable(JitCacheMiss test/Execution/jit_cache_miss.cpp)
+target_link_libraries(JitCacheMiss PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME JitCacheMiss COMMAND JitCacheMiss)
+
+add_llk_test(ScheduleRegression benchmark/schedule_regression.cpp)
+
 add_llvm_executable(ThreadPoolStress test/Execution/thread_pool_stress.cpp)
 target_link_libraries(ThreadPoolStress PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME ThreadPoolStress COMMAND ThreadPoolStress)
@@ -313,6 +344,10 @@ add_test(NAME SwiGLUSmallShape COMMAND SwiGLUSmallShape)
 add_llvm_executable(JitCacheHit test/Execution/jit_cache_hit.cpp)
 target_link_libraries(JitCacheHit PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME JitCacheHit COMMAND JitCacheHit)
+
+add_llvm_executable(CacheEviction test/Execution/cache_eviction.cpp)
+target_link_libraries(CacheEviction PRIVATE LLKRuntime GTest::gtest_main)
+add_test(NAME CacheEviction COMMAND CacheEviction)
 
 # FileCheck tests
 find_program(FILECHECK_BIN FileCheck)
@@ -401,6 +436,12 @@ if(FILECHECK_BIN)
         ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_llrt.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_llrt.mlir"
   )
+  # ForallToOpenMP test: scf.forall → omp.parallel + omp.wsloop
+  add_test(NAME ForallToOpenMP
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --forall-to-openmp \
+        ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_openmp.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/forall_to_openmp.mlir"
+  )
   # ShapeSpecialization test: check M bucket classification
   add_test(NAME ShapeSpecialization
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --shape-specialize \
@@ -426,6 +467,10 @@ if(FILECHECK_BIN)
   # RoPE vector shuffle: verify even/odd slice + interleave
   add_test(NAME RoPEVectorShuffle
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir"
+  )
+  # RoPE broadcast: verify cos/sin tables broadcast across BxH dimensions
+  add_test(NAME RoPEBroadcast
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir"
   )
   # Causal mask: verify cmp + select pattern for upper-triangular -inf
   add_test(NAME CausalMask

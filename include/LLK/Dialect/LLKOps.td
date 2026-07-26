@@ -5,6 +5,7 @@ include "LLKDialect.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/TilingInterface.td"
+include "mlir/IR/SymbolInterfaces.td"
 
 class LLK_Op<string mnemonic, list<Trait> traits = []>
     : Op<LLK_Dialect, mnemonic, traits>;
@@ -127,6 +128,82 @@ def LLK_AttentionOp : LLK_Op<"attention", [
         `->` type($result)
     }];
 
+    let hasVerifier = 1;
+}
+
+def LLK_ReturnOp : LLK_Op<"return", [Terminator]> {
+    let summary = "Return from a dispatch variant region";
+    let arguments = (ins Variadic<AnyType>:$operands);
+}
+
+def LLK_AssumeOp : LLK_Op<"assume", [
+    DeclareOpInterfaceMethods<DestinationStyleOpInterface>
+]> {
+    let summary = "Divisibility and alignment hints for downstream passes";
+    let description = [{
+        Annotates tensors with constraints that the compiler can exploit.
+        Does NOT change program semantics — a verifier check that would
+        abort if violated.
+
+        Constraints:
+        - divisible(dim, factor): dimension is divisible by factor
+        - aligned(ptr_bytes): underlying buffer is aligned to ptr_bytes boundary
+
+        Example:
+          %x_assumed = llk.assume ins(%x : tensor<MxKxbf16>)
+              outs(%init : tensor<MxKxbf16>)
+              {divisible_dims = [0, 1], divisible_factors = [8, 64],
+               alignment_bytes = 64}
+              -> tensor<MxKxbf16>
+    }];
+
+    let arguments = (ins
+        AnyTensor:$input,
+        AnyTensor:$init,
+        DenseI64ArrayAttr:$divisible_dims,
+        DenseI64ArrayAttr:$divisible_factors,
+        DefaultValuedAttr<I64Attr, "0">:$alignment_bytes
+    );
+    let results = (outs AnyTensor:$result);
+
+    let assemblyFormat = [{
+        `ins` `(` $input `:` type($input) `)`
+        `outs` `(` $init `:` type($init) `)`
+        attr-dict
+        `->` type($result)
+    }];
+
+    let hasVerifier = 1;
+}
+
+def LLK_DispatchOp : LLK_Op<"dispatch", [
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>
+]> {
+    let summary = "Multi-variant dispatch guard for shape specialization";
+    let description = [{
+        Dispatches to one of several variant regions based on runtime
+        shape checks. The last region is the fallback (otherwise clause).
+
+        Each variant has a condition written as an arith dialect predicate
+        over symbolic dims M, N, K.
+
+        Example:
+          llk.dispatch { M = %m, N = %n, K = %k }
+          variants {
+              @variant1 when(%m == 1),
+              @variant2 when(%m <= 4),
+              @generic otherwise
+          }
+    }];
+
+    let arguments = (ins
+        Variadic<AnyType>:$inputs,
+        I64Attr:$M,
+        I64Attr:$N,
+        I64Attr:$K
+    );
+    let results = (outs Variadic<AnyType>:$results);
+    let regions = (region VariadicRegion<SizedRegion<1>>:$variants);
     let hasVerifier = 1;
 }
 

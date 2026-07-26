@@ -16,6 +16,7 @@
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Transforms/ForallToLLRT.h"
+#include "LLK/Transforms/ForallToOpenMP.h"
 #include "LLK/Transforms/FuseDoubleContraction.h"
 #include "LLK/Transforms/LinearizeForall.h"
 #include "LLK/Transforms/PackWeights.h"
@@ -76,6 +77,11 @@ int main(int argc, char **argv) {
   // Register the ForallToLLRT pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createForallToLLRTPass();
+  });
+
+  // Register the ForallToOpenMP pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createForallToOpenMPPass();
   });
 
   // Register the ShapeSpecialization pass.

@@ -32,10 +32,11 @@
 | M4 | Parallel execution | 4.1–4.3 | [m4-parallel-execution.md](m4-parallel-execution.md) | [m4-parallel-execution.md](../../design/m4-parallel-execution.md) |
 | M5 | Specialization & tuning | 5.1–5.3 | [m5-specialization-tuning.md](m5-specialization-tuning.md) | [m5-specialization-tuning.md](../../design/m5-specialization-tuning.md) |
 | M6 | Multi-kernel (RoPE + Attention) | 6.1–6.5 | [m6-multi-kernel.md](m6-multi-kernel.md) | [m6-multi-kernel.md](../../design/m6-multi-kernel.md) |
+| Post-M6 | Enhancement: dialect, pipeline, cache, tests | 7.1–7.9 | [2026-07-23-post-m6-enhancement.md](2026-07-23-post-m6-enhancement.md) | [Issue #14](https://github.com/skg7on/DSLCompiler/issues/14) |
 
 ## Execution Order
 
-Milestones are strictly sequential — each builds on the previous. Implement M1 through M6 in order.
+Milestones are strictly sequential — each builds on the previous. Implement M1 through M6 in order, then Post-M6 enhancements.
 
 ```
 M1 (scalar) → M2 (vector) → M3 (fusion) → M4 (parallel) → M5 (specialize) → M6 (multi-kernel)
