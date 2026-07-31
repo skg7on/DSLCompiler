@@ -12,9 +12,10 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 
 using namespace mlir;
@@ -129,12 +130,45 @@ void TritonGridToForallPass::runOnOperation() {
       }
     }
 
-    // Replace tt.get_program_id results with the computed tile indices.
+    // Build IRMapping: pid results → computed tile indices inside forall.
+    IRMapping mapper;
     for (auto *op : pidOps) {
       int axis = (int)op->getAttrOfType<IntegerAttr>("axis").getInt();
-      op->getResult(0).replaceAllUsesWith(tileIndices[axis]);
-      op->erase();
+      mapper.map(op->getResult(0), tileIndices[axis]);
     }
+
+    // Collect all ops after the forall (excluding func.return and pid
+    // ops) that need to be moved into the forall body so that consumers
+    // of pid results are inside the forall where tile indices dominate.
+    Block &funcBlock = funcOp.getBody().front();
+    SmallVector<Operation *> opsToClone;
+    bool foundForall = false;
+    for (auto &op : funcBlock.without_terminator()) {
+      if (&op == forallOp.getOperation()) {
+        foundForall = true;
+        continue;
+      }
+      if (!foundForall)
+        continue;
+      if (llvm::is_contained(pidOps, &op))
+        continue;
+      opsToClone.push_back(&op);
+    }
+
+    // Clone operations into the forall body, inserting before the
+    // InParallelOp terminator that the forall already owns.
+    builder.setInsertionPoint(forallOp.getBody()->getTerminator());
+    for (auto *op : opsToClone) {
+      builder.clone(*op, mapper);
+    }
+
+    // Erase original ops from the function body.  Order matters:
+    // erase in reverse so a consumer is removed before the operation
+    // that produces one of its operands.
+    for (auto *op : llvm::reverse(opsToClone))
+      op->erase();
+    for (auto *op : pidOps)
+      op->erase();
 
     return WalkResult::advance();
   });
