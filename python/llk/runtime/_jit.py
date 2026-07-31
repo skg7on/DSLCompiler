@@ -1,8 +1,6 @@
-import textwrap
-from typing import Any, Callable
+from typing import Callable
 
 from ..language._ast_compiler import compile_kernel
-from ..language._triton_ir import TritonIRBuilder
 
 
 class JitFunction:
