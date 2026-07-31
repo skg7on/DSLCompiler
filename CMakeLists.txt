@@ -476,6 +476,10 @@ if(FILECHECK_BIN)
   add_test(NAME CausalMask
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir"
   )
+  # TritonToLLK: verify llk.matmul / llk.make_tensor parse and verify
+  add_test(NAME TritonToLLKNewOps
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/llk_new_ops.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/llk_new_ops.mlir"
+  )
 endif()
 
 # Test for ops_invalid.mlir: runs llk-opt with --verify-diagnostics.

@@ -254,9 +254,7 @@ def LLK_MatmulOp : LLK_Op<"matmul", [
     }];
 }
 
-def LLK_MakeTensorOp : LLK_Op<"make_tensor", [
-    DeclareOpInterfaceMethods<DestinationStyleOpInterface>
-]> {
+def LLK_MakeTensorOp : LLK_Op<"make_tensor", []> {
     let summary = "Wrap raw pointer as tensor for pipeline entry";
     let description = [{
         Bridges Triton's pointer-based ABI to MLIR's tensor pipeline.

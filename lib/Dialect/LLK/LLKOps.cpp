@@ -304,7 +304,8 @@ LogicalResult mlir::llk::MatmulOp::verify() {
   if (aType.getRank() != 2 || bType.getRank() != 2)
     return emitOpError("requires rank-2 inputs");
 
-  if (aType.getDimSize(1) != bType.getDimSize(0))
+  if (!aType.isDynamicDim(1) && !bType.isDynamicDim(0) &&
+      aType.getDimSize(1) != bType.getDimSize(0))
     return emitOpError("K dimension must match: ")
            << aType.getDimSize(1) << " vs " << bType.getDimSize(0);
 
@@ -342,15 +343,6 @@ LogicalResult mlir::llk::MatmulOp::getResultTilePosition(
   resultOffsets.assign({offsets[0], offsets[1]});
   resultSizes.assign({sizes[0], sizes[1]});
   return success();
-}
-
-//===----------------------------------------------------------------------===//
-// DestinationStyleOpInterface: return the mutable init operands for
-// MakeTensorOp.
-//===----------------------------------------------------------------------===//
-
-MutableOperandRange MakeTensorOp::getDpsInitsMutable() {
-  return MutableOperandRange(getOperation(), 0, 0);
 }
 
 //===----------------------------------------------------------------------===//
