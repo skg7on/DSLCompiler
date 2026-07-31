@@ -286,3 +286,79 @@ mlir::LogicalResult llk::DispatchOp::verify() {
   }
   return mlir::success();
 }
+
+//===----------------------------------------------------------------------===//
+// DestinationStyleOpInterface: return the mutable init operands for MatmulOp.
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange MatmulOp::getDpsInitsMutable() { return getInitMutable(); }
+
+//===----------------------------------------------------------------------===//
+// MatmulOp verification
+//===----------------------------------------------------------------------===//
+
+LogicalResult mlir::llk::MatmulOp::verify() {
+  auto aType = mlir::cast<ShapedType>(getA().getType());
+  auto bType = mlir::cast<ShapedType>(getB().getType());
+
+  if (aType.getRank() != 2 || bType.getRank() != 2)
+    return emitOpError("requires rank-2 inputs");
+
+  if (aType.getDimSize(1) != bType.getDimSize(0))
+    return emitOpError("K dimension must match: ")
+           << aType.getDimSize(1) << " vs " << bType.getDimSize(0);
+
+  return success();
+}
+
+// TilingInterface methods delegate to linalg.matmul behavior
+SmallVector<utils::IteratorType> mlir::llk::MatmulOp::getLoopIteratorTypes() {
+  return {utils::IteratorType::parallel, utils::IteratorType::parallel,
+          utils::IteratorType::reduction};
+}
+
+SmallVector<Range> mlir::llk::MatmulOp::getIterationDomain(OpBuilder &b) {
+  Location loc = getLoc();
+  Value zero = arith::ConstantIndexOp::create(b, loc, 0);
+  Value one = arith::ConstantIndexOp::create(b, loc, 1);
+  Value M = tensor::DimOp::create(b, loc, getA(), zero);
+  Value N = tensor::DimOp::create(b, loc, getB(), one);
+  Value K = tensor::DimOp::create(b, loc, getA(), one);
+  return {Range{zero, M, one}, Range{zero, N, one}, Range{zero, K, one}};
+}
+
+FailureOr<TilingResult>
+mlir::llk::MatmulOp::getTiledImplementation(OpBuilder &b,
+                                            ArrayRef<OpFoldResult> offsets,
+                                            ArrayRef<OpFoldResult> sizes) {
+  // Delegate to linalg.matmul tiling
+  return emitOpError("MatmulOp::getTiledImplementation not yet implemented");
+}
+
+LogicalResult mlir::llk::MatmulOp::getResultTilePosition(
+    OpBuilder &b, unsigned resultNumber, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes, SmallVector<OpFoldResult> &resultOffsets,
+    SmallVector<OpFoldResult> &resultSizes) {
+  resultOffsets.assign({offsets[0], offsets[1]});
+  resultSizes.assign({sizes[0], sizes[1]});
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// DestinationStyleOpInterface: return the mutable init operands for
+// MakeTensorOp.
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange MakeTensorOp::getDpsInitsMutable() {
+  return MutableOperandRange(getOperation(), 0, 0);
+}
+
+//===----------------------------------------------------------------------===//
+// MakeTensorOp verification
+//===----------------------------------------------------------------------===//
+
+LogicalResult mlir::llk::MakeTensorOp::verify() {
+  if (getDim0() <= 0 || getDim1() <= 0)
+    return emitOpError("dimensions must be positive");
+  return success();
+}

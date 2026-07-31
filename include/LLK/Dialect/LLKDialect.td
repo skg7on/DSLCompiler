@@ -34,8 +34,9 @@ def LLK_ActivationAttr : EnumAttr<LLK_Dialect, LLK_Activation, "activation"> {
 def LLK_Strict      : I32EnumAttrCase<"strict", 0, "strict">;
 def LLK_BoundedFast : I32EnumAttrCase<"bounded_fast", 1, "bounded_fast">;
 def LLK_UnsafeFast  : I32EnumAttrCase<"unsafe_fast", 2, "unsafe_fast">;
+def LLK_TritonFast  : I32EnumAttrCase<"triton_fast", 3, "triton_fast">;
 def LLK_MathMode : I32EnumAttr<"MathMode", "Numerical approximation policy", [
-    LLK_Strict, LLK_BoundedFast, LLK_UnsafeFast
+    LLK_Strict, LLK_BoundedFast, LLK_UnsafeFast, LLK_TritonFast
 ]> {
     let cppNamespace = "::mlir::llk";
     let genSpecializedAttr = 0;
