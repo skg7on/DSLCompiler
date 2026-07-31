@@ -2,6 +2,16 @@ from ._triton_ir import TritonIRBuilder, IRValue
 
 _builder: TritonIRBuilder | None = None
 
+# Sentinel-type objects recognized by the AST compiler
+class constexpr:
+    """Annotation sentinel for compile-time constant parameters."""
+    pass
+
+
+float32 = "float32"
+float16 = "float16"
+int32 = "int32"
+
 
 def _get_builder() -> TritonIRBuilder:
     global _builder
