@@ -211,6 +211,9 @@ add_mlir_library(LLKScheduleSelection
     LINK_LIBS PUBLIC MLIRFuncDialect MLIRPass
 )
 
+# Library: TritonToLLK lowering passes
+add_subdirectory(lib/Conversion/TritonToLLK)
+
 # Tool: llk-opt
 add_mlir_library(LLKPasses
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -257,11 +260,11 @@ set(LLK_MLIR_EXEC_LIBS
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection TritonToLLKPasses MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
-target_link_libraries(llk-compile PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-compile PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection TritonToLLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-bench (benchmarking harness)
 add_llvm_executable(llk-bench tools/llk-bench/llk-bench.cpp)
@@ -295,6 +298,13 @@ if(LLK_BUILD_E2E_TESTS)
 add_llvm_executable(SwigluScalar test/Execution/swiglu_scalar.cpp)
 target_link_libraries(SwigluScalar PRIVATE LLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwigluScalar COMMAND SwigluScalar)
+
+# Triton IR → staged pipeline → JIT integration test (M8b). Test body is
+# currently a DISABLED stub; links the staged-pipeline pass libs it will
+# exercise once the full Triton lowering path is integrated.
+add_llvm_executable(TritonSwigluStaged test/Execution/triton_swiglu_staged.cpp)
+target_link_libraries(TritonSwigluStaged PRIVATE LLKPasses TritonToLLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME TritonSwigluStaged COMMAND TritonSwigluStaged)
 
 add_llvm_executable(SwiGLUVector test/Execution/swiglu_vector_avx2.cpp)
 target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
@@ -472,9 +482,83 @@ if(FILECHECK_BIN)
   add_test(NAME RoPEBroadcast
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir"
   )
+  # GridToForall: verify tt.get_program_id -> scf.forall lowering
+  add_test(NAME GridToForall
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-grid-to-forall \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall.mlir"
+  )
+  # GridToForallReturnOperands: regression for func.return referencing a cloned
+  # op -- the pass must remap the return operand instead of crashing on erase.
+  add_test(NAME GridToForallReturnOperands
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --verify-each=false --triton-grid-to-forall \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall_return.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall_return.mlir"
+  )
+  # TritonToStructured: verify tt.dot -> linalg.matmul lowering
+  add_test(NAME TritonToStructured
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --triton-to-structured --allow-unregistered-dialect \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_to_structured.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_to_structured.mlir"
+  )
+  # BlockPointerToVector: verify tt.make_block_ptr + load/store -> vector.transfer
+  add_test(NAME BlockPointerToVector
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-block-ptr-to-vector \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_to_vector.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_to_vector.mlir"
+  )
+  # BlockPointer1D: verify 1D block pointer lowering
+  add_test(NAME BlockPointer1D
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-block-ptr-to-vector \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_1d.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_1d.mlir"
+  )
+  # BlockPointerMasked: verify boundary mask for partial tiles (N=127 not /8)
+  add_test(NAME BlockPointerMasked
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-block-ptr-to-vector \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_masked.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_masked.mlir"
+  )
+  # SharedMemToScratch: verify tt.alloc -> memref.alloc, tt.async_copy -> memref.copy
+  add_test(NAME SharedMemToScratch
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-shared-mem-to-scratch \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/shared_mem_to_scratch.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/shared_mem_to_scratch.mlir"
+  )
+  # AtomicToLLRT: verify tt.atomic_* -> llrt.atomic_* runtime calls
+  add_test(NAME AtomicToLLRT
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-atomic-to-llrt \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/atomic_to_llrt.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/atomic_to_llrt.mlir"
+  )
+  # TritonCPUVerifierPass: whitelisted ops pass through with no diagnostics
+  add_test(NAME TritonCPUVerifierPass
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-cpu-verify \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_pass.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_pass.mlir"
+  )
+  # TritonCPUVerifierReject: unsupported tt.* ops rejected with an error
+  add_test(NAME TritonCPUVerifierReject
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-cpu-verify \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_reject.mlir \
+        2>&1 | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_reject.mlir"
+  )
+  # TritonFullPipeline: all 5 Triton->LLK stages in one invocation
+  add_test(NAME TritonFullPipeline
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect \
+        --triton-to-structured --canonicalize --triton-cpu-verify \
+        --triton-block-ptr-to-vector --triton-shared-mem-to-scratch \
+        --triton-atomic-to-llrt --triton-grid-to-forall \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_full_pipeline.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_full_pipeline.mlir"
+  )
   # Causal mask: verify cmp + select pattern for upper-triangular -inf
   add_test(NAME CausalMask
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir"
+  )
+  # TritonToLLK: verify llk.matmul / llk.make_tensor parse and verify
+  add_test(NAME TritonToLLKNewOps
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/llk_new_ops.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/llk_new_ops.mlir"
   )
 endif()
 

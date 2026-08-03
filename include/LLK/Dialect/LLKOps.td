@@ -207,4 +207,79 @@ def LLK_DispatchOp : LLK_Op<"dispatch", [
     let hasVerifier = 1;
 }
 
+def LLK_MatmulOp : LLK_Op<"matmul", [
+    DeclareOpInterfaceMethods<DestinationStyleOpInterface>,
+    DeclareOpInterfaceMethods<TilingInterface>
+]> {
+    let summary = "Generic batched matmul fallback";
+    let description = [{
+        Generic matrix multiplication — fallback when no fusion pattern
+        matches. Lowered identically to linalg.matmul by LLKToLinalg.
+    }];
+
+    let arguments = (ins
+        TensorOf<[BF16, F16, F32]>:$a,
+        TensorOf<[BF16, F16, F32]>:$b,
+        TensorOf<[BF16, F16, F32]>:$init,
+        AnyAttr:$accumulator_type,
+        LLK_MathModeAttr:$math_mode
+    );
+
+    let results = (outs
+        TensorOf<[BF16, F16, F32]>:$result
+    );
+
+    let assemblyFormat = [{
+        `ins` `(` $a `,` $b `:` type($a) `,` type($b) `)`
+        `outs` `(` $init `:` type($init) `)`
+        attr-dict
+        `->` type($result)
+    }];
+
+    let hasVerifier = 1;
+
+    let extraClassDeclaration = [{
+      ::mlir::SmallVector<::mlir::utils::IteratorType> getLoopIteratorTypes();
+      ::mlir::SmallVector<::mlir::Range> getIterationDomain(::mlir::OpBuilder &b);
+      ::mlir::FailureOr<::mlir::TilingResult> getTiledImplementation(
+          ::mlir::OpBuilder &b,
+          ::mlir::ArrayRef<::mlir::OpFoldResult> offsets,
+          ::mlir::ArrayRef<::mlir::OpFoldResult> sizes);
+      ::llvm::LogicalResult getResultTilePosition(
+          ::mlir::OpBuilder &b, unsigned resultNumber,
+          ::mlir::ArrayRef<::mlir::OpFoldResult> offsets,
+          ::mlir::ArrayRef<::mlir::OpFoldResult> sizes,
+          ::mlir::SmallVector<::mlir::OpFoldResult> &resultOffsets,
+          ::mlir::SmallVector<::mlir::OpFoldResult> &resultSizes);
+    }];
+}
+
+def LLK_MakeTensorOp : LLK_Op<"make_tensor", []> {
+    let summary = "Wrap raw pointer as tensor for pipeline entry";
+    let description = [{
+        Bridges Triton's pointer-based ABI to MLIR's tensor pipeline.
+        Eliminated during bufferization — the tensor becomes a memref
+        backed by the original raw pointer.
+    }];
+
+    let arguments = (ins
+        AnyType:$base_ptr,
+        I64Attr:$dim0,
+        I64Attr:$dim1,
+        TypeAttr:$dtype
+    );
+
+    let results = (outs AnyTensor:$result);
+
+    let assemblyFormat = [{
+        `from` `(` $base_ptr `:` type($base_ptr) `)`
+        `shape` `(` $dim0 `,` $dim1 `)`
+        `dtype` `(` $dtype `)`
+        attr-dict
+        `->` type($result)
+    }];
+
+    let hasVerifier = 1;
+}
+
 #endif

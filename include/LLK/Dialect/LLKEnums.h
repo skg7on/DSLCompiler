@@ -28,6 +28,7 @@ enum MathMode : uint32_t {
   strict = 0,
   bounded_fast = 1,
   unsafe_fast = 2,
+  triton_fast = 3,
 };
 
 // Stringification / symbolization for Activation
@@ -54,6 +55,8 @@ inline llvm::StringRef stringifyMathMode(MathMode val) {
     return "bounded_fast";
   case unsafe_fast:
     return "unsafe_fast";
+  case triton_fast:
+    return "triton_fast";
   }
   return "";
 }
@@ -63,6 +66,7 @@ inline std::optional<MathMode> symbolizeMathMode(llvm::StringRef str) {
       .Case("strict", strict)
       .Case("bounded_fast", bounded_fast)
       .Case("unsafe_fast", unsafe_fast)
+      .Case("triton_fast", triton_fast)
       .Default(std::nullopt);
 }
 

@@ -197,6 +197,42 @@
         "parallel_axis": "n",
         "grain_size": 2
       }
+    },
+    {
+      "source": "triton",
+      "operation": "fused_swiglu",
+      "target": "x86-avx2",
+      "shape": { "M_bucket": 0, "N": 4096, "K": 4096 },
+      "dtype": "bf16",
+      "math_mode": "triton_fast",
+      "schedule": {
+        "BM": "inherit_from_triton",
+        "BN": "inherit_from_triton",
+        "BK": "inherit_from_triton",
+        "VM": 1, "VN": 8,
+        "vector_width": 8,
+        "num_threads": 8,
+        "parallel_axis": "n",
+        "grain_size": 1
+      }
+    },
+    {
+      "source": "triton",
+      "operation": "fused_swiglu",
+      "target": "x86-avx2",
+      "shape": { "M_bucket": 4, "N": 4096, "K": 4096 },
+      "dtype": "bf16",
+      "math_mode": "triton_fast",
+      "schedule": {
+        "BM": "inherit_from_triton",
+        "BN": "inherit_from_triton",
+        "BK": "inherit_from_triton",
+        "VM": 4, "VN": 8,
+        "vector_width": 8,
+        "num_threads": 8,
+        "parallel_axis": "m",
+        "grain_size": 4
+      }
     }
   ]
 }
