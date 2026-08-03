@@ -11,6 +11,8 @@
 
 #include <cstdint>
 
+#include "mlir/IR/Operation.h"
+
 namespace mlir {
 namespace llk {
 
@@ -49,7 +51,6 @@ inline int64_t numInnerTiles(int64_t outerTileSize, int64_t innerTileSize) {
 
 /// Check if any operand of an operation has a dynamic (unknown) dimension.
 /// Used by tiling passes to decide between static and dynamic tiling paths.
-class Operation;
 bool hasDynamicOperand(Operation *op);
 
 /// Forward declaration for ScheduleEntry.
