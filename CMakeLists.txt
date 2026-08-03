@@ -481,6 +481,12 @@ if(FILECHECK_BIN)
         ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall.mlir"
   )
+  # TritonToStructured: verify tt.dot -> linalg.matmul lowering
+  add_test(NAME TritonToStructured
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --triton-to-structured --allow-unregistered-dialect \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_to_structured.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_to_structured.mlir"
+  )
   # Causal mask: verify cmp + select pattern for upper-triangular -inf
   add_test(NAME CausalMask
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir"

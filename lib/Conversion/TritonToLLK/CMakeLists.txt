@@ -1,5 +1,6 @@
 add_mlir_library(TritonToLLKPasses
   GridToForall.cpp
+  TritonToStructured.cpp
 
   LINK_LIBS PUBLIC
   MLIRIR
@@ -7,5 +8,7 @@ add_mlir_library(TritonToLLKPasses
   MLIRSCFDialect
   MLIRArithDialect
   MLIRFuncDialect
+  MLIRLinalgDialect
+  MLIRTensorDialect
   MLIRTransformUtils
 )
