@@ -18,6 +18,7 @@
 #include "LLK/Conversion/TritonToLLK/BlockPointerToVector.h"
 #include "LLK/Conversion/TritonToLLK/GridToForall.h"
 #include "LLK/Conversion/TritonToLLK/SharedMemToScratch.h"
+#include "LLK/Conversion/TritonToLLK/TritonCPUVerifier.h"
 #include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Transforms/ForallToLLRT.h"
@@ -127,6 +128,11 @@ int main(int argc, char **argv) {
   // Register the AtomicToLLRT pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createAtomicToLLRTPass();
+  });
+
+  // Register the TritonCPUVerifier pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createTritonCPUVerifierPass();
   });
 
   return mlir::asMainReturnCode(

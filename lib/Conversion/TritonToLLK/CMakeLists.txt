@@ -2,6 +2,7 @@ add_mlir_library(TritonToLLKPasses
   GridToForall.cpp
   TritonToStructured.cpp
   BlockPointerToVector.cpp
+  TritonCPUVerifier.cpp
   SharedMemToScratch.cpp
   AtomicToLLRT.cpp
 

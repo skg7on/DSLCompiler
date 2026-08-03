@@ -531,6 +531,27 @@ if(FILECHECK_BIN)
         ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/atomic_to_llrt.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/atomic_to_llrt.mlir"
   )
+  # TritonCPUVerifierPass: whitelisted ops pass through with no diagnostics
+  add_test(NAME TritonCPUVerifierPass
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-cpu-verify \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_pass.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_pass.mlir"
+  )
+  # TritonCPUVerifierReject: unsupported tt.* ops rejected with an error
+  add_test(NAME TritonCPUVerifierReject
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-cpu-verify \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_reject.mlir \
+        2>&1 | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_reject.mlir"
+  )
+  # TritonFullPipeline: all 5 Triton->LLK stages in one invocation
+  add_test(NAME TritonFullPipeline
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect \
+        --triton-to-structured --canonicalize --triton-cpu-verify \
+        --triton-block-ptr-to-vector --triton-shared-mem-to-scratch \
+        --triton-atomic-to-llrt --triton-grid-to-forall \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_full_pipeline.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_full_pipeline.mlir"
+  )
   # Causal mask: verify cmp + select pattern for upper-triangular -inf
   add_test(NAME CausalMask
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir"
