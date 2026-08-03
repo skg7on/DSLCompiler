@@ -14,8 +14,10 @@
 
 // Include the LLK dialect public header to register it.
 #include "LLK/Conversion/LLKToLinalg.h"
+#include "LLK/Conversion/TritonToLLK/AtomicToLLRT.h"
 #include "LLK/Conversion/TritonToLLK/BlockPointerToVector.h"
 #include "LLK/Conversion/TritonToLLK/GridToForall.h"
+#include "LLK/Conversion/TritonToLLK/SharedMemToScratch.h"
 #include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Transforms/ForallToLLRT.h"
@@ -115,6 +117,16 @@ int main(int argc, char **argv) {
   // Register the BlockPointerToVector pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createBlockPointerToVectorPass();
+  });
+
+  // Register the SharedMemToScratch pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createSharedMemToScratchPass();
+  });
+
+  // Register the AtomicToLLRT pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createAtomicToLLRTPass();
   });
 
   return mlir::asMainReturnCode(
