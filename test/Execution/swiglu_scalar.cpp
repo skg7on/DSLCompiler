@@ -159,38 +159,38 @@ static mlir::OwningOpRef<mlir::ModuleOp>
 parseSwiGLUModule(mlir::MLIRContext *ctx, int64_t M, int64_t N, int64_t K) {
   std::string ir = generateSwiGLUIR(M, N, K);
   return mlir::parseSourceString<mlir::ModuleOp>(ir, ctx);
+}
 
-  /// Build a SwiGLU module programmatically using OpBuilder.
-  /// Avoids func.func custom assembly text-parsing issues
-  /// (known broken in LLVM 20 Homebrew builds).
-  static mlir::OwningOpRef<mlir::ModuleOp> buildSwiGLUModule(
-      mlir::OpBuilder & builder, int64_t M, int64_t N, int64_t K) {
-    auto loc = builder.getUnknownLoc();
-    auto module = mlir::ModuleOp::create(builder, loc);
-    auto bf16Type = builder.getBF16Type();
-    auto xType = mlir::RankedTensorType::get({M, K}, bf16Type);
-    auto wType = mlir::RankedTensorType::get({K, N}, bf16Type);
-    auto outType = mlir::RankedTensorType::get({M, N}, bf16Type);
+/// Build a SwiGLU module programmatically using OpBuilder.
+/// Avoids func.func custom assembly text-parsing issues
+/// (known broken in LLVM 20 Homebrew builds).
+static mlir::OwningOpRef<mlir::ModuleOp>
+buildSwiGLUModule(mlir::OpBuilder &builder, int64_t M, int64_t N, int64_t K) {
+  auto loc = builder.getUnknownLoc();
+  auto module = mlir::ModuleOp::create(builder, loc);
+  auto bf16Type = builder.getBF16Type();
+  auto xType = mlir::RankedTensorType::get({M, K}, bf16Type);
+  auto wType = mlir::RankedTensorType::get({K, N}, bf16Type);
+  auto outType = mlir::RankedTensorType::get({M, N}, bf16Type);
 
-    auto funcType =
-        builder.getFunctionType({xType, wType, wType, outType}, {outType});
-    auto func =
-        mlir::func::FuncOp::create(builder, loc, "llk_swiglu", funcType);
-    auto *entry = func.addEntryBlock();
-    builder.setInsertionPointToStart(entry);
+  auto funcType =
+      builder.getFunctionType({xType, wType, wType, outType}, {outType});
+  auto func = mlir::func::FuncOp::create(builder, loc, "llk_swiglu", funcType);
+  auto *entry = func.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
 
-    auto fusedOp = mlir::llk::FusedSwiGLUOp::create(
-        builder, loc, outType, entry->getArgument(0), entry->getArgument(1),
-        entry->getArgument(2), entry->getArgument(3),
-        mlir::TypeAttr::get(builder.getF32Type()),
-        mlir::llk::ActivationAttr::get(builder.getContext(),
-                                       mlir::llk::Activation::silu),
-        mlir::llk::MathModeAttr::get(builder.getContext(),
-                                     mlir::llk::MathMode::bounded_fast));
+  auto fusedOp = mlir::llk::FusedSwiGLUOp::create(
+      builder, loc, outType, entry->getArgument(0), entry->getArgument(1),
+      entry->getArgument(2), entry->getArgument(3),
+      mlir::TypeAttr::get(builder.getF32Type()),
+      mlir::llk::ActivationAttr::get(builder.getContext(),
+                                     mlir::llk::Activation::silu),
+      mlir::llk::MathModeAttr::get(builder.getContext(),
+                                   mlir::llk::MathMode::bounded_fast));
 
-    mlir::func::ReturnOp::create(builder, loc, fusedOp.getResult());
-    return module;
-  }
+  mlir::func::ReturnOp::create(builder, loc, fusedOp.getResult());
+  return module;
+}
 }
 
 // ---------------------------------------------------------------------------
