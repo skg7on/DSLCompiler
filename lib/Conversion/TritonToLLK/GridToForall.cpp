@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -70,13 +71,19 @@ void TritonGridToForallPass::runOnOperation() {
     builder.setInsertionPointToStart(&funcOp.getBody().front());
     Location loc = funcOp.getLoc();
 
-    // Convention: function arguments encode grid dimensions.
-    // args[0 .. gridDims-1] = dimension sizes (M, N, ...)
-    // args[gridDims .. 2*gridDims-1] = block sizes (BM, BN, ...)
-    auto args = funcOp.getArguments();
-    if ((int)args.size() < 2 * gridDims) {
+    // Convention: grid dimensions are encoded as index-typed function
+    // arguments. Scan for them rather than assuming a positional layout,
+    // since real Triton signatures may lead with pointer/block args.
+    // indexArgs[0 .. gridDims-1] = dimension sizes (M, N, ...)
+    // indexArgs[gridDims .. 2*gridDims-1] = block sizes (BM, BN, ...)
+    SmallVector<Value> indexArgs;
+    for (auto arg : funcOp.getArguments()) {
+      if (isa<IndexType>(arg.getType()))
+        indexArgs.push_back(arg);
+    }
+    if ((int)indexArgs.size() < 2 * gridDims) {
       funcOp.emitWarning(
-          "triton-grid-to-forall: not enough function arguments for "
+          "triton-grid-to-forall: not enough index-typed arguments for "
           "a ")
           << gridDims << "D grid";
       return WalkResult::advance();
@@ -85,8 +92,8 @@ void TritonGridToForallPass::runOnOperation() {
     // Compute num_tiles for each axis: ceilDiv(dim, block).
     SmallVector<Value> numTilesPerAxis;
     for (int i = 0; i < gridDims; ++i) {
-      Value dim = args[i];
-      Value block = args[gridDims + i];
+      Value dim = indexArgs[i];
+      Value block = indexArgs[gridDims + i];
       Value numTiles = arith::CeilDivSIOp::create(builder, loc, dim, block);
       numTilesPerAxis.push_back(numTiles);
     }
@@ -160,6 +167,16 @@ void TritonGridToForallPass::runOnOperation() {
     builder.setInsertionPoint(forallOp.getBody()->getTerminator());
     for (auto *op : opsToClone) {
       builder.clone(*op, mapper);
+    }
+
+    // Remap return operands so they don't reference erased ops.  A
+    // func.return that consumes a value produced by a cloned op would
+    // otherwise dangle once the original op is erased below.
+    auto returnOp = funcOp.getBody().back().getTerminator();
+    for (unsigned i = 0; i < returnOp->getNumOperands(); ++i) {
+      if (mapper.contains(returnOp->getOperand(i))) {
+        returnOp->setOperand(i, mapper.lookup(returnOp->getOperand(i)));
+      }
     }
 
     // Erase original ops from the function body.  Order matters:
