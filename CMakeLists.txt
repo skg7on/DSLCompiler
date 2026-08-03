@@ -513,6 +513,12 @@ if(FILECHECK_BIN)
         ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_1d.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_1d.mlir"
   )
+  # BlockPointerMasked: verify boundary mask for partial tiles (N=127 not /8)
+  add_test(NAME BlockPointerMasked
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-block-ptr-to-vector \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_masked.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_masked.mlir"
+  )
   # Causal mask: verify cmp + select pattern for upper-triangular -inf
   add_test(NAME CausalMask
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir"

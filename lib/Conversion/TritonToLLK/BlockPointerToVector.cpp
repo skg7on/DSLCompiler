@@ -73,13 +73,15 @@ struct BlockPtrLoadPattern : public RewritePattern {
     Location loc = op->getLoc();
 
     // Extract block pointer attributes.
+    auto shapeAttr = ptrOp->getAttrOfType<DenseI64ArrayAttr>("shape");
     auto blockShapeAttr =
         ptrOp->getAttrOfType<DenseI64ArrayAttr>("block_shape");
     auto stridesAttr = ptrOp->getAttrOfType<DenseI64ArrayAttr>("strides");
 
-    if (!blockShapeAttr || !stridesAttr)
+    if (!shapeAttr || !blockShapeAttr || !stridesAttr)
       return failure();
 
+    auto shape = shapeAttr.asArrayRef();
     auto blockShape = blockShapeAttr.asArrayRef();
     auto strides = stridesAttr.asArrayRef();
     unsigned rank = static_cast<unsigned>(blockShape.size());
@@ -126,6 +128,22 @@ struct BlockPtrLoadPattern : public RewritePattern {
     if (op->getNumOperands() >= 2)
       mask = op->getOperand(1);
 
+    // Generate a boundary mask when the block may extend past the global
+    // shape. vector.create_mask yields lane-wise `index < remaining`, so a
+    // full block (remaining >= blockShape) produces an all-true mask and a
+    // partial edge tile is masked to the in-range elements.
+    if (!mask) {
+      SmallVector<Value> remaining;
+      for (unsigned i = 0; i < rank; ++i) {
+        Value dim = arith::ConstantIndexOp::create(rewriter, loc, shape[i]);
+        Value off = ptrOp->getOperand(1 + i);
+        remaining.push_back(arith::SubIOp::create(rewriter, loc, dim, off));
+      }
+      mask = vector::CreateMaskOp::create(
+          rewriter, loc, VectorType::get(vectorShape, rewriter.getI1Type()),
+          remaining);
+    }
+
     // All dimensions are in-bounds within the subview.
     SmallVector<bool> inBoundsVec(rank, true);
     auto inBoundsAttr = rewriter.getBoolArrayAttr(inBoundsVec);
@@ -170,12 +188,14 @@ struct BlockPtrStorePattern : public RewritePattern {
     Value base = ptrOp->getOperand(0);
     Location loc = op->getLoc();
 
+    auto shapeAttr = ptrOp->getAttrOfType<DenseI64ArrayAttr>("shape");
     auto blockShapeAttr =
         ptrOp->getAttrOfType<DenseI64ArrayAttr>("block_shape");
     auto stridesAttr = ptrOp->getAttrOfType<DenseI64ArrayAttr>("strides");
-    if (!blockShapeAttr || !stridesAttr)
+    if (!shapeAttr || !blockShapeAttr || !stridesAttr)
       return failure();
 
+    auto shape = shapeAttr.asArrayRef();
     auto blockShape = blockShapeAttr.asArrayRef();
     auto strides = stridesAttr.asArrayRef();
     unsigned rank = static_cast<unsigned>(blockShape.size());
@@ -208,6 +228,23 @@ struct BlockPtrStorePattern : public RewritePattern {
     Value mask;
     if (op->getNumOperands() >= 3)
       mask = op->getOperand(2);
+
+    // Vector shape derived from the block shape for mask generation.
+    SmallVector<int64_t> vectorShape(blockShape.begin(), blockShape.end());
+
+    // Generate a boundary mask when the block may extend past the global
+    // shape, so a partial edge tile never writes out-of-bounds elements.
+    if (!mask) {
+      SmallVector<Value> remaining;
+      for (unsigned i = 0; i < rank; ++i) {
+        Value dim = arith::ConstantIndexOp::create(rewriter, loc, shape[i]);
+        Value off = ptrOp->getOperand(1 + i);
+        remaining.push_back(arith::SubIOp::create(rewriter, loc, dim, off));
+      }
+      mask = vector::CreateMaskOp::create(
+          rewriter, loc, VectorType::get(vectorShape, rewriter.getI1Type()),
+          remaining);
+    }
 
     // All dimensions are in-bounds within the subview.
     SmallVector<bool> inBoundsVec(rank, true);
