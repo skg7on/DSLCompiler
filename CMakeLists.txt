@@ -501,6 +501,18 @@ if(FILECHECK_BIN)
         ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_to_structured.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_to_structured.mlir"
   )
+  # BlockPointerToVector: verify tt.make_block_ptr + load/store -> vector.transfer
+  add_test(NAME BlockPointerToVector
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-block-ptr-to-vector \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_to_vector.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_to_vector.mlir"
+  )
+  # BlockPointer1D: verify 1D block pointer lowering
+  add_test(NAME BlockPointer1D
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-block-ptr-to-vector \
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_1d.mlir \
+        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_1d.mlir"
+  )
   # Causal mask: verify cmp + select pattern for upper-triangular -inf
   add_test(NAME CausalMask
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir"
