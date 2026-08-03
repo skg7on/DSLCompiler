@@ -9,6 +9,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToLinalg.h"
+#include "LLK/Conversion/TritonToLLK/GridToForall.h"
+#include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Runtime/JitCache.h"
 #include "LLK/Transforms/ForallToLLRT.h"
@@ -85,6 +87,24 @@ static cl::opt<int64_t> optK("K", cl::desc("K dimension (hidden)"),
 
 static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
   mlir::PassManager pm(module->getContext());
+
+  // Triton IR path (M8b): staged lowering before the existing pipeline.
+  // Detect Triton IR by checking for tt.* ops (unregistered dialect, so the
+  // check is on the op name prefix rather than a dialect namespace).
+  bool hasTritonOps = false;
+  module.walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef().starts_with("tt."))
+      hasTritonOps = true;
+  });
+
+  if (hasTritonOps) {
+    // Stage 0a: Triton compute ops (tt.dot) → Linalg structured ops.
+    pm.addPass(mlir::llk::createTritonToStructuredPass());
+    // Stage 0b: Clean up the lowered IR before grid dispatch lowering.
+    pm.addPass(mlir::createCanonicalizerPass(mlir::GreedyRewriteConfig()));
+    // Stage 0c: Triton grid dispatch (tt.get_program_id) → scf.forall.
+    pm.addPass(mlir::llk::createTritonGridToForallPass());
+  }
 
   // Stage 1: Lower LLK dialect ops to Linalg + Arith + Math.
   pm.addPass(mlir::llk::createLLKToLinalgPass());

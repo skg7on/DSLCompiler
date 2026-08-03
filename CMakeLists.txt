@@ -299,6 +299,13 @@ add_llvm_executable(SwigluScalar test/Execution/swiglu_scalar.cpp)
 target_link_libraries(SwigluScalar PRIVATE LLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwigluScalar COMMAND SwigluScalar)
 
+# Triton IR → staged pipeline → JIT integration test (M8b). Test body is
+# currently a DISABLED stub; links the staged-pipeline pass libs it will
+# exercise once the full Triton lowering path is integrated.
+add_llvm_executable(TritonSwigluStaged test/Execution/triton_swiglu_staged.cpp)
+target_link_libraries(TritonSwigluStaged PRIVATE LLKPasses TritonToLLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME TritonSwigluStaged COMMAND TritonSwigluStaged)
+
 add_llvm_executable(SwiGLUVector test/Execution/swiglu_vector_avx2.cpp)
 target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
