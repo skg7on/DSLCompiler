@@ -90,10 +90,22 @@ public:
   JitCache &operator=(JitCache &&) = delete;
 
   // -----------------------------------------------------------------------
-  // Legacy API (M1-M4): string-keyed single-level cache for lookupOrCompile
+  // Primary compilation entry point
   // -----------------------------------------------------------------------
+  //
+  // lookupOrCompile is the main JIT entry point.  Both overloads compile an
+  // MLIR module to native code via ORC LLJIT and cache the result in L3.
+  //
+  // The string-keyed overload is retained for backward compat with M1-M4
+  // callers; prefer the KernelKey overload in new code.
 
+  /// Legacy overload (string key).  Still used by tests and llk-compile.
   llvm::Expected<KernelFn> lookupOrCompile(const std::string &cache_key,
+                                           mlir::ModuleOp module);
+
+  /// Preferred overload: derive the cache key from a structured KernelKey
+  /// and delegate to the string-keyed implementation.
+  llvm::Expected<KernelFn> lookupOrCompile(const KernelKey &key,
                                            mlir::ModuleOp module);
 
   // -----------------------------------------------------------------------
@@ -192,7 +204,7 @@ private:
 
   std::unique_ptr<llvm::orc::LLJIT> jit_;
 
-  // Legacy string-keyed cache (used by lookupOrCompile for backward compat).
+  // Backward-compat string-keyed cache (used by the string overload).
   std::unordered_map<std::string, KernelFn> cache_;
   mutable std::shared_mutex mutex_;
 
