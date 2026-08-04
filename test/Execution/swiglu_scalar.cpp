@@ -19,6 +19,14 @@
 
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"
+
+// Generated op and attribute class definitions required for
+// programmatic IR building (buildSwiGLUModule).
+#define GET_ATTRDEF_CLASSES
+#include "LLK/Dialect/LLKAttributes.h.inc"
+
+#define GET_OP_CLASSES
+#include "LLK/Dialect/LLKOps.h.inc"
 #include "LLK/Runtime/JitCache.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
