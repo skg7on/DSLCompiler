@@ -29,6 +29,7 @@ enum class CpuIsa : uint8_t {
   AMX_BF16 = 3,
   NEON = 4,
   SVE = 5,
+  UNKNOWN = 6
 };
 
 enum class OperationKind : uint8_t { FusedSwiGLU = 0, RoPE = 1, Attention = 2 };

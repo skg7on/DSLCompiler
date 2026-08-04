@@ -16,30 +16,22 @@
 #include <cstdint>
 #include <string>
 
+#include "LLK/Runtime/KernelKey.h"
+
 namespace llk {
 
-enum class CpuIsa : uint8_t {
-    UNKNOWN = 0,
-    AVX2 = 1,
-    AVX512_BF16 = 2,
-    AVX512_VNNI = 3,
-    AMX_BF16 = 4,
-    NEON = 5,
-    SVE = 6,
-};
-
 struct CpuFeatures {
-    bool avx2 = false;
-    bool fma = false;
-    bool avx512f = false;
-    bool avx512bf16 = false;
-    bool amx_bf16 = false;
-    bool neon = false;
-    bool sve = false;
+  bool avx2 = false;
+  bool fma = false;
+  bool avx512f = false;
+  bool avx512bf16 = false;
+  bool amx_bf16 = false;
+  bool neon = false;
+  bool sve = false;
 
-    static CpuFeatures detect();
-    CpuIsa bestIsa() const;
-    std::string toString() const;
+  static CpuFeatures detect();
+  CpuIsa bestIsa() const;
+  std::string toString() const;
 };
 
 } // namespace llk
