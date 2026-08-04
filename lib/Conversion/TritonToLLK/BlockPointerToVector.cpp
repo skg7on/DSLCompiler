@@ -105,7 +105,7 @@ struct BlockPtrLoadPattern : public RewritePattern {
     auto vectorType = VectorType::get(vectorShape, elementType);
 
     // Zero indices for in-bounds read starting at subview origin.
-    SmallVector<Value> zeroIndices = llk::buildZeroIndices(rank, loc, rewriter);
+    SmallVector<Value> zeroIndices = llk::buildZeroIndices(rewriter, loc, rank);
 
     // Build identity permutation map.
     auto permMapAttr =
@@ -211,7 +211,7 @@ struct BlockPtrStorePattern : public RewritePattern {
                                              sizes, subStrides);
 
     // Zero indices at subview origin.
-    SmallVector<Value> zeroIndices = llk::buildZeroIndices(rank, loc, rewriter);
+    SmallVector<Value> zeroIndices = llk::buildZeroIndices(rewriter, loc, rank);
 
     auto permMapAttr =
         getIdentityPermutationMapAttr(rank, rewriter.getContext());
