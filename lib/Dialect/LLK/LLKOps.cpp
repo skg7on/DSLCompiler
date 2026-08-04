@@ -364,7 +364,7 @@ SmallVector<Range> mlir::llk::MatmulOp::getIterationDomain(OpBuilder &b) {
   return {Range{zero, M, one}, Range{zero, N, one}, Range{zero, K, one}};
 }
 
-FailureOr<TilingResult> FailureOr<TilingResult>
+FailureOr<TilingResult>
 mlir::llk::MatmulOp::getTiledImplementation(OpBuilder &b,
                                             ArrayRef<OpFoldResult> offsets,
                                             ArrayRef<OpFoldResult> sizes) {
@@ -397,7 +397,6 @@ mlir::llk::MatmulOp::getTiledImplementation(OpBuilder &b,
 
   return TilingResult{
       {tiledOp}, SmallVector<Value>(tiledOp->getResults()), generatedSlices};
-}
 }
 
 LogicalResult mlir::llk::MatmulOp::getResultTilePosition(
