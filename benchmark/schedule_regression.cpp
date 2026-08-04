@@ -11,15 +11,26 @@
 #include <cstdint>
 #include <vector>
 
-// Baseline GFLOPS thresholds per M-bucket (placeholder values;
-// actual baselines should be recorded from the tuning harness).
+// Baseline GFLOPS thresholds per M-bucket.
+//
+// CURRENT STATUS (M8): These are placeholder values. Real thresholds require:
+//   1. Full JIT pipeline integration in llk-bench (M2+ vector codegen working
+//      end-to-end with ORC JIT).
+//   2. A reference hardware baseline (e.g., Intel Core i7-12700H or Apple M2
+//   Pro).
+//   3. Running llk-tune with --record-baseline flag to populate real numbers
+//      from the tuning harness.
+//
+// Once llk-bench produces GFLOPS measurements on the reference machine,
+// replace these placeholders with the P50 measured values and set a 5%
+// regression tolerance. Expected timeline: M8+ (post-triton-frontend).
 struct Baseline {
   int64_t M_bucket;
   double min_gflops;
 };
 
 // These thresholds are intentionally low for initial check-in.
-// They should be tightened once llk-bench produces real numbers.
+// They will be replaced once the prerequisites above are met.
 static const Baseline kBaselines[] = {
     {0, 0.5},  // M=1:    at least 0.5 GFLOPS (GEMV-like)
     {1, 1.0},  // M=2-4:  at least 1.0 GFLOPS
