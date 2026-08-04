@@ -244,6 +244,11 @@ JitCache::lookupOrCompile(const std::string &cache_key, mlir::ModuleOp module) {
   return fn;
 }
 
+llvm::Expected<JitCache::KernelFn>
+JitCache::lookupOrCompile(const KernelKey &key, mlir::ModuleOp module) {
+  return lookupOrCompile(kernelKeyToString(key), module);
+}
+
 // ---------------------------------------------------------------------------
 // L3: Object-code cache
 // ---------------------------------------------------------------------------
