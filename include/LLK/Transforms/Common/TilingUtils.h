@@ -11,6 +11,8 @@
 
 #include <cstdint>
 
+#include "mlir/IR/Operation.h"
+
 namespace mlir {
 namespace llk {
 
@@ -38,6 +40,26 @@ inline int64_t tileSize(int64_t dimSize, int64_t tileSize, int64_t tileIdx) {
   int64_t remaining = dimSize - start;
   return remaining < tileSize ? remaining : tileSize;
 }
+
+/// Compute the number of inner (vector) tiles within one outer tile.
+/// Ceiling division: (outerTileSize + innerTileSize - 1) / innerTileSize.
+inline int64_t numInnerTiles(int64_t outerTileSize, int64_t innerTileSize) {
+  if (innerTileSize == 0)
+    return 1;
+  return (outerTileSize + innerTileSize - 1) / innerTileSize;
+}
+
+/// Check if any operand of an operation has a dynamic (unknown) dimension.
+/// Used by tiling passes to decide between static and dynamic tiling paths.
+bool hasDynamicOperand(mlir::Operation *op);
+
+/// Forward declaration for ScheduleEntry.
+struct ScheduleEntry;
+
+/// Resolve effective tile sizes from a schedule entry and target ISA.
+/// Fills in ISA-specific defaults when schedule values are zero and
+/// computes VM/VN from vector_width when not explicitly set.
+TileParams resolveTileParams(const ScheduleEntry &entry, int vectorWidth);
 
 } // namespace llk
 } // namespace mlir
