@@ -305,7 +305,8 @@ TEST(SwiGLUScalar, JitCompilationSmoke) {
     SUCCEED() << "JIT compilation infrastructure is operational.";
   } else {
     llvm::consumeError(fnOrErr.takeError());
-    GTEST_SKIP() << "JIT compilation not yet available.";
+    GTEST_SKIP()
+        << "JIT runtime not available (ORC LLJIT may not be configured).";
   }
 }
 

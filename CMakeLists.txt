@@ -296,7 +296,7 @@ add_llk_test(SwigluReference test/Execution/swiglu_reference.cpp)
 
 if(LLK_BUILD_E2E_TESTS)
 add_llvm_executable(SwigluScalar test/Execution/swiglu_scalar.cpp)
-target_link_libraries(SwigluScalar PRIVATE LLKPasses LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(SwigluScalar PRIVATE LLKPasses LLKTransforms LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwigluScalar COMMAND SwigluScalar)
 
 # Triton IR → staged pipeline → JIT integration test (M8b). Test body is
