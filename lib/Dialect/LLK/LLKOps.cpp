@@ -91,7 +91,7 @@ MutableOperandRange FusedSwiGLUOp::getDpsInitsMutable() {
 }
 
 //===----------------------------------------------------------------------===//
-// TilingInterface stubs.
+// TilingInterface implementations.
 //===----------------------------------------------------------------------===//
 
 SmallVector<utils::IteratorType> FusedSwiGLUOp::getLoopIteratorTypes() {
@@ -114,8 +114,44 @@ FailureOr<TilingResult>
 FusedSwiGLUOp::getTiledImplementation(OpBuilder &b,
                                       ArrayRef<OpFoldResult> offsets,
                                       ArrayRef<OpFoldResult> sizes) {
-  // For M1: return failure to signal no tiling support yet (M2 will implement).
-  return failure();
+  Location loc = getLoc();
+  SmallVector<Operation *> generatedSlices;
+
+  // offsets = [oM, oN, oK], sizes = [sM, sN, sK]
+
+  // X slice: at [oM, oK] x [sM, sK], stride [1,1]
+  SmallVector<OpFoldResult> strides2(2, b.getI64IntegerAttr(1));
+  auto xSlice = tensor::ExtractSliceOp::create(
+      b, loc, getX(), {offsets[0], offsets[2]}, {sizes[0], sizes[2]}, strides2);
+  generatedSlices.push_back(xSlice);
+
+  // Wg slice: at [oK, oN] x [sK, sN], stride [1,1]
+  auto wgSlice =
+      tensor::ExtractSliceOp::create(b, loc, getWg(), {offsets[2], offsets[1]},
+                                     {sizes[2], sizes[1]}, strides2);
+  generatedSlices.push_back(wgSlice);
+
+  // Wu slice: same offsets/sizes as Wg
+  auto wuSlice =
+      tensor::ExtractSliceOp::create(b, loc, getWu(), {offsets[2], offsets[1]},
+                                     {sizes[2], sizes[1]}, strides2);
+  generatedSlices.push_back(wuSlice);
+
+  // Init slice: at [oM, oN] x [sM, sN], stride [1,1]
+  auto initSlice = tensor::ExtractSliceOp::create(
+      b, loc, getInit(), {offsets[0], offsets[1]}, {sizes[0], sizes[1]},
+      strides2);
+  generatedSlices.push_back(initSlice);
+
+  // Create tiled FusedSwiGLUOp with sliced operands.
+  auto resultType = initSlice.getType();
+  auto tiledOp = FusedSwiGLUOp::create(
+      b, loc, resultType, xSlice.getResult(), wgSlice.getResult(),
+      wuSlice.getResult(), initSlice.getResult(), getAccumulatorTypeAttr(),
+      getActivationAttr(), getMathModeAttr());
+
+  return TilingResult{
+      {tiledOp}, SmallVector<Value>(tiledOp->getResults()), generatedSlices};
 }
 
 LogicalResult FusedSwiGLUOp::getResultTilePosition(
@@ -332,8 +368,35 @@ FailureOr<TilingResult>
 mlir::llk::MatmulOp::getTiledImplementation(OpBuilder &b,
                                             ArrayRef<OpFoldResult> offsets,
                                             ArrayRef<OpFoldResult> sizes) {
-  // Delegate to linalg.matmul tiling
-  return emitOpError("MatmulOp::getTiledImplementation not yet implemented");
+  Location loc = getLoc();
+  SmallVector<Operation *> generatedSlices;
+
+  // offsets = [oM, oN, oK], sizes = [sM, sN, sK]
+
+  // A slice: at [oM, oK] x [sM, sK], stride [1,1]
+  SmallVector<OpFoldResult> strides2(2, b.getI64IntegerAttr(1));
+  auto aSlice = tensor::ExtractSliceOp::create(
+      b, loc, getA(), {offsets[0], offsets[2]}, {sizes[0], sizes[2]}, strides2);
+  generatedSlices.push_back(aSlice);
+
+  // B slice: at [oK, oN] x [sK, sN], stride [1,1]
+  auto bSlice = tensor::ExtractSliceOp::create(
+      b, loc, getB(), {offsets[2], offsets[1]}, {sizes[2], sizes[1]}, strides2);
+  generatedSlices.push_back(bSlice);
+
+  // Init slice: at [oM, oN] x [sM, sN], stride [1,1]
+  auto initSlice = tensor::ExtractSliceOp::create(
+      b, loc, getInit(), {offsets[0], offsets[1]}, {sizes[0], sizes[1]},
+      strides2);
+  generatedSlices.push_back(initSlice);
+
+  // Create tiled MatmulOp with sliced operands.
+  auto tiledOp = MatmulOp::create(
+      b, loc, initSlice.getType(), aSlice.getResult(), bSlice.getResult(),
+      initSlice.getResult(), getAccumulatorTypeAttr(), getMathModeAttr());
+
+  return TilingResult{
+      {tiledOp}, SmallVector<Value>(tiledOp->getResults()), generatedSlices};
 }
 
 LogicalResult mlir::llk::MatmulOp::getResultTilePosition(
