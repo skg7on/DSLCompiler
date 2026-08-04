@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/TritonToLLK/BlockPointerToVector.h"
+#include "LLK/Transforms/Common/VectorizationUtils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -26,15 +27,6 @@ namespace {
 //===----------------------------------------------------------------------===//
 // Helpers
 //===----------------------------------------------------------------------===//
-
-/// Build a SmallVector of index-typed zero constants for the given rank.
-static SmallVector<Value> buildZeroIndices(unsigned rank, Location loc,
-                                           PatternRewriter &rewriter) {
-  SmallVector<Value> zeros;
-  for (unsigned i = 0; i < rank; ++i)
-    zeros.push_back(arith::ConstantIndexOp::create(rewriter, loc, 0));
-  return zeros;
-}
 
 /// Build an AffineMapAttr for the identity permutation map of a given rank.
 static AffineMapAttr getIdentityPermutationMapAttr(unsigned rank,
@@ -113,7 +105,7 @@ struct BlockPtrLoadPattern : public RewritePattern {
     auto vectorType = VectorType::get(vectorShape, elementType);
 
     // Zero indices for in-bounds read starting at subview origin.
-    SmallVector<Value> zeroIndices = buildZeroIndices(rank, loc, rewriter);
+    SmallVector<Value> zeroIndices = llk::buildZeroIndices(rewriter, loc, rank);
 
     // Build identity permutation map.
     auto permMapAttr =
@@ -219,7 +211,7 @@ struct BlockPtrStorePattern : public RewritePattern {
                                              sizes, subStrides);
 
     // Zero indices at subview origin.
-    SmallVector<Value> zeroIndices = buildZeroIndices(rank, loc, rewriter);
+    SmallVector<Value> zeroIndices = llk::buildZeroIndices(rewriter, loc, rank);
 
     auto permMapAttr =
         getIdentityPermutationMapAttr(rank, rewriter.getContext());
