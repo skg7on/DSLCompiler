@@ -6,6 +6,12 @@
 - [M9+ Canonical Micro-IR Architecture](../../design/m9-canonical-micro-ir-architecture.md)
 - [Micro-IR Core Concepts](../../design/m9-micro-ir-core-concepts.md)
 
+**Detailed Implementation Specs:**
+- [Micro-IR Dialect Implementation Spec](2026-08-11-micro-ir-dialect-implementation-spec.md)
+- [LLK/Linalg to Micro-IR Lowering Implementation Spec](2026-08-11-llk-to-micro-lowering-implementation-spec.md)
+- [Micro-IR Auto-Tuning and Auto-Optimization Implementation Spec](2026-08-11-micro-ir-autotuning-implementation-spec.md)
+- [Micro-IR AVX2 Simulator and Emulator Implementation Spec](2026-08-11-micro-ir-avx2-simulator-implementation-spec.md)
+
 ---
 
 ## 1. Goal
