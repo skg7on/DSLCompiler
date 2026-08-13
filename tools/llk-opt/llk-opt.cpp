@@ -21,6 +21,7 @@
 #include "LLK/Conversion/TritonToLLK/TritonCPUVerifier.h"
 #include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
 #include "LLK/Dialect/LLKDialect.h"
+#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Transforms/ForallToLLRT.h"
 #include "LLK/Transforms/ForallToOpenMP.h"
 #include "LLK/Transforms/FuseDoubleContraction.h"
@@ -40,6 +41,9 @@ int main(int argc, char **argv) {
 
   // Register the LLK dialect.
   registry.insert<mlir::llk::LLKDialect>();
+
+  // Register the Micro dialect.
+  registry.insert<mlir::micro::MicroDialect>();
 
   // Register Linalg transform dialect extensions (e.g.
   // transform.structured.match).
