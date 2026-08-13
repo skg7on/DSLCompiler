@@ -41,10 +41,6 @@ using namespace mlir::micro;
 //===----------------------------------------------------------------------===//
 
 LogicalResult KernelOp::verify() {
-  // Body region must not be empty.
-  if (getBody().empty())
-    return emitOpError("body must not be empty");
-
   // workload, if present, must be non-empty.
   if (auto workload = getWorkload())
     if (workload->empty())

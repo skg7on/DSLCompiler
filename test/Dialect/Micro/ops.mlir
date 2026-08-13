@@ -6,7 +6,8 @@
 // CHECK-LABEL: func.func @test_kernel_roundtrip
 func.func @test_kernel_roundtrip() {
   // CHECK: micro.kernel
-  micro.kernel @my_kernel attributes {workload = "fused_swiglu", target = "x86-avx2-cpu"} {
+  // CHECK: candidate = "candidate_17"
+  micro.kernel @my_kernel attributes {workload = "fused_swiglu", target = "x86-avx2-cpu", candidate = "candidate_17"} {
     micro.yield
   }
   return

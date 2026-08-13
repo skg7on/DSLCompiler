@@ -3,7 +3,6 @@
 
 include "MicroDialect.td"
 include "MicroTypes.td"
-include "mlir/IR/SymbolInterfaces.td"
 
 //===----------------------------------------------------------------------===//
 // Base class for all Micro dialect ops
@@ -30,7 +29,7 @@ def Micro_KernelOp : Micro_Op<"kernel", [
         SymbolNameAttr:$sym_name,
         OptionalAttr<StrAttr>:$workload,
         OptionalAttr<StrAttr>:$target,
-        OptionalAttr<I64Attr>:$candidate,
+        OptionalAttr<StrAttr>:$candidate,
         OptionalAttr<I64Attr>:$schedule_id
     );
 
