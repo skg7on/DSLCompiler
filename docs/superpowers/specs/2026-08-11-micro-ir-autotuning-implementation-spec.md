@@ -10,6 +10,8 @@
 
 Implement an auto-tuning framework based on `micro.search_space`, `micro.candidate`, concrete `micro.kernel`, `MachineModel` YAML, and `micro-perf`. The framework should evolve the current `llk-tune` grid-search tool into a micro-IR based schedule search engine.
 
+The tuning framework is tile-centric. It searches tile hierarchy, tile layout, memory placement, owner mapping, pipeline structure, and instruction-fragment binding, not only loop tile sizes.
+
 The first target is Intel CPU with AVX2. The design must remain generic enough for future accelerator profiles.
 
 ---
@@ -24,6 +26,14 @@ Current `tools/llk-tune/llk-tune.cpp`:
 - records measured GFLOPS metadata
 
 The new framework keeps that simple grid as the first candidate generator, but moves legality, evaluation, and persistence onto the `micro` abstraction.
+
+The first grid remains useful, but each candidate must eventually bind:
+
+```text
+uTile choices: BM, BN, BK, fusion, reduction tile shape
+uMap choices: layout, memory placement, owner mapping, pipeline stages
+uHW choices: MMA/vector/reduction fragment shape and target compute binding
+```
 
 ---
 
@@ -115,9 +125,13 @@ MVP should evolve `llk-tune` first to reuse the existing tool name.
 ### 5.1 `SearchParam`
 
 ```cpp
+struct SearchChoice {
+  std::variant<int64_t, std::string> value;
+};
+
 struct SearchParam {
   std::string name;
-  std::vector<int64_t> choices;
+  std::vector<SearchChoice> choices;
 };
 ```
 
@@ -125,7 +139,8 @@ Rules:
 
 - `choices` must be non-empty
 - choices must be unique after sorting
-- all MVP values are signed 64-bit integers
+- integer choices are used for tile sizes, loop bounds, pipeline stages, and vector widths
+- string choices are used for layout, owner mapping, memory path, fragment shape, and policy names
 
 ### 5.2 `SearchConstraint`
 
@@ -136,7 +151,12 @@ enum class ConstraintKind {
   MmaCompatible,
   MappingExtent,
   TailSupported,
-  VectorWidthSupported
+  VectorWidthSupported,
+  TileHierarchyCompatible,
+  LayoutSupported,
+  OwnerSupported,
+  FragmentCompatible,
+  PipelineLiveTiles
 };
 
 struct SearchConstraint {
@@ -189,14 +209,17 @@ struct SearchSpace {
 struct Candidate {
   std::string id;
   std::map<std::string, int64_t> values;
+  std::map<std::string, std::string> symbolicValues;
 };
 ```
 
 Candidate IDs should be stable:
 
 ```text
-candidate_<64-bit-hash-of-sorted-param-bindings>
+candidate_<64-bit-hash-of-sorted-numeric-and-symbolic-bindings>
 ```
+
+String-valued candidate choices are required for layout, owner mapping, memory path, and fragment-shape names. Store those in `symbolicValues` so integer parameter handling remains simple.
 
 ### 5.6 `CandidateMetrics`
 
@@ -294,6 +317,11 @@ Deferred until the candidate record format and metrics are stable.
 Mutation dimensions:
 
 - tile sizes
+- multi-level tile hierarchy
+- tile layouts
+- owner mappings
+- memory placements
+- instruction fragment shapes
 - pipeline stages
 - vector width
 - thread count
@@ -405,6 +433,61 @@ bf16 logical vector_width <= 16 for storage, but dot accumulation maps to f32 la
 
 The initial BF16 path should use the existing project convention `vector_width = 8`.
 
+### 7.7 `TileHierarchyCompatible`
+
+Legal if every child tile divides its parent tile or has explicit mask/tail metadata.
+
+Example:
+
+```text
+worker_tile = [BM, BN, BK]
+fragment = [fm, fn, fk]
+legal if BM % fm == 0 and BN % fn == 0 and BK % fk == 0
+or tail_policy == "mask"
+```
+
+### 7.8 `LayoutSupported`
+
+Legal if:
+
+- every materialized tile layout is supported by the target memory space
+- every compute fragment layout is supported by the selected compute engine
+- physical layout transforms fit in the selected memory and pipeline budget
+- alignment requirements from the layout are satisfiable
+
+### 7.9 `OwnerSupported`
+
+Legal if:
+
+- every selected owner exists in the MachineModel
+- mapped owner extent is within resource count
+- nested owner scopes are compatible
+- a tile consumed by another owner has an explicit transfer, exchange, or replication step
+
+### 7.10 `FragmentCompatible`
+
+Legal if:
+
+- selected fragment shape is supported by at least one target compute engine
+- fragment dtype and accumulator dtype are supported
+- fragment shape divides or masks the execution tile
+- the selected owner can issue the fragment
+
+### 7.11 `PipelineLiveTiles`
+
+Legal if:
+
+```text
+live_materialized_bytes(stage_count, tile_shapes, layouts, memory_spaces)
+  <= memory_capacity * utilization_limit
+```
+
+Also check async queue limits:
+
+```text
+outstanding_async_copies <= machine.dma.max_outstanding
+```
+
 ---
 
 ## 8. Candidate Binding
@@ -427,6 +510,20 @@ Outputs:
 - MLIR module containing one concrete `micro.kernel`
 
 MVP strategy:
+
+Candidate binding must fill both numeric and symbolic tile decisions:
+
+```text
+BM/BN/BK                  -> loop steps and logical tile shapes
+tile_layout               -> #micro.layout on tile views/materialized tiles
+memory_path               -> tile copy/load/store spaces
+owner_mapping             -> #micro.owner and micro.spatial_for maps
+fragment_shape            -> micro.tile_partition and micro.tile_mma fragment metadata
+pipeline_stages           -> micro.pipeline stages and live tile instances
+vector_width              -> micro.tile_vector metadata
+```
+
+The output must contain no `micro.param`, `micro.constraint`, `micro.objective`, or unresolved symbolic choice.
 
 Use C++ builders to emit a concrete kernel directly from candidate values. Do not try to textual-substitute MLIR.
 
@@ -555,6 +652,19 @@ candidate:
     vector_width: 8
     num_threads: 8
     grain_size: 4
+  tile:
+    hierarchy:
+      worker: [32, 64, 64]
+      vector_engine_fragment: [16, 16, 32]
+    layout:
+      input: row_major
+      weights: blocked_16x16
+      accumulator: row_major
+    memory_path: [dram, sram, acc]
+    owner_mapping:
+      outer: worker
+      fragment: vector_engine
+    tail_policy: mask
 metrics:
   perf_level: 1
   predicted_cycles: 123456
@@ -592,6 +702,7 @@ Input:
 Assert:
 
 - param names and choices are parsed
+- string-valued choices for layout, owner, and fragment shape are parsed
 - constraints are typed
 - objective is parsed
 
@@ -616,6 +727,10 @@ Cases:
 - ACC overflow
 - unsupported MMA shape
 - unsupported vector width
+- unsupported tile layout
+- unsupported owner mapping
+- incompatible fragment shape
+- pipeline live-tile overflow
 
 ### 13.4 Candidate Binding
 
@@ -628,6 +743,7 @@ Assert:
 - concrete `micro.kernel` is emitted
 - no search ops remain in output
 - bound tile sizes appear in loop steps and tensor shapes
+- layout, memory, owner, and fragment decisions appear in tile metadata
 
 ### 13.5 Tuning Session
 
@@ -648,14 +764,15 @@ Assert:
 ## 14. Implementation Order
 
 1. Add typed C++ search data structures.
-2. Parse `micro.search_space` into `SearchSpace`.
-3. Implement deterministic grid candidate generation.
-4. Implement candidate legality checks against `MachineModel`.
-5. Implement candidate binding to concrete `micro.kernel`.
-6. Connect bound kernels to `micro-perf` L0/L1 APIs.
-7. Evolve `llk-tune` CLI to use the new flow.
-8. Add YAML schedule output.
-9. Add optional AVX2 measurement loop.
+2. Add symbolic candidate values for layout, owner, memory path, and fragment choices.
+3. Parse `micro.search_space` into `SearchSpace`.
+4. Implement deterministic grid candidate generation.
+5. Implement tile hierarchy, layout, owner, fragment, and live-tile legality checks against `MachineModel`.
+6. Implement candidate binding to tile-centric concrete `micro.kernel`.
+7. Connect bound kernels to `micro-perf` L0/L1 APIs.
+8. Evolve `llk-tune` CLI to use the new flow.
+9. Add YAML schedule output with tile decisions.
+10. Add optional AVX2 measurement loop.
 
 ---
 
@@ -665,5 +782,5 @@ Assert:
 - grid search generates deterministic candidates.
 - legality checks reject invalid candidates with stable reason strings.
 - top candidates can be ranked by L0 or L1 predicted cycles.
-- selected schedule YAML is written.
+- selected schedule YAML is written with tile hierarchy, layout, owner mapping, memory placement, pipeline, and fragment decisions.
 - optional AVX2 measurement can annotate top candidates without changing the default compile path.

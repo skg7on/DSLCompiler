@@ -2,7 +2,7 @@
 
 **Parent:** [ARCHITECTURE.md](../../ARCHITECTURE.md)
 **Status:** Draft Design
-**Scope:** Project-level redesign for a canonical DNN micro-IR, machine models, performance evaluation, and auto-scheduling.
+**Scope:** Project-level redesign for a tile-centric canonical DNN micro-IR, machine models, performance evaluation, and auto-scheduling.
 
 ---
 
@@ -13,9 +13,10 @@ The existing LLK compiler is a focused out-of-tree MLIR compiler for CPU LLM ker
 - Comparing schedules across hardware targets.
 - Evaluating model performance on candidate AI accelerators.
 - Searching tile, memory, mapping, and pipeline choices in an Ansor/TVM-style auto-scheduler.
+- Representing multi-level tile execution close to AI hardware resources.
 - Sharing one artifact between compiler backends, performance models, and architecture exploration.
 
-The new architecture adds a canonical `micro` dialect below LLK and above target-specific lowering. `micro` is not a new DNN semantic dialect. It represents how a tensor program executes on an abstract AI accelerator: compute engines, memory hierarchy, data movement, spatial mapping, temporal schedule, synchronization, and tunable schedule choices.
+The new architecture adds a canonical `micro` dialect below LLK and above target-specific lowering. `micro` is not a new DNN semantic dialect. It represents how a tensor program executes on an abstract AI accelerator: tile dataflow, compute engines, memory hierarchy, data movement, spatial mapping, temporal schedule, synchronization, and tunable schedule choices.
 
 ---
 
@@ -59,6 +60,16 @@ Frontend / semantic path:
 
 The first implementation keeps the existing AVX2/JIT path working. `micro` is introduced as an export, analysis, and auto-search layer. Once it is stable, target lowerings can move to consume concrete `micro.kernel` directly.
 
+Concrete Micro-IR is organized conceptually as:
+
+```text
+uTile: algorithmic tile dataflow
+    -> uMap: memory placement, owner mapping, pipeline, sync
+    -> uHW: instruction fragments and machine-visible events
+```
+
+The MVP may implement these as one `micro` dialect rather than three dialects, but the separation is part of the architecture contract.
+
 ---
 
 ## 3. Layer Responsibilities
@@ -97,12 +108,22 @@ This layer can still use Linalg, Tensor, SCF, and Vector to preserve MLIR-native
 
 The canonical execution layer answers: how does this scheduled tensor program execute on a machine with finite compute, memory, movement, and synchronization resources?
 
+The primary value is a tile:
+
+```text
+Tile = (shape, dtype, layout, memory_space, owner)
+```
+
+Tiles are the bridge between MLIR tensor semantics and AI hardware. Concrete Micro-IR must distinguish logical tiles, materialized memory tiles, execution tiles assigned to resources, and instruction fragments that match hardware compute granularity.
+
 It is represented by the new `micro` dialect:
 
 - `micro.kernel`
 - `micro.for`
 - `micro.spatial_for`
 - `micro.pipeline`
+- `micro.tile_view`
+- `micro.tile_partition`
 - `micro.alloc`
 - `micro.async_copy`
 - `micro.wait`
@@ -166,6 +187,32 @@ LLK/Linalg workload
 ```
 
 A concrete `micro.kernel` must be fully bound and deterministic. Search constructs must not leak into the final lowering path.
+
+### 4.1 Tile-Centric Contract
+
+The canonical artifact is not only a loop nest with ops. It is a tile execution plan:
+
+```text
+DNN Micro-IR = Tile Dataflow + Tile Mapping + Tile Schedule
+```
+
+The tile contract is:
+
+- `uTile` represents algorithmic tile dataflow: partition, view, matmul, elementwise, reduce, broadcast, and fusion.
+- `uMap` binds tiles to memory spaces, owner resources, copy paths, pipelines, and synchronization.
+- `uHW` resolves mapped tiles into instruction fragments such as MMA tiles, vector tiles, DMA transactions, barriers, and communication events.
+- Logical tile views have no direct movement cost.
+- Memory tiles consume capacity and generate memory/copy events.
+- Execution tiles drive occupancy, parallelism, and owner-scoped synchronization.
+- Instruction fragments drive compute utilization and target-lowering legality.
+
+This makes the performance contract:
+
+```text
+Performance = F(Tile Dataflow, Tile Mapping, Tile Schedule, MachineModel, Calibration)
+```
+
+The detailed tile programming model is specified in [2026-08-13-micro-ir-tile-programming-model-spec.md](../superpowers/specs/2026-08-13-micro-ir-tile-programming-model-spec.md).
 
 ---
 
@@ -259,6 +306,7 @@ The L0 evaluator computes:
 
 - total MACs/FLOPs
 - bytes moved by memory level
+- live materialized tile bytes
 - compute lower bound
 - memory lower bound
 - capacity requirements
@@ -268,11 +316,12 @@ It should be fast enough to evaluate large search spaces.
 
 ### 7.2 L1 Resource DAG Scheduler
 
-The L1 evaluator lowers `micro` ops into a resource-constrained event DAG:
+The L1 evaluator lowers tile-producing and tile-consuming `micro` ops into a resource-constrained event DAG:
 
-- DMA events for `micro.async_copy`
-- matrix-engine events for `micro.mma`
-- vector-engine events for `micro.vector` and `micro.reduce`
+- DMA events for `micro.tile_async_copy` or `micro.async_copy`
+- memory events for `micro.tile_load`, `micro.tile_store`, `micro.load`, and `micro.store`
+- matrix-engine events for `micro.tile_mma` or `micro.mma`
+- vector-engine events for `micro.tile_vector`, `micro.vector`, `micro.tile_reduce`, and `micro.reduce`
 - dependency events for `micro.wait`
 - synchronization costs for barriers and fences
 
@@ -333,7 +382,7 @@ optional AVX2 JIT measurement
 schedule YAML + calibration data
 ```
 
-Search dimensions include tile sizes, loop order, spatial mapping, memory placement, pipeline depth, layout, compute binding, vector width, reduction strategy, parallel granularity, and fusion boundaries.
+Search dimensions include tile sizes at each hierarchy level, loop order, spatial mapping, memory placement, owner mapping, pipeline depth, layout, compute binding, tensorization fragment shape, vector width, reduction strategy, communication strategy, parallel granularity, and fusion boundaries.
 
 ---
 
@@ -341,27 +390,27 @@ Search dimensions include tile sizes, loop order, spatial mapping, memory placem
 
 ### M9: Canonical Micro-IR Foundation
 
-Add the concrete execution dialect and tests.
+Add the concrete execution dialect, tile type/attributes, tile operation MVP, and tests.
 
-Exit criterion: `llk-opt` can round-trip representative `micro.kernel` IR containing memory placement, spatial mapping, pipeline, async copies, waits, and MMA.
+Exit criterion: `llk-opt` can round-trip representative tile-centric `micro.kernel` IR containing logical tile views, materialized memory tiles, owner mapping, pipeline, async copies, waits, and MMA/vector fragments.
 
 ### M10: MachineModel and Performance L0/L1
 
 Add YAML machine profiles, schema validation, and `micro-perf`.
 
-Exit criterion: one concrete `micro.kernel` can be evaluated on both `generic-ai-accel-v1.yaml` and `x86-avx2-cpu.yaml`.
+Exit criterion: one concrete tile-centric `micro.kernel` can be evaluated on both `generic-ai-accel-v1.yaml` and `x86-avx2-cpu.yaml`.
 
 ### M11: LLKToMicro Export Path
 
 Convert scheduled LLK/Linalg patterns into concrete `micro`.
 
-Exit criterion: current SwiGLU schedules can be materialized as `micro` and evaluated without breaking the existing AVX2/JIT path.
+Exit criterion: current SwiGLU schedules can be materialized as tile-centric `micro` and evaluated without breaking the existing AVX2/JIT path.
 
 ### M12: Search-Space Micro-IR and Auto Scheduler
 
 Add parametric search constructs and integrate candidate generation with `llk-tune`.
 
-Exit criterion: the tuner searches `BM`, `BN`, `BK`, pipeline stages, spatial mapping, and vector width, then records the chosen candidate and predicted/measured metrics.
+Exit criterion: the tuner searches `BM`, `BN`, `BK`, multi-level tile shapes, pipeline stages, layout, owner mapping, spatial mapping, tensorization fragments, and vector width, then records the chosen candidate and predicted/measured metrics.
 
 ### M13: Feedback and Calibration
 
@@ -384,7 +433,6 @@ Exit criterion: predicted vs measured error is tracked across regression tests a
 
 ## 11. Design Summary
 
-The redesigned project keeps LLK as the semantic DNN layer and adds `micro` as the canonical execution layer. `micro` is low enough to model AI hardware behavior and high enough to stay portable across matrix engines, vector engines, SRAM hierarchies, DMA engines, and spatial mappings.
+The redesigned project keeps LLK as the semantic DNN layer and adds `micro` as the tile-centric canonical execution layer. `micro` is low enough to model AI hardware behavior and high enough to stay portable across matrix engines, vector engines, SRAM hierarchies, DMA engines, NoC-like communication, and spatial mappings.
 
-The key shift is that schedules become explicit executable artifacts and searchable objects, not only JSON fields consumed by transformation passes.
-
+The key shift is that tile dataflow, tile mapping, and tile schedule become explicit executable artifacts and searchable objects, not only JSON fields consumed by transformation passes.

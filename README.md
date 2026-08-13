@@ -14,7 +14,8 @@ Intel CPU with AVX2 is the first validation backend and machine profile. It is n
 Build an AI compiler and architecture-evaluation stack around one canonical artifact:
 
 ```text
-Micro-IR = scheduled DNN execution + machine-visible resource behavior
+DNN Micro-IR = Tile Dataflow + Tile Mapping + Tile Schedule
+Performance = F(Tile Dataflow, Mapping, Schedule, MachineModel, Calibration)
 ```
 
 The project should answer:
@@ -38,6 +39,10 @@ LLK / Linalg / Tensor optimization
         |
         v
 LLKToMicro lowering
+        |
+        v
+tile-centric micro IR
+uTile -> uMap -> uHW
         |
         +---------------------------+----------------------------+
         |                           |                            |
@@ -70,10 +75,18 @@ candidate binding             micro-perf
 - memory spaces such as DRAM, L2, SRAM, register file, accumulator, and scratch
 - target-independent resource annotations that can be interpreted by different MachineModels
 
+The primary Micro-IR value is a tile:
+
+```text
+Tile = (shape, dtype, layout, memory_space, owner)
+```
+
+Concrete Micro-IR distinguishes logical tiles, memory tiles, execution tiles, and instruction fragments. This is the bridge between MLIR tensor programs and AI hardware: the same tile dataflow can be remapped across AVX2 workers, GPU warps, NPU cores, systolic-array PEs, DMA engines, and custom matrix engines through MachineModel YAML and backend-specific lowering.
+
 The Micro-IR contract is:
 
 ```text
-Performance = F(workload semantics, micro schedule, machine model, calibration)
+Performance = F(tile dataflow, tile mapping, tile schedule, MachineModel, calibration)
 ```
 
 ## Primary Use Cases
@@ -147,6 +160,7 @@ Future targets should reuse the same Micro-IR contract with different MachineMod
 | [docs/design/m9-canonical-micro-ir-architecture.md](docs/design/m9-canonical-micro-ir-architecture.md) | M9+ architecture: canonical Micro-IR, MachineModel, performance evaluation, auto-search |
 | [docs/design/m9-micro-ir-core-concepts.md](docs/design/m9-micro-ir-core-concepts.md) | Core `micro` concepts: execution IR, search IR, attributes, verifier invariants |
 | [docs/superpowers/specs/2026-08-11-canonical-micro-ir-redesign.md](docs/superpowers/specs/2026-08-11-canonical-micro-ir-redesign.md) | Full canonical Micro-IR redesign spec and milestone contract |
+| [docs/superpowers/specs/2026-08-13-micro-ir-tile-programming-model-spec.md](docs/superpowers/specs/2026-08-13-micro-ir-tile-programming-model-spec.md) | Tile-based programming model: `!micro.tile`, tile kinds, `uTile/uMap/uHW`, lowering, search, and performance contract |
 | [docs/superpowers/specs/2026-08-11-micro-ir-dialect-implementation-spec.md](docs/superpowers/specs/2026-08-11-micro-ir-dialect-implementation-spec.md) | Detailed implementation spec for the `micro` dialect |
 | [docs/superpowers/specs/2026-08-11-llk-to-micro-lowering-implementation-spec.md](docs/superpowers/specs/2026-08-11-llk-to-micro-lowering-implementation-spec.md) | Detailed implementation spec for LLK/Linalg to Micro lowering |
 | [docs/superpowers/specs/2026-08-11-micro-ir-autotuning-implementation-spec.md](docs/superpowers/specs/2026-08-11-micro-ir-autotuning-implementation-spec.md) | Detailed implementation spec for Micro-based auto-tuning and auto-optimization |
@@ -190,7 +204,13 @@ micro.search_space
     -> concrete micro.kernel
 ```
 
-It captures memory placement, compute shape, data movement, synchronization, spatial mapping, temporal schedule, and pipeline structure.
+It captures tile construction, memory placement, layout, data movement, compute fragments, synchronization, spatial mapping, temporal schedule, and pipeline structure.
+
+The layer is split conceptually into:
+
+- `uTile`: algorithmic tile dataflow, such as tile matmul, elementwise, reduce, broadcast, and partition.
+- `uMap`: memory placement, spatial ownership, pipeline structure, copy paths, and synchronization.
+- `uHW`: native execution fragments that match hardware granularity, such as MMA tiles, vector tiles, DMA transactions, barriers, and NoC transfers.
 
 ### 4. MachineModel Layer
 
@@ -271,15 +291,17 @@ When `LLVM_PROJECT_BUILD_DIR` is set, `MLIR_DIR` and `LLVM_DIR` are inferred and
 ## Engineering Rules
 
 1. Treat Micro-IR as the core project artifact for execution, evaluation, and optimization.
-2. Keep DNN semantics, structured MLIR optimization, Micro-IR execution scheduling, MachineModel cost, and target lowering separate.
-3. Lower high-level DNN operators into hardware-near Micro primitives; do not leave semantic ops inside concrete `micro.kernel`.
-4. Keep Micro-IR architecture-parametric; model AVX2, GPU, NPU, systolic-array, and custom accelerator targets through MachineModel data and backend-specific lowering.
-5. Use verifier-backed legality before auto-tuning or performance claims.
-6. Prefer deterministic schedule generation before stochastic search.
-7. Measure and model memory movement, synchronization, packing, and dispatch overhead, not only compute throughput.
-8. Keep the existing AVX2 path working while Micro-IR matures.
-9. Persist selected schedules, predicted metrics, measured metrics, and calibration data in structured formats.
-10. Use external high-performance libraries as baselines, not as substitutes for the Micro-IR contract.
+2. Treat `!micro.tile` as the primary execution value; represent tile shape, dtype, layout, memory space, and owner explicitly.
+3. Keep DNN semantics, structured MLIR optimization, Micro-IR tile scheduling, MachineModel cost, and target lowering separate.
+4. Lower high-level DNN operators into hardware-near Micro primitives; do not leave semantic ops inside concrete `micro.kernel`.
+5. Distinguish zero-cost logical tile views from materialized memory tiles and physical layout transforms.
+6. Keep Micro-IR architecture-parametric; model AVX2, GPU, NPU, systolic-array, and custom accelerator targets through MachineModel data and backend-specific lowering.
+7. Use verifier-backed legality before auto-tuning or performance claims.
+8. Prefer deterministic schedule generation before stochastic search.
+9. Measure and model memory movement, synchronization, packing, tile layout transforms, and dispatch overhead, not only compute throughput.
+10. Keep the existing AVX2 path working while Micro-IR matures.
+11. Persist selected schedules, predicted metrics, measured metrics, and calibration data in structured formats.
+12. Use external high-performance libraries as baselines, not as substitutes for the Micro-IR contract.
 
 ## License
 
