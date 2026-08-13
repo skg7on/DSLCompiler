@@ -15,7 +15,6 @@ def Micro_AsyncToken : TypeDef<Micro_Dialect, "AsyncToken"> {
         Used by micro.async_copy and micro.wait to model async dependencies.
     }];
     let parameters = (ins);
-    let assemblyFormat = "";
 }
 
 #endif

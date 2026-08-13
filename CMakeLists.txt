@@ -98,10 +98,6 @@ mlir_tablegen(include/LLK/Dialect/Micro/MicroOps.h.inc -gen-op-decls
   EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect/Micro)
 mlir_tablegen(include/LLK/Dialect/Micro/MicroOps.cpp.inc -gen-op-defs
   EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect/Micro)
-mlir_tablegen(include/LLK/Dialect/Micro/MicroOpsDialect.h.inc -gen-dialect-decls -dialect=micro
-  EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect/Micro)
-mlir_tablegen(include/LLK/Dialect/Micro/MicroOpsDialect.cpp.inc -gen-dialect-defs -dialect=micro
-  EXTRA_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/include/LLK/Dialect/Micro)
 add_public_tablegen_target(MicroOpsGen)
 
 # Library: Micro dialect
