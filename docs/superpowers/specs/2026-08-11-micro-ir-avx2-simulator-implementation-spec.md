@@ -10,6 +10,8 @@
 
 Implement a simulator/emulator path for concrete `micro.kernel` on a specific target, starting with Intel CPU with AVX2. The first version is a performance simulator, not a functional tensor emulator. It estimates latency, utilization, bandwidth pressure, and bottlenecks from `micro` plus `machines/x86-avx2-cpu.yaml`.
 
+The simulator consumes tile-centric Micro-IR. It must derive events from tile shape, dtype, layout, memory space, owner, and fragment metadata rather than treating generic op names as enough information.
+
 Functional emulation can be added later for debugging, but it is not required for the first target.
 
 ---
@@ -86,6 +88,17 @@ name: x86-avx2-cpu
 clock_hz: 3000000000
 
 compute:
+  owners:
+    worker:
+      count: 8
+      maps_to: worker_threads
+    lane:
+      count: 8
+      maps_to: avx2_lanes
+    vector_engine:
+      count: 8
+      maps_to: avx2-vector
+
   worker_threads:
     count: 8
 
@@ -109,6 +122,7 @@ compute:
         bf16: 16
       issue_cycles: 1
       latency_cycles: 4
+      supported_layouts: [row_major, vectorized]
 
 memory:
   dram:
@@ -127,12 +141,14 @@ memory:
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 4
     banks: 1
+    supported_layouts: [row_major, vectorized, blocked]
 
   acc:
     alias: registers
     capacity_bytes: 4096
     bandwidth_bytes_per_cycle: 256
     latency_cycles: 1
+    supported_layouts: [row_major, vectorized]
 
 dma:
   engines: 1
@@ -185,6 +201,7 @@ struct VectorEngineModel {
   std::map<std::string, int64_t> lanes;
   uint64_t issueCycles;
   uint64_t latencyCycles;
+  std::vector<std::string> supportedLayouts;
 };
 
 struct MemoryLevelModel {
@@ -194,6 +211,13 @@ struct MemoryLevelModel {
   double bandwidthBytesPerCycle;
   uint64_t latencyCycles;
   std::optional<uint32_t> banks;
+  std::vector<std::string> supportedLayouts;
+};
+
+struct OwnerModel {
+  std::string name;
+  uint32_t count;
+  std::optional<std::string> mapsTo;
 };
 
 struct DmaModel {
@@ -213,6 +237,7 @@ struct MachineModel {
   std::string name;
   uint64_t clockHz;
   uint32_t workerThreads;
+  std::vector<OwnerModel> owners;
   std::vector<MatrixEngineModel> matrixEngines;
   std::vector<VectorEngineModel> vectorEngines;
   llvm::StringMap<MemoryLevelModel> memory;
@@ -234,6 +259,8 @@ Reject:
 - zero capacity for modeled memory
 - matrix tile shapes not length 3
 - unknown dtype names
+- unknown owner names
+- unsupported layout names
 - missing required memory spaces used by a concrete kernel
 
 Return `llvm::Expected<MachineModel>`.
@@ -246,6 +273,8 @@ Return `llvm::Expected<MachineModel>`.
 
 ```cpp
 enum class EventKind {
+  TileView,
+  TilePartition,
   AsyncCopy,
   Load,
   Store,
@@ -283,6 +312,10 @@ struct MicroEvent {
   uint64_t minCycles;
   std::vector<uint32_t> deps;
   std::string sourceOpName;
+  std::string tileShape;
+  std::string tileLayout;
+  std::string tileMemory;
+  std::string tileOwner;
 };
 ```
 
@@ -299,6 +332,7 @@ Algorithm:
 walk concrete micro kernel in block order
 track async token producer event ids
 for each op:
+  read tile shape, dtype, layout, memory, owner, and fragment metadata
   create event with resource and estimated work
   add dependency on prior event in same sequential region
   for wait:
@@ -310,6 +344,7 @@ return MicroDAG
 
 MVP dependency model:
 
+- logical tile views and partitions create metadata nodes only when needed for dependency tracing; they have zero cycles unless they imply a physical layout transform
 - preserve sequential order inside `micro.for`
 - allow async copies before `micro.wait` to overlap
 - model `pipeline stages > 1` by allowing copy event for iteration i+1 to overlap with MMA for iteration i
@@ -332,6 +367,7 @@ struct L0Report {
   uint64_t totalFlops;
   uint64_t totalBytesDram;
   uint64_t totalBytesSram;
+  llvm::StringMap<uint64_t> liveTileBytesByMemory;
   uint64_t computeCyclesLowerBound;
   uint64_t memoryCyclesLowerBound;
   uint64_t predictedCycles;
@@ -343,7 +379,7 @@ Calculations:
 
 ### 7.1 `micro.mma`
 
-For MMA shape `[m, n, k]`:
+For `micro.mma` or `micro.tile_mma` shape `[m, n, k]`:
 
 ```text
 flops = 2 * m * n * k
@@ -357,15 +393,28 @@ For AVX2:
 cycles = ceil(flops / (worker_threads * flops_per_cycle_per_worker))
 ```
 
-### 7.2 `micro.async_copy`, `micro.load`, `micro.store`
+### 7.2 Tile Movement Ops
+
+For `micro.tile_async_copy`, `micro.async_copy`, `micro.tile_load`, `micro.load`, `micro.tile_store`, and `micro.store`:
 
 ```text
 cycles = latency(src_or_dst_memory) + ceil(bytes / bandwidth_bytes_per_cycle)
 ```
 
-L0 accumulates bytes by memory space and computes memory lower bound by dominant memory path.
+Bytes are derived from tile shape, dtype, layout, and padding. L0 accumulates bytes by memory space and computes memory lower bound by dominant memory path.
 
-### 7.3 Prediction
+### 7.3 Logical Tile Ops
+
+`micro.tile_view`, `micro.tile_slice`, and logical `micro.tile_partition` contribute zero cycles. They may affect:
+
+- downstream byte counts
+- downstream fragment compatibility
+- live range attribution
+- layout metadata
+
+Physical layout transforms are not zero-cost and must be represented as copy, permute, vector, or target-specific transform events.
+
+### 7.4 Prediction
 
 ```text
 predictedCycles = max(computeCyclesLowerBound, memoryCyclesLowerBound)
@@ -395,6 +444,8 @@ struct L1Report {
   double sramBandwidthUtilization;
   std::string bottleneck;
   std::vector<std::string> capacityViolations;
+  std::vector<std::string> layoutWarnings;
+  std::vector<std::string> ownerWarnings;
 };
 ```
 
@@ -421,6 +472,7 @@ Resource multiplicity:
 - matrix engine count allows that many concurrent matrix events
 - vector engine count allows that many concurrent vector events
 - DMA engines allow that many concurrent copy events
+- owner count bounds concurrent execution tiles mapped to that owner
 - worker thread count scales AVX2 matrix/vector throughput but does not create separate events in MVP
 
 ### 8.2 Pipeline Overlap
@@ -457,6 +509,8 @@ vector_engine
 dma
 dram_bandwidth
 sram_bandwidth
+owner_occupancy
+layout_transform
 sync
 dependency
 unknown
@@ -470,9 +524,12 @@ Before scheduling, compute peak live allocation per memory space.
 
 MVP:
 
+- logical tile views do not count against capacity
 - all `micro.alloc` in a loop body are assumed live for the whole loop body
-- `micro.async_copy` result tiles are live until the next `micro.wait` and consuming compute event
+- `micro.tile_alloc` and `micro.alloc` contribute materialized tile bytes
+- `micro.tile_async_copy` and `micro.async_copy` result tiles are live until the next `micro.wait` and consuming compute event
 - pipeline `stages` multiplies tile storage by stage count for SRAM copies
+- physical layout transforms contribute destination tile bytes while the transform is live
 
 Report capacity violations:
 
@@ -528,6 +585,16 @@ utilization:
 bandwidth:
   dram: 0.58
   sram: 0.33
+tiles:
+  live_bytes:
+    sram: 32768
+    acc: 4096
+  layouts:
+    input: row_major
+    weights: blocked_16x16
+  owners:
+    outer: worker
+    fragment: vector_engine
 bottleneck: matrix_engine
 capacity_violations: []
 ```
@@ -576,6 +643,8 @@ Cases:
 - missing clock rejected
 - invalid dtype rejected
 - invalid tile shape rejected
+- invalid owner rejected
+- invalid layout rejected
 - zero bandwidth rejected
 
 ### 12.2 L0 Static Bound
@@ -595,6 +664,7 @@ Assert:
 
 - flops = 16384
 - DRAM bytes equals A+B+C tile bytes
+- live tile bytes by memory are reported
 - predicted cycles is max of compute/memory lower bounds
 
 ### 12.3 L1 Resource DAG
@@ -606,6 +676,8 @@ Cases:
 - copy -> wait -> mma produces ordered schedule
 - independent copies can overlap when DMA engines > 1
 - pipeline stages reduce predicted cycles compared with sequential model
+- logical tile views have zero cycles
+- owner resource limits cap concurrent execution tiles
 - bottleneck classification is stable
 
 ### 12.4 CLI FileCheck
@@ -624,6 +696,7 @@ Checks:
 - `predicted_cycles`
 - `matrix`
 - `dma`
+- `tiles`
 - `bottleneck`
 
 ---
@@ -659,7 +732,7 @@ Functional emulation can be added after L1 performance modeling.
 
 Scope:
 
-- execute `micro.mma`, `micro.vector`, `micro.reduce`, and memory ops on host tensors
+- execute `micro.tile_mma`, `micro.mma`, `micro.tile_vector`, `micro.vector`, `micro.tile_reduce`, `micro.reduce`, and memory ops on host tensors
 - compare outputs against existing C++ reference kernels
 - debug lowering correctness independently from performance estimates
 

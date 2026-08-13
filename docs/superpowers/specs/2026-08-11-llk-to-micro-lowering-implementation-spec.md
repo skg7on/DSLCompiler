@@ -10,6 +10,19 @@
 
 Implement an export path from the current LLK/Linalg scheduling pipeline into concrete `micro.kernel` and optional `micro.search_space` IR. The lowering must preserve the current AVX2/JIT pipeline while producing a canonical execution artifact for performance modeling and future backends.
 
+The exported Micro-IR is tile-centric. Lowering should produce:
+
+```text
+Linalg/Tensor semantics
+    -> logical tile dataflow
+    -> materialized memory tiles
+    -> owner-mapped execution tiles
+    -> pipeline/sync structure
+    -> MMA/vector/reduction instruction fragments
+```
+
+The MVP may keep existing op names such as `micro.async_copy`, `micro.mma`, and `micro.vector`, but the values and attributes must preserve tile shape, dtype, layout, memory space, and owner information.
+
 ---
 
 ## 2. Integration Point
@@ -162,6 +175,10 @@ struct ScheduleEntry {
   std::string mma_shape{"16x16x32"};
   std::string accumulator_space{"acc"};
   std::string tile_layout{"row_major"};
+  std::string owner_mapping{"worker"};
+  std::string fragment_owner{"vector_engine"};
+  std::string fragment_shape{"16x16x32"};
+  bool enable_tile_masks{true};
 };
 ```
 
@@ -170,6 +187,9 @@ Backward compatibility:
 - missing `pipeline_stages` defaults to 1
 - missing `memory_path` defaults to `dram:sram:acc`
 - missing `mma_shape` defaults to `16x16x32`
+- missing `fragment_shape` defaults to `mma_shape`
+- missing `owner_mapping` defaults to `worker`
+- missing `fragment_owner` defaults to `vector_engine`
 - existing JSON schedule entries remain loadable
 
 The first implementation should not migrate `schedules/schedule_db.json`; it only adds optional fields.
@@ -199,14 +219,18 @@ For `M x K` input, `K x N` weights, output `M x N`, schedule `BM/BN/BK`:
 ```text
 spatial_for bm over M step BM
 spatial_for bn over N step BN
+logical tile_view X[BM x BK]
+logical tile_view Wg[BK x BN]
+logical tile_view Wu[BK x BN]
 alloc gate accumulator BM x BN in acc
 alloc up accumulator BM x BN in acc
 pipeline stages = schedule.pipeline_stages
   temporal for bk over K step BK
-    async_copy X tile DRAM -> SRAM
-    async_copy Wg tile DRAM -> SRAM
-    async_copy Wu tile DRAM -> SRAM
+    async_copy materializes X tile DRAM -> SRAM
+    async_copy materializes Wg tile DRAM -> SRAM
+    async_copy materializes Wu tile DRAM -> SRAM
     wait copies
+    partition materialized tiles into instruction fragments
     mma X, Wg -> gate accumulator
     mma X, Wu -> up accumulator
 vector silu gate
@@ -230,25 +254,48 @@ micro.kernel @fused_swiglu_M4_N4096_K4096
 
       micro.pipeline stages = 1 {
         micro.for %bk = 0 to %K step 64 {
-          %x, %x_tok = micro.async_copy %arg0
+          %x_view = micro.tile_view %arg0[%bm, %bk]
+              {shape = [32, 64], layout = #micro.layout<row_major>}
+              : tensor<?x?xbf16> -> !micro.tile<32x64xbf16>
+          %wg_view = micro.tile_view %arg1[%bk, %bn]
+              {shape = [64, 64], layout = #micro.layout<row_major>}
+              : tensor<?x?xbf16> -> !micro.tile<64x64xbf16>
+          %wu_view = micro.tile_view %arg2[%bk, %bn]
+              {shape = [64, 64], layout = #micro.layout<row_major>}
+              : tensor<?x?xbf16> -> !micro.tile<64x64xbf16>
+          %x, %x_tok = micro.async_copy %x_view
               {src_memory = #micro.memory<dram>,
-               dst_memory = #micro.memory<sram>}
+               dst_memory = #micro.memory<sram>,
+               owner = #micro.owner<worker>}
               : tensor<32x64xbf16>
-          %wg, %wg_tok = micro.async_copy %arg1
+          %wg, %wg_tok = micro.async_copy %wg_view
               {src_memory = #micro.memory<dram>,
-               dst_memory = #micro.memory<sram>}
+               dst_memory = #micro.memory<sram>,
+               owner = #micro.owner<worker>}
               : tensor<64x64xbf16>
-          %wu, %wu_tok = micro.async_copy %arg2
+          %wu, %wu_tok = micro.async_copy %wu_view
               {src_memory = #micro.memory<dram>,
-               dst_memory = #micro.memory<sram>}
+               dst_memory = #micro.memory<sram>,
+               owner = #micro.owner<worker>}
               : tensor<64x64xbf16>
           micro.wait %x_tok, %wg_tok, %wu_tok
-          micro.mma %x, %wg, %gate_acc
+          %x_frag = micro.tile_partition %x
+              {shape = [16, 32], owner = #micro.owner<vector_engine>}
+              : tensor<32x64xbf16> -> !micro.tile<16x32xbf16>
+          %wg_frag = micro.tile_partition %wg
+              {shape = [32, 16], owner = #micro.owner<vector_engine>}
+              : tensor<64x64xbf16> -> !micro.tile<32x16xbf16>
+          %wu_frag = micro.tile_partition %wu
+              {shape = [32, 16], owner = #micro.owner<vector_engine>}
+              : tensor<64x64xbf16> -> !micro.tile<32x16xbf16>
+          micro.mma %x_frag, %wg_frag, %gate_acc
               {shape = [16, 16, 32], input = #micro.dtype<bf16>,
-               accumulator = #micro.dtype<f32>}
-          micro.mma %x, %wu, %up_acc
+               accumulator = #micro.dtype<f32>,
+               owner = #micro.owner<vector_engine>}
+          micro.mma %x_frag, %wu_frag, %up_acc
               {shape = [16, 16, 32], input = #micro.dtype<bf16>,
-               accumulator = #micro.dtype<f32>}
+               accumulator = #micro.dtype<f32>,
+               owner = #micro.owner<vector_engine>}
         }
       }
 
@@ -265,6 +312,8 @@ micro.kernel @fused_swiglu_M4_N4096_K4096
 ```
 
 Indexing details can be represented as attributes in the MVP if full subview syntax is too large for the first pass. The performance model needs tile shapes and memory spaces first; exact SSA index arithmetic can follow.
+
+The example uses both `micro.tile_view` and legacy tensor-typed compute spellings to show the migration path. Once `!micro.tile` is implemented, `micro.tile_async_copy`, `micro.tile_mma`, `micro.tile_vector`, and `micro.tile_store` should be the preferred spellings.
 
 ---
 
@@ -294,7 +343,11 @@ struct MicroTileConfig {
   int64_t BK;
   int64_t stages;
   llvm::SmallVector<int64_t, 3> mmaShape;
+  llvm::SmallVector<int64_t, 3> fragmentShape;
   mlir::micro::MemorySpace accumulatorSpace;
+  mlir::micro::LayoutAttr layout;
+  mlir::micro::OwnerAttr owner;
+  mlir::micro::OwnerAttr fragmentOwner;
 };
 
 MicroTileConfig getTileConfig(Operation *op, const ScheduleEntry &schedule);
@@ -314,6 +367,10 @@ Initial choices derive from existing `llk-tune` grid:
 BM: [1, 4, 8, 16, 32, 64]
 BN: [16, 32, 64, 128, 256]
 BK: [32, 64, 128, 256]
+tile_hierarchy: ["worker", "worker/vector_engine"]
+tile_layout: ["row_major", "blocked_16x16"]
+owner_mapping: ["worker", "worker_lane"]
+fragment_shape: ["16x16x32", "8x8x32"]
 VM: [1, 2, 4]
 VN: [4, 8]
 vector_width: [8]
@@ -328,9 +385,14 @@ Constraints:
 sram_capacity
 acc_capacity
 mma_compatible
+tile_hierarchy_compatible
+layout_supported
+owner_supported
+fragment_compatible
 tail_supported
 vector_width_supported
 mapping_extent
+pipeline_live_tiles
 ```
 
 M-bucket rules from existing `llk-tune`:
@@ -339,6 +401,19 @@ M-bucket rules from existing `llk-tune`:
 - M bucket >= 3 rejects `BM <= 4`
 
 These rules become constraints rather than hard-coded generator branches.
+
+## 8.1 Tile-Centric Lowering Rules
+
+Lowering must follow these rules:
+
+- create logical tile views before materializing data movement
+- represent packing as a layout attribute when it is a reinterpretation
+- represent packing as a physical layout transform when bytes are rearranged
+- materialize DRAM to SRAM/RF/ACC movement with tile copy/load/store ops
+- attach owner mapping to spatial loops and execution tiles
+- partition execution tiles into instruction fragments before MMA/vector/reduce
+- emit waits and barriers at the scope where tile producers and consumers meet
+- preserve enough tile metadata for `micro-perf` to compute bytes, capacity, and utilization without re-inferring schedule intent from names
 
 ---
 
@@ -436,9 +511,11 @@ Checks:
 
 - `micro.kernel`
 - two nested `micro.spatial_for`
+- logical `micro.tile_view` ops for X, Wg, and Wu
 - two accumulator allocations
 - three async copies
 - wait
+- tile partitions or fragment metadata
 - two MMA ops
 - silu and mul vector ops
 - store
@@ -449,6 +526,7 @@ Checks:
 
 Checks:
 
+- logical tile views for A and B
 - one accumulator allocation
 - two async copies
 - one MMA op inside K loop
@@ -462,6 +540,7 @@ Checks:
 
 - `micro.search_space`
 - params for BM/BN/BK/vector_width/num_threads/grain_size/pipeline_stages
+- params or constraints for tile layout, owner mapping, and fragment shape
 - constraints
 - objective
 
@@ -475,6 +554,9 @@ Cases:
 - unsupported dtype
 - missing schedule entry with no fallback
 - malformed schedule optional fields
+- unsupported owner mapping
+- unsupported tile layout
+- fragment shape that cannot divide the selected tile shape without masks
 
 ---
 
@@ -509,4 +591,5 @@ build/llk-opt --verify-diagnostics --split-input-file \
 - current `llk-compile` default behavior is unchanged.
 - SwiGLU and matmul lowering tests pass.
 - search-space lowering test passes.
+- generated Micro-IR includes tile shape, dtype, layout, memory, owner, and fragment metadata.
 - invalid lowering diagnostics are actionable.

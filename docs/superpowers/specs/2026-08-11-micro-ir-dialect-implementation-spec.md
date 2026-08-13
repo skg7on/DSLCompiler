@@ -10,6 +10,14 @@
 
 Implement the `micro` MLIR dialect as the canonical execution IR for DNN kernels. The dialect must represent both concrete hardware-near execution schedules and search-space metadata for auto-scheduling.
 
+The dialect is tile-centric. The primary execution value is:
+
+```text
+Tile = (shape, dtype, layout, memory_space, owner)
+```
+
+The implementation should prefer first-class `!micro.tile` values. If custom type parsing is staged, tensor values with required tile attributes may be used only as a temporary bridge.
+
 The MVP is parser, printer, verifier, and FileCheck coverage. It does not require a backend lowering in the first task batch.
 
 ---
@@ -23,12 +31,20 @@ micro.kernel
 micro.for
 micro.spatial_for
 micro.pipeline
+micro.tile_view
+micro.tile_partition
+micro.tile_alloc
 micro.alloc
+micro.tile_async_copy
 micro.async_copy
 micro.wait
+micro.tile_mma
 micro.mma
+micro.tile_vector
 micro.vector
+micro.tile_reduce
 micro.reduce
+micro.tile_store
 micro.store
 micro.yield
 ```
@@ -65,6 +81,25 @@ micro.candidate
 #micro.map<vector_engine>
 #micro.map<dma>
 
+#micro.owner<cluster>
+#micro.owner<core>
+#micro.owner<warp>
+#micro.owner<wave>
+#micro.owner<subgroup>
+#micro.owner<pe_group>
+#micro.owner<pe>
+#micro.owner<lane>
+#micro.owner<worker>
+#micro.owner<matrix_engine>
+#micro.owner<vector_engine>
+#micro.owner<dma>
+
+#micro.layout<row_major>
+#micro.layout<col_major>
+#micro.layout<blocked>
+#micro.layout<vectorized>
+#micro.layout<swizzled>
+
 #micro.dtype<f32>
 #micro.dtype<f16>
 #micro.dtype<bf16>
@@ -91,6 +126,8 @@ lib/Dialect/Micro/MicroOps.cpp
 
 test/Dialect/Micro/ops.mlir
 test/Dialect/Micro/ops_invalid.mlir
+test/Dialect/Micro/tile_ops.mlir
+test/Dialect/Micro/tile_ops_invalid.mlir
 test/Dialect/Micro/search_space.mlir
 test/Dialect/Micro/search_space_invalid.mlir
 ```
@@ -107,6 +144,15 @@ Optional tool added in a later task:
 ```text
 tools/micro-opt/micro-opt.cpp
 ```
+
+Optional later split:
+
+```text
+include/LLK/Dialect/Micro/MicroTileOps.td
+lib/Dialect/Micro/MicroTileOps.cpp
+```
+
+Do not split tile ops in the first patch unless `MicroOps.td` becomes difficult to review.
 
 The first implementation can register `micro` in `llk-opt` to avoid a new tool target until dialect parse/print is stable.
 
@@ -167,6 +213,8 @@ def Micro_Dialect : Dialect {
 ```
 
 `MicroTypes.td` should define enum-style attributes rather than custom storage classes in the MVP. That keeps parse/print and verifier implementation small.
+
+Exception: `!micro.tile` and `!micro.async_token` should be real types once the dialect skeleton is stable. The temporary tensor-plus-attributes form is allowed only if it reduces risk in the first TableGen patch.
 
 ---
 
@@ -243,6 +291,100 @@ i8
 ```
 
 Use this dtype attribute for machine modeling metadata. MLIR tensor element types still carry actual tensor element types. Verifiers must ensure explicit dtype attributes agree with tensor element types when both are present.
+
+### 6.4 Layout Attribute
+
+Use an enum-style layout kind plus optional dictionary parameters.
+
+Required kind values:
+
+```text
+row_major
+col_major
+blocked
+vectorized
+swizzled
+```
+
+Assembly examples:
+
+```mlir
+#micro.layout<row_major>
+#micro.layout<blocked, block = [16, 16]>
+#micro.layout<vectorized, vector = 8, align = 32>
+#micro.layout<swizzled, swizzle = "xor", banks = 32>
+```
+
+Verifier:
+
+- `block` extents must be positive.
+- `vector` width must be positive.
+- `align` must be positive and a power of two.
+- `banks` must be positive when present.
+- `swizzle` requires `swizzled` layout kind.
+
+### 6.5 Owner Attribute
+
+Use enum values for:
+
+```text
+cluster
+core
+warp
+wave
+subgroup
+pe_group
+pe
+lane
+worker
+matrix_engine
+vector_engine
+dma
+```
+
+Assembly examples:
+
+```mlir
+#micro.owner<worker>
+#micro.owner<matrix_engine>
+#micro.owner<pe_group>
+```
+
+Verifier:
+
+- owner values must be known.
+- owner compatibility with MachineModel is checked by machine-aware verification and the performance layer, not by the dialect parser alone.
+
+### 6.6 Tile Type
+
+Preferred assembly:
+
+```mlir
+!micro.tile<32x64xbf16,
+             layout = #micro.layout<row_major, vector = 8>,
+             memory = #micro.memory<sram>,
+             owner = #micro.owner<worker>>
+```
+
+Type parameters:
+
+- ranked shape, with static dimensions for the MVP
+- MLIR element type or `#micro.dtype`
+- optional layout, default `#micro.layout<row_major>`
+- optional memory space, required after materialization
+- optional owner, required for execution tiles and fragments
+
+Verifier:
+
+- dimensions must be positive or explicitly dynamic.
+- dtype must map to a supported Micro dtype.
+- materialized memory tiles require a memory space.
+- execution tiles and instruction fragments require an owner.
+- instruction fragment shape must fit inside parent tile shape when statically known.
+
+Temporary bridge:
+
+If implementing custom tile type parsing blocks initial progress, allow tensor result types plus attributes named `micro.layout`, `micro.memory`, and `micro.owner`. This bridge must be removed once tile op tests pass with `!micro.tile`.
 
 ---
 
@@ -378,6 +520,65 @@ Verifier:
 - memory space must not be `dram`; DRAM operands represent external buffers, not local allocations
 - static footprint should be computable when all dimensions are static
 
+### 7.5a Tile Construction and Materialization Ops
+
+The tile MVP adds these ops. They may live in `MicroOps.td` initially.
+
+#### `micro.tile_view`
+
+Purpose: create a logical zero-cost tile view from a tensor or larger tile.
+
+Shape:
+
+```mlir
+%t = micro.tile_view %A[%i, %j]
+    {shape = [32, 64], layout = #micro.layout<row_major>}
+    : tensor<?x?xbf16> -> !micro.tile<32x64xbf16>
+```
+
+Verifier:
+
+- result is `!micro.tile` or a staged tensor-plus-tile-attributes value.
+- view shape has positive static dimensions where known.
+- no memory allocation or copy token is produced.
+
+#### `micro.tile_partition`
+
+Purpose: partition a tile into smaller logical or execution fragments.
+
+Shape:
+
+```mlir
+%frag = micro.tile_partition %tile
+    {shape = [16, 16], owner = #micro.owner<vector_engine>}
+    : !micro.tile<32x64xbf16> -> !micro.tile<16x16xbf16>
+```
+
+Verifier:
+
+- fragment shape divides the parent shape or carries explicit mask/tail metadata.
+- owner, when present, is a known owner attribute.
+- partition is logical unless followed by materialization or compute consumption.
+
+#### `micro.tile_alloc`
+
+Purpose: allocate a materialized tile in a memory space.
+
+Shape:
+
+```mlir
+%acc = micro.tile_alloc
+    {shape = [32, 64], dtype = #micro.dtype<f32>,
+     memory = #micro.memory<acc>, owner = #micro.owner<worker>}
+    : !micro.tile<32x64xf32>
+```
+
+Verifier:
+
+- memory must not be DRAM for local allocations.
+- dtype, memory, layout, and owner must agree with the result tile type.
+- static footprint must be computable when dimensions are static.
+
 ### 7.6 `micro.async_copy`
 
 Purpose: asynchronous movement between memory spaces.
@@ -409,6 +610,21 @@ Verifier:
 - `src_memory` and `dst_memory` are known
 - result tile type is shaped
 - token result has a dedicated token type or `!micro.async_token`
+
+`micro.tile_async_copy` is the tile-typed spelling:
+
+```mlir
+%tile, %tok = micro.tile_async_copy %logical
+    to #micro.memory<sram> owner = #micro.owner<worker>
+    : !micro.tile<32x64xbf16> -> !micro.tile<32x64xbf16>, !micro.async_token
+```
+
+Verifier:
+
+- source must be a tile or staged tile-compatible tensor.
+- destination memory differs from source materialized memory when the source has one.
+- destination memory and owner are present in the result tile metadata.
+- byte count must be derivable from shape, dtype, layout, and padding.
 
 ### 7.7 `micro.wait`
 
@@ -455,6 +671,10 @@ Verifier:
 - shape has exactly three positive dimensions
 - lhs/rhs/acc result shapes are compatible when static
 - accumulator dtype matches accumulator tensor element type when expressible
+- tile operands, when present, have compatible layout and owner metadata
+- fragment shape divides or masks the input execution tiles
+
+`micro.tile_mma` is the explicit tile spelling. It has the same semantic contract but requires tile operands and returns or mutates a tile accumulator according to the selected MLIR op style.
 
 ### 7.9 `micro.vector`
 
@@ -478,6 +698,9 @@ Verifier:
 - op must be one of `add`, `sub`, `mul`, `div`, `exp`, `silu`, `sigmoid`, `max`, `min`, `select`, `convert`
 - all shaped operands must have identical static shapes unless op is `select`
 - result type must be shaped
+- tile operands, when present, must have compatible owner and layout metadata
+
+`micro.tile_vector` is the explicit tile spelling and should be used once `!micro.tile` is available.
 
 ### 7.10 `micro.reduce`
 
@@ -494,6 +717,9 @@ Verifier:
 - op is `sum`, `max`, `min`, or `prod`
 - `axis` is in range for static ranked operands
 - result rank is operand rank minus one in MVP
+- tile reduction outputs must define accumulator dtype, layout, and owner
+
+`micro.tile_reduce` is the explicit tile spelling and should be used once `!micro.tile` is available.
 
 ### 7.11 `micro.store`
 
@@ -512,6 +738,20 @@ Verifier:
 - source and destination memory spaces differ
 - stored value is shaped
 - destination is external or previously allocated
+
+`micro.tile_store` is the tile-typed spelling:
+
+```mlir
+micro.tile_store %tile, %Y[%i, %j]
+    to #micro.memory<dram>
+    : !micro.tile<32x64xbf16>
+```
+
+Verifier:
+
+- stored value is a tile or staged tile-compatible tensor.
+- destination memory differs from source memory unless this is an explicit writeback/update.
+- byte count is derivable from tile metadata.
 
 ### 7.12 `micro.yield`
 
@@ -587,6 +827,11 @@ mma_compatible
 mapping_extent
 tail_supported
 vector_width_supported
+tile_hierarchy_compatible
+layout_supported
+owner_supported
+fragment_compatible
+pipeline_live_tiles
 ```
 
 Verifier:
@@ -641,6 +886,8 @@ MVP implementation choices:
 2. If custom type setup is too much for the first patch, use MLIR `NoneType` only for parse tests and immediately follow with a custom token type task.
 
 Preferred implementation: add the custom token type in M9 because `micro.wait` verifier quality depends on it.
+
+The token type is used by both `micro.async_copy` and `micro.tile_async_copy`.
 
 ---
 
@@ -700,6 +947,8 @@ Must include:
 - `micro.kernel`
 - nested `micro.spatial_for`
 - `micro.pipeline`
+- `micro.tile_view`
+- `micro.tile_partition`
 - `micro.alloc`
 - `micro.async_copy`
 - `micro.wait`
@@ -731,6 +980,32 @@ Cases:
 - `micro.alloc` in `dram`
 - search op inside `micro.kernel`
 
+### 12.2a `test/Dialect/Micro/tile_ops.mlir`
+
+Must include:
+
+- `!micro.tile` type examples
+- `#micro.layout` attributes
+- `#micro.owner` attributes
+- logical tile view
+- tile allocation
+- tile async copy returning a token
+- tile partition into an instruction fragment
+- tile MMA/vector/reduce/store examples
+
+### 12.2b `test/Dialect/Micro/tile_ops_invalid.mlir`
+
+Use `--verify-diagnostics`.
+
+Cases:
+
+- tile with invalid layout parameter
+- tile allocation missing memory space
+- execution tile missing owner
+- tile partition with incompatible fragment shape and no mask metadata
+- tile async copy with identical source/destination memory space
+- tile MMA with unsupported fragment metadata
+
 ### 12.3 `test/Dialect/Micro/search_space.mlir`
 
 Must include:
@@ -760,6 +1035,8 @@ MVP verification commands:
 cmake --build build --target llk-opt
 build/llk-opt test/Dialect/Micro/ops.mlir | FileCheck test/Dialect/Micro/ops.mlir
 build/llk-opt --verify-diagnostics --split-input-file test/Dialect/Micro/ops_invalid.mlir
+build/llk-opt test/Dialect/Micro/tile_ops.mlir | FileCheck test/Dialect/Micro/tile_ops.mlir
+build/llk-opt --verify-diagnostics --split-input-file test/Dialect/Micro/tile_ops_invalid.mlir
 build/llk-opt test/Dialect/Micro/search_space.mlir | FileCheck test/Dialect/Micro/search_space.mlir
 build/llk-opt --verify-diagnostics --split-input-file test/Dialect/Micro/search_space_invalid.mlir
 ```
@@ -771,20 +1048,25 @@ The first implementation plan should add these tests before implementation code.
 ## 14. Implementation Order
 
 1. Add dialect skeleton and CMake integration.
-2. Add attributes and token type.
-3. Add concrete execution ops with minimal verifiers.
-4. Add concrete FileCheck tests.
-5. Add search-space ops and verifiers.
-6. Add search-space FileCheck tests.
-7. Register dialect in `llk-opt`.
-8. Add docs links from architecture/spec docs if needed.
+2. Add memory, dtype, layout, and owner attributes.
+3. Add `!micro.async_token`.
+4. Add `!micro.tile` or the explicitly scoped tensor-plus-tile-attributes bridge.
+5. Add tile construction and materialization ops with minimal verifiers.
+6. Add concrete execution ops with tile-compatible verifiers.
+7. Add concrete and tile FileCheck tests.
+8. Add search-space ops and verifiers.
+9. Add search-space FileCheck tests.
+10. Register dialect in `llk-opt`.
+11. Add docs links from architecture/spec docs if needed.
 
 ---
 
 ## 15. Acceptance Criteria
 
 - `micro` dialect builds as `MicroDialect`.
+- `!micro.tile`, `#micro.layout`, and `#micro.owner` parse, print, and verify, or the temporary tensor-plus-attributes bridge is documented in tests.
 - `llk-opt` can parse and print concrete `micro.kernel` examples.
+- `llk-opt` can parse and print tile-centric `micro.kernel` examples.
 - `llk-opt` can parse and print `micro.search_space` examples.
 - verifiers reject the invalid cases listed above.
 - all new tests are registered in CMake.

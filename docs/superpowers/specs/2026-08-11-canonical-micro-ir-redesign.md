@@ -8,6 +8,7 @@
 
 **Detailed Implementation Specs:**
 - [Micro-IR Dialect Implementation Spec](2026-08-11-micro-ir-dialect-implementation-spec.md)
+- [Micro-IR Tile Programming Model Spec](2026-08-13-micro-ir-tile-programming-model-spec.md)
 - [LLK/Linalg to Micro-IR Lowering Implementation Spec](2026-08-11-llk-to-micro-lowering-implementation-spec.md)
 - [Micro-IR Auto-Tuning and Auto-Optimization Implementation Spec](2026-08-11-micro-ir-autotuning-implementation-spec.md)
 - [Micro-IR AVX2 Simulator and Emulator Implementation Spec](2026-08-11-micro-ir-avx2-simulator-implementation-spec.md)
@@ -17,6 +18,13 @@
 ## 1. Goal
 
 Redesign the project around a canonical DNN micro-IR that is lower level than LLK/Linalg, closer to AI hardware execution, and useful for both performance evaluation and auto-search/auto-optimization.
+
+The refined design is tile-centric:
+
+```text
+DNN Micro-IR = Tile Dataflow + Tile Mapping + Tile Schedule
+Performance = F(Tile Dataflow, Mapping, Schedule, MachineModel, Calibration)
+```
 
 The redesign target is dual-track:
 
@@ -37,12 +45,15 @@ LLK dialect -> Linalg -> tiled/fused IR -> Vector -> MemRef/SCF -> LLVM -> ORC J
 
 It can represent DNN-specific operations such as SwiGLU, RoPE, and Attention, and it can lower them toward CPU execution. However, it lacks a canonical representation of executed tensor programs that explicitly models:
 
+- tile dataflow and multi-level tiling
 - matrix/tensor engine work
 - vector work
 - memory hierarchy
 - async data movement
+- tile layout and physical layout transforms
 - pipeline overlap
 - spatial mapping
+- tile ownership by hardware resources
 - synchronization
 - communication
 - resource occupancy
@@ -82,7 +93,17 @@ LLK answers what is computed. `micro` answers how it executes. `MachineModel` an
 
 Search constructs are not backend IR. Candidate binding produces deterministic concrete `micro.kernel`.
 
-### 3.5 Preserve the Working Compiler
+### 3.5 Make Tile the Primary Execution Value
+
+The primary Micro-IR value is:
+
+```text
+Tile = (shape, dtype, layout, memory_space, owner)
+```
+
+This makes tile shape, memory placement, layout, owner mapping, and tensorization fragments available to lowering, verifiers, search, and performance evaluation. Logical tile operations are zero-cost views until materialized. Memory tiles consume capacity and movement bandwidth. Execution tiles drive occupancy and synchronization. Instruction fragments drive compute utilization and backend legality.
+
+### 3.6 Preserve the Working Compiler
 
 The first milestone must not break the current AVX2 path. `micro` starts as export and evaluation infrastructure, then later becomes a lowering contract.
 
@@ -130,6 +151,16 @@ The architecture supports two use cases immediately:
 1. Compile and run kernels using the existing CPU path.
 2. Export and evaluate concrete/searchable micro-IR for hardware and schedule exploration.
 
+Within `micro`, the canonical layering is:
+
+```text
+uTile: algorithmic tile dataflow
+    -> uMap: memory placement, owner mapping, pipeline, sync
+    -> uHW: instruction fragments and machine-visible events
+```
+
+The MVP can implement these layers in one `micro` dialect, but the boundaries must remain visible in op naming, verifier rules, tuning parameters, and performance events.
+
 ---
 
 ## 5. Micro Dialect Scope
@@ -151,21 +182,35 @@ Memory:
 ```text
 micro.alloc
 micro.view
+micro.tile_view
+micro.tile_slice
+micro.tile_partition
+micro.tile_alloc
 micro.load
 micro.store
 micro.copy
 micro.async_copy
+micro.tile_load
+micro.tile_store
+micro.tile_copy
+micro.tile_async_copy
 micro.prefetch
+micro.tile_prefetch
 ```
 
 Compute:
 
 ```text
 micro.mma
+micro.tile_mma
 micro.vector
+micro.tile_vector
 micro.reduce
+micro.tile_reduce
 micro.permute
+micro.tile_permute
 micro.convert
+micro.tile_convert
 micro.special
 ```
 
@@ -185,6 +230,9 @@ micro.gather
 micro.scatter
 micro.exchange
 micro.collective
+micro.tile_distribute
+micro.tile_replicate
+micro.tile_exchange
 ```
 
 MVP implementation should focus on:
@@ -194,6 +242,8 @@ micro.kernel
 micro.for
 micro.spatial_for
 micro.pipeline
+micro.tile_view
+micro.tile_partition
 micro.alloc
 micro.async_copy
 micro.wait
@@ -244,6 +294,33 @@ dma
 matrix_engine
 vector_engine
 worker
+```
+
+Owner scopes:
+
+```text
+cluster
+core
+warp
+wave
+subgroup
+pe_group
+pe
+lane
+worker
+matrix_engine
+vector_engine
+dma
+```
+
+Layouts:
+
+```text
+row_major
+col_major
+blocked
+vectorized
+swizzled
 ```
 
 DTypes:
@@ -297,9 +374,12 @@ micro.search_space @swiglu_space
 The first search space should cover:
 
 - `BM`, `BN`, `BK`
+- multi-level tile hierarchy
 - pipeline stages
 - spatial mapping over M/N
+- owner mapping
 - vector width
+- tensorization fragment shape
 - parallel grain
 - memory placement
 - packed layout selection
@@ -342,7 +422,7 @@ Binding a candidate must:
 
 ## 7. Concrete Execution Design
 
-Example concrete SwiGLU tile:
+Example concrete SwiGLU tile. This example keeps the shorter MVP spellings while making the tile contract explicit through shapes, memory spaces, and owner/mapping attributes:
 
 ```mlir
 micro.kernel @swiglu_candidate_17
@@ -351,8 +431,8 @@ micro.kernel @swiglu_candidate_17
       candidate = "candidate_17",
       target = "x86-avx2-cpu"
     } {
-  micro.spatial_for %bm = 0 to %M step 32 map = #micro.map<cluster.y> {
-    micro.spatial_for %bn = 0 to %N step 64 map = #micro.map<cluster.x> {
+  micro.spatial_for %bm = 0 to %M step 32 map = #micro.map<worker> {
+    micro.spatial_for %bn = 0 to %N step 64 map = #micro.map<lane> {
       %acc_g = micro.alloc tensor<32x64xf32> memory = #micro.memory<acc>
       %acc_u = micro.alloc tensor<32x64xf32> memory = #micro.memory<acc>
 
@@ -385,10 +465,13 @@ micro.kernel @swiglu_candidate_17
 
 This IR makes the following directly observable:
 
+- tile shape and tile hierarchy
 - matrix work
 - DRAM traffic
 - SRAM traffic
 - accumulator footprint
+- layout choices
+- owner mapping
 - pipeline depth
 - copy/compute overlap
 - spatial parallelism
@@ -469,6 +552,7 @@ Validation requirements:
 
 - operation counts
 - memory bytes by source/destination level
+- materialized tile bytes and lifetime
 - compute lower bound
 - memory lower bound
 - capacity requirements
@@ -483,12 +567,17 @@ This level is used for fast candidate pruning.
 Events:
 
 ```text
+micro.tile_async_copy -> DMA event
 micro.async_copy -> DMA event
+micro.tile_mma -> matrix-engine event
 micro.mma -> matrix-engine event
+micro.tile_vector -> vector-engine event
 micro.vector -> vector-engine event
+micro.tile_reduce -> vector-engine/reduction event
 micro.reduce -> vector-engine/reduction event
 micro.wait -> dependency edge
 micro.barrier -> sync event
+micro.tile_load/store -> memory event
 micro.load/store -> memory event
 ```
 
@@ -698,6 +787,50 @@ Success criteria:
 
 ---
 
+### Tile-Centric Refinement Milestones
+
+These sub-milestones refine M9-M12 around the Part 2 tile programming model without replacing the main milestone sequence.
+
+### M9a: Tile Programming Model Foundation
+
+Add `!micro.tile`, layout attributes, owner attributes, tile view/partition/allocation/copy ops, and tile-typed compute op verification.
+
+Success criteria:
+
+- tile type and layout/owner attributes parse, print, and verify.
+- representative logical, memory, execution, and fragment tile examples are covered by FileCheck.
+- invalid layout, owner, memory, and fragment-shape combinations fail verification.
+
+### M10a: Tile-Aware MachineModel and Performance Events
+
+Extend MachineModel YAML and `micro-perf` to understand tile layouts, owner hierarchy, copy paths, fragment shapes, and live materialized tile capacity.
+
+Success criteria:
+
+- `generic-ai-accel-v1.yaml` exposes matrix/vector fragments and owner hierarchy.
+- `x86-avx2-cpu.yaml` maps `worker`, `lane`, and `vector_engine` cleanly.
+- L0/L1 reports include tile bytes, tile lifetimes, capacity pressure, and fragment utilization.
+
+### M11a: Tile-Centric Lowering
+
+Update `LLKToMicro` so lowering emits logical tile dataflow first, then memory placement, owner mapping, pipeline, synchronization, and instruction fragments.
+
+Success criteria:
+
+- matmul and fused SwiGLU lowering emit logical tile views, materialized memory tiles, pipeline copies, waits, and tile compute fragments.
+- the existing AVX2/JIT path remains independent and working.
+
+### M12a: Tile Search and Optimization
+
+Extend search-space IR, candidate binding, and schedule YAML to include tile hierarchy, layout, memory placement, owner mapping, tensorization fragments, pipeline stage count, and async limits.
+
+Success criteria:
+
+- the tuner can rank candidates whose differences are not only `BM/BN/BK`, but also layout, memory placement, owner mapping, fragment shape, and pipeline strategy.
+- legality checks reject unsupported tile hierarchy, layout, owner, memory, and fragment combinations before measurement.
+
+---
+
 ## 14. Non-Goals
 
 - Do not replace LLK semantic ops.
@@ -802,8 +935,16 @@ The canonical artifact is no longer only optimized MLIR or object code. It is th
 concrete micro.kernel + MachineModel YAML
 ```
 
+The concrete `micro.kernel` is tile-centric:
+
+```text
+concrete micro.kernel = uTile dataflow + uMap mapping/schedule + uHW fragments
+```
+
 For auto-optimization, the canonical source is:
 
 ```text
 micro.search_space + workload shape + MachineModel YAML
 ```
+
+The selected schedule must preserve the tile hierarchy, layout choices, memory placement, owner mapping, pipeline decisions, and instruction-fragment choices that produced the reported metrics.
