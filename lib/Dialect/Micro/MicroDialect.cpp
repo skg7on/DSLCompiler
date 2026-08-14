@@ -13,6 +13,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 //===----------------------------------------------------------------------===//
@@ -104,12 +105,19 @@ Attribute LayoutAttr::parse(AsmParser &parser, Type type) {
   StringAttr swizzle;
 
   // Parse optional named parameters.
+  SmallVector<StringRef, 4> seenParams;
   while (succeeded(parser.parseOptionalComma())) {
     StringRef name;
     if (parser.parseKeyword(&name))
       return {};
     if (parser.parseEqual())
       return {};
+    if (llvm::is_contained(seenParams, name)) {
+      parser.emitError(parser.getCurrentLocation(),
+                       "duplicate layout parameter '" + name + "'");
+      return {};
+    }
+    seenParams.push_back(name);
     if (name == "block") {
       if (parser.parseAttribute(block))
         return {};
@@ -161,6 +169,9 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                                  uint32_t kind, DenseI64ArrayAttr block,
                                  int64_t vector, int64_t align, int64_t banks,
                                  StringAttr swizzle) {
+  // Kind must be a known layout kind.
+  if (kind > static_cast<uint32_t>(LayoutKind::swizzled))
+    return emitError() << "unknown layout kind";
   // Block extents must be positive.
   if (block)
     for (int64_t extent : block.asArrayRef())
@@ -179,9 +190,17 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   // Banks must be positive when set.
   if (banks < 0)
     return emitError() << "banks must be positive";
+  // Kind/parameter consistency.
+  if (static_cast<LayoutKind>(kind) == LayoutKind::blocked &&
+      (!block || block.asArrayRef().empty()))
+    return emitError() << "blocked layout requires a block parameter";
+  if (static_cast<LayoutKind>(kind) == LayoutKind::vectorized && vector <= 0)
+    return emitError() << "vectorized layout requires a positive vector width";
   // Swizzle requires a swizzled layout kind.
   if (swizzle && static_cast<LayoutKind>(kind) != LayoutKind::swizzled)
     return emitError() << "swizzle requires a swizzled layout";
+  if (static_cast<LayoutKind>(kind) == LayoutKind::swizzled && !swizzle)
+    return emitError() << "swizzled layout requires a swizzle parameter";
   return success();
 }
 
@@ -220,12 +239,19 @@ Type TileType::parse(AsmParser &parser) {
   OwnerAttr owner;
 
   // Parse optional layout, memory, and owner parameters.
+  SmallVector<StringRef, 3> seenParams;
   while (succeeded(parser.parseOptionalComma())) {
     StringRef name;
     if (parser.parseKeyword(&name))
       return {};
     if (parser.parseEqual())
       return {};
+    if (llvm::is_contained(seenParams, name)) {
+      parser.emitError(parser.getCurrentLocation(),
+                       "duplicate tile parameter '" + name + "'");
+      return {};
+    }
+    seenParams.push_back(name);
     if (name == "layout") {
       if (parser.parseAttribute(layout))
         return {};
@@ -262,7 +288,9 @@ void TileType::print(AsmPrinter &printer) const {
     else
       printer << dim;
   }
-  printer << "x" << getElementType();
+  if (!getShape().empty())
+    printer << "x";
+  printer << getElementType();
   if (getLayout())
     printer << ", layout = " << getLayout();
   if (getMemory())
@@ -276,6 +304,9 @@ LogicalResult TileType::verify(function_ref<InFlightDiagnostic()> emitError,
                                ArrayRef<int64_t> shape, Type elementType,
                                LayoutAttr layout, MemorySpaceAttr memory,
                                OwnerAttr owner) {
+  // A tile is a shaped value; reject rank-0 (scalar) tiles.
+  if (shape.empty())
+    return emitError() << "tile must have at least one dimension";
   // Dimensions must be positive or dynamic.
   for (int64_t dim : shape)
     if (!ShapedType::isDynamic(dim) && dim <= 0)

@@ -68,12 +68,15 @@ def Micro_YieldOp : Micro_Op<"yield", [
 def Micro_TileViewOp : Micro_Op<"tile_view"> {
     let summary = "Logical zero-cost tile view of a tensor or larger tile";
     let description = [{
-        Creates a logical tile view over a source tensor or tile. A view is
-        zero-cost: it does not allocate storage or produce a copy token.
+        Creates a logical tile view over a windowed slice of a source tensor
+        or larger tile. The optional offsets index the source; when absent the
+        view covers the whole source. A view is zero-cost: it does not allocate
+        storage or produce a copy token.
     }];
 
     let arguments = (ins
         AnyType:$source,
+        Variadic<Index>:$offsets,
         DenseI64ArrayAttr:$shape,
         OptionalAttr<Micro_LayoutAttr>:$layout
     );
@@ -81,7 +84,7 @@ def Micro_TileViewOp : Micro_Op<"tile_view"> {
     let results = (outs AnyType:$result);
 
     let assemblyFormat = [{
-        $source attr-dict `:` type($source) `->` type($result)
+        $source (`[` $offsets^ `]`)? attr-dict `:` type($source) `->` type($result)
     }];
 
     let hasVerifier = 1;
@@ -122,7 +125,8 @@ def Micro_TilePartitionOp : Micro_Op<"tile_partition"> {
     let arguments = (ins
         AnyType:$source,
         DenseI64ArrayAttr:$shape,
-        OptionalAttr<Micro_OwnerAttr>:$owner
+        OptionalAttr<Micro_OwnerAttr>:$owner,
+        OptionalAttr<BoolAttr>:$tail
     );
 
     let results = (outs AnyType:$result);
@@ -229,7 +233,8 @@ def Micro_VectorOp : Micro_Op<"vector"> {
 
     let arguments = (ins
         StrAttr:$op,
-        Variadic<AnyType>:$inputs
+        Variadic<AnyType>:$inputs,
+        OptionalAttr<StrAttr>:$math_mode
     );
 
     let results = (outs AnyType:$result);

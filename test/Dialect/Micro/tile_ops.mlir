@@ -59,13 +59,20 @@ func.func @test_tile_type(%a : !micro.tile<32x64xbf16, layout = #micro.layout<ro
 }
 
 //===----------------------------------------------------------------------===//
-// micro.tile_view — logical zero-cost view
+// micro.tile_view — logical zero-cost view (whole and windowed)
 //===----------------------------------------------------------------------===//
 
 // CHECK-LABEL: func.func @test_tile_view
 func.func @test_tile_view(%A : tensor<?x?xbf16>) {
   // CHECK: micro.tile_view %{{.*}} {shape = array<i64: 32, 64>} : tensor<?x?xbf16> -> !micro.tile<32x64xbf16>
   %t = micro.tile_view %A {shape = array<i64: 32, 64>} : tensor<?x?xbf16> -> !micro.tile<32x64xbf16>
+  return
+}
+
+// CHECK-LABEL: func.func @test_tile_view_offsets
+func.func @test_tile_view_offsets(%A : tensor<?x?xbf16>, %i : index, %j : index) {
+  // CHECK: micro.tile_view %{{.*}}[%{{.*}}, %{{.*}}] {shape = array<i64: 32, 64>} : tensor<?x?xbf16> -> !micro.tile<32x64xbf16>
+  %t = micro.tile_view %A[%i, %j] {shape = array<i64: 32, 64>} : tensor<?x?xbf16> -> !micro.tile<32x64xbf16>
   return
 }
 
@@ -86,8 +93,15 @@ func.func @test_tile_alloc() {
 
 // CHECK-LABEL: func.func @test_tile_partition
 func.func @test_tile_partition(%tile : !micro.tile<32x64xbf16>) {
-  // CHECK: micro.tile_partition %{{.*}} {owner = #micro.owner<vector_engine>, shape = array<i64: 16, 16>} : !micro.tile<32x64xbf16> -> !micro.tile<16x16xbf16>
-  %frag = micro.tile_partition %tile {shape = array<i64: 16, 16>, owner = #micro.owner<vector_engine>} : !micro.tile<32x64xbf16> -> !micro.tile<16x16xbf16>
+  // CHECK: micro.tile_partition %{{.*}} {owner = #micro.owner<vector_engine>, shape = array<i64: 16, 16>} : !micro.tile<32x64xbf16> -> !micro.tile<16x16xbf16, owner = #micro.owner<vector_engine>>
+  %frag = micro.tile_partition %tile {shape = array<i64: 16, 16>, owner = #micro.owner<vector_engine>} : !micro.tile<32x64xbf16> -> !micro.tile<16x16xbf16, owner = #micro.owner<vector_engine>>
+  return
+}
+
+// CHECK-LABEL: func.func @test_tile_partition_tail
+func.func @test_tile_partition_tail(%tile : !micro.tile<32x64xbf16>) {
+  // CHECK: micro.tile_partition %{{.*}} {shape = array<i64: 7, 7>, tail = true} : !micro.tile<32x64xbf16> -> !micro.tile<7x7xbf16>
+  %frag = micro.tile_partition %tile {shape = array<i64: 7, 7>, tail = true} : !micro.tile<32x64xbf16> -> !micro.tile<7x7xbf16>
   return
 }
 
@@ -97,8 +111,8 @@ func.func @test_tile_partition(%tile : !micro.tile<32x64xbf16>) {
 
 // CHECK-LABEL: func.func @test_tile_async_copy
 func.func @test_tile_async_copy(%logical : !micro.tile<32x64xbf16>) {
-  // CHECK: %[[T:.*]], %[[TOK:.*]] = micro.tile_async_copy %{{.*}} {dst_memory = #micro.memory<sram>, owner = #micro.owner<worker>} : !micro.tile<32x64xbf16> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>>, !micro.async_token
-  %tile, %tok = micro.tile_async_copy %logical {dst_memory = #micro.memory<sram>, owner = #micro.owner<worker>} : !micro.tile<32x64xbf16> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>>, !micro.async_token
+  // CHECK: %[[T:.*]], %[[TOK:.*]] = micro.tile_async_copy %{{.*}} {dst_memory = #micro.memory<sram>, owner = #micro.owner<worker>} : !micro.tile<32x64xbf16> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>, owner = #micro.owner<worker>>, !micro.async_token
+  %tile, %tok = micro.tile_async_copy %logical {dst_memory = #micro.memory<sram>, owner = #micro.owner<worker>} : !micro.tile<32x64xbf16> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>, owner = #micro.owner<worker>>, !micro.async_token
   return
 }
 
@@ -130,8 +144,10 @@ func.func @test_tile_mma(%a : !micro.tile<16x32xbf16>, %b : !micro.tile<32x16xbf
 
 // CHECK-LABEL: func.func @test_tile_vector
 func.func @test_tile_vector(%acc_g : !micro.tile<32x64xf32>) {
-  // CHECK: micro.vector "silu" %{{.*}} : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
-  %gate = micro.vector "silu" %acc_g : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  // CHECK: micro.vector "silu" %{{.*}} {math_mode = "bounded_fast"} : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  %gate = micro.vector "silu" %acc_g {math_mode = "bounded_fast"} : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  // CHECK: micro.vector "reciprocal" %{{.*}} : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  %rec = micro.vector "reciprocal" %acc_g : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
   return
 }
 
@@ -143,5 +159,7 @@ func.func @test_tile_vector(%acc_g : !micro.tile<32x64xf32>) {
 func.func @test_tile_reduce(%scores : !micro.tile<32x64xf32>) {
   // CHECK: micro.reduce "max" %{{.*}} {axis = 1 : i64} : !micro.tile<32x64xf32> -> !micro.tile<32xf32>
   %m = micro.reduce "max" %scores {axis = 1 : i64} : !micro.tile<32x64xf32> -> !micro.tile<32xf32>
+  // CHECK: micro.reduce "product" %{{.*}} {axis = 0 : i64} : !micro.tile<32x64xf32> -> !micro.tile<64xf32>
+  %p = micro.reduce "product" %scores {axis = 0 : i64} : !micro.tile<32x64xf32> -> !micro.tile<64xf32>
   return
 }
