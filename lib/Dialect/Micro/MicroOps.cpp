@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/Micro/MicroEnums.h"
+#include "LLK/Dialect/Micro/MicroHelpers.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"
@@ -53,43 +54,34 @@ LogicalResult KernelOp::verify() {
 // Tile op verifiers
 //===----------------------------------------------------------------------===//
 
-static bool isSupportedVectorOp(StringRef op) {
-  return llvm::StringSwitch<bool>(op)
-      .Cases({"add", "sub", "mul", "div"}, true)
-      .Cases({"exp", "silu", "sigmoid", "reciprocal"}, true)
-      .Cases({"max", "min", "compare", "select", "convert"}, true)
-      .Default(false);
-}
-
 static bool isSupportedReduceOp(StringRef op) {
   return llvm::StringSwitch<bool>(op)
       .Cases({"sum", "max", "min", "prod", "product"}, true)
       .Default(false);
 }
 
-static int requiredVectorArity(StringRef op) {
-  if (op == "select")
-    return 3;
-  if (op == "add" || op == "sub" || op == "mul" || op == "div" || op == "max" ||
-      op == "min" || op == "compare")
-    return 2;
-  return 1; // exp, silu, sigmoid, reciprocal, convert
+// Returns the arity of a vector operation, or 0 for an unknown operation.
+static int vectorOpArity(StringRef op) {
+  return llvm::StringSwitch<int>(op)
+      .Cases({"add", "sub", "mul", "div", "max", "min", "compare"}, 2)
+      .Cases({"exp", "silu", "sigmoid", "reciprocal", "convert"}, 1)
+      .Case("select", 3)
+      .Default(0);
 }
 
-static bool dtypeMatchesElementType(DType dtype, Type elementType) {
-  switch (dtype) {
-  case DType::f32:
-    return elementType.isF32();
-  case DType::f16:
-    return elementType.isF16();
-  case DType::bf16:
-    return elementType.isBF16();
-  case DType::i32:
-    return elementType.isInteger(32);
-  case DType::i8:
-    return elementType.isInteger(8);
-  }
-  return false;
+// Verifies that an optional owner attribute is carried by and agrees with the
+// result tile's owner (shared by tile_partition and tile_async_copy).
+template <typename OpTy>
+static LogicalResult verifyOwnerAttrMatches(OpTy op, std::optional<Owner> owner,
+                                            TileType resultType) {
+  if (!owner)
+    return success();
+  if (!resultType.getOwner())
+    return op.emitOpError(
+        "owner attribute requires the result tile to carry an owner");
+  if (*owner != resultType.getOwner().getValue())
+    return op.emitOpError("owner attribute must match result tile owner");
+  return success();
 }
 
 LogicalResult TileViewOp::verify() {
@@ -159,15 +151,8 @@ LogicalResult TilePartitionOp::verify() {
   if (getShape() != resultType.getShape())
     return emitOpError("shape attribute must match result tile shape");
 
-  // Owner attribute, when present, must be carried by and agree with the
-  // result tile's owner.
-  if (auto owner = getOwner()) {
-    if (!resultType.getOwner())
-      return emitOpError(
-          "owner attribute requires the result tile to carry an owner");
-    if (*owner != resultType.getOwner().getValue())
-      return emitOpError("owner attribute must match result tile owner");
-  }
+  if (failed(verifyOwnerAttrMatches(*this, getOwner(), resultType)))
+    return failure();
 
   // Fragment shape must divide the parent shape, unless a tail/mask is set.
   bool hasTail = getTail().value_or(false);
@@ -214,15 +199,8 @@ LogicalResult TileAsyncCopyOp::verify() {
     return emitOpError("result tile element type must match source tile "
                        "element type");
 
-  // Owner attribute, when present, must be carried by and agree with the
-  // result tile's owner.
-  if (auto owner = getOwner()) {
-    if (!resultType.getOwner())
-      return emitOpError(
-          "owner attribute requires the result tile to carry an owner");
-    if (*owner != resultType.getOwner().getValue())
-      return emitOpError("owner attribute must match result tile owner");
-  }
+  if (failed(verifyOwnerAttrMatches(*this, getOwner(), resultType)))
+    return failure();
 
   return success();
 }
@@ -277,19 +255,20 @@ LogicalResult MmaOp::verify() {
     return emitOpError("result tile shape must be [M, N]");
 
   // Dtype compatibility.
-  if (!dtypeMatchesElementType(getInput(), lhsType.getElementType()) ||
-      !dtypeMatchesElementType(getInput(), rhsType.getElementType()))
+  if (dtypeOfElementType(lhsType.getElementType()) != getInput() ||
+      dtypeOfElementType(rhsType.getElementType()) != getInput())
     return emitOpError("input dtype must match operand element types");
-  if (!dtypeMatchesElementType(getAccumulator(), accType.getElementType()))
+  if (dtypeOfElementType(accType.getElementType()) != getAccumulator())
     return emitOpError("accumulator dtype must match accumulator element type");
   return success();
 }
 
 LogicalResult VectorOp::verify() {
-  if (!isSupportedVectorOp(getOp()))
+  int arity = vectorOpArity(getOp());
+  if (arity == 0)
     return emitOpError("unknown vector operation");
 
-  if (static_cast<int>(getInputs().size()) != requiredVectorArity(getOp()))
+  if (static_cast<int>(getInputs().size()) != arity)
     return emitOpError("vector operation has wrong number of operands");
 
   SmallVector<TileType> inputTypes;

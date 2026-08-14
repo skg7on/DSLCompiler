@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/Micro/MicroEnums.h"
+#include "LLK/Dialect/Micro/MicroHelpers.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"
@@ -15,6 +16,7 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
 
 //===----------------------------------------------------------------------===//
 // Generated headers: class declarations
@@ -184,7 +186,7 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
   if (align != 0) {
     if (align <= 0)
       return emitError() << "align must be positive";
-    if ((align & (align - 1)) != 0)
+    if (!llvm::isPowerOf2_64(align))
       return emitError() << "align must be a power of two";
   }
   // Banks must be positive when set.
@@ -207,16 +209,6 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 //===----------------------------------------------------------------------===//
 // TileType custom parse/print/verify
 //===----------------------------------------------------------------------===//
-
-/// Returns true for the MLIR element types that map to a supported Micro
-/// dtype (f32, f16, bf16, i32, i8).
-static bool isSupportedTileElementType(Type elementType) {
-  if (auto floatType = dyn_cast<FloatType>(elementType))
-    return floatType.isBF16() || floatType.isF16() || floatType.isF32();
-  if (auto intType = dyn_cast<IntegerType>(elementType))
-    return intType.getWidth() == 8 || intType.getWidth() == 32;
-  return false;
-}
 
 Type TileType::parse(AsmParser &parser) {
   SMLoc loc = parser.getCurrentLocation();
@@ -312,7 +304,7 @@ LogicalResult TileType::verify(function_ref<InFlightDiagnostic()> emitError,
     if (!ShapedType::isDynamic(dim) && dim <= 0)
       return emitError() << "tile dimensions must be positive or dynamic";
   // Element type must map to a supported Micro dtype.
-  if (!isSupportedTileElementType(elementType))
+  if (!dtypeOfElementType(elementType))
     return emitError() << "unsupported tile element type";
   return success();
 }
