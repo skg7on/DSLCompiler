@@ -162,6 +162,112 @@ inline std::optional<DType> symbolizeDType(llvm::StringRef str) {
       .Default(std::nullopt);
 }
 
+//===----------------------------------------------------------------------===//
+// Layout kind enum (for #micro.layout)
+//===----------------------------------------------------------------------===//
+
+enum class LayoutKind : uint32_t {
+  row_major = 0,
+  col_major = 1,
+  blocked = 2,
+  vectorized = 3,
+  swizzled = 4,
+};
+
+inline llvm::StringRef stringifyLayoutKind(LayoutKind val) {
+  switch (val) {
+  case LayoutKind::row_major:
+    return "row_major";
+  case LayoutKind::col_major:
+    return "col_major";
+  case LayoutKind::blocked:
+    return "blocked";
+  case LayoutKind::vectorized:
+    return "vectorized";
+  case LayoutKind::swizzled:
+    return "swizzled";
+  }
+  return "";
+}
+
+inline std::optional<LayoutKind> symbolizeLayoutKind(llvm::StringRef str) {
+  return llvm::StringSwitch<std::optional<LayoutKind>>(str)
+      .Case("row_major", LayoutKind::row_major)
+      .Case("col_major", LayoutKind::col_major)
+      .Case("blocked", LayoutKind::blocked)
+      .Case("vectorized", LayoutKind::vectorized)
+      .Case("swizzled", LayoutKind::swizzled)
+      .Default(std::nullopt);
+}
+
+//===----------------------------------------------------------------------===//
+// Owner enum (for #micro.owner)
+//===----------------------------------------------------------------------===//
+
+// Scoped enum: several owner names (lane, worker, matrix_engine, vector_engine,
+// dma) also appear as unscoped MappingTarget enumerators in this namespace.
+enum class Owner : uint32_t {
+  cluster = 0,
+  core = 1,
+  warp = 2,
+  wave = 3,
+  subgroup = 4,
+  pe_group = 5,
+  pe = 6,
+  lane = 7,
+  worker = 8,
+  matrix_engine = 9,
+  vector_engine = 10,
+  dma = 11,
+};
+
+inline llvm::StringRef stringifyOwner(Owner val) {
+  switch (val) {
+  case Owner::cluster:
+    return "cluster";
+  case Owner::core:
+    return "core";
+  case Owner::warp:
+    return "warp";
+  case Owner::wave:
+    return "wave";
+  case Owner::subgroup:
+    return "subgroup";
+  case Owner::pe_group:
+    return "pe_group";
+  case Owner::pe:
+    return "pe";
+  case Owner::lane:
+    return "lane";
+  case Owner::worker:
+    return "worker";
+  case Owner::matrix_engine:
+    return "matrix_engine";
+  case Owner::vector_engine:
+    return "vector_engine";
+  case Owner::dma:
+    return "dma";
+  }
+  return "";
+}
+
+inline std::optional<Owner> symbolizeOwner(llvm::StringRef str) {
+  return llvm::StringSwitch<std::optional<Owner>>(str)
+      .Case("cluster", Owner::cluster)
+      .Case("core", Owner::core)
+      .Case("warp", Owner::warp)
+      .Case("wave", Owner::wave)
+      .Case("subgroup", Owner::subgroup)
+      .Case("pe_group", Owner::pe_group)
+      .Case("pe", Owner::pe)
+      .Case("lane", Owner::lane)
+      .Case("worker", Owner::worker)
+      .Case("matrix_engine", Owner::matrix_engine)
+      .Case("vector_engine", Owner::vector_engine)
+      .Case("dma", Owner::dma)
+      .Default(std::nullopt);
+}
+
 } // namespace mlir::micro
 
 #endif // LLK_DIALECT_MICRO_MICROENUMS_H
