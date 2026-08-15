@@ -109,4 +109,70 @@ def Micro_DTypeAttr :
     let assemblyFormat = "`<` $value `>`";
 }
 
+//===----------------------------------------------------------------------===//
+// Owner enum attribute
+//===----------------------------------------------------------------------===//
+
+def Micro_OwnerCluster : I32EnumAttrCase<"cluster", 0, "cluster">;
+def Micro_OwnerCore : I32EnumAttrCase<"core", 1, "core">;
+def Micro_OwnerWarp : I32EnumAttrCase<"warp", 2, "warp">;
+def Micro_OwnerWave : I32EnumAttrCase<"wave", 3, "wave">;
+def Micro_OwnerSubgroup : I32EnumAttrCase<"subgroup", 4, "subgroup">;
+def Micro_OwnerPeGroup : I32EnumAttrCase<"pe_group", 5, "pe_group">;
+def Micro_OwnerPE : I32EnumAttrCase<"pe", 6, "pe">;
+def Micro_OwnerLane : I32EnumAttrCase<"lane", 7, "lane">;
+def Micro_OwnerWorker : I32EnumAttrCase<"worker", 8, "worker">;
+def Micro_OwnerMatrixEngine : I32EnumAttrCase<"matrix_engine", 9, "matrix_engine">;
+def Micro_OwnerVectorEngine : I32EnumAttrCase<"vector_engine", 10, "vector_engine">;
+def Micro_OwnerDMA : I32EnumAttrCase<"dma", 11, "dma">;
+
+def Micro_Owner : I32EnumAttr<"Owner", "Owner resource scope", [
+    Micro_OwnerCluster,
+    Micro_OwnerCore,
+    Micro_OwnerWarp,
+    Micro_OwnerWave,
+    Micro_OwnerSubgroup,
+    Micro_OwnerPeGroup,
+    Micro_OwnerPE,
+    Micro_OwnerLane,
+    Micro_OwnerWorker,
+    Micro_OwnerMatrixEngine,
+    Micro_OwnerVectorEngine,
+    Micro_OwnerDMA
+]> {
+    let cppNamespace = "::mlir::micro";
+    let genSpecializedAttr = 0;
+}
+
+def Micro_OwnerAttr :
+    EnumAttr<Micro_Dialect, Micro_Owner, "owner"> {
+    let assemblyFormat = "`<` $value `>`";
+}
+
+//===----------------------------------------------------------------------===//
+// Layout attribute (kind + optional parameters)
+//===----------------------------------------------------------------------===//
+
+def Micro_LayoutAttr : AttrDef<Micro_Dialect, "Layout"> {
+    let mnemonic = "layout";
+    let summary = "Tile memory layout kind with optional parameters";
+    let description = [{
+        Describes the memory layout of a tile: order (row/column/blocked/
+        vectorized/swizzled) plus optional block shape, vector width,
+        alignment, banking, and swizzle parameters.
+    }];
+
+    let parameters = (ins
+        "uint32_t":$kind,
+        "DenseI64ArrayAttr":$block,
+        "int64_t":$vector,
+        "int64_t":$align,
+        "int64_t":$banks,
+        "StringAttr":$swizzle
+    );
+
+    let hasCustomAssemblyFormat = 1;
+    let genVerifyDecl = 1;
+}
+
 #endif

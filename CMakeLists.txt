@@ -406,6 +406,7 @@ endfunction()
 if(FILECHECK_BIN)
   add_llk_filecheck_test(DialectOps test/Dialect/ops.mlir)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
+  add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
@@ -603,6 +604,10 @@ add_test(NAME DialectOpsInvalid
 add_test(NAME MicroDialectOpsInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
             ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/ops_invalid.mlir
+)
+add_test(NAME MicroDialectTileOpsInvalid
+    COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+            ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/tile_ops_invalid.mlir
 )
 # ScratchAnalysis test: verify-diagnostics validates expected-warning comments
 add_test(NAME ScratchAnalysis
