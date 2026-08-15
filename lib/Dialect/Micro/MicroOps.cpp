@@ -85,6 +85,28 @@ static LogicalResult verifyOwnerAttrMatches(OpTy op, std::optional<Owner> owner,
   return success();
 }
 
+/// Returns the byte size of a tile (product of its static dimensions times the
+/// element byte width), or nullopt if any dimension is dynamic.
+static std::optional<int64_t> tileByteSize(TileType tile) {
+  int64_t elements = 1;
+  for (int64_t dim : tile.getShape()) {
+    if (ShapedType::isDynamic(dim))
+      return std::nullopt;
+    elements *= dim;
+  }
+  switch (*dtypeOfElementType(tile.getElementType())) {
+  case DType::f32:
+  case DType::i32:
+    return elements * 4;
+  case DType::f16:
+  case DType::bf16:
+    return elements * 2;
+  case DType::i8:
+    return elements;
+  }
+  return std::nullopt;
+}
+
 LogicalResult TileViewOp::verify() {
   auto resultType = dyn_cast<TileType>(getResult().getType());
   if (!resultType)
@@ -134,6 +156,10 @@ LogicalResult TileAllocOp::verify() {
     return emitOpError("tile_alloc result tile must have a memory space");
   if (resultType.getMemory().getValue() == MemorySpace::dram)
     return emitOpError("tile_alloc memory must not be dram");
+  // A materialized allocation must have a statically computable byte size.
+  if (!tileByteSize(resultType))
+    return emitOpError(
+        "tile_alloc result must have a statically computable byte size");
   return success();
 }
 

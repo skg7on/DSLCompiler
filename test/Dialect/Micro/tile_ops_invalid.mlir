@@ -82,6 +82,15 @@ func.func @tile_alloc_in_dram() {
 
 // -----
 
+// tile_alloc result must have a statically computable byte size.
+func.func @tile_alloc_dynamic_shape() {
+  // expected-error @+1 {{tile_alloc result must have a statically computable byte size}}
+  %acc = micro.tile_alloc : !micro.tile<?x64xf32, memory = #micro.memory<acc>>
+  return
+}
+
+// -----
+
 // tile_view must preserve the element type.
 func.func @tile_view_bad_element_type(%A : tensor<?x?xbf16>) {
   // expected-error @+1 {{source and result element types must match}}
