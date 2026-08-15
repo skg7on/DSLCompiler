@@ -275,4 +275,176 @@ def Micro_ReduceOp : Micro_Op<"reduce"> {
     let hasVerifier = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// micro.for — temporal loop
+//===----------------------------------------------------------------------===//
+
+def Micro_ForOp : Micro_Op<"for", [
+    SingleBlockImplicitTerminator<"YieldOp">
+]> {
+    let summary = "Temporal loop";
+    let description = [{
+        A temporal loop over an index induction variable with lower bound,
+        upper bound, and step. Modeled after scf.for; no iter_args in the MVP.
+    }];
+
+    let arguments = (ins
+        Index:$lower_bound,
+        Index:$upper_bound,
+        Index:$step
+    );
+
+    let regions = (region SizedRegion<1>:$body);
+
+    let hasCustomAssemblyFormat = 1;
+    let hasVerifier = 1;
+
+    let extraClassDeclaration = [{
+        BlockArgument getInductionVar() {
+          return getBody().front().getArgument(0);
+        }
+    }];
+}
+
+//===----------------------------------------------------------------------===//
+// micro.spatial_for — spatial loop over machine resources
+//===----------------------------------------------------------------------===//
+
+def Micro_SpatialForOp : Micro_Op<"spatial_for", [
+    SingleBlockImplicitTerminator<"YieldOp">
+]> {
+    let summary = "Spatial loop over machine resources";
+    let description = [{
+        A spatial loop mapping iterations over machine resources via a
+        #micro.map target. Modeled after micro.for with an additional map.
+    }];
+
+    let arguments = (ins
+        Index:$lower_bound,
+        Index:$upper_bound,
+        Index:$step,
+        Micro_MappingTargetAttr:$map
+    );
+
+    let regions = (region SizedRegion<1>:$body);
+
+    let hasCustomAssemblyFormat = 1;
+    let hasVerifier = 1;
+
+    let extraClassDeclaration = [{
+        BlockArgument getInductionVar() {
+          return getBody().front().getArgument(0);
+        }
+    }];
+}
+
+//===----------------------------------------------------------------------===//
+// micro.pipeline — pipeline overlap between movement and compute
+//===----------------------------------------------------------------------===//
+
+def Micro_PipelineOp : Micro_Op<"pipeline", [
+    SingleBlockImplicitTerminator<"YieldOp">
+]> {
+    let summary = "Pipeline overlap between movement and compute";
+    let description = [{
+        Marks pipeline overlap between data movement and compute. The stages
+        attribute controls the number of pipeline stages.
+    }];
+
+    let arguments = (ins I64Attr:$stages);
+
+    let regions = (region SizedRegion<1>:$body);
+
+    let assemblyFormat = "`stages` `=` $stages attr-dict-with-keyword $body";
+
+    let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.alloc — allocate logical storage in a memory space
+//===----------------------------------------------------------------------===//
+
+def Micro_AllocOp : Micro_Op<"alloc"> {
+    let summary = "Allocate logical tile storage in a memory space";
+    let description = [{
+        Allocates tensor storage in a memory space. DRAM operands represent
+        external buffers, so local allocations must not target dram.
+    }];
+
+    let arguments = (ins Micro_MemorySpaceAttr:$memory);
+
+    let results = (outs AnyType:$result);
+
+    let assemblyFormat = "attr-dict `:` type($result)";
+
+    let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.async_copy — asynchronous movement between memory spaces
+//===----------------------------------------------------------------------===//
+
+def Micro_AsyncCopyOp : Micro_Op<"async_copy"> {
+    let summary = "Asynchronous movement between memory spaces";
+    let description = [{
+        Moves a tensor between two memory spaces asynchronously, returning the
+        materialized tensor and an async token for synchronization.
+    }];
+
+    let arguments = (ins
+        AnyType:$source,
+        Micro_MemorySpaceAttr:$src_memory,
+        Micro_MemorySpaceAttr:$dst_memory
+    );
+
+    let results = (outs AnyType:$result, AnyType:$token);
+
+    let assemblyFormat = [{
+        $source attr-dict `:` type($source) `->` type($result) `,` type($token)
+    }];
+
+    let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.wait — wait on async tokens
+//===----------------------------------------------------------------------===//
+
+def Micro_WaitOp : Micro_Op<"wait"> {
+    let summary = "Wait on async movement or compute tokens";
+    let description = [{
+        Blocks until all operand async tokens have completed.
+    }];
+
+    let arguments = (ins Variadic<Micro_AsyncToken>:$tokens);
+
+    let assemblyFormat = "$tokens attr-dict";
+
+    let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.store — store a value to a destination memory space
+//===----------------------------------------------------------------------===//
+
+def Micro_StoreOp : Micro_Op<"store"> {
+    let summary = "Store a value to a destination memory space";
+    let description = [{
+        Stores a shaped value to a destination memory space. The source and
+        destination memory spaces must differ.
+    }];
+
+    let arguments = (ins
+        AnyType:$source,
+        Micro_MemorySpaceAttr:$src_memory,
+        Micro_MemorySpaceAttr:$dst_memory
+    );
+
+    let assemblyFormat = [{
+        $source attr-dict `:` type($source)
+    }];
+
+    let hasVerifier = 1;
+}
+
 #endif

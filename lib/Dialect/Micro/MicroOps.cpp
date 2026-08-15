@@ -9,6 +9,7 @@
 #include "LLK/Dialect/Micro/MicroHelpers.h"
 
 #include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
@@ -84,6 +85,28 @@ static LogicalResult verifyOwnerAttrMatches(OpTy op, std::optional<Owner> owner,
   return success();
 }
 
+/// Returns the byte size of a tile (product of its static dimensions times the
+/// element byte width), or nullopt if any dimension is dynamic.
+static std::optional<int64_t> tileByteSize(TileType tile) {
+  int64_t elements = 1;
+  for (int64_t dim : tile.getShape()) {
+    if (ShapedType::isDynamic(dim))
+      return std::nullopt;
+    elements *= dim;
+  }
+  switch (*dtypeOfElementType(tile.getElementType())) {
+  case DType::f32:
+  case DType::i32:
+    return elements * 4;
+  case DType::f16:
+  case DType::bf16:
+    return elements * 2;
+  case DType::i8:
+    return elements;
+  }
+  return std::nullopt;
+}
+
 LogicalResult TileViewOp::verify() {
   auto resultType = dyn_cast<TileType>(getResult().getType());
   if (!resultType)
@@ -133,6 +156,10 @@ LogicalResult TileAllocOp::verify() {
     return emitOpError("tile_alloc result tile must have a memory space");
   if (resultType.getMemory().getValue() == MemorySpace::dram)
     return emitOpError("tile_alloc memory must not be dram");
+  // A materialized allocation must have a statically computable byte size.
+  if (!tileByteSize(resultType))
+    return emitOpError(
+        "tile_alloc result must have a statically computable byte size");
   return success();
 }
 
@@ -323,5 +350,153 @@ LogicalResult ReduceOp::verify() {
   if (resultType.getElementType() != inputType.getElementType())
     return emitOpError("reduce result element type must match input element "
                        "type");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Concrete loop/sync op verifiers and parsers
+//===----------------------------------------------------------------------===//
+
+/// Verifies a loop step is positive when statically known.
+static LogicalResult verifyStaticPositiveStep(Operation *op, Value step) {
+  if (auto constantOp = step.getDefiningOp<arith::ConstantOp>()) {
+    if (auto intAttr = dyn_cast<IntegerAttr>(constantOp.getValue())) {
+      if (!intAttr.getValue().isStrictlyPositive())
+        return op->emitOpError("step must be positive");
+    }
+  }
+  return success();
+}
+
+ParseResult ForOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto &builder = parser.getBuilder();
+
+  OpAsmParser::Argument inductionVariable;
+  OpAsmParser::UnresolvedOperand lb, ub, step;
+
+  // Parse `%i = lb to ub step step`.
+  if (parser.parseOperand(inductionVariable.ssaName) || parser.parseEqual() ||
+      parser.parseOperand(lb) || parser.parseKeyword("to") ||
+      parser.parseOperand(ub) || parser.parseKeyword("step") ||
+      parser.parseOperand(step))
+    return failure();
+
+  inductionVariable.type = builder.getIndexType();
+  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, regionArgs))
+    return failure();
+  ForOp::ensureTerminator(*body, builder, result.location);
+
+  Type indexType = builder.getIndexType();
+  if (parser.resolveOperand(lb, indexType, result.operands) ||
+      parser.resolveOperand(ub, indexType, result.operands) ||
+      parser.resolveOperand(step, indexType, result.operands))
+    return failure();
+
+  return success();
+}
+
+void ForOp::print(OpAsmPrinter &printer) {
+  printer << ' ' << getInductionVar() << " = " << getLowerBound() << " to "
+          << getUpperBound() << " step " << getStep() << ' ';
+  printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
+                      /*printBlockTerminators=*/false);
+}
+
+LogicalResult ForOp::verify() {
+  return verifyStaticPositiveStep(*this, getStep());
+}
+
+ParseResult SpatialForOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto &builder = parser.getBuilder();
+
+  OpAsmParser::Argument inductionVariable;
+  OpAsmParser::UnresolvedOperand lb, ub, step;
+
+  if (parser.parseOperand(inductionVariable.ssaName) || parser.parseEqual() ||
+      parser.parseOperand(lb) || parser.parseKeyword("to") ||
+      parser.parseOperand(ub) || parser.parseKeyword("step") ||
+      parser.parseOperand(step) || parser.parseKeyword("map") ||
+      parser.parseEqual())
+    return failure();
+
+  MappingTargetAttr mapAttr;
+  if (parser.parseAttribute(mapAttr))
+    return failure();
+  result.getOrAddProperties<SpatialForOp::Properties>().map = mapAttr;
+
+  inductionVariable.type = builder.getIndexType();
+  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, regionArgs))
+    return failure();
+  SpatialForOp::ensureTerminator(*body, builder, result.location);
+
+  Type indexType = builder.getIndexType();
+  if (parser.resolveOperand(lb, indexType, result.operands) ||
+      parser.resolveOperand(ub, indexType, result.operands) ||
+      parser.resolveOperand(step, indexType, result.operands))
+    return failure();
+
+  return success();
+}
+
+void SpatialForOp::print(OpAsmPrinter &printer) {
+  printer << ' ' << getInductionVar() << " = " << getLowerBound() << " to "
+          << getUpperBound() << " step " << getStep()
+          << " map = " << getMapAttr() << ' ';
+  printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
+                      /*printBlockTerminators=*/false);
+}
+
+LogicalResult SpatialForOp::verify() {
+  return verifyStaticPositiveStep(*this, getStep());
+}
+
+LogicalResult PipelineOp::verify() {
+  if (getStages() < 1)
+    return emitOpError("pipeline stages must be at least 1");
+  for (Operation &op : getBody().getOps())
+    if (auto nested = dyn_cast<PipelineOp>(op))
+      return nested.emitOpError("nested pipeline is not allowed");
+  return success();
+}
+
+LogicalResult AllocOp::verify() {
+  if (!isa<ShapedType>(getResult().getType()))
+    return emitOpError("result must be a shaped type");
+  if (getMemory() == MemorySpace::dram)
+    return emitOpError("alloc memory must not be dram");
+  return success();
+}
+
+LogicalResult AsyncCopyOp::verify() {
+  if (!isa<ShapedType>(getSource().getType()) ||
+      !isa<ShapedType>(getResult().getType()))
+    return emitOpError("source and result must be shaped types");
+  if (!isa<AsyncTokenType>(getToken().getType()))
+    return emitOpError("token result must be an async token");
+  if (getSrcMemory() == getDstMemory())
+    return emitOpError("source and destination memory must differ");
+  return success();
+}
+
+LogicalResult WaitOp::verify() {
+  if (getTokens().empty())
+    return emitOpError("wait requires at least one token operand");
+  for (Value token : getTokens())
+    if (!isa<AsyncTokenType>(token.getType()))
+      return emitOpError("wait operands must be async tokens");
+  return success();
+}
+
+LogicalResult StoreOp::verify() {
+  if (!isa<ShapedType>(getSource().getType()))
+    return emitOpError("stored value must be a shaped type");
+  if (getSrcMemory() == getDstMemory())
+    return emitOpError("source and destination memory must differ");
   return success();
 }

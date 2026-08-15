@@ -105,7 +105,7 @@ add_mlir_dialect_library(MicroDialect
     lib/Dialect/Micro/MicroDialect.cpp
     lib/Dialect/Micro/MicroOps.cpp
     DEPENDS MicroDialectGen MicroTypesGen MicroOpsGen
-    LINK_LIBS PUBLIC MLIRIR MLIRDialect MLIRSupport
+    LINK_LIBS PUBLIC MLIRIR MLIRDialect MLIRSupport MLIRArithDialect
 )
 
 # Library: LLKToLinalg conversion
