@@ -288,6 +288,17 @@ set(LLK_MLIR_EXEC_LIBS
     MLIRVectorToLLVMPass
 )
 
+# When MLIR is built with a single libMLIR dylib, MLIRConfig.cmake exports
+# MLIR_LINK_MLIR_DYLIB and the component libraries above are static archives.
+# Naming them individually puts those archives in the executable alongside the
+# dylib, so the process holds two copies of MLIR whose dialect classes have
+# different TypeIDs. Startup then aborts during context construction with:
+#   LLVM ERROR: Trying to register different dialects for the same namespace: builtin
+# Link the dylib target instead, as MLIR's own mlir_target_link_libraries() does.
+if(MLIR_LINK_MLIR_DYLIB)
+  set(LLK_MLIR_EXEC_LIBS MLIR)
+endif()
+
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
 target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
