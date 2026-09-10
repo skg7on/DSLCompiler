@@ -34,6 +34,19 @@ All worktree branches MUST follow the pattern `category/short-description` using
 - `worktree-fix+cmake-native-target-libs` — ❌ same pattern. Use `fix/cmake-native-target-libs`
 - `worktree-docs+m4-parallel-design` — ❌ same pattern. Use `docs/m4-parallel-design`
 
+### Claude Code produces the bad pattern automatically
+
+The `EnterWorktree` tool generates exactly the pattern above. `EnterWorktree(name: "docs/foo-bar")` creates
+branch `worktree-docs+foo-bar` in `.claude/worktrees/docs+foo-bar`. Rename the branch as your first command,
+before any commit:
+
+```bash
+git branch -m worktree-docs+foo-bar docs/foo-bar
+```
+
+Leave the directory name alone — this policy constrains branch naming only, and moving the directory
+mid-session breaks the session's working directory.
+
 ## Lifecycle
 
 1. Create worktree + branch before making any changes
