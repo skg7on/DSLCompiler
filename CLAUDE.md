@@ -24,7 +24,7 @@ ctest -R MicroDialectTileOps     # Run a single FileCheck test
 ./bin/<TestName>                 # Run a single GTest
 ```
 
-CI configures with `-DLLK_BUILD_TOOLS=OFF -DLLK_BUILD_E2E_TESTS=OFF`, so the JIT execution tests (`test/Execution/*`, `test/Numerical/*`) are never built there — green CI does not mean the JIT/AVX2 path works. Run them locally.
+**CI runs almost none of this suite.** It configures with `-DLLK_BUILD_TOOLS=OFF -DLLK_BUILD_E2E_TESTS=OFF`, so the JIT execution tests (`test/Execution/*`, `test/Numerical/*`) are never built. It also builds LLVM with `-DLLVM_INCLUDE_TESTS=OFF`, so no `FileCheck` binary exists, `find_program(FILECHECK_BIN)` fails, and `if(FILECHECK_BIN)` silently registers none of the `.mlir` tests. Green CI therefore says nothing about either path — run `ctest` locally before trusting a change.
 
 ## Architecture
 
