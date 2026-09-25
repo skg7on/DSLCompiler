@@ -400,21 +400,33 @@ add_llvm_executable(CacheEviction test/Execution/cache_eviction.cpp)
 target_link_libraries(CacheEviction PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME CacheEviction COMMAND CacheEviction)
 
-# FileCheck tests
-find_program(FILECHECK_BIN FileCheck)
-# llk-opt is built as part of this project; referenced at test time via $<TARGET_FILE>
+# FileCheck tests require llk-opt and must use the FileCheck built alongside
+# the LLVM/MLIR packages consumed by this project. Clear the cached result on
+# every configure so changing LLVM_PROJECT_BUILD_DIR cannot retain FileCheck
+# from an older or unrelated LLVM build.
+if(LLK_BUILD_TOOLS)
+  unset(FILECHECK_BIN CACHE)
+  unset(FILECHECK_BIN)
+  find_program(FILECHECK_BIN NAMES FileCheck
+      HINTS "${LLVM_TOOLS_BINARY_DIR}"
+      NO_DEFAULT_PATH)
+  if(NOT FILECHECK_BIN)
+    message(FATAL_ERROR
+        "FileCheck is required when LLK_BUILD_TOOLS=ON, but it was not found "
+        "in LLVM_TOOLS_BINARY_DIR (${LLVM_TOOLS_BINARY_DIR}). Rebuild LLVM "
+        "with -DLLVM_BUILD_UTILS=ON.")
+  endif()
 
-function(add_llk_filecheck_test test_name input_file)
-    # Use sh -c to properly handle input redirection (CMake's add_test
-    # COMMAND mode does not support < redirection natively).
-    # Execute the RUN line: llk-opt %s | llk-opt | FileCheck %s
-    # This round-trips the IR through llk-opt twice to verify parse+print stability.
-    add_test(NAME ${test_name}
-        COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
-    )
-endfunction()
+  function(add_llk_filecheck_test test_name input_file)
+      # Use sh -c to properly handle input redirection (CMake's add_test
+      # COMMAND mode does not support < redirection natively).
+      # Execute the RUN line: llk-opt %s | llk-opt | FileCheck %s
+      # This round-trips the IR through llk-opt twice to verify parse+print stability.
+      add_test(NAME ${test_name}
+          COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
+      )
+  endfunction()
 
-if(FILECHECK_BIN)
   add_llk_filecheck_test(DialectOps test/Dialect/ops.mlir)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
@@ -422,9 +434,9 @@ if(FILECHECK_BIN)
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
   )
-  # RoPE lowering: verify llk.rope → cos/sin + even/odd interleave
+  # RoPE lowering: verify llk.rope → bounded-fast trig + even/odd interleave
   add_test(NAME RoPELowering
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir"
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir | ${FILECHECK_BIN} --implicit-check-not=math.cos --implicit-check-not=math.sin ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir"
   )
   # Attention lowering: verify llk.attention → Q@K^T + softmax + @V
   add_test(NAME AttentionLowering
@@ -521,9 +533,9 @@ if(FILECHECK_BIN)
   add_test(NAME RoPEVectorShuffle
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir"
   )
-  # RoPE broadcast: verify cos/sin tables broadcast across BxH dimensions
+  # RoPE broadcast: verify trig tables broadcast across BxH dimensions
   add_test(NAME RoPEBroadcast
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir"
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir | ${FILECHECK_BIN} --implicit-check-not=math.cos --implicit-check-not=math.sin ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir"
   )
   # GridToForall: verify tt.get_program_id -> scf.forall lowering
   add_test(NAME GridToForall

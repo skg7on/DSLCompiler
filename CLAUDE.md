@@ -24,7 +24,7 @@ ctest -R MicroDialectTileOps     # Run a single FileCheck test
 ./bin/<TestName>                 # Run a single GTest
 ```
 
-**CI runs almost none of this suite.** It configures with `-DLLK_BUILD_TOOLS=OFF -DLLK_BUILD_E2E_TESTS=OFF`, so the JIT execution tests (`test/Execution/*`, `test/Numerical/*`) are never built. It also builds LLVM with `-DLLVM_INCLUDE_TESTS=OFF`, so no `FileCheck` binary exists, `find_program(FILECHECK_BIN)` fails, and `if(FILECHECK_BIN)` silently registers none of the `.mlir` tests. Green CI therefore says nothing about either path — run `ctest` locally before trusting a change.
+CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned LLVM source, so the full registered suite runs. Local LLVM builds must use `-DLLVM_BUILD_UTILS=ON`; configuration fails when `LLK_BUILD_TOOLS=ON` and a matching `FileCheck` is unavailable. Run `ctest` locally before trusting a change.
 
 ## Architecture
 
@@ -63,7 +63,7 @@ ctest -R MicroDialectTileOps     # Run a single FileCheck test
 - Error handling: MLIR `emitError()` for verifier failures, `llvm::Expected<T>` for JIT ops
 - ABI: C structs (`Tensor2D`, `KernelContext`) — not MLIR memref descriptors
 - TDD: every task starts with a failing test, then minimal code; commit per task
-- FileCheck tests are plain `add_test` entries in the root `CMakeLists.txt` — there is no lit runner, and `// RUN:` lines are comments only. Register new `.mlir` tests by hand: `add_llk_filecheck_test(Name test/Dialect/Micro/foo.mlir)` (~line 407), or a raw `add_test` using `--verify-diagnostics --split-input-file` for invalid-IR tests (~line 600)
+- FileCheck tests are plain `add_test` entries in the root `CMakeLists.txt` — there is no lit runner, and `// RUN:` lines are comments only. Register new `.mlir` tests by hand with `add_llk_filecheck_test(Name test/Dialect/Micro/foo.mlir)`, or use a raw `add_test` with `--verify-diagnostics --split-input-file` for invalid-IR tests
 
 ## Milestone Sequence
 

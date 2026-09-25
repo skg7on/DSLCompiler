@@ -37,12 +37,13 @@ jobs:
           tar xf llvm.tar.xz -C $LLVM_SOURCE --strip-components=1
           rm llvm.tar.xz
 
-      - name: Cache LLVM build
+      - name: Restore LLVM build cache
         id: cache-llvm-build
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.LLVM_BUILD }}
-          key: llvm-build-${{ env.LLVM_VERSION }}-v1
+          key: llvm-build-${{ env.LLVM_VERSION }}-utils-v2
+          restore-keys: llvm-build-${{ env.LLVM_VERSION }}-v1
 
       - name: Build LLVM
         if: steps.cache-llvm-build.outputs.cache-hit != 'true'
@@ -52,6 +53,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS=mlir \
             -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_BUILD_UTILS=ON \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_INCLUDE_DOCS=OFF \
@@ -63,14 +65,21 @@ jobs:
             -DLLVM_ENABLE_ZSTD=OFF
           ninja
 
+      - name: Save LLVM build cache
+        if: steps.cache-llvm-build.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.LLVM_BUILD }}
+          key: ${{ steps.cache-llvm-build.outputs.cache-primary-key }}
+
       - name: Configure project
         run: |
           mkdir -p build && cd build
           cmake .. -G Ninja \
             -DLLVM_PROJECT_BUILD_DIR=$LLVM_BUILD \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLK_BUILD_TOOLS=OFF \
-            -DLLK_BUILD_E2E_TESTS=OFF
+            -DLLK_BUILD_TOOLS=ON \
+            -DLLK_BUILD_E2E_TESTS=ON
 
       - name: Build
         run: cd build && ninja
