@@ -37,9 +37,9 @@ jobs:
           tar xf llvm.tar.xz -C $LLVM_SOURCE --strip-components=1
           rm llvm.tar.xz
 
-      - name: Cache LLVM build
+      - name: Restore LLVM build cache
         id: cache-llvm-build
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.LLVM_BUILD }}
           key: llvm-build-${{ env.LLVM_VERSION }}-utils-v2
@@ -63,6 +63,13 @@ jobs:
             -DLLVM_ENABLE_ZLIB=OFF \
             -DLLVM_ENABLE_ZSTD=OFF
           ninja
+
+      - name: Save LLVM build cache
+        if: steps.cache-llvm-build.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.LLVM_BUILD }}
+          key: ${{ steps.cache-llvm-build.outputs.cache-primary-key }}
 
       - name: Configure project
         run: |

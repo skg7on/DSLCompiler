@@ -1,4 +1,4 @@
-// RUN: llk-opt --llk-to-linalg %s | FileCheck %s
+// RUN: llk-opt --llk-to-linalg %s | FileCheck %s --implicit-check-not=math.cos --implicit-check-not=math.sin
 //
 // Verify that RoPE cos/sin tables are computed as 2D [L, halfD] tensors
 // and broadcast to BxHxLxhalfD via affine maps in linalg.generic ops.
@@ -12,8 +12,10 @@ func.func @rope_broadcast_b2_h4(%x: tensor<2x4x32x64xf32>, %pos: tensor<32xi64>,
       -> tensor<2x4x32x64xf32>
   return %y : tensor<2x4x32x64xf32>
 }
-// CHECK: math.cos
-// CHECK: math.sin
+// CHECK: math.round
+// CHECK: arith.remsi
+// CHECK: math.round
+// CHECK: arith.remsi
 // CHECK: tensor.extract_slice
 // CHECK: linalg.generic
 // CHECK: tensor.insert_slice

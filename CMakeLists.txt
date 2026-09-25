@@ -434,9 +434,9 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
   )
-  # RoPE lowering: verify llk.rope → cos/sin + even/odd interleave
+  # RoPE lowering: verify llk.rope → bounded-fast trig + even/odd interleave
   add_test(NAME RoPELowering
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir"
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir | ${FILECHECK_BIN} --implicit-check-not=math.cos --implicit-check-not=math.sin ${CMAKE_SOURCE_DIR}/test/Conversion/rope_lowering.mlir"
   )
   # Attention lowering: verify llk.attention → Q@K^T + softmax + @V
   add_test(NAME AttentionLowering
@@ -533,9 +533,9 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME RoPEVectorShuffle
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_vector_shuffle.mlir"
   )
-  # RoPE broadcast: verify cos/sin tables broadcast across BxH dimensions
+  # RoPE broadcast: verify trig tables broadcast across BxH dimensions
   add_test(NAME RoPEBroadcast
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir"
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir | ${FILECHECK_BIN} --implicit-check-not=math.cos --implicit-check-not=math.sin ${CMAKE_SOURCE_DIR}/test/Transforms/rope_broadcast.mlir"
   )
   # GridToForall: verify tt.get_program_id -> scf.forall lowering
   add_test(NAME GridToForall
