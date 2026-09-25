@@ -43,6 +43,7 @@ jobs:
         with:
           path: ${{ env.LLVM_BUILD }}
           key: llvm-build-${{ env.LLVM_VERSION }}-utils-v2
+          restore-keys: llvm-build-${{ env.LLVM_VERSION }}-v1
 
       - name: Build LLVM
         if: steps.cache-llvm-build.outputs.cache-hit != 'true'
