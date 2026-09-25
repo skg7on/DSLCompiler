@@ -400,21 +400,33 @@ add_llvm_executable(CacheEviction test/Execution/cache_eviction.cpp)
 target_link_libraries(CacheEviction PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME CacheEviction COMMAND CacheEviction)
 
-# FileCheck tests
-find_program(FILECHECK_BIN FileCheck)
-# llk-opt is built as part of this project; referenced at test time via $<TARGET_FILE>
+# FileCheck tests require llk-opt and must use the FileCheck built alongside
+# the LLVM/MLIR packages consumed by this project. Clear the cached result on
+# every configure so changing LLVM_PROJECT_BUILD_DIR cannot retain FileCheck
+# from an older or unrelated LLVM build.
+if(LLK_BUILD_TOOLS)
+  unset(FILECHECK_BIN CACHE)
+  unset(FILECHECK_BIN)
+  find_program(FILECHECK_BIN NAMES FileCheck
+      HINTS "${LLVM_TOOLS_BINARY_DIR}"
+      NO_DEFAULT_PATH)
+  if(NOT FILECHECK_BIN)
+    message(FATAL_ERROR
+        "FileCheck is required when LLK_BUILD_TOOLS=ON, but it was not found "
+        "in LLVM_TOOLS_BINARY_DIR (${LLVM_TOOLS_BINARY_DIR}). Rebuild LLVM "
+        "with -DLLVM_BUILD_UTILS=ON.")
+  endif()
 
-function(add_llk_filecheck_test test_name input_file)
-    # Use sh -c to properly handle input redirection (CMake's add_test
-    # COMMAND mode does not support < redirection natively).
-    # Execute the RUN line: llk-opt %s | llk-opt | FileCheck %s
-    # This round-trips the IR through llk-opt twice to verify parse+print stability.
-    add_test(NAME ${test_name}
-        COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
-    )
-endfunction()
+  function(add_llk_filecheck_test test_name input_file)
+      # Use sh -c to properly handle input redirection (CMake's add_test
+      # COMMAND mode does not support < redirection natively).
+      # Execute the RUN line: llk-opt %s | llk-opt | FileCheck %s
+      # This round-trips the IR through llk-opt twice to verify parse+print stability.
+      add_test(NAME ${test_name}
+          COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
+      )
+  endfunction()
 
-if(FILECHECK_BIN)
   add_llk_filecheck_test(DialectOps test/Dialect/ops.mlir)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
