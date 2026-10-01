@@ -1,0 +1,115 @@
+# Machine model: Intel x86 CPU with AVX2, the first validation backend.
+#
+# AVX2 is a vector machine, not a systolic array. `worker` maps to thread-pool
+# workers, `lane` to AVX2 lanes, and `vector_engine` to the FMA unit those
+# lanes feed. There are deliberately no `pe`/`pe_group` owners here: modeling
+# SIMD in lanes as processing elements would make every later comparison
+# against a real accelerator lie.
+#
+# The numbers below are calibration seeds, not claims about any SKU. Copy this
+# file and calibrate it for your host before trusting the cycle estimates.
+
+schema_version: 1
+name: x86-avx2-cpu
+description: >-
+  Intel AVX2 CPU validation backend. Thread-parallel worker model with
+  256-bit vector engines and a model load/store DMA path.
+clock_hz: 3000000000
+
+compute:
+  owners:
+    worker:
+      count: 8
+      maps_to: worker_threads
+    lane:
+      count: 8
+      parent: worker
+      maps_to: avx2_lane_group
+    vector_engine:
+      count: 8
+      parent: lane
+      maps_to: avx2-vector
+
+  worker_threads:
+    count: 8
+
+  # AVX2 has no tensor core. This entry models the FMA unit issuing the small
+  # outer-product fragments an AVX2 microkernel is built from.
+  matrix_engines:
+    - name: avx2-fma
+      count: 8
+      owner: vector_engine
+      tile_shapes:
+        - [1, 8, 8]
+        - [4, 8, 8]
+      input_dtypes: [f32, bf16]
+      accumulator_dtypes: [f32]
+      issue_cycles: 1
+      latency_cycles: 5
+      flops_per_cycle: 16
+      supported_layouts: [row_major, vectorized]
+
+  vector_engines:
+    - name: avx2-vector
+      count: 8
+      owner: vector_engine
+      lanes:
+        f32: 8
+        bf16: 16
+        i8: 32
+      issue_cycles: 1
+      latency_cycles: 4
+      supported_layouts: [row_major, vectorized]
+
+memory:
+  dram:
+    capacity_bytes: 68719476736
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+    supported_layouts: [row_major]
+
+  l2:
+    capacity_bytes: 1048576
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    supported_layouts: [row_major, vectorized]
+
+  sram:
+    alias: l1
+    capacity_bytes: 32768
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+    banks: 1
+    supported_layouts: [row_major, vectorized, blocked]
+
+  acc:
+    alias: registers
+    capacity_bytes: 4096
+    bandwidth_bytes_per_cycle: 256
+    latency_cycles: 1
+    banks: 16
+    supported_layouts: [row_major, vectorized]
+
+dma:
+  engines: 1
+  max_outstanding: 1
+  setup_cycles: 0
+  owner: worker
+  maps_to: load_store_units
+  paths:
+    - src: dram
+      dst: l2
+    - src: l2
+      dst: sram
+    - src: dram
+      dst: sram
+    - src: sram
+      dst: acc
+    - src: acc
+      dst: sram
+    - src: sram
+      dst: dram
+
+sync:
+  barrier_cycles: 200
+  wait_cycles: 0
