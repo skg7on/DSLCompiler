@@ -263,7 +263,7 @@ These commands document the intended M9-M13 interface. They become available as 
 ## Tech Stack
 
 - **C++20**, **CMake** >= 3.20
-- **MLIR/LLVM** main branch, aligned with LLVM 20+
+- **MLIR/LLVM** — CI builds against LLVM 22.1.8, local development against LLVM 24 from `main`; code is guarded to build on LLVM 20+
 - **MLIR dialects and passes** for semantic, structured, and Micro-IR lowering
 - **Google Test** for C++ tests
 - **FileCheck** for MLIR IR tests
@@ -287,6 +287,10 @@ ninja check-llk
 ```
 
 When `LLVM_PROJECT_BUILD_DIR` is set, `MLIR_DIR` and `LLVM_DIR` are inferred and system-installed LLVM/MLIR are ignored. If omitted, `find_package` searches the standard CMake prefixes.
+
+Configure emits a compilation database at `build/compile_commands.json` for clangd and other editors; pass `-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF` to turn it off.
+
+The build uses the `clang` found on `PATH`. CMake's own search would pick the Apple toolchain at `/usr/bin/cc` on macOS, so `CMakeLists.txt` selects `clang`/`clang++` from `PATH` explicitly. An absolute `CC`/`CXX` naming a file that does not exist is ignored with a status message instead of aborting the configure — the usual cause is a shell profile exporting a toolchain from `brew --prefix llvm@NN` after that keg has been uninstalled. To switch compilers, delete `build/` and reconfigure: an existing build tree keeps the compiler it cached.
 
 ## Engineering Rules
 
