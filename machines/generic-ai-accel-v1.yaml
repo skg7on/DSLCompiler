@@ -1,0 +1,114 @@
+# Machine model: a generic systolic-array-style AI accelerator.
+#
+# This is the counterpart to x86-avx2-cpu.yaml: it exists to prove the schema
+# expresses an accelerator-shaped owner hierarchy and matrix fragments, so
+# tile programs can be compared across a CPU and an accelerator without
+# changing the IR. It describes a plausible class of machine, not a product.
+
+schema_version: 1
+name: generic-ai-accel-v1
+description: >-
+  Generic AI accelerator with a cluster/core/PE hierarchy, a 16x16x32 MXU,
+  a companion vector unit, and a deep multi-engine DMA path.
+clock_hz: 1000000000
+
+compute:
+  owners:
+    cluster:
+      count: 1
+      maps_to: chiplet
+    core:
+      count: 16
+      parent: cluster
+      maps_to: compute_tiles
+    pe_group:
+      count: 4
+      parent: core
+      maps_to: pe_rows
+    pe:
+      count: 16
+      parent: pe_group
+      maps_to: processing_elements
+    matrix_engine:
+      count: 1
+      parent: pe
+      maps_to: mxu
+    vector_engine:
+      count: 1
+      parent: pe
+      maps_to: vpu
+    dma:
+      count: 1
+      parent: core
+      maps_to: dma_engine
+
+  worker_threads:
+    count: 1
+
+  matrix_engines:
+    - name: mxu
+      count: 16
+      owner: matrix_engine
+      tile_shapes:
+        - [16, 16, 32]
+      input_dtypes: [bf16, f16, i8]
+      accumulator_dtypes: [f32, i32]
+      issue_cycles: 1
+      latency_cycles: 8
+      flops_per_cycle: 512
+      supported_layouts: [row_major, blocked]
+
+  vector_engines:
+    - name: vpu
+      count: 16
+      owner: vector_engine
+      lanes:
+        f32: 64
+        f16: 128
+        i8: 256
+      issue_cycles: 1
+      latency_cycles: 6
+      supported_layouts: [row_major, vectorized, blocked]
+
+memory:
+  dram:
+    capacity_bytes: 68719476736
+    bandwidth_bytes_per_cycle: 1024
+    latency_cycles: 300
+    supported_layouts: [row_major, blocked]
+
+  sram:
+    alias: global_buffer
+    capacity_bytes: 1048576
+    bandwidth_bytes_per_cycle: 4096
+    latency_cycles: 20
+    banks: 32
+    supported_layouts: [row_major, blocked, swizzled]
+
+  acc:
+    alias: accumulator_sram
+    capacity_bytes: 262144
+    bandwidth_bytes_per_cycle: 8192
+    latency_cycles: 1
+    banks: 16
+    supported_layouts: [row_major, blocked]
+
+dma:
+  engines: 4
+  max_outstanding: 16
+  setup_cycles: 16
+  owner: dma
+  maps_to: noc_copy_engine
+  paths:
+    - src: dram
+      dst: sram
+    - src: sram
+      dst: dram
+    - src: sram
+      dst: acc
+    - src: acc
+      dst: sram
+
+sync:
+  barrier_cycles: 64
+  wait_cycles: 4

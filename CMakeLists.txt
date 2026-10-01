@@ -119,6 +119,20 @@ mlir_target_link_libraries(MicroDialect PUBLIC
     MLIRIR MLIRDialect MLIRSupport MLIRArithDialect
 )
 
+# Library: MachineModel + YAML loader (M10 performance evaluation).
+# Deliberately names no MLIR component: the model is plain data plus the micro
+# dialect's vocabulary, which is header-only, so LLKPerf stays out of the
+# MLIR dylib/archive split described below.
+add_library(LLKPerf STATIC
+    lib/Perf/MachineModel.cpp
+    lib/Perf/MachineModelLoader.cpp
+)
+target_include_directories(LLKPerf PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+target_link_libraries(LLKPerf PUBLIC LLVMSupport)
+
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -466,6 +480,14 @@ add_test(NAME JitCacheHit COMMAND JitCacheHit)
 add_llvm_executable(CacheEviction test/Execution/cache_eviction.cpp)
 target_link_libraries(CacheEviction PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME CacheEviction COMMAND CacheEviction)
+
+# The loader test loads the shipped machine files, not just inline fixtures, so
+# the models used for real must parse and verify.
+add_llvm_executable(MachineModelLoaderTest test/Perf/machine_model_loader.cpp)
+target_link_libraries(MachineModelLoaderTest PRIVATE LLKPerf GTest::gtest_main)
+target_compile_definitions(MachineModelLoaderTest PRIVATE
+    LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines")
+add_test(NAME MachineModelLoaderTest COMMAND MachineModelLoaderTest)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
