@@ -515,10 +515,36 @@ TEST(MachineModelLoader, RejectsZeroMemoryCapacity) {
       "capacity_bytes must be positive");
 }
 
+TEST(MachineModelLoader, RejectsNaNMemoryBandwidth) {
+  expectErrorContains(mutate("    bandwidth_bytes_per_cycle: 32",
+                             "    bandwidth_bytes_per_cycle: nan"),
+                      "finite");
+}
+
+TEST(MachineModelLoader, RejectsInfiniteMemoryBandwidth) {
+  expectErrorContains(mutate("    bandwidth_bytes_per_cycle: 32",
+                             "    bandwidth_bytes_per_cycle: inf"),
+                      "finite");
+}
+
+TEST(MachineModelLoader, RejectsNonFiniteFlopsPerCycle) {
+  expectErrorContains(
+      mutate("      flops_per_cycle: 16", "      flops_per_cycle: inf"),
+      "finite");
+}
+
+TEST(MachineModelLoader, RejectsNonFiniteCopyPathBandwidth) {
+  expectErrorContains(mutate("    - src: dram\n      dst: sram",
+                             "    - src: dram\n      dst: sram\n"
+                             "      bandwidth_bytes_per_cycle: nan"),
+                      "finite");
+}
+
 TEST(MachineModelLoader, RejectsNonPositiveBandwidth) {
   expectErrorContains(mutate("    bandwidth_bytes_per_cycle: 32",
                              "    bandwidth_bytes_per_cycle: 0"),
-                      "bandwidth_bytes_per_cycle must be positive");
+                      "bandwidth_bytes_per_cycle must be a finite positive "
+                      "number");
 }
 
 TEST(MachineModelLoader, RejectsNonPositiveMemoryLatency) {
@@ -597,10 +623,31 @@ TEST(MachineModelLoader, WorkerThreadsIsIndependentOfWorkerOwnerCount) {
 // Diagnostics
 //===----------------------------------------------------------------------===//
 
-TEST(MachineModelLoader, DiagnosticCarriesSourceLocation) {
+TEST(MachineModelLoader, ValueDiagnosticNamesSourceAndSchemaPath) {
+  // Verify runs on the typed model, where the parser's positions are gone, so
+  // this diagnostic identifies the field by its schema path instead.
   std::string message =
       loadError(mutate("clock_hz: 1000000000", "clock_hz: 0"));
-  EXPECT_NE(message.find("test-machine.yaml"), std::string::npos) << message;
+  EXPECT_NE(message.find("test-machine.yaml: error: clock_hz"),
+            std::string::npos)
+      << message;
+}
+
+TEST(MachineModelLoader, DiagnosticCarriesSourceLocation) {
+  std::string yaml =
+      mutate("clock_hz: 1000000000", "clock_hz: 1000000000\nclock_rate_hz: 3");
+  size_t offset = yaml.find("clock_rate_hz");
+  ASSERT_NE(offset, std::string::npos);
+
+  unsigned line = 1;
+  for (size_t i = 0; i < offset; ++i)
+    if (yaml[i] == '\n')
+      ++line;
+
+  std::string message = loadError(yaml);
+  EXPECT_NE(message.find("test-machine.yaml:" + std::to_string(line) + ":"),
+            std::string::npos)
+      << message;
 }
 
 TEST(MachineModelLoader, ReportsUnreadableFile) {
@@ -609,6 +656,17 @@ TEST(MachineModelLoader, ReportsUnreadableFile) {
   std::string message = llvm::toString(model.takeError());
   EXPECT_NE(message.find("/nonexistent/machines/nope.yaml"), std::string::npos)
       << message;
+}
+
+TEST(MachineModelLoader, RejectsASecondDocument) {
+  // Concatenating two machine files would otherwise load the first silently.
+  expectErrorContains(kValidYaml + "\n---\nschema_version: 1\n",
+                      "expected a single YAML document");
+}
+
+TEST(MachineModelLoader, RejectsAnAliasShadowingAnotherResource) {
+  expectErrorContains(mutate("    alias: l1", "    alias: test-mxu"),
+                      "duplicate resource name");
 }
 
 TEST(MachineModelLoader, ReportsMalformedYaml) {

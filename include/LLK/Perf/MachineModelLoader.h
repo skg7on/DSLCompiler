@@ -7,10 +7,14 @@
 // hand-built model and a parsed one are held to the same rules.
 //
 // Every failure returns the first diagnostic found, prefixed with the source
-// name and, where the YAML parser knows one, a `line:column` location:
+// name. A failure found while reading the document also carries the parser's
+// location; a value rejected afterwards names the schema path instead, because
+// the parser's positions are gone by then:
 //
 //   machines/x86-avx2-cpu.yaml:14:5: error: compute.matrix_engines[0]: \
 //       unknown key 'tile_shape'
+//   machines/x86-avx2-cpu.yaml: error: memory['sram'].capacity_bytes must be \
+//       positive
 //
 //===----------------------------------------------------------------------===//
 

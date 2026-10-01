@@ -21,6 +21,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 
+#include <cmath>
 #include <string>
 
 using namespace llvm;
@@ -217,8 +218,12 @@ Error verifyMachineModel(const MachineModel &model) {
     if (Error err = verifyDTypeList(engine.accumulatorDTypes,
                                     path + ".accumulator_dtypes"))
       return err;
-    if (engine.flopsPerCycle && *engine.flopsPerCycle <= 0)
-      return invalid(path + ".flops_per_cycle must be positive");
+    // A NaN or infinite throughput passes `<= 0` and then poisons every cycle
+    // estimate built on it, so it is rejected as hard as a negative one.
+    if (engine.flopsPerCycle &&
+        (!std::isfinite(*engine.flopsPerCycle) || *engine.flopsPerCycle <= 0))
+      return invalid(path + ".flops_per_cycle must be a finite positive "
+                            "number");
     if (Error err = verifyLayoutList(engine.supportedLayouts,
                                      path + ".supported_layouts"))
       return err;
@@ -270,8 +275,10 @@ Error verifyMachineModel(const MachineModel &model) {
       return err;
     if (level.capacityBytes == 0)
       return invalid(path + ".capacity_bytes must be positive");
-    if (level.bandwidthBytesPerCycle <= 0)
-      return invalid(path + ".bandwidth_bytes_per_cycle must be positive");
+    if (!std::isfinite(level.bandwidthBytesPerCycle) ||
+        level.bandwidthBytesPerCycle <= 0)
+      return invalid(
+          path + ".bandwidth_bytes_per_cycle must be a finite positive number");
     if (level.latencyCycles == 0)
       return invalid(path + ".latency_cycles must be positive");
     if (level.banks && *level.banks == 0)
@@ -294,6 +301,10 @@ Error verifyMachineModel(const MachineModel &model) {
     if (model.memory.count(alias))
       return invalid("memory['" + levelName + "'].alias '" + alias +
                      "' conflicts with memory level '" + alias + "'");
+    // An alias names the same resource as its level, so it belongs to the
+    // shared namespace too.
+    if (Error err = names.claim(alias, "memory['" + levelName + "'].alias"))
+      return err;
   }
 
   // --- DMA ----------------------------------------------------------------
@@ -321,8 +332,12 @@ Error verifyMachineModel(const MachineModel &model) {
     if (path.source == path.destination)
       return invalid(location + ": source and destination must differ, both '" +
                      path.source + "'");
-    if (path.bandwidthBytesPerCycle && *path.bandwidthBytesPerCycle <= 0)
-      return invalid(location + ".bandwidth_bytes_per_cycle must be positive");
+    if (path.bandwidthBytesPerCycle &&
+        (!std::isfinite(*path.bandwidthBytesPerCycle) ||
+         *path.bandwidthBytesPerCycle <= 0))
+      return invalid(location +
+                     ".bandwidth_bytes_per_cycle must be a finite positive "
+                     "number");
     if (path.latencyCycles && *path.latencyCycles == 0)
       return invalid(location + ".latency_cycles must be positive");
     if (!seenPaths.insert(path.source + " -> " + path.destination).second)

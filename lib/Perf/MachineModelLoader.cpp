@@ -800,9 +800,18 @@ Expected<MachineModel> Loader::load(StringRef yamlText) {
   }
 
   // The scanner is lazy: a syntax error anywhere in the document can surface
-  // during the walk rather than at the first token.
+  // during the walk rather than at the first token. Advancing the document
+  // iterator also finishes the document, which sweeps up anything left after
+  // the last key the walker read.
+  ++document;
   if (!capture.text.empty()) {
     error_ = capture.text;
+    return takeError();
+  }
+  if (document != stream.end()) {
+    error_ = (source_ + ": error: expected a single YAML document, found a "
+                        "second one")
+                 .str();
     return takeError();
   }
 
