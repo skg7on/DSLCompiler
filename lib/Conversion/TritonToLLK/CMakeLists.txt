@@ -6,7 +6,9 @@ add_mlir_library(TritonToLLKPasses
   SharedMemToScratch.cpp
   AtomicToLLRT.cpp
 
-  LINK_LIBS PUBLIC
+)
+
+mlir_target_link_libraries(TritonToLLKPasses PUBLIC
   MLIRIR
   MLIRPass
   MLIRSCFDialect

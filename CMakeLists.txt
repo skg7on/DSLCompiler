@@ -69,13 +69,22 @@ set(LLVM_TARGET_DEFINITIONS include/LLK/Transforms/Passes.td)
 mlir_tablegen(include/LLK/Transforms/Passes.h.inc -gen-pass-decls -name=LLK)
 add_public_tablegen_target(LLKTransformsGen)
 
+# Link MLIR dependencies through mlir_target_link_libraries() instead of
+# naming MLIR components in LINK_LIBS. add_mlir_library() passes LINK_LIBS
+# straight to llvm_add_library(), so those component archives reach the link
+# interface of every consumer and put a second copy of MLIR next to the dylib
+# (see the LLK_MLIR_EXEC_LIBS comment below for why that breaks verifiers).
+# mlir_target_link_libraries() substitutes the dylib when it exists and the
+# component archives otherwise, so it is correct for both configurations.
+
 # Library: LLK dialect
 add_mlir_dialect_library(LLKDialect
     lib/Dialect/LLK/LLKDialect.cpp
     lib/Dialect/LLK/LLKOps.cpp
     DEPENDS LLKDialectGen LLKOpsGen
-    LINK_LIBS PUBLIC MLIRIR MLIRDialect MLIRSupport MLIRArithDialect
-                     MLIRTensorDialect
+)
+mlir_target_link_libraries(LLKDialect PUBLIC
+    MLIRIR MLIRDialect MLIRSupport MLIRArithDialect MLIRTensorDialect
 )
 
 # TableGen for Micro dialect
@@ -105,15 +114,20 @@ add_mlir_dialect_library(MicroDialect
     lib/Dialect/Micro/MicroDialect.cpp
     lib/Dialect/Micro/MicroOps.cpp
     DEPENDS MicroDialectGen MicroTypesGen MicroOpsGen
-    LINK_LIBS PUBLIC MLIRIR MLIRDialect MLIRSupport MLIRArithDialect
+)
+mlir_target_link_libraries(MicroDialect PUBLIC
+    MLIRIR MLIRDialect MLIRSupport MLIRArithDialect
 )
 
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
     DEPENDS LLKDialect LLKCommon
-    LINK_LIBS PUBLIC LLKDialect LLKCommon MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
-                     MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
+    LINK_LIBS PUBLIC LLKDialect LLKCommon
+)
+mlir_target_link_libraries(LLKToLinalg PUBLIC
+    MLIRLinalgDialect MLIRArithDialect MLIRMathDialect MLIRFuncDialect
+    MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
 # Library: JIT cache runtime + weight packing
@@ -132,7 +146,11 @@ target_include_directories(LLKRuntime PUBLIC
 # On AArch64 → LLVMAArch64{CodeGen,Info,Desc,AsmParser,AsmPrinter,Disassembler}
 llvm_map_components_to_libnames(LLVM_NATIVE_TARGET_LIBS native)
 target_link_libraries(LLKRuntime PUBLIC
-    LLVMOrcJIT MLIRExecutionEngine
+    LLVMOrcJIT
+    ${LLVM_NATIVE_TARGET_LIBS}
+)
+mlir_target_link_libraries(LLKRuntime PUBLIC
+    MLIRExecutionEngine
     MLIRArithToLLVM
     MLIRControlFlowToLLVM
     MLIRFuncToLLVM
@@ -141,7 +159,6 @@ target_link_libraries(LLKRuntime PUBLIC
     MLIRReconcileUnrealizedCasts
     MLIRSCFToControlFlow
     MLIRVectorToLLVMPass
-    ${LLVM_NATIVE_TARGET_LIBS}
 )
 
 # Library: X86 target feature detection
@@ -168,77 +185,100 @@ add_mlir_library(LLKCommon
     lib/Transforms/Common/MaskGeneration.cpp
     lib/Transforms/Common/MathApproximation.cpp
     DEPENDS LLKDialect
-    LINK_LIBS PUBLIC MLIRArithDialect MLIRMathDialect MLIRVectorDialect MLIRPass
+)
+mlir_target_link_libraries(LLKCommon PUBLIC
+    MLIRArithDialect MLIRMathDialect MLIRVectorDialect MLIRPass
 )
 
 # Library: LLK Transforms (TileAndVectorize)
 add_mlir_library(LLKTransforms
     lib/Transforms/TileAndVectorize.cpp
     DEPENDS LLKDialect LLKToLinalg LLKTransformsGen
-    LINK_LIBS PUBLIC LLKToLinalg MLIRLinalgDialect MLIRLinalgTransforms
-                     MLIRVectorDialect MLIRSCFDialect MLIRSCFTransforms
-                     MLIRFuncDialect MLIRTensorDialect MLIRArithDialect MLIRPass
+    LINK_LIBS PUBLIC LLKToLinalg
+)
+mlir_target_link_libraries(LLKTransforms PUBLIC
+    MLIRLinalgDialect MLIRLinalgTransforms MLIRVectorDialect MLIRSCFDialect
+    MLIRSCFTransforms MLIRFuncDialect MLIRTensorDialect MLIRArithDialect MLIRPass
 )
 
 # Library: FuseDoubleContraction
 add_mlir_library(LLKFuseDoubleContraction
     lib/Transforms/FuseDoubleContraction.cpp
     DEPENDS LLKDialect LLKToLinalg
-    LINK_LIBS PUBLIC LLKToLinalg MLIRLinalgDialect MLIRArithDialect MLIRMathDialect
-                     MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
+    LINK_LIBS PUBLIC LLKToLinalg
+)
+mlir_target_link_libraries(LLKFuseDoubleContraction PUBLIC
+    MLIRLinalgDialect MLIRArithDialect MLIRMathDialect MLIRFuncDialect
+    MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
 # Library: PackWeights weight annotation pass
 add_mlir_library(LLKPackWeights
     lib/Transforms/PackWeights.cpp
     DEPENDS LLKDialect
-    LINK_LIBS PUBLIC MLIRLinalgDialect MLIRFuncDialect MLIRTensorDialect MLIRPass
+)
+mlir_target_link_libraries(LLKPackWeights PUBLIC
+    MLIRLinalgDialect MLIRFuncDialect MLIRTensorDialect MLIRPass
 )
 
 # Library: ScratchAnalysis memory auditing pass
 add_mlir_library(LLKScratchAnalysis
     lib/Transforms/ScratchAnalysis.cpp
-    LINK_LIBS PUBLIC MLIRMemRefDialect MLIRFuncDialect MLIRPass
+)
+mlir_target_link_libraries(LLKScratchAnalysis PUBLIC
+    MLIRMemRefDialect MLIRFuncDialect MLIRPass
 )
 
 # Library: LinearizeForall pass
 add_mlir_library(LLKLinearizeForall
     lib/Transforms/LinearizeForall.cpp
     DEPENDS LLKDialect
-    LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRTensorDialect MLIRPass
+)
+mlir_target_link_libraries(LLKLinearizeForall PUBLIC
+    MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRTensorDialect MLIRPass
 )
 
 # Library: SerialParallelDispatch pass
 add_mlir_library(LLKSerialParallelDispatch
     lib/Transforms/SerialParallelDispatch.cpp
-    LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRPass
+)
+mlir_target_link_libraries(LLKSerialParallelDispatch PUBLIC
+    MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRPass
 )
 
 # Library: ForallToLLRT pass
 add_mlir_library(LLKForallToLLRT
     lib/Transforms/ForallToLLRT.cpp
-    LINK_LIBS PUBLIC MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRPass
+)
+mlir_target_link_libraries(LLKForallToLLRT PUBLIC
+    MLIRSCFDialect MLIRArithDialect MLIRFuncDialect MLIRPass
 )
 
 # Library: ForallToOpenMP pass (prototype)
 add_mlir_library(LLKForallToOpenMP
     lib/Transforms/ForallToOpenMP.cpp
     DEPENDS LLKTransformsGen
-    LINK_LIBS PUBLIC MLIRSCFDialect MLIRSCFTransforms MLIRSCFToOpenMP MLIROpenMPDialect MLIRPass
+)
+mlir_target_link_libraries(LLKForallToOpenMP PUBLIC
+    MLIRSCFDialect MLIRSCFTransforms MLIRSCFToOpenMP MLIROpenMPDialect MLIRPass
 )
 
 # Library: ShapeSpecialization pass
 add_mlir_library(LLKShapeSpecialization
     lib/Transforms/ShapeSpecialization.cpp
     DEPENDS LLKDialect
-    LINK_LIBS PUBLIC MLIRFuncDialect MLIRPass
+)
+mlir_target_link_libraries(LLKShapeSpecialization PUBLIC
+    MLIRFuncDialect MLIRPass
 )
 
 # Library: ScheduleSelection pass
 add_mlir_library(LLKScheduleSelection
     lib/Transforms/ScheduleSelection.cpp
     DEPENDS LLKDialect
-    LINK_LIBS PUBLIC MLIRFuncDialect MLIRPass
+)
+mlir_target_link_libraries(LLKScheduleSelection PUBLIC
+    MLIRFuncDialect MLIRPass
 )
 
 # Library: TritonToLLK lowering passes
