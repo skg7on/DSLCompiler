@@ -17,14 +17,15 @@ mkdir -p build && cd build
 cmake .. -G Ninja -DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build
 ninja                            # Build all targets
 ninja llk-opt                    # Build IR tool only
-ctest --output-on-failure        # Run all tests (CTest; there is no check-llk target)
+ninja check-llk                  # Build the test binaries + run the whole suite
+ctest --output-on-failure        # Same suite, without building first
 ctest -R MicroDialectTileOps     # Run a single FileCheck test
-./bin/llk-opt input.mlir         # Parse + print IR
-./bin/llk-opt --llk-to-linalg input.mlir  # Run a specific pass
-./bin/<TestName>                 # Run a single GTest
+./llk-opt input.mlir             # Parse + print IR
+./llk-opt --llk-to-linalg input.mlir  # Run a specific pass
+./<TestName>                     # Run a single GTest
 ```
 
-CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned LLVM source, so the full registered suite runs. Local LLVM builds must use `-DLLVM_BUILD_UTILS=ON`; configuration fails when `LLK_BUILD_TOOLS=ON` and a matching `FileCheck` is unavailable. Run `ctest` locally before trusting a change.
+CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned LLVM source, so the full registered suite runs. Local LLVM builds must use `-DLLVM_BUILD_UTILS=ON`; configuration fails when `LLK_BUILD_TOOLS=ON` and a matching `FileCheck` is unavailable. `check-llk` is a thin wrapper over CTest, so it runs exactly the registered suite — run it locally before trusting a change.
 
 ## Architecture
 
