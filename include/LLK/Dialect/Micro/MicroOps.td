@@ -447,4 +447,142 @@ def Micro_StoreOp : Micro_Op<"store"> {
     let hasVerifier = 1;
 }
 
+//===----------------------------------------------------------------------===//
+// micro.search_space — container for legal schedule choices
+//===----------------------------------------------------------------------===//
+
+def Micro_SearchSpaceOp : Micro_Op<"search_space", [
+    IsolatedFromAbove,
+    SingleBlockImplicitTerminator<"YieldOp">
+]> {
+    let summary = "Top-level container for legal schedule choices";
+    let description = [{
+        Holds the search-space metadata an auto-scheduler consumes: tunable
+        parameters, legality constraints, ranking objectives, and candidate
+        bindings. Concrete execution ops are not allowed in the body.
+
+        Candidate bindings are named assignments of the declared parameters,
+        and are symbols so that later stages can refer to a specific candidate.
+    }];
+
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        StrAttr:$workload
+    );
+
+    let regions = (region SizedRegion<1>:$body);
+
+    let assemblyFormat = [{
+        $sym_name attr-dict-with-keyword $body
+    }];
+
+    let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.param — one tunable search parameter
+//===----------------------------------------------------------------------===//
+
+def Micro_ParamOp : Micro_Op<"param"> {
+    let summary = "Declare one tunable search parameter";
+    let description = [{
+        Declares a named parameter and its legal values. The kind names the
+        domain so that verifiers do not have to infer semantics from the
+        parameter name:
+
+          integer        positive integers, strictly increasing
+          layout         a Micro layout kind
+          memory_path    colon-separated memory spaces, e.g. dram:sram:acc
+          owner_mapping  slash-separated owners, e.g. worker/vector_engine
+          fragment_shape MxNxK instruction fragment, e.g. 16x16x32
+          tail_policy    mask only in the MVP
+
+        Parameters are lexically scoped to their micro.search_space and are
+        referred to by name, not bound to SSA values.
+    }];
+
+    let arguments = (ins
+        StrAttr:$name,
+        StrAttr:$kind,
+        ArrayAttr:$choices
+    );
+
+    let assemblyFormat = "$name attr-dict";
+
+    let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.constraint — one typed legality record
+//===----------------------------------------------------------------------===//
+
+def Micro_ConstraintOp : Micro_Op<"constraint"> {
+    let summary = "Declare one typed legality constraint";
+    let description = [{
+        Records that a set of search parameters must satisfy a named legality
+        rule. This is a typed record, not a free-form expression language:
+        machine-aware evaluation of capacity, MMA compatibility, and the like
+        belongs to the MachineModel and tuning stages.
+
+        The kind is one of sram_capacity, acc_capacity, mma_compatible,
+        mapping_extent, tail_supported, vector_width_supported,
+        tile_hierarchy_compatible, layout_supported, owner_supported,
+        fragment_compatible, or pipeline_live_tiles.
+    }];
+
+    let arguments = (ins
+        StrAttr:$kind,
+        ArrayAttr:$params
+    );
+
+    let assemblyFormat = "$kind attr-dict";
+
+    let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.objective — ranking objective for candidate search
+//===----------------------------------------------------------------------===//
+
+def Micro_ObjectiveOp : Micro_Op<"objective"> {
+    let summary = "Ranking objective for candidate search";
+    let description = [{
+        Names the metric candidates are ranked by, the direction to optimize
+        it in, and optional secondary metrics used as tie-breakers in the
+        order given.
+    }];
+
+    let arguments = (ins
+        StrAttr:$direction,
+        StrAttr:$metric,
+        OptionalAttr<ArrayAttr>:$secondary
+    );
+
+    let assemblyFormat = "attr-dict";
+
+    let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.candidate — one parameter binding
+//===----------------------------------------------------------------------===//
+
+def Micro_CandidateOp : Micro_Op<"candidate"> {
+    let summary = "Bind every search parameter to one selected value";
+    let description = [{
+        A candidate is a named assignment of every parameter declared in the
+        enclosing micro.search_space. Binding a candidate to a concrete
+        micro.kernel happens in the tuning stage, not here.
+    }];
+
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        DictionaryAttr:$bindings
+    );
+
+    let assemblyFormat = "$sym_name attr-dict";
+
+    let hasVerifier = 1;
+}
+
 #endif

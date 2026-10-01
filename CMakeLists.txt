@@ -470,6 +470,7 @@ if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(DialectOps test/Dialect/ops.mlir)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
+  add_llk_filecheck_test(MicroDialectSearchSpace test/Dialect/Micro/search_space.mlir)
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
@@ -671,6 +672,10 @@ add_test(NAME MicroDialectOpsInvalid
 add_test(NAME MicroDialectTileOpsInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
             ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/tile_ops_invalid.mlir
+)
+add_test(NAME MicroDialectSearchSpaceInvalid
+    COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+            ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/search_space_invalid.mlir
 )
 # ScratchAnalysis test: verify-diagnostics validates expected-warning comments
 add_test(NAME ScratchAnalysis
