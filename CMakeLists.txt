@@ -161,6 +161,33 @@ mlir_target_link_libraries(LLKRuntime PUBLIC
     MLIRVectorToLLVMPass
 )
 
+# find_package(ZLIB) and find_package(LibEdit) run from LLVMConfig.cmake resolve
+# to the macOS SDK, and CMake propagates their include directories as *system*
+# includes onto every target that links LLVM. <sdk>/usr/include is already
+# searched implicitly through the sysroot, but as an explicit -isystem it sorts
+# ahead of the C++ standard library's own headers. Apple's clang ships libc++
+# inside that SDK so it is unaffected; any other clang on macOS fails to build
+# LLKRuntime, the only target linking LLVM libraries directly, with
+#   <cstdint> tried including <stdint.h> but didn't find libc++'s <stdint.h>
+# Drop just those SDK roots so the include order stays valid for both.
+foreach(_llk_sysdep IN ITEMS ZLIB::ZLIB LibEdit::LibEdit)
+  if(NOT TARGET ${_llk_sysdep})
+    continue()
+  endif()
+  get_target_property(_llk_sysdep_inc ${_llk_sysdep} INTERFACE_INCLUDE_DIRECTORIES)
+  if(NOT _llk_sysdep_inc)
+    continue()
+  endif()
+  set(_llk_sysdep_kept "")
+  foreach(_llk_sysdep_dir IN LISTS _llk_sysdep_inc)
+    if(NOT _llk_sysdep_dir MATCHES "^/.*\\.sdk/usr/include$")
+      list(APPEND _llk_sysdep_kept ${_llk_sysdep_dir})
+    endif()
+  endforeach()
+  set_property(TARGET ${_llk_sysdep}
+               PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${_llk_sysdep_kept}")
+endforeach()
+
 # Library: X86 target feature detection
 add_library(LLKTargetX86 STATIC
     lib/Target/X86/TargetAVX2.cpp
@@ -683,3 +710,31 @@ add_test(NAME ScratchAnalysis
             ${CMAKE_SOURCE_DIR}/test/Transforms/scratch_analysis.mlir
 )
 endif()
+
+# The canonical local test command, as documented in README.md. It is defined
+# once, over the CTest registry, so `check-llk`, `ctest`, and CI cannot drift
+# apart. Test binaries are derived from the registry rather than listed by
+# hand: every test whose name is also a build target is built first, and
+# llk-opt covers the FileCheck and verifier tests.
+get_property(_llk_test_names DIRECTORY PROPERTY TESTS)
+set(_llk_check_deps "")
+foreach(_llk_test_name IN LISTS _llk_test_names)
+  if(TARGET ${_llk_test_name})
+    list(APPEND _llk_check_deps ${_llk_test_name})
+  endif()
+  # A gtest that calls GTEST_SKIP still exits 0, so CTest would otherwise
+  # report an unsupported host as a pass. Match gtest's skip banner so the
+  # summary separates skipped from executed tests.
+  set_tests_properties(${_llk_test_name}
+                       PROPERTIES SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
+endforeach()
+if(TARGET llk-opt)
+  list(APPEND _llk_check_deps llk-opt)
+endif()
+
+add_custom_target(check-llk
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS ${_llk_check_deps}
+    USES_TERMINAL
+    COMMENT "Running the LLK test suite"
+)
