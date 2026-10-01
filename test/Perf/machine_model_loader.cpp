@@ -443,6 +443,11 @@ TEST(MachineModelLoader, RejectsNonPositiveTileShape) {
                       "must be positive");
 }
 
+TEST(MachineModelLoader, RejectsOverLongTileShape) {
+  expectErrorContains(mutate("        - [4, 8, 8]", "        - [4, 8, 8, 1]"),
+                      "exactly 3 dimensions, got 4");
+}
+
 TEST(MachineModelLoader, RejectsUnknownLayout) {
   expectErrorContains(mutate("[row_major, blocked]", "[row_major, zigzag]"),
                       "unknown layout 'zigzag'");
@@ -530,6 +535,12 @@ TEST(MachineModelLoader, RejectsUnknownMemorySpace) {
 TEST(MachineModelLoader, RejectsAliasCollidingWithLevelName) {
   expectErrorContains(mutate("    alias: l1", "    alias: dram"),
                       "conflicts with memory level");
+}
+
+TEST(MachineModelLoader, RejectsTwoLevelsSharingAnAlias) {
+  expectErrorContains(mutate("    capacity_bytes: 1024",
+                             "    alias: l1\n    capacity_bytes: 1024"),
+                      "already used by memory level");
 }
 
 TEST(MachineModelLoader, RejectsDuplicateCopyPath) {

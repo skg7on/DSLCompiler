@@ -249,19 +249,20 @@ bool Loader::readTileShapes(Node *node, const Twine &path,
                                                 "integers"));
 
     std::array<int64_t, 3> dimensions{0, 0, 0};
-    size_t dimension = 0;
+    size_t found = 0;
     for (auto &value : *shape) {
-      if (dimension >= dimensions.size())
-        break;
-      if (!readInt64(&value, shapePath + "[" + Twine(dimension) + "]",
-                     dimensions[dimension]))
+      // Count every dimension so an over-long shape is reported with its real
+      // width, but only read the first three.
+      if (found < dimensions.size() &&
+          !readInt64(&value, shapePath + "[" + Twine(found) + "]",
+                     dimensions[found]))
         return false;
-      ++dimension;
+      ++found;
     }
-    if (dimension != dimensions.size())
+    if (found != dimensions.size())
       return failAt(&element,
                     Twine(shapePath + " must have exactly 3 dimensions, got ") +
-                        Twine(dimension));
+                        Twine(found));
     out.push_back(dimensions);
   }
   return true;
