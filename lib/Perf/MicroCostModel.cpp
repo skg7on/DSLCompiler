@@ -73,23 +73,19 @@ uint32_t totalSlots(const EngineRange &engines) {
   return std::max<uint32_t>(1, total);
 }
 
-/// How many of these events can run at once. An event that names no engine runs
-/// on the class as a whole, which is what an op without an `engine` attribute
-/// asks for; a named one is confined to that engine's own slots.
+/// How many of these events can run at once. Each engine name is a separate
+/// pool, so two events that name the same engine share its slots rather than
+/// each getting the whole machine.
 uint32_t resourceSlots(const MicroEvent &event, const MachineModel &machine) {
   switch (event.resource) {
   case ResourceKind::Dma:
     return std::max<uint32_t>(1, machine.dma.engines);
   case ResourceKind::MatrixEngine: {
-    if (event.resourceName.empty())
-      return totalSlots(machine.matrixEngines);
     const MatrixEngineModel *engine =
         machine.findMatrixEngine(event.resourceName);
     return std::max<uint32_t>(1, engine ? engine->count : 1);
   }
   case ResourceKind::VectorEngine: {
-    if (event.resourceName.empty())
-      return totalSlots(machine.vectorEngines);
     const VectorEngineModel *engine =
         machine.findVectorEngine(event.resourceName);
     return std::max<uint32_t>(1, engine ? engine->count : 1);
@@ -282,8 +278,9 @@ L1Report scheduleL1(const MicroDAG &dag, const MachineModel &machine) {
     ResourcePool &pool = poolFor(key, resourceSlots(event, machine));
 
     ResourcePool *ownerPool = nullptr;
+    std::string ownerKey;
     if (!event.tileOwner.empty()) {
-      std::string ownerKey = "owner/" + event.tileOwner;
+      ownerKey = "owner/" + event.tileOwner;
       uint32_t slots =
           std::max<uint32_t>(1, machine.getOwnerCount(event.tileOwner));
       ownerSlots.emplace(ownerKey, slots);
@@ -309,9 +306,14 @@ L1Report scheduleL1(const MicroDAG &dag, const MachineModel &machine) {
     start[id] = begin;
     finish[id] = begin + event.minCycles;
     pool.acquire(begin, event.minCycles);
-    if (ownerPool)
-      ownerPool->acquire(begin, event.minCycles);
     busy[key] += event.minCycles;
+    if (ownerPool) {
+      ownerPool->acquire(begin, event.minCycles);
+      // Owner occupancy is utilization like any other, and a schedule that runs
+      // out of owners is a different bottleneck than one that runs out of
+      // engines. It only shows up if the owner's busy cycles are recorded too.
+      busy[ownerKey] += event.minCycles;
+    }
 
     for (uint32_t dependent : dependents[id])
       if (--remaining[dependent] == 0) {

@@ -126,6 +126,9 @@ private:
   /// its tiles however many times the loop runs.
   void noteStorage(mlir::Operation &op, llvm::StringRef space, uint64_t bytes,
                    uint64_t storageFactor);
+  /// Complains when a value's byte count cannot be computed, so the zero it is
+  /// charged is never mistaken for a real measurement.
+  void noteUnsizable(const TileInfo &info, mlir::Operation &op);
 
   /// Cost helpers, all answered by the machine model.
   uint64_t copyCycles(llvm::StringRef src, llvm::StringRef dst,
@@ -198,6 +201,22 @@ void DAGBuilder::noteLayoutUsage(llvm::StringRef engineName,
                         "' (supported: " + llvm::join(supported, ", ") + ")";
   if (seenWarnings.insert(message).second)
     dag.layoutWarnings.push_back(std::move(message));
+}
+
+void DAGBuilder::noteUnsizable(const TileInfo &info, mlir::Operation &op) {
+  // A value whose byte count this model cannot compute is charged as zero
+  // rather than given an invented size -- but never quietly. Two ways to get
+  // there: an extent that is dynamic, and an element type outside the micro
+  // dtype vocabulary, which an f64 load would otherwise move for free.
+  llvm::StringRef opName = op.getName().getStringRef();
+  if (info.hasDynamicShape())
+    noteWarning(opName.str() +
+                " moves or allocates a value with a dynamic extent; its bytes "
+                "are charged as zero");
+  else if (info.elements() > 0 && info.bytes() == 0)
+    noteWarning(opName.str() +
+                " moves or allocates a value whose element type is not a micro "
+                "dtype; its bytes are charged as zero");
 }
 
 void DAGBuilder::noteStorage(mlir::Operation &op, llvm::StringRef space,
@@ -610,9 +629,11 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     MicroEvent event;
     event.kind = EventKind::Mma;
     event.resource = ResourceKind::MatrixEngine;
-    // An op that names no engine asks for the class as a whole, so the whole
-    // pool is available to it; naming one confines it to that engine's slots.
-    event.resourceName = requested.str();
+    // An op that names no engine runs on the first engine of its class; one
+    // that names an engine runs there. Either way the event names a single
+    // pool, so two events naming the same engine share its slots instead of
+    // each being handed the whole machine.
+    event.resourceName = engine->name;
     event.workItems = macs;
     event.minCycles = mmaCycles(*engine, shape, 2 * macs);
     event.sourceOpName = op.getName().getStringRef().str();
@@ -640,7 +661,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     MicroEvent event;
     event.kind = EventKind::Vector;
     event.resource = ResourceKind::VectorEngine;
-    // No op names a vector engine, so these ask for the class as a whole.
+    event.resourceName = engine->name;
     event.workItems = resultInfo.elements();
     event.minCycles =
         vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
@@ -668,6 +689,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     MicroEvent event;
     event.kind = EventKind::Reduce;
     event.resource = ResourceKind::VectorEngine;
+    event.resourceName = engine->name;
     event.workItems = inputInfo.elements();
     event.minCycles =
         vectorCycles(engine, inputInfo.dtype, inputInfo.elements());
@@ -731,6 +753,7 @@ llvm::Error DAGBuilder::buildLogicalTileOp(
   MicroEvent event;
   event.kind = kind;
   event.resource = ResourceKind::VectorEngine;
+  event.resourceName = engine->name;
   event.workItems = resultInfo.elements();
   event.bytes = resultInfo.bytes();
   event.minCycles =
@@ -765,10 +788,8 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
 
   const TileInfo &shapeInfo = resultInfo.elements() ? resultInfo : sourceInfo;
   uint64_t bytes = shapeInfo.bytes();
-  if (shapeInfo.hasDynamicShape())
-    noteWarning(op.getName().getStringRef().str() +
-                " moves a tile with a dynamic extent; its bytes are charged as "
-                "zero");
+  noteUnsizable(sourceInfo, op);
+  noteUnsizable(resultInfo, op);
 
   MicroEvent event;
   event.kind = kind;
@@ -799,10 +820,8 @@ llvm::Error DAGBuilder::noteAllocation(mlir::Operation &op,
                                        const TileInfo &info,
                                        llvm::StringRef space,
                                        const State &state) {
-  if (info.hasDynamicShape()) {
-    noteWarning(op.getName().getStringRef().str() +
-                " allocates a tile with a dynamic extent; it is not counted "
-                "against capacity");
+  if (info.hasDynamicShape() || info.bytes() == 0) {
+    noteUnsizable(info, op);
     return llvm::Error::success();
   }
   if (space.empty()) {

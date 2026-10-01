@@ -97,10 +97,11 @@ struct MicroEvent {
   EventKind kind = EventKind::Vector;
   ResourceKind resource = ResourceKind::VectorEngine;
 
-  /// Which instance of the resource: the engine a `micro.mma` named, `dma` or
-  /// `sync` for the shared serial resources, and *empty* for compute that asks
-  /// for an engine class rather than one engine. Two events with the same
-  /// resource kind but different names compete for different pools.
+  /// Which instance of the resource: the engine that will run this event --
+  /// the one `micro.mma` named, or the machine's first engine of that class --
+  /// and `dma` or `sync` for the shared serial resources. Two events with the
+  /// same name share a pool; two events naming different engines of the same
+  /// class do not, because those are different hardware.
   std::string resourceName;
 
   /// MACs for `micro.mma`, elements for everything else. `micro.mma` work is

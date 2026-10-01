@@ -349,6 +349,34 @@ module {
                        "'swizzled'"));
 }
 
+TEST(MachineFit, UnsizeableElementTypeIsReported) {
+  // The micro dialect does not restrict movement operands to its own dtype
+  // vocabulary, so an f64 tile can reach the simulator. It has no byte size
+  // here, and charging zero for it must not be silent.
+  constexpr const char *kF64 = R"MLIR(
+module {
+  micro.kernel @f64 {
+    %a_ext = tensor.empty() : tensor<16x32xf64>
+    %a_tile, %a_tok = micro.async_copy %a_ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<16x32xf64> -> tensor<16x32xf64>, !micro.async_token
+    micro.wait %a_tok
+    micro.yield
+  }
+}
+)MLIR";
+
+  auto parsed = parseKernel(kF64);
+  ASSERT_TRUE(parsed);
+  MachineModel model = avx2Model();
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+
+  ASSERT_FALSE(dag->events.empty());
+  EXPECT_EQ(dag->events.front().bytes, 0u);
+  EXPECT_TRUE(mentions(dag->warnings, "not a micro dtype"))
+      << (dag->warnings.empty() ? "no warnings" : dag->warnings.front());
+}
+
 TEST(MachineFit, UnmodeledOwnerIsReported) {
   constexpr const char *kUnmodeledOwner = R"MLIR(
 module {

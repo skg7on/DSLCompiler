@@ -335,6 +335,62 @@ TEST(L1ResourceDag, OwnerCountCapsConcurrentExecutionTiles) {
 // Reporting
 //===----------------------------------------------------------------------===//
 
+TEST(L1ResourceDag, OwnerOccupancyCanBeTheBottleneck) {
+  auto parsed = parseKernel(kSpatialKernel);
+  ASSERT_TRUE(parsed);
+  // One worker and plenty of matrix engines: nothing but the owner limits how
+  // much of the kernel runs at once, so that is the bottleneck.
+  MachineModel model = parseMachine(testMachine(/*dmaEngines=*/1, 1, 4));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  L1Report report = scheduleL1(*dag, model);
+
+  EXPECT_DOUBLE_EQ(report.matrixUtilization, 0.25);
+  EXPECT_EQ(report.bottleneck, "owner_occupancy");
+}
+
+TEST(L1ResourceDag, NamingAnEngineDoesNotDuplicateItsSlots) {
+  // Eight independent MMAs, half naming the machine's only matrix engine and
+  // half leaving it implicit. All eight must draw on the same four engines: if
+  // the two spellings landed in different pools, each would be sized as if it
+  // owned the machine and the schedule would run twice the hardware it has.
+  std::string body;
+  for (unsigned i = 0; i < 8; ++i) {
+    std::string engine = (i % 2 == 0) ? ", engine = \"mxu\"" : std::string();
+    body += "    %r" + std::to_string(i) +
+            " = micro.mma %a, %b, %c {shape = array<i64: 1, 1, 1>, input = "
+            "#micro.dtype<bf16>, accumulator = #micro.dtype<f32>" +
+            engine +
+            "} : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, "
+            "!micro.tile<1x1xbf16, memory = #micro.memory<sram>>, "
+            "!micro.tile<1x1xf32, memory = #micro.memory<acc>> -> "
+            "!micro.tile<1x1xf32, memory = #micro.memory<acc>>\n";
+  }
+  std::string source =
+      "module {\n  micro.kernel @mixed {\n"
+      "    %a = micro.tile_alloc : !micro.tile<1x1xbf16, memory = "
+      "#micro.memory<sram>>\n"
+      "    %b = micro.tile_alloc : !micro.tile<1x1xbf16, memory = "
+      "#micro.memory<sram>>\n"
+      "    %c = micro.tile_alloc : !micro.tile<1x1xf32, memory = "
+      "#micro.memory<acc>>\n" +
+      body + "    micro.yield\n  }\n}\n";
+
+  auto parsed = parseKernel(source);
+  ASSERT_TRUE(parsed);
+  MachineModel model = parseMachine(testMachine(/*dmaEngines=*/1, 4, 4));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 8u);
+
+  L1Report report = scheduleL1(*dag, model);
+  EXPECT_LE(report.matrixUtilization, 1.0);
+  EXPECT_GE(report.predictedCycles,
+            computeL0StaticBound(*dag, model).predictedCycles);
+}
+
 TEST(L1ResourceDag, BottleneckNamesTheBusiestResource) {
   auto copies = parseKernel(kCopiesKernel);
   ASSERT_TRUE(copies);

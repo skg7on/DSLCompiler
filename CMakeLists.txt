@@ -361,6 +361,7 @@ set(LLK_MLIR_EXEC_LIBS
     MLIRParser
     MLIRPass
     MLIRReconcileUnrealizedCasts
+    MLIRRegisterAllDialects
     MLIRRegisterAllPasses
     MLIRSCFDialect
     MLIRSCFToControlFlow
