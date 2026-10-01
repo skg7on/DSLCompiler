@@ -1,5 +1,6 @@
 .DS_Store
 build/
+compile_commands.json
 *.pyc
 __pycache__/
 *.o

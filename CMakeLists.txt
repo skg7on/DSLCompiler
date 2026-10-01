@@ -1,8 +1,64 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Compiler selection. This has to run before project(), because that is where
+# CMake consults $CC/$CXX and detects the compiler.
+#
+# $CC/$CXX take precedence over CMake's own compiler search, and CMake aborts
+# configuration when the named file is missing. A shell profile that exports a
+# toolchain from `brew --prefix llvm@NN` leaves exactly that behind once the keg
+# is removed, because brew keeps printing the path after uninstalling. Drop such
+# values. Absolute paths only: bare names like CC=gcc are resolved through PATH
+# by CMake and must be preserved.
+foreach(_llk_var IN ITEMS CC CXX)
+  if(DEFINED ENV{${_llk_var}} AND IS_ABSOLUTE "$ENV{${_llk_var}}"
+     AND NOT EXISTS "$ENV{${_llk_var}}")
+    message(STATUS "Ignoring ${_llk_var}=$ENV{${_llk_var}} (no such file); "
+                   "falling back to the compiler on PATH")
+    unset(ENV{${_llk_var}})
+  endif()
+endforeach()
+
+# On macOS, CMake's default search lands on /usr/bin/cc (Apple clang), while the
+# intended compiler is the clang on PATH: Homebrew's llvm kegs are keg-only yet
+# still symlink clang/clang++ into <prefix>/bin, which PATH places ahead of
+# /usr/bin. NO_DEFAULT_PATH restricts the search to PATH order. Pre-seeding the
+# cache is what actually selects it -- CMake otherwise prefers its own /usr/bin
+# search over PATH. An explicit -D or a still-valid $CC/$CXX wins.
+#
+# These only apply to a fresh build tree. Once CMAKE_C_COMPILER/CMAKE_CXX_COMPILER
+# are cached they are kept, so an already-configured build/ must be removed to
+# re-resolve the compiler.
+if(APPLE)
+  if(NOT DEFINED CMAKE_C_COMPILER AND NOT DEFINED ENV{CC})
+    find_program(_llk_clang NAMES clang HINTS ENV PATH NO_DEFAULT_PATH)
+    if(_llk_clang)
+      set(CMAKE_C_COMPILER "${_llk_clang}" CACHE FILEPATH "C compiler")
+    endif()
+  endif()
+  if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
+    find_program(_llk_clangxx NAMES clang++ HINTS ENV PATH NO_DEFAULT_PATH)
+    if(_llk_clangxx)
+      set(CMAKE_CXX_COMPILER "${_llk_clangxx}" CACHE FILEPATH "C++ compiler")
+    endif()
+  endif()
+endif()
+
 project(llk-compiler LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Emit compile_commands.json for clangd and other editors. Honoured by the Ninja
+# and Makefile generators; other generators ignore it.
+#
+# CMake pre-seeds this as an *empty* cache entry -- CMakeGenericSystem.cmake
+# runs before this file does -- so "defined" is always true and only the value
+# carries intent. An explicit -DCMAKE_EXPORT_COMPILE_COMMANDS=OFF is non-empty
+# and is therefore preserved.
+if(CMAKE_EXPORT_COMPILE_COMMANDS STREQUAL "")
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL
+      "Enable/Disable output of compile commands during generation" FORCE)
+endif()
 
 option(LLK_BUILD_TOOLS "Build llk-opt and llk-compile tools" ON)
 option(LLK_BUILD_E2E_TESTS "Build end-to-end JIT tests (requires LLVMOrcJIT)" ON)
