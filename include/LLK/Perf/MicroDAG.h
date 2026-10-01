@@ -1,0 +1,153 @@
+//===- MicroDAG.h - Event DAG extracted from concrete Micro-IR ------------===//
+//
+// Part of the M10 AVX2 performance simulator (issue #46).
+//
+// buildMicroDAG() turns one concrete tile-centric `micro.kernel` into the flat
+// event list the L1 resource scheduler consumes, plus the program properties
+// (live tile bytes, layout/owner warnings) that do not depend on scheduling.
+// Every event carries the tile metadata it was derived from -- shape, dtype,
+// layout, memory space, owner -- so the cost model can ask "which tile, in
+// which memory, owned by whom" instead of "which opcode".
+//
+// Dependency rules (MVP, analytical rather than cycle-accurate):
+//
+//   * Data: an op depends on the event that produced each operand, and a
+//     `micro.wait` depends on the event that produced each token it waits on.
+//   * Program order: an event depends on the immediately preceding event in
+//     its region, unless both use the same resource *kind*. Same-class work is
+//     separated by its shared resource pool instead, and that is what lets two
+//     independent copies overlap when a machine has more than one DMA engine.
+//   * Loops are unrolled so trip counts become real iteration costs. A
+//     non-pipelined iteration depends on every event of the previous one; a
+//     loop whose body is a `micro.pipeline stages >= 2` carries no such edge,
+//     so the copy for iteration i+1 may issue while iteration i still computes.
+//     A `micro.spatial_for` maps independent work onto resources and carries
+//     no edge either; its owner pool bounds how many iterations run at once.
+//   * Logical ops: `micro.tile_view` and `micro.tile_partition` are pure
+//     metadata and normally produce no event. One is produced only when the
+//     result names a layout the operand does not already have, i.e. when the op
+//     describes a physical layout transform, which is not free.
+//
+// Loops with non-static bounds are executed once and reported as a warning,
+// because a run of unknown length cannot be charged. A kernel that unrolls past
+// kMaxEvents is rejected rather than silently approximated.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLK_PERF_MICRODAG_H
+#define LLK_PERF_MICRODAG_H
+
+#include "LLK/Perf/MachineModel.h"
+
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Error.h"
+
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace mlir {
+class Operation;
+} // namespace mlir
+
+namespace mlir::llk::perf {
+
+/// Upper bound on unrolled events. Reached only by kernels far outside the MVP
+/// scope; exceeding it is reported as an error so a cycle estimate is never
+/// quietly produced from a truncated graph.
+inline constexpr uint64_t kMaxEvents = 100000;
+
+/// One machine-visible action. `Load` and `Barrier` are named for the event
+/// families the model is meant to cover but no micro op produces them yet: the
+/// dialect currently expresses every read as a copy and every sync as a wait.
+enum class EventKind {
+  TileView,
+  TilePartition,
+  AsyncCopy,
+  Load,
+  Store,
+  Mma,
+  Vector,
+  Reduce,
+  Wait,
+  Barrier
+};
+
+/// The machine resource an event occupies while it executes. Events sharing a
+/// kind are ordered by that resource's pool rather than by program order.
+///
+/// `MemoryRead` and `MemoryWrite` are reserved for memory work that bypasses
+/// the DMA path; every movement op the dialect has (async copy, store) goes
+/// through the machine's load/store engine and is modeled as `Dma`.
+enum class ResourceKind {
+  Dma,
+  MatrixEngine,
+  VectorEngine,
+  MemoryRead,
+  MemoryWrite,
+  Sync
+};
+
+llvm::StringRef stringifyEventKind(EventKind kind);
+llvm::StringRef stringifyResourceKind(ResourceKind kind);
+
+struct MicroEvent {
+  uint32_t id = 0;
+  EventKind kind = EventKind::Vector;
+  ResourceKind resource = ResourceKind::VectorEngine;
+
+  /// Which instance of the resource: the engine a `micro.mma` named, `dma` or
+  /// `sync` for the shared serial resources, and *empty* for compute that asks
+  /// for an engine class rather than one engine. Two events with the same
+  /// resource kind but different names compete for different pools.
+  std::string resourceName;
+
+  /// MACs for `micro.mma`, elements for everything else. `micro.mma` work is
+  /// two flops per unit, which is how the L0 bound recovers total flops.
+  uint64_t workItems = 0;
+  uint64_t bytes = 0;
+  uint64_t minCycles = 0;
+  std::vector<uint32_t> deps;
+  std::string sourceOpName;
+
+  std::string tileShape;
+  std::string tileLayout;
+  /// Memory space the movement writes into, or where the compute tile lives.
+  std::string tileMemory;
+  /// Memory space a movement reads from; empty for compute.
+  std::string srcMemory;
+  std::string tileOwner;
+};
+
+struct MicroDAG {
+  std::vector<MicroEvent> events;
+
+  /// Peak materialized tile bytes per memory space, from `micro.alloc` and
+  /// `micro.tile_alloc`, async copy results, and layout-transform results.
+  /// Pipeline stage count multiplies the tiles allocated inside the body.
+  std::map<std::string, uint64_t> liveTileBytesByMemory;
+
+  /// Extraction diagnostics. They describe the kernel/machine pair, not the
+  /// schedule, so the report carries them at every level.
+  std::vector<std::string> warnings;
+  std::vector<std::string> layoutWarnings;
+  std::vector<std::string> ownerWarnings;
+};
+
+/// Builds the event DAG for `kernel` against `machine`. `kernel` must be a
+/// `micro.kernel`. Fails when the kernel uses a memory space the machine does
+/// not model, or expands past kMaxEvents.
+llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
+                                       const MachineModel &machine);
+
+/// Locates the `micro.kernel` to simulate anywhere under `root`: the one named
+/// `symbol`, or the only one present when `symbol` is empty. Fails when the
+/// name matches nothing or when the choice is ambiguous, so a multi-kernel file
+/// is never simulated by accident.
+llvm::Expected<mlir::Operation *> findMicroKernel(mlir::Operation *root,
+                                                  llvm::StringRef symbol);
+
+} // namespace mlir::llk::perf
+
+#endif // LLK_PERF_MICRODAG_H

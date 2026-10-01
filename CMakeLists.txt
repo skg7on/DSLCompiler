@@ -119,19 +119,23 @@ mlir_target_link_libraries(MicroDialect PUBLIC
     MLIRIR MLIRDialect MLIRSupport MLIRArithDialect
 )
 
-# Library: MachineModel + YAML loader (M10 performance evaluation).
-# Deliberately names no MLIR component: the model is plain data plus the micro
-# dialect's vocabulary, which is header-only, so LLKPerf stays out of the
-# MLIR dylib/archive split described below.
+# Library: MachineModel, YAML loader, and the L0/L1 performance models (M10).
+# The model and loader are plain data; the simulator walks micro IR, so LLKPerf
+# depends on MicroDialect. That dependency is not named through LINK_LIBS, it
+# goes through mlir_target_link_libraries() inside MicroDialect itself, so the
+# dylib/archive split described below stays correct for every consumer.
 add_library(LLKPerf STATIC
     lib/Perf/MachineModel.cpp
     lib/Perf/MachineModelLoader.cpp
+    lib/Perf/MicroDAG.cpp
+    lib/Perf/MicroCostModel.cpp
+    lib/Perf/MicroPerfReport.cpp
 )
 target_include_directories(LLKPerf PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
 )
-target_link_libraries(LLKPerf PUBLIC LLVMSupport)
+target_link_libraries(LLKPerf PUBLIC LLVMSupport MicroDialect)
 
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg
@@ -395,6 +399,10 @@ target_link_libraries(llk-bench PRIVATE LLKRuntime)
 # Tool: llk-tune (autotuning grid search)
 add_llvm_executable(llk-tune tools/llk-tune/llk-tune.cpp)
 target_link_libraries(llk-tune PRIVATE LLKRuntime)
+
+# Tool: micro-perf (Micro-IR performance simulator, M10)
+add_llvm_executable(micro-perf tools/micro-perf/micro-perf.cpp)
+target_link_libraries(micro-perf PRIVATE LLKPerf MicroDialect ${LLK_MLIR_EXEC_LIBS})
 endif()
 
 # Tests
@@ -488,6 +496,26 @@ target_link_libraries(MachineModelLoaderTest PRIVATE LLKPerf GTest::gtest_main)
 target_compile_definitions(MachineModelLoaderTest PRIVATE
     LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines")
 add_test(NAME MachineModelLoaderTest COMMAND MachineModelLoaderTest)
+
+# Performance-model tests. Unlike the loader test these parse micro IR. They
+# must not name MLIR components directly: LLK_MLIR_EXEC_LIBS already carries
+# MLIRParser, and resolves to the MLIR dylib when there is one. Naming a
+# component alongside it is the mistake described above -- the executable then
+# holds two copies of MLIR whose attribute classes have different TypeIDs, and
+# `isa<StringAttr>` starts failing on perfectly good IR. Each test loads the
+# shipped machine files by path, for the same reason the loader test does: the
+# model used for real must be the one tested.
+function(add_llk_perf_test test_name test_file)
+  add_llvm_executable(${test_name} ${test_file})
+  target_link_libraries(${test_name} PRIVATE
+      LLKPerf MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+  target_compile_definitions(${test_name} PRIVATE
+      LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines")
+  add_test(NAME ${test_name} COMMAND ${test_name})
+endfunction()
+
+add_llk_perf_test(L0StaticBoundTest test/Perf/l0_static_bound.cpp)
+add_llk_perf_test(L1ResourceDAGTest test/Perf/l1_resource_dag.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
@@ -701,6 +729,16 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME CausalMask
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Transforms/causal_mask.mlir"
   )
+  # micro-perf: the simulator report on a concrete tile GEMM must contain the
+  # counts, the schedule, the tile summary, and a bottleneck.
+  add_test(NAME MicroPerfCli
+      COMMAND sh -c "$<TARGET_FILE:micro-perf> --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-cpu.yaml --level=1 ${CMAKE_SOURCE_DIR}/test/Perf/micro_perf_cli.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Perf/micro_perf_cli.mlir"
+  )
+  # The help text has to say what the MVP is, so nobody reads "simulator" as
+  # "functional emulator". Same fixture, other check prefix.
+  add_test(NAME MicroPerfHelp
+      COMMAND sh -c "$<TARGET_FILE:micro-perf> --help 2>&1 | ${FILECHECK_BIN} --check-prefix=HELP ${CMAKE_SOURCE_DIR}/test/Perf/micro_perf_cli.mlir"
+  )
   # TritonToLLK: verify llk.matmul / llk.make_tensor parse and verify
   add_test(NAME TritonToLLKNewOps
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/llk_new_ops.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/llk_new_ops.mlir"
@@ -752,6 +790,9 @@ foreach(_llk_test_name IN LISTS _llk_test_names)
 endforeach()
 if(TARGET llk-opt)
   list(APPEND _llk_check_deps llk-opt)
+endif()
+if(TARGET micro-perf)
+  list(APPEND _llk_check_deps micro-perf)
 endif()
 
 add_custom_target(check-llk
