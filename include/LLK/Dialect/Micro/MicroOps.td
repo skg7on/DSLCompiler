@@ -475,6 +475,8 @@ def Micro_SearchSpaceOp : Micro_Op<"search_space", [
     let assemblyFormat = [{
         $sym_name attr-dict-with-keyword $body
     }];
+
+    let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -506,6 +508,8 @@ def Micro_ParamOp : Micro_Op<"param"> {
     );
 
     let assemblyFormat = "$name attr-dict";
+
+    let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -532,6 +536,8 @@ def Micro_ConstraintOp : Micro_Op<"constraint"> {
     );
 
     let assemblyFormat = "$kind attr-dict";
+
+    let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -553,6 +559,8 @@ def Micro_ObjectiveOp : Micro_Op<"objective"> {
     );
 
     let assemblyFormat = "attr-dict";
+
+    let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -573,6 +581,8 @@ def Micro_CandidateOp : Micro_Op<"candidate"> {
     );
 
     let assemblyFormat = "$sym_name attr-dict";
+
+    let hasVerifier = 1;
 }
 
 #endif

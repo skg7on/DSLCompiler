@@ -14,6 +14,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpImplementation.h"
+#include "llvm/ADT/StringSet.h"
 
 // Attribute class declarations.
 #define GET_ATTRDEF_CLASSES
@@ -47,6 +48,18 @@ LogicalResult KernelOp::verify() {
   if (auto workload = getWorkload())
     if (workload->empty())
       return emitOpError("workload attribute must be non-empty");
+
+  // Search metadata drives the scheduler and is never executed on hardware,
+  // so it does not belong in a concrete kernel.
+  Operation *searchOp = nullptr;
+  getBody().walk([&](Operation *op) {
+    if (!searchOp &&
+        isa<SearchSpaceOp, ParamOp, ConstraintOp, ObjectiveOp, CandidateOp>(op))
+      searchOp = op;
+  });
+  if (searchOp)
+    return searchOp->emitOpError(
+        "search ops are not allowed inside micro.kernel");
 
   return success();
 }
@@ -498,5 +511,313 @@ LogicalResult StoreOp::verify() {
     return emitOpError("stored value must be a shaped type");
   if (getSrcMemory() == getDstMemory())
     return emitOpError("source and destination memory must differ");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Search-space op verifiers
+//===----------------------------------------------------------------------===//
+
+/// Returns true if `kind` names a supported micro.param domain.
+static bool isSupportedParamKind(StringRef kind) {
+  return llvm::StringSwitch<bool>(kind)
+      .Cases({"integer", "layout", "memory_path", "owner_mapping",
+              "fragment_shape", "tail_policy"},
+             true)
+      .Default(false);
+}
+
+/// Integer domains must be positive and strictly increasing. Enforcing a
+/// canonical order keeps the printed parameter reproducible, which the
+/// generated candidates and FileCheck both depend on.
+static LogicalResult verifyIntegerChoices(Operation *op, ArrayAttr choices) {
+  std::optional<int64_t> previous;
+  for (Attribute choice : choices) {
+    auto integer = dyn_cast<IntegerAttr>(choice);
+    if (!integer)
+      return op->emitOpError("integer parameter choices must be integers");
+    int64_t value = integer.getInt();
+    if (value <= 0)
+      return op->emitOpError("integer parameter choices must be positive");
+    if (previous && value <= *previous)
+      return op->emitOpError(
+          "integer parameter choices must be unique and strictly increasing");
+    previous = value;
+  }
+  return success();
+}
+
+/// Validates one choice of a symbolic domain against the Micro vocabulary, so
+/// a search space cannot name layouts, memory spaces, or owners that the rest
+/// of the dialect would reject.
+static LogicalResult verifySymbolicChoice(Operation *op, StringRef kind,
+                                          StringRef choice) {
+  if (kind == "layout") {
+    if (!symbolizeLayoutKind(choice))
+      return op->emitOpError("layout choice '")
+             << choice << "' is not a known layout kind";
+    return success();
+  }
+
+  if (kind == "memory_path") {
+    llvm::SmallVector<StringRef, 4> spaces;
+    choice.split(spaces, ':');
+    if (spaces.size() < 2)
+      return op->emitOpError("memory_path choice '")
+             << choice << "' must join at least two memory spaces with ':'";
+    for (StringRef space : spaces)
+      if (!symbolizeMemorySpace(space))
+        return op->emitOpError("memory_path choice '")
+               << choice << "' has unknown memory space '" << space << "'";
+    return success();
+  }
+
+  if (kind == "owner_mapping") {
+    llvm::SmallVector<StringRef, 4> owners;
+    choice.split(owners, '/');
+    if (owners.size() < 2)
+      return op->emitOpError("owner_mapping choice '")
+             << choice << "' must join at least two owners with '/'";
+    for (StringRef owner : owners)
+      if (!symbolizeOwner(owner))
+        return op->emitOpError("owner_mapping choice '")
+               << choice << "' has unknown owner '" << owner << "'";
+    return success();
+  }
+
+  if (kind == "fragment_shape") {
+    llvm::SmallVector<StringRef, 3> dimensions;
+    choice.split(dimensions, 'x');
+    bool valid = dimensions.size() == 3;
+    for (StringRef dimension : dimensions) {
+      int64_t value;
+      if (dimension.getAsInteger(10, value) || value <= 0) {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid)
+      return op->emitOpError("fragment_shape choice '")
+             << choice << "' must be a positive MxNxK triple";
+    return success();
+  }
+
+  // tail_policy: masked tails are the only strategy in the MVP.
+  if (choice != "mask")
+    return op->emitOpError("tail_policy choice '")
+           << choice << "' is not supported (only 'mask')";
+  return success();
+}
+
+LogicalResult ParamOp::verify() {
+  if (getName().empty())
+    return emitOpError("parameter name must be non-empty");
+
+  StringRef kind = getKind();
+  if (!isSupportedParamKind(kind))
+    return emitOpError("unsupported parameter kind '") << kind << "'";
+
+  ArrayAttr choices = getChoices();
+  if (choices.empty())
+    return emitOpError("parameter must declare at least one choice");
+
+  if (kind == "integer")
+    return verifyIntegerChoices(getOperation(), choices);
+
+  for (Attribute choice : choices) {
+    auto text = dyn_cast<StringAttr>(choice);
+    if (!text)
+      return emitOpError("symbolic parameter choices must be strings");
+    if (failed(verifySymbolicChoice(getOperation(), kind, text.getValue())))
+      return failure();
+  }
+  return success();
+}
+
+/// Returns true if `kind` names a supported micro.constraint legality rule.
+static bool isSupportedConstraintKind(StringRef kind) {
+  return llvm::StringSwitch<bool>(kind)
+      .Cases({"sram_capacity", "acc_capacity", "mma_compatible",
+              "mapping_extent", "tail_supported", "vector_width_supported",
+              "tile_hierarchy_compatible", "layout_supported",
+              "owner_supported", "fragment_compatible", "pipeline_live_tiles"},
+             true)
+      .Default(false);
+}
+
+/// Returns true if `metric` is a metric candidates can be ranked by.
+static bool isSupportedObjectiveMetric(StringRef metric) {
+  return llvm::StringSwitch<bool>(metric)
+      .Cases({"latency_cycles", "dram_bytes", "sram_bytes",
+              "matrix_utilization", "dma_utilization", "capacity_spill_bytes"},
+             true)
+      .Default(false);
+}
+
+LogicalResult ConstraintOp::verify() {
+  if (!isSupportedConstraintKind(getKind()))
+    return emitOpError("unsupported constraint kind '") << getKind() << "'";
+
+  ArrayAttr params = getParams();
+  if (params.empty())
+    return emitOpError("constraint must reference at least one parameter");
+
+  for (Attribute param : params)
+    if (!isa<StringAttr>(param))
+      return emitOpError("constraint parameters must be strings");
+
+  return success();
+}
+
+LogicalResult CandidateOp::verify() {
+  if (getSymName().empty())
+    return emitOpError("candidate name must be non-empty");
+
+  for (NamedAttribute binding : getBindings())
+    if (!isa<IntegerAttr, StringAttr>(binding.getValue()))
+      return emitOpError("candidate binding for '")
+             << binding.getName().strref()
+             << "' must be an integer or a string";
+
+  return success();
+}
+
+LogicalResult ObjectiveOp::verify() {
+  StringRef direction = getDirection();
+  if (direction != "minimize" && direction != "maximize")
+    return emitOpError("objective direction must be 'minimize' or 'maximize'");
+
+  if (!isSupportedObjectiveMetric(getMetric()))
+    return emitOpError("unsupported objective metric '") << getMetric() << "'";
+
+  std::optional<ArrayAttr> secondary = getSecondary();
+  if (!secondary)
+    return success();
+
+  llvm::StringSet<> seen;
+  for (Attribute metricAttr : *secondary) {
+    auto metric = dyn_cast<StringAttr>(metricAttr);
+    if (!metric)
+      return emitOpError("secondary metrics must be strings");
+    if (!isSupportedObjectiveMetric(metric.getValue()))
+      return emitOpError("unsupported secondary metric '")
+             << metric.getValue() << "'";
+    if (!seen.insert(metric.getValue()).second)
+      return emitOpError("duplicate secondary metric '")
+             << metric.getValue() << "'";
+  }
+
+  return success();
+}
+
+/// Returns true if `choices` contains `value`. Integer choices are compared by
+/// value so that an i32 spelling still matches an i64 one.
+static bool choiceContains(ArrayAttr choices, Attribute value) {
+  auto integer = dyn_cast<IntegerAttr>(value);
+  for (Attribute choice : choices) {
+    if (integer) {
+      if (auto other = dyn_cast<IntegerAttr>(choice))
+        if (other.getInt() == integer.getInt())
+          return true;
+      continue;
+    }
+    if (choice == value)
+      return true;
+  }
+  return false;
+}
+
+/// Checks one candidate against the declared parameters: every parameter is
+/// bound exactly once, with a value of the parameter's domain type drawn from
+/// its declared choices.
+static LogicalResult verifyCandidate(CandidateOp candidate,
+                                     const llvm::StringMap<ParamOp> &params) {
+  DictionaryAttr bindings = candidate.getBindings();
+  if (bindings.empty())
+    return candidate.emitOpError("candidate must bind at least one parameter");
+
+  for (NamedAttribute binding : bindings) {
+    StringRef name = binding.getName().strref();
+    auto param = params.find(name);
+    if (param == params.end())
+      return candidate.emitOpError("candidate binds unknown parameter '")
+             << name << "'";
+
+    ParamOp declaration = param->second;
+    bool isInteger = declaration.getKind() == "integer";
+
+    if (isInteger && !isa<IntegerAttr>(binding.getValue()))
+      return candidate.emitOpError("candidate binding for integer parameter '")
+             << name << "' must be an integer";
+    if (!isInteger && !isa<StringAttr>(binding.getValue()))
+      return candidate.emitOpError("candidate binding for parameter '")
+             << name << "' must be a string";
+
+    if (!choiceContains(declaration.getChoices(), binding.getValue()))
+      return candidate.emitOpError("candidate value for '")
+             << name << "' is not one of the declared choices";
+  }
+
+  for (auto &entry : params)
+    if (!bindings.get(entry.getKey()))
+      return candidate.emitOpError("candidate does not bind parameter '")
+             << entry.getKey() << "'";
+
+  return success();
+}
+
+LogicalResult SearchSpaceOp::verify() {
+  if (getWorkload().empty())
+    return emitOpError("workload must be non-empty");
+
+  llvm::StringMap<ParamOp> params;
+  llvm::StringSet<> candidateNames;
+  unsigned objectiveCount = 0;
+
+  // First pass: structural rules and the parameter declarations.
+  for (Operation &op : getBody().front().without_terminator()) {
+    if (auto param = dyn_cast<ParamOp>(op)) {
+      if (!params.try_emplace(param.getName(), param).second)
+        return param.emitOpError("duplicate parameter name '")
+               << param.getName() << "'";
+      continue;
+    }
+    if (auto objective = dyn_cast<ObjectiveOp>(op)) {
+      if (++objectiveCount > 1)
+        return objective.emitOpError("at most one micro.objective is allowed");
+      continue;
+    }
+    if (auto candidate = dyn_cast<CandidateOp>(op)) {
+      if (!candidateNames.insert(candidate.getSymName()).second)
+        return candidate.emitOpError("duplicate candidate name '")
+               << candidate.getSymName() << "'";
+      continue;
+    }
+    if (isa<ConstraintOp>(op))
+      continue;
+    return op.emitOpError(
+        "only search ops are allowed in a micro.search_space");
+  }
+
+  if (params.empty())
+    return emitOpError("search space requires at least one micro.param");
+
+  // Second pass: references between records, which need the parameter set.
+  for (Operation &op : getBody().front().without_terminator()) {
+    if (auto constraint = dyn_cast<ConstraintOp>(op)) {
+      for (Attribute param : constraint.getParams()) {
+        StringRef name = cast<StringAttr>(param).getValue();
+        if (!params.count(name))
+          return constraint.emitOpError(
+                     "constraint references unknown parameter '")
+                 << name << "'";
+      }
+      continue;
+    }
+    if (auto candidate = dyn_cast<CandidateOp>(op))
+      if (failed(verifyCandidate(candidate, params)))
+        return failure();
+  }
+
   return success();
 }

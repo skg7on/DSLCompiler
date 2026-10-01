@@ -673,6 +673,10 @@ add_test(NAME MicroDialectTileOpsInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
             ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/tile_ops_invalid.mlir
 )
+add_test(NAME MicroDialectSearchSpaceInvalid
+    COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+            ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/search_space_invalid.mlir
+)
 # ScratchAnalysis test: verify-diagnostics validates expected-warning comments
 add_test(NAME ScratchAnalysis
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --scratch-analysis --split-input-file
