@@ -38,33 +38,7 @@ using namespace mlir;
 using llk::classifyM;
 using llk::loadScheduleDB;
 using llk::ScheduleEntry;
-
-// ---------------------------------------------------------------------------
-// Fallback schedule selection
-// ---------------------------------------------------------------------------
-
-static ScheduleEntry selectBest(const std::vector<ScheduleEntry> &matches,
-                                int64_t N, int64_t K) {
-  if (matches.empty()) {
-    // Built-in default: conservative small-tile schedule.
-    ScheduleEntry def;
-    def.BM = 8;
-    def.BN = 32;
-    def.BK = 32;
-    def.VM = 1;
-    def.VN = 4;
-    def.vector_width = 8;
-    def.num_threads = 4;
-    def.grain_size = 1;
-    def.parallel_axis = "n";
-    return def;
-  }
-
-  // All entries from loadScheduleDB already match M_bucket.
-  // Return the first match; a fuller implementation would
-  // compare N and K against the entry values for exact fit.
-  return matches.front();
-}
+using llk::selectBestSchedule;
 
 // ---------------------------------------------------------------------------
 // ScheduleSelectionPass
@@ -138,7 +112,7 @@ struct ScheduleSelectionPass
                           << " in schedules/schedule_db.json; using fallback";
       }
 
-      ScheduleEntry selected = selectBest(matches, N, 0);
+      ScheduleEntry selected = selectBestSchedule(matches, N, 0);
 
       op->emitRemark() << "selected schedule for " << opName
                        << ": BM=" << selected.BM << " BN=" << selected.BN

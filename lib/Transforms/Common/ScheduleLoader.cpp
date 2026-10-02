@@ -35,13 +35,13 @@ std::vector<ScheduleEntry> loadScheduleDB(llvm::StringRef dbPath, int M_bucket,
 
   auto buf = llvm::MemoryBuffer::getFile(dbPath);
   if (!buf) {
-    llvm::errs() << "ScheduleSelection: cannot open " << dbPath << "\n";
+    llvm::errs() << "ScheduleLoader: cannot open " << dbPath << "\n";
     return matches;
   }
 
   auto json = llvm::json::parse(buf->get()->getBuffer());
   if (!json) {
-    llvm::errs() << "ScheduleSelection: invalid JSON in " << dbPath << "\n";
+    llvm::errs() << "ScheduleLoader: invalid JSON in " << dbPath << "\n";
     return matches;
   }
 
@@ -91,10 +91,56 @@ std::vector<ScheduleEntry> loadScheduleDB(llvm::StringRef dbPath, int M_bucket,
     if (auto axis = sched->getString("parallel_axis"))
       se.parallel_axis = axis->str();
 
+    // Micro-IR export metadata (M11). Every field is optional and keeps its
+    // default when absent, so the pre-M11 entries in schedules/schedule_db.json
+    // load unchanged.
+    se.pipeline_stages = sched->getInteger("pipeline_stages").value_or(1);
+    if (auto path = sched->getString("memory_path"))
+      se.memory_path = path->str();
+    if (auto shape = sched->getString("mma_shape"))
+      se.mma_shape = shape->str();
+    if (auto space = sched->getString("accumulator_space"))
+      se.accumulator_space = space->str();
+    if (auto layout = sched->getString("tile_layout"))
+      se.tile_layout = layout->str();
+    if (auto owner = sched->getString("owner_mapping"))
+      se.owner_mapping = owner->str();
+    if (auto owner = sched->getString("fragment_owner"))
+      se.fragment_owner = owner->str();
+    // fragment_shape is derived from mma_shape unless the entry overrides it.
+    se.fragment_shape = se.mma_shape;
+    if (auto shape = sched->getString("fragment_shape"))
+      se.fragment_shape = shape->str();
+    if (auto masks = sched->getBoolean("enable_tile_masks"))
+      se.enable_tile_masks = *masks;
+
     matches.push_back(se);
   }
 
   return matches;
+}
+
+ScheduleEntry selectBestSchedule(const std::vector<ScheduleEntry> &matches,
+                                 int64_t N, int64_t K) {
+  if (matches.empty()) {
+    // Built-in default: conservative small-tile schedule.
+    ScheduleEntry def;
+    def.BM = 8;
+    def.BN = 32;
+    def.BK = 32;
+    def.VM = 1;
+    def.VN = 4;
+    def.vector_width = 8;
+    def.num_threads = 4;
+    def.grain_size = 1;
+    def.parallel_axis = "n";
+    return def;
+  }
+
+  // All entries from loadScheduleDB already match M_bucket.
+  // Return the first match; a fuller implementation would
+  // compare N and K against the entry values for exact fit.
+  return matches.front();
 }
 
 } // namespace llk
