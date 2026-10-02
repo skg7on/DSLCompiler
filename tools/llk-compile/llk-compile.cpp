@@ -9,9 +9,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToLinalg.h"
+#include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/TritonToLLK/GridToForall.h"
 #include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
 #include "LLK/Dialect/LLKDialect.h"
+#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Runtime/JitCache.h"
 #include "LLK/Transforms/ForallToLLRT.h"
 #include "LLK/Transforms/FuseDoubleContraction.h"
@@ -80,6 +82,12 @@ static cl::opt<int64_t> optM("M", cl::desc("M dimension (rows)"), cl::init(0));
 static cl::opt<int64_t> optN("N", cl::desc("N dimension (cols)"), cl::init(0));
 static cl::opt<int64_t> optK("K", cl::desc("K dimension (hidden)"),
                              cl::init(0));
+
+static cl::opt<std::string> emitMode(
+    "emit",
+    cl::desc("What to emit: llvm (JIT-compile, the default), mlir (print the "
+             "fully lowered module), or micro (print concrete Micro-IR)"),
+    cl::init("llvm"));
 
 // ---------------------------------------------------------------------------
 // Pipeline
@@ -202,6 +210,17 @@ static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
   return pm.run(module);
 }
 
+/// Runs the Micro-IR export on its own.
+///
+/// The export lowers directly from the LLK root operations, so it does not run
+/// the Linalg pipeline: it needs the semantic structure and the selected
+/// schedule, not the tiled and bufferized form the JIT path produces.
+static mlir::LogicalResult runMicroExport(mlir::ModuleOp module) {
+  mlir::PassManager pm(module->getContext());
+  pm.addPass(mlir::llk::createLLKToMicroPass());
+  return pm.run(module);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -243,17 +262,27 @@ int main(int argc, char **argv) {
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createForallToLLRTPass();
   });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createLLKToMicroPass();
+  });
 
   // Parse command line.
   cl::ParseCommandLineOptions(argc, argv, "LLK kernel compiler\n");
 
+  const std::string emit = emitMode.getValue();
+  if (emit != "llvm" && emit != "mlir" && emit != "micro") {
+    llvm::errs() << "Unsupported --emit=" << emit
+                 << "; expected llvm, mlir, or micro\n";
+    return 1;
+  }
+
   // Build dialect registry with all required dialects.
   mlir::DialectRegistry registry;
-  registry.insert<mlir::llk::LLKDialect, mlir::func::FuncDialect,
-                  mlir::linalg::LinalgDialect, mlir::tensor::TensorDialect,
-                  mlir::scf::SCFDialect, mlir::arith::ArithDialect,
-                  mlir::math::MathDialect, mlir::memref::MemRefDialect,
-                  mlir::LLVM::LLVMDialect>();
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::scf::SCFDialect,
+                  mlir::arith::ArithDialect, mlir::math::MathDialect,
+                  mlir::memref::MemRefDialect, mlir::LLVM::LLVMDialect>();
 
   // Register TilingInterface external models so Linalg ops can be tiled.
   mlir::linalg::registerTilingInterfaceExternalModels(registry);
@@ -287,10 +316,29 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // Micro-IR export runs on its own and never reaches the JIT.
+  if (emit == "micro") {
+    if (mlir::failed(runMicroExport(*module))) {
+      llvm::errs() << "Micro-IR export failed\n";
+      return 1;
+    }
+    module->print(llvm::outs());
+    llvm::outs() << "\n";
+    return 0;
+  }
+
   // Run the compilation pipeline.
   if (mlir::failed(runCompilationPipeline(*module))) {
     llvm::errs() << "Compilation pipeline failed\n";
     return 1;
+  }
+
+  // --emit=mlir stops after lowering and prints the module instead of
+  // executing it.
+  if (emit == "mlir") {
+    module->print(llvm::outs());
+    llvm::outs() << "\n";
+    return 0;
   }
 
   // Derive a cache key from the module content and shape parameters.

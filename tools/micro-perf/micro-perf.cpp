@@ -15,6 +15,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Perf/MachineModelLoader.h"
 #include "LLK/Perf/MicroPerfReport.h"
@@ -96,6 +97,10 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
   registry.insert<mlir::micro::MicroDialect>();
+  // The compiler emits a micro.kernel alongside the LLK operations it came
+  // from, so the simulator registers the LLK dialect to read that output
+  // directly.
+  registry.insert<mlir::llk::LLKDialect>();
 
   mlir::MLIRContext context(registry);
   mlir::ParserConfig parserConfig(&context);
