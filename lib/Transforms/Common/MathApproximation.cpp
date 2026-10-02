@@ -77,6 +77,7 @@ Value createApproxExp(OpBuilder &b, Location loc, Value x, MathMode mode) {
     return math::ExpOp::create(b, loc, x);
   case MathMode::bounded_fast:
   case MathMode::unsafe_fast:
+  case MathMode::triton_fast:
     return approxExpBoundedFast(b, loc, x);
   }
   return math::ExpOp::create(b, loc, x);

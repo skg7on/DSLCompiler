@@ -43,6 +43,38 @@ if(APPLE)
   endif()
 endif()
 
+# On macOS, pin the deployment target when the user has not chosen one.
+#
+# Left to itself the compiler reads it off the target triple -- arm64-apple-
+# darwin27.0.0 on a current host -- through a Darwin-to-macOS version table, and
+# a clang built before the host's Darwin major existed falls back to the old
+# pre-macOS-11 formula "Darwin - 9". Homebrew's llvm@20 therefore announces
+# macOS 18.0 for a macOS 27 host, which is old enough that the linker warns
+# about every Homebrew dylib built for a newer macOS ("building for macOS-18.0,
+# but linking with dylib '/opt/homebrew/opt/zstd/lib/libzstd.1.dylib' which was
+# built for newer version 26.0"), and it is wrong regardless: the objects are
+# compiled against the installed SDK. The host version is what the triple was
+# trying to express, so pin to that. An explicit -DCMAKE_OSX_DEPLOYMENT_TARGET
+# wins, and a value already in the cache is left alone.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+  execute_process(COMMAND sw_vers -productVersion
+                  OUTPUT_VARIABLE _llk_host_macos
+                  OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET)
+  # "major.minor" only: the value reaches the compiler as
+  # -mmacosx-version-min, which takes no patch component.
+  if(_llk_host_macos MATCHES "^([0-9]+\\.[0-9]+)")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "${CMAKE_MATCH_1}" CACHE STRING
+        "Minimum OS X version to target for deployment (at runtime); newer"
+        FORCE)
+    message(STATUS "Pinning CMAKE_OSX_DEPLOYMENT_TARGET to host macOS "
+                   "${CMAKE_MATCH_1}")
+  else()
+    message(STATUS "Could not read a macOS version from `sw_vers`; leaving "
+                   "CMAKE_OSX_DEPLOYMENT_TARGET to the compiler default")
+  endif()
+endif()
+
 project(llk-compiler LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -466,12 +498,7 @@ endif()
 include(CTest)
 enable_testing()
 
-# Build GoogleTest from vendored source (never the system package) to avoid
-# ABI incompatibilities with prebuilt system libgtest packages.
-# googletest's cxx_library() macro auto-creates the GTest::gtest_main ALIAS.
-set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
-set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/googletest)
+add_subdirectory(third_party)
 
 function(add_llk_test test_name test_file)
     add_llvm_executable(${test_name} ${test_file})
@@ -608,6 +635,11 @@ if(LLK_BUILD_TOOLS)
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
+  )
+  # math_mode=triton_fast on the SiLU path: the sigmoid's exp must take the
+  # bounded-fast (math.exp2) path, like bounded_fast and unsafe_fast do.
+  add_test(NAME LLKToLinalgTritonFast
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg_triton_fast.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg_triton_fast.mlir"
   )
   # RoPE lowering: verify llk.rope → bounded-fast trig + even/odd interleave
   add_test(NAME RoPELowering
