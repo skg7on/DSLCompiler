@@ -143,3 +143,16 @@ TEST(Routing, SameMemoryIsATrivialRoute) {
 **Non-scope respected:** no materialization into Micro-IR (§12.4 — that is D5/plan binding); no placement; no `micro-perf` coupling.
 
 **Type consistency:** `MemoryNodeId`/`LinkId`/`ExecutorId` come from `MappingPlan.h`, `Cost` from `CostModel.h`, `MachineModel` from `LLK/Machine` — all defined once and reused.
+
+## Verification Results (2026-10-03)
+
+- **Build:** `ninja -C build` — clean.
+- **New tests:** `MappingRoutingTest` **13/13**.
+- **Full suite:** `ctest --test-dir build --output-on-failure` — 95 registered, **93 passed, 2 skipped, 0 failed** on the D2 branch (D1 #81 + MachineModel #83 + D2 all present).
+- **Deprecated-API audit:** clean across `Routing.h`, `Routing.cpp`, `routing.cpp`.
+
+### Notes taken while implementing
+
+1. **`TopologyService` rejects rvalue models.** It keeps a `const MachineModel&`, so binding it to a temporary dangles; the rvalue-ref constructor is `= delete` to turn that into a compile error. The first draft of the test hit exactly this and produced a green-looking but meaningless result.
+2. **Tie-break is `(cost, hop count, lexicographic link-id sequence)`**, and neighbours are expanded in sorted link-id order, so two runs agree exactly.
+3. **Alignment rule:** a memory supports a request when `memory.alignmentBytes % request.alignmentBytes == 0` — a 128-byte memory satisfies a 64-byte request, not the reverse.
