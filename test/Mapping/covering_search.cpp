@@ -1,0 +1,274 @@
+//===- covering_search.cpp - Complete-plan search (D6) -------------------===//
+
+#include "LLK/Mapping/CoveringSearch.h"
+
+#include "llvm/Support/Error.h"
+
+#include <gtest/gtest.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+using namespace mlir::llk::machine;
+using namespace mlir::llk::mapping;
+
+namespace {
+
+MachineModel searchMachine() {
+  MachineModel model;
+  model.target = "search";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}}};
+  MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "e0";
+  sram.capacityBytes = 1u << 20;
+  sram.alignmentBytes = 64;
+  MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "e0";
+  dram.capacityBytes = 1u << 30;
+  dram.alignmentBytes = 64;
+  model.memories = {sram, dram};
+  return model;
+}
+
+/// A `micro.vector` with `op = "add"`, as the shipped rules predicate on.
+mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context) {
+  return mlir::DictionaryAttr::get(
+      &context, {mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
+                                      mlir::StringAttr::get(&context, "add"))});
+}
+
+/// producer -> consumer, both `micro.vector`.
+WorkloadGraph twoNodeGraph(mlir::MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.attributes = vectorAttributes(context);
+  producer.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(producer));
+
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.attributes = vectorAttributes(context);
+  consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+constexpr llvm::StringLiteral kRules = R"llkmap(
+rule r.cheap {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.cheap";
+  emit "e1";
+  cost 1;
+}
+rule r.expensive {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.expensive";
+  emit "e1";
+  cost 10;
+}
+)llkmap";
+
+constexpr llvm::StringLiteral kRulesWithMemory = R"llkmap(
+rule r.cheap {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.cheap";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+constexpr llvm::StringLiteral kNoPlacementRules = R"llkmap(
+rule r.pe_only {
+  match micro.vector(op = "add");
+  require executor kind pe;
+  bundle "b.pe";
+  emit "e1";
+}
+)llkmap";
+
+std::unique_ptr<MappingTarget> targetWith(MachineModel machine,
+                                          llvm::StringRef rules) {
+  llvm::Expected<RuleRegistry> registry = parseRuleText(rules, "<test>");
+  if (!registry)
+    return nullptr;
+  return std::make_unique<FileMappingTarget>(
+      "test", std::move(machine), LayoutRegistry{}, std::move(*registry),
+      std::vector<std::string>{"e1"});
+}
+
+std::vector<PlanId> planIds(const MappingSearchResult &result) {
+  std::vector<PlanId> ids;
+  for (const CoveringPlan &plan : result.plans)
+    ids.push_back(plan.id);
+  return ids;
+}
+
+} // namespace
+
+TEST(CoveringSearch, DeterministicReturnsTheFirstCompletePlan) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 1u);
+  EXPECT_EQ(result->plans[0].instances.size(), 2u);
+  EXPECT_EQ(result->plans[0].connections.size(), 1u);
+  EXPECT_FALSE(result->searchTruncated);
+}
+
+TEST(CoveringSearch, ReportsNodesWithoutRules) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), "");
+  ASSERT_NE(target, nullptr);
+
+  CoveringSearch search(graph, *target, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_EQ(result->frontier.nodesWithoutRules, 2u);
+  EXPECT_FALSE(result->frontier.messages.empty());
+}
+
+TEST(CoveringSearch, ReportsCandidatesWithoutPlacement) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kNoPlacementRules);
+  ASSERT_NE(target, nullptr);
+
+  CoveringSearch search(graph, *target, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_EQ(result->frontier.candidatesWithoutPlacement, 2u);
+}
+
+TEST(CoveringSearch, WideBeamAndExactAgreeOnTheBestPlan) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions beamOptions;
+  beamOptions.mode = SearchMode::Beam;
+  beamOptions.beamWidth = 64;
+  CoveringSearch beam(graph, *target, context, LayoutContext{}, beamOptions);
+  llvm::Expected<MappingSearchResult> beamResult = beam.search();
+  ASSERT_TRUE(static_cast<bool>(beamResult))
+      << llvm::toString(beamResult.takeError());
+
+  MappingSearchOptions exactOptions;
+  exactOptions.mode = SearchMode::Exact;
+  CoveringSearch exact(graph, *target, context, LayoutContext{}, exactOptions);
+  llvm::Expected<MappingSearchResult> exactResult = exact.search();
+  ASSERT_TRUE(static_cast<bool>(exactResult))
+      << llvm::toString(exactResult.takeError());
+
+  ASSERT_FALSE(beamResult->plans.empty());
+  ASSERT_FALSE(exactResult->plans.empty());
+  EXPECT_EQ(beamResult->plans[0].id, exactResult->plans[0].id);
+  // The cheapest rule costs 1 per node, so the best plan is 2 (plus nothing:
+  // both instances share a memory, so the connection is direct and free).
+  EXPECT_DOUBLE_EQ(exactResult->plans[0].totalCost.latencyCycles, 2.0);
+}
+
+TEST(CoveringSearch, EveryPlanIsRankedAndCappedAtTopK) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result));
+  EXPECT_EQ(result->plans.size(), 1u);
+  // Two rules per node give four plans; asking for one is a cap.
+  EXPECT_TRUE(result->searchTruncated);
+}
+
+TEST(CoveringSearch, NarrowBeamDisclosesTruncationAndExactDoesNot) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions narrow;
+  narrow.mode = SearchMode::Beam;
+  narrow.beamWidth = 1;
+  CoveringSearch beam(graph, *target, context, LayoutContext{}, narrow);
+  llvm::Expected<MappingSearchResult> beamResult = beam.search();
+  ASSERT_TRUE(static_cast<bool>(beamResult));
+  EXPECT_TRUE(beamResult->searchTruncated);
+
+  MappingSearchOptions exact;
+  exact.mode = SearchMode::Exact;
+  CoveringSearch exactSearch(graph, *target, context, LayoutContext{}, exact);
+  llvm::Expected<MappingSearchResult> exactResult = exactSearch.search();
+  ASSERT_TRUE(static_cast<bool>(exactResult));
+  EXPECT_FALSE(exactResult->searchTruncated);
+}
+
+TEST(CoveringSearch, RepeatedRunsProduceIdenticalPlanIds) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Beam;
+  CoveringSearch first(graph, *target, context, LayoutContext{}, options);
+  CoveringSearch second(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> firstResult = first.search();
+  llvm::Expected<MappingSearchResult> secondResult = second.search();
+  ASSERT_TRUE(static_cast<bool>(firstResult));
+  ASSERT_TRUE(static_cast<bool>(secondResult));
+  EXPECT_EQ(planIds(*firstResult), planIds(*secondResult));
+}
+
+TEST(CoveringSearch, ReportsCapacityRejection) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  options.memoryBudgetBytes = 1; // any bound memory overflows this
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
