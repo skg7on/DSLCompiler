@@ -1,0 +1,35 @@
+// Generic accelerator mapping rules.
+//
+// `require executor kind pe` is the interesting line: the AVX2 rules ask for
+// `worker`, and both are satisfied because each machine declares its own
+// refinement (an AVX2 `core` refines `worker`; the accelerator's `pe` does
+// too). No generic code knows either word.
+//
+// Layout ids refer to layouts.llkmap; capability kinds must be ones
+// machines/generic-ai-accel-v2.yaml declares, or the target refuses to load.
+
+rule accel.vector_add {
+  match micro.vector(op = "add");
+  require executor kind pe;
+  require compute kind vector_engine;
+  require layout operand0 satisfies accel.row_major;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "accel.vector.add";
+  emit "accel_vector_add";
+  cost 2;
+}
+
+rule accel.mma_bf16 {
+  match micro.mma(input = bf16);
+  require executor kind pe;
+  require compute kind matrix_engine;
+  input "lhs";
+  input "rhs";
+  input "acc";
+  output "result";
+  bundle "accel.mma.bf16";
+  emit "accel_mxu";
+  cost 8;
+}
