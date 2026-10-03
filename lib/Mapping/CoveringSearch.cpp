@@ -245,14 +245,42 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     ++partial.covered;
     partial.executorSlots += instance.resourceUsage.executorSlots;
     // A bound memory holds the tile this instance materializes, plus anything
-    // the rule declared explicitly.
-    for (const auto &entry : instance.memoryBindings)
-      partial.memoryBytes[entry.second] += kAssumedValueBytes;
+    // the rule declared explicitly. `memoryBytes` is keyed by memory *node*, so
+    // each byte can be charged to the node that actually holds it: the binding
+    // map resolves a requirement kind to the node placement chose, while
+    // `resourceUsage` is keyed by that requirement kind. Bytes are accumulated
+    // for the duration of the partial plan -- an honest conservative live-range
+    // bound, since true expiry is not modelled.
+    for (const auto &binding : instance.memoryBindings)
+      partial.memoryBytes[binding.second] += kAssumedValueBytes;
+    for (const auto &usage : instance.resourceUsage.memoryBytes) {
+      MemoryNodeId node = instance.memoryBindings.lookup(usage.first());
+      if (node.empty())
+        node = usage.first().str(); // no binding recorded: charge the raw key
+      partial.memoryBytes[node] += usage.second;
+    }
+
+    // §9.3: no memory's own capacity may be exceeded (per-node), on top of the
+    // global byte ceiling (whole plan).
     uint64_t totalBytes = 0;
-    for (const auto &entry : instance.resourceUsage.memoryBytes)
-      partial.memoryBytes[entry.first()] += entry.second;
-    for (const auto &entry : partial.memoryBytes)
+    for (const auto &entry : partial.memoryBytes) {
       totalBytes += entry.second;
+      const MemoryNode *memory = machine.findMemory(entry.first());
+      if (!memory) {
+        // Defensive: an id no machine node names cannot be checked. Surface it
+        // as an error rather than silently treating it as unlimited.
+        if (!pendingError)
+          pendingError = llvm::createStringError(
+              llvm::inconvertibleErrorCode(),
+              "covering search: plan binds unknown memory '" +
+                  entry.first().str() + "'");
+        return false;
+      }
+      if (entry.second > memory->capacityBytes) {
+        ++result.frontier.plansRejectedByCapacity;
+        return false;
+      }
+    }
     if (totalBytes > options_.memoryBudgetBytes) {
       ++result.frontier.plansRejectedByCapacity;
       return false;

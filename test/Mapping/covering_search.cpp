@@ -48,6 +48,18 @@ MachineModel twoWorkerMachine() {
   return model;
 }
 
+/// `searchMachine` with the sram node shrunk to 5000 bytes. The search charges
+/// 4096 bytes per bound instance (kAssumedValueBytes), so one instance fits the
+/// node while two do not -- and two still fit the default global byte budget,
+/// leaving the per-memory check as the only thing that can reject the pair.
+MachineModel smallMemoryMachine() {
+  MachineModel model = searchMachine();
+  for (MemoryNode &memory : model.memories)
+    if (memory.kind == "sram")
+      memory.capacityBytes = 5000;
+  return model;
+}
+
 /// A `micro.vector` with `op = "add"`, as the shipped rules predicate on.
 mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context) {
   return mlir::DictionaryAttr::get(
@@ -323,6 +335,31 @@ TEST(CoveringSearch, ReportsCapacityRejection) {
   MappingSearchOptions options;
   options.mode = SearchMode::Deterministic;
   options.memoryBudgetBytes = 1; // any bound memory overflows this
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// §9.3: capacity is per memory, not one global pot. Each instance's 4096-byte
+// tile fits both the 5000-byte sram node and the default byte budget; the two
+// together exceed the node but not the budget, so only the per-memory check can
+// reject the plan -- and it must.
+TEST(CoveringSearch, PerMemoryCapacityRejectsOverSubscription) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(smallMemoryMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+  // Guard the premise: one instance fits the node, two would not.
+  const MemoryNode *sram = target->machine().findMemory("sram.0");
+  ASSERT_NE(sram, nullptr);
+  ASSERT_GE(sram->capacityBytes, 4096u);
+  ASSERT_LT(sram->capacityBytes, 2u * 4096u);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
   CoveringSearch search(graph, *target, context, LayoutContext{}, options);
   llvm::Expected<MappingSearchResult> result = search.search();
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
