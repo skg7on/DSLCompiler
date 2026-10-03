@@ -19,10 +19,11 @@
 // matches an abstract Micro owner against an executor's *kind*, never against
 // a concrete executor id (design §11.5).
 //
-// Node `kind` values are the Micro dialect vocabulary: executor kinds are
-// `micro::Owner` names, memory kinds are `micro::MemorySpace` names. The model
-// stores them as strings so it carries no dependency on the dialect headers at
-// its public surface; the loader validates them against the dialect enums.
+// Node `kind` values are the Micro dialect vocabulary: executor, compute, and
+// transfer kinds are `micro::Owner` names, memory kinds are
+// `micro::MemorySpace` names. The model stores them as strings so it carries no
+// dependency on the dialect headers at its public surface; the terminology
+// (and the validation) lives in the dialect enums.
 //
 //===----------------------------------------------------------------------===//
 
@@ -43,6 +44,14 @@ namespace mlir::llk::machine {
 /// The only schema major this build understands. A file naming another major
 /// is rejected rather than reinterpreted (design §11.6).
 inline constexpr uint32_t kSupportedSchemaMajor = 2;
+
+/// The highest schema *minor* this build understands. Design §11.6 requires a
+/// minor addition to be optional or defaulted, so a file at a *higher* minor
+/// may carry keys added after this build and the loader ignores the keys it
+/// does not recognize. At this minor or lower, an unrecognized key is a typo
+/// (or a misdeclared schema), and the loader rejects it: silently ignoring it
+/// would defeat the diagnostic §11.6 depends on.
+inline constexpr uint32_t kSupportedSchemaMinor = 0;
 
 /// The schema string a v2 file declares.
 inline constexpr llvm::StringLiteral kSchemaName = "llk.machine.v2";
@@ -130,6 +139,11 @@ struct SyncModel {
 
 struct MachineModel {
   uint32_t schemaMajor = kSupportedSchemaMajor;
+  /// The declared schema minor, 0 when the file wrote a bare
+  /// `llk.machine.v2`. Recorded so callers can tell which revision a profile
+  /// targets; it is schema metadata, not machine content, so it does not enter
+  /// the content hash.
+  uint32_t schemaMinor = kSupportedSchemaMinor;
   std::string target;
   std::string description;
 

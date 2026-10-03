@@ -377,13 +377,27 @@ bool isKnownMemoryKind(llvm::StringRef kind) {
   return micro::symbolizeMemorySpace(kind).has_value();
 }
 
-/// Compute capabilities the dialect models today. A rule that wants another
-/// capability adds it here and in the profile that declares it.
-bool isKnownComputeKind(llvm::StringRef kind) {
-  return kind == "matrix_engine" || kind == "vector_engine";
+/// Compute capabilities and transfer resources are `micro::Owner` vocabulary
+/// (design §11.5): a kernel maps onto a `matrix_engine` or `vector_engine`
+/// owner, and a `dma` owner moves its data. The subset a machine may declare is
+/// written with the enum's own enumerators, so a rename in MicroEnums.h breaks
+/// this code at compile time instead of letting a string list drift. Execution
+/// scopes such as `core` are also owners, but they are not capabilities a
+/// machine attaches, so they are excluded here.
+bool isComputeOwner(micro::Owner owner) {
+  return owner == micro::Owner::matrix_engine ||
+         owner == micro::Owner::vector_engine;
 }
 
-bool isKnownTransferKind(llvm::StringRef kind) { return kind == "dma"; }
+bool isKnownComputeKind(llvm::StringRef kind) {
+  std::optional<micro::Owner> owner = micro::symbolizeOwner(kind);
+  return owner && isComputeOwner(*owner);
+}
+
+bool isKnownTransferKind(llvm::StringRef kind) {
+  std::optional<micro::Owner> owner = micro::symbolizeOwner(kind);
+  return owner && *owner == micro::Owner::dma;
+}
 
 } // namespace
 

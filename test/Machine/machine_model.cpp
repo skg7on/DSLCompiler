@@ -136,6 +136,32 @@ TEST(MachineModel, VerifyRejectsUnknownExecutorKind) {
   EXPECT_FALSE(verifies(model));
 }
 
+TEST(MachineModel, VerifyRejectsUnknownComputeKind) {
+  MachineModel model = twoCoreMachine();
+  model.computes[0].kind = "tensor_core"; // not Micro owner vocabulary
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsUnknownTransferKind) {
+  MachineModel model = twoCoreMachine();
+  model.transferEngines[0].kind = "pcie";
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyAcceptsMatrixEngineComputeKind) {
+  MachineModel model = twoCoreMachine();
+  model.computes[0].kind = "matrix_engine"; // a Micro owner capability
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsExecutorOwnerAsComputeKind) {
+  MachineModel model = twoCoreMachine();
+  // `core` is valid Micro owner vocabulary, but it is an execution scope, not
+  // a compute capability a machine may attach.
+  model.computes[0].kind = "core";
+  EXPECT_FALSE(verifies(model));
+}
+
 TEST(MachineModel, VerifyRejectsMissingParent) {
   MachineModel model = twoCoreMachine();
   model.executors[1].parent = "nope.0";
