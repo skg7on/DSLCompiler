@@ -82,6 +82,7 @@ compute:
     attached_to: core.0
     element_types: [f32, bf16]
     shapes: [[8], [16]]
+    lanes: {f32: 8, bf16: 16}
     issue_cycles: 1
     latency_cycles: 5
     throughput_per_cycle: 16
@@ -91,6 +92,7 @@ compute:
     attached_to: core.1
     element_types: [f32, bf16]
     shapes: [[8], [16]]
+    lanes: {f32: 8, bf16: 16}
     issue_cycles: 1
     latency_cycles: 5
     throughput_per_cycle: 16

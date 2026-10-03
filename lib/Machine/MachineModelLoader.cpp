@@ -27,6 +27,7 @@
 
 #include <cctype>
 #include <limits>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -94,6 +95,8 @@ private:
   bool readStringList(Node *node, const Twine &path,
                       std::vector<std::string> &out);
   bool readIntList(Node *node, const Twine &path, std::vector<int64_t> &out);
+  bool readLanes(Node *node, const Twine &path,
+                 std::map<std::string, int64_t> &out);
   bool readShapes(Node *node, const Twine &path,
                   std::vector<std::vector<int64_t>> &out);
 
@@ -260,6 +263,18 @@ bool Loader::readShapes(Node *node, const Twine &path,
   });
 }
 
+bool Loader::readLanes(Node *node, const Twine &path,
+                       std::map<std::string, int64_t> &out) {
+  return forEachEntry(node, path,
+                      [&](StringRef key, Node *value, Node *) -> bool {
+                        int64_t lanes = 0;
+                        if (!readInt64(value, path + "['" + key + "']", lanes))
+                          return false;
+                        out[key.str()] = lanes;
+                        return true;
+                      });
+}
+
 //===----------------------------------------------------------------------===//
 // Structure
 //===----------------------------------------------------------------------===//
@@ -419,6 +434,8 @@ bool Loader::parseCompute(Node *node, size_t index, ComputeNode &out) {
           sawShapes = true;
           return readShapes(value, path + ".shapes", out.shapes);
         }
+        if (key == "lanes")
+          return readLanes(value, path + ".lanes", out.lanes);
         if (key == "issue_cycles")
           return readUInt(value, path + ".issue_cycles", out.issueCycles);
         if (key == "latency_cycles")

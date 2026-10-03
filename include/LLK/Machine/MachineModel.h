@@ -33,6 +33,7 @@
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -78,6 +79,11 @@ struct ComputeNode {
   std::vector<std::string> elementTypes;
   std::vector<std::string> supportedLayouts;
   std::vector<std::vector<int64_t>> shapes;
+  /// Elements per instruction for a dtype, when the capability has one (a
+  /// vector engine's lane count). Absent for capabilities without a per-dtype
+  /// width, such as a matrix engine. Layout declarations query this as
+  /// `machine.compute(<kind>).lanes(<dtype>)`.
+  std::map<std::string, int64_t> lanes;
   uint64_t issueCycles = 1;
   uint64_t latencyCycles = 0;
   std::optional<double> throughputPerCycle;
@@ -136,6 +142,11 @@ struct MachineModel {
 
   /// True when `executorId` can address `memoryId` (design §11.2 `dominates`).
   bool isVisible(llvm::StringRef memoryId, llvm::StringRef executorId) const;
+
+  /// Elements per instruction for `elementType` on the first capability of
+  /// `computeKind`, or nullopt when no such capability or dtype is modelled.
+  std::optional<int64_t> lanesFor(llvm::StringRef computeKind,
+                                  llvm::StringRef elementType) const;
 
   /// Compute capabilities and transfer engines directly attached to
   /// `executorId`, in declaration order.
