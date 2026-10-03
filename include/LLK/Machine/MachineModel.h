@@ -51,6 +51,11 @@ inline constexpr uint32_t kSupportedSchemaMajor = 2;
 /// does not recognize. At this minor or lower, an unrecognized key is a typo
 /// (or a misdeclared schema), and the loader rejects it: silently ignoring it
 /// would defeat the diagnostic §11.6 depends on.
+///
+/// The declared minor is unbounded and self-declared, so a file may claim a
+/// large minor to opt out of unknown-key rejection (typos included). Only
+/// *unknown keys* are tolerated this way; the major check and
+/// `verifyMachineModel` still enforce structure, required fields, and kinds.
 inline constexpr uint32_t kSupportedSchemaMinor = 0;
 
 /// The schema string a v2 file declares.

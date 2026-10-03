@@ -15,6 +15,13 @@
 // supported one, an unknown key is rejected: at the current minor it is a typo,
 // and discarding it silently would defeat the diagnostic §11.6 relies on.
 //
+// The minor is self-declared and unbounded: any file may write a large minor
+// (e.g. `llk.machine.v2.99`) and thereby opt out of unknown-key rejection --
+// including for a genuine typo. That is deliberate: §11.6 asks the loader not
+// to reject a newer-minor file it cannot fully understand, and the schema major
+// plus `verifyMachineModel` still guard structure, required fields, and kinds,
+// so tolerance never extends past unknown keys.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef LLK_MACHINE_MACHINEMODELLOADER_H

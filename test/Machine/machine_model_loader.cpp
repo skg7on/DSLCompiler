@@ -159,6 +159,50 @@ TEST(MachineModelLoader, RejectsUnknownKeysAtTheCurrentMinor) {
   EXPECT_FALSE(loads(nested));
 }
 
+TEST(MachineModelLoader, ANewerMinorStillRejectsMissingRequiredKeys) {
+  // Tolerance covers *unknown* keys only: a newer minor may add optional keys,
+  // but the required structure is unchanged, so a missing `target` still fails.
+  // Non-vacuous: it would load if tolerantMinor_ also suppressed requireKey.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2.1
+executors:
+  - {id: e0, kind: worker}
+)yaml"));
+}
+
+TEST(MachineModelLoader, ANewerMinorStillRejectsWrongNodeTypes) {
+  // `executors` must be a sequence; a newer minor does not relax that.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2.1
+target: t
+executors:
+  id: e0
+  kind: worker
+)yaml"));
+}
+
+TEST(MachineModelLoader, ANewerMinorStillRejectsMalformedKnownValues) {
+  // A *known* key with a bad value is a type error, not an unknown key.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2.1
+target: t
+clock_hz: not-a-number
+)yaml"));
+}
+
+TEST(MachineModelLoader, ANewerMinorStillRejectsUnknownKinds) {
+  // Kind validation is vocabulary, not an unknown key: a newer minor cannot
+  // smuggle in a capability this build does not model.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2.1
+target: t
+executors:
+  - {id: e0, kind: worker}
+compute:
+  - {id: c0, kind: tensor_core, attached_to: e0, element_types: [f32], shapes: [[8]]}
+)yaml"));
+}
+
 TEST(MachineModelLoader, RejectsUnknownRootKey) {
   std::string text = kValid.str();
   text += "\nnonsense: 1\n";

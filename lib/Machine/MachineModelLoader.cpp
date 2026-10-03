@@ -125,11 +125,12 @@ private:
 
   bool requireKey(bool present, const Twine &path, StringRef key);
 
-  /// Records an unrecognized key. The verdict is deferred: whether the key is
-  /// a typo or a forward-compatible addition depends on this file's schema
-  /// minor, which may be declared after the key, and a YAML mapping is a
-  /// single-pass stream, so resolveUnknownKeys() decides once the walk ends.
-  bool unknownKey(const Node *node, const Twine &path, StringRef key);
+  /// Defers the verdict on an unrecognized key: it always returns true so the
+  /// walk can continue, and never means "accepted". Whether the key is a typo
+  /// or a forward-compatible addition depends on this file's schema minor,
+  /// which may be declared after the key, and a YAML mapping is a single-pass
+  /// stream, so resolveUnknownKeys() decides once the walk ends.
+  bool deferUnknownKey(const Node *node, const Twine &path, StringRef key);
   bool resolveUnknownKeys();
 
   StringRef source_;
@@ -344,7 +345,8 @@ bool Loader::requireKey(bool present, const Twine &path, StringRef key) {
   return fail(path + ": missing required key '" + key + "'");
 }
 
-bool Loader::unknownKey(const Node *node, const Twine &path, StringRef key) {
+bool Loader::deferUnknownKey(const Node *node, const Twine &path,
+                             StringRef key) {
   // A file at a newer minor may carry keys added after this build; §11.6
   // requires those additions to be optional or defaulted, so they are ignored.
   if (tolerantMinor_)
@@ -398,7 +400,7 @@ bool Loader::parseExecutor(Node *node, size_t index, ExecutorNode &out) {
                         if (key == "refines")
                           return readStringList(value, path + ".refines",
                                                 out.refines);
-                        return unknownKey(keyNode, path, key);
+                        return deferUnknownKey(keyNode, path, key);
                       }) &&
          requireKey(sawId, path, "id") && requireKey(sawKind, path, "kind");
 }
@@ -444,7 +446,7 @@ bool Loader::parseMemory(Node *node, size_t index, MemoryNode &out) {
           out.banks = banks;
           return true;
         }
-        return unknownKey(keyNode, path, key);
+        return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&
          requireKey(sawKind, path, "kind") &&
@@ -500,7 +502,7 @@ bool Loader::parseCompute(Node *node, size_t index, ComputeNode &out) {
         }
         if (key == "concurrency")
           return readUInt32(value, path + ".concurrency", out.concurrency);
-        return unknownKey(keyNode, path, key);
+        return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&
          requireKey(sawKind, path, "kind") &&
@@ -535,7 +537,7 @@ bool Loader::parseTransferEngine(Node *node, size_t index,
                             out.maxOutstanding);
         if (key == "setup_cycles")
           return readUInt(value, path + ".setup_cycles", out.setupCycles);
-        return unknownKey(keyNode, path, key);
+        return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&
          requireKey(sawKind, path, "kind") &&
@@ -577,7 +579,7 @@ bool Loader::parseLink(Node *node, size_t index, LinkEdge &out) {
                                 out.transferEngines);
         if (key == "concurrency")
           return readUInt32(value, path + ".concurrency", out.concurrency);
-        return unknownKey(keyNode, path, key);
+        return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&
          requireKey(sawSource, path, "source") &&
@@ -593,7 +595,7 @@ bool Loader::parseSync(Node *node, MachineModel &model) {
                           model.sync.barrierCycles);
         if (key == "wait_cycles")
           return readUInt(value, "sync.wait_cycles", model.sync.waitCycles);
-        return unknownKey(keyNode, "sync", key);
+        return deferUnknownKey(keyNode, "sync", key);
       });
 }
 
@@ -683,7 +685,7 @@ bool Loader::parseRoot(Node *root, MachineModel &model) {
                                   model.links.push_back(std::move(link));
                                   return true;
                                 });
-        return unknownKey(keyNode, "document", key);
+        return deferUnknownKey(keyNode, "document", key);
       });
   return ok && resolveUnknownKeys() && requireKey(sawSchema, "", "schema") &&
          requireKey(sawTarget, "", "target");
