@@ -14,7 +14,10 @@
 //      report has a writer but no reader, so this pins the ids the report
 //      carries rather than re-deriving them from a parsed report);
 //   5. cost ordering is a deterministic total order whose exact ties break on
-//      the stable id.
+//      the stable id -- the *exposed* `CoveringPlan::id`, so the emitted order
+//      is reproducible from `(totalCost, plan.id)` alone. The search's internal
+//      partial-plan hash (`partialId`) is a beam heuristic, not the tie-break
+//      the emitted list is ordered by.
 //
 // The generator is splitmix64 with a fixed seed: the draws are deterministic,
 // so a failure reproduces from the seed alone and the harness adds no fuzz
@@ -703,17 +706,20 @@ TEST(MappingProperties, SearchReturnsPlansInDeterministicRankedOrder) {
     MappingSearchResult result = runSearch(graph, *target, context, options);
     ASSERT_FALSE(result.plans.empty());
 
-    // The returned list is ranked by the declared objective; ties are broken
-    // deterministically (verified by the re-run below). Two facts must hold:
-    // a later plan is never strictly cheaper, and the first plan is never
-    // beaten on cost by any other.
+    // §22.1/§25.6: the emitted list is ordered by the declared objective, then
+    // the exposed plan id. Plan ids are unique, so this is a strict order and
+    // every adjacent pair must satisfy `ranksBefore`. Cost monotonicity is
+    // asserted alongside it.
     for (size_t i = 0; i + 1 < result.plans.size(); ++i) {
       const CoveringPlan &lhs = result.plans[i];
       const CoveringPlan &rhs = result.plans[i + 1];
-      EXPECT_FALSE(costLess(rhs.totalCost, lhs.totalCost, options.objective))
-          << "a later plan is strictly cheaper: " << i << " cost "
+      EXPECT_TRUE(ranksBefore(lhs.totalCost, lhs.id, rhs.totalCost, rhs.id,
+                              options.objective))
+          << "plans are not ordered by (objective, plan.id) at " << i << ": "
           << canonicalCostString(lhs.totalCost) << " then "
           << canonicalCostString(rhs.totalCost);
+      EXPECT_FALSE(costLess(rhs.totalCost, lhs.totalCost, options.objective))
+          << "a later plan is strictly cheaper at " << i;
     }
     for (const CoveringPlan &plan : result.plans)
       EXPECT_FALSE(costLess(plan.totalCost, result.plans.front().totalCost,

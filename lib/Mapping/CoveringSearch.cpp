@@ -960,6 +960,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     result.plans.push_back(std::move(plan));
   }
 
+  // §22.1: the emitted list is ordered by the declared objective and then the
+  // *exposed* plan id. The beam's `partialId` order chosen above is a search
+  // heuristic over partial plans; it must not leak into the reported order, so
+  // re-sort here, where each plan's content id exists. An exact cost tie now
+  // breaks on `plan.id`, making the emitted order reproducible from
+  // `(totalCost, plan.id)` alone.
+  llvm::sort(result.plans,
+             [&](const CoveringPlan &lhs, const CoveringPlan &rhs) {
+               return ranksBefore(lhs.totalCost, lhs.id, rhs.totalCost, rhs.id,
+                                  options_.objective);
+             });
+
   // §22.1/§22.3: the frontier's codes are the stable interface, so their order
   // must not depend on the order branches happened to be explored.
   llvm::sort(result.frontier.diagnostics, diagnosticLess);
