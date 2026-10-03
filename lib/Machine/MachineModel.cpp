@@ -2,12 +2,13 @@
 
 #include "LLK/Machine/MachineModel.h"
 
+#include "LLK/Dialect/Micro/MicroEnums.h"
+
 #include "MachineHash.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
-
-#include <algorithm>
+#include "llvm/ADT/StringSet.h"
 
 namespace mlir::llk::machine {
 
@@ -270,6 +271,174 @@ std::string canonicalMachineString(const MachineModel &model) {
 
 uint64_t computeContentHash(const MachineModel &model) {
   return stableHash(canonicalMachineString(model));
+}
+
+namespace {
+
+llvm::Error invalid(const std::string &message) {
+  return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+}
+
+bool isKnownOwnerKind(llvm::StringRef kind) {
+  return micro::symbolizeOwner(kind).has_value();
+}
+
+bool isKnownMemoryKind(llvm::StringRef kind) {
+  return micro::symbolizeMemorySpace(kind).has_value();
+}
+
+/// Compute capabilities the dialect models today. A rule that wants another
+/// capability adds it here and in the profile that declares it.
+bool isKnownComputeKind(llvm::StringRef kind) {
+  return kind == "matrix_engine" || kind == "vector_engine";
+}
+
+bool isKnownTransferKind(llvm::StringRef kind) { return kind == "dma"; }
+
+} // namespace
+
+llvm::Error verifyMachineModel(const MachineModel &model) {
+  if (model.schemaMajor != kSupportedSchemaMajor)
+    return invalid("schema: unsupported major " +
+                   std::to_string(model.schemaMajor) + ", expected " +
+                   std::to_string(kSupportedSchemaMajor));
+  if (model.target.empty())
+    return invalid("target: must not be empty");
+
+  // Ids share one namespace across every node kind, so a memory and an
+  // executor can never collide silently.
+  llvm::StringSet<> seenIds;
+  auto checkId = [&](const std::string &id,
+                     const std::string &path) -> llvm::Error {
+    if (id.empty())
+      return invalid(path + ": id must not be empty");
+    if (!seenIds.insert(id).second)
+      return invalid(path + ": duplicate id '" + id + "'");
+    return llvm::Error::success();
+  };
+  for (size_t i = 0; i < model.executors.size(); ++i)
+    if (auto error = checkId(model.executors[i].id,
+                             "executors[" + std::to_string(i) + "]"))
+      return error;
+  for (size_t i = 0; i < model.memories.size(); ++i)
+    if (auto error = checkId(model.memories[i].id,
+                             "memories[" + std::to_string(i) + "]"))
+      return error;
+  for (size_t i = 0; i < model.computes.size(); ++i)
+    if (auto error =
+            checkId(model.computes[i].id, "compute[" + std::to_string(i) + "]"))
+      return error;
+  for (size_t i = 0; i < model.transferEngines.size(); ++i)
+    if (auto error = checkId(model.transferEngines[i].id,
+                             "transfer_engines[" + std::to_string(i) + "]"))
+      return error;
+  for (size_t i = 0; i < model.links.size(); ++i)
+    if (auto error =
+            checkId(model.links[i].id, "links[" + std::to_string(i) + "]"))
+      return error;
+
+  for (size_t i = 0; i < model.executors.size(); ++i) {
+    const ExecutorNode &executor = model.executors[i];
+    std::string path = "executors[" + std::to_string(i) + "]";
+    if (!isKnownOwnerKind(executor.kind))
+      return invalid(path + ".kind: unknown owner kind '" + executor.kind +
+                     "'");
+    for (const std::string &refined : executor.refines)
+      if (!isKnownOwnerKind(refined))
+        return invalid(path + ".refines: unknown owner kind '" + refined + "'");
+    if (executor.concurrency == 0)
+      return invalid(path + ".concurrency: must be positive");
+    if (executor.parent && !model.findExecutor(*executor.parent))
+      return invalid(path + ".parent: unknown executor '" + *executor.parent +
+                     "'");
+  }
+
+  // Containment must be acyclic: walk each executor's parent chain.
+  for (size_t i = 0; i < model.executors.size(); ++i) {
+    const ExecutorNode *current = &model.executors[i];
+    llvm::SmallPtrSet<const ExecutorNode *, 8> visited;
+    while (current) {
+      if (!visited.insert(current).second)
+        return invalid("executors[" + std::to_string(i) +
+                       "].parent: containment cycle");
+      if (!current->parent)
+        break;
+      current = model.findExecutor(*current->parent);
+    }
+  }
+
+  for (size_t i = 0; i < model.memories.size(); ++i) {
+    const MemoryNode &memory = model.memories[i];
+    std::string path = "memories[" + std::to_string(i) + "]";
+    if (!isKnownMemoryKind(memory.kind))
+      return invalid(path + ".kind: unknown memory kind '" + memory.kind + "'");
+    if (!model.findExecutor(memory.visibleFrom))
+      return invalid(path + ".visible_from: unknown executor '" +
+                     memory.visibleFrom + "'");
+    if (memory.capacityBytes == 0)
+      return invalid(path + ".capacity_bytes: must be positive");
+    if (memory.alignmentBytes == 0)
+      return invalid(path + ".alignment_bytes: must be positive");
+  }
+
+  for (size_t i = 0; i < model.computes.size(); ++i) {
+    const ComputeNode &compute = model.computes[i];
+    std::string path = "compute[" + std::to_string(i) + "]";
+    if (!isKnownComputeKind(compute.kind))
+      return invalid(path + ".kind: unknown capability kind '" + compute.kind +
+                     "'");
+    if (!model.findExecutor(compute.attachedTo))
+      return invalid(path + ".attached_to: unknown executor '" +
+                     compute.attachedTo + "'");
+    if (compute.concurrency == 0)
+      return invalid(path + ".concurrency: must be positive");
+    if (compute.shapes.empty())
+      return invalid(path + ".shapes: must not be empty");
+    for (const std::vector<int64_t> &shape : compute.shapes) {
+      if (shape.empty())
+        return invalid(path + ".shapes: shape must not be empty");
+      for (int64_t extent : shape)
+        if (extent <= 0)
+          return invalid(path + ".shapes: extent must be positive");
+    }
+  }
+
+  for (size_t i = 0; i < model.transferEngines.size(); ++i) {
+    const TransferEngineNode &engine = model.transferEngines[i];
+    std::string path = "transfer_engines[" + std::to_string(i) + "]";
+    if (!isKnownTransferKind(engine.kind))
+      return invalid(path + ".kind: unknown transfer kind '" + engine.kind +
+                     "'");
+    if (!model.findExecutor(engine.attachedTo))
+      return invalid(path + ".attached_to: unknown executor '" +
+                     engine.attachedTo + "'");
+    if (engine.count == 0)
+      return invalid(path + ".count: must be positive");
+    if (engine.maxOutstanding == 0)
+      return invalid(path + ".max_outstanding: must be positive");
+  }
+
+  for (size_t i = 0; i < model.links.size(); ++i) {
+    const LinkEdge &link = model.links[i];
+    std::string path = "links[" + std::to_string(i) + "]";
+    if (!model.findMemory(link.source))
+      return invalid(path + ".source: unknown memory '" + link.source + "'");
+    if (!model.findMemory(link.destination))
+      return invalid(path + ".destination: unknown memory '" +
+                     link.destination + "'");
+    if (link.bandwidthBytesPerCycle <= 0.0)
+      return invalid(path + ".bandwidth_bytes_per_cycle: must be positive");
+    if (link.transactionBytes == 0)
+      return invalid(path + ".transaction_bytes: must be positive");
+    if (link.concurrency == 0)
+      return invalid(path + ".concurrency: must be positive");
+    for (const std::string &engine : link.transferEngines)
+      if (!model.findTransferEngine(engine))
+        return invalid(path + ".transfer_engines: unknown transfer engine '" +
+                       engine + "'");
+  }
+
+  return llvm::Error::success();
 }
 
 } // namespace mlir::llk::machine

@@ -2,6 +2,8 @@
 
 #include "LLK/Machine/MachineModel.h"
 
+#include "llvm/Support/Error.h"
+
 #include <gtest/gtest.h>
 
 #include <string>
@@ -9,6 +11,15 @@
 using namespace mlir::llk::machine;
 
 namespace {
+
+/// True when the model passes verification.
+bool verifies(const MachineModel &model) {
+  if (llvm::Error error = verifyMachineModel(model)) {
+    llvm::consumeError(std::move(error));
+    return false;
+  }
+  return true;
+}
 
 MachineModel twoCoreMachine() {
   MachineModel model;
@@ -94,4 +105,86 @@ TEST(MachineModel, ContentHashDistinguishesContent) {
   MachineModel b = twoCoreMachine();
   b.memories[0].capacityBytes += 1;
   EXPECT_NE(computeContentHash(a), computeContentHash(b));
+}
+
+TEST(MachineModel, VerifyAcceptsTheTwoCoreMachine) {
+  EXPECT_TRUE(verifies(twoCoreMachine()));
+}
+
+TEST(MachineModel, VerifyRejectsUnknownSchemaMajor) {
+  MachineModel model = twoCoreMachine();
+  model.schemaMajor = 1;
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsEmptyTarget) {
+  MachineModel model = twoCoreMachine();
+  model.target.clear();
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsDuplicateIds) {
+  MachineModel model = twoCoreMachine();
+  model.memories[0].id = "core.0"; // collides with an executor
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsUnknownExecutorKind) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].kind = "warp_group";
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsMissingParent) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].parent = "nope.0";
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsContainmentCycle) {
+  MachineModel model = twoCoreMachine();
+  model.executors[0].parent = "core.0"; // package.0 -> core.0 -> package.0
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsZeroCapacity) {
+  MachineModel model = twoCoreMachine();
+  model.memories[0].capacityBytes = 0;
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsUnknownMemoryKind) {
+  MachineModel model = twoCoreMachine();
+  model.memories[0].kind = "hbm";
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsInvisibleFromNonExecutor) {
+  MachineModel model = twoCoreMachine();
+  model.memories[0].visibleFrom = "nope.0";
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsDanglingAttachment) {
+  MachineModel model = twoCoreMachine();
+  model.computes[0].attachedTo = "nope.0";
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsDanglingLink) {
+  MachineModel model = twoCoreMachine();
+  model.links[0].destination = "l1.9";
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsZeroBandwidthLink) {
+  MachineModel model = twoCoreMachine();
+  model.links[0].bandwidthBytesPerCycle = 0.0;
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsDanglingLinkEngine) {
+  MachineModel model = twoCoreMachine();
+  model.links[0].transferEngines = {"nope.0"};
+  EXPECT_FALSE(verifies(model));
 }
