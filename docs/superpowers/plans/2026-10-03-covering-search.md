@@ -126,3 +126,19 @@ public:
 **Non-scope:** binding the plan to Micro-IR (D7 / #50 revision), latency calibration (#52), and the `micro-perf` evaluator (#46) — D6 ranks by declared lower bounds plus connection cost.
 
 **Type consistency:** `CoveringPlan`, `CandidateInstance`, `ConnectionPlan`, `Cost`, `PlanDiagnostics` are D1 types used unchanged; `MappingTarget` is D4's; `enumeratePlacements`/`synthesizeConnections` are D5's.
+
+## Verification Results (2026-10-03)
+
+- **Build:** `ninja -C build` — clean.
+- **New tests:** `MappingCoveringSearchTest` **8/8**.
+- **Full suite:** `ctest --test-dir build --output-on-failure` — 100 registered, **98 passed, 2 skipped, 0 failed**.
+- **Deprecated-API audit:** clean.
+
+### Decisions taken while implementing
+
+1. **The three modes share one table of legal instances.** Candidates and placements are enumerated once, up front; the modes differ only in traversal. That is what makes the beam/exact agreement test meaningful rather than a coincidence.
+2. **Connections are synthesized lazily.** Extending a partial plan immediately tests every edge whose other end is already chosen, so a branch dies at the first incompatible pair rather than at completion.
+3. **The bound is admissible**: accumulated cost plus, per uncovered node, the cheapest available instance. Connection costs are non-negative, so pruning cannot discard the optimum — which is why a wide beam and exact mode agree.
+4. **Capacity accounting counts a bound memory as holding the tile.** Rule `memory` requirements carry no byte count yet, so an instance with no requirement would never trip a budget; accounting `kAssumedValueBytes` per bound memory makes the budget meaningful. The real size arrives with the plan binder.
+5. **`topK` pruning is disclosed.** Exact mode prunes against the kth-best cost once K plans exist; the prune is sound (it cannot drop a plan we would keep) but the space was not exhausted, so `searchTruncated` is set. Deterministic mode's early stop is *not* truncation — returning the first legal plan is its definition.
+6. **A connection's byte count is an assumption** (`kAssumedValueBytes`), because a `WorkloadPort` does not yet carry the value's size. Every plan is costed the same way, so ranking is unaffected; the plan binder replaces it.
