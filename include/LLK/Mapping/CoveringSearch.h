@@ -70,6 +70,8 @@ struct MappingSearchOptions {
 /// Why no complete plan was found (design §16.5), counted per category. The
 /// counts are deterministic: the same graph always produces the same numbers.
 struct FailureFrontier {
+  /// Nodes with no rule in effect: either no rule names the operation, or every
+  /// rule that names it was rejected by its `require` constraints.
   uint64_t nodesWithoutRules = 0;
   uint64_t candidatesWithoutPlacement = 0;
   uint64_t incompatibleInstancePairs = 0;

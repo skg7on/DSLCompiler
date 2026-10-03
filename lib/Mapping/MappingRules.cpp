@@ -761,11 +761,22 @@ LayoutContext ruleLayoutContext(const WorkloadNode &node,
   return context;
 }
 
+/// Adds every identifier an expression references to `out`, so a rule can tell
+/// which of its parameters a constraint actually derives.
+void collectIdentifiers(const Expr &expr, llvm::StringSet<> &out) {
+  if (expr.kind == ExprKind::Ident)
+    out.insert(expr.text);
+  for (const ExprPtr &operand : expr.operands)
+    collectIdentifiers(*operand, out);
+}
+
 /// The result of evaluating a rule's `require` constraints against one node:
 /// whether some assignment of the rule's declared parameters satisfies every
-/// constraint, why not when none does, and the satisfying assignment.
+/// constraint, why not when none does, whether the bounded enumeration was cut
+/// off before it could decide, and the satisfying assignment.
 struct RuleResolution {
   bool matched = true;
+  bool truncated = false;
   std::string reason;
   llvm::StringMap<SearchValue> parameters;
 };
@@ -775,6 +786,11 @@ struct RuleResolution {
 /// no constraints binds nothing. Fails the match -- never the search -- when no
 /// assignment satisfies a constraint, or when a constraint cannot be evaluated
 /// from the facts the node and context supply.
+///
+/// Only parameters a constraint references are recorded; a declared but
+/// unconstrained parameter is not derived, so it never lands in the result.
+/// Hitting the assignment cap sets `truncated`: a rule whose space was not
+/// exhausted was not proven unsatisfiable.
 RuleResolution resolveRuleConstraints(const RuleDef &rule,
                                       const WorkloadNode &node,
                                       const machine::MachineModel &machine,
@@ -795,6 +811,11 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
     enumerable.push_back(&param);
   }
 
+  // The parameters a constraint actually derives: only these are recorded.
+  llvm::StringSet<> referenced;
+  for (const ExprPtr &constraint : rule.constraints)
+    collectIdentifiers(*constraint, referenced);
+
   auto domainOf = [&](const LayoutParam &param) -> const ParamDomain & {
     return rule.domains.find(param.name)->second;
   };
@@ -807,8 +828,10 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
   while (!exhausted) {
     if (assignments >= kMaxRuleAssignments) {
       result.matched = false;
-      result.reason = "constraint space exceeds " +
-                      std::to_string(kMaxRuleAssignments) + " assignments";
+      result.truncated = true;
+      result.reason = "require constraint search exceeded " +
+                      std::to_string(kMaxRuleAssignments) +
+                      " assignments without proving the rule unsatisfiable";
       return result;
     }
 
@@ -835,7 +858,8 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
 
     if (satisfied) {
       for (const auto &entry : bindings)
-        result.parameters[entry.first().str()] = entry.second;
+        if (referenced.contains(entry.first()))
+          result.parameters[entry.first().str()] = entry.second;
       return result;
     }
 
@@ -861,7 +885,8 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
 std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
-                   const LayoutContext &context, std::string *reason) {
+                   const LayoutContext &context, std::string *reason,
+                   bool *truncated) {
   RuleResolution resolution =
       resolveRuleConstraints(rule, node, machine, context);
   if (!resolution.matched) {
@@ -869,6 +894,8 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
       *reason = resolution.reason.empty()
                     ? std::string("require constraints not satisfied")
                     : resolution.reason;
+    if (truncated)
+      *truncated = resolution.truncated;
     return std::nullopt;
   }
 

@@ -538,9 +538,23 @@ TEST(RuleMatch, BuildsAMappingCandidate) {
 
 namespace {
 
-/// Defined with the port-data predicate helpers below; declared here so these
-/// constraint tests can build a node that exposes an element type.
-WorkloadNode typedVectorNode(mlir::Type inputType, mlir::Type outputType);
+/// A `micro.vector` node with one input and one output carrying `inputType` and
+/// `outputType`. The port-data predicates read these types, and a rule's
+/// constraints read them as `element_type`.
+WorkloadNode typedVectorNode(mlir::Type inputType, mlir::Type outputType) {
+  WorkloadNode node;
+  node.id = 21;
+  node.opName = "micro.vector";
+  WorkloadPort input;
+  input.value = 1;
+  input.type = inputType;
+  WorkloadPort output;
+  output.value = 2;
+  output.type = outputType;
+  node.inputs.push_back(input);
+  node.outputs.push_back(output);
+  return node;
+}
 
 /// A machine whose `vector_engine` models `f32` at `f32Lanes` elements per
 /// instruction, which is what `machine.compute("vector_engine").lanes(...)`
@@ -651,28 +665,78 @@ rule r.plain {
   EXPECT_TRUE(candidate->resolvedParameters.empty());
 }
 
+TEST(RuleMatch, RecordsOnlyParametersAConstraintDerives) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.two {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  param T in [1..2];
+  require VW == machine.compute("vector_engine").lanes(element_type);
+  input "operand0";
+  output "result";
+  bundle "b.two";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.two");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  LayoutContext layoutContext;
+  layoutContext.elementType = "f32";
+  std::optional<MappingCandidate> candidate =
+      toMappingCandidate(*rule, typedVectorNode(f32, f32),
+                         machineWithVectorLanes(8), layoutContext);
+  ASSERT_TRUE(candidate.has_value());
+  // VW is derived by the constraint; T is referenced by no constraint, so it is
+  // not "derived" and must not enter the candidate's canonical content.
+  ASSERT_EQ(candidate->resolvedParameters.count("VW"), 1u);
+  EXPECT_EQ(std::get<int64_t>(candidate->resolvedParameters.lookup("VW")), 8);
+  EXPECT_EQ(candidate->resolvedParameters.count("T"), 0u);
+}
+
+TEST(RuleMatch, ATruncatedConstraintSearchIsReportedNotSilentlyRejected) {
+  mlir::MLIRContext context;
+  // A domain larger than the assignment cap, with a constraint no assignment
+  // satisfies: the search is cut off before it can prove the rule
+  // unsatisfiable, so the non-match reports truncation rather than silently
+  // concluding the rule does not apply.
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.big {
+  match micro.vector();
+  param A in [1..400];
+  param B in [1..400];
+  require A == 999999;
+  input "operand0";
+  output "result";
+  bundle "b.big";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.big");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  bool truncated = false;
+  std::string reason;
+  std::optional<MappingCandidate> candidate =
+      toMappingCandidate(*rule, typedVectorNode(f32, f32), MachineModel{},
+                         LayoutContext{}, &reason, &truncated);
+  EXPECT_FALSE(candidate.has_value());
+  EXPECT_TRUE(truncated);
+  EXPECT_FALSE(reason.empty());
+}
+
 //===----------------------------------------------------------------------===//
 // Port-data predicates: element type, shape, and affine map (design §14.1)
 //===----------------------------------------------------------------------===//
 
 namespace {
-
-/// A `micro.vector` node with one input and one output carrying `inputType` and
-/// `outputType`. These predicates read port data, not attributes.
-WorkloadNode typedVectorNode(mlir::Type inputType, mlir::Type outputType) {
-  WorkloadNode node;
-  node.id = 21;
-  node.opName = "micro.vector";
-  WorkloadPort input;
-  input.value = 1;
-  input.type = inputType;
-  WorkloadPort output;
-  output.value = 2;
-  output.type = outputType;
-  node.inputs.push_back(input);
-  node.outputs.push_back(output);
-  return node;
-}
 
 /// Renders the matched rule ids, in registry order.
 llvm::Expected<RuleRegistry> parseOne(llvm::StringRef match) {

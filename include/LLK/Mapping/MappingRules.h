@@ -167,13 +167,22 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
 /// facts the node does not carry). No assignment of the rule's declared
 /// parameters satisfies a constraint, or a constraint cannot be evaluated from
 /// the available facts, yields `std::nullopt` -- a non-match, never an error.
-/// On a match, the satisfying assignment is recorded in the candidate's
-/// `resolvedParameters`. When `reason` is given it receives why the rule did
-/// not match.
+///
+/// On a match, the candidate's `resolvedParameters` records the satisfying
+/// value of every parameter that appears in a `require` constraint. A parameter
+/// no constraint references is not "derived" and is omitted, so the map holds
+/// only values the rule actually computed.
+///
+/// When `reason` is given it receives why the rule did not match. When
+/// `truncated` is given, it is set true if the match failed because the
+/// bounded parameter enumeration hit its assignment cap -- a possibly
+/// satisfiable rule that was not fully explored -- so a caller can report the
+/// search as truncated rather than concluding no match.
 std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
-                   const LayoutContext &context, std::string *reason = nullptr);
+                   const LayoutContext &context, std::string *reason = nullptr,
+                   bool *truncated = nullptr);
 
 } // namespace mlir::llk::mapping
 

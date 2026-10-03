@@ -231,10 +231,20 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   if (!result)
     return result.takeError();
   run.result = std::move(*result);
-  if (run.result.plans.empty())
-    return llvm::createStringError(
-        llvm::inconvertibleErrorCode(),
-        (passName + ": the search produced no complete plan").str());
+  if (run.result.plans.empty()) {
+    // The frontier explains why no plan was found -- unmatched nodes, rejected
+    // rules, and their reasons -- so the failure is diagnosable rather than a
+    // bare "no plan". A truncated search is called out separately: no plan
+    // under a cap does not mean the graph is unmappable (design §16.2).
+    std::string message =
+        (passName + ": the search produced no complete plan").str();
+    if (run.result.searchTruncated)
+      message += " (a search cap was hit)";
+    for (const std::string &detail : run.result.frontier.messages)
+      message += "\n  " + detail;
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   std::move(message));
+  }
   return std::move(run);
 }
 

@@ -167,13 +167,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     }
     // A rule whose `require` constraints no assignment satisfies produces no
     // candidate: that is a non-match, so a node with only such rules has no
-    // rule in effect and is counted once, below.
+    // rule in effect and is counted under `nodesWithoutRules` once, below. If
+    // the constraint search hit its cap the match was not proven false, so the
+    // result is reported as truncated rather than silently treated as absent.
     bool producedCandidate = false;
     for (const RuleDef *rule : matches) {
       std::string reason;
-      std::optional<MappingCandidate> candidate =
-          toMappingCandidate(*rule, *node, machine, layoutContext_, &reason);
+      bool truncated = false;
+      std::optional<MappingCandidate> candidate = toMappingCandidate(
+          *rule, *node, machine, layoutContext_, &reason, &truncated);
       if (!candidate) {
+        if (truncated)
+          result.searchTruncated = true;
         result.frontier.messages.push_back("node " + std::to_string(node->id) +
                                            ": rule '" + rule->id +
                                            "' not applicable: " + reason);

@@ -240,6 +240,39 @@ TEST(CoveringSearch, ReportsCandidatesWithoutPlacement) {
   EXPECT_EQ(result->frontier.candidatesWithoutPlacement, 2u);
 }
 
+TEST(CoveringSearch, ReportsARuleWhoseConstraintSearchWasTruncated) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  // A rule whose parameter space exceeds the assignment cap, with a constraint
+  // no assignment satisfies. The rule is not proven inapplicable, so the
+  // search is truncated rather than silently reporting "no matching rule".
+  constexpr llvm::StringLiteral kBigRule = R"llkmap(
+rule r.big {
+  match micro.vector(op = "add");
+  param A in [1..400];
+  param B in [1..400];
+  require A == 999999;
+  bundle "b.big";
+  emit "e1";
+}
+)llkmap";
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kBigRule);
+  ASSERT_NE(target, nullptr);
+
+  CoveringSearch search(graph, *target, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(result->searchTruncated);
+  EXPECT_EQ(result->frontier.nodesWithoutRules, 2u);
+  ASSERT_FALSE(result->frontier.messages.empty());
+  // The cap reason reaches the frontier, where the pass surfaces it.
+  bool mentionsCap = false;
+  for (const std::string &message : result->frontier.messages)
+    mentionsCap |= message.find("assignments") != std::string::npos;
+  EXPECT_TRUE(mentionsCap);
+}
+
 TEST(CoveringSearch, WideBeamAndExactAgreeOnTheBestPlan) {
   mlir::MLIRContext context;
   WorkloadGraph graph = twoNodeGraph(context);
