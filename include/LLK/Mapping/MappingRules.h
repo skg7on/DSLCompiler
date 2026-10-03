@@ -156,6 +156,14 @@ llvm::Expected<RuleRegistry> parseRuleText(llvm::StringRef text,
 /// Reads and parses the file at `path`.
 llvm::Expected<RuleRegistry> loadRuleFile(llvm::StringRef path);
 
+/// Renders one `rule` declaration as LLKMap text that re-parses to an equal
+/// `RuleDef` (design §25.3): id and version, match clause with every predicate
+/// kind, parameters and their domains, expression/kind/layout requirements,
+/// ports, the bundle and its typed parameters (in their canonical name order),
+/// the emitter key, and the cost when declared. Deterministic: two calls on the
+/// same value produce identical bytes.
+std::string printRule(const RuleDef &def);
+
 //===----------------------------------------------------------------------===//
 // One-operation matching (design §14.2)
 //===----------------------------------------------------------------------===//

@@ -624,6 +624,97 @@ std::string canonicalRuleDefString(const RuleDef &def) {
 
 } // namespace
 
+//===----------------------------------------------------------------------===//
+// Source-faithful printing (design §25.3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The `input[i].` / `output[i].` subject a port predicate was written with, or
+/// empty for an unqualified predicate.
+std::string printPredicateSubject(const RulePredicate &predicate) {
+  if (!predicate.directionSet)
+    return {};
+  return (predicate.isInput ? "input[" : "output[") +
+         std::to_string(predicate.portIndex) + "].";
+}
+
+std::string printPredicate(const RulePredicate &predicate) {
+  std::string subject = printPredicateSubject(predicate);
+  switch (predicate.kind) {
+  case RulePredicateKind::Attribute:
+    return predicate.attribute + " = " + printValue(predicate.value);
+  case RulePredicateKind::ElementType:
+    return subject + "element_type = " + printValue(predicate.value);
+  case RulePredicateKind::Shape:
+    return subject + "shape[" + std::to_string(predicate.dimension) +
+           "] = " + printValue(predicate.value);
+  case RulePredicateKind::AccessMap:
+    return subject + "access_map = " +
+           (predicate.accessMap ? printAffineMapSpec(*predicate.accessMap)
+                                : std::string("<null>"));
+  }
+  return {};
+}
+
+} // namespace
+
+std::string printRule(const RuleDef &def) {
+  std::string out =
+      "rule " + def.id + " v" + std::to_string(def.version) + " {\n";
+
+  out += "  match " + def.matchOp + "(";
+  for (size_t index = 0; index < def.predicates.size(); ++index) {
+    if (index)
+      out += ", ";
+    out += printPredicate(def.predicates[index]);
+  }
+  out += ");\n";
+
+  // A rule declares a parameter through its `param ... in ...` statement, so
+  // emit them in `params` order to keep that order on re-parse.
+  for (const LayoutParam &param : def.params) {
+    auto domain = def.domains.find(param.name);
+    if (domain == def.domains.end())
+      continue;
+    out += "  param " + param.name + " in " + printParamDomain(domain->second) +
+           ";\n";
+  }
+  for (const ExprPtr &constraint : def.constraints) {
+    out += "  require ";
+    out += constraint ? printExpr(*constraint) : "<null>";
+    out += ";\n";
+  }
+  for (const KindRequirement &requirement : def.kindRequirements)
+    out +=
+        "  require " + requirement.role + " kind " + requirement.kind + ";\n";
+  for (const RuleLayoutRequirement &requirement : def.layoutRequirements)
+    out += "  require layout " + requirement.port + " satisfies " +
+           requirement.layoutId + ";\n";
+  for (const RulePort &port : def.ports)
+    out += "  " + std::string(port.isInput ? "input" : "output") + " \"" +
+           port.name + "\";\n";
+
+  out += "  bundle \"" + def.bundle + "\"";
+  if (!def.bundleParameters.empty()) {
+    out += " {";
+    for (size_t index = 0; index < def.bundleParameters.size(); ++index) {
+      if (index)
+        out += ",";
+      out += " " + def.bundleParameters[index].first + " = " +
+             printValue(def.bundleParameters[index].second);
+    }
+    out += " }";
+  }
+  out += ";\n";
+
+  out += "  emit \"" + def.emitter + "\";\n";
+  if (def.costLowerBound)
+    out += "  cost " + std::to_string(*def.costLowerBound) + ";\n";
+  out += "}\n";
+  return out;
+}
+
 bool RuleRegistry::add(RuleDef def, std::string &error) {
   if (find(def.id)) {
     error = "duplicate rule id '" + def.id + "'";

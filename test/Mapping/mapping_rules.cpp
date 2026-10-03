@@ -449,6 +449,8 @@ constexpr llvm::StringLiteral kShippedLayouts =
     LLK_MAPPING_DIR "/x86-avx2/layouts.llkmap";
 constexpr llvm::StringLiteral kShippedRules =
     LLK_MAPPING_DIR "/x86-avx2/rules.llkmap";
+constexpr llvm::StringLiteral kShippedGenericRules =
+    LLK_MAPPING_DIR "/generic-ai-accel/rules.llkmap";
 constexpr llvm::StringLiteral kInvalidRules =
     LLK_MAPPING_DIR "/../test/Mapping/Inputs/invalid-rules.llkmap";
 
@@ -500,6 +502,93 @@ TEST(MappingTarget, RejectsTheInvalidRuleFixture) {
   EXPECT_FALSE(static_cast<bool>(registry));
   if (!registry)
     llvm::consumeError(registry.takeError());
+}
+
+//===----------------------------------------------------------------------===//
+// Printing and round-trip (design §25.3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Prints every rule in `registry`, re-parses the text, and returns the
+/// re-parsed content hash -- or `std::nullopt` when the printed text does not
+/// parse. The hash folds every field that shapes a rule, so hash equality is
+/// the structural round-trip comparison.
+std::optional<uint64_t> roundTripRules(const RuleRegistry &registry) {
+  std::string text;
+  for (const RuleDef &def : registry.all())
+    text += printRule(def);
+  llvm::Expected<RuleRegistry> reparsed = parseRuleText(text, "<round-trip>");
+  if (!reparsed) {
+    llvm::consumeError(reparsed.takeError());
+    return std::nullopt;
+  }
+  return reparsed->computeContentHash();
+}
+
+} // namespace
+
+TEST(RulePrint, RoundTripsEveryConstruct) {
+  // A version suffix, attribute/port predicates of every kind, integer and
+  // symbolic domains, a machine-query and a quantified constraint, both
+  // requirement kinds, ports, a bundle with typed parameters, and a cost.
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule t.everything v3 {
+  match micro.mma(op = "mul", input[0].element_type = bf16, output[1].shape[0] = 64, input[0].access_map = (d0, d1) -> (d1, d0), shape[2] = 8);
+  param VW in [4..8];
+  param policy in {"a", "b"};
+  require VW == machine.compute("vector_engine").lanes(element_type);
+  require forall d in dimensions : d >= 0;
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies avx2.blocked_2d;
+  input "lhs";
+  input "rhs";
+  output "result";
+  bundle "t.bundle" { alpha = 1, beta = "two" };
+  emit "t_emit";
+  cost 9;
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  std::optional<uint64_t> reparsed = roundTripRules(*registry);
+  ASSERT_TRUE(reparsed.has_value())
+      << "printed rule did not parse back:\n"
+      << printRule(*registry->find("t.everything"));
+  EXPECT_EQ(*reparsed, registry->computeContentHash());
+}
+
+TEST(RulePrint, RoundTripsAVersionlessRule) {
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule t.plain {
+  match micro.async_copy();
+  bundle "t.copy";
+  emit "t_copy";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry));
+  std::optional<uint64_t> reparsed = roundTripRules(*registry);
+  ASSERT_TRUE(reparsed.has_value());
+  EXPECT_EQ(*reparsed, registry->computeContentHash());
+}
+
+TEST(RulePrint, RoundTripsShippedFiles) {
+  for (llvm::StringLiteral path : {kShippedRules, kShippedGenericRules}) {
+    llvm::Expected<RuleRegistry> registry = loadRuleFile(path);
+    ASSERT_TRUE(static_cast<bool>(registry))
+        << path.str() << ": " << llvm::toString(registry.takeError());
+    std::optional<uint64_t> reparsed = roundTripRules(*registry);
+    ASSERT_TRUE(reparsed.has_value()) << path.str();
+    EXPECT_EQ(*reparsed, registry->computeContentHash()) << path.str();
+  }
+}
+
+TEST(RulePrint, PrintingIsDeterministic) {
+  llvm::Expected<RuleRegistry> registry = loadRuleFile(kShippedRules);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  for (const RuleDef &def : registry->all())
+    EXPECT_EQ(printRule(def), printRule(def)) << def.id;
 }
 
 //===----------------------------------------------------------------------===//

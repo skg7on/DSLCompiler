@@ -978,4 +978,84 @@ std::string canonicalValueString(const LayoutValue &value) {
   return "s:" + std::to_string(text.size()) + ":" + text;
 }
 
+//===----------------------------------------------------------------------===//
+// Source-faithful printing
+//===----------------------------------------------------------------------===//
+
+std::string printValue(const LayoutValue &value) {
+  if (const int64_t *integer = std::get_if<int64_t>(&value))
+    return std::to_string(*integer);
+  // A symbolic value is quoted so any name re-lexes as a string literal, never
+  // as a keyword or a number.
+  return "\"" + std::get<std::string>(value) + "\"";
+}
+
+namespace {
+
+/// True when `expr` prints as a compound the printer parenthesizes, so a
+/// surrounding construct cannot re-associate it on re-parse.
+bool isCompoundExpr(const Expr &expr) {
+  return expr.kind == ExprKind::Unary || expr.kind == ExprKind::Binary ||
+         expr.kind == ExprKind::Quantifier;
+}
+
+std::string printExprNode(const ExprPtr &expr) {
+  return expr ? printExpr(*expr) : "<null>";
+}
+
+} // namespace
+
+std::string printExpr(const Expr &expr) {
+  switch (expr.kind) {
+  case ExprKind::IntLit:
+    return std::to_string(expr.intValue);
+  case ExprKind::StringLit:
+    return "\"" + expr.text + "\"";
+  case ExprKind::Ident:
+    return expr.text;
+  case ExprKind::Call: {
+    std::string out = expr.text + "(";
+    for (size_t index = 0; index < expr.operands.size(); ++index) {
+      if (index)
+        out += ", ";
+      out += printExprNode(expr.operands[index]);
+    }
+    out += ")";
+    return out;
+  }
+  case ExprKind::MemberCall: {
+    // `operands[0]` is the receiver; the rest are the member's arguments.
+    std::string receiver = expr.operands.empty()
+                               ? std::string("<null>")
+                               : printExprNode(expr.operands.front());
+    if (!expr.operands.empty() && isCompoundExpr(*expr.operands.front()))
+      receiver = "(" + receiver + ")";
+    std::string out = receiver + "." + expr.text;
+    if (expr.operands.size() > 1) {
+      out += "(";
+      for (size_t index = 1; index < expr.operands.size(); ++index) {
+        if (index > 1)
+          out += ", ";
+        out += printExprNode(expr.operands[index]);
+      }
+      out += ")";
+    }
+    return out;
+  }
+  case ExprKind::Unary:
+    return "(" + expr.text + printExprNode(expr.operands[0]) + ")";
+  case ExprKind::Binary:
+    return "(" + printExprNode(expr.operands[0]) + " " + expr.text + " " +
+           printExprNode(expr.operands[1]) + ")";
+  case ExprKind::Quantifier:
+    // operands: [bound-variable Ident, domain, body]. The body is always
+    // compound or a single primary, so the greedy re-parse cannot absorb a
+    // following operator.
+    return "(" + expr.text + " " + printExprNode(expr.operands[0]) + " in " +
+           printExprNode(expr.operands[1]) + " : " +
+           printExprNode(expr.operands[2]) + ")";
+  }
+  return {};
+}
+
 } // namespace mlir::llk::mapping

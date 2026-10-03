@@ -82,6 +82,19 @@ std::string canonicalExprString(const Expr &expr);
 /// changes its content hash.
 std::string canonicalValueString(const LayoutValue &value);
 
+/// Source-faithful rendering of `expr` as LLKMap text: the inverse of the
+/// expression grammar above, so `parseExpr(printExpr(e))` is structurally `e`.
+/// Compound nodes (unary, binary, quantifier) are parenthesized, which keeps
+/// the tree exactly and stops a quantifier's greedy body from swallowing a
+/// following operator. Deterministic and dependency-free.
+std::string printExpr(const Expr &expr);
+
+/// Source-faithful rendering of a value: integers bare, strings quoted, so the
+/// result re-parses to the same value wherever a literal is accepted (a
+/// predicate value, a domain member, a bundle parameter). The kind survives the
+/// round trip, unlike `canonicalValueString`'s type tags.
+std::string printValue(const LayoutValue &value);
+
 /// The result of evaluating an expression. `Handle` is the intermediate value
 /// a `machine.compute(...)` / `machine.memory(...)` query produces before a
 /// member query is applied; it never escapes as a solution value.

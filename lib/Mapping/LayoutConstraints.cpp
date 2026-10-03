@@ -260,6 +260,85 @@ std::string canonicalAffineMapSpecString(const AffineMapSpec &spec) {
   return out;
 }
 
+//===----------------------------------------------------------------------===//
+// Source-faithful printing (design §25.3)
+//===----------------------------------------------------------------------===//
+
+std::string printAffineMapSpec(const AffineMapSpec &spec) {
+  std::string out = "(";
+  for (size_t index = 0; index < spec.dims.size(); ++index) {
+    if (index)
+      out += ", ";
+    out += spec.dims[index];
+  }
+  out += ") -> (";
+  for (size_t index = 0; index < spec.results.size(); ++index) {
+    if (index)
+      out += ", ";
+    out += spec.results[index] ? printExpr(*spec.results[index]) : "<null>";
+  }
+  out += ")";
+  return out;
+}
+
+std::string printParamDomain(const ParamDomain &domain) {
+  // A non-empty contiguous ascending integer run prints as a range; every other
+  // domain (symbolic, sparse, or unordered) prints as an enum. Both re-parse to
+  // the identical value list.
+  bool isRun = !domain.values.empty();
+  const int64_t *previous = nullptr;
+  for (const LayoutValue &value : domain.values) {
+    const int64_t *integer = std::get_if<int64_t>(&value);
+    if (!integer || (previous && *integer != *previous + 1)) {
+      isRun = false;
+      break;
+    }
+    previous = integer;
+  }
+  if (isRun)
+    return "[" + std::to_string(std::get<int64_t>(domain.values.front())) +
+           ".." + std::to_string(std::get<int64_t>(domain.values.back())) + "]";
+
+  std::string out = "{";
+  for (size_t index = 0; index < domain.values.size(); ++index) {
+    if (index)
+      out += ", ";
+    out += printValue(domain.values[index]);
+  }
+  out += "}";
+  return out;
+}
+
+std::string printLayout(const LayoutDef &def) {
+  std::string out = "layout " + def.id + "(";
+  for (size_t index = 0; index < def.params.size(); ++index) {
+    if (index)
+      out += ", ";
+    out += def.params[index].symbolic ? "sym " : "int ";
+    out += def.params[index].name;
+  }
+  out += ") {\n";
+  // Domains follow parameter declaration order so `params` round-trips
+  // order-for-order (the domain map is canonical by name, so its own order is
+  // not semantic). A parameter with no domain is still declared by the header.
+  for (const LayoutParam &param : def.params) {
+    auto domain = def.domains.find(param.name);
+    if (domain == def.domains.end())
+      continue;
+    out += "  param " + param.name + " in " + printParamDomain(domain->second) +
+           ";\n";
+  }
+  for (const ExprPtr &constraint : def.constraints) {
+    out += "  require ";
+    out += constraint ? printExpr(*constraint) : "<null>";
+    out += ";\n";
+  }
+  if (def.map)
+    out += "  map " + printAffineMapSpec(*def.map) + ";\n";
+  out += "}\n";
+  return out;
+}
+
 namespace {
 
 /// Canonical rendering of one layout declaration: every field that shapes the

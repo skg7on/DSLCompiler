@@ -421,6 +421,8 @@ TEST(LayoutSolve, RespectsMaxSolutionsAndDisclosesIt) {
 namespace {
 constexpr llvm::StringLiteral kShippedLayouts =
     LLK_MAPPING_DIR "/x86-avx2/layouts.llkmap";
+constexpr llvm::StringLiteral kShippedGenericLayouts =
+    LLK_MAPPING_DIR "/generic-ai-accel/layouts.llkmap";
 constexpr llvm::StringLiteral kInvalidLayouts =
     LLK_MAPPING_DIR "/../test/Mapping/Inputs/invalid-layouts.llkmap";
 } // namespace
@@ -480,6 +482,93 @@ TEST(LayoutShipped, RejectsTheInvalidFixture) {
   EXPECT_FALSE(static_cast<bool>(registry));
   if (!registry)
     llvm::consumeError(registry.takeError());
+}
+
+//===----------------------------------------------------------------------===//
+// Printing and round-trip (design §25.3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Prints every declaration in `registry`, re-parses the text, and returns the
+/// re-parsed content hash -- or `std::nullopt` when the printed text does not
+/// parse. Comparing content hashes is the structural-equality check: the hash
+/// folds every field that shapes a declaration.
+std::optional<uint64_t> roundTripLayouts(const LayoutRegistry &registry) {
+  std::string text;
+  for (const LayoutDef &def : registry.all())
+    text += printLayout(def);
+  llvm::Expected<LayoutRegistry> reparsed =
+      parseLayoutText(text, "<round-trip>");
+  if (!reparsed) {
+    llvm::consumeError(reparsed.takeError());
+    return std::nullopt;
+  }
+  return reparsed->computeContentHash();
+}
+
+} // namespace
+
+TEST(LayoutPrint, RoundTripsEveryConstruct) {
+  // Integer and symbolic parameters, an integer range and a symbolic enum, a
+  // plain and a machine-query constraint, both quantifiers, and an affine map.
+  llvm::Expected<LayoutRegistry> registry = parse(R"llkmap(
+layout t.everything(int M, int N, sym policy) {
+  param M in [2..4];
+  param N in [1..3];
+  param policy in {"row", "col"};
+  require rank == 2;
+  require M == machine.compute("vector_engine").lanes(element_type);
+  require forall d in dimensions : d >= 0;
+  require exists v in domain(N) : v > 1;
+  map (m, n) -> (m, floordiv(n, N), mod(n, N));
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  std::optional<uint64_t> reparsed = roundTripLayouts(*registry);
+  ASSERT_TRUE(reparsed.has_value())
+      << "printed layout did not parse back:\n"
+      << printLayout(*registry->find("t.everything"));
+  EXPECT_EQ(*reparsed, registry->computeContentHash());
+}
+
+TEST(LayoutPrint, RoundTripsBareParameterDeclaration) {
+  llvm::Expected<LayoutRegistry> registry =
+      parse("layout t.bare(N) { param N in [1..2]; }");
+  ASSERT_TRUE(static_cast<bool>(registry));
+  std::optional<uint64_t> reparsed = roundTripLayouts(*registry);
+  ASSERT_TRUE(reparsed.has_value());
+  EXPECT_EQ(*reparsed, registry->computeContentHash());
+}
+
+TEST(LayoutPrint, RoundTripsADomainlessParameter) {
+  // A parameter declared in the header but never given a domain must survive:
+  // the header list, not a domain statement, is what declares it.
+  llvm::Expected<LayoutRegistry> registry =
+      parse("layout t.free(int M, sym tag) { require rank == 1; }");
+  ASSERT_TRUE(static_cast<bool>(registry));
+  std::optional<uint64_t> reparsed = roundTripLayouts(*registry);
+  ASSERT_TRUE(reparsed.has_value());
+  EXPECT_EQ(*reparsed, registry->computeContentHash());
+}
+
+TEST(LayoutPrint, RoundTripsShippedFiles) {
+  for (llvm::StringLiteral path : {kShippedLayouts, kShippedGenericLayouts}) {
+    llvm::Expected<LayoutRegistry> registry = loadLayoutFile(path);
+    ASSERT_TRUE(static_cast<bool>(registry))
+        << path.str() << ": " << llvm::toString(registry.takeError());
+    std::optional<uint64_t> reparsed = roundTripLayouts(*registry);
+    ASSERT_TRUE(reparsed.has_value()) << path.str();
+    EXPECT_EQ(*reparsed, registry->computeContentHash()) << path.str();
+  }
+}
+
+TEST(LayoutPrint, PrintingIsDeterministic) {
+  llvm::Expected<LayoutRegistry> registry = loadLayoutFile(kShippedLayouts);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  for (const LayoutDef &def : registry->all())
+    EXPECT_EQ(printLayout(def), printLayout(def)) << def.id;
 }
 
 //===----------------------------------------------------------------------===//

@@ -63,6 +63,16 @@ struct AffineMapSpec {
 /// order. Shared by layout and rule content hashing.
 std::string canonicalAffineMapSpecString(const AffineMapSpec &spec);
 
+/// Source-faithful rendering of a map clause as `(dims) -> (results)`, the
+/// inverse of the map grammar. Shared by layout and rule printing.
+std::string printAffineMapSpec(const AffineMapSpec &spec);
+
+/// Source-faithful rendering of a declared parameter domain: a contiguous
+/// ascending integer run prints as `[lo..hi]`, anything else as `{...}`. Both
+/// forms re-parse to the same value list, so the printer is deterministic and
+/// faithful without the original spelling being recorded.
+std::string printParamDomain(const ParamDomain &domain);
+
 /// Builds the concrete `mlir::AffineMap` a map clause describes, substituting
 /// `constants` for integer parameters. `spec.dims` become the map's dimensions
 /// in order. Fails when a result references neither a dimension nor a listed
@@ -83,6 +93,13 @@ struct LayoutDef {
   const LayoutParam *findParam(llvm::StringRef name) const;
   bool isSymbolic(llvm::StringRef name) const;
 };
+
+/// Renders one `layout` declaration as LLKMap text that re-parses to an equal
+/// `LayoutDef` (design §25.3). Parameters keep their declaration order; domains
+/// are emitted in the order the parameters appear, with a parameterless-of-
+/// domain parameter still declared by the header list. Deterministic: two calls
+/// on the same value produce identical bytes.
+std::string printLayout(const LayoutDef &def);
 
 /// Loaded layout declarations, keyed by id.
 class LayoutRegistry {
