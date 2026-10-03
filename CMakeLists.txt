@@ -237,6 +237,24 @@ target_link_libraries(LLKPerf PUBLIC LLVMSupport MicroDialect)
 # keeping a single copy of MLIR in every consumer.
 mlir_target_link_libraries(LLKPerf PRIVATE MLIRTensorDialect)
 
+# Library: target-independent mapping data model (issue #80, epic #67 D1).
+# Generic planning types only -- workload graphs, search bindings, plan
+# structures, costs, and stable ids. It must not depend on LLKPerf or any
+# backend: mapping is below performance modeling, and a target package plugs
+# into it rather than the reverse.
+add_library(LLKMapping STATIC
+    lib/Mapping/StableHash.cpp
+)
+target_include_directories(LLKMapping PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+target_link_libraries(LLKMapping PUBLIC LLVMSupport)
+# AffineMap, OperationName, DictionaryAttr, and Type are MLIR IR values used by
+# the workload graph. They are named through mlir_target_link_libraries() so the
+# dylib/archive split stays correct, exactly as LLKPerf does.
+mlir_target_link_libraries(LLKMapping PRIVATE MLIRIR)
+
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -648,6 +666,18 @@ add_llk_perf_test(CandidateBindingTest test/Perf/candidate_binding.cpp)
 # and the persisted record. Uses the shipped machine model, so the model the
 # driver tunes against is the one under test.
 add_llk_perf_test(TuningSessionTest test/Perf/tuning_session.cpp)
+
+# Mapping-engine tests (epic #67, workstream D1). They parse micro IR to build
+# workload graphs, so they follow the same MLIR exec-lib rule as the perf tests:
+# name MLIR components only through LLK_MLIR_EXEC_LIBS, never alongside it.
+function(add_llk_mapping_test test_name test_file)
+  add_llvm_executable(${test_name} ${test_file})
+  target_link_libraries(${test_name} PRIVATE
+      LLKMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+  add_test(NAME ${test_name} COMMAND ${test_name})
+endfunction()
+
+add_llk_mapping_test(MappingStableHashTest test/Mapping/stable_hash.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
