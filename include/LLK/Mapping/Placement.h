@@ -52,11 +52,15 @@ struct PlacementOptions {
 /// declaration order. Returns an empty vector when the candidate cannot be
 /// placed; fails only on a malformed input, such as a layout requirement that
 /// names a layout the target does not declare.
-llvm::Expected<std::vector<CandidateInstance>>
-enumeratePlacements(const MappingCandidate &candidate,
-                    const MappingTarget &target, mlir::MLIRContext &context,
-                    const LayoutContext &layoutContext,
-                    const PlacementOptions &options = {});
+///
+/// When `truncated` is non-null it is set to true if `maxInstances` was
+/// reached. The check is conservative: it also fires when the candidate has
+/// exactly `maxInstances` legal placements, because a caller may not claim
+/// optimality once the cap was touched (design §16.2).
+llvm::Expected<std::vector<CandidateInstance>> enumeratePlacements(
+    const MappingCandidate &candidate, const MappingTarget &target,
+    mlir::MLIRContext &context, const LayoutContext &layoutContext,
+    const PlacementOptions &options = {}, bool *truncated = nullptr);
 
 /// One dataflow edge to connect: where the value is produced, where the
 /// consumer expects it, and whether the two ends want different layouts.
@@ -77,9 +81,13 @@ struct ConnectionRequest {
 /// a transfer plus transform, and one plan per route D2 found -- so a
 /// multi-hop route appears as a transfer whose route has intermediate nodes.
 /// An empty result means the pair is incompatible; it does not fail.
+///
+/// When `truncated` is non-null it is set to true if a route enumeration hit
+/// its cap, so the caller can report truncated search rather than optimality.
 llvm::Expected<std::vector<ConnectionPlan>> synthesizeConnections(
     const ConnectionRequest &request, const machine::MachineModel &machine,
-    const TopologyService &topology, const PlacementOptions &options = {});
+    const TopologyService &topology, const PlacementOptions &options = {},
+    bool *truncated = nullptr);
 
 /// Fan-out (design §15.3): when every consumer reads the producer's memory a
 /// single shared-read plan carries them all; otherwise each consumer gets its

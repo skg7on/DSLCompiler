@@ -163,7 +163,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       MappingCandidate candidate = toMappingCandidate(*rule, *node);
       llvm::Expected<std::vector<CandidateInstance>> instances =
           enumeratePlacements(candidate, target_, context_, layoutContext_,
-                              placementOptions);
+                              placementOptions, &result.searchTruncated);
       if (!instances)
         return instances.takeError();
       if (instances->empty()) {
@@ -277,7 +277,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       request.bytes = kAssumedValueBytes;
       request.alignmentBytes = kAssumedAlignment;
       llvm::Expected<std::vector<ConnectionPlan>> alternatives =
-          synthesizeConnections(request, machine, topology, placementOptions);
+          synthesizeConnections(request, machine, topology, placementOptions,
+                                &result.searchTruncated);
       if (!alternatives) {
         result.frontier.messages.push_back(
             "connection " + request.producerMemory + " -> " +

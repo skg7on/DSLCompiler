@@ -147,6 +147,30 @@ TEST(Routing, RespectsTheLimit) {
       (std::vector<std::string>{"dram_to_l2", "l2_to_sram", "sram_to_acc"}));
 }
 
+TEST(Routing, ReportsTruncationWhenTheRouteCapIsHit) {
+  MachineModel model = diamond();
+  TopologyService service(model);
+  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  // diamond() has more than one route dram -> acc; asking for one reaches the
+  // cap and must say so rather than implying the space was exhausted.
+  bool truncated = false;
+  auto result = service.enumerateRoutes(request, 1, &truncated);
+  ASSERT_TRUE(static_cast<bool>(result));
+  ASSERT_EQ(result->size(), 1u);
+  EXPECT_TRUE(truncated);
+}
+
+TEST(Routing, ReportsNoTruncationWhenEveryRouteFits) {
+  MachineModel model = diamond();
+  TopologyService service(model);
+  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  bool truncated = false;
+  auto result = service.enumerateRoutes(request, 8, &truncated);
+  ASSERT_TRUE(static_cast<bool>(result));
+  EXPECT_LT(result->size(), 8u); // the whole space fit under the cap
+  EXPECT_FALSE(truncated);
+}
+
 TEST(Routing, SameMemoryIsATrivialRoute) {
   MachineModel model = diamond();
   TopologyService service(model);

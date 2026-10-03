@@ -36,6 +36,16 @@ MachineModel searchMachine() {
   return model;
 }
 
+/// Two interchangeable workers. With symmetry reduction off, a candidate that
+/// requires a worker has two legal placements, so an instance cap of one
+/// genuinely stops enumeration early rather than merely matching the count.
+MachineModel twoWorkerMachine() {
+  MachineModel model = searchMachine();
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}},
+                     {"e1", "worker", std::nullopt, {}, 1, {}}};
+  return model;
+}
+
 /// A `micro.vector` with `op = "add"`, as the shipped rules predicate on.
 mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context) {
   return mlir::DictionaryAttr::get(
@@ -300,6 +310,23 @@ TEST(CoveringSearch, ReportsCapacityRejection) {
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   EXPECT_TRUE(result->plans.empty());
   EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+TEST(CoveringSearch, ReportsTruncationWhenInstanceCapIsHit) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(twoWorkerMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  options.maxInstancesPerCandidate = 1;    // force the cap
+  options.enableSymmetryReduction = false; // keep both workers legal
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->searchTruncated);
 }
 
 //===----------------------------------------------------------------------===//

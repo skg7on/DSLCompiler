@@ -213,6 +213,44 @@ TEST(Placement, SymmetryReductionKeepsOneRepresentative) {
             (std::vector<std::string>{"c.0", "c.1", "c.2"}));
 }
 
+TEST(Placement, ReportsTruncationWhenTheInstanceCapIsHit) {
+  // Three interchangeable executors and no reduction: a cap of one genuinely
+  // stops enumeration before the other two legal placements are considered.
+  MachineModel machine;
+  machine.target = "symmetric";
+  machine.executors = {{"c.0", "core", std::nullopt, {}, 1, {}},
+                       {"c.1", "core", std::nullopt, {}, 1, {}},
+                       {"c.2", "core", std::nullopt, {}, 1, {}}};
+  std::unique_ptr<MappingTarget> target = targetFor(std::move(machine));
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate core = candidate();
+  core.executorRequirements[0].capability = "core";
+  mlir::MLIRContext context;
+
+  PlacementOptions capped;
+  capped.reduceSymmetry = false;
+  capped.maxInstances = 1;
+  bool truncated = false;
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(core, *target, context, LayoutContext{}, capped,
+                          &truncated);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances), (std::vector<std::string>{"c.0"}));
+  EXPECT_TRUE(truncated);
+
+  // A cap that admits every placement reports no truncation.
+  PlacementOptions roomy;
+  roomy.reduceSymmetry = false;
+  bool notTruncated = false;
+  llvm::Expected<std::vector<CandidateInstance>> all = enumeratePlacements(
+      core, *target, context, LayoutContext{}, roomy, &notTruncated);
+  ASSERT_TRUE(static_cast<bool>(all));
+  EXPECT_EQ(all->size(), 3u);
+  EXPECT_FALSE(notTruncated);
+}
+
 TEST(Placement, InstancesAreLegalAndStable) {
   std::unique_ptr<MappingTarget> target = targetFor(placementMachine());
   ASSERT_NE(target, nullptr);

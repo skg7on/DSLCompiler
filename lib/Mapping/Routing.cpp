@@ -88,8 +88,8 @@ TopologyService::TopologyService(const MachineModel &model,
     : model_(model), options_(options) {}
 
 llvm::Expected<llvm::SmallVector<MemoryRoute>>
-TopologyService::enumerateRoutes(const RouteRequest &request,
-                                 unsigned limit) const {
+TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
+                                 bool *truncated) const {
   if (request.bytes == 0)
     return routeError("route request: bytes must be positive");
   if (request.alignmentBytes == 0)
@@ -189,6 +189,13 @@ TopologyService::enumerateRoutes(const RouteRequest &request,
       work.push(std::move(advanced));
     }
   }
+
+  // Reaching the effective cap means the space was not exhausted. This is
+  // deliberately conservative -- it also fires when exactly `effectiveLimit`
+  // routes exist -- because §16.2 forbids implying optimality once a cap was
+  // touched.
+  if (truncated && routes.size() >= effectiveLimit)
+    *truncated = true;
 
   if (routes.empty())
     return routeError("no route from '" + request.source + "' to '" +

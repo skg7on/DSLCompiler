@@ -78,7 +78,7 @@ llvm::Expected<std::vector<CandidateInstance>>
 enumeratePlacements(const MappingCandidate &candidate,
                     const MappingTarget &target, mlir::MLIRContext &context,
                     const LayoutContext &layoutContext,
-                    const PlacementOptions &options) {
+                    const PlacementOptions &options, bool *truncated) {
   const MachineModel &machine = target.machine();
 
   // A layout requirement that cannot solve makes the candidate unplaceable,
@@ -170,15 +170,23 @@ enumeratePlacements(const MappingCandidate &candidate,
     instance.localCost = candidate.lowerBound;
     instance.id = computeInstanceId(instance);
     instances.push_back(std::move(instance));
-    if (instances.size() >= options.maxInstances)
+    if (instances.size() >= options.maxInstances) {
+      // Conservative: also fires when the candidate has exactly maxInstances
+      // legal placements. A caller may not claim optimality after touching the
+      // cap (design §16.2).
+      if (truncated)
+        *truncated = true;
       break;
+    }
   }
   return instances;
 }
 
-llvm::Expected<std::vector<ConnectionPlan>> synthesizeConnections(
-    const ConnectionRequest &request, const MachineModel &machine,
-    const TopologyService &topology, const PlacementOptions &options) {
+llvm::Expected<std::vector<ConnectionPlan>>
+synthesizeConnections(const ConnectionRequest &request,
+                      const MachineModel &machine,
+                      const TopologyService &topology,
+                      const PlacementOptions &options, bool *truncated) {
   if (!machine.findMemory(request.producerMemory))
     return placementError("connection: unknown memory '" +
                           request.producerMemory + "'");
@@ -222,7 +230,8 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeConnections(
   route.bytes = request.bytes;
   route.alignmentBytes = request.alignmentBytes;
   llvm::Expected<llvm::SmallVector<MemoryRoute>> routes =
-      topology.enumerateRoutes(route, options.maxRoutesPerConnection);
+      topology.enumerateRoutes(route, options.maxRoutesPerConnection,
+                               truncated);
   if (!routes) {
     // No route is a legal outcome: the pair is incompatible, not an error.
     llvm::consumeError(routes.takeError());

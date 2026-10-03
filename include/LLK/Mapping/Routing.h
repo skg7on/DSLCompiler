@@ -84,8 +84,15 @@ public:
   /// `request.destination`, best first. Fails when the request is malformed,
   /// an endpoint is unknown or unreachable by its executor, or no legal route
   /// exists.
+  ///
+  /// When `truncated` is non-null it is set to true if the enumeration reached
+  /// its effective cap (the smaller of `limit` and `maxRoutes`). This is
+  /// deliberately conservative: it may report truncation when exactly that many
+  /// routes exist, because the caller is never allowed to claim optimality
+  /// after a cap was reached (design §16.2).
   llvm::Expected<llvm::SmallVector<MemoryRoute>>
-  enumerateRoutes(const RouteRequest &request, unsigned limit) const;
+  enumerateRoutes(const RouteRequest &request, unsigned limit,
+                  bool *truncated = nullptr) const;
 
 private:
   const machine::MachineModel &model_;
