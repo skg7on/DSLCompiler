@@ -277,3 +277,18 @@ Expected: clean; record the registered/passed/skipped/failed counts.
 **Non-scope respected:** no routing (D2), no LLKMap (D3/D4), no `micro-perf` rewiring, v1 files untouched.
 
 **Type consistency:** node structs are defined once in Task 1 and referenced by the loader (Task 3) and profiles tests (Task 4); `verifyMachineModel` and `computeContentHash` are declared in Task 1's header and implemented in Task 1/Task 2 respectively.
+
+## Verification Results (2026-10-03)
+
+- **Build:** `ninja -C build` — clean, no warnings.
+- **New tests:** `MachineModelTest` 21/21, `MachineModelV2LoaderTest` 12/12.
+- **Full suite:** `ctest --test-dir build --output-on-failure` — 89 registered, **87 passed, 2 skipped, 0 failed**. Skips are the pre-existing host-gated `SwigluScalar`/`SwiGLUVector`.
+- **Deprecated-API audit:** clean across `include/LLK/Machine`, `lib/Machine`, `test/Machine`.
+
+### Decisions taken while implementing
+
+1. **Node `kind` is a Micro vocabulary name** — executor kinds are `micro::Owner` names, memory kinds are `micro::MemorySpace` names (`MicroEnums.h`), validated at load. This is what lets owner matching be a kind comparison (§11.5) with no target vocabulary in generic code.
+2. **Refinement is declared per executor** (`refines:`), transitively closed at load. The generic code only compares kinds; target policy stays in the profile.
+3. **The loader accepts `llk.machine.v2.<minor>`** but rejects any other major (§11.6).
+4. **A small self-contained FNV-1a hash** lives in `lib/Machine/MachineHash.h`; D1's equivalent is under `LLK/Mapping`, which `LLK/Machine` must not depend on. A follow-up should lift both into `LLK/Support`.
+5. **The v1 model and profiles are untouched**; v2 ships as sibling files (`*-v2.yaml`).
