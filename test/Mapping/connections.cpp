@@ -107,6 +107,52 @@ mlir::AffineMap shifted2(mlir::MLIRContext &context) {
   return mlir::AffineMap::get(2, 0, {d0 + one, d1}, &context);
 }
 
+/// A linear machine with no shortcut: `dram.0 -> sram.0 -> acc.0`. The
+/// producer's layout is supported only by the source memory and the consumer's
+/// only by the memories after the first hop, so a plan-wide layout rule would
+/// reject the route. Placing the transform at the first hop makes it legal.
+MachineModel transformHopMachine() {
+  MachineModel model;
+  model.target = "transform-hop";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}}};
+  MemoryNode dram = memory("dram.0", "dram");
+  dram.supportedLayouts = {"t.a"};
+  MemoryNode sram = memory("sram.0", "sram");
+  sram.supportedLayouts = {"t.b"};
+  MemoryNode acc = memory("acc.0", "acc");
+  acc.supportedLayouts = {"t.b"};
+  model.memories = {dram, sram, acc};
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+  model.links = {link("dram_to_sram.0", "dram.0", "sram.0"),
+                 link("sram_to_acc.0", "sram.0", "acc.0")};
+  return model;
+}
+
+/// The §15.2 attempt a plan belongs to: 1 direct, 2 layout-only transform in a
+/// mutually visible memory, 3 direct transfer, 4 transfer plus transform, 5
+/// bounded multi-hop transfer. A multi-hop route is one with an intermediate
+/// memory (more than two nodes).
+unsigned sectionRank(const ConnectionPlan &plan) {
+  switch (plan.kind) {
+  case ConnectionKind::Direct:
+    return 1;
+  case ConnectionKind::LayoutTransform:
+    return 2;
+  case ConnectionKind::Transfer:
+    return plan.memoryRoute.size() <= 2 ? 3 : 5;
+  case ConnectionKind::TransferAndTransform:
+    return plan.memoryRoute.size() <= 2 ? 4 : 5;
+  case ConnectionKind::Replicate:
+  case ConnectionKind::Reduce:
+    return 6;
+  }
+  return 6;
+}
+
 } // namespace
 
 TEST(Connections, DirectWhenMemoryAndLayoutAgree) {
@@ -171,9 +217,140 @@ TEST(Connections, TransferAndTransformWhenBothDiffer) {
       synthesizeConnections(request, machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
   ASSERT_FALSE(plans->empty());
+  // Different memories and different layouts: the route alternatives are
+  // transfer-plus-transform. A layout-only transform in the producer's memory
+  // (alternative 2) is also legal here and appears alongside them, so it is
+  // skipped when checking the transfer routes.
+  size_t transferAndTransform = 0;
   for (const ConnectionPlan &plan : *plans) {
+    if (plan.kind == ConnectionKind::LayoutTransform)
+      continue;
     EXPECT_EQ(plan.kind, ConnectionKind::TransferAndTransform);
     ASSERT_TRUE(plan.transform.has_value());
+    ++transferAndTransform;
+  }
+  EXPECT_GE(transferAndTransform, 2u);
+}
+
+// (a) Same memory, different layouts: a direct connection is impossible and a
+// layout-only transform in that shared memory is the alternative.
+TEST(Connections, SameMemoryDifferentLayoutsCannotConnectDirectly) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory; // one shared memory
+  request.consumerLayout = "t.b";
+
+  EXPECT_FALSE(portsDirectCompatible(request, machine));
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::LayoutTransform);
+  ASSERT_TRUE((*plans)[0].transform.has_value());
+}
+
+// (b) Different memories that both endpoints can reach: alongside the transfer
+// routes, a layout-only transform can run in the producer's memory and the
+// consumer can read the result there without a transfer.
+TEST(Connections, DifferentMemoriesYieldTransferAndLayoutOnlyTransform) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest(); // dram.0 -> acc.0
+  request.producerExecutor = "e0";
+  request.consumerExecutor = "e0";
+  request.consumerLayout = "t.b";
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+
+  bool layoutOnly = false;
+  bool transfer = false;
+  for (const ConnectionPlan &plan : *plans) {
+    if (plan.kind == ConnectionKind::LayoutTransform) {
+      layoutOnly = true;
+      // No transfer: the transform runs where the value already is.
+      ASSERT_EQ(plan.memoryRoute.size(), 1u);
+      EXPECT_EQ(plan.memoryRoute[0], "dram.0");
+      ASSERT_TRUE(plan.transform.has_value());
+    } else {
+      transfer = true;
+    }
+  }
+  EXPECT_TRUE(layoutOnly);
+  EXPECT_TRUE(transfer);
+}
+
+// (c) A multi-hop transfer whose transform is placed at a legal hop: the
+// producer's layout is supported only by the source, the consumer's by every
+// memory after it, so a plan-wide layout rule would reject the route. The hop
+// boundary carries the transform.
+TEST(Connections, MultiHopPlacesTheTransformAtALegalHop) {
+  MachineModel machine = transformHopMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest(); // dram.0 -> acc.0
+  request.producerExecutor = "e0";
+  request.consumerExecutor = "e0";
+  request.producerLayout = "t.a";
+  request.consumerLayout = "t.b";
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::TransferAndTransform);
+  ASSERT_EQ((*plans)[0].memoryRoute.size(), 3u);
+  EXPECT_EQ((*plans)[0].memoryRoute[1], "sram.0");
+  ASSERT_TRUE((*plans)[0].transform.has_value());
+  EXPECT_EQ((*plans)[0].transform->srcLayout, "t.a");
+  EXPECT_EQ((*plans)[0].transform->dstLayout, "t.b");
+}
+
+// (d) The five alternatives are attempted in the §15.2 order: direct, layout
+// transform, direct transfer, transfer plus transform, multi-hop transfer.
+TEST(Connections, AlternativesAreAttemptedInSection15Order) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+
+  auto ranksOf = [&](const ConnectionRequest &request) {
+    llvm::Expected<std::vector<ConnectionPlan>> plans =
+        synthesizeConnections(request, machine, topology);
+    EXPECT_TRUE(static_cast<bool>(plans));
+    std::vector<unsigned> ranks;
+    if (plans)
+      for (const ConnectionPlan &plan : *plans)
+        ranks.push_back(sectionRank(plan));
+    return ranks;
+  };
+
+  // Same memory, same layout: alternative 1 only.
+  {
+    ConnectionRequest request = baseRequest();
+    request.consumerMemory = request.producerMemory;
+    EXPECT_EQ(ranksOf(request), (std::vector<unsigned>{1u}));
+  }
+  // Same memory, different layout: alternative 2 only.
+  {
+    ConnectionRequest request = baseRequest();
+    request.consumerMemory = request.producerMemory;
+    request.consumerLayout = "t.b";
+    EXPECT_EQ(ranksOf(request), (std::vector<unsigned>{2u}));
+  }
+  // Different memory, same layout: a direct transfer then a multi-hop transfer.
+  {
+    ConnectionRequest request = baseRequest();
+    EXPECT_EQ(ranksOf(request), (std::vector<unsigned>{3u, 5u}));
+  }
+  // Different memory, different layout: the layout-only transform precedes the
+  // direct transfer-plus-transform, which precedes the multi-hop one.
+  {
+    ConnectionRequest request = baseRequest();
+    request.producerExecutor = "e0";
+    request.consumerExecutor = "e0";
+    request.consumerLayout = "t.b";
+    EXPECT_EQ(ranksOf(request), (std::vector<unsigned>{2u, 4u, 5u}));
   }
 }
 

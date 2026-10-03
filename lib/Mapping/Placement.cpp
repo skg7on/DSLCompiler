@@ -144,6 +144,46 @@ bool consumerSeesProducerMemory(const ConnectionRequest &request,
   return machine.isVisible(request.producerMemory, *request.consumerExecutor);
 }
 
+/// A memory supports a declared layout when it names it; a memory that declares
+/// no layouts supports none. This is the same rule `TopologyService` applies to
+/// a route's hops, so the connection engine and the router agree on what a
+/// memory can hold.
+bool memorySupportsLayout(const MemoryNode &memory, llvm::StringRef layout) {
+  return llvm::is_contained(memory.supportedLayouts, layout);
+}
+
+/// The hop a transform runs on (design §15.2 alternative 5, "transform placed
+/// at a legal hop"). The value stays in the producer's layout up to
+/// `nodes[hop]` and is in the consumer's layout from `nodes[hop + 1]` on, so
+/// the transform is a property of one hop boundary rather than the whole plan.
+/// The first legal hop is chosen, so the placement is deterministic. Nullopt
+/// when no hop admits the transform -- the route cannot carry the value in
+/// either layout regime and is not a legal alternative.
+std::optional<size_t> legalTransformHop(llvm::ArrayRef<MemoryNodeId> nodes,
+                                        const MachineModel &machine,
+                                        llvm::StringRef producerLayout,
+                                        llvm::StringRef consumerLayout) {
+  if (nodes.size() < 2)
+    return std::nullopt;
+  for (size_t hop = 0; hop + 1 < nodes.size(); ++hop) {
+    bool legal = true;
+    // Up to and including the hop's source the value is stored in the layout
+    // the producer wrote it in.
+    for (size_t index = 0; index <= hop && legal; ++index) {
+      const MemoryNode *memory = machine.findMemory(nodes[index]);
+      legal = memory && memorySupportsLayout(*memory, producerLayout);
+    }
+    // From the hop's destination on it is stored in the consumer's layout.
+    for (size_t index = hop + 1; index < nodes.size() && legal; ++index) {
+      const MemoryNode *memory = machine.findMemory(nodes[index]);
+      legal = memory && memorySupportsLayout(*memory, consumerLayout);
+    }
+    if (legal)
+      return hop;
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 bool portsDirectCompatible(const ConnectionRequest &request,
@@ -378,8 +418,9 @@ synthesizeConnections(const ConnectionRequest &request,
   if (!elementAndShapeCompatible(request) || !affineCompatible(request))
     return std::vector<ConnectionPlan>{};
 
-  bool transformRequired = request.producerLayout && request.consumerLayout &&
-                           *request.producerLayout != *request.consumerLayout;
+  const bool transformRequired =
+      request.producerLayout && request.consumerLayout &&
+      *request.producerLayout != *request.consumerLayout;
   auto transformOf = [&]() -> std::optional<LayoutTransform> {
     if (!transformRequired)
       return std::nullopt;
@@ -388,30 +429,61 @@ synthesizeConnections(const ConnectionRequest &request,
     transform.dstLayout = *request.consumerLayout;
     return transform;
   };
+  const MemoryNode *producerMemory = machine.findMemory(request.producerMemory);
+  const bool sameMemory = request.producerMemory == request.consumerMemory;
+  // Both endpoints must be able to reach the memory a layout-only transform
+  // runs in. The producer wrote there; the check that matters is the
+  // consumer's.
+  const bool mutuallyVisible = consumerSeesProducerMemory(request, machine);
 
+  // §15.2's alternatives are attempted in order, and every alternative that is
+  // legal becomes its own plan so a caller can see all the shapes. The order of
+  // `plans` is that attempt order.
   std::vector<ConnectionPlan> plans;
-  if (request.producerMemory == request.consumerMemory) {
-    // Nothing to move: either a direct connection or an in-place transform. A
-    // consumer that cannot address the producer's memory cannot read the value
-    // from it, and with both ends in one memory there is no transfer
-    // alternative, so the pair is incompatible (design §10.2).
-    if (!consumerSeesProducerMemory(request, machine))
-      return std::vector<ConnectionPlan>{};
 
+  // Alternative 1: a direct connection -- same memory, nothing moved, nothing
+  // transformed, and the §10.2 direct-compatibility checks all hold.
+  if (sameMemory && portsDirectCompatible(request, machine)) {
     ConnectionPlan plan;
     plan.producer = request.producer;
     plan.consumers.push_back(request.consumer);
     plan.value = request.value;
-    plan.kind = portsDirectCompatible(request, machine)
-                    ? ConnectionKind::Direct
-                    : ConnectionKind::LayoutTransform;
+    plan.kind = ConnectionKind::Direct;
+    plan.memoryRoute.push_back(request.producerMemory);
+    plan.cost.localBytes = request.bytes;
+    plan.id = computeConnectionId(plan);
+    plans.push_back(std::move(plan));
+  }
+
+  // Alternative 2: a layout-only transform in a memory both endpoints can see.
+  // The value already sits in the producer's memory, so the transform runs
+  // there and the consumer reads the result -- there is no transfer. This is
+  // emitted even when the two ends are *placed* on different memories, because
+  // the consumer may legally read the producer's memory (that is exactly the
+  // property `portsDirectCompatible` checks). The memory must be able to hold
+  // both layouts, or the transform cannot occur in it.
+  if (transformRequired && mutuallyVisible &&
+      memorySupportsLayout(*producerMemory, *request.producerLayout) &&
+      memorySupportsLayout(*producerMemory, *request.consumerLayout)) {
+    ConnectionPlan plan;
+    plan.producer = request.producer;
+    plan.consumers.push_back(request.consumer);
+    plan.value = request.value;
+    plan.kind = ConnectionKind::LayoutTransform;
     plan.memoryRoute.push_back(request.producerMemory);
     plan.transform = transformOf();
     plan.cost.localBytes = request.bytes;
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
-    return plans;
   }
+
+  // Alternatives 3-5 are transfers over the topology. A route from a memory to
+  // itself is not a movement, so a same-memory pair has no transfer to make and
+  // the alternatives above stand alone. (Falling through rather than returning
+  // early keeps a same-memory pair whose consumer cannot read the memory
+  // incompatible without short-circuiting before the transfer path.)
+  if (sameMemory)
+    return plans;
 
   RouteRequest route;
   route.source = request.producerMemory;
@@ -420,11 +492,13 @@ synthesizeConnections(const ConnectionRequest &request,
   route.alignmentBytes = request.alignmentBytes;
   route.producerExecutor = request.producerExecutor;
   route.consumerExecutor = request.consumerExecutor;
-  // The value leaves the producer in its layout, so that is the layout the hop
-  // memories must support; the consumer's (possibly different) layout is
-  // reached by the transform a later connection materializes. Threaded only
-  // when the producer states it.
-  if (request.producerLayout)
+  // A value that keeps one layout is carried in that layout over every hop, so
+  // the route's every memory must support it. A transform changes the layout,
+  // so its legality is *not* a plan-wide fact: rather than asking the router to
+  // hold one layout on every hop, the transform's hop is validated per route
+  // with `legalTransformHop` below, and the route is enumerated with no layout
+  // filter. Threaded only when the producer states a layout.
+  if (!transformRequired && request.producerLayout)
     route.layoutClass = *request.producerLayout;
   // liveBytesOnIntermediate stays unset: this layer keeps no occupancy state,
   // so it has no live-byte figure to supply rather than a zero that would
@@ -438,7 +512,27 @@ synthesizeConnections(const ConnectionRequest &request,
     return plans;
   }
 
-  for (const MemoryRoute &memoryRoute : *routes) {
+  // §15.2 orders a direct transfer (alternative 3/4) before a bounded
+  // multi-hop transfer (alternative 5). D2 ranks routes cheapest-first, which
+  // can interleave the two, so single-hop routes are emitted first; within each
+  // group D2's cost-ranked order is preserved.
+  std::vector<const MemoryRoute *> directRoutes;
+  std::vector<const MemoryRoute *> multiHopRoutes;
+  for (const MemoryRoute &memoryRoute : *routes)
+    (memoryRoute.hopCount() == 1 ? directRoutes : multiHopRoutes)
+        .push_back(&memoryRoute);
+
+  auto emitRoute = [&](const MemoryRoute &memoryRoute) {
+    if (transformRequired) {
+      // A transform that no hop can carry makes this route no alternative at
+      // all: the value cannot be held in either layout regime along it. The
+      // chosen hop is not a `ConnectionPlan` field -- the plan carries the
+      // route and the layout pair, and the boundary the two meet at is implied
+      // by them -- so this validation is what fixes where the transform runs.
+      if (!legalTransformHop(memoryRoute.nodes, machine,
+                             *request.producerLayout, *request.consumerLayout))
+        return;
+    }
     ConnectionPlan plan;
     plan.producer = request.producer;
     plan.consumers.push_back(request.consumer);
@@ -451,7 +545,11 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.cost = memoryRoute.cost;
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
-  }
+  };
+  for (const MemoryRoute *memoryRoute : directRoutes)
+    emitRoute(*memoryRoute);
+  for (const MemoryRoute *memoryRoute : multiHopRoutes)
+    emitRoute(*memoryRoute);
   return plans;
 }
 
