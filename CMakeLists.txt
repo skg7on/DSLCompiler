@@ -222,12 +222,18 @@ add_library(LLKPerf STATIC
     lib/Perf/Candidate.cpp
     lib/Perf/CandidateGenerator.cpp
     lib/Perf/Legality.cpp
+    lib/Perf/CandidateBinding.cpp
 )
 target_include_directories(LLKPerf PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
 )
 target_link_libraries(LLKPerf PUBLIC LLVMSupport MicroDialect)
+# Candidate binding builds concrete micro IR, which references tensor.empty for
+# the kernel's external tensors. MLIRTensorDialect is named through
+# mlir_target_link_libraries() so it resolves to the MLIR dylib when one exists,
+# keeping a single copy of MLIR in every consumer.
+mlir_target_link_libraries(LLKPerf PRIVATE MLIRTensorDialect)
 
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg
@@ -629,6 +635,11 @@ add_llk_perf_test(L1ResourceDAGTest test/Perf/l1_resource_dag.cpp)
 add_llk_perf_test(SearchSpaceLoaderTest test/Perf/search_space_loader.cpp)
 add_llk_perf_test(CandidateGeneratorTest test/Perf/candidate_generator.cpp)
 add_llk_perf_test(LegalityTest test/Perf/legality.cpp)
+
+# Candidate binding (issue #50): the point where a search-space candidate
+# becomes a concrete micro.kernel. The test builds the kernel and asserts both
+# the emitted IR and the decisions the schedule record persists.
+add_llk_perf_test(CandidateBindingTest test/Perf/candidate_binding.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
