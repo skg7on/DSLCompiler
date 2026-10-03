@@ -278,6 +278,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/MappingTarget.cpp
     lib/Mapping/Placement.cpp
     lib/Mapping/CoveringSearch.cpp
+    lib/Mapping/PlanBinder.cpp
     lib/Mapping/Routing.cpp
 )
 target_include_directories(LLKMapping PUBLIC
@@ -382,6 +383,20 @@ add_library(LLKTargetX86 STATIC
 target_include_directories(LLKTargetX86 PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
+
+# Library: target mapping packages (issue #67, workstream D7). Each target owns
+# its configuration paths and emitter keys; generic mapping code sees only the
+# MappingTarget interface. Kept out of LLKTargetX86 so CPU feature detection
+# does not drag in MLIR.
+add_library(LLKTargetMapping STATIC
+    lib/Target/X86/Mapping/AVX2MappingTarget.cpp
+    lib/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.cpp
+)
+target_include_directories(LLKTargetMapping PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(LLKTargetMapping PUBLIC LLKMapping LLKMachine)
+target_compile_options(LLKTargetMapping PRIVATE -fno-rtti -fno-exceptions)
 
 # Library: AArch64 target feature detection (SVE/SVE2/NEON)
 add_library(LLKTargetAArch64 STATIC
@@ -728,10 +743,11 @@ add_llk_machine_test(MachineModelV2LoaderTest test/Machine/machine_model_loader.
 function(add_llk_mapping_test test_name test_file)
   add_llvm_executable(${test_name} ${test_file})
   target_link_libraries(${test_name} PRIVATE
-      LLKMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+      LLKMapping LLKTargetMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
   target_compile_definitions(${test_name} PRIVATE
       LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping"
-      LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines")
+      LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
+      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 
@@ -745,6 +761,9 @@ add_llk_mapping_test(MappingRulesTest test/Mapping/mapping_rules.cpp)
 add_llk_mapping_test(MappingPlacementTest test/Mapping/placement.cpp)
 add_llk_mapping_test(MappingConnectionsTest test/Mapping/connections.cpp)
 add_llk_mapping_test(MappingCoveringSearchTest test/Mapping/covering_search.cpp)
+add_llk_mapping_test(MappingAvx2TargetTest test/Mapping/avx2_target.cpp)
+add_llk_mapping_test(MappingGenericAcceleratorTargetTest test/Mapping/generic_accelerator_target.cpp)
+add_llk_mapping_test(MappingPlanBinderTest test/Mapping/plan_binder.cpp)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside

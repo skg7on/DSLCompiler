@@ -29,6 +29,7 @@
 #include "mlir/IR/OperationSupport.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
 
@@ -90,8 +91,10 @@ public:
 
   /// Sorts nodes and values by canonical content key and reassigns all ids, so
   /// the same graph built in any insertion order finalizes to identical ids
-  /// and identical `canonicalString()` output.
-  void finalize();
+  /// and identical `canonicalString()` output. When `valueRemap` is given it
+  /// records each temporary value id's final id.
+  void finalize(
+      llvm::DenseMap<WorkloadValueId, WorkloadValueId> *valueRemap = nullptr);
 
   llvm::ArrayRef<WorkloadNode> getNodes() const { return nodes; }
   llvm::ArrayRef<WorkloadValue> getValues() const { return values; }
@@ -120,9 +123,29 @@ bool isWorkloadNodeOp(llvm::StringRef name);
 /// becoming nodes.
 bool isTransparentWorkloadOp(OperationName op);
 
+/// The correspondence between a graph and the IR it was extracted from.
+///
+/// A `WorkloadGraph` is deliberately context-free -- it holds stable ids, not
+/// MLIR pointers -- so anything that has to act on the IR again (the plan
+/// binder, for one) needs this side table. Only extraction can build it: the
+/// ids are assigned and then canonicalized there, so it cannot be recovered
+/// from a finished graph.
+struct WorkloadGraphBinding {
+  llvm::DenseMap<WorkloadNodeId, Operation *> nodeOps;
+  llvm::DenseMap<WorkloadValueId, Value> values;
+
+  /// The op a node came from, or null when the id is unknown.
+  Operation *opFor(WorkloadNodeId node) const;
+  /// The SSA value a workload value came from, or a null Value.
+  Value valueFor(WorkloadValueId value) const;
+};
+
 /// Extracts the workload graph from a `micro.kernel`. Fails when `kernel` is
-/// not a `micro.kernel` op.
-llvm::Expected<WorkloadGraph> extractWorkloadGraph(Operation *kernel);
+/// not a `micro.kernel` op. When `binding` is given, it is filled with the
+/// node-to-op and value-to-SSA correspondence for this extraction.
+llvm::Expected<WorkloadGraph>
+extractWorkloadGraph(Operation *kernel,
+                     WorkloadGraphBinding *binding = nullptr);
 
 } // namespace mlir::llk::mapping
 

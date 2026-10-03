@@ -45,10 +45,17 @@ constexpr uint64_t kAssumedValueBytes = 4096;
 /// Alignment every fixture memory supports.
 constexpr uint64_t kAssumedAlignment = 32;
 
+/// A legal placement and the rule that produced it, so a selected plan can
+/// name the rule and bundle it chose.
+struct InstanceEntry {
+  CandidateInstance instance;
+  const RuleDef *rule = nullptr;
+};
+
 struct NodeTable {
   WorkloadNodeId node = 0;
   const WorkloadNode *workload = nullptr;
-  std::vector<CandidateInstance> instances;
+  std::vector<InstanceEntry> instances;
 };
 
 struct Edge {
@@ -159,7 +166,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                                            "' has no legal placement");
       }
       for (CandidateInstance &instance : *instances)
-        table.instances.push_back(std::move(instance));
+        table.instances.push_back(InstanceEntry{std::move(instance), rule});
     }
     tables.push_back(std::move(table));
   }
@@ -269,8 +276,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (partial.chosen[index])
         continue;
       double cheapest = std::numeric_limits<double>::infinity();
-      for (const CandidateInstance &instance : tables[index].instances)
-        cheapest = std::min(cheapest, instance.localCost.latencyCycles);
+      for (const InstanceEntry &entry : tables[index].instances)
+        cheapest = std::min(cheapest, entry.instance.localCost.latencyCycles);
       if (!std::isfinite(cheapest))
         return std::numeric_limits<double>::infinity();
       total += cheapest;
@@ -297,9 +304,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         std::optional<size_t> node = lowestUncovered(partial);
         if (!node)
           continue;
-        for (const CandidateInstance &instance : tables[*node].instances) {
+        for (const InstanceEntry &entry : tables[*node].instances) {
           Partial branch = partial;
-          if (extend(branch, *node, instance)) {
+          if (extend(branch, *node, entry.instance)) {
             branch.lowerBound = bound(branch);
             next.push_back(std::move(branch));
           }
@@ -341,11 +348,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           bestCosts.resize(options_.topK);
         return;
       }
-      for (const CandidateInstance &instance : tables[*node].instances) {
+      for (const InstanceEntry &entry : tables[*node].instances) {
         if (stop)
           return;
         Partial branch = partial;
-        if (!extend(branch, *node, instance))
+        if (!extend(branch, *node, entry.instance))
           continue;
         if (exact) {
           branch.lowerBound = bound(branch);
@@ -401,6 +408,47 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       connections.push_back(pool[index].id);
     llvm::sort(connections);
     plan.connections.assign(connections.begin(), connections.end());
+
+    // Resolve the same selection into the facts a materializer needs.
+    for (size_t index = 0; index < partial.chosen.size(); ++index) {
+      const CandidateInstance *instance = partial.chosen[index];
+      if (!instance)
+        continue;
+      PlanPlacement placement;
+      placement.node = tables[index].node;
+      placement.instance = instance->id;
+      for (const InstanceEntry &entry : tables[index].instances) {
+        if (&entry.instance == instance) {
+          placement.rule = entry.rule->id;
+          placement.bundle = entry.rule->bundle;
+          break;
+        }
+      }
+      placement.executor = instance->executorBindings.lookup("executor");
+      placement.memories = instance->memoryBindings;
+      placement.layouts = instance->layoutBindings;
+      plan.placements.push_back(std::move(placement));
+    }
+    llvm::sort(plan.placements,
+               [](const PlanPlacement &lhs, const PlanPlacement &rhs) {
+                 return lhs.node < rhs.node;
+               });
+
+    for (size_t index : partial.connections) {
+      const ConnectionPlan &connection = pool[index];
+      PlanConnection detail;
+      detail.id = connection.id;
+      detail.value = connection.value;
+      detail.kind = connection.kind;
+      detail.route = connection.memoryRoute;
+      detail.engines = connection.transferEngines;
+      detail.transform = connection.transform;
+      plan.connectionPlans.push_back(std::move(detail));
+    }
+    llvm::sort(plan.connectionPlans,
+               [](const PlanConnection &lhs, const PlanConnection &rhs) {
+                 return lhs.id < rhs.id;
+               });
 
     plan.totalCost = partial.cost;
     plan.diagnostics.searchTruncated = result.searchTruncated;
