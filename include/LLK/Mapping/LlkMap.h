@@ -1,0 +1,174 @@
+//===- LlkMap.h - Shared LLKMap language core (D3/D4) ---------------------===//
+//
+// LLKMap is one small language with several declaration kinds: layouts (D3)
+// and mapping rules (D4). They share a token set, an expression grammar, and
+// an evaluator, so those live here rather than being duplicated per
+// declaration kind. A declaration parser derives from `LlkMapParser` and adds
+// its own statements on top of the shared expression grammar.
+//
+// Everything in this header is target-independent: it knows about Micro
+// vocabulary names and `MachineModel` queries, never about a specific target.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLK_MAPPING_LLKMAP_H
+#define LLK_MAPPING_LLKMAP_H
+
+#include "LLK/Machine/MachineModel.h"
+
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/Error.h"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace mlir::llk::mapping {
+
+/// A concrete value an LLKMap expression can take: an integer or a symbolic
+/// name. Boolean expressions evaluate to integers 0 and 1.
+using LayoutValue = std::variant<int64_t, std::string>;
+
+enum class ExprKind {
+  IntLit,     ///< integer literal
+  StringLit,  ///< quoted string
+  Ident,      ///< parameter or builtin (`rank`, `element_type`)
+  Call,       ///< `floordiv(a, b)`, `machine.compute("vector_engine")`
+  MemberCall, ///< `receiver.lanes(dtype)`, `receiver.count`
+  Unary,      ///< `!a`, `-a`
+  Binary      ///< `a + b`, `a % b`, `a == b`, `a && b`
+};
+
+struct Expr;
+using ExprPtr = std::shared_ptr<const Expr>;
+
+struct Expr {
+  ExprKind kind = ExprKind::IntLit;
+  /// Integer literal value, or a boolean result materialized during parsing.
+  int64_t intValue = 0;
+  /// Identifier name, call callee, member name, or operator spelling.
+  std::string text;
+  /// Call/member arguments; for a member call, `operands[0]` is the receiver.
+  std::vector<ExprPtr> operands;
+};
+
+/// The values a declaration is instantiated against: the rank and element type
+/// of the value being laid out or matched. They back the `rank` and
+/// `element_type` builtins.
+struct LayoutContext {
+  int64_t rank = 0;
+  std::string elementType;
+};
+
+/// The result of evaluating an expression. `Handle` is the intermediate value
+/// a `machine.compute(...)` / `machine.memory(...)` query produces before a
+/// member query is applied; it never escapes as a solution value.
+struct EvalValue {
+  enum class Kind { Int, Str, Handle };
+  Kind kind = Kind::Int;
+  int64_t intValue = 0;
+  std::string text;
+};
+
+/// Evaluates a parsed expression. Booleans are integers (0 and 1). Fails on an
+/// unknown identifier, an unknown machine fact, a type mismatch between an
+/// integer and a string, or division by zero.
+llvm::Expected<EvalValue>
+evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
+             const machine::MachineModel &machine,
+             const LayoutContext &context);
+
+//===----------------------------------------------------------------------===//
+// Tokens
+//===----------------------------------------------------------------------===//
+
+struct LlkMapToken {
+  enum class Kind { Identifier, Int, String, Punct, End };
+  Kind kind = Kind::End;
+  std::string text;
+  int64_t intValue = 0;
+  unsigned line = 1;
+  unsigned column = 1;
+};
+
+/// Tokenizes `text`, appending an `End` token. Fails with a message (no source
+/// prefix) on an unterminated string or block comment.
+llvm::Expected<std::vector<LlkMapToken>> lexLlkMap(llvm::StringRef text,
+                                                   llvm::StringRef sourceName);
+
+//===----------------------------------------------------------------------===//
+// Shared parser
+//===----------------------------------------------------------------------===//
+
+/// A cursor over LLKMap tokens with the shared expression grammar and
+/// diagnostics. Declaration parsers derive from it.
+class LlkMapParser {
+public:
+  LlkMapParser(std::vector<LlkMapToken> tokens, llvm::StringRef sourceName)
+      : tokens_(std::move(tokens)), source_(sourceName) {}
+  virtual ~LlkMapParser() = default;
+
+  // --- cursor -------------------------------------------------------------
+  const LlkMapToken &current() const { return tokens_[pos_]; }
+  const LlkMapToken &peek(size_t ahead = 1) const {
+    size_t index = pos_ + ahead;
+    return index < tokens_.size() ? tokens_[index] : tokens_.back();
+  }
+  bool atEnd() const { return current().kind == LlkMapToken::Kind::End; }
+  void advance() {
+    if (pos_ + 1 < tokens_.size())
+      ++pos_;
+  }
+  bool isPunct(llvm::StringRef punct) const {
+    return current().kind == LlkMapToken::Kind::Punct &&
+           current().text == punct;
+  }
+
+  // --- diagnostics --------------------------------------------------------
+  bool fail(const llvm::Twine &message);
+  bool failAt(const LlkMapToken &token, const llvm::Twine &message);
+  llvm::Error takeError();
+  bool hasError() const { return !error_.empty(); }
+  const std::string &errorText() const { return error_; }
+
+  // --- terminals ----------------------------------------------------------
+  bool expectPunct(llvm::StringRef punct);
+  bool expectIdentifier(llvm::StringRef what, std::string &out);
+
+  /// Parses `[ lo ".." hi ]` or `{ literal ("," literal)* }` into a value list.
+  /// Shared by `param` domains in layouts and rules.
+  bool parseDomainValues(std::vector<LayoutValue> &out);
+
+  // --- expressions --------------------------------------------------------
+  ExprPtr parseExpression();
+
+  /// Validates every identifier, call, and member against the vocabulary the
+  /// current declaration allows.
+  bool validateExpr(const ExprPtr &expr, const llvm::StringSet<> &allowed);
+
+protected:
+  ExprPtr parseOr();
+  ExprPtr parseAnd();
+  ExprPtr parseEquality();
+  ExprPtr parseRelational();
+  ExprPtr parseAdditive();
+  ExprPtr parseMultiplicative();
+  ExprPtr parseUnary();
+  ExprPtr parsePostfix();
+  ExprPtr parsePrimary();
+  bool parseCallArgs(std::vector<ExprPtr> &out);
+
+  std::vector<LlkMapToken> tokens_;
+  llvm::StringRef source_;
+  size_t pos_ = 0;
+  std::string error_;
+};
+
+} // namespace mlir::llk::mapping
+
+#endif // LLK_MAPPING_LLKMAP_H

@@ -20,6 +20,8 @@
 #ifndef LLK_MAPPING_LAYOUTCONSTRAINTS_H
 #define LLK_MAPPING_LAYOUTCONSTRAINTS_H
 
+#include "LLK/Mapping/LlkMap.h"
+
 #include "LLK/Machine/MachineModel.h"
 
 #include "mlir/IR/AffineMap.h"
@@ -38,33 +40,6 @@
 #include <vector>
 
 namespace mlir::llk::mapping {
-
-/// A concrete value a layout expression can take: an integer or a symbolic
-/// name. Boolean expressions evaluate to integers 0 and 1.
-using LayoutValue = std::variant<int64_t, std::string>;
-
-enum class ExprKind {
-  IntLit,     ///< integer literal
-  StringLit,  ///< quoted string
-  Ident,      ///< parameter or builtin (`rank`, `element_type`)
-  Call,       ///< `floordiv(a, b)`, `machine.compute("vector_engine")`
-  MemberCall, ///< `receiver.lanes(dtype)`, `receiver.count`
-  Unary,      ///< `!a`, `-a`
-  Binary      ///< `a + b`, `a % b`, `a == b`, `a && b`
-};
-
-struct Expr;
-using ExprPtr = std::shared_ptr<const Expr>;
-
-struct Expr {
-  ExprKind kind = ExprKind::IntLit;
-  /// Integer literal value, or a boolean result materialized during parsing.
-  int64_t intValue = 0;
-  /// Identifier name, call callee, member name, or operator spelling.
-  std::string text;
-  /// Call/member arguments; for a member call, `operands[0]` is the receiver.
-  std::vector<ExprPtr> operands;
-};
 
 /// One declared parameter. `symbolic` parameters range over a declared set of
 /// names; integer parameters range over integer intervals.
@@ -114,36 +89,6 @@ llvm::Expected<LayoutRegistry> parseLayoutText(llvm::StringRef text,
 
 /// Reads and parses the file at `path`.
 llvm::Expected<LayoutRegistry> loadLayoutFile(llvm::StringRef path);
-
-//===----------------------------------------------------------------------===//
-// Expression evaluation
-//===----------------------------------------------------------------------===//
-
-/// The values a declaration is instantiated against: the rank and element type
-/// of the value being laid out. They back the `rank` and `element_type`
-/// builtins.
-struct LayoutContext {
-  int64_t rank = 0;
-  std::string elementType;
-};
-
-/// The result of evaluating an expression. `Handle` is the intermediate value
-/// a `machine.compute(...)` / `machine.memory(...)` query produces before a
-/// member query is applied; it never escapes as a solution value.
-struct EvalValue {
-  enum class Kind { Int, Str, Handle };
-  Kind kind = Kind::Int;
-  int64_t intValue = 0;
-  std::string text;
-};
-
-/// Evaluates a parsed expression. Booleans are integers (0 and 1). Fails on an
-/// unknown identifier, an unknown machine fact, a type mismatch between an
-/// integer and a string, or division by zero.
-llvm::Expected<EvalValue>
-evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
-             const machine::MachineModel &machine,
-             const LayoutContext &context);
 
 //===----------------------------------------------------------------------===//
 // Solving

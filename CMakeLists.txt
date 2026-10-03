@@ -264,6 +264,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/SearchBinding.cpp
     lib/Mapping/WorkloadGraph.cpp
     lib/Mapping/MappingPlan.cpp
+    lib/Mapping/LlkMap.cpp
     lib/Mapping/LayoutConstraints.cpp
     lib/Mapping/Routing.cpp
 )
