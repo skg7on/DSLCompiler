@@ -298,7 +298,8 @@ TEST(Placement, InstancesAreLegalAndStable) {
 TEST(Placement, ComputeUtilizationUsesTheSyncWindow) {
   MachineModel machine = placementMachine();
   machine.workerThreads = 4;
-  machine.clockHz = 3000000000;
+  // No clockHz: it cancels in the dimensionless cycle ratio (see
+  // utilizationEstimate), so the sync period is the only fact this needs.
   machine.sync.barrierCycles = 200;
   machine.sync.waitCycles = 50;
   std::unique_ptr<MappingTarget> target = targetFor(machine);

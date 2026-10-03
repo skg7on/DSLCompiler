@@ -42,7 +42,16 @@ struct Cost {
   /// is nothing to count. It stays 0 until a spill notion exists rather than
   /// inventing a model for one (design §17.2).
   uint64_t spillBytes = 0;
+  /// Aggregate compute load factor, **not** a per-component fraction. Each
+  /// component contributes `busyCycles / (workerThreads x syncPeriod)`, and
+  /// `addCost` sums those ratios. Because the denominator is a machine-global
+  /// constant, the sum is `ΣbusyCycles / capacity` and may exceed 1, which
+  /// legitimately signals oversubscription. A plan carrying 1.0 has engaged one
+  /// full window of compute across its components, not a component that was
+  /// 100% busy.
   double computeUtilization = 0.0;
+  /// Aggregate transfer load factor; same convention as `computeUtilization`,
+  /// with the denominator `transferEngineCount x syncPeriod`.
   double transferUtilization = 0.0;
 };
 
@@ -66,6 +75,13 @@ double costMetric(const Cost &cost, CostMetric metric);
 
 /// Component-wise sum. Used to combine rule-local, route, and transform costs
 /// into a plan total without collapsing the dimensions.
+///
+/// The two utilization dimensions follow their documented aggregate
+/// convention: they are summed, not averaged, and since each ratio shares one
+/// machine-global denominator the sum is a total load factor that may exceed 1.
+/// Two components each 0.5 yield 1.0 -- one full window of engaged work. An
+/// objective naming a utilization metric therefore ranks aggregate occupancy,
+/// not per-component efficiency.
 Cost addCost(const Cost &lhs, const Cost &rhs);
 
 /// First-order component utilization (design §17.2): the `busyCycles` a

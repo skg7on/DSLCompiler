@@ -512,7 +512,8 @@ TEST(Connections, SpillBytesStayUnpopulated) {
 // machine's transfer engines had available in one sync period.
 TEST(Connections, TransferUtilizationUsesTheSyncWindow) {
   MachineModel machine = connectionMachine();
-  machine.clockHz = 3000000000;
+  // No clockHz: it cancels in the dimensionless cycle ratio (see
+  // utilizationEstimate), so the sync period is the only fact this needs.
   machine.sync.barrierCycles = 100; // one modelled sync period
   TopologyService topology(machine);
   ConnectionRequest request = baseRequest(); // dram.0 -> acc.0, 1024 bytes

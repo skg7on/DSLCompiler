@@ -29,6 +29,26 @@ TEST(CostModel, AddsDimensionwise) {
   EXPECT_EQ(sum.localBytes, 5u);
 }
 
+// Utilization is an aggregate load factor, not a per-component fraction: both
+// dimensions share one machine-global denominator, so `addCost` sums them and
+// the total may exceed 1 to signal oversubscription. Two components each using
+// half a window therefore add to one full window.
+TEST(CostModel, UtilizationAddsAsAnAggregateLoadFactor) {
+  Cost half;
+  half.computeUtilization = 0.5;
+  half.transferUtilization = 0.5;
+  Cost other = half;
+
+  Cost sum = addCost(half, other);
+  EXPECT_DOUBLE_EQ(sum.computeUtilization, 1.0);
+  EXPECT_DOUBLE_EQ(sum.transferUtilization, 1.0);
+
+  // The sum is not clamped to 1: an overloaded plan reads above 1.
+  Cost overloaded = addCost(sum, half);
+  EXPECT_DOUBLE_EQ(overloaded.computeUtilization, 1.5);
+  EXPECT_DOUBLE_EQ(overloaded.transferUtilization, 1.5);
+}
+
 TEST(CostModel, MinimizeOrdersByPrimaryThenSecondary) {
   ObjectiveOrder order{
       CostMetric::LatencyCycles, {CostMetric::DramBytes}, true};

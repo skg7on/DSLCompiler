@@ -159,8 +159,9 @@ TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
       route.transferEngines = current.engines;
       route.cost.latencyCycles = current.cost;
       route.cost.localBytes = request.bytes;
-      // DRAM bytes: each hop whose source or destination is the DRAM-class
-      // memory moves the value across the DRAM boundary once.
+      // DRAM bytes: charge the value once per hop whose source or destination
+      // is the DRAM-class memory. A route that enters and later leaves DRAM is
+      // charged on both hops, so the count is per-hop, not per-route.
       for (size_t hop = 0; hop + 1 < current.nodes.size(); ++hop) {
         const MemoryNode *from = model_.findMemory(current.nodes[hop]);
         const MemoryNode *to = model_.findMemory(current.nodes[hop + 1]);
