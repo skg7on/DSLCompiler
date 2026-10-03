@@ -356,6 +356,166 @@ rule r.sram {
 /// the link latency (10) plus 4096 assumed bytes at 32 bytes/cycle.
 constexpr double kFanTransferCycles = 10.0 + 4096.0 / 32.0;
 
+/// Two producers and two consumers of one value: the multi-producer,
+/// multi-consumer shape.
+WorkloadGraph fanInFanOutGraph(mlir::MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId in1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in1", /*external=*/true});
+  WorkloadValueId in2 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in2", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+  WorkloadValueId out1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "o1", /*external=*/false});
+  WorkloadValueId out2 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "o2", /*external=*/false});
+
+  auto producer = [&](WorkloadValueId input, unsigned ordinal) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.attributes = vectorAttributes(context, "produce");
+    node.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
+    node.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  producer(in1, 0);
+  producer(in2, 1);
+
+  auto consumer = [&](WorkloadValueId output, unsigned ordinal) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.attributes = vectorAttributes(context, "consume");
+    node.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+    node.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  consumer(out1, 2);
+  consumer(out2, 3);
+
+  graph.finalize();
+  return graph;
+}
+
+/// One producer and two consumers of one value, where each consumer is gated
+/// by its own operation so it binds a distinct destination memory.
+WorkloadGraph twoConsumerGraph(mlir::MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+  WorkloadValueId out1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "o1", /*external=*/false});
+  WorkloadValueId out2 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "o2", /*external=*/false});
+
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.sourceOrdinal = 0;
+  producer.attributes = vectorAttributes(context, "produce");
+  producer.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(producer));
+
+  WorkloadNode first;
+  first.opName = "micro.vector";
+  first.sourceOrdinal = 1;
+  first.attributes = vectorAttributes(context, "consume_a");
+  first.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  first.outputs.push_back(WorkloadPort{out1, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(first));
+
+  WorkloadNode second;
+  second.opName = "micro.vector";
+  second.sourceOrdinal = 2;
+  second.attributes = vectorAttributes(context, "consume_b");
+  second.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  second.outputs.push_back(WorkloadPort{out2, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(second));
+
+  graph.finalize();
+  return graph;
+}
+
+/// Two consumers that must each copy, into two distinct destination memories,
+/// both reached only through the same staging memory: dram.0 -> stage.0 ->
+/// {acc.0, aux.0}. `stage.0` is large enough for the router to accept each hop
+/// (>= 4096 bytes) but too small to hold both staged copies, so whether the
+/// search charges intermediate hops is observable.
+MachineModel twoDestinationHopMachine() {
+  MachineModel model;
+  model.target = "fan-hop";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}},
+                     {"e1", "worker", std::nullopt, {}, 1, {}}};
+  auto memory = [](llvm::StringRef id, llvm::StringRef kind,
+                   llvm::StringRef visible, uint64_t capacity) {
+    MemoryNode node;
+    node.id = id.str();
+    node.kind = kind.str();
+    node.visibleFrom = visible.str();
+    node.capacityBytes = capacity;
+    node.alignmentBytes = 64;
+    return node;
+  };
+  model.memories = {memory("dram.0", "dram", "e0", 1u << 30),
+                    memory("stage.0", "sram", "e0", 5000),
+                    memory("acc.0", "acc", "e1", 1u << 20),
+                    memory("aux.0", "aux", "e1", 1u << 20)};
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+  auto link = [](llvm::StringRef id, llvm::StringRef source,
+                 llvm::StringRef destination) {
+    LinkEdge edge;
+    edge.id = id.str();
+    edge.source = source.str();
+    edge.destination = destination.str();
+    edge.bandwidthBytesPerCycle = 32;
+    edge.latencyCycles = 10;
+    edge.transactionBytes = 64;
+    edge.transferEngines = {"dma.0"};
+    return edge;
+  };
+  model.links = {link("dram_to_stage.0", "dram.0", "stage.0"),
+                 link("stage_to_acc.0", "stage.0", "acc.0"),
+                 link("stage_to_aux.0", "stage.0", "aux.0")};
+  return model;
+}
+
+/// One producer rule and two consumer rules, each consumer gated on its own
+/// operation so it binds a different memory kind (acc vs aux).
+constexpr llvm::StringLiteral kTwoConsumerRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume_a {
+  match micro.vector(op = "consume_a");
+  require executor kind worker;
+  require memory kind acc;
+  bundle "b.consume_a";
+  emit "e1";
+  cost 1;
+}
+rule r.consume_b {
+  match micro.vector(op = "consume_b");
+  require executor kind worker;
+  require memory kind aux;
+  bundle "b.consume_b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
 std::unique_ptr<MappingTarget> targetWith(MachineModel machine,
                                           llvm::StringRef rules) {
   llvm::Expected<RuleRegistry> registry = parseRuleText(rules, "<test>");
@@ -704,10 +864,10 @@ TEST(CoveringSearch, SharedReadSynthesizesOnePlanForBothConsumers) {
   EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, 3.0);
 }
 
-// Two consumers whose placements their executors cannot read in place each get
-// a copied connection, labelled `Replicate`, and the copies cost a transfer
-// apiece.
-TEST(CoveringSearch, ReplicatedConsumersGetReplicateConnections) {
+// Two consumers whose placements their executors cannot read in place must be
+// served by a copy. They share a destination memory, so one `Replicate` copy
+// serves both: the transfer cost is counted once, not once per consumer.
+TEST(CoveringSearch, ReplicatedConsumersOnOneMemoryShareACopy) {
   mlir::MLIRContext context;
   WorkloadGraph graph = fanOutGraph(context, /*producerOp=*/"produce",
                                     /*consumerOp=*/"consume");
@@ -721,12 +881,35 @@ TEST(CoveringSearch, ReplicatedConsumersGetReplicateConnections) {
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   ASSERT_FALSE(result->plans.empty());
   const CoveringPlan &plan = result->plans[0];
-  ASSERT_EQ(plan.connections.size(), 2u);
-  for (const PlanConnection &connection : plan.connectionPlans)
-    EXPECT_EQ(connection.kind, ConnectionKind::Replicate);
-  // Three instances at one cycle, plus two replicated copies.
+  ASSERT_EQ(plan.connections.size(), 1u);
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  EXPECT_EQ(plan.connectionPlans[0].kind, ConnectionKind::Replicate);
+  // Three instances at one cycle, plus one shared copy.
+  EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, 3.0 + kFanTransferCycles);
+}
+
+// Two producers and two consumers of one value: consumers sharing a
+// destination memory are served by a single gather, so the feeds and the
+// intermediate tile are counted once per memory, not once per consumer.
+TEST(CoveringSearch, MultiProducerMultiConsumerDedupesToOneReduce) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanInFanOutGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connections.size(), 1u);
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  EXPECT_EQ(plan.connectionPlans[0].kind, ConnectionKind::Reduce);
+  // Four instances at one cycle, plus the two summed feeds.
   EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles,
-                   3.0 + 2.0 * kFanTransferCycles);
+                   4.0 + 2.0 * kFanTransferCycles);
 }
 
 // A value fed by two producers is gathered into one `Reduce` connection whose
@@ -776,18 +959,37 @@ TEST(CoveringSearch, FanOutRouteCapSetsSearchTruncated) {
 }
 
 // Replicated bytes are charged to the memory that holds the copy: two consumer
-// instances fit acc.0, but the two replicas they need do not.
+// instances fit acc.0, but the one copy they share does not.
 TEST(CoveringSearch, ReplicationBytesCountAgainstCapacity) {
   mlir::MLIRContext context;
   WorkloadGraph graph = fanOutGraph(context, /*producerOp=*/"produce",
                                     /*consumerOp=*/"consume");
   MachineModel machine = fanMachine();
-  // Two consumer instances charge 4096 each (8192); one 4096 replica apiece
-  // pushes acc.0 to 16384. 12000 admits the instances but not the copies.
+  // The two consumer instances charge 4096 each (8192); the one shared copy
+  // pushes acc.0 to 12288. 12000 admits the instances but not the copy.
   for (MemoryNode &memory : machine.memories)
     if (memory.kind == "acc")
       memory.capacityBytes = 12000;
   std::unique_ptr<MappingTarget> target = targetWith(machine, kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// A replica staged through an intermediate memory is charged there too, not
+// only at its destination: two copies into acc.0 and aux.0 both stage through
+// the 5000-byte stage.0, which holds one 4096-byte tile but not two.
+TEST(CoveringSearch, ReplicateIntermediateHopsCountAgainstCapacity) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoConsumerGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(twoDestinationHopMachine(), kTwoConsumerRules);
   ASSERT_NE(target, nullptr);
 
   MappingSearchOptions options;

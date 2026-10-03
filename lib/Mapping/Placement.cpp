@@ -568,75 +568,137 @@ synthesizeConnections(const ConnectionRequest &request,
 
 llvm::Expected<std::vector<ConnectionPlan>>
 synthesizeFanOut(const ConnectionRequest &base,
-                 llvm::ArrayRef<InstanceId> consumers,
-                 llvm::ArrayRef<MemoryNodeId> consumerMemories,
+                 llvm::ArrayRef<ConnectionRequest> consumers,
                  const MachineModel &machine, const TopologyService &topology,
                  const PlacementOptions &options, bool *truncated) {
-  if (consumers.size() != consumerMemories.size())
-    return placementError(
-        "fan-out: consumers and consumer memories must correspond");
+  if (consumers.empty())
+    return std::vector<ConnectionPlan>{};
 
-  // Shared read: every consumer reads the memory the producer already wrote.
-  bool allShareProducerMemory = true;
-  for (const MemoryNodeId &memory : consumerMemories)
-    if (memory != base.producerMemory)
-      allShareProducerMemory = false;
+  // §15.3(a): a shared read is legal exactly when every consumer can legally
+  // access the producer's placement. That is a visibility fact, checked here
+  // against *each* consumer's own request -- not a memory-equality shortcut and
+  // not a check of one representative only.
+  bool allShareProducerPlacement = true;
+  for (const ConnectionRequest &consumer : consumers)
+    if (!portsDirectCompatible(consumer, machine)) {
+      allShareProducerPlacement = false;
+      break;
+    }
 
-  std::vector<ConnectionPlan> plans;
-  if (allShareProducerMemory && !consumers.empty() &&
-      portsDirectCompatible(base, machine)) {
+  if (allShareProducerPlacement) {
     ConnectionPlan plan;
     plan.producer = base.producer;
     plan.value = base.value;
-    for (InstanceId consumer : consumers)
-      plan.consumers.push_back(consumer);
+    for (const ConnectionRequest &consumer : consumers)
+      plan.consumers.push_back(consumer.consumer);
+    llvm::sort(plan.consumers);
     plan.kind = ConnectionKind::Direct;
     plan.memoryRoute.push_back(base.producerMemory);
     plan.cost.localBytes = base.bytes;
     plan.id = computeConnectionId(plan);
-    plans.push_back(std::move(plan));
-    return plans;
+    return std::vector<ConnectionPlan>{std::move(plan)};
   }
 
-  // Replication: each consumer gets its own connection. A plan that actually
-  // moves the value into another memory is a copy, so it is labelled
-  // `Replicate` and its transfer cost (and the bytes it stages) can be
-  // accounted by the search; a plan that reads the producer's memory in place
-  // stays `Direct`, because no copy is made.
+  // §15.3(b): replication. Consumers that share a destination memory share one
+  // copy, so a copy's cost and capacity are counted once per memory rather
+  // than once per consumer. Each consumer is still validated on its own
+  // request, so a mismatched element type or affine relation is not missed.
+  std::vector<MemoryNodeId> groupMemories;
+  std::vector<std::vector<size_t>> groups;
   for (size_t index = 0; index < consumers.size(); ++index) {
-    ConnectionRequest request = base;
-    request.consumer = consumers[index];
-    request.consumerMemory = consumerMemories[index];
-    llvm::Expected<std::vector<ConnectionPlan>> replicated =
-        synthesizeConnections(request, machine, topology, options, truncated);
-    if (!replicated)
-      return replicated.takeError();
-    for (ConnectionPlan &plan : *replicated) {
-      if (plan.kind == ConnectionKind::Transfer ||
-          plan.kind == ConnectionKind::TransferAndTransform) {
-        plan.kind = ConnectionKind::Replicate;
-        // `kind` is part of the canonical string, so the id is recomputed.
-        plan.id = computeConnectionId(plan);
-      }
-      plans.push_back(std::move(plan));
+    size_t group = 0;
+    for (; group < groupMemories.size(); ++group)
+      if (groupMemories[group] == consumers[index].consumerMemory)
+        break;
+    if (group == groupMemories.size()) {
+      groupMemories.push_back(consumers[index].consumerMemory);
+      groups.emplace_back();
     }
+    groups[group].push_back(index);
+  }
+
+  std::vector<ConnectionPlan> plans;
+  for (const std::vector<size_t> &group : groups) {
+    // A group every member of which reads the producer's placement needs no
+    // copy at all.
+    bool groupSharesProducer = true;
+    for (size_t index : group)
+      if (!portsDirectCompatible(consumers[index], machine)) {
+        groupSharesProducer = false;
+        break;
+      }
+    if (groupSharesProducer) {
+      ConnectionPlan plan;
+      plan.producer = base.producer;
+      plan.value = base.value;
+      for (size_t index : group)
+        plan.consumers.push_back(consumers[index].consumer);
+      llvm::sort(plan.consumers);
+      plan.kind = ConnectionKind::Direct;
+      plan.memoryRoute.push_back(base.producerMemory);
+      plan.cost.localBytes = base.bytes;
+      plan.id = computeConnectionId(plan);
+      plans.push_back(std::move(plan));
+      continue;
+    }
+
+    // A copy into this memory serves the whole group. Validate every member and
+    // pick the cheapest copy among their alternatives; group members share a
+    // destination memory, so one copy's route is the group's route. Only plans
+    // that actually move the value into the memory count -- a member's in-place
+    // read or transform does not serve the group's non-sharing members.
+    std::vector<ConnectionPlan> alternatives;
+    for (size_t index : group) {
+      llvm::Expected<std::vector<ConnectionPlan>> member =
+          synthesizeConnections(consumers[index], machine, topology, options,
+                                truncated);
+      if (!member)
+        return member.takeError();
+      if (member->empty())
+        return std::vector<ConnectionPlan>{}; // this consumer cannot be served
+      for (ConnectionPlan &plan : *member) {
+        if (plan.kind == ConnectionKind::Transfer ||
+            plan.kind == ConnectionKind::TransferAndTransform) {
+          plan.kind = ConnectionKind::Replicate;
+          // `kind` is part of the canonical string, so the id is recomputed.
+          plan.id = computeConnectionId(plan);
+        }
+        if (plan.kind == ConnectionKind::Replicate)
+          alternatives.push_back(std::move(plan));
+      }
+    }
+    if (alternatives.empty())
+      return std::vector<ConnectionPlan>{};
+    auto best = llvm::min_element(
+        alternatives, [](const ConnectionPlan &lhs, const ConnectionPlan &rhs) {
+          return lhs.cost.latencyCycles < rhs.cost.latencyCycles;
+        });
+    ConnectionPlan chosen = *best;
+    chosen.consumers.clear();
+    for (size_t index : group)
+      chosen.consumers.push_back(consumers[index].consumer);
+    llvm::sort(chosen.consumers);
+    chosen.id = computeConnectionId(chosen);
+    plans.push_back(std::move(chosen));
   }
   return plans;
 }
 
 ConnectionPlan synthesizeFanIn(llvm::ArrayRef<InstanceId> producers,
-                               InstanceId consumer, WorkloadValueId value,
+                               llvm::ArrayRef<InstanceId> consumers,
+                               WorkloadValueId value,
                                MemoryNodeId consumerMemory, uint64_t bytes,
                                const Cost &feedCost) {
   ConnectionPlan plan;
   plan.kind = ConnectionKind::Reduce;
-  plan.consumers.push_back(consumer);
+  plan.consumers.assign(consumers.begin(), consumers.end());
   plan.producers.assign(producers.begin(), producers.end());
   plan.value = value;
   plan.memoryRoute.push_back(std::move(consumerMemory));
-  // A gather sums what its feeds cost and stages one intermediate tile.
+  // A gather sums what its feeds cost. The gathered tile's `bytes` are charged
+  // to its memory by the caller (capacity), not added again to `localBytes`,
+  // which already carries each feed's staged value.
   plan.cost = feedCost;
-  plan.cost.localBytes = feedCost.localBytes + bytes;
   plan.id = computeConnectionId(plan);
   return plan;
 }

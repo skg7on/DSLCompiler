@@ -526,6 +526,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // Connections are staged locally and committed to the pool only after the
     // capacity check, so a rejected branch leaves no partial state behind.
     std::vector<ConnectionPlan> staged;
+    // Bytes a connection adds beyond the instances' own tiles: a replicated
+    // copy and a gather's intermediate tile are extra objects in memory, so
+    // they are charged. A plain single-consumer `Transfer` is deliberately not
+    // charged here: its destination tile is the consumer instance's own tile,
+    // already counted through that instance's memory binding.
     llvm::StringMap<uint64_t> stagedBytes; // memory -> replica/gather bytes
 
     // Synthesizes one plain-edge connection, staging the chosen alternative.
@@ -584,78 +589,90 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           continue;
         }
 
-        // Fan-out (design §15.3): a shared read when every consumer reads the
-        // producer's placement, otherwise a per-consumer plan (replication).
-        std::vector<InstanceId> consumerIds;
-        std::vector<MemoryNodeId> consumerMemories;
-        for (const ValueEndpoint &consumerEnd : link.consumers) {
-          const CandidateInstance &consumer = *partial.chosen[consumerEnd.node];
-          consumerIds.push_back(consumer.id);
-          consumerMemories.push_back(primaryMemory(machine, consumer));
-        }
-        const ValueEndpoint &firstConsumer = link.consumers[0];
-        ConnectionRequest base =
-            makeRequest(producer, *partial.chosen[firstConsumer.node],
-                        producerEnd.port, firstConsumer.port, link.value);
+        // Fan-out (design §15.3). Each consumer is described by its own
+        // request, so the shared-read decision and every §10.2 check see that
+        // consumer's real element type, affine relation, and executor.
+        std::vector<ConnectionRequest> consumerRequests;
+        for (const ValueEndpoint &consumerEnd : link.consumers)
+          consumerRequests.push_back(
+              makeRequest(producer, *partial.chosen[consumerEnd.node],
+                          producerEnd.port, consumerEnd.port, link.value));
         bool fanOutTruncated = false;
         llvm::Expected<std::vector<ConnectionPlan>> alternatives =
-            synthesizeFanOut(base, consumerIds, consumerMemories, machine,
-                             topology, placementOptions, &fanOutTruncated);
+            synthesizeFanOut(consumerRequests.front(), consumerRequests,
+                             machine, topology, placementOptions,
+                             &fanOutTruncated);
         if (alternatives)
           result.routeCount += alternatives->size();
         reportTruncation(fanOutTruncated);
         if (!alternatives) {
           report(DiagnosticCode::NoMemoryRoute,
-                 "fan-out " + base.producerMemory + ": " +
+                 "fan-out " + consumerRequests.front().producerMemory + ": " +
                      llvm::toString(alternatives.takeError()));
           return false;
         }
         if (alternatives->empty()) {
-          incompatible("fan-out " + base.producerMemory + ": no legal route");
+          incompatible("fan-out " + consumerRequests.front().producerMemory +
+                       ": no legal route");
           return false;
         }
-        // A shared read carries every consumer in one plan.
-        if (alternatives->front().consumers.size() == consumerIds.size()) {
-          staged.push_back(alternatives->front());
+        // `synthesizeFanOut` has already selected the shapes: one shared read,
+        // or one copy per destination memory (plus any in-place group reads).
+        for (const ConnectionPlan &plan : *alternatives) {
+          staged.push_back(plan);
           cost = addCost(cost, staged.back().cost);
-        } else {
-          for (InstanceId consumerId : consumerIds) {
-            std::vector<ConnectionPlan> mine;
-            for (const ConnectionPlan &plan : *alternatives)
-              if (llvm::is_contained(plan.consumers, consumerId))
-                mine.push_back(plan);
-            const ConnectionPlan *best = pickBest(mine);
-            if (!best) {
-              incompatible("fan-out " + base.producerMemory +
-                           ": a consumer has no legal route");
-              return false;
-            }
-            staged.push_back(*best);
-            cost = addCost(cost, staged.back().cost);
-            // A replicated copy occupies the memory that holds it.
-            if (staged.back().kind == ConnectionKind::Replicate &&
-                !staged.back().memoryRoute.empty())
-              stagedBytes[staged.back().memoryRoute.back()] +=
-                  kAssumedValueBytes;
-          }
+          // A copy occupies every memory after its source: its destination and
+          // any staging hop it passes through.
+          if (staged.back().kind == ConnectionKind::Replicate)
+            for (size_t hop = 1; hop < staged.back().memoryRoute.size(); ++hop)
+              stagedBytes[staged.back().memoryRoute[hop]] += kAssumedValueBytes;
         }
         continue;
       }
 
-      // Fan-in (design §15.3): several producers feed one value, so a gather
-      // sums their feeds into one intermediate tile.
+      // Fan-in (design §15.3): several producers feed one value. Consumers
+      // sharing a destination memory are served by one gather, so the feeds and
+      // the intermediate tile are counted once per memory, not once per
+      // consumer.
       std::vector<InstanceId> producerIds;
       for (const ValueEndpoint &producerEnd : link.producers)
         producerIds.push_back(partial.chosen[producerEnd.node]->id);
       llvm::sort(producerIds);
+
+      std::vector<MemoryNodeId> gatherMemories;
+      std::vector<std::vector<const ValueEndpoint *>> gatherGroups;
       for (const ValueEndpoint &consumerEnd : link.consumers) {
-        const CandidateInstance &consumer = *partial.chosen[consumerEnd.node];
+        MemoryNodeId memory =
+            primaryMemory(machine, *partial.chosen[consumerEnd.node]);
+        size_t group = 0;
+        for (; group < gatherMemories.size(); ++group)
+          if (gatherMemories[group] == memory)
+            break;
+        if (group == gatherMemories.size()) {
+          gatherMemories.push_back(memory);
+          gatherGroups.emplace_back();
+        }
+        gatherGroups[group].push_back(&consumerEnd);
+      }
+
+      for (size_t group = 0; group < gatherGroups.size(); ++group) {
+        MemoryNodeId consumerMemory = gatherMemories[group];
+        const std::vector<const ValueEndpoint *> &groupEndpoints =
+            gatherGroups[group];
+        const ValueEndpoint &representative = *groupEndpoints.front();
+        const CandidateInstance &consumer =
+            *partial.chosen[representative.node];
+        std::vector<InstanceId> consumerIds;
+        for (const ValueEndpoint *endpoint : groupEndpoints)
+          consumerIds.push_back(partial.chosen[endpoint->node]->id);
+        llvm::sort(consumerIds);
+
         Cost feedCost;
         std::vector<ExecutorId> engines;
         for (const ValueEndpoint &producerEnd : link.producers) {
           ConnectionRequest request =
               makeRequest(*partial.chosen[producerEnd.node], consumer,
-                          producerEnd.port, consumerEnd.port, link.value);
+                          producerEnd.port, representative.port, link.value);
           bool feedTruncated = false;
           llvm::Expected<std::vector<ConnectionPlan>> alternatives =
               synthesizeConnections(request, machine, topology,
@@ -678,9 +695,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             if (!llvm::is_contained(engines, engine))
               engines.push_back(engine);
         }
-        MemoryNodeId consumerMemory = primaryMemory(machine, consumer);
         ConnectionPlan reduce =
-            synthesizeFanIn(producerIds, consumer.id, link.value,
+            synthesizeFanIn(producerIds, consumerIds, link.value,
                             consumerMemory, kAssumedValueBytes, feedCost);
         reduce.transferEngines.assign(engines.begin(), engines.end());
         staged.push_back(std::move(reduce));

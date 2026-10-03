@@ -78,10 +78,10 @@ ConnectionRequest baseRequest() {
   return request;
 }
 
-/// e0 owns dram.0 and e1 owns acc.0; neither sees the other's memory. A
-/// consumer placed on acc.0 therefore cannot read the producer's dram.0 in
-/// place, so serving it means a real copy over the single dram.0 -> acc.0 link:
-/// replication, not a direct read.
+/// e0 owns dram.0; e1 owns acc.0 and sram.0, and neither executor sees the
+/// other's memory. A consumer placed on acc.0 or sram.0 therefore cannot read
+/// the producer's dram.0 in place, so serving it means a real copy over the
+/// dram.0 -> acc.0 / dram.0 -> sram.0 links: replication, not a direct read.
 MachineModel replicationMachine() {
   MachineModel model;
   model.target = "replication";
@@ -91,13 +91,16 @@ MachineModel replicationMachine() {
   dram.visibleFrom = "e0";
   MemoryNode acc = memory("acc.0", "acc");
   acc.visibleFrom = "e1";
-  model.memories = {dram, acc};
+  MemoryNode sram = memory("sram.0", "sram");
+  sram.visibleFrom = "e1";
+  model.memories = {dram, acc, sram};
   TransferEngineNode dma;
   dma.id = "dma.0";
   dma.kind = "dma";
   dma.attachedTo = "e0";
   model.transferEngines = {dma};
-  model.links = {link("dram_to_acc.0", "dram.0", "acc.0")};
+  model.links = {link("dram_to_acc.0", "dram.0", "acc.0"),
+                 link("dram_to_sram.0", "dram.0", "sram.0")};
   return model;
 }
 
@@ -109,6 +112,16 @@ ConnectionRequest replicationRequest() {
   request.consumerMemory = "acc.0";
   request.producerExecutor = "e0";
   request.consumerExecutor = "e1";
+  return request;
+}
+
+/// A fully-specified per-consumer request derived from `base`, as the search
+/// builds one per consumer so every §10.2 check sees that consumer's own facts.
+ConnectionRequest consumerRequest(const ConnectionRequest &base,
+                                  InstanceId consumer, MemoryNodeId memory) {
+  ConnectionRequest request = base;
+  request.consumer = consumer;
+  request.consumerMemory = std::move(memory);
   return request;
 }
 
@@ -668,10 +681,11 @@ TEST(Connections, FanOutSharesAReadWhenEveryConsumerReadsTheProducersMemory) {
   TopologyService topology(machine);
   ConnectionRequest base = baseRequest();
 
-  llvm::Expected<std::vector<ConnectionPlan>> plans = synthesizeFanOut(
-      base, std::vector<InstanceId>{11, 12},
-      std::vector<MemoryNodeId>{base.producerMemory, base.producerMemory},
-      machine, topology);
+  std::vector<ConnectionRequest> consumers = {
+      consumerRequest(base, 11, base.producerMemory),
+      consumerRequest(base, 12, base.producerMemory)};
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeFanOut(base, consumers, machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
   ASSERT_EQ(plans->size(), 1u);
   EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
@@ -680,58 +694,100 @@ TEST(Connections, FanOutSharesAReadWhenEveryConsumerReadsTheProducersMemory) {
   EXPECT_EQ((*plans)[0].consumers[1], 12u);
 }
 
-TEST(Connections, FanOutReplicatesWhenAConsumerNeedsADifferentMemory) {
+// §15.3(a): "all consumers can **legally access** one placement" is a
+// visibility fact, not memory equality. Consumer 12 is *placed* on acc.0 but
+// its executor can address the producer's dram.0, so both consumers share one
+// read there.
+TEST(Connections, FanOutSharesAReadAcrossVisibleMemories) {
   MachineModel machine = connectionMachine();
   TopologyService topology(machine);
   ConnectionRequest base = baseRequest();
 
+  std::vector<ConnectionRequest> consumers = {
+      consumerRequest(base, 11, base.producerMemory),
+      consumerRequest(base, 12, "acc.0")};
   llvm::Expected<std::vector<ConnectionPlan>> plans =
-      synthesizeFanOut(base, std::vector<InstanceId>{11, 12},
-                       std::vector<MemoryNodeId>{base.producerMemory, "acc.0"},
-                       machine, topology);
+      synthesizeFanOut(base, consumers, machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
-  // Consumer 11 shares the producer's memory (one direct read). Consumer 12 is
-  // placed on acc.0: it can read the producer's memory directly *and* it has
-  // both transfer routes into acc.0. The transfer routes are copies, so they
-  // are `Replicate`; the shared-memory read stays `Direct`.
-  ASSERT_EQ(plans->size(), 4u);
-  size_t direct = 0;
-  size_t replicates = 0;
-  for (const ConnectionPlan &plan : *plans) {
-    EXPECT_EQ(plan.consumers.size(), 1u);
-    if (plan.kind == ConnectionKind::Direct)
-      ++direct;
-    else if (plan.kind == ConnectionKind::Replicate)
-      ++replicates;
-  }
-  EXPECT_EQ(direct, 2u);
-  EXPECT_EQ(replicates, 2u);
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+  ASSERT_EQ((*plans)[0].consumers.size(), 2u);
+  ASSERT_EQ((*plans)[0].memoryRoute.size(), 1u);
+  EXPECT_EQ((*plans)[0].memoryRoute[0], "dram.0");
 }
 
-// Two consumers that must be served from a memory their executors cannot read
-// in place: every consumer gets a copy, and each copy is labelled `Replicate`.
-// Replication multiplies the transfer cost, one transfer per consumer.
-TEST(Connections, FanOutReplicatesWhenConsumersNeedDistinctPlacements) {
+// §10.2 is checked against *every* consumer, not one representative: a second
+// consumer whose element type disagrees must not be silently folded into a
+// shared read built from the first consumer's facts. The mismatched consumer
+// also has no alternative, so the fan-out is incompatible rather than wrong.
+TEST(Connections, FanOutValidatesEveryConsumerNotJustTheFirst) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest base = baseRequest();
+  base.elementType =
+      mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
+
+  std::vector<ConnectionRequest> consumers = {
+      consumerRequest(base, 11, base.producerMemory),
+      consumerRequest(base, 12, base.producerMemory)};
+  consumers[0].consumerType =
+      mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
+  consumers[1].consumerType =
+      mlir::RankedTensorType::get({8, 8}, mlir::BFloat16Type::get(&context));
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeFanOut(base, consumers, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_TRUE(plans->empty());
+}
+
+// Consumers whose executors cannot read the producer's placement must copy. Two
+// consumers that share a destination memory are served by a single copy: the
+// cost and capacity of a copy are counted once per memory, not once per
+// consumer.
+TEST(Connections, FanOutCopiesOncePerDestinationMemory) {
   MachineModel machine = replicationMachine();
   TopologyService topology(machine);
   ConnectionRequest base = replicationRequest();
 
-  llvm::Expected<std::vector<ConnectionPlan>> plans = synthesizeFanOut(
-      base, std::vector<InstanceId>{11, 12},
-      std::vector<MemoryNodeId>{"acc.0", "acc.0"}, machine, topology);
+  std::vector<ConnectionRequest> consumers = {
+      consumerRequest(base, 11, "acc.0"), consumerRequest(base, 12, "acc.0")};
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeFanOut(base, consumers, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  const double perCopy = 10.0 + 1024.0 / 32.0; // link latency + bytes/bandwidth
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Replicate);
+  ASSERT_EQ((*plans)[0].consumers.size(), 2u);
+  EXPECT_EQ((*plans)[0].consumers[0], 11u);
+  EXPECT_EQ((*plans)[0].consumers[1], 12u);
+  ASSERT_FALSE((*plans)[0].memoryRoute.empty());
+  EXPECT_EQ((*plans)[0].memoryRoute.back(), "acc.0");
+  EXPECT_DOUBLE_EQ((*plans)[0].cost.latencyCycles, perCopy);
+}
+
+// Consumers that require distinct destination placements each need their own
+// copy, and replication multiplies the transfer cost.
+TEST(Connections, FanOutCopiesOncePerDistinctDestinationMemory) {
+  MachineModel machine = replicationMachine();
+  TopologyService topology(machine);
+  ConnectionRequest base = replicationRequest();
+
+  std::vector<ConnectionRequest> consumers = {
+      consumerRequest(base, 11, "acc.0"), consumerRequest(base, 12, "sram.0")};
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeFanOut(base, consumers, machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
   ASSERT_EQ(plans->size(), 2u);
-  const double perCopy = 10.0 + 1024.0 / 32.0; // link latency + bytes/bandwidth
+  const double perCopy = 10.0 + 1024.0 / 32.0;
   double total = 0.0;
   for (const ConnectionPlan &plan : *plans) {
     EXPECT_EQ(plan.kind, ConnectionKind::Replicate);
     ASSERT_EQ(plan.consumers.size(), 1u);
-    ASSERT_FALSE(plan.memoryRoute.empty());
-    EXPECT_EQ(plan.memoryRoute.back(), "acc.0");
     EXPECT_DOUBLE_EQ(plan.cost.latencyCycles, perCopy);
     total += plan.cost.latencyCycles;
   }
-  // Two copies cost two transfers.
   EXPECT_DOUBLE_EQ(total, 2.0 * perCopy);
 }
 
@@ -745,11 +801,11 @@ TEST(Connections, FanOutReportsRouteCapThroughTruncated) {
   PlacementOptions options;
   options.maxRoutesPerConnection = 1; // the single route saturates the cap
 
+  std::vector<ConnectionRequest> consumers = {
+      consumerRequest(base, 11, "acc.0"), consumerRequest(base, 12, "acc.0")};
   bool truncated = false;
   llvm::Expected<std::vector<ConnectionPlan>> plans =
-      synthesizeFanOut(base, std::vector<InstanceId>{11, 12},
-                       std::vector<MemoryNodeId>{"acc.0", "acc.0"}, machine,
-                       topology, options, &truncated);
+      synthesizeFanOut(base, consumers, machine, topology, options, &truncated);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
   EXPECT_TRUE(truncated);
   ASSERT_FALSE(plans->empty());
@@ -758,8 +814,8 @@ TEST(Connections, FanOutReportsRouteCapThroughTruncated) {
 
 TEST(Connections, FanInProducesOneReducePlan) {
   ConnectionPlan plan =
-      synthesizeFanIn(std::vector<InstanceId>{1, 2, 3}, /*consumer=*/9,
-                      /*value=*/5, "acc.0", 1024);
+      synthesizeFanIn(std::vector<InstanceId>{1, 2, 3},
+                      std::vector<InstanceId>{9}, /*value=*/5, "acc.0", 1024);
   EXPECT_EQ(plan.kind, ConnectionKind::Reduce);
   ASSERT_EQ(plan.consumers.size(), 1u);
   EXPECT_EQ(plan.consumers[0], 9u);
@@ -768,7 +824,8 @@ TEST(Connections, FanInProducesOneReducePlan) {
   EXPECT_NE(plan.id, 0u);
 }
 
-// A gather sums what its feeds cost, and stages one intermediate tile on top.
+// A gather sums what its feeds cost. The gathered tile's capacity is charged by
+// the caller, so it is not added again to the feeds' staged `localBytes`.
 TEST(Connections, FanInSumsTheFeedCost) {
   Cost feeds;
   feeds.latencyCycles = 42.0;
@@ -776,13 +833,12 @@ TEST(Connections, FanInSumsTheFeedCost) {
   feeds.localBytes = 1024;
 
   ConnectionPlan plan =
-      synthesizeFanIn(std::vector<InstanceId>{1, 2},
-                      /*consumer=*/9, /*value=*/5, "acc.0", 1024, feeds);
+      synthesizeFanIn(std::vector<InstanceId>{1, 2}, std::vector<InstanceId>{9},
+                      /*value=*/5, "acc.0", 1024, feeds);
   EXPECT_EQ(plan.kind, ConnectionKind::Reduce);
   EXPECT_DOUBLE_EQ(plan.cost.latencyCycles, 42.0);
   EXPECT_EQ(plan.cost.dramBytes, 1024u);
-  // The gathered tile's bytes join the feeds' staged bytes.
-  EXPECT_EQ(plan.cost.localBytes, 1024u + 1024u);
+  EXPECT_EQ(plan.cost.localBytes, 1024u);
 }
 
 //===----------------------------------------------------------------------===//

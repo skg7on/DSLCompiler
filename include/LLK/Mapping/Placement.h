@@ -147,28 +147,33 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeConnections(
     const TopologyService &topology, const PlacementOptions &options = {},
     bool *truncated = nullptr);
 
-/// Fan-out (design §15.3): when every consumer reads the producer's memory a
-/// single shared-read plan carries them all; otherwise each consumer gets its
-/// own plan. A per-consumer plan that copies the value into a different memory
-/// is labelled `ConnectionKind::Replicate`, so the copy's cost and capacity are
-/// visible; a consumer that can still read the producer's memory in place keeps
-/// its `Direct` read.
+/// Fan-out (design §15.3). Every consumer is given by its own fully-specified
+/// `ConnectionRequest`, so §10.2 (element type, logical tile shape, visibility,
+/// affine index relation) is checked against *each* consumer rather than one
+/// representative.
+///
+/// When every consumer can legally read the producer's placement (a visibility
+/// fact, not memory equality) one shared-read `Direct` plan carries them all.
+/// Otherwise the consumers replicate: they are grouped by destination memory,
+/// and one copy serves each group, labelled `ConnectionKind::Replicate` so its
+/// cost and capacity are visible. A group whose every member can still read the
+/// producer's memory in place keeps a `Direct` read instead of copying.
 ///
 /// When `truncated` is non-null it is set to true when a replication route
 /// enumeration hit its cap, so the caller can report truncated search rather
 /// than optimality.
 llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
-    const ConnectionRequest &base, llvm::ArrayRef<InstanceId> consumers,
-    llvm::ArrayRef<MemoryNodeId> consumerMemories,
+    const ConnectionRequest &base, llvm::ArrayRef<ConnectionRequest> consumers,
     const machine::MachineModel &machine, const TopologyService &topology,
     const PlacementOptions &options = {}, bool *truncated = nullptr);
 
 /// Fan-in (design §15.3): one gather plan collecting several producers into one
-/// consumer. `feedCost` is the summed cost of moving each producer's value to
-/// the consumer -- a gather sums its feeds -- and the plan stages one
-/// intermediate tile of `bytes` on top of them.
+/// or more consumers that share a destination memory. `feedCost` is the summed
+/// cost of moving each producer's value to that memory -- a gather sums its
+/// feeds. `bytes` is the gathered tile's size; the search charges its capacity.
 ConnectionPlan synthesizeFanIn(llvm::ArrayRef<InstanceId> producers,
-                               InstanceId consumer, WorkloadValueId value,
+                               llvm::ArrayRef<InstanceId> consumers,
+                               WorkloadValueId value,
                                MemoryNodeId consumerMemory, uint64_t bytes,
                                const Cost &feedCost = {});
 
