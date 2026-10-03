@@ -9,8 +9,46 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/ErrorHandling.h"
 
 namespace mlir::llk::machine {
+
+llvm::StringRef stringifySchedulingClass(SchedulingClass value) {
+  switch (value) {
+  case SchedulingClass::InOrder:
+    return "in_order";
+  case SchedulingClass::OutOfOrder:
+    return "out_of_order";
+  }
+  llvm_unreachable("unhandled SchedulingClass");
+}
+
+std::optional<SchedulingClass> symbolizeSchedulingClass(llvm::StringRef text) {
+  if (text == "in_order")
+    return SchedulingClass::InOrder;
+  if (text == "out_of_order")
+    return SchedulingClass::OutOfOrder;
+  return std::nullopt;
+}
+
+llvm::StringRef stringifyLinkDirectionality(LinkDirectionality value) {
+  switch (value) {
+  case LinkDirectionality::Unidirectional:
+    return "unidirectional";
+  case LinkDirectionality::Bidirectional:
+    return "bidirectional";
+  }
+  llvm_unreachable("unhandled LinkDirectionality");
+}
+
+std::optional<LinkDirectionality>
+symbolizeLinkDirectionality(llvm::StringRef text) {
+  if (text == "unidirectional")
+    return LinkDirectionality::Unidirectional;
+  if (text == "bidirectional")
+    return LinkDirectionality::Bidirectional;
+  return std::nullopt;
+}
 
 namespace {
 
@@ -67,6 +105,8 @@ std::string renderExecutor(const ExecutorNode &node) {
   out += std::to_string(node.concurrency);
   out += "|refines=";
   out += joinStrings(refines, ",");
+  out += "|scheduling=";
+  out += stringifySchedulingClass(node.schedulingClass);
   return out;
 }
 
@@ -91,6 +131,8 @@ std::string renderMemory(const MemoryNode &node) {
   out += formatDouble(node.bandwidthBytesPerCycle);
   out += "|latency=";
   out += std::to_string(node.latencyCycles);
+  out += "|transaction=";
+  out += optionalNumber(node.transactionBytes);
   return out;
 }
 
@@ -136,6 +178,8 @@ std::string renderCompute(const ComputeNode &node) {
   std::vector<std::string> accumulators(node.accumulatorDTypes);
   llvm::sort(accumulators);
   out += joinStrings(accumulators, ",");
+  out += "|occupancy=";
+  out += optionalNumber(node.occupancyLimit);
   return out;
 }
 
@@ -174,6 +218,8 @@ std::string renderLink(const LinkEdge &node) {
   out += joinStrings(engines, ",");
   out += "|concurrency=";
   out += std::to_string(node.concurrency);
+  out += "|directionality=";
+  out += stringifyLinkDirectionality(node.directionality);
   return out;
 }
 
@@ -489,6 +535,11 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
       return invalid(path + ".capacity_bytes: must be positive");
     if (memory.alignmentBytes == 0)
       return invalid(path + ".alignment_bytes: must be positive");
+    // A zero-granule transaction can never move anything; absent is fine, and
+    // means the profile does not model a granularity (fall back to alignment).
+    if (memory.transactionBytes && *memory.transactionBytes == 0)
+      return invalid(path +
+                     ".transaction_bytes: must be positive when declared");
   }
 
   for (size_t i = 0; i < model.computes.size(); ++i) {
@@ -502,6 +553,10 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
                      compute.attachedTo + "'");
     if (compute.concurrency == 0)
       return invalid(path + ".concurrency: must be positive");
+    // An occupancy limit of zero would forbid all resident work; absent is
+    // fine, and means the capability is bounded only by its slots.
+    if (compute.occupancyLimit && *compute.occupancyLimit == 0)
+      return invalid(path + ".occupancy_limit: must be positive when declared");
     if (compute.shapes.empty())
       return invalid(path + ".shapes: must not be empty");
     for (const std::vector<int64_t> &shape : compute.shapes) {

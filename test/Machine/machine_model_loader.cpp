@@ -449,3 +449,135 @@ TEST(MachineModelLoader, ShippedProfilesDeclareTheirPerfFacts) {
     EXPECT_GT(model->workerThreads, 0u) << name;
   }
 }
+
+//===----------------------------------------------------------------------===//
+// Design 11.3 properties added after the v2 model shipped
+//===----------------------------------------------------------------------===//
+
+TEST(MachineModelLoader, AppliesDocumentedDefaultsForTheAddedProperties) {
+  llvm::Expected<MachineModel> model = parse(kValid);
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  for (const ExecutorNode &executor : model->executors)
+    EXPECT_EQ(executor.schedulingClass, SchedulingClass::InOrder);
+  for (const MemoryNode &memory : model->memories)
+    EXPECT_FALSE(memory.transactionBytes.has_value());
+  for (const ComputeNode &compute : model->computes)
+    EXPECT_FALSE(compute.occupancyLimit.has_value());
+  for (const LinkEdge &link : model->links)
+    EXPECT_EQ(link.directionality, LinkDirectionality::Unidirectional);
+}
+
+TEST(MachineModelLoader,
+     ParsesSchedulingTransactionOccupancyAndDirectionality) {
+  llvm::Expected<MachineModel> model = parse(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - id: e0
+    kind: worker
+    scheduling_class: out_of_order
+memories:
+  - id: m0
+    kind: sram
+    visible_from: e0
+    capacity_bytes: 32768
+    transaction_bytes: 32
+compute:
+  - id: c0
+    kind: vector_engine
+    attached_to: e0
+    element_types: [f32]
+    shapes: [[8]]
+    occupancy_limit: 4
+links:
+  - id: l0
+    source: m0
+    destination: m0
+    bandwidth_bytes_per_cycle: 64
+    directionality: bidirectional
+)yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  ASSERT_EQ(model->executors.size(), 1u);
+  EXPECT_EQ(model->executors[0].schedulingClass, SchedulingClass::OutOfOrder);
+  ASSERT_EQ(model->memories.size(), 1u);
+  ASSERT_TRUE(model->memories[0].transactionBytes.has_value());
+  EXPECT_EQ(*model->memories[0].transactionBytes, 32u);
+  ASSERT_EQ(model->computes.size(), 1u);
+  ASSERT_TRUE(model->computes[0].occupancyLimit.has_value());
+  EXPECT_EQ(*model->computes[0].occupancyLimit, 4u);
+  ASSERT_EQ(model->links.size(), 1u);
+  EXPECT_EQ(model->links[0].directionality, LinkDirectionality::Bidirectional);
+}
+
+TEST(MachineModelLoader, RejectsUnknownSchedulingClass) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, scheduling_class: warp_ordered}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsUnknownLinkDirectionality) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+memories:
+  - {id: m0, kind: sram, visible_from: e0, capacity_bytes: 32768}
+links:
+  - {id: l0, source: m0, destination: m0, bandwidth_bytes_per_cycle: 64, directionality: omni}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsZeroMemoryTransactionBytes) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+memories:
+  - {id: m0, kind: sram, visible_from: e0, capacity_bytes: 32768, transaction_bytes: 0}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsZeroOccupancyLimit) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+compute:
+  - id: c0
+    kind: vector_engine
+    attached_to: e0
+    element_types: [f32]
+    shapes: [[8]]
+    occupancy_limit: 0
+)yaml"));
+}
+
+TEST(MachineModelLoader, AddedPropertiesChangeTheContentHash) {
+  llvm::Expected<MachineModel> base = parse(kValid);
+  ASSERT_TRUE(static_cast<bool>(base)) << llvm::toString(base.takeError());
+
+  // Rewrite the worker executor entry in place instead of appending.
+  std::string scheduling = kValid.str();
+  scheduling.replace(scheduling.find("    kind: worker\n"),
+                     std::string("    kind: worker\n").size(),
+                     "    kind: worker\n    scheduling_class: out_of_order\n");
+  llvm::Expected<MachineModel> scheduled = parse(scheduling);
+  ASSERT_TRUE(static_cast<bool>(scheduled))
+      << llvm::toString(scheduled.takeError());
+  EXPECT_NE(base->contentHash, scheduled->contentHash);
+
+  std::string withOccupancy = kValid.str();
+  withOccupancy.replace(withOccupancy.find("    shapes: [[8]]\n"),
+                        std::string("    shapes: [[8]]\n").size(),
+                        "    shapes: [[8]]\n    occupancy_limit: 4\n");
+  llvm::Expected<MachineModel> occupied = parse(withOccupancy);
+  ASSERT_TRUE(static_cast<bool>(occupied))
+      << llvm::toString(occupied.takeError());
+  EXPECT_NE(base->contentHash, occupied->contentHash);
+}

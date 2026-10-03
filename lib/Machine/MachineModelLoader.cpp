@@ -374,34 +374,50 @@ bool Loader::parseExecutor(Node *node, size_t index, ExecutorNode &out) {
   std::string path = "executors[" + std::to_string(index) + "]";
   bool sawId = false;
   bool sawKind = false;
-  return forEachEntry(node, path,
-                      [&](StringRef key, Node *value, Node *keyNode) -> bool {
-                        if (key == "id") {
-                          sawId = true;
-                          return readText(value, path + ".id", out.id);
-                        }
-                        if (key == "kind") {
-                          sawKind = true;
-                          return readText(value, path + ".kind", out.kind);
-                        }
-                        if (key == "parent") {
-                          std::string parent;
-                          if (!readText(value, path + ".parent", parent))
-                            return false;
-                          out.parent = std::move(parent);
-                          return true;
-                        }
-                        if (key == "coordinates")
-                          return readIntList(value, path + ".coordinates",
-                                             out.coordinates);
-                        if (key == "concurrency")
-                          return readUInt32(value, path + ".concurrency",
-                                            out.concurrency);
-                        if (key == "refines")
-                          return readStringList(value, path + ".refines",
-                                                out.refines);
-                        return deferUnknownKey(keyNode, path, key);
-                      }) &&
+  return forEachEntry(
+             node, path,
+             [&](StringRef key, Node *value, Node *keyNode) -> bool {
+               if (key == "id") {
+                 sawId = true;
+                 return readText(value, path + ".id", out.id);
+               }
+               if (key == "kind") {
+                 sawKind = true;
+                 return readText(value, path + ".kind", out.kind);
+               }
+               if (key == "parent") {
+                 std::string parent;
+                 if (!readText(value, path + ".parent", parent))
+                   return false;
+                 out.parent = std::move(parent);
+                 return true;
+               }
+               if (key == "coordinates")
+                 return readIntList(value, path + ".coordinates",
+                                    out.coordinates);
+               if (key == "concurrency")
+                 return readUInt32(value, path + ".concurrency",
+                                   out.concurrency);
+               if (key == "refines")
+                 return readStringList(value, path + ".refines", out.refines);
+               if (key == "scheduling_class") {
+                 std::string name;
+                 if (!readText(value, path + ".scheduling_class", name))
+                   return false;
+                 std::optional<SchedulingClass> scheduling =
+                     symbolizeSchedulingClass(name);
+                 if (!scheduling)
+                   return failAt(value, path +
+                                            ".scheduling_class: unknown "
+                                            "class '" +
+                                            name +
+                                            "', expected in_order or "
+                                            "out_of_order");
+                 out.schedulingClass = *scheduling;
+                 return true;
+               }
+               return deferUnknownKey(keyNode, path, key);
+             }) &&
          requireKey(sawId, path, "id") && requireKey(sawKind, path, "kind");
 }
 
@@ -444,6 +460,13 @@ bool Loader::parseMemory(Node *node, size_t index, MemoryNode &out) {
           if (!readUInt32(value, path + ".banks", banks))
             return false;
           out.banks = banks;
+          return true;
+        }
+        if (key == "transaction_bytes") {
+          uint64_t transaction = 0;
+          if (!readUInt(value, path + ".transaction_bytes", transaction))
+            return false;
+          out.transactionBytes = transaction;
           return true;
         }
         return deferUnknownKey(keyNode, path, key);
@@ -502,6 +525,13 @@ bool Loader::parseCompute(Node *node, size_t index, ComputeNode &out) {
         }
         if (key == "concurrency")
           return readUInt32(value, path + ".concurrency", out.concurrency);
+        if (key == "occupancy_limit") {
+          uint32_t occupancy = 0;
+          if (!readUInt32(value, path + ".occupancy_limit", occupancy))
+            return false;
+          out.occupancyLimit = occupancy;
+          return true;
+        }
         return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&
@@ -579,6 +609,19 @@ bool Loader::parseLink(Node *node, size_t index, LinkEdge &out) {
                                 out.transferEngines);
         if (key == "concurrency")
           return readUInt32(value, path + ".concurrency", out.concurrency);
+        if (key == "directionality") {
+          std::string name;
+          if (!readText(value, path + ".directionality", name))
+            return false;
+          std::optional<LinkDirectionality> directionality =
+              symbolizeLinkDirectionality(name);
+          if (!directionality)
+            return failAt(value,
+                          path + ".directionality: unknown class '" + name +
+                              "', expected unidirectional or bidirectional");
+          out.directionality = *directionality;
+          return true;
+        }
         return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&

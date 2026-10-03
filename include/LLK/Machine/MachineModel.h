@@ -61,6 +61,38 @@ inline constexpr uint32_t kSupportedSchemaMinor = 0;
 /// The schema string a v2 file declares.
 inline constexpr llvm::StringLiteral kSchemaName = "llk.machine.v2";
 
+/// How an executor orders and overlaps the work handed to it. This is the
+/// scheduling half of design §11.3's "supported concurrency and scheduling
+/// properties"; the concurrency half is `ExecutorNode::concurrency`.
+///
+///   InOrder      work retires in issue order, so at most one item per slot is
+///                in flight and a simulator may not overlap two.
+///   OutOfOrder   independent items may overlap and retire out of order.
+///
+/// Co-residency -- several owners sharing one executor -- is not a separate
+/// field: `concurrency` already says how many slots share the executor, and
+/// this describes how each slot schedules.
+enum class SchedulingClass : uint8_t { InOrder, OutOfOrder };
+
+/// The name a v2 file writes for `value` (`in_order` / `out_of_order`).
+llvm::StringRef stringifySchedulingClass(SchedulingClass value);
+/// The inverse of stringifySchedulingClass; nullopt for an unknown name.
+std::optional<SchedulingClass> symbolizeSchedulingClass(llvm::StringRef text);
+
+/// Whether a link carries the reverse transfer at the same cost. `source` and
+/// `destination` already fix the transfer's direction; this says whether the
+/// *opposite* direction is modelled by the same edge (and so is routable at
+/// the same cost) or needs its own link. It is the directionality half of
+/// design §11.3's "directionality and concurrency class"; concurrency is
+/// `LinkEdge::concurrency`.
+enum class LinkDirectionality : uint8_t { Unidirectional, Bidirectional };
+
+/// The name a v2 file writes for `value`
+/// (`unidirectional` / `bidirectional`).
+llvm::StringRef stringifyLinkDirectionality(LinkDirectionality value);
+/// The inverse of stringifyLinkDirectionality; nullopt for an unknown name.
+std::optional<LinkDirectionality> symbolizeLinkDirectionality(llvm::StringRef);
+
 /// A place work can execute. `parent` is the containment edge; `refines` names
 /// additional owner kinds this executor satisfies, which is how an accelerator
 /// PE can accept a kernel that asked for a `worker`.
@@ -71,6 +103,10 @@ struct ExecutorNode {
   std::vector<int64_t> coordinates;
   uint32_t concurrency = 1;
   std::vector<std::string> refines;
+  /// Defaults to in-order: it is the conservative assumption and the one the
+  /// model implied before the field existed, so existing profiles keep their
+  /// meaning.
+  SchedulingClass schedulingClass = SchedulingClass::InOrder;
 };
 
 /// A place data can reside. `visibleFrom` names the executor scope that can
@@ -88,6 +124,12 @@ struct MemoryNode {
   /// means the profile does not model it.
   double bandwidthBytesPerCycle = 0.0;
   uint64_t latencyCycles = 0;
+  /// Smallest unit a single access moves, when the profile models one. This is
+  /// the transaction half of design §11.3's "optional banking and transaction
+  /// properties"; `banks` is the independent capacity/parallelism half. Absent
+  /// means "not modelled": a consumer falls back to `alignmentBytes`, the
+  /// smallest addressable granule, and a declared value must be positive.
+  std::optional<uint64_t> transactionBytes = std::nullopt;
 };
 
 /// A capability attached to an executor.
@@ -111,6 +153,14 @@ struct ComputeNode {
   /// them from its inputs. Ranked by the checks that guard accumulator
   /// capacity and MMA compatibility.
   std::vector<std::string> accumulatorDTypes;
+  /// Most work items that may reside on the capability at once, when the
+  /// profile models a limit. This is the occupancy half of design §11.3's
+  /// "concurrency and occupancy limits"; `concurrency` is the issue-slot half,
+  /// and the two are independent (resident items may outnumber issue slots).
+  /// Absent means "unconstrained" -- the slots are the only bound, which is
+  /// what the model assumed before the field existed -- and a declared value
+  /// must be positive.
+  std::optional<uint32_t> occupancyLimit = std::nullopt;
 };
 
 /// A resource that moves data over links, attached to an executor.
@@ -134,6 +184,9 @@ struct LinkEdge {
   uint64_t transactionBytes = 1;
   std::vector<std::string> transferEngines;
   uint32_t concurrency = 1;
+  /// Defaults to unidirectional: a transfer runs from `source` to
+  /// `destination` only, the semantics the edge had before the field existed.
+  LinkDirectionality directionality = LinkDirectionality::Unidirectional;
 };
 
 /// Synchronization costs a machine charges for its barriers and waits.
