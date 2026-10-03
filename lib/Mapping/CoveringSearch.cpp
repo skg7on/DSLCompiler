@@ -61,6 +61,8 @@ struct NodeTable {
 struct Edge {
   size_t producer = 0; // index into the node table
   size_t consumer = 0;
+  /// The value the edge carries, so a connection names what it moves.
+  WorkloadValueId value = 0;
 };
 
 /// A partial cover: one instance chosen per covered node.
@@ -181,7 +183,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     for (const WorkloadPort &port : tables[index].workload->inputs) {
       auto producer = producerOf.find(port.value);
       if (producer != producerOf.end() && producer->second != index)
-        edges.push_back({producer->second, index});
+        edges.push_back({producer->second, index, port.value});
     }
 
   TopologyService topology(machine,
@@ -237,6 +239,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       ConnectionRequest request;
       request.producer = producer->id;
       request.consumer = consumer->id;
+      request.value = edge.value;
       request.producerMemory = primaryMemory(machine, *producer);
       request.consumerMemory = primaryMemory(machine, *consumer);
       request.bytes = kAssumedValueBytes;

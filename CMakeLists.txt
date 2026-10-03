@@ -295,7 +295,10 @@ target_compile_options(LLKMapping PRIVATE -fno-rtti -fno-exceptions)
 # AffineMap, OperationName, DictionaryAttr, and Type are MLIR IR values used by
 # the workload graph. They are named through mlir_target_link_libraries() so the
 # dylib/archive split stays correct, exactly as LLKPerf does.
-mlir_target_link_libraries(LLKMapping PRIVATE MLIRIR)
+# The binder builds `#micro.memory<...>` and `!micro.async_token` without the
+# dialect's generated classes, so it reads them from assembly. Named through
+# mlir_target_link_libraries() like every other MLIR dependency here.
+mlir_target_link_libraries(LLKMapping PRIVATE MLIRIR MLIRAsmParser)
 
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg

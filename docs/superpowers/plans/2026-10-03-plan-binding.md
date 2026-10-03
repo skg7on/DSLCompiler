@@ -36,6 +36,53 @@ Adding a copy rule to the shipped AVX2 set (a target must implement movement) br
 1. It hardcoded the emitter key list, so the new rule failed to verify. It now reads `target::avx2::emitterKeys()`, which is the package that owns them — the duplication was the bug, not the new rule.
 2. It asserted exactly three shipped rules. It now asserts that specific rules are present, so growing the shipped set does not fail a test whose subject is that the set loads.
 
-### Not done
+## §18.2 emission (follow-up, same branch)
 
-Emitting tile copies, allocations, transforms, waits, and barriers (design §18.2), for the reason above. Everything §18.1 and §18.3 asked for is implemented and tested.
+Materialization now emits the movement a selected connection implies: a
+`Transfer`/`TransferAndTransform` whose route spans two memories becomes a
+`micro.async_copy` immediately after the producing operation plus a
+`micro.wait` on its token, and every other use of the original value is
+rewired to the copy. One copy is emitted per *value*, not per connection, so a
+fan-out does not duplicate it. A connection the binder cannot materialize is
+reported in `BoundPlan::unmaterialized` with its reason rather than dropped
+silently.
+
+**Two limits are deliberate and reported, not hidden:**
+
+- a value that is not a shaped (tensor) type has no generic copy form:
+  `micro.tile_async_copy` requires a *destination-memory-typed* tile, and the
+  binder cannot build one because `!micro.tile` has no public C++ class (the
+  same reason the dialect's op classes are not usable here);
+- a target layout id has no Micro operation form at all -- design §13.4 keeps
+  target ids out of `#micro.layout`, so a transform stays metadata until a
+  generic representation exists.
+
+`#micro.memory<...>` and `!micro.async_token` are built with
+`mlir::parseAttribute` / `mlir::parseType`, which is why `LLKMapping` now names
+`MLIRAsmParser` through `mlir_target_link_libraries()`.
+
+### Two bugs this work found
+
+1. **`synthesizeConnections` never set `PlanConnection::value`.** D6's edge did
+   not carry the value it transported, so every connection reported value 0 and
+   the binder could not find what to copy. The edge now records it.
+2. **The value-id binding was incomplete.** Only the external-value path
+   recorded a `WorkloadGraphBinding` entry; node outputs and structural results
+   did not, so `valueFor` returned null for every internal value. The
+   replacements that were meant to add them had not matched after formatting.
+   Both are now covered.
+
+## Verification Results (2026-10-03)
+
+- **Build:** `ninja -C build` — clean.
+- **New tests:** `MappingPlanBinderTest` **6/6**.
+- **Full suite:** `ctest --test-dir build --output-on-failure` — 103 registered, **101 passed, 2 skipped, 0 failed**.
+- **Deprecated-API audit:** clean.
+
+### Still not done
+
+Tile allocations for intermediate staging, and layout-conversion operations.
+Both need a generic Micro representation the dialect does not have yet (a
+destination-memory tile type is constructible only with the dialect's type
+class; a target layout id is not a `#micro.layout`). Transfers -- the case the
+plan actually determines a route for -- are emitted.

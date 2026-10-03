@@ -305,6 +305,7 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
         WorkloadValueId id = graph.addValue(WorkloadValue{
             0, result.getType(), nameFor(result), /*external=*/false});
         valueIds[result] = id;
+        pendingValues[id] = result;
         node.outputs.push_back(
             WorkloadPort{id, result.getType(), std::nullopt});
       }
@@ -318,8 +319,10 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
     for (Value result : op->getResults()) {
       if (isAsyncToken(result.getType()) || valueIds.count(result))
         continue;
-      valueIds[result] = graph.addValue(WorkloadValue{
+      WorkloadValueId id = graph.addValue(WorkloadValue{
           0, result.getType(), nameFor(result), /*external=*/true});
+      valueIds[result] = id;
+      pendingValues[id] = result;
     }
   });
 

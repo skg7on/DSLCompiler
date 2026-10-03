@@ -1,5 +1,6 @@
 //===- plan_binder.cpp - Materializing a selected plan (#50 revision) ----===//
 
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
@@ -193,4 +194,109 @@ TEST(PlanBinder, MachineAwareVerificationRejectsAnUnknownExecutor) {
   });
   EXPECT_TRUE(
       static_cast<bool>(verifyMappedMicroIR(*bound->module, *fixture.target)));
+}
+
+//===----------------------------------------------------------------------===//
+// Movement materialization (design §18.2)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Rules whose memory requirements differ per node, so the two instances bind
+/// different memories and the edge between them has to move.
+constexpr llvm::StringLiteral kMovementRules = R"llkmap(
+rule t.copy {
+  match micro.async_copy();
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.copy";
+  emit "e1";
+  cost 1;
+}
+rule t.vector {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.vector";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The shipped AVX2 machine with these rules.
+llvm::Expected<std::unique_ptr<MappingTarget>> movementTarget() {
+  llvm::Expected<mlir::llk::machine::MachineModel> machine =
+      mlir::llk::machine::loadMachineModel(std::string(LLK_SOURCE_DIR) +
+                                           "/machines/x86-avx2-v2.yaml");
+  if (!machine)
+    return machine.takeError();
+  llvm::Expected<LayoutRegistry> layouts = parseLayoutText("", "<test>");
+  if (!layouts)
+    return layouts.takeError();
+  llvm::Expected<RuleRegistry> rules = parseRuleText(kMovementRules, "<test>");
+  if (!rules)
+    return rules.takeError();
+  return std::make_unique<FileMappingTarget>(
+      "movement", std::move(*machine), std::move(*layouts), std::move(*rules),
+      std::vector<std::string>{"e1"});
+}
+
+size_t countOps(ModuleOp module, llvm::StringRef name) {
+  size_t count = 0;
+  module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == name)
+      ++count;
+  });
+  return count;
+}
+
+} // namespace
+
+TEST(PlanBinder, EmitsACopyAndWaitWhenTheValueMustMove) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+  ASSERT_EQ(plan->connectionPlans[0].kind, ConnectionKind::Transfer);
+
+  const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
+  const size_t waitsBefore = countOps(*fixture.module, "micro.wait");
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  for (const std::string &note : bound->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(bound->unmaterialized.empty());
+  EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore + 1);
+  EXPECT_EQ(countOps(*bound->module, "micro.wait"), waitsBefore + 1);
+
+  // The mapped IR must satisfy both the dialect verifier and the mapping
+  // checks: a copy that broke either is worse than no copy.
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
+
+  // The source kernel is untouched.
+  EXPECT_EQ(countOps(*fixture.module, "micro.async_copy"), copiesBefore);
+  EXPECT_EQ(countOps(*fixture.module, "micro.wait"), waitsBefore);
+}
+
+TEST(PlanBinder, ReportsConnectionsItCannotMaterialize) {
+  // The shipped rules bind no memory, so both instances land in the same
+  // memory and nothing has to move -- there is no movement to report.
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  llvm::Expected<BoundPlan> bound =
+      bindPlan(*fixture.module, *plan, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  EXPECT_TRUE(bound->unmaterialized.empty());
 }
