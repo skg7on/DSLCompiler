@@ -224,3 +224,67 @@ TEST(MachineModelLoader, LoadsShippedGenericProfile) {
   EXPECT_NE(model->findLink("dram_to_sram.0"), nullptr);
   EXPECT_NE(model->findLink("sram_to_acc.0"), nullptr);
 }
+
+//===----------------------------------------------------------------------===//
+// Performance facts
+//===----------------------------------------------------------------------===//
+
+TEST(MachineModelLoader, ParsesClockThreadsAndSyncCosts) {
+  llvm::Expected<MachineModel> model = parse(R"yaml(
+schema: llk.machine.v2
+target: t
+clock_hz: 3000000000
+worker_threads: 8
+sync:
+  barrier_cycles: 64
+  wait_cycles: 4
+executors:
+  - {id: e0, kind: worker}
+)yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  ASSERT_TRUE(model->clockHz.has_value());
+  EXPECT_EQ(*model->clockHz, 3000000000u);
+  EXPECT_EQ(model->workerThreads, 8u);
+  EXPECT_EQ(model->sync.barrierCycles, 64u);
+  EXPECT_EQ(model->sync.waitCycles, 4u);
+}
+
+TEST(MachineModelLoader, LeavesTheClockUnsetWhenAbsent) {
+  llvm::Expected<MachineModel> model = parse(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+)yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  EXPECT_FALSE(model->clockHz.has_value());
+  EXPECT_EQ(model->workerThreads, 1u); // a machine still executes somewhere
+}
+
+TEST(MachineModelLoader, RejectsUnknownSyncKey) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+sync:
+  barrier_cycles: 1
+  spin_cycles: 2
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsADeclaredZeroClock) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+clock_hz: 0
+)yaml"));
+}
+
+TEST(MachineModelLoader, ShippedProfilesDeclareTheirPerfFacts) {
+  for (const char *name : {"/x86-avx2-v2.yaml", "/generic-ai-accel-v2.yaml"}) {
+    llvm::Expected<MachineModel> model =
+        loadMachineModel(std::string(LLK_MACHINE_DIR) + name);
+    ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+    EXPECT_TRUE(model->clockHz.has_value()) << name;
+    EXPECT_GT(model->workerThreads, 0u) << name;
+  }
+}

@@ -284,6 +284,14 @@ std::string canonicalMachineString(const MachineModel &model) {
   out += model.target;
   out += "\ndescription=";
   out += model.description;
+  out += "\nclock_hz=";
+  out += model.clockHz ? std::to_string(*model.clockHz) : "<none>";
+  out += "\nworker_threads=";
+  out += std::to_string(model.workerThreads);
+  out += "\nsync=barrier:";
+  out += std::to_string(model.sync.barrierCycles);
+  out += ",wait:";
+  out += std::to_string(model.sync.waitCycles);
   out += '\n';
   renderSection(out, model.executors, renderExecutor);
   renderSection(out, model.memories, renderMemory);
@@ -328,6 +336,12 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
                    std::to_string(kSupportedSchemaMajor));
   if (model.target.empty())
     return invalid("target: must not be empty");
+  // A declared clock of zero would make every nanosecond estimate infinite;
+  // an *absent* clock is fine -- cycles are still meaningful.
+  if (model.clockHz && *model.clockHz == 0)
+    return invalid("clock_hz: must be positive when declared");
+  if (model.workerThreads == 0)
+    return invalid("worker_threads: must be positive");
 
   // Ids share one namespace across every node kind, so a memory and an
   // executor can never collide silently.

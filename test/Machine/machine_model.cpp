@@ -208,3 +208,32 @@ TEST(MachineModel, ContentHashCoversLanes) {
   b.computes[0].lanes = {{"f32", 16}};
   EXPECT_NE(computeContentHash(a), computeContentHash(b));
 }
+
+TEST(MachineModel, ContentHashCoversClockAndSync) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.clockHz = 2000000000;
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+
+  MachineModel c = twoCoreMachine();
+  c.sync.barrierCycles = 128;
+  EXPECT_NE(computeContentHash(a), computeContentHash(c));
+}
+
+TEST(MachineModel, VerifyRejectsADeclaredZeroClock) {
+  MachineModel model = twoCoreMachine();
+  model.clockHz = 0; // declared, and meaningless for a cycle estimate
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyAcceptsAModelThatDoesNotDeclareAClock) {
+  MachineModel model = twoCoreMachine();
+  model.clockHz.reset();
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsZeroWorkerThreads) {
+  MachineModel model = twoCoreMachine();
+  model.workerThreads = 0;
+  EXPECT_FALSE(verifies(model));
+}

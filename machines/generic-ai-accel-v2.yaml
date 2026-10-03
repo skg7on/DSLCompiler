@@ -18,6 +18,12 @@ description: >-
   Generic AI accelerator with a chip/core/pe_group/PE hierarchy, a 16x16x32
   MXU, a companion vector unit, and a multi-hop DRAM -> SRAM -> ACC path.
 
+clock_hz: 1000000000
+worker_threads: 1
+sync:
+  barrier_cycles: 64
+  wait_cycles: 4
+
 executors:
   - id: chip.0
     kind: worker

@@ -111,10 +111,25 @@ struct LinkEdge {
   uint32_t concurrency = 1;
 };
 
+/// Synchronization costs a machine charges for its barriers and waits.
+struct SyncModel {
+  uint64_t barrierCycles = 0;
+  uint64_t waitCycles = 0;
+};
+
 struct MachineModel {
   uint32_t schemaMajor = kSupportedSchemaMajor;
   std::string target;
   std::string description;
+
+  /// Clock rate, absent when the profile does not model one. A cycle estimate
+  /// is still meaningful without it; a *nanosecond* estimate is not, which is
+  /// why this is optional rather than zero.
+  std::optional<uint64_t> clockHz;
+  /// Host workers available to the target. Defaults to 1: a machine that does
+  /// not model thread-level parallelism still executes somewhere.
+  uint32_t workerThreads = 1;
+  SyncModel sync;
 
   std::vector<ExecutorNode> executors;
   std::vector<MemoryNode> memories;

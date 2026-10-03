@@ -19,6 +19,12 @@ description: >-
   Intel AVX2 CPU validation backend. Two worker cores with private L1 and
   accumulator storage behind a shared L2 and DRAM.
 
+clock_hz: 3000000000
+worker_threads: 8
+sync:
+  barrier_cycles: 64
+  wait_cycles: 4
+
 executors:
   - id: package.0
     kind: worker
