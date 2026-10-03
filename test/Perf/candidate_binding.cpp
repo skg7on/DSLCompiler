@@ -237,6 +237,44 @@ TEST(CandidateBinding, EmitsExactlyOneConcreteKernel) {
   EXPECT_EQ(onlyKernel(scratch->module.get()).getSymName(), bound->symbolName);
 }
 
+TEST(CandidateBinding, EmitsAVerifiableKernel) {
+  SearchSpace space = swigluSpace();
+  Candidate candidate = preferred();
+  auto scratch = makeScratch();
+  auto bound = bindCandidateToMicroKernel(scratch->module.get(), space,
+                                          candidate, swigluShape());
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+
+  // The verifier is the contract the dialect ops hold themselves to; a bound
+  // kernel the simulator accepts but the verifier rejects would be a kernel no
+  // later lowering could consume.
+  EXPECT_TRUE(mlir::succeeded(mlir::verify(scratch->module.get())));
+}
+
+TEST(CandidateBinding, BindsAMatmulWithoutTheFusedEpilogue) {
+  SearchSpace space = swigluSpace();
+  space.workload = "matmul";
+  Candidate candidate = preferred();
+  candidate.values["BM"] = 16; // M = 16, and a single matmul accumulator fits
+  WorkloadShape shape = swigluShape();
+  shape.M = 16;
+
+  auto scratch = makeScratch();
+  auto bound = bindCandidateToMicroKernel(scratch->module.get(), space,
+                                          candidate, shape);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+
+  // One weight operand, one accumulator, and no SwiGLU activation.
+  EXPECT_EQ(countOps<tensor::EmptyOp>(scratch->module.get()), 2u);
+  EXPECT_EQ(countOps<micro::MmaOp>(scratch->module.get()), 1u);
+  unsigned silu = 0;
+  scratch->module.get().walk([&](micro::VectorOp op) {
+    if (op.getOp() == "silu")
+      ++silu;
+  });
+  EXPECT_EQ(silu, 0u);
+}
+
 TEST(CandidateBinding, LeavesNoSearchOpBehind) {
   SearchSpace space = swigluSpace();
   Candidate candidate = preferred();
