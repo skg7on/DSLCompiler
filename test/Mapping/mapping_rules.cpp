@@ -520,7 +520,9 @@ TEST(RuleMatch, BuildsAMappingCandidate) {
   ASSERT_TRUE(resolved.has_value());
   MappingCandidate candidate = std::move(*resolved);
   EXPECT_EQ(candidate.rule, "r.add");
-  EXPECT_EQ(candidate.targetBundle, "b.add");
+  EXPECT_EQ(candidate.bundle.name, "b.add");
+  EXPECT_EQ(candidate.bundle.emitterKey, "e1");
+  EXPECT_FALSE(candidate.bundle.parameters);
   ASSERT_EQ(candidate.coveredNodes.size(), 1u);
   EXPECT_EQ(candidate.coveredNodes[0], 7u);
   ASSERT_EQ(candidate.executorRequirements.size(), 1u);
@@ -530,6 +532,84 @@ TEST(RuleMatch, BuildsAMappingCandidate) {
   ASSERT_EQ(candidate.layoutRequirements.size(), 1u);
   EXPECT_EQ(candidate.layoutRequirements[0].layoutClass, "avx2.blocked_2d");
   EXPECT_DOUBLE_EQ(candidate.lowerBound.latencyCycles, 9.0);
+}
+
+//===----------------------------------------------------------------------===//
+// Typed target bundles (design §14.3)
+//===----------------------------------------------------------------------===//
+
+TEST(RuleParse, ParsesBundleParameters) {
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.p {
+  match micro.vector();
+  bundle "b" { tile_m = 8, layout = blocked_2d, note = "wide" };
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.p");
+  ASSERT_NE(rule, nullptr);
+  // Stored sorted by name, independent of declaration order.
+  ASSERT_EQ(rule->bundleParameters.size(), 3u);
+  EXPECT_EQ(rule->bundleParameters[0].first, "layout");
+  EXPECT_EQ(std::get<std::string>(rule->bundleParameters[0].second),
+            "blocked_2d");
+  EXPECT_EQ(rule->bundleParameters[1].first, "note");
+  EXPECT_EQ(std::get<std::string>(rule->bundleParameters[1].second), "wide");
+  EXPECT_EQ(rule->bundleParameters[2].first, "tile_m");
+  EXPECT_EQ(std::get<int64_t>(rule->bundleParameters[2].second), 8);
+}
+
+TEST(RuleParse, RejectsDuplicateBundleParameter) {
+  EXPECT_FALSE(parses(R"llkmap(
+rule r.p {
+  match micro.vector();
+  bundle "b" { tile_m = 8, tile_m = 16 };
+  emit "e";
+}
+)llkmap"));
+}
+
+TEST(RuleParse, RejectsMalformedBundleParameter) {
+  EXPECT_FALSE(parses(R"llkmap(
+rule r.p {
+  match micro.vector();
+  bundle "b" { tile_m = };
+  emit "e";
+}
+)llkmap"));
+}
+
+TEST(RuleBundle, CarriesDeclaredParametersToTheCandidate) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.p {
+  match micro.vector(op = "add");
+  input "operand0";
+  output "result";
+  bundle "avx2.vector.add.f32" { tile_m = 8, layout = "blocked_2d" };
+  emit "e1";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.p");
+  ASSERT_NE(rule, nullptr);
+  WorkloadNode node = vectorNode(context, "add");
+
+  std::optional<MappingCandidate> resolved =
+      toMappingCandidate(*rule, node, MachineModel{}, LayoutContext{});
+  ASSERT_TRUE(resolved.has_value());
+  EXPECT_EQ(resolved->bundle.name, "avx2.vector.add.f32");
+  EXPECT_EQ(resolved->bundle.emitterKey, "e1");
+  ASSERT_TRUE(resolved->bundle.parameters);
+  auto tileM = resolved->bundle.parameters.getAs<mlir::IntegerAttr>("tile_m");
+  ASSERT_TRUE(tileM);
+  EXPECT_EQ(tileM.getInt(), 8);
+  auto layout = resolved->bundle.parameters.getAs<mlir::StringAttr>("layout");
+  ASSERT_TRUE(layout);
+  EXPECT_EQ(layout.getValue(), "blocked_2d");
 }
 
 //===----------------------------------------------------------------------===//

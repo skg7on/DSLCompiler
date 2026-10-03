@@ -189,9 +189,10 @@ values(std::initializer_list<std::pair<llvm::StringRef, SearchValue>> entries) {
   return map;
 }
 
-/// The plan id the deterministic two-node fixture produced before bindings
-/// were recorded. Pinned so the no-binding path cannot drift silently.
-constexpr PlanId kNoBindingPlanId = 3353624054279393187ULL;
+/// The plan id the deterministic two-node fixture produces when a zero binding
+/// hash and no parameters are folded in. Pinned so the no-binding path cannot
+/// drift silently; it changes only when the canonical plan form does.
+constexpr PlanId kNoBindingPlanId = 13971994565763734923ULL;
 
 } // namespace
 

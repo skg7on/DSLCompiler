@@ -35,6 +35,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mlir::llk::mapping {
@@ -116,6 +117,11 @@ struct RuleDef {
   std::vector<RulePort> ports;
   /// Opaque target-owned names; generic code never interprets them.
   std::string bundle;
+  /// The typed parameters the rule declares for its bundle, sorted by name so
+  /// declaration order never leaks into an id. Context-free at parse time (a
+  /// value is an integer or a string); the rule-to-candidate bridge
+  /// materializes them as a `DictionaryAttr`.
+  std::vector<std::pair<std::string, LayoutValue>> bundleParameters;
   std::string emitter;
   /// Static cost lower bound, when the rule declares one.
   std::optional<uint64_t> costLowerBound;

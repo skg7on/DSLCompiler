@@ -153,8 +153,9 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     llvm::SmallVector<mlir::NamedAttribute> attributes;
     attributes.emplace_back(mlir::StringAttr::get(context, "rule"),
                             mlir::StringAttr::get(context, placement.rule));
-    attributes.emplace_back(mlir::StringAttr::get(context, "bundle"),
-                            mlir::StringAttr::get(context, placement.bundle));
+    attributes.emplace_back(
+        mlir::StringAttr::get(context, "bundle"),
+        mlir::StringAttr::get(context, placement.bundle.name));
     attributes.emplace_back(mlir::StringAttr::get(context, "emitter"),
                             mlir::StringAttr::get(context, rule->emitter));
     attributes.emplace_back(mlir::StringAttr::get(context, "executor"),

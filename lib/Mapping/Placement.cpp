@@ -200,6 +200,7 @@ enumeratePlacements(const MappingCandidate &candidate,
   for (const ExecutorNode *executor : executors) {
     CandidateInstance instance;
     instance.candidate = candidate.id;
+    instance.bundle = candidate.bundle;
     instance.executorBindings["executor"] = executor->id;
 
     // Compute attachments: the first attached capability of each required kind.

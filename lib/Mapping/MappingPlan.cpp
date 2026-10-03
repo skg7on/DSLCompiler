@@ -76,6 +76,51 @@ std::string transformString(const LayoutTransform &transform) {
   return out;
 }
 
+/// One bundle parameter as `key:type:value`. The type tag keeps a string `8`
+/// and an integer `8` from colliding, so two typed parameters that differ only
+/// in type still get different ids.
+std::string bundleParameterString(mlir::NamedAttribute entry) {
+  std::string text = entry.getName().str();
+  text += ':';
+  mlir::Attribute value = entry.getValue();
+  if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(value)) {
+    text += "int:";
+    text += std::to_string(integer.getInt());
+    return text;
+  }
+  if (auto string = mlir::dyn_cast<mlir::StringAttr>(value)) {
+    text += "str:";
+    text += string.getValue().str();
+    return text;
+  }
+  text += "attr:";
+  std::string printed;
+  llvm::raw_string_ostream stream(printed);
+  value.print(stream);
+  text += stream.str();
+  return text;
+}
+
+/// The opaque bundle's canonical content: name, emitter key, then its typed
+/// parameters sorted by the rendered `key:type:value` so declaration and
+/// dictionary iteration order never leak into an id. Generic code does not
+/// interpret any field; it only makes the bundle content-addressed.
+std::string bundleString(const TargetBundle &bundle) {
+  std::vector<std::string> parameters;
+  if (bundle.parameters) {
+    parameters.reserve(bundle.parameters.size());
+    for (mlir::NamedAttribute entry : bundle.parameters)
+      parameters.push_back(bundleParameterString(entry));
+    llvm::sort(parameters);
+  }
+  std::string out = bundle.name;
+  out += "|emit=";
+  out += bundle.emitterKey;
+  out += "|parameters=";
+  out += joinStrings(parameters, ",");
+  return out;
+}
+
 } // namespace
 
 llvm::StringRef stringifyConnectionKind(ConnectionKind kind) {
@@ -164,7 +209,7 @@ std::string canonicalCandidateString(const MappingCandidate &candidate) {
   std::string out = "rule=";
   out += candidate.rule;
   out += "|bundle=";
-  out += candidate.targetBundle;
+  out += bundleString(candidate.bundle);
   out += "|covered=";
   out += joinNumbers(covered);
   out += "|ports=";
@@ -187,6 +232,8 @@ std::string canonicalCandidateString(const MappingCandidate &candidate) {
 std::string canonicalInstanceString(const CandidateInstance &instance) {
   std::string out = "candidate=";
   out += std::to_string(instance.candidate);
+  out += "|bundle=";
+  out += bundleString(instance.bundle);
   out += "|exec=";
   out += joinStrings(sortedEntries(instance.executorBindings), ",");
   out += "|mem=";
@@ -254,7 +301,7 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
     text += ':';
     text += placement.rule;
     text += ':';
-    text += placement.bundle;
+    text += bundleString(placement.bundle);
     text += ':';
     text += placement.executor;
     text += ":mem=";

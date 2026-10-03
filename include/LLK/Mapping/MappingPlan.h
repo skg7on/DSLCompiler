@@ -29,6 +29,7 @@
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinAttributes.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -51,6 +52,19 @@ using CandidateId = uint64_t;
 using InstanceId = uint64_t;
 using ConnectionId = uint64_t;
 using PlanId = uint64_t;
+
+/// An opaque target-owned implementation name plus typed parameters and the
+/// emitter key its plugin understands. Only the target's emitter interprets
+/// `name` and `parameters`; generic mapping code may compare, hash, report, and
+/// hand the bundle to a plugin, but never reads a field as target semantics
+/// (design §14.3). The plan value types carry one so a selected bundle reaches
+/// the materializer unchanged; it is content-addressed by
+/// `canonicalCandidateString` / `canonicalPlanString`.
+struct TargetBundle {
+  std::string name;
+  mlir::DictionaryAttr parameters;
+  std::string emitterKey;
+};
 
 /// One value crossing a candidate's boundary. `isInput` distinguishes an
 /// operand the candidate consumes from a result it produces.
@@ -100,7 +114,7 @@ struct MappingCandidate {
   CandidateId id = 0;
   RuleId rule;
   llvm::SmallVector<WorkloadNodeId> coveredNodes;
-  std::string targetBundle;
+  TargetBundle bundle;
   llvm::SmallVector<PortSpec> ports;
   llvm::SmallVector<ExecutorRequirement> executorRequirements;
   llvm::SmallVector<MemoryRequirement> memoryRequirements;
@@ -114,6 +128,9 @@ struct MappingCandidate {
 struct CandidateInstance {
   InstanceId id = 0;
   CandidateId candidate = 0;
+  /// The candidate's opaque bundle, carried unchanged so a materializer reads
+  /// it off the placed instance rather than re-looking-up the rule.
+  TargetBundle bundle;
   llvm::StringMap<ExecutorId> executorBindings;
   llvm::StringMap<MemoryNodeId> memoryBindings;
   llvm::StringMap<std::string> computeBindings;
@@ -162,12 +179,12 @@ struct PlanDiagnostics {
 
 /// One selected placement: which node an instance covers, and the target facts
 /// a materializer needs (design §18.1). Everything here is a target-neutral
-/// container -- a rule id, a bundle id, a machine node id, a layout id.
+/// container -- a rule id, an opaque bundle, a machine node id, a layout id.
 struct PlanPlacement {
   WorkloadNodeId node = 0;
   InstanceId instance = 0;
   std::string rule;
-  std::string bundle;
+  TargetBundle bundle;
   ExecutorId executor;
   llvm::StringMap<MemoryNodeId> memories;
   llvm::StringMap<LayoutId> layouts;

@@ -542,10 +542,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       PlanPlacement placement;
       placement.node = tables[index].node;
       placement.instance = instance->id;
+      // The bundle travels on the placed instance, so it reaches the plan
+      // unchanged and generic code never re-reads the rule for it.
+      placement.bundle = instance->bundle;
       for (const InstanceEntry &entry : tables[index].instances) {
         if (&entry.instance == instance) {
           placement.rule = entry.rule->id;
-          placement.bundle = entry.rule->bundle;
           break;
         }
       }

@@ -37,7 +37,8 @@ require   ::= "require" expr ";"
             | "require" memory   "kind" ident ";"
             | "require" "layout" ident "satisfies" id ";"
 port      ::= ( "input" | "output" ) string ";"
-bundle    ::= "bundle" string ";"
+bundle    ::= "bundle" string [ "{" bundle-param ("," bundle-param)* "}" ] ";"
+bundle-param ::= ident "=" ( int | ident | string )
 emit      ::= "emit" string ";"
 cost      ::= "cost" int ";"
 micro-op  ::= "micro." ident
@@ -103,9 +104,27 @@ rule avx2.vector_add v1 {
 | `require <role> kind <k>` | an abstract capability requirement; `role` is `executor`, `compute`, or `memory` |
 | `require layout <port> satisfies <id>` | the value on `<port>` must satisfy that layout |
 | `input`/`output` | named boundary values, one declaration per name |
-| `bundle` | an opaque target-owned implementation name (exactly one) |
+| `bundle` | an opaque target-owned implementation name (exactly one), with optional typed parameters |
 | `emit` | an opaque emitter key, validated against the target's declared set (exactly one) |
 | `cost` | an optional static cost lower bound |
+
+## Target bundles (design §14.3)
+
+A `bundle` is opaque to generic mapping code: it may compare, hash, report, and
+hand it to a target plugin, but it never reads the name or a parameter as target
+semantics. A rule may declare typed parameters on its bundle:
+
+```text
+bundle "avx2.vector.add.f32" { tile_m = 8, layout_blocked = blocked_2d };
+```
+
+A value is an **integer** or a **symbolic name** (bare or quoted); the spelling
+chooses the type, so `tile_m = 8` reaches the plan as an integer attribute and
+`layout_blocked = blocked_2d` as a string. Duplicate parameter names are a
+load-time error. The parameters travel with the selected bundle from the rule
+through the plan (`TargetBundle{name, parameters, emitterKey}`), and are hashed
+and printed in sorted, type-tagged order so declaration order never changes an
+id. `emit` stays a bare key; only `bundle` accepts a parameter block.
 
 ## Load-time validation
 
@@ -115,6 +134,7 @@ Parsing rejects, with a `file:line:column` diagnostic:
 - a missing `match`, `bundle`, or `emit`, or a duplicate `match`/`bundle`/`emit`/`cost`;
 - a Micro operation outside the workload vocabulary;
 - a duplicate port name;
+- a duplicate bundle parameter name, or a bundle parameter with no value;
 - a `shape` predicate without a dimension index, a port subject naming a
   property other than `element_type`/`shape`/`access_map`, or a missing
   non-negative port index;

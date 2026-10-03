@@ -20,6 +20,7 @@
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinTypes.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/ErrorOr.h"
@@ -103,6 +104,7 @@ private:
   bool parseRequire(RuleDef &out);
   bool parsePort(RuleDef &out);
   bool parseMetadata(RuleDef &out);
+  bool parseBundleParameters(RuleDef &out);
 };
 
 llvm::Expected<RuleRegistry> RuleParser::parseFile() {
@@ -464,6 +466,9 @@ bool RuleParser::parseMetadata(RuleDef &out) {
                     "expected a quoted name after '" + keyword + "'");
     slot = current().text;
     advance();
+    // Only a bundle may carry typed parameters; `emit` stays a bare key.
+    if (keyword == "bundle" && isPunct("{"))
+      return parseBundleParameters(out);
     return expectPunct(";");
   }
 
@@ -473,6 +478,49 @@ bool RuleParser::parseMetadata(RuleDef &out) {
     return failAt(current(), "expected an integer cost");
   out.costLowerBound = static_cast<uint64_t>(current().intValue);
   advance();
+  return expectPunct(";");
+}
+
+/// Parses the optional `{ key = value, ... }` block after a bundle name. A
+/// value is an integer or a symbolic name (bare or quoted), so the parameter is
+/// typed from its spelling alone; the block is small and flat on purpose
+/// (design §14.3). The result is sorted by key so declaration order never
+/// reaches an id.
+bool RuleParser::parseBundleParameters(RuleDef &out) {
+  advance(); // '{'
+  if (isPunct("}"))
+    return failAt(current(), "expected a bundle parameter name");
+  while (true) {
+    std::string name;
+    if (!expectIdentifier("a bundle parameter name", name))
+      return false;
+    for (const auto &entry : out.bundleParameters)
+      if (entry.first == name)
+        return failAt(current(), "duplicate bundle parameter '" + name + "'");
+    if (!expectPunct("="))
+      return false;
+    LayoutValue value;
+    if (current().kind == LlkMapToken::Kind::Int) {
+      value = current().intValue;
+      advance();
+    } else if (current().kind == LlkMapToken::Kind::String ||
+               current().kind == LlkMapToken::Kind::Identifier) {
+      value = current().text;
+      advance();
+    } else {
+      return failAt(current(),
+                    "expected an integer or symbolic value for '" + name + "'");
+    }
+    out.bundleParameters.emplace_back(std::move(name), std::move(value));
+    if (isPunct(",")) {
+      advance();
+      continue;
+    }
+    break;
+  }
+  if (!expectPunct("}"))
+    return false;
+  llvm::sort(out.bundleParameters);
   return expectPunct(";");
 }
 
@@ -880,6 +928,45 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
   return result;
 }
 
+/// An MLIR context to type a rule's bundle parameters with, taken from the node
+/// they matched. A rule that declares parameters only ever matches a node built
+/// from real IR, so a context is available; the null return is the belt-and-
+/// braces case of a synthetic node with no attributes and no port types.
+mlir::MLIRContext *nodeContext(const WorkloadNode &node) {
+  if (node.attributes)
+    return node.attributes.getContext();
+  for (const WorkloadPort &port : node.inputs)
+    if (port.type)
+      return port.type.getContext();
+  for (const WorkloadPort &port : node.outputs)
+    if (port.type)
+      return port.type.getContext();
+  return nullptr;
+}
+
+/// Materializes a rule's context-free bundle parameters as a typed
+/// `DictionaryAttr`: an integer value becomes an `IntegerAttr` (i64) and a
+/// symbolic value a `StringAttr`. Null when the rule declares no parameters.
+mlir::DictionaryAttr buildBundleParameters(
+    mlir::MLIRContext *context,
+    const std::vector<std::pair<std::string, LayoutValue>> &parameters) {
+  if (parameters.empty() || !context)
+    return {};
+  llvm::SmallVector<mlir::NamedAttribute> attributes;
+  attributes.reserve(parameters.size());
+  for (const auto &entry : parameters) {
+    mlir::Attribute value;
+    if (const auto *integer = std::get_if<int64_t>(&entry.second))
+      value =
+          mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64), *integer);
+    else
+      value =
+          mlir::StringAttr::get(context, std::get<std::string>(entry.second));
+    attributes.emplace_back(mlir::StringAttr::get(context, entry.first), value);
+  }
+  return mlir::DictionaryAttr::get(context, attributes);
+}
+
 } // namespace
 
 std::optional<MappingCandidate>
@@ -902,7 +989,10 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   MappingCandidate candidate;
   candidate.rule = rule.id;
   candidate.coveredNodes.push_back(node.id);
-  candidate.targetBundle = rule.bundle;
+  candidate.bundle.name = rule.bundle;
+  candidate.bundle.emitterKey = rule.emitter;
+  candidate.bundle.parameters =
+      buildBundleParameters(nodeContext(node), rule.bundleParameters);
   candidate.resolvedParameters = std::move(resolution.parameters);
   if (rule.costLowerBound)
     candidate.lowerBound.latencyCycles =

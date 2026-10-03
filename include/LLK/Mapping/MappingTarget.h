@@ -33,13 +33,8 @@
 
 namespace mlir::llk::mapping {
 
-/// An opaque target-owned implementation name plus typed parameters. Only the
-/// target's emitter interprets `name` and `parameters`.
-struct TargetBundle {
-  std::string name;
-  mlir::DictionaryAttr parameters;
-  std::string emitterKey;
-};
+// `TargetBundle` (an opaque name, typed parameters, and an emitter key) is
+// defined in MappingPlan.h, which the plan value types embed it in.
 
 /// The interface target-independent mapping code uses.
 class MappingTarget {
