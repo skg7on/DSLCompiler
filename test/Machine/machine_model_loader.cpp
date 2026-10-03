@@ -191,6 +191,26 @@ TEST(MachineModelLoader, LoadsShippedAvx2Profile) {
   EXPECT_TRUE(hasWorkerScope);
 }
 
+TEST(MachineModelLoader, ParsesComputeLanes) {
+  llvm::Expected<MachineModel> model = parse(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+compute:
+  - id: c0
+    kind: vector_engine
+    attached_to: e0
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8, bf16: 16}
+)yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  ASSERT_TRUE(model->lanesFor("vector_engine", "f32").has_value());
+  EXPECT_EQ(*model->lanesFor("vector_engine", "f32"), 8);
+  EXPECT_EQ(*model->lanesFor("vector_engine", "bf16"), 16);
+}
+
 TEST(MachineModelLoader, LoadsShippedGenericProfile) {
   llvm::Expected<MachineModel> model = loadMachineModel(
       std::string(LLK_MACHINE_DIR) + "/generic-ai-accel-v2.yaml");

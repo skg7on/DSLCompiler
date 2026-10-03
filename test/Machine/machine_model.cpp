@@ -43,6 +43,7 @@ MachineModel twoCoreMachine() {
                      {"f32"},
                      {"row_major", "vectorized"},
                      {{8}},
+                     {{"f32", 8}},
                      1,
                      5,
                      16.0,
@@ -187,4 +188,23 @@ TEST(MachineModel, VerifyRejectsDanglingLinkEngine) {
   MachineModel model = twoCoreMachine();
   model.links[0].transferEngines = {"nope.0"};
   EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, LanesForComputeKindAndElementType) {
+  MachineModel model = twoCoreMachine();
+  model.computes[0].lanes = {{"f32", 8}, {"bf16", 16}};
+  ASSERT_TRUE(model.lanesFor("vector_engine", "f32").has_value());
+  EXPECT_EQ(*model.lanesFor("vector_engine", "f32"), 8);
+  EXPECT_EQ(*model.lanesFor("vector_engine", "bf16"), 16);
+  // Unknown dtype and unknown capability both answer "not modelled".
+  EXPECT_FALSE(model.lanesFor("vector_engine", "f64").has_value());
+  EXPECT_FALSE(model.lanesFor("matrix_engine", "f32").has_value());
+}
+
+TEST(MachineModel, ContentHashCoversLanes) {
+  MachineModel a = twoCoreMachine();
+  a.computes[0].lanes = {{"f32", 8}};
+  MachineModel b = twoCoreMachine();
+  b.computes[0].lanes = {{"f32", 16}};
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
 }

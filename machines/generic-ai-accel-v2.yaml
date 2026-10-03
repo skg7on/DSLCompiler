@@ -89,6 +89,7 @@ compute:
     attached_to: pe.0
     element_types: [f32, f16]
     shapes: [[64]]
+    lanes: {f32: 64, f16: 128}
     issue_cycles: 1
     latency_cycles: 6
     throughput_per_cycle: 64

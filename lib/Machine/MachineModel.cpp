@@ -111,6 +111,14 @@ std::string renderCompute(const ComputeNode &node) {
     out += joinNumbers(shape);
     out += ']';
   }
+  // std::map iterates in key order, so the rendering is already canonical.
+  out += "|lanes=";
+  for (const auto &lane : node.lanes) {
+    out += lane.first;
+    out += ':';
+    out += std::to_string(lane.second);
+    out += ',';
+  }
   out += "|issue=";
   out += std::to_string(node.issueCycles);
   out += "|latency=";
@@ -233,6 +241,22 @@ bool MachineModel::isVisible(llvm::StringRef memoryId,
   if (!memory)
     return false;
   return isWithin(executorId, memory->visibleFrom);
+}
+
+std::optional<int64_t>
+MachineModel::lanesFor(llvm::StringRef computeKind,
+                       llvm::StringRef elementType) const {
+  for (const ComputeNode &node : computes) {
+    if (node.kind != computeKind)
+      continue;
+    auto it = node.lanes.find(elementType.str());
+    if (it != node.lanes.end())
+      return it->second;
+    // The first capability of this kind is the one queried; if it does not
+    // model the dtype, neither does the kind.
+    return std::nullopt;
+  }
+  return std::nullopt;
 }
 
 std::vector<const ComputeNode *>
@@ -401,6 +425,10 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
         if (extent <= 0)
           return invalid(path + ".shapes: extent must be positive");
     }
+    for (const auto &lane : compute.lanes)
+      if (lane.second <= 0)
+        return invalid(path + ".lanes['" + lane.first +
+                       "']: lane count must be positive");
   }
 
   for (size_t i = 0; i < model.transferEngines.size(); ++i) {
