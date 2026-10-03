@@ -156,3 +156,18 @@ llvm::Error verifyMappingTarget(const MappingTarget &target);
 **Non-scope respected:** placement (D5) and covering (D6) consume `MappingCandidate` from D1; no target-specific fields are added to generic ODS; the target plugin that *creates* emitters is D7 — D4 only validates keys.
 
 **Type consistency:** `Expr`/`ExprPtr`/`LayoutValue`/`LayoutParam`/`ParamDomain` are defined once in `LlkMap.h` (Task 1) and reused by both declaration kinds; `RuleDef` field names match between header, parser, and tests.
+
+## Verification Results (2026-10-03)
+
+- **Build:** `ninja -C build` — clean.
+- **New tests:** `MappingRulesTest` **19/19** (rule parsing + target validation); D3's `MappingLayoutTest` 30/30 unchanged after the parser extraction.
+- **Full suite:** `ctest --test-dir build --output-on-failure` — 97 registered, **95 passed, 2 skipped, 0 failed**.
+- **Deprecated-API audit:** clean across `LlkMap.h`, `LayoutConstraints.*`, `MappingRules.*`, `MappingTarget.*`, `WorkloadGraph.*`, `mapping_rules.cpp`.
+
+### Decisions taken while implementing
+
+1. **The shared core was extracted rather than duplicated.** `LlkMap.h` now holds the AST, lexer, `LlkMapParser` (cursor + expression grammar + `validateExpr`), and the evaluator; layouts and rules derive from it. D3's 30 tests were the guard for a behaviour-preserving move.
+2. **A rule's `param` statement declares and bounds the parameter**, so it must appear before its first use — unlike a layout, whose parameters are listed in its header.
+3. **Capability requirements are checked against the machine**, not against a static vocabulary: a rule requiring a `compute kind tensor_core` fails because `x86-avx2-v2.yaml` declares no such capability. Executor matching uses the same owner-kind refinement rule as placement (`worker` is satisfied by a refining `core`).
+4. **`match` predicates are structural.** The attribute names are not checked against each operation's definition; validating them against the dialect is a later refinement.
+5. **One lexer fix surfaced:** a single `=` was not in the punctuation set, so `kind = "add"` failed to lex. `->` had the same problem in D3.
