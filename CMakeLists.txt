@@ -816,6 +816,7 @@ add_llk_mapping_test(MappingPlanBinderTest test/Mapping/plan_binder.cpp)
 add_llk_mapping_test(MappingE2EWorkflowTest test/Mapping/e2e_workflow.cpp)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
+add_llk_mapping_test(MappingPropertiesTest test/Mapping/properties.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
