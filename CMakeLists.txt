@@ -245,6 +245,7 @@ mlir_target_link_libraries(LLKPerf PRIVATE MLIRTensorDialect)
 add_library(LLKMapping STATIC
     lib/Mapping/StableHash.cpp
     lib/Mapping/CostModel.cpp
+    lib/Mapping/SearchBinding.cpp
 )
 target_include_directories(LLKMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -680,6 +681,7 @@ endfunction()
 
 add_llk_mapping_test(MappingStableHashTest test/Mapping/stable_hash.cpp)
 add_llk_mapping_test(MappingCostModelTest test/Mapping/cost_model.cpp)
+add_llk_mapping_test(MappingSearchBindingTest test/Mapping/search_binding.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
