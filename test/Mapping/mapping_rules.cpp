@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
 #include <string>
 
 using namespace mlir::llk::mapping;
@@ -514,7 +515,10 @@ TEST(RuleMatch, BuildsAMappingCandidate) {
   ASSERT_NE(rule, nullptr);
   WorkloadNode node = vectorNode(context, "add");
 
-  MappingCandidate candidate = toMappingCandidate(*rule, node);
+  std::optional<MappingCandidate> resolved =
+      toMappingCandidate(*rule, node, MachineModel{}, LayoutContext{});
+  ASSERT_TRUE(resolved.has_value());
+  MappingCandidate candidate = std::move(*resolved);
   EXPECT_EQ(candidate.rule, "r.add");
   EXPECT_EQ(candidate.targetBundle, "b.add");
   ASSERT_EQ(candidate.coveredNodes.size(), 1u);
@@ -526,6 +530,125 @@ TEST(RuleMatch, BuildsAMappingCandidate) {
   ASSERT_EQ(candidate.layoutRequirements.size(), 1u);
   EXPECT_EQ(candidate.layoutRequirements[0].layoutClass, "avx2.blocked_2d");
   EXPECT_DOUBLE_EQ(candidate.lowerBound.latencyCycles, 9.0);
+}
+
+//===----------------------------------------------------------------------===//
+// `require <expr>` constraint evaluation (design §14.1)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Defined with the port-data predicate helpers below; declared here so these
+/// constraint tests can build a node that exposes an element type.
+WorkloadNode typedVectorNode(mlir::Type inputType, mlir::Type outputType);
+
+/// A machine whose `vector_engine` models `f32` at `f32Lanes` elements per
+/// instruction, which is what `machine.compute("vector_engine").lanes(...)`
+/// queries. Only the capability is needed: `lanesFor` reads `computes`.
+MachineModel machineWithVectorLanes(int64_t f32Lanes) {
+  MachineModel model;
+  model.target = "lanes";
+  ComputeNode vector;
+  vector.id = "vec.0";
+  vector.kind = "vector_engine";
+  vector.lanes = {{"f32", f32Lanes}};
+  model.computes = {vector};
+  return model;
+}
+
+/// The shipped shape of the AVX2 vector rule's parameter: a vector width
+/// derived from the machine's lane count for the matched element type.
+constexpr llvm::StringLiteral kLaneRule = R"llkmap(
+rule r.lanes {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  require VW == machine.compute("vector_engine").lanes(element_type);
+  input "operand0";
+  output "result";
+  bundle "b.lanes";
+  emit "e";
+}
+)llkmap";
+
+} // namespace
+
+TEST(RuleMatch, EvaluatesRequireConstraintsAgainstTheMachine) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(kLaneRule);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.lanes");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  WorkloadNode node = typedVectorNode(f32, f32);
+
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "f32";
+
+  // The machine models 8 f32 lanes, so VW must be 8 -- inside the declared
+  // [4..8] domain, so the rule matches and the derived width is recorded.
+  std::string reason;
+  std::optional<MappingCandidate> satisfying = toMappingCandidate(
+      *rule, node, machineWithVectorLanes(8), layoutContext, &reason);
+  ASSERT_TRUE(satisfying.has_value()) << reason;
+  auto derived = satisfying->resolvedParameters.find("VW");
+  ASSERT_NE(derived, satisfying->resolvedParameters.end());
+  EXPECT_EQ(std::get<int64_t>(derived->second), 8);
+
+  // The machine models 16 lanes, which no value in [4..8] can equal: the rule
+  // is a non-match, never a candidate.
+  std::string rejectingReason;
+  EXPECT_FALSE(toMappingCandidate(*rule, node, machineWithVectorLanes(16),
+                                  layoutContext, &rejectingReason)
+                   .has_value());
+  EXPECT_FALSE(rejectingReason.empty());
+}
+
+TEST(RuleMatch, AConstraintOnFactsTheNodeCannotSupplyIsANonMatch) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(kLaneRule);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.lanes");
+  ASSERT_NE(rule, nullptr);
+
+  // A node that exposes no element type, and a context that names none either:
+  // `element_type` cannot be resolved, so the constraint is unevaluable. It is
+  // rejected as a non-match with a reason, never silently accepted.
+  WorkloadNode bare;
+  bare.opName = "micro.vector";
+  std::string reason;
+  EXPECT_FALSE(toMappingCandidate(*rule, bare, machineWithVectorLanes(8),
+                                  LayoutContext{}, &reason)
+                   .has_value());
+  EXPECT_FALSE(reason.empty());
+}
+
+TEST(RuleMatch, ARuleWithoutConstraintsRecordsNoDerivedParameters) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.plain {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  input "operand0";
+  output "result";
+  bundle "b.plain";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.plain");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  std::optional<MappingCandidate> candidate = toMappingCandidate(
+      *rule, typedVectorNode(f32, f32), MachineModel{}, LayoutContext{});
+  ASSERT_TRUE(candidate.has_value());
+  // An unconstrained parameter is not "derived", so nothing is recorded for it.
+  EXPECT_TRUE(candidate->resolvedParameters.empty());
 }
 
 //===----------------------------------------------------------------------===//

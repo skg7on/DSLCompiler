@@ -708,12 +708,175 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
   return matches;
 }
 
-MappingCandidate toMappingCandidate(const RuleDef &rule,
-                                    const WorkloadNode &node) {
+namespace {
+
+/// The most assignments a rule's parameter space is enumerated over before the
+/// rule is treated as a non-match. A rule's domains are tiny in practice (a
+/// vector width's `[4..8]`), so this only stops a pathological rule from
+/// stalling a search.
+constexpr uint64_t kMaxRuleAssignments = 100000;
+
+/// The rank and element type a rule's `require` constraints see: the facts the
+/// node exposes, falling back to `fallback` for anything it does not carry.
+/// `element_type` is the first input's element type (else the first output's);
+/// `rank` is the first output's static rank (else the first input's). The
+/// fallback is the search's `LayoutContext`, which names the value being
+/// mapped.
+LayoutContext ruleLayoutContext(const WorkloadNode &node,
+                                const LayoutContext &fallback) {
+  LayoutContext context = fallback;
+  bool haveElement = false;
+  for (const WorkloadPort &port : node.inputs) {
+    if (mlir::Type element = elementTypeOf(port.type)) {
+      context.elementType = printedType(element);
+      haveElement = true;
+      break;
+    }
+  }
+  if (!haveElement)
+    for (const WorkloadPort &port : node.outputs) {
+      if (mlir::Type element = elementTypeOf(port.type)) {
+        context.elementType = printedType(element);
+        break;
+      }
+    }
+
+  bool haveRank = false;
+  for (const WorkloadPort &port : node.outputs) {
+    if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
+            shapeOf(port.type)) {
+      context.rank = static_cast<int64_t>(shape->size());
+      haveRank = true;
+      break;
+    }
+  }
+  if (!haveRank)
+    for (const WorkloadPort &port : node.inputs) {
+      if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
+              shapeOf(port.type)) {
+        context.rank = static_cast<int64_t>(shape->size());
+        break;
+      }
+    }
+  return context;
+}
+
+/// The result of evaluating a rule's `require` constraints against one node:
+/// whether some assignment of the rule's declared parameters satisfies every
+/// constraint, why not when none does, and the satisfying assignment.
+struct RuleResolution {
+  bool matched = true;
+  std::string reason;
+  llvm::StringMap<SearchValue> parameters;
+};
+
+/// Enumerates the rule's declared parameter domains in declaration order and
+/// returns the first assignment that satisfies every constraint. A rule with
+/// no constraints binds nothing. Fails the match -- never the search -- when no
+/// assignment satisfies a constraint, or when a constraint cannot be evaluated
+/// from the facts the node and context supply.
+RuleResolution resolveRuleConstraints(const RuleDef &rule,
+                                      const WorkloadNode &node,
+                                      const machine::MachineModel &machine,
+                                      const LayoutContext &context) {
+  RuleResolution result;
+  if (rule.constraints.empty())
+    return result;
+
+  // Every declared parameter must have a finite, non-empty domain to enumerate.
+  llvm::SmallVector<const LayoutParam *, 4> enumerable;
+  for (const LayoutParam &param : rule.params) {
+    auto domain = rule.domains.find(param.name);
+    if (domain == rule.domains.end() || domain->second.values.empty()) {
+      result.matched = false;
+      result.reason = "parameter '" + param.name + "' has no declared domain";
+      return result;
+    }
+    enumerable.push_back(&param);
+  }
+
+  auto domainOf = [&](const LayoutParam &param) -> const ParamDomain & {
+    return rule.domains.find(param.name)->second;
+  };
+  LayoutContext ruleContext = ruleLayoutContext(node, context);
+
+  llvm::SmallVector<size_t, 4> index(enumerable.size(), 0);
+  uint64_t assignments = 0;
+  std::optional<std::string> failure;
+  bool exhausted = false;
+  while (!exhausted) {
+    if (assignments >= kMaxRuleAssignments) {
+      result.matched = false;
+      result.reason = "constraint space exceeds " +
+                      std::to_string(kMaxRuleAssignments) + " assignments";
+      return result;
+    }
+
+    llvm::StringMap<LayoutValue> bindings;
+    for (size_t i = 0; i < enumerable.size(); ++i)
+      bindings[enumerable[i]->name] = domainOf(*enumerable[i]).values[index[i]];
+    ++assignments;
+
+    bool satisfied = true;
+    for (const ExprPtr &constraint : rule.constraints) {
+      llvm::Expected<EvalValue> value =
+          evaluateExpr(*constraint, bindings, machine, ruleContext);
+      if (!value) {
+        failure = llvm::toString(value.takeError());
+        satisfied = false;
+        break;
+      }
+      if (value->kind != EvalValue::Kind::Int || value->intValue == 0) {
+        failure = "a require constraint is not satisfied";
+        satisfied = false;
+        break;
+      }
+    }
+
+    if (satisfied) {
+      for (const auto &entry : bindings)
+        result.parameters[entry.first().str()] = entry.second;
+      return result;
+    }
+
+    // Advance the odometer: the last declared parameter varies fastest.
+    exhausted = true;
+    for (size_t i = enumerable.size(); i-- > 0;) {
+      if (++index[i] < domainOf(*enumerable[i]).values.size()) {
+        exhausted = false;
+        break;
+      }
+      index[i] = 0;
+    }
+  }
+
+  result.matched = false;
+  result.reason =
+      failure.value_or("no assignment satisfies the rule's constraints");
+  return result;
+}
+
+} // namespace
+
+std::optional<MappingCandidate>
+toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
+                   const machine::MachineModel &machine,
+                   const LayoutContext &context, std::string *reason) {
+  RuleResolution resolution =
+      resolveRuleConstraints(rule, node, machine, context);
+  if (!resolution.matched) {
+    if (reason)
+      *reason = resolution.reason.empty()
+                    ? std::string("require constraints not satisfied")
+                    : resolution.reason;
+    return std::nullopt;
+  }
+
   MappingCandidate candidate;
   candidate.rule = rule.id;
   candidate.coveredNodes.push_back(node.id);
   candidate.targetBundle = rule.bundle;
+  candidate.resolvedParameters = std::move(resolution.parameters);
   if (rule.costLowerBound)
     candidate.lowerBound.latencyCycles =
         static_cast<double>(*rule.costLowerBound);

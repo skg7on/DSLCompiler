@@ -161,8 +161,19 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
 /// Bridges a matched rule onto the workload node it covers: the result is the
 /// unplaced `MappingCandidate` the placement engine consumes. Rule ports are
 /// wired positionally to the node's inputs and then its outputs.
-MappingCandidate toMappingCandidate(const RuleDef &rule,
-                                    const WorkloadNode &node);
+///
+/// The rule's `require` constraints are evaluated here, against `machine` and
+/// the rank and element type the node exposes (falling back to `context` for
+/// facts the node does not carry). No assignment of the rule's declared
+/// parameters satisfies a constraint, or a constraint cannot be evaluated from
+/// the available facts, yields `std::nullopt` -- a non-match, never an error.
+/// On a match, the satisfying assignment is recorded in the candidate's
+/// `resolvedParameters`. When `reason` is given it receives why the rule did
+/// not match.
+std::optional<MappingCandidate>
+toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
+                   const machine::MachineModel &machine,
+                   const LayoutContext &context, std::string *reason = nullptr);
 
 } // namespace mlir::llk::mapping
 

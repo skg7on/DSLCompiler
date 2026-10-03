@@ -165,10 +165,23 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                                          " ('" + node->opName +
                                          "'): no matching rule");
     }
+    // A rule whose `require` constraints no assignment satisfies produces no
+    // candidate: that is a non-match, so a node with only such rules has no
+    // rule in effect and is counted once, below.
+    bool producedCandidate = false;
     for (const RuleDef *rule : matches) {
-      MappingCandidate candidate = toMappingCandidate(*rule, *node);
+      std::string reason;
+      std::optional<MappingCandidate> candidate =
+          toMappingCandidate(*rule, *node, machine, layoutContext_, &reason);
+      if (!candidate) {
+        result.frontier.messages.push_back("node " + std::to_string(node->id) +
+                                           ": rule '" + rule->id +
+                                           "' not applicable: " + reason);
+        continue;
+      }
+      producedCandidate = true;
       llvm::Expected<std::vector<CandidateInstance>> instances =
-          enumeratePlacements(candidate, target_, context_, layoutContext_,
+          enumeratePlacements(*candidate, target_, context_, layoutContext_,
                               placementOptions, &result.searchTruncated);
       if (!instances)
         return instances.takeError();
@@ -207,6 +220,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         }
         table.instances.push_back(std::move(entry));
       }
+    }
+    if (!producedCandidate && !matches.empty()) {
+      ++result.frontier.nodesWithoutRules;
+      result.frontier.messages.push_back(
+          "node " + std::to_string(node->id) + " ('" + node->opName +
+          "'): no rule satisfies its constraints");
     }
     tables.push_back(std::move(table));
   }
