@@ -405,3 +405,75 @@ TEST(LayoutSolve, RespectsMaxSolutionsAndDisclosesIt) {
   // Hitting the solution cap is a cap: the caller must be told.
   EXPECT_TRUE(result->truncated);
 }
+
+//===----------------------------------------------------------------------===//
+// Shipped AVX2 layouts
+//===----------------------------------------------------------------------===//
+
+#ifndef LLK_MAPPING_DIR
+#error "LLK_MAPPING_DIR must name the shipped mapping directory"
+#endif
+
+namespace {
+constexpr llvm::StringLiteral kShippedLayouts =
+    LLK_MAPPING_DIR "/x86-avx2/layouts.llkmap";
+constexpr llvm::StringLiteral kInvalidLayouts =
+    LLK_MAPPING_DIR "/../test/Mapping/Inputs/invalid-layouts.llkmap";
+} // namespace
+
+TEST(LayoutShipped, LoadsTheAvx2LayoutFile) {
+  llvm::Expected<LayoutRegistry> registry = loadLayoutFile(kShippedLayouts);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  EXPECT_NE(registry->find("avx2.blocked_2d"), nullptr);
+  EXPECT_NE(registry->find("avx2.row_major"), nullptr);
+}
+
+TEST(LayoutShipped, Blocked2dSolvesForF32) {
+  llvm::Expected<LayoutRegistry> registry = loadLayoutFile(kShippedLayouts);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("avx2.blocked_2d");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "f32";
+  SolverLimits limits;
+  limits.maxSolutions = 64;
+  llvm::Expected<LayoutSolveResult> result =
+      solveLayout(*def, machine, context, layoutContext, limits);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->solutions.empty());
+  // The lane count forces VW = 8, and N must divide by it.
+  for (const LayoutSolution &solution : result->solutions) {
+    EXPECT_EQ(solutionInt(solution, "VW"), 8);
+    EXPECT_EQ(solutionInt(solution, "N") % 8, 0);
+  }
+}
+
+TEST(LayoutShipped, Blocked2dDoesNotSolveWhenLanesFallOutsideTheDomain) {
+  llvm::Expected<LayoutRegistry> registry = loadLayoutFile(kShippedLayouts);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("avx2.blocked_2d");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "bf16"; // lanes 16, outside VW in [4..8]
+  llvm::Expected<LayoutSolveResult> result =
+      solveLayout(*def, machine, context, layoutContext);
+  ASSERT_TRUE(static_cast<bool>(result));
+  EXPECT_TRUE(result->solutions.empty());
+  EXPECT_FALSE(result->truncated);
+}
+
+TEST(LayoutShipped, RejectsTheInvalidFixture) {
+  llvm::Expected<LayoutRegistry> registry = loadLayoutFile(kInvalidLayouts);
+  EXPECT_FALSE(static_cast<bool>(registry));
+  if (!registry)
+    llvm::consumeError(registry.takeError());
+}

@@ -708,6 +708,8 @@ function(add_llk_mapping_test test_name test_file)
   add_llvm_executable(${test_name} ${test_file})
   target_link_libraries(${test_name} PRIVATE
       LLKMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+  target_compile_definitions(${test_name} PRIVATE
+      LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping")
   add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 

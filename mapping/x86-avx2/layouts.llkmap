@@ -1,0 +1,26 @@
+// AVX2 target layouts.
+//
+// Layout ids are target-owned mapping results, not `#micro.layout` enumerants.
+// Machine facts are read only through machine queries, so nothing here names a
+// concrete executor. Domains are kept small: the solver enumerates them, and a
+// wide domain costs more than it buys.
+
+// Plain row-major: the logical index is the physical index.
+layout avx2.row_major(int N) {
+  param N in [1..8];
+  require rank == 2;
+  map (m, n) -> (m, n);
+}
+
+// Two-dimensional blocking with a vector inner dimension. The vector width is
+// whatever the machine's vector engine has for this element type, so the
+// declaration follows the machine instead of hard-coding 8.
+layout avx2.blocked_2d(int M, int N, int VW) {
+  param M in [4..16];
+  param N in [4..16];
+  param VW in [4..8];
+  require rank == 2;
+  require VW == machine.compute("vector_engine").lanes(element_type);
+  require N % VW == 0;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}

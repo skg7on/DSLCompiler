@@ -1,0 +1,8 @@
+// A deliberately invalid LLKMap file: the `require` names `M`, which is not a
+// declared parameter, a map dimension, or a builtin. Loading it must fail with
+// a diagnostic rather than producing a registry the solver could use.
+layout broken.one(N) {
+  param N in [1..8];
+  require M > 0;
+  map (m, n) -> (m, n);
+}
