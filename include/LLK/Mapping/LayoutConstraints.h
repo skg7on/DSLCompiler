@@ -121,23 +121,48 @@ struct LayoutSolution {
   mlir::AffineMap map;
 };
 
-/// Bounds on a solve. `truncated` in the result reports when either bound ended
+/// Bounds on a solve. `truncated` in the result reports when any bound ended
 /// the search early, so a caller never reads a capped result as complete.
 struct SolverLimits {
   uint64_t maxAssignments = 100000;
   uint64_t maxSolutions = 8;
+  /// Total domain elements every `forall`/`exists` in one solve may examine
+  /// (design §13.3 bounds quantification). A quantifier that would exceed it
+  /// stops and the solve is reported truncated -- never a silently accepted
+  /// "no solution". A declaration without a quantifier never consumes it.
+  uint64_t maxQuantifierIterations = 100000;
 };
 
 struct LayoutSolveResult {
   std::vector<LayoutSolution> solutions;
-  /// True when the search stopped before exhausting the assignment space.
+  /// True when the search stopped before exhausting the assignment space or a
+  /// quantifier ran out of its budget (design §13.3).
   bool truncated = false;
 };
+
+/// The layout-solving backend (design §13.3). The bounded enumerator is one
+/// implementation; a future solver -- an SMT backend, say -- implements this
+/// same interface without any change to rule files or callers.
+class LayoutSolver {
+public:
+  virtual ~LayoutSolver() = default;
+
+  /// Solves `def`; the contract is `solveLayout`'s below.
+  virtual llvm::Expected<LayoutSolveResult>
+  solve(const LayoutDef &def, const machine::MachineModel &machine,
+        mlir::MLIRContext &context, const LayoutContext &layoutContext,
+        const SolverLimits &limits = {}) const = 0;
+};
+
+/// The bounded-enumeration backend: deterministic and dependency-free, the only
+/// implementation today.
+std::unique_ptr<LayoutSolver> makeBoundedLayoutSolver();
 
 /// Solves `def` against `machine` by bounded enumeration over the declared
 /// finite domains, in declaration order. Fails on a parameter without a
 /// domain, an empty domain, a constraint that cannot be evaluated, or a map
-/// clause that is not affine.
+/// clause that is not affine. A thin wrapper over `makeBoundedLayoutSolver()`,
+/// kept so existing callers keep working while the interface is adopted.
 llvm::Expected<LayoutSolveResult>
 solveLayout(const LayoutDef &def, const machine::MachineModel &machine,
             mlir::MLIRContext &context, const LayoutContext &layoutContext,

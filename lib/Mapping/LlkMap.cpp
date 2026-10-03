@@ -8,6 +8,7 @@
 #include "LLK/Mapping/LlkMap.h"
 
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
@@ -135,7 +136,7 @@ bool lex(llvm::StringRef text, std::vector<LlkMapToken> &out,
     if (matched)
       continue;
 
-    static const std::string kOneChar = "(){}[],;.<>!+-*/%=";
+    static const std::string kOneChar = "(){}[],;.<>!+-*/%=:";
     if (kOneChar.find(c) == std::string::npos) {
       error = (llvm::Twine("unexpected character '") +
                llvm::Twine(std::string(1, c)) + "'")
@@ -423,6 +424,36 @@ bool LlkMapParser::validateExpr(const ExprPtr &expr,
   case ExprKind::Unary:
   case ExprKind::Binary:
     break;
+  case ExprKind::Quantifier: {
+    // operands: [bound-variable Ident, domain, body].
+    const Expr &domain = *expr->operands[1];
+    if (domain.kind == ExprKind::Ident) {
+      if (domain.text != "dimensions")
+        return failAt(current(),
+                      "unknown quantifier domain '" + domain.text + "'");
+    } else if (domain.kind == ExprKind::Call && domain.text == "domain") {
+      if (domain.operands.size() != 1 ||
+          domain.operands[0]->kind != ExprKind::Ident)
+        return failAt(current(), "'domain' needs a declared parameter name");
+      if (!allowed.contains(domain.operands[0]->text))
+        return failAt(current(), "unknown parameter '" +
+                                     domain.operands[0]->text +
+                                     "' in quantifier domain");
+    } else if (domain.kind == ExprKind::Call && domain.text == "executors") {
+      if (domain.operands.size() != 1)
+        return failAt(current(), "'executors' takes a kind argument");
+      if (!validateExpr(domain.operands[0], allowed))
+        return false;
+    } else {
+      return failAt(current(), "expected a quantifier domain "
+                               "('domain(<param>)', 'executors(<kind>)', or "
+                               "'dimensions')");
+    }
+    // The bound variable is local to the body and shadows any outer name.
+    llvm::StringSet<> scoped = allowed;
+    scoped.insert(expr->operands[0]->text);
+    return validateExpr(expr->operands[2], scoped);
+  }
   }
   for (const ExprPtr &operand : expr->operands)
     if (!validateExpr(operand, allowed))
@@ -601,6 +632,8 @@ ExprPtr LlkMapParser::parsePrimary() {
     return inner;
   }
   if (current().kind == LlkMapToken::Kind::Identifier) {
+    if (current().text == "forall" || current().text == "exists")
+      return parseQuantifier();
     std::string name = current().text;
     advance();
     if (isPunct("(")) {
@@ -615,11 +648,123 @@ ExprPtr LlkMapParser::parsePrimary() {
   return nullptr;
 }
 
+ExprPtr LlkMapParser::parseQuantifier() {
+  std::string op = current().text; // `forall` or `exists`
+  advance();
+  std::string variable;
+  if (!expectIdentifier("a quantifier variable", variable))
+    return nullptr;
+  if (current().kind != LlkMapToken::Kind::Identifier ||
+      current().text != "in") {
+    failAt(current(), "expected 'in'");
+    return nullptr;
+  }
+  advance();
+
+  // The domain is parsed as an ordinary primary-level expression and its shape
+  // is checked by `validateExpr`; `domain(...)`, `executors(...)`, and
+  // `dimensions` are understood only in this position.
+  ExprPtr domain = parseExpression();
+  if (!domain)
+    return nullptr;
+  if (!expectPunct(":"))
+    return nullptr;
+  // The body extends as far right as possible, so a quantifier that must feed
+  // a larger expression needs parentheses.
+  ExprPtr body = parseExpression();
+  if (!body)
+    return nullptr;
+  return makeExpr(
+      ExprKind::Quantifier, std::move(op),
+      {makeExpr(ExprKind::Ident, std::move(variable), {}), domain, body});
+}
+
+namespace {
+
+llvm::Expected<EvalValue> evalImpl(const Expr &expr,
+                                   const llvm::StringMap<LayoutValue> &bindings,
+                                   const MachineModel &machine,
+                                   const LayoutContext &context,
+                                   const EvalOptions &options);
+
+/// Evaluates a `forall`/`exists` over its finite domain. The domain is either
+/// a declared parameter's domain (`domain(<param>)`), a machine-derived set of
+/// executor ids (`executors(<kind>)`), or the value's logical dimensions
+/// (`dimensions`, the integers `0 .. rank-1`). An empty domain is vacuous:
+/// `forall` is 1 and `exists` is 0. Whether it is decisive is bounded by
+/// `options.budget`; when the budget runs out the quantifier yields 0 and sets
+/// `budget->exhausted`, which the caller must surface rather than accept.
 llvm::Expected<EvalValue>
-evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
-             const MachineModel &machine, const LayoutContext &context) {
+evalQuantifier(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
+               const MachineModel &machine, const LayoutContext &context,
+               const EvalOptions &options) {
+  const Expr &variable = *expr.operands[0];
+  const Expr &domainNode = *expr.operands[1];
+  const Expr &body = *expr.operands[2];
+  bool isForall = expr.text == "forall";
+
+  llvm::SmallVector<LayoutValue, 8> domain;
+  if (domainNode.kind == ExprKind::Ident && domainNode.text == "dimensions") {
+    for (int64_t dimension = 0; dimension < context.rank; ++dimension)
+      domain.push_back(dimension);
+  } else if (domainNode.kind == ExprKind::Call && domainNode.text == "domain") {
+    if (!options.domainResolver)
+      return evalError("'domain' quantifier needs a declaration to resolve");
+    std::optional<llvm::ArrayRef<LayoutValue>> values =
+        options.domainResolver(domainNode.operands[0]->text);
+    if (!values)
+      return evalError("unknown domain for parameter '" +
+                       domainNode.operands[0]->text + "'");
+    domain.assign(values->begin(), values->end());
+  } else if (domainNode.kind == ExprKind::Call &&
+             domainNode.text == "executors") {
+    llvm::Expected<EvalValue> kind =
+        evalImpl(*domainNode.operands[0], bindings, machine, context, options);
+    if (!kind)
+      return kind.takeError();
+    if (kind->kind != EvalValue::Kind::Str)
+      return evalError("'executors' needs a string kind");
+    for (const machine::ExecutorNode &executor : machine.executors)
+      if (machine.ownerMatches(kind->text, executor.id))
+        domain.push_back(executor.id);
+    // A kind the machine does not offer is an unknown fact, matching the
+    // `machine.compute(<kind>).count` convention -- never a silently empty set.
+    if (domain.empty())
+      return evalError("unknown executor kind '" + kind->text + "'");
+  } else {
+    return evalError("unknown quantifier domain");
+  }
+
+  if (!options.budget)
+    return evalError("quantifier evaluated without a bound");
+
+  llvm::StringMap<LayoutValue> scoped = bindings;
+  for (const LayoutValue &value : domain) {
+    if (!options.budget->step())
+      return makeInt(0); // undecided; flagged by budget->exhausted
+    scoped[variable.text] = value;
+    llvm::Expected<EvalValue> bodyValue =
+        evalImpl(body, scoped, machine, context, options);
+    if (!bodyValue)
+      return bodyValue.takeError();
+    if (bodyValue->kind != EvalValue::Kind::Int)
+      return evalError("a quantifier body must be an integer");
+    bool truthy = bodyValue->intValue != 0;
+    if (isForall && !truthy)
+      return makeInt(0); // counterexample
+    if (!isForall && truthy)
+      return makeInt(1); // witness
+  }
+  return makeInt(isForall ? 1 : 0);
+}
+
+llvm::Expected<EvalValue> evalImpl(const Expr &expr,
+                                   const llvm::StringMap<LayoutValue> &bindings,
+                                   const MachineModel &machine,
+                                   const LayoutContext &context,
+                                   const EvalOptions &options) {
   auto eval = [&](const Expr &node) {
-    return evaluateExpr(node, bindings, machine, context);
+    return evalImpl(node, bindings, machine, context, options);
   };
 
   switch (expr.kind) {
@@ -657,8 +802,34 @@ evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
     return evalCall(expr, eval);
   case ExprKind::MemberCall:
     return evalMember(expr, eval, machine);
+  case ExprKind::Quantifier:
+    return evalQuantifier(expr, bindings, machine, context, options);
   }
   return evalError("unhandled expression");
+}
+
+} // namespace
+
+llvm::Expected<EvalValue>
+evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
+             const MachineModel &machine, const LayoutContext &context,
+             const EvalOptions &options) {
+  if (options.budget)
+    return evalImpl(expr, bindings, machine, context, options);
+
+  // A caller with no budget of its own still gets a bounded evaluation; an
+  // exhausted default budget is an error, not a quietly false value.
+  QuantifierBudget local;
+  EvalOptions scoped = options;
+  scoped.budget = &local;
+  llvm::Expected<EvalValue> result =
+      evalImpl(expr, bindings, machine, context, scoped);
+  if (!result)
+    return result.takeError();
+  if (local.exhausted)
+    return evalError("quantified expression exceeded its evaluation bound; "
+                     "the result is undecided");
+  return result;
 }
 
 std::string resolveMachineQueries(const Expr &expr,
@@ -755,6 +926,8 @@ std::string canonicalExprString(const Expr &expr) {
     break;
   case ExprKind::Binary:
     break;
+  case ExprKind::Quantifier:
+    break;
   }
 
   llvm::StringRef prefix;
@@ -770,6 +943,9 @@ std::string canonicalExprString(const Expr &expr) {
     break;
   case ExprKind::Binary:
     prefix = "binary:";
+    break;
+  case ExprKind::Quantifier:
+    prefix = "quant:";
     break;
   default:
     break;

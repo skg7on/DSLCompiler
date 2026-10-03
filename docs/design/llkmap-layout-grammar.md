@@ -37,7 +37,9 @@ additive   ::= multiplicative (("+" | "-") multiplicative)*
 multiplicative ::= unary (("*" | "/" | "%") unary)*
 unary      ::= ("!" | "-") unary | postfix
 postfix    ::= primary ("." ident [ "(" args ")" ])*
-primary    ::= int | string | ident | "(" expr ")" | call
+primary    ::= int | string | ident | "(" expr ")" | call | quantifier
+quantifier ::= ("forall" | "exists") ident "in" domain ":" expr
+domain     ::= "domain" "(" ident ")" | "executors" "(" expr ")" | "dimensions"
 call       ::= ident "(" args ")"
 id         ::= (letter | "_") (alnum | "_" | ".")*
 ```
@@ -75,6 +77,52 @@ A `layout` names its integer and symbolic parameters, then states:
 | `machine.memory(<id>).capacity_bytes` | memory capacity |
 | `machine.memory(<id>).alignment_bytes` | memory alignment |
 
+## Finite quantification
+
+Design §13.3 requires the evaluator to quantify over a declared finite domain,
+so a constraint like "every declared vector width is a multiple of two" or
+"every executor of this kind exists" is *declared* rather than written in
+target-specific C++.
+
+```text
+require forall v in domain(VW) : v % 2 == 0;
+require exists d in dimensions : d == 1;
+require forall e in executors("worker") : e != "";
+```
+
+`forall x in D : p` is 1 when the body `p` holds for every element of `D`, and
+`exists x in D : p` is 1 when it holds for at least one. Booleans are integers,
+so a quantifier is usable anywhere an expression is.
+
+### Domains
+
+| Domain | Elements (in declaration order) |
+|---|---|
+| `domain(<param>)` | the declared domain of `<param>` (`[lo..hi]` or `{...}`) |
+| `executors(<kind>)` | every executor whose kind is `<kind>` (or that refines it), binding its id |
+| `dimensions` | the integers `0 .. rank-1`, the value's logical dimensions |
+
+The bound variable shadows any outer name and is local to the body. The body
+extends as far right as possible, so a quantifier that must feed a larger
+expression needs parentheses: `(forall v in domain(VW) : p) && q`.
+
+`executors(<kind>)` reads the machine like the other capability queries: a
+`<kind>` the machine does not offer is an unknown fact, reported as an error,
+never a silently empty set.
+
+An empty domain is vacuous: `forall` over it is 1 and `exists` over it is 0.
+`dimensions` is the only domain that can be empty (a scalar has no dimensions).
+
+### Boundedness
+
+Quantification is bounded and deterministic. Every element a quantifier examines
+consumes one unit of a budget set from `SolverLimits::maxQuantifierIterations`
+(a rule's `require` uses its own assignment bound). When the budget runs out
+before a quantifier has decided, the quantifier yields **0** -- *undecided*,
+never a definite false -- and the solve reports `truncated`, so a caller never
+reads a capped search as a proof that no solution exists. The cap is never
+silently ignored.
+
 ## Example
 
 ```text
@@ -97,6 +145,9 @@ The parser rejects, with a file/line/column diagnostic:
 - a `param ... in` clause for an undeclared parameter, or a duplicate domain;
 - an identifier in a `require`/`map` that is neither a declared parameter, a
   map dimension, nor a builtin;
+- a `domain(<param>)` quantifier whose argument is not a declared parameter, a
+  quantifier domain that is not `domain(...)`, `executors(...)`, or
+  `dimensions`, or a missing `in`/`:` in a quantifier;
 - an unknown function (`floordiv`, `ceildiv`, `mod`, `min`, `max`,
   `machine.compute`, `machine.memory`) or member query (`lanes`, `count`,
   `capacity_bytes`, `alignment_bytes`);

@@ -79,6 +79,7 @@ bool isAffineSpecExpr(const Expr &expr) {
            isAffineSpecExpr(*expr.operands[1]);
   case ExprKind::StringLit:
   case ExprKind::MemberCall:
+  case ExprKind::Quantifier:
     return false;
   }
   return false;
@@ -930,8 +931,22 @@ LayoutContext ruleLayoutContext(const WorkloadNode &node,
 /// Adds every identifier an expression references to `out`, so a rule can tell
 /// which of its parameters a constraint actually derives.
 void collectIdentifiers(const Expr &expr, llvm::StringSet<> &out) {
-  if (expr.kind == ExprKind::Ident)
+  if (expr.kind == ExprKind::Ident) {
     out.insert(expr.text);
+    return;
+  }
+  if (expr.kind == ExprKind::Quantifier) {
+    // operands: [bound-variable Ident, domain, body]. The bound variable is
+    // local -- not a reference to a rule parameter. `domain(<param>)` names a
+    // domain, not a value, so its argument is not a value reference either;
+    // `executors(<expr>)` does evaluate its argument, so that one is walked.
+    const Expr &domain = *expr.operands[1];
+    if (domain.kind == ExprKind::Call && domain.text == "executors")
+      for (const ExprPtr &argument : domain.operands)
+        collectIdentifiers(*argument, out);
+    collectIdentifiers(*expr.operands[2], out);
+    return;
+  }
   for (const ExprPtr &operand : expr.operands)
     collectIdentifiers(*operand, out);
 }
@@ -987,6 +1002,24 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
   };
   LayoutContext ruleContext = ruleLayoutContext(node, context);
 
+  // A quantifier in a rule's `require` is bounded like the rule's own
+  // enumeration, and `domain(<param>)` reads the rule's declared domains. The
+  // resolver is a named lvalue because `function_ref` does not own its
+  // callable.
+  QuantifierBudget budget;
+  budget.limit = kMaxRuleAssignments;
+  auto resolveDomain =
+      [&rule](
+          llvm::StringRef name) -> std::optional<llvm::ArrayRef<LayoutValue>> {
+    auto it = rule.domains.find(name.str());
+    if (it == rule.domains.end())
+      return std::nullopt;
+    return llvm::ArrayRef<LayoutValue>(it->second.values);
+  };
+  EvalOptions evalOptions;
+  evalOptions.budget = &budget;
+  evalOptions.domainResolver = resolveDomain;
+
   llvm::SmallVector<size_t, 4> index(enumerable.size(), 0);
   uint64_t assignments = 0;
   std::optional<std::string> failure;
@@ -1008,8 +1041,8 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
 
     bool satisfied = true;
     for (const ExprPtr &constraint : rule.constraints) {
-      llvm::Expected<EvalValue> value =
-          evaluateExpr(*constraint, bindings, machine, ruleContext);
+      llvm::Expected<EvalValue> value = evaluateExpr(
+          *constraint, bindings, machine, ruleContext, evalOptions);
       if (!value) {
         failure = llvm::toString(value.takeError());
         satisfied = false;
@@ -1041,6 +1074,9 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
   }
 
   result.matched = false;
+  // A quantifier that ran out of budget leaves the rule undecided, not
+  // unsatisfiable; report it so the caller does not read it as a clean miss.
+  result.truncated = result.truncated || budget.exhausted;
   result.reason =
       failure.value_or("no assignment satisfies the rule's constraints");
   return result;

@@ -16,6 +16,7 @@
 
 #include "LLK/Machine/MachineModel.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -43,7 +44,9 @@ enum class ExprKind {
   Call,       ///< `floordiv(a, b)`, `machine.compute("vector_engine")`
   MemberCall, ///< `receiver.lanes(dtype)`, `receiver.count`
   Unary,      ///< `!a`, `-a`
-  Binary      ///< `a + b`, `a % b`, `a == b`, `a && b`
+  Binary,     ///< `a + b`, `a % b`, `a == b`, `a && b`
+  Quantifier  ///< `forall x in domain(N) : p`, `exists e in executors("dma") :
+              ///< q`
 };
 
 struct Expr;
@@ -89,13 +92,60 @@ struct EvalValue {
   std::string text;
 };
 
+/// A shared, bounded budget for quantified evaluation. Each candidate element a
+/// quantifier examines consumes one unit. When the budget is spent before a
+/// quantifier has decided, `exhausted` is set and the quantifier yields 0 --
+/// *undecided*, never a definite false -- so a caller must surface `exhausted`
+/// instead of reading the value as a final answer. The cap is never silently
+/// ignored.
+struct QuantifierBudget {
+  /// Total domain elements one evaluation may examine. The solver sets this
+  /// from its `SolverLimits`; a direct evaluator call uses the default.
+  uint64_t limit = 65536;
+  uint64_t used = 0;
+  bool exhausted = false;
+
+  /// Consumes one unit of the budget. Returns false once it is spent (setting
+  /// `exhausted`), so a quantifier stops rather than running unbounded.
+  bool step() {
+    if (used >= limit) {
+      exhausted = true;
+      return false;
+    }
+    ++used;
+    return true;
+  }
+};
+
+/// Resolves a `domain(<name>)` quantifier to the finite set a declared
+/// parameter ranges over, in declaration order. The evaluator carries no
+/// declaration of its own, so the enclosing solver supplies one. A name with no
+/// declared domain returns `std::nullopt`, which evaluation reports as an
+/// error -- never a silently empty set.
+using DomainResolver =
+    llvm::function_ref<std::optional<llvm::ArrayRef<LayoutValue>>(
+        llvm::StringRef name)>;
+
+/// Extra inputs a quantified expression needs. The four-argument
+/// `evaluateExpr` call -- everything without a quantifier -- leaves these
+/// defaulted.
+struct EvalOptions {
+  /// Resolves `domain(<name>)` quantifiers, or empty when the caller has no
+  /// declaration to resolve against (in which case such a quantifier errors).
+  DomainResolver domainResolver;
+  /// Budget shared across one evaluation, or null to use a private default
+  /// budget -- in which case exceeding it is an error rather than a value.
+  QuantifierBudget *budget = nullptr;
+};
+
 /// Evaluates a parsed expression. Booleans are integers (0 and 1). Fails on an
 /// unknown identifier, an unknown machine fact, a type mismatch between an
-/// integer and a string, or division by zero.
+/// integer and a string, division by zero, or -- when `options` carries no
+/// budget -- a quantifier that exhausts the private default budget.
 llvm::Expected<EvalValue>
 evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
-             const machine::MachineModel &machine,
-             const LayoutContext &context);
+             const machine::MachineModel &machine, const LayoutContext &context,
+             const EvalOptions &options = {});
 
 /// Resolves the literal subject of a `machine.<callee>("<subject>")` query
 /// against a machine. Returns `std::nullopt` when the subject is known, or the
@@ -197,6 +247,7 @@ protected:
   ExprPtr parseUnary();
   ExprPtr parsePostfix();
   ExprPtr parsePrimary();
+  ExprPtr parseQuantifier();
   bool parseCallArgs(std::vector<ExprPtr> &out);
 
   std::vector<LlkMapToken> tokens_;

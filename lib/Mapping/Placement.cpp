@@ -9,6 +9,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -172,14 +173,17 @@ enumeratePlacements(const MappingCandidate &candidate,
   };
 
   // A layout requirement that cannot solve makes the candidate unplaceable,
-  // independently of which executor would run it.
+  // independently of which executor would run it. Solved through the
+  // `LayoutSolver` interface (design §13.3), not the free function, so a future
+  // backend drops in here without touching placement.
+  std::unique_ptr<LayoutSolver> layoutSolver = makeBoundedLayoutSolver();
   for (const LayoutRequirement &requirement : candidate.layoutRequirements) {
     const LayoutDef *def = target.layouts().find(requirement.layoutClass);
     if (!def)
       return placementError("placement: unknown layout '" +
                             requirement.layoutClass + "'");
     llvm::Expected<LayoutSolveResult> solved =
-        solveLayout(*def, machine, context, layoutContext);
+        layoutSolver->solve(*def, machine, context, layoutContext);
     if (!solved)
       return solved.takeError();
     if (solved->solutions.empty()) {

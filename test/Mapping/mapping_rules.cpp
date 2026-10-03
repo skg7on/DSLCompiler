@@ -915,6 +915,58 @@ TEST(RuleMatch, EvaluatesRequireConstraintsAgainstTheMachine) {
   EXPECT_FALSE(rejectingReason.empty());
 }
 
+TEST(RuleMatch, AQuantifiedRequireConstraintDecidesTheMatch) {
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  WorkloadNode node = typedVectorNode(f32, f32);
+  MachineModel machine = machineWithVectorLanes(8);
+
+  llvm::StringLiteral holding = R"llkmap(
+rule r.quant {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  require forall v in domain(VW) : v >= 4;
+  input "operand0";
+  output "result";
+  bundle "b.quant";
+  emit "e";
+}
+)llkmap";
+  llvm::Expected<RuleRegistry> registry = parse(holding);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.quant");
+  ASSERT_NE(rule, nullptr);
+
+  std::string reason;
+  std::optional<MappingCandidate> match =
+      toMappingCandidate(*rule, node, machine, {}, &reason);
+  ASSERT_TRUE(match.has_value()) << reason;
+  // `domain(VW)` names VW's domain, not its value, so the rule derives no
+  // parameter value for its bundle.
+  EXPECT_TRUE(match->resolvedParameters.empty());
+
+  llvm::StringLiteral failing = R"llkmap(
+rule r.quant {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  require exists v in domain(VW) : v > 8;
+  input "operand0";
+  output "result";
+  bundle "b.quant";
+  emit "e";
+}
+)llkmap";
+  llvm::Expected<RuleRegistry> failingRegistry = parse(failing);
+  ASSERT_TRUE(static_cast<bool>(failingRegistry));
+  const RuleDef *failingRule = failingRegistry->find("r.quant");
+  ASSERT_NE(failingRule, nullptr);
+  std::string failingReason;
+  EXPECT_FALSE(
+      toMappingCandidate(*failingRule, node, machine, {}, &failingReason)
+          .has_value());
+}
+
 TEST(RuleMatch, AConstraintOnFactsTheNodeCannotSupplyIsANonMatch) {
   mlir::MLIRContext context;
   llvm::Expected<RuleRegistry> registry = parse(kLaneRule);

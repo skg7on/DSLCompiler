@@ -2,10 +2,14 @@
 
 #include "LLK/Mapping/LayoutConstraints.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 
 #include <gtest/gtest.h>
 
+#include <memory>
+#include <optional>
 #include <string>
 
 using namespace mlir::llk::mapping;
@@ -476,4 +480,212 @@ TEST(LayoutShipped, RejectsTheInvalidFixture) {
   EXPECT_FALSE(static_cast<bool>(registry));
   if (!registry)
     llvm::consumeError(registry.takeError());
+}
+
+//===----------------------------------------------------------------------===//
+// Finite quantification (design §13.3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Evaluates the first `require` of `id` in `text`, resolving a `domain(...)`
+/// quantifier against the layout's declared parameter domains.
+llvm::Expected<EvalValue>
+evalLayoutConstraint(llvm::StringRef text, llvm::StringRef id,
+                     const MachineModel &machine, LayoutContext context = {},
+                     const llvm::StringMap<LayoutValue> &bindings = {}) {
+  llvm::Expected<LayoutRegistry> registry = parseLayoutText(text, "<test>");
+  if (!registry)
+    return registry.takeError();
+  const LayoutDef *def = registry->find(id);
+  if (!def)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "missing layout '" + id + "'");
+  // Named lvalue: `function_ref` borrows, so it must outlive the call.
+  auto resolveDomain =
+      [def](
+          llvm::StringRef name) -> std::optional<llvm::ArrayRef<LayoutValue>> {
+    auto it = def->domains.find(name.str());
+    if (it == def->domains.end())
+      return std::nullopt;
+    return llvm::ArrayRef<LayoutValue>(it->second.values);
+  };
+  EvalOptions options;
+  options.domainResolver = resolveDomain;
+  return evaluateExpr(*def->constraints[0], bindings, machine, context,
+                      options);
+}
+
+int64_t evalLayoutInt(llvm::StringRef text, llvm::StringRef id,
+                      const MachineModel &machine, LayoutContext context = {},
+                      const llvm::StringMap<LayoutValue> &bindings = {}) {
+  llvm::Expected<EvalValue> value =
+      evalLayoutConstraint(text, id, machine, context, bindings);
+  if (!value || value->kind != EvalValue::Kind::Int)
+    return INT64_MIN;
+  return value->intValue;
+}
+
+} // namespace
+
+TEST(LayoutQuantifier, ForallOverAParamDomainHoldsAndFails) {
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral holds = R"llkmap(
+layout t.q(int N) {
+  param N in [2..6];
+  require forall v in domain(N) : v >= 2;
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(holds, "t.q", machine), 1);
+
+  llvm::StringLiteral fails = R"llkmap(
+layout t.q(int N) {
+  param N in [2..6];
+  require forall v in domain(N) : v >= 3;
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(fails, "t.q", machine), 0);
+}
+
+TEST(LayoutQuantifier, ExistsOverAParamDomainHoldsAndFails) {
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral holds = R"llkmap(
+layout t.q(int N) {
+  param N in [2..6];
+  require exists v in domain(N) : v == 6;
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(holds, "t.q", machine), 1);
+
+  llvm::StringLiteral fails = R"llkmap(
+layout t.q(int N) {
+  param N in [2..6];
+  require exists v in domain(N) : v == 9;
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(fails, "t.q", machine), 0);
+}
+
+TEST(LayoutQuantifier, QuantifiesOverMachineExecutors) {
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral everyWorker = R"llkmap(
+layout t.q() {
+  require forall e in executors("worker") : e != "nobody";
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(everyWorker, "t.q", machine), 1);
+
+  llvm::StringLiteral someWorker = R"llkmap(
+layout t.q() {
+  require exists e in executors("worker") : e == "e0";
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(someWorker, "t.q", machine), 1);
+
+  llvm::StringLiteral noWorker = R"llkmap(
+layout t.q() {
+  require exists e in executors("worker") : e == "e9";
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(noWorker, "t.q", machine), 0);
+}
+
+TEST(LayoutQuantifier, RejectsAnUnknownExecutorKind) {
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral unknown = R"llkmap(
+layout t.q() {
+  require forall e in executors("dma") : e != "";
+}
+)llkmap";
+  EXPECT_FALSE(
+      static_cast<bool>(evalLayoutConstraint(unknown, "t.q", machine)));
+}
+
+TEST(LayoutQuantifier, OverDimensionsIsVacuouslyTrueWhenEmpty) {
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral everyDim = R"llkmap(
+layout t.q() {
+  require forall d in dimensions : d < rank;
+}
+)llkmap";
+  llvm::StringLiteral anyDim = R"llkmap(
+layout t.q() {
+  require exists d in dimensions : d >= 0;
+}
+)llkmap";
+  LayoutContext rank2;
+  rank2.rank = 2;
+  EXPECT_EQ(evalLayoutInt(everyDim, "t.q", machine, rank2), 1);
+  EXPECT_EQ(evalLayoutInt(anyDim, "t.q", machine, rank2), 1);
+
+  // A scalar has no dimensions: `forall` is vacuous, `exists` finds nothing.
+  LayoutContext rank0;
+  rank0.rank = 0;
+  EXPECT_EQ(evalLayoutInt(everyDim, "t.q", machine, rank0), 1);
+  EXPECT_EQ(evalLayoutInt(anyDim, "t.q", machine, rank0), 0);
+}
+
+TEST(LayoutQuantifier, ReportsTruncationWhenTheDomainExceedsTheBound) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral text = R"llkmap(
+layout t.q(int N) {
+  param N in [1..4];
+  require forall v in domain(N) : v >= 1;
+}
+)llkmap";
+
+  // With room for the whole quantified domain, every assignment solves.
+  SolverLimits roomy;
+  roomy.maxAssignments = 1000;
+  roomy.maxQuantifierIterations = 1000;
+  llvm::Expected<LayoutSolveResult> solved =
+      solveText(text, "t.q", machine, context, {}, roomy);
+  ASSERT_TRUE(static_cast<bool>(solved)) << llvm::toString(solved.takeError());
+  EXPECT_FALSE(solved->truncated);
+  EXPECT_EQ(solved->solutions.size(), 4u);
+
+  // A quantifier bound below the domain size stops the scan. The result is
+  // reported truncated, never read as a definite "no solution".
+  SolverLimits tight;
+  tight.maxAssignments = 1000;
+  tight.maxQuantifierIterations = 2;
+  llvm::Expected<LayoutSolveResult> clipped =
+      solveText(text, "t.q", machine, context, {}, tight);
+  ASSERT_TRUE(static_cast<bool>(clipped));
+  EXPECT_TRUE(clipped->solutions.empty());
+  EXPECT_TRUE(clipped->truncated);
+}
+
+//===----------------------------------------------------------------------===//
+// LayoutSolver interface (design §13.3)
+//===----------------------------------------------------------------------===//
+
+TEST(LayoutSolverInterface, SolvesThroughTheInterface) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  llvm::Expected<LayoutRegistry> registry = parse(kSolvable);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("t.block");
+  ASSERT_NE(def, nullptr);
+
+  std::unique_ptr<LayoutSolver> solver = makeBoundedLayoutSolver();
+  ASSERT_NE(solver, nullptr);
+  SolverLimits limits;
+  limits.maxSolutions = 64;
+
+  llvm::Expected<LayoutSolveResult> throughInterface =
+      solver->solve(*def, machine, context, layoutContext, limits);
+  ASSERT_TRUE(static_cast<bool>(throughInterface))
+      << llvm::toString(throughInterface.takeError());
+  llvm::Expected<LayoutSolveResult> throughFree =
+      solveLayout(*def, machine, context, layoutContext, limits);
+  ASSERT_TRUE(static_cast<bool>(throughFree))
+      << llvm::toString(throughFree.takeError());
+
+  EXPECT_EQ(throughInterface->solutions.size(), throughFree->solutions.size());
+  EXPECT_EQ(throughInterface->solutions.size(), 12u);
+  EXPECT_FALSE(throughInterface->truncated);
 }

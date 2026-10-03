@@ -11,6 +11,7 @@
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
@@ -20,6 +21,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -452,6 +454,7 @@ llvm::Expected<mlir::AffineExpr> AffineBuilder::convert(const Expr &expr) {
   }
   case ExprKind::StringLit:
   case ExprKind::MemberCall:
+  case ExprKind::Quantifier:
     return evalError("non-affine expression in map");
   }
   return evalError("unhandled map expression");
@@ -478,10 +481,15 @@ buildAffineMap(const AffineMapSpec &spec,
                               &context);
 }
 
+namespace {
+
+/// The bounded-enumeration implementation body: deterministic, over the
+/// declared finite domains, in declaration order. Design §13.3's first
+/// implementation; `BoundedLayoutSolver` wraps it behind the interface.
 llvm::Expected<LayoutSolveResult>
-solveLayout(const LayoutDef &def, const MachineModel &machine,
-            mlir::MLIRContext &context, const LayoutContext &layoutContext,
-            const SolverLimits &limits) {
+solveBounded(const LayoutDef &def, const MachineModel &machine,
+             mlir::MLIRContext &context, const LayoutContext &layoutContext,
+             const SolverLimits &limits) {
   // Every declared parameter must have a finite domain to enumerate.
   llvm::SmallVector<const LayoutParam *, 4> enumerable;
   uint64_t total = 1;
@@ -506,6 +514,24 @@ solveLayout(const LayoutDef &def, const MachineModel &machine,
     return def.domains.find(param.name)->second;
   };
 
+  // One quantifier budget for the whole solve, and a resolver that lets a
+  // `domain(<param>)` quantifier read the declared domains (§13.3). The
+  // resolver is a named lvalue: `function_ref` does not own its callable, so it
+  // must outlive every `evaluateExpr` that borrows it.
+  QuantifierBudget budget;
+  budget.limit = limits.maxQuantifierIterations;
+  auto resolveDomain =
+      [&def](
+          llvm::StringRef name) -> std::optional<llvm::ArrayRef<LayoutValue>> {
+    auto it = def.domains.find(name.str());
+    if (it == def.domains.end())
+      return std::nullopt;
+    return llvm::ArrayRef<LayoutValue>(it->second.values);
+  };
+  EvalOptions evalOptions;
+  evalOptions.budget = &budget;
+  evalOptions.domainResolver = resolveDomain;
+
   LayoutSolveResult result;
   llvm::SmallVector<size_t, 4> index(enumerable.size(), 0);
   uint64_t assignments = 0;
@@ -521,8 +547,8 @@ solveLayout(const LayoutDef &def, const MachineModel &machine,
 
     bool satisfied = true;
     for (const ExprPtr &constraint : def.constraints) {
-      llvm::Expected<EvalValue> value =
-          evaluateExpr(*constraint, bindings, machine, layoutContext);
+      llvm::Expected<EvalValue> value = evaluateExpr(
+          *constraint, bindings, machine, layoutContext, evalOptions);
       if (!value)
         return value.takeError();
       if (value->kind != EvalValue::Kind::Int || value->intValue == 0) {
@@ -562,8 +588,36 @@ solveLayout(const LayoutDef &def, const MachineModel &machine,
     }
   }
 
-  result.truncated = assignments < total;
+  // The search is incomplete both when the assignment space was not exhausted
+  // and when a quantifier ran out of budget (design §13.3).
+  result.truncated = assignments < total || budget.exhausted;
   return result;
+}
+
+/// The interface wrapper around `solveBounded`.
+class BoundedLayoutSolver final : public LayoutSolver {
+public:
+  llvm::Expected<LayoutSolveResult>
+  solve(const LayoutDef &def, const MachineModel &machine,
+        mlir::MLIRContext &context, const LayoutContext &layoutContext,
+        const SolverLimits &limits) const override {
+    return solveBounded(def, machine, context, layoutContext, limits);
+  }
+};
+
+} // namespace
+
+std::unique_ptr<LayoutSolver> makeBoundedLayoutSolver() {
+  return std::make_unique<BoundedLayoutSolver>();
+}
+
+llvm::Expected<LayoutSolveResult>
+solveLayout(const LayoutDef &def, const MachineModel &machine,
+            mlir::MLIRContext &context, const LayoutContext &layoutContext,
+            const SolverLimits &limits) {
+  // Preserved as a thin wrapper; new clients take the `LayoutSolver` interface.
+  return makeBoundedLayoutSolver()->solve(def, machine, context, layoutContext,
+                                          limits);
 }
 
 } // namespace mlir::llk::mapping
