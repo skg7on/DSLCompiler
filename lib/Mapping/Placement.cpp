@@ -48,12 +48,34 @@ std::vector<std::string> visibleMemories(const MachineModel &machine,
   return ids;
 }
 
+/// True when the target declares `lhs` and `rhs` interchangeable (design §15.1:
+/// "symmetric placements may be canonicalized when *the target declares*
+/// executors equivalent"). A loaded model is guaranteed symmetric and same-kind
+/// by `verifyMachineModel`; checking either direction keeps the rule robust for
+/// a hand-built model, and a *valid* declaration read from YAML always holds
+/// both ways.
+bool declaredEquivalent(const ExecutorNode &lhs, const ExecutorNode &rhs) {
+  return llvm::is_contained(lhs.equivalentTo, rhs.id) ||
+         llvm::is_contained(rhs.equivalentTo, lhs.id);
+}
+
 /// Two executors are interchangeable when swapping them cannot change any
-/// binding: same kind, same parent, and exactly the same attached compute and
-/// visible memory nodes. Symmetry reduction is only sound under this rule.
+/// binding or any cost, so symmetry reduction is sound. A target-declared
+/// equivalence settles the question outright; otherwise the structural
+/// heuristic requires the same kind, parent, logical coordinates, concurrency,
+/// and scheduling class, and exactly the same attached compute and visible
+/// memory nodes. Coordinates, concurrency, and scheduling class are compared
+/// because two executors that differ in any of them occupy a different
+/// spatial/parallelism/overlap position -- collapsing distinct-performance
+/// executors into one representative would hide a placement and misstate cost.
 bool interchangeable(const MachineModel &machine, const ExecutorNode &lhs,
                      const ExecutorNode &rhs) {
+  if (declaredEquivalent(lhs, rhs))
+    return true;
   return lhs.kind == rhs.kind && lhs.parent == rhs.parent &&
+         lhs.coordinates == rhs.coordinates &&
+         lhs.concurrency == rhs.concurrency &&
+         lhs.schedulingClass == rhs.schedulingClass &&
          attachedComputes(machine, lhs) == attachedComputes(machine, rhs) &&
          visibleMemories(machine, lhs) == visibleMemories(machine, rhs);
 }

@@ -283,6 +283,63 @@ transfer_engines:
 )yaml"));
 }
 
+TEST(MachineModelLoader, ParsesDeclaredEquivalence) {
+  llvm::Expected<MachineModel> model = parse(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [e1]}
+  - {id: e1, kind: worker, equivalent_to: [e0]}
+)yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  ASSERT_NE(model->findExecutor("e0"), nullptr);
+  ASSERT_NE(model->findExecutor("e1"), nullptr);
+  EXPECT_EQ(model->findExecutor("e0")->equivalentTo,
+            (std::vector<std::string>{"e1"}));
+  EXPECT_EQ(model->findExecutor("e1")->equivalentTo,
+            (std::vector<std::string>{"e0"}));
+}
+
+TEST(MachineModelLoader, RejectsEquivalenceWithUnknownExecutor) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [nope]}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsAsymmetricEquivalence) {
+  // e0 declares e1 equivalent, but e1 declares nothing: the assertion is not
+  // mutual, so it is not a sound canonicalization and is rejected.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [e1]}
+  - {id: e1, kind: worker}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsEquivalenceAcrossKinds) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [e1]}
+  - {id: e1, kind: core, equivalent_to: [e0]}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsSelfEquivalence) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [e0]}
+)yaml"));
+}
+
 #ifndef LLK_MACHINE_DIR
 #error "LLK_MACHINE_DIR must name the shipped machines directory"
 #endif

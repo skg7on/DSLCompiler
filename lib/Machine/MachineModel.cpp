@@ -92,7 +92,9 @@ std::string optionalNumber(const std::optional<T> &value) {
 
 std::string renderExecutor(const ExecutorNode &node) {
   std::vector<std::string> refines(node.refines);
+  std::vector<std::string> equivalents(node.equivalentTo);
   llvm::sort(refines);
+  llvm::sort(equivalents);
   std::string out = "executor|id=";
   out += node.id;
   out += "|kind=";
@@ -107,6 +109,10 @@ std::string renderExecutor(const ExecutorNode &node) {
   out += joinStrings(refines, ",");
   out += "|scheduling=";
   out += stringifySchedulingClass(node.schedulingClass);
+  // A declared equivalence changes which placements the symmetry reducer
+  // keeps, so it is behaviour-bearing and enters the content hash.
+  out += "|equivalent_to=";
+  out += joinStrings(equivalents, ",");
   return out;
 }
 
@@ -507,6 +513,28 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
     if (executor.parent && !model.findExecutor(*executor.parent))
       return invalid(path + ".parent: unknown executor '" + *executor.parent +
                      "'");
+    // A declared equivalence is a target assertion that two executors can be
+    // canonicalized. It is only sound when it names a real executor, is
+    // mutual, and joins executors of one kind -- a cross-kind collapse would
+    // make a placement bind the wrong executor class. Checked in declaration
+    // order, so the first bad entry decides.
+    for (const std::string &equivalent : executor.equivalentTo) {
+      if (equivalent == executor.id)
+        return invalid(path + ".equivalent_to: executor '" + executor.id +
+                       "' cannot declare itself equivalent");
+      const ExecutorNode *other = model.findExecutor(equivalent);
+      if (!other)
+        return invalid(path + ".equivalent_to: unknown executor '" +
+                       equivalent + "'");
+      if (other->kind != executor.kind)
+        return invalid(path + ".equivalent_to: '" + equivalent +
+                       "' has kind '" + other->kind + "', expected '" +
+                       executor.kind + "'");
+      if (!llvm::is_contained(other->equivalentTo, executor.id))
+        return invalid(path + ".equivalent_to: '" + equivalent +
+                       "' does not declare '" + executor.id +
+                       "' equivalent (the declaration must be mutual)");
+    }
   }
 
   // Containment must be acyclic: walk each executor's parent chain.

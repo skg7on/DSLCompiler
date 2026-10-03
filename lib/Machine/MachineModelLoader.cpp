@@ -400,6 +400,9 @@ bool Loader::parseExecutor(Node *node, size_t index, ExecutorNode &out) {
                                    out.concurrency);
                if (key == "refines")
                  return readStringList(value, path + ".refines", out.refines);
+               if (key == "equivalent_to")
+                 return readStringList(value, path + ".equivalent_to",
+                                       out.equivalentTo);
                if (key == "scheduling_class") {
                  std::string name;
                  if (!readText(value, path + ".scheduling_class", name))

@@ -67,6 +67,29 @@ MachineModel attachmentMachine() {
   return model;
 }
 
+/// Two executors of the same kind that differ in coordinates and concurrency,
+/// so the structural heuristic would keep both; each declares the other
+/// `equivalentTo`, so the target's declaration is what makes them
+/// interchangeable.
+MachineModel declaredEquivalentMachine() {
+  MachineModel model;
+  model.target = "declared";
+  ExecutorNode lhs;
+  lhs.id = "c.0";
+  lhs.kind = "core";
+  lhs.coordinates = {0};
+  lhs.concurrency = 1;
+  lhs.equivalentTo = {"c.1"};
+  ExecutorNode rhs;
+  rhs.id = "c.1";
+  rhs.kind = "core";
+  rhs.coordinates = {3};
+  rhs.concurrency = 4;
+  rhs.equivalentTo = {"c.0"};
+  model.executors = {lhs, rhs};
+  return model;
+}
+
 constexpr llvm::StringLiteral kLayouts = R"llkmap(
 layout t.rank2(int N) {
   param N in [1..8];
@@ -407,6 +430,75 @@ TEST(Placement, SymmetryReductionKeepsOneRepresentative) {
   ASSERT_TRUE(static_cast<bool>(all));
   EXPECT_EQ(boundExecutors(*all),
             (std::vector<std::string>{"c.0", "c.1", "c.2"}));
+}
+
+TEST(Placement, DeclaredEquivalenceCollapsesExecutorsToRepresentative) {
+  // The target declares c.0 and c.1 equivalent even though their coordinates
+  // and concurrency differ, so symmetry reduction collapses them to one
+  // representative -- a declared group always keeps at least one member.
+  std::unique_ptr<MappingTarget> target =
+      targetFor(declaredEquivalentMachine());
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate core = candidate();
+  core.executorRequirements[0].capability = "core";
+  mlir::MLIRContext context;
+
+  PlacementOptions reduced; // reduceSymmetry defaults on
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(core, *target, context, LayoutContext{}, reduced);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances), (std::vector<std::string>{"c.0"}));
+}
+
+TEST(Placement, DeclaredEquivalenceRespectsTheSymmetrySwitch) {
+  // The same declared-equivalent machine with reduction disabled enumerates
+  // every representative, so the switch still governs the collapse.
+  std::unique_ptr<MappingTarget> target =
+      targetFor(declaredEquivalentMachine());
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate core = candidate();
+  core.executorRequirements[0].capability = "core";
+  mlir::MLIRContext context;
+
+  PlacementOptions full;
+  full.reduceSymmetry = false;
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(core, *target, context, LayoutContext{}, full);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances),
+            (std::vector<std::string>{"c.0", "c.1"}));
+}
+
+TEST(Placement, DoesNotCollapseExecutorsThatDifferInConcurrencyOrCoordinates) {
+  // The structural heuristic must compare the facts that make two executors
+  // behave differently: logical coordinates, concurrency, and scheduling class.
+  // Executors that differ in any of them are not interchangeable, so collapsing
+  // them to one representative would hide a distinct-performance placement.
+  MachineModel machine;
+  machine.target = "distinct";
+  machine.executors = {
+      {"c.0", "core", std::nullopt, {0}, 1, {}},
+      {"c.1", "core", std::nullopt, {1}, 1, {}},
+      {"c.2", "core", std::nullopt, {0}, 4, {}},
+      {"c.3", "core", std::nullopt, {0}, 1, {}, SchedulingClass::OutOfOrder}};
+  std::unique_ptr<MappingTarget> target = targetFor(std::move(machine));
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate core = candidate();
+  core.executorRequirements[0].capability = "core";
+  mlir::MLIRContext context;
+
+  PlacementOptions reduced; // reduceSymmetry defaults on
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(core, *target, context, LayoutContext{}, reduced);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances),
+            (std::vector<std::string>{"c.0", "c.1", "c.2", "c.3"}));
 }
 
 TEST(Placement, ReportsTruncationWhenTheInstanceCapIsHit) {

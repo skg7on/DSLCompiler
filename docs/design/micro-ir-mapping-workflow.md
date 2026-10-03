@@ -84,7 +84,8 @@ target: my-machine
 clock_hz: 3000000000       # needed only for nanosecond estimates
 worker_threads: 8
 sync: {barrier_cycles: 200, wait_cycles: 0}
-executors: [...]           # each with a Micro owner kind, a parent, a concurrency
+executors: [...]           # each with a Micro owner kind, a parent, a concurrency,
+                           #   optional coordinates, and optional equivalent_to
 memories: [...]            # capacity, alignment, access bandwidth and latency
 compute: [...]             # element types, accumulator types, shapes, lanes
 transfer_engines: [...]
@@ -94,6 +95,18 @@ links: [...]               # transfer bandwidth, latency, engines
 Copy `machines/x86-avx2-v2.yaml` and calibrate it for your host before trusting
 any cycle estimate. The numbers in the shipped files are calibration seeds, not
 claims about any SKU.
+
+An executor may list `equivalent_to: [other, ...]` to declare that it can be
+swapped with those executors without changing a mapping. The declaration is a
+*target* assertion, so the loader enforces it: every entry must name an existing
+executor, must be mutual (the other executor declares this one back), and must
+join executors of the same kind. The mapper collapses a declared group to a
+single representative; symmetry reduction over executors that declare nothing
+falls back to a structural rule (same kind, parent, coordinates, concurrency,
+scheduling class, and compute/memory attachments). Both are off-switchable for
+diagnostics (`MappingSearchOptions::enableSymmetryReduction`,
+`PlacementOptions::reduceSymmetry`), so a caller can still enumerate every
+representative.
 
 ## Mapping a kernel onto a target
 

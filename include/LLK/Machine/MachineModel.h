@@ -119,6 +119,24 @@ struct ExecutorNode {
   /// meaning. Loaded, hashed, and verified, but not yet consulted by the
   /// simulator.
   SchedulingClass schedulingClass = SchedulingClass::InOrder;
+  /// Executor ids this executor declares interchangeable (YAML
+  /// `equivalent_to`). Design §15.1: "symmetric placements may be canonicalized
+  /// when *the target declares* executors equivalent". A declaration is a
+  /// target assertion that two executors can be swapped without changing a
+  /// binding or a cost; the symmetry reducer collapses a declared group to one
+  /// representative while `PlacementOptions::reduceSymmetry` remains the on/off
+  /// switch.
+  ///
+  /// The declaration must be *mutual*, name an *existing* executor, and join
+  /// executors of the *same kind*; `verifyMachineModel` rejects a one-sided,
+  /// unknown, self-, or cross-kind entry (so a loaded model always satisfies
+  /// the rule, and the order of checks is deterministic). Empty means "the
+  /// target declares nothing"; symmetry reduction then falls back to the
+  /// structural heuristic, which compares kind, parent, logical coordinates,
+  /// concurrency, scheduling class, and the attached compute and visible memory
+  /// nodes -- so two executors with distinct performance characteristics are
+  /// not collapsed merely because they look alike.
+  std::vector<std::string> equivalentTo;
 };
 
 /// A place data can reside. `visibleFrom` names the executor scope that can

@@ -42,8 +42,12 @@ namespace mlir::llk::mapping {
 
 struct PlacementOptions {
   /// Collapse interchangeable executors to one representative (design §15.1).
-  /// Two executors are interchangeable only when swapping them cannot change a
-  /// binding: same kind, same parent, same attached compute and memory nodes.
+  /// A target-declared `equivalent_to` settles interchangeability outright;
+  /// otherwise two executors are interchangeable only when swapping them cannot
+  /// change a binding or a cost: same kind, parent, logical coordinates,
+  /// concurrency, and scheduling class, and identical attached compute and
+  /// visible memory nodes. Kept as an explicit switch so a diagnostic run can
+  /// enumerate every representative.
   bool reduceSymmetry = true;
   /// Upper bound on the instances one candidate may produce.
   unsigned maxInstances = 64;

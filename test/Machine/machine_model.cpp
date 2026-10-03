@@ -319,6 +319,53 @@ TEST(MachineModel, ContentHashCoversSchedulingClass) {
   EXPECT_NE(computeContentHash(a), computeContentHash(b));
 }
 
+TEST(MachineModel, DeclaredEquivalenceDefaultsToEmpty) {
+  MachineModel model = twoCoreMachine();
+  for (const ExecutorNode &executor : model.executors)
+    EXPECT_TRUE(executor.equivalentTo.empty());
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyAcceptsMutualSameKindEquivalence) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].equivalentTo = {"core.1"};
+  model.executors[2].equivalentTo = {"core.0"};
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsUnknownEquivalentExecutor) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].equivalentTo = {"nope.0"};
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsAsymmetricEquivalence) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].equivalentTo = {"core.1"};
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsCrossKindEquivalence) {
+  MachineModel model = twoCoreMachine();
+  model.executors[0].equivalentTo = {"core.0"};
+  model.executors[1].equivalentTo = {"package.0"};
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsSelfEquivalence) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].equivalentTo = {"core.0"};
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, ContentHashCoversDeclaredEquivalence) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.executors[1].equivalentTo = {"core.1"};
+  b.executors[2].equivalentTo = {"core.0"};
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+}
+
 TEST(MachineModel, MemoryAccessGranularityIsUnmodelledByDefault) {
   MachineModel model = twoCoreMachine();
   EXPECT_FALSE(model.memories[0].accessGranularityBytes.has_value());
