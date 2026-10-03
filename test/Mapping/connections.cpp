@@ -70,13 +70,6 @@ ConnectionRequest baseRequest() {
   return request;
 }
 
-std::vector<std::string> planKinds(const std::vector<ConnectionPlan> &plans) {
-  std::vector<std::string> kinds;
-  for (const ConnectionPlan &plan : plans)
-    kinds.push_back(stringifyConnectionKind(plan.kind).str());
-  return kinds;
-}
-
 } // namespace
 
 TEST(Connections, DirectWhenMemoryAndLayoutAgree) {

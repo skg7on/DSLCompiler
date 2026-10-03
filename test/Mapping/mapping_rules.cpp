@@ -382,9 +382,6 @@ TEST(MappingTarget, RejectsTheInvalidRuleFixture) {
 
 namespace {
 
-using mlir::llk::machine::ComputeNode;
-using mlir::llk::machine::MachineModel;
-
 mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context,
                                       llvm::StringRef op) {
   return mlir::DictionaryAttr::get(
@@ -392,23 +389,18 @@ mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context,
                                       mlir::StringAttr::get(&context, op))});
 }
 
+/// Builds a `micro.vector` workload node. Only the ids matter here: matching
+/// reads the node's attributes, and the rule-to-candidate bridge reads its
+/// ports positionally, so the fixture does not set port types.
 WorkloadNode vectorNode(mlir::MLIRContext &context, llvm::StringRef op) {
   WorkloadNode node;
   node.id = 7;
   node.opName = "micro.vector";
   node.attributes = vectorAttributes(context, op);
-  WorkloadValue input;
-  input.id = 1;
-  input.type = mlir::Float32Type::get(&context);
-  WorkloadValue output;
-  output.id = 2;
-  output.type = mlir::Float32Type::get(&context);
   WorkloadPort inPort;
   inPort.value = 1;
-  inPort.type = input.type;
   WorkloadPort outPort;
   outPort.value = 2;
-  outPort.type = output.type;
   node.inputs.push_back(inPort);
   node.outputs.push_back(outPort);
   return node;
