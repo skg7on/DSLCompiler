@@ -223,6 +223,8 @@ add_library(LLKPerf STATIC
     lib/Perf/CandidateGenerator.cpp
     lib/Perf/Legality.cpp
     lib/Perf/CandidateBinding.cpp
+    lib/Perf/ScheduleRecord.cpp
+    lib/Perf/TuningSession.cpp
 )
 target_include_directories(LLKPerf PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -505,9 +507,10 @@ target_link_libraries(llk-compile PRIVATE LLKPasses LLKTransforms LLKFuseDoubleC
 add_llvm_executable(llk-bench tools/llk-bench/llk-bench.cpp)
 target_link_libraries(llk-bench PRIVATE LLKRuntime)
 
-# Tool: llk-tune (autotuning grid search)
+# Tool: llk-tune (autotuning: Micro search space, or the legacy grid)
 add_llvm_executable(llk-tune tools/llk-tune/llk-tune.cpp)
-target_link_libraries(llk-tune PRIVATE LLKRuntime)
+target_link_libraries(llk-tune PRIVATE
+    LLKPerf MicroDialect LLKDialect LLKRuntime ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: micro-perf (Micro-IR performance simulator, M10)
 add_llvm_executable(micro-perf tools/micro-perf/micro-perf.cpp)
@@ -640,6 +643,11 @@ add_llk_perf_test(LegalityTest test/Perf/legality.cpp)
 # becomes a concrete micro.kernel. The test builds the kernel and asserts both
 # the emitted IR and the decisions the schedule record persists.
 add_llk_perf_test(CandidateBindingTest test/Perf/candidate_binding.cpp)
+
+# Tuning session and schedule YAML (issue #50): ranking order, the session loop,
+# and the persisted record. Uses the shipped machine model, so the model the
+# driver tunes against is the one under test.
+add_llk_perf_test(TuningSessionTest test/Perf/tuning_session.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
@@ -900,6 +908,16 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME MicroPerfHelp
       COMMAND sh -c "$<TARGET_FILE:micro-perf> --help 2>&1 | ${FILECHECK_BIN} --check-prefix=HELP ${CMAKE_SOURCE_DIR}/test/Perf/micro_perf_cli.mlir"
   )
+  # llk-tune in Micro mode: a search space and the AVX2 model go in, a ranked
+  # schedule YAML comes out. The fixture's YAML checks describe that output.
+  add_test(NAME LLKTuneSearchSpace
+      COMMAND sh -c "$<TARGET_FILE:llk-tune> --input=${CMAKE_SOURCE_DIR}/test/Perf/llk_tune_search_space.mlir --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-cpu.yaml --M=8 --N=64 --K=64 --top-k=2 --output=${CMAKE_CURRENT_BINARY_DIR}/llk_tune_out.yaml && ${FILECHECK_BIN} --check-prefix=YAML ${CMAKE_SOURCE_DIR}/test/Perf/llk_tune_search_space.mlir < ${CMAKE_CURRENT_BINARY_DIR}/llk_tune_out.yaml"
+  )
+  # Compatibility: with no --input the driver keeps the pre-Micro grid search
+  # and writes the JSON schedule_db entry the existing pipeline consumes.
+  add_test(NAME LLKTuneLegacyJson
+      COMMAND sh -c "$<TARGET_FILE:llk-tune> -M=8 -N=64 -K=64 -o=${CMAKE_CURRENT_BINARY_DIR}/llk_tune_legacy.json && ${FILECHECK_BIN} --check-prefix=LEGACY ${CMAKE_SOURCE_DIR}/test/Perf/llk_tune_search_space.mlir < ${CMAKE_CURRENT_BINARY_DIR}/llk_tune_legacy.json"
+  )
   # TritonToLLK: verify llk.matmul / llk.make_tensor parse and verify
   add_test(NAME TritonToLLKNewOps
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/llk_new_ops.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/llk_new_ops.mlir"
@@ -961,6 +979,9 @@ if(TARGET llk-opt)
 endif()
 if(TARGET micro-perf)
   list(APPEND _llk_check_deps micro-perf)
+endif()
+if(TARGET llk-tune)
+  list(APPEND _llk_check_deps llk-tune)
 endif()
 
 add_custom_target(check-llk

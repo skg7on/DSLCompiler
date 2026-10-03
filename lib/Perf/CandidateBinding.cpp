@@ -401,12 +401,12 @@ resolveDecisions(MLIRContext *context, const SearchSpace &space,
 // Emission
 //===----------------------------------------------------------------------===//
 
-/// Appends one concrete `micro.kernel` for `decisions` to `module` and returns
-/// its symbol.
-std::string emitKernel(ModuleOp module, const SearchSpace &space,
-                       const Candidate &candidate, const WorkloadShape &shape,
-                       const KernelContext &context,
-                       const BoundTileDecisions &decisions) {
+/// Appends one concrete `micro.kernel` for `decisions` to `module`.
+micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
+                           const Candidate &candidate,
+                           const WorkloadShape &shape,
+                           const KernelContext &context,
+                           const BoundTileDecisions &decisions) {
   MLIRContext *ctx = module.getContext();
   Location loc = module.getLoc();
 
@@ -624,7 +624,7 @@ std::string emitKernel(ModuleOp module, const SearchSpace &space,
       micro::MemorySpaceAttr::get(ctx, micro::MemorySpace::dram));
 
   builder.setInsertionPointToEnd(module.getBody());
-  return symName;
+  return kernel;
 }
 
 } // namespace
@@ -653,8 +653,10 @@ bindCandidateToMicroKernel(mlir::ModuleOp module, const SearchSpace &space,
   BoundKernel bound;
   bound.workload = space.workload;
   bound.decisions = std::move(*decisions);
-  bound.symbolName = emitKernel(module, space, candidate, shape, *kernelContext,
-                                bound.decisions);
+  micro::KernelOp kernel = emitKernel(module, space, candidate, shape,
+                                      *kernelContext, bound.decisions);
+  bound.kernel = kernel.getOperation();
+  bound.symbolName = kernel.getSymName().str();
   return bound;
 }
 

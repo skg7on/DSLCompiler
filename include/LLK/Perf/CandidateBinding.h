@@ -41,6 +41,7 @@
 
 namespace mlir {
 class ModuleOp;
+class Operation;
 } // namespace mlir
 
 namespace mlir::llk::perf {
@@ -83,6 +84,9 @@ struct BoundTileDecisions {
 
 /// A bound kernel and the decisions it resolved to.
 struct BoundKernel {
+  /// The emitted `micro.kernel`. Owned by the module it was emitted into, so
+  /// the pointer is only valid while that module lives.
+  mlir::Operation *kernel = nullptr;
   /// Symbol of the emitted `micro.kernel`.
   std::string symbolName;
   std::string workload;
