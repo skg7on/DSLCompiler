@@ -238,7 +238,7 @@ bool RuleParser::parseRequire(RuleDef &out) {
                              peek(2).text == "satisfies";
   if (isLayoutRequirement) {
     advance(); // 'layout'
-    LayoutRequirement requirement;
+    RuleLayoutRequirement requirement;
     if (!expectIdentifier("a port name", requirement.port))
       return false;
     advance(); // 'satisfies'
@@ -353,6 +353,99 @@ llvm::Expected<RuleRegistry> loadRuleFile(llvm::StringRef path) {
     return llvm::createStringError(buffer.getError(),
                                    "cannot read LLKMap file '" + path + "'");
   return parseRuleText(buffer.get()->getBuffer(), path);
+}
+
+//===----------------------------------------------------------------------===//
+// One-operation matching
+//===----------------------------------------------------------------------===//
+
+bool predicateMatches(const RulePredicate &predicate,
+                      mlir::DictionaryAttr attributes) {
+  if (!attributes)
+    return false;
+  mlir::Attribute value = attributes.get(predicate.attribute);
+  if (!value)
+    return false;
+  if (const auto *integer = std::get_if<int64_t>(&predicate.value)) {
+    if (auto attribute = mlir::dyn_cast<mlir::IntegerAttr>(value))
+      return attribute.getInt() == *integer;
+    return false;
+  }
+  const std::string &expected = std::get<std::string>(predicate.value);
+  if (auto attribute = mlir::dyn_cast<mlir::StringAttr>(value))
+    return attribute.getValue() == expected;
+  return false;
+}
+
+std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
+                                        const RuleRegistry &rules) {
+  std::vector<const RuleDef *> matches;
+  for (const RuleDef &rule : rules.all()) {
+    if (rule.matchOp != node.opName)
+      continue;
+    bool matched = true;
+    for (const RulePredicate &predicate : rule.predicates) {
+      if (!predicateMatches(predicate, node.attributes)) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched)
+      matches.push_back(&rule);
+  }
+  return matches;
+}
+
+MappingCandidate toMappingCandidate(const RuleDef &rule,
+                                    const WorkloadNode &node) {
+  MappingCandidate candidate;
+  candidate.rule = rule.id;
+  candidate.coveredNodes.push_back(node.id);
+  candidate.targetBundle = rule.bundle;
+  if (rule.costLowerBound)
+    candidate.lowerBound.latencyCycles =
+        static_cast<double>(*rule.costLowerBound);
+
+  size_t inputIndex = 0;
+  size_t outputIndex = 0;
+  for (const RulePort &port : rule.ports) {
+    PortSpec spec;
+    spec.name = port.name;
+    spec.isInput = port.isInput;
+    if (port.isInput) {
+      if (inputIndex < node.inputs.size())
+        spec.value = node.inputs[inputIndex++].value;
+    } else {
+      if (outputIndex < node.outputs.size())
+        spec.value = node.outputs[outputIndex++].value;
+    }
+    candidate.ports.push_back(std::move(spec));
+  }
+
+  for (const KindRequirement &requirement : rule.kindRequirements) {
+    if (requirement.role == "executor") {
+      ExecutorRequirement resolved;
+      resolved.capability = requirement.kind;
+      candidate.executorRequirements.push_back(std::move(resolved));
+    } else if (requirement.role == "memory") {
+      MemoryRequirement resolved;
+      resolved.kind = requirement.kind;
+      candidate.memoryRequirements.push_back(std::move(resolved));
+    } else if (requirement.role == "compute") {
+      ComputeRequirement resolved;
+      resolved.kind = requirement.kind;
+      candidate.computeRequirements.push_back(std::move(resolved));
+    }
+  }
+
+  for (const RuleLayoutRequirement &requirement : rule.layoutRequirements) {
+    LayoutRequirement resolved;
+    resolved.layoutClass = requirement.layoutId;
+    candidate.layoutRequirements.push_back(std::move(resolved));
+  }
+
+  candidate.id = computeCandidateId(candidate);
+  return candidate;
 }
 
 } // namespace mlir::llk::mapping

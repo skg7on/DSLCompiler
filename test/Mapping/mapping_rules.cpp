@@ -2,6 +2,7 @@
 
 #include "LLK/Mapping/MappingRules.h"
 #include "LLK/Mapping/MappingTarget.h"
+#include "LLK/Mapping/WorkloadGraph.h"
 
 #include "llvm/Support/Error.h"
 
@@ -363,7 +364,7 @@ TEST(MappingTarget, ShippedRulesResolveTheirLayouts) {
   llvm::Expected<std::unique_ptr<MappingTarget>> target = loadShippedAvx2();
   ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
   for (const RuleDef &rule : (*target)->rules().all())
-    for (const LayoutRequirement &requirement : rule.layoutRequirements)
+    for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)
       EXPECT_NE((*target)->layouts().find(requirement.layoutId), nullptr)
           << rule.id << " -> " << requirement.layoutId;
 }
@@ -373,4 +374,128 @@ TEST(MappingTarget, RejectsTheInvalidRuleFixture) {
   EXPECT_FALSE(static_cast<bool>(registry));
   if (!registry)
     llvm::consumeError(registry.takeError());
+}
+
+//===----------------------------------------------------------------------===//
+// One-op rule matching
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context,
+                                      llvm::StringRef op) {
+  return mlir::DictionaryAttr::get(
+      &context, {mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
+                                      mlir::StringAttr::get(&context, op))});
+}
+
+/// Builds a `micro.vector` workload node. Only the ids matter here: matching
+/// reads the node's attributes, and the rule-to-candidate bridge reads its
+/// ports positionally, so the fixture does not set port types.
+WorkloadNode vectorNode(mlir::MLIRContext &context, llvm::StringRef op) {
+  WorkloadNode node;
+  node.id = 7;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context, op);
+  WorkloadPort inPort;
+  inPort.value = 1;
+  WorkloadPort outPort;
+  outPort.value = 2;
+  node.inputs.push_back(inPort);
+  node.outputs.push_back(outPort);
+  return node;
+}
+
+constexpr llvm::StringLiteral kMatchingRules = R"llkmap(
+rule r.add {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies avx2.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "b.add";
+  emit "e1";
+  cost 9;
+}
+rule r.relu {
+  match micro.vector(op = "relu");
+  bundle "b.relu";
+  emit "e2";
+}
+rule r.any {
+  match micro.vector();
+  bundle "b.any";
+  emit "e3";
+}
+)llkmap";
+
+std::vector<std::string> matchedIds(const WorkloadNode &node,
+                                    const RuleRegistry &registry) {
+  std::vector<std::string> ids;
+  for (const RuleDef *rule : matchRules(node, registry))
+    ids.push_back(rule->id);
+  return ids;
+}
+
+} // namespace
+
+TEST(RuleMatch, MatchesByOperationAndPredicates) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(kMatchingRules);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+
+  WorkloadNode add = vectorNode(context, "add");
+  EXPECT_EQ(matchedIds(add, *registry),
+            (std::vector<std::string>{"r.add", "r.any"}));
+
+  WorkloadNode sub = vectorNode(context, "sub");
+  EXPECT_EQ(matchedIds(sub, *registry), (std::vector<std::string>{"r.any"}));
+}
+
+TEST(RuleMatch, DoesNotMatchADifferentOperation) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.mma {
+  match micro.mma();
+  bundle "b";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry));
+  WorkloadNode node = vectorNode(context, "add");
+  EXPECT_TRUE(matchRules(node, *registry).empty());
+}
+
+TEST(RuleMatch, DoesNotMatchAMissingAttribute) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(kMatchingRules);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  WorkloadNode node;
+  node.id = 3;
+  node.opName = "micro.vector"; // no attributes at all
+  EXPECT_EQ(matchedIds(node, *registry), (std::vector<std::string>{"r.any"}));
+}
+
+TEST(RuleMatch, BuildsAMappingCandidate) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(kMatchingRules);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const RuleDef *rule = registry->find("r.add");
+  ASSERT_NE(rule, nullptr);
+  WorkloadNode node = vectorNode(context, "add");
+
+  MappingCandidate candidate = toMappingCandidate(*rule, node);
+  EXPECT_EQ(candidate.rule, "r.add");
+  EXPECT_EQ(candidate.targetBundle, "b.add");
+  ASSERT_EQ(candidate.coveredNodes.size(), 1u);
+  EXPECT_EQ(candidate.coveredNodes[0], 7u);
+  ASSERT_EQ(candidate.executorRequirements.size(), 1u);
+  EXPECT_EQ(candidate.executorRequirements[0].capability, "worker");
+  ASSERT_EQ(candidate.memoryRequirements.size(), 1u);
+  EXPECT_EQ(candidate.memoryRequirements[0].kind, "sram");
+  ASSERT_EQ(candidate.layoutRequirements.size(), 1u);
+  EXPECT_EQ(candidate.layoutRequirements[0].layoutClass, "avx2.blocked_2d");
+  EXPECT_DOUBLE_EQ(candidate.lowerBound.latencyCycles, 9.0);
 }
