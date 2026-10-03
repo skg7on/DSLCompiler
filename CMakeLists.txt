@@ -829,6 +829,16 @@ if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(MicroMappingMap test/Conversion/MicroMapping/micro_map.mlir
       "\"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_mma,avx2_reduce,avx2_copy mode=deterministic\"")
 
+  # MicroMappingUnmaterialized: a plan whose edge is an unmaterializable
+  # movement (see the fixture's rules file). The binder reports such a
+  # connection rather than dropping it silently; the pass must surface that
+  # report as a warning, so this pins the diagnostic. stderr is merged because
+  # the warning goes there while FileCheck reads stdout. Raw add_test because
+  # add_llk_filecheck_test() pipes stdout only and cannot set --check-prefix.
+  add_test(NAME MicroMappingUnmaterialized
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=WARN ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir"
+  )
+
   # LLKToMicro lowering tests. The schedule database is pointed at a path that
   # does not exist on purpose: the export then uses its built-in conservative
   # schedule, so the expected tile sizes do not depend on the working directory

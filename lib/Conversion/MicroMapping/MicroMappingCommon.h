@@ -190,6 +190,12 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
 /// Binds `plan` onto the module. `bindPlan` writes onto a private clone, so the
 /// clone's body replaces the module's own to make the mapped IR the pass's
 /// output; the module op itself is preserved so the pass manager stays valid.
+///
+/// A connection the binder cannot materialize is *reported*, not silently
+/// dropped (design §18.2): the mapped IR is still valid and useful, so each
+/// report is surfaced as a warning and the pass still succeeds. The reports are
+/// captured before `takeBody`, because taking the body is what lets the
+/// `BoundPlan` fall out of scope.
 inline llvm::Error bindPlanOntoModule(ModuleOp module,
                                       const mapping::CoveringPlan &plan,
                                       const mapping::MappingTarget &target) {
@@ -197,6 +203,9 @@ inline llvm::Error bindPlanOntoModule(ModuleOp module,
       mapping::bindPlan(module, plan, target);
   if (!bound)
     return bound.takeError();
+  for (const std::string &unmaterialized : bound->unmaterialized)
+    module.emitWarning() << "mapping: connection not materialized: "
+                         << unmaterialized;
   module.getBodyRegion().takeBody(bound->module->getBodyRegion());
   return llvm::Error::success();
 }
