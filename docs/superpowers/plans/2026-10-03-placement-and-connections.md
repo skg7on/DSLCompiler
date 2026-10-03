@@ -146,3 +146,18 @@ synthesizeFanIn(llvm::ArrayRef<InstanceId> producers, InstanceId consumer,
 **Non-scope:** covering search (D6) consumes these outputs; no Micro-IR is materialized (that is the plan binder, #50 revision / D7); no `micro-perf` coupling.
 
 **Type consistency:** `CandidateInstance`/`ConnectionPlan`/`ResourceUsage`/`Cost` are D1 types used unchanged; `MemoryNodeId`/`ExecutorId`/`LayoutId` come from `MappingPlan.h`; `TopologyService` is D2's.
+
+## Verification Results (2026-10-03)
+
+- **Build:** `ninja -C build` — clean.
+- **New tests:** `MappingPlacementTest` **7/7**, `MappingConnectionsTest` **10/10**; D4's `MappingRulesTest` 23/23 after rule matching was added to it.
+- **Full suite:** `ctest --test-dir build --output-on-failure` — 99 registered, **97 passed, 2 skipped, 0 failed**.
+- **Deprecated-API audit:** clean.
+
+### Decisions taken while implementing
+
+1. **D4 does not produce `MappingCandidate`s**, so Task 1 adds one-op matching to `MappingRules.h` rather than inventing a second home for it. This closes the gap the D4 plan assumed was already filled.
+2. **D4's `LayoutRequirement` was renamed `RuleLayoutRequirement`.** It collided with D1's `LayoutRequirement`, so no file could include both. Renaming the rule-specific one is the smaller, more honest fix.
+3. **Two additive D1 fields**: `MappingCandidate::computeRequirements` and `CandidateInstance::computeBindings` (design §15.1's compute attachments had nowhere to live), plus `ConnectionPlan::producers` for `Reduce` gathers (§15.3). Canonical strings cover all three, so ids stay content-derived.
+4. **Symmetry reduction is conservative by construction**: two executors are interchangeable only when they have the same kind, parent, and *identical* attached compute and visible memory nodes. Anything weaker would collapse placements that bind different resources.
+5. **A link error was a real defect, not a test artifact**: `LLKMapping`, `LLKPerf`, and `LLKMachine` are plain `add_library` targets and did not inherit LLVM's `-fno-rtti -fno-exceptions`. Without them, the vtable LLVM emits for `llvm::ErrorInfo` (reached when an `llvm::Expected` carries a non-trivial payload like `std::vector<ConnectionPlan>`) references a typeinfo the LLVM build does not contain. All three now match the toolchain.
