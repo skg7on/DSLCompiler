@@ -126,6 +126,12 @@ struct SearchSpace {
   const SearchParam *findParamOfKind(llvm::StringRef kind) const;
 };
 
+/// The five M buckets the schedule database is keyed by: {1}, [2, 4], [5, 16],
+/// [17, 64], and [65, inf). Mirrors `llk::classifyM`, which lives in the LLK
+/// transforms layer the perf layer does not depend on; the bucket boundaries
+/// are a project convention, so the two must stay in step.
+int64_t classifyMBucket(int64_t M);
+
 /// The problem shape a search space is instantiated for. The shape is not part
 /// of `micro.search_space` (the op names the workload, not its extents), so the
 /// driver supplies it; legality and ranking need the extents and dtypes to

@@ -1,12 +1,31 @@
-//===- llk-tune.cpp - LLK autotuning grid search driver -------------------===//
+//===- llk-tune.cpp - LLK schedule tuning driver --------------------------===//
 //
-// Generates candidate tile configurations, filters by L1 cache capacity,
-// and would measure each to find the best-performing schedule for a given
-// shape regime. Integrates with schedule_db.json for persistence.
+// Two modes, selected by whether a Micro search space is given:
+//
+//   * Micro mode (--input=<space.mlir>): load one `micro.search_space` and a
+//     MachineModel, generate candidates, reject the illegal ones, bind the rest
+//     to concrete kernels, cost them with the L0/L1 models, and write the
+//     ranked top-K as schedule YAML. This is the M12 tuning flow (#50).
+//   * Legacy mode (no --input): the pre-Micro grid over BM/BN/BK/VM/VN,
+//     num_threads, and grain_size, filtered by an L1 footprint estimate and
+//     written as a JSON schedule_db entry to -o. Preserved so the existing
+//     schedule-consumption pipeline keeps working.
 //
 //===----------------------------------------------------------------------===//
 
+#include "LLK/Dialect/LLKDialect.h"
+#include "LLK/Dialect/Micro/MicroDialect.h"
+#include "LLK/Perf/MachineModelLoader.h"
+#include "LLK/Perf/ScheduleRecord.h"
+#include "LLK/Perf/TuningSession.h"
+
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/InitAllDialects.h"
+#include "mlir/Parser/Parser.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -17,6 +36,11 @@
 #include <vector>
 
 namespace cl = llvm::cl;
+using namespace mlir;
+
+//===----------------------------------------------------------------------===//
+// Options
+//===----------------------------------------------------------------------===//
 
 static cl::opt<int64_t> tuneM("M", cl::desc("M dimension (rows)"),
                               cl::init(128));
@@ -24,11 +48,70 @@ static cl::opt<int64_t> tuneN("N", cl::desc("N dimension (hidden)"),
                               cl::init(4096));
 static cl::opt<int64_t> tuneK("K", cl::desc("K dimension (input)"),
                               cl::init(4096));
-static cl::opt<std::string> tuneOutput("o", cl::desc("Output JSON file"),
-                                       cl::init("tune_result.json"));
+
+static cl::opt<std::string> tuneInput(
+    "input",
+    cl::desc("Micro search-space file to tune; omit for the legacy grid"),
+    cl::init(""));
+static cl::opt<std::string> tuneWorkload(
+    "workload",
+    cl::desc("Workload name override for the search space (default: the "
+             "space's own workload attribute)"),
+    cl::init(""));
+static cl::opt<std::string>
+    tuneMachine("machine",
+                cl::desc("Machine model to evaluate candidates against"),
+                cl::init("machines/x86-avx2-cpu.yaml"));
+static cl::opt<std::string>
+    tuneSearch("search", cl::desc("Candidate search: grid or random"),
+               cl::init("grid"));
+static cl::opt<uint64_t>
+    tuneSeed("seed", cl::desc("RNG seed for random search"), cl::init(0));
+static cl::opt<uint64_t> tuneMaxCandidates(
+    "max-candidates",
+    cl::desc("Stop after this many candidates (0 = the whole space)"),
+    cl::init(0));
+static cl::opt<unsigned>
+    tunePerfLevel("perf-level",
+                  cl::desc("Prediction depth: 0 static bound, 1 resource"),
+                  cl::init(1));
+static cl::opt<uint64_t> tuneTopK("top-k", cl::desc("Schedule records to keep"),
+                                  cl::init(10));
+static cl::opt<std::string>
+    tuneOutput("output", cl::desc("Schedule YAML output file (Micro mode)"),
+               cl::init("tune_result.yaml"));
+
+static cl::opt<std::string> tuneInputDType("input-dtype",
+                                           cl::desc("Input element dtype"),
+                                           cl::init("bf16"));
+static cl::opt<std::string> tuneWeightDType("weight-dtype",
+                                            cl::desc("Weight element dtype"),
+                                            cl::init("bf16"));
+static cl::opt<std::string> tuneAccumulatorDType("accumulator-dtype",
+                                                 cl::desc("Accumulator dtype"),
+                                                 cl::init("f32"));
+static cl::opt<std::string> tuneOutputDType("output-dtype",
+                                            cl::desc("Output element dtype"),
+                                            cl::init("bf16"));
+
+// Legacy grid-search options.
+static cl::opt<std::string>
+    tuneLegacyOutput("o", cl::desc("Legacy JSON output file"),
+                     cl::init("tune_result.json"));
 static cl::opt<bool> tuneDryRun("dry-run",
                                 cl::desc("Generate configs without measuring"),
                                 cl::init(false));
+
+namespace {
+
+int reportError(const llvm::Twine &message) {
+  llvm::errs() << "llk-tune: error: " << message << "\n";
+  return 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Legacy grid search
+//===----------------------------------------------------------------------===//
 
 /// A single tuning configuration with tile sizes and parallelism knobs.
 struct TuningConfig {
@@ -128,9 +211,9 @@ static std::vector<TuningConfig> generateConfigs(int64_t M, int64_t N,
 }
 
 /// Write results as a JSON schedule_db entry.
-static void writeResults(const std::string &path,
-                         const std::vector<TuningConfig> &configs, int64_t M,
-                         int64_t N, int64_t K) {
+static int writeLegacyResults(const std::string &path,
+                              const std::vector<TuningConfig> &configs,
+                              int64_t M, int64_t N, int64_t K) {
   int M_bucket = classifyM(M);
 
   // Sort by GFLOPS descending
@@ -181,26 +264,22 @@ static void writeResults(const std::string &path,
   root["entries"] = std::move(entries);
 
   std::ofstream ofs(path);
-  if (!ofs) {
-    llvm::errs() << "Cannot open output file: " << path << "\n";
-    return;
-  }
+  if (!ofs)
+    return reportError("cannot open output file: " + path);
 
   std::string jsonStr;
   llvm::raw_string_ostream rss(jsonStr);
   rss << llvm::json::Value(std::move(root));
   ofs << jsonStr;
-  if (!ofs) {
-    llvm::errs() << "Failed to write output file: " << path << "\n";
-    return;
-  }
+  if (!ofs)
+    return reportError("failed to write output file: " + path);
 
   llvm::outs() << "Wrote top-" << count << " configs to " << path << "\n";
+  return 0;
 }
 
-int main(int argc, char **argv) {
-  cl::ParseCommandLineOptions(argc, argv, "LLK autotuning grid search\n");
-
+/// The pre-Micro grid search, preserved unchanged for existing consumers.
+int runLegacyGrid() {
   int M_bucket = classifyM(tuneM);
   auto configs = generateConfigs(tuneM, tuneN, tuneK);
 
@@ -210,7 +289,6 @@ int main(int argc, char **argv) {
                << " candidate configs (L1-filtered)\n";
 
   if (tuneDryRun) {
-    // Print top-5 configs by estimated efficiency for inspection
     llvm::outs() << "\nTop candidate configs (estimated):\n";
     size_t n = std::min(configs.size(), size_t(5));
     for (size_t i = 0; i < n; i++) {
@@ -223,13 +301,127 @@ int main(int argc, char **argv) {
     }
   }
 
-  // In a full implementation, each config would be measured:
-  //   1. JIT-compile with this config's tile sizes
-  //   2. Run warmup + measurement
-  //   3. Record GFLOPS
-  //
-  // For now, write the candidate configs as the result (dry-run mode).
-  writeResults(tuneOutput, configs, tuneM, tuneN, tuneK);
+  return writeLegacyResults(tuneLegacyOutput, configs, tuneM, tuneN, tuneK);
+}
 
+//===----------------------------------------------------------------------===//
+// Micro search-space tuning
+//===----------------------------------------------------------------------===//
+
+bool parseSearchMode(mlir::llk::perf::SearchMode &mode,
+                     const std::string &name) {
+  if (name == "grid") {
+    mode = mlir::llk::perf::SearchMode::Grid;
+    return true;
+  }
+  if (name == "random") {
+    mode = mlir::llk::perf::SearchMode::Random;
+    return true;
+  }
+  return false;
+}
+
+int runMicroSearch() {
+  namespace perf = mlir::llk::perf;
+
+  if (tunePerfLevel > 1)
+    return reportError("unsupported --perf-level=" +
+                       llvm::Twine(tunePerfLevel) + "; expected 0 or 1");
+
+  perf::SearchMode mode;
+  if (!parseSearchMode(mode, tuneSearch))
+    return reportError("unsupported --search=" + llvm::Twine(tuneSearch) +
+                       "; expected grid or random (staged is not implemented)");
+
+  auto machine = perf::loadMachineModel(tuneMachine);
+  if (!machine)
+    return reportError(llvm::toString(machine.takeError()));
+
+  DialectRegistry registry;
+  mlir::registerAllDialects(registry);
+  registry.insert<mlir::micro::MicroDialect>();
+  // A search space file exported from LLK keeps the source operations, so the
+  // LLK dialect is registered to read that output directly.
+  registry.insert<mlir::llk::LLKDialect>();
+
+  MLIRContext context(registry);
+  ParserConfig parserConfig(&context);
+  auto module =
+      mlir::parseSourceFile<ModuleOp>(tuneInput.getValue(), parserConfig);
+  if (!module)
+    return reportError("cannot parse " + llvm::Twine(tuneInput.getValue()));
+
+  auto loaded = perf::loadSearchSpace(module.get());
+  if (!loaded)
+    return reportError(llvm::toString(loaded.takeError()));
+
+  perf::SearchSpace space = std::move(*loaded);
+  if (!tuneWorkload.empty())
+    space.workload = tuneWorkload;
+
+  perf::WorkloadShape shape;
+  shape.M = tuneM;
+  shape.N = tuneN;
+  shape.K = tuneK;
+  shape.inputDType = tuneInputDType;
+  shape.weightDType = tuneWeightDType;
+  shape.accumulatorDType = tuneAccumulatorDType;
+  shape.outputDType = tuneOutputDType;
+
+  perf::TuningSessionOptions options;
+  options.generator.mode = mode;
+  options.generator.seed = tuneSeed;
+  if (tuneMaxCandidates > 0)
+    options.generator.maxCandidates = tuneMaxCandidates;
+  options.perfLevel = tunePerfLevel;
+  options.topK = tuneTopK;
+  options.machinePath = tuneMachine;
+
+  auto report =
+      perf::runTuningSession(context, space, shape, *machine, options);
+  if (!report)
+    return reportError(llvm::toString(report.takeError()));
+
+  std::vector<perf::ScheduleRecord> records =
+      perf::buildScheduleRecords(*report, space, shape);
+  if (llvm::Error error = perf::writeScheduleYamlFile(tuneOutput, records)) {
+    return reportError(llvm::toString(std::move(error)));
+  }
+
+  llvm::outs() << "workload " << space.workload << " M=" << tuneM
+               << " N=" << tuneN << " K=" << tuneK << " on " << machine->name
+               << "\n";
+  llvm::outs() << "Generated " << report->generated
+               << " candidates: " << report->ranked.size() << " ranked, "
+               << report->rejected.size() << " rejected\n";
+  for (size_t i = 0; i < records.size(); ++i) {
+    const perf::ScheduleRecord &record = records[i];
+    llvm::outs() << "  [" << i << "] " << record.candidate.id << "  "
+                 << record.metrics.predictedCycles << " cycles  "
+                 << record.metrics.bottleneck << "\n";
+  }
+  llvm::outs() << "Wrote " << records.size() << " schedule records to "
+               << tuneOutput << "\n";
   return 0;
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  cl::ParseCommandLineOptions(
+      argc, argv,
+      "LLK schedule tuner\n"
+      "\n"
+      "With --input=<micro.search_space.mlir> this runs the Micro-IR tuning\n"
+      "flow: generate candidates, check legality against a MachineModel, bind\n"
+      "them to concrete micro kernels, rank by predicted cycles, and write "
+      "the\n"
+      "top-K as schedule YAML.\n"
+      "\n"
+      "Without --input it keeps the pre-Micro grid search and writes a JSON\n"
+      "schedule_db entry to -o.\n");
+
+  if (tuneInput.empty())
+    return runLegacyGrid();
+  return runMicroSearch();
 }

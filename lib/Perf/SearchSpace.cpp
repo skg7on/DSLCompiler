@@ -88,6 +88,18 @@ std::optional<ConstraintKind> symbolizeConstraintKind(llvm::StringRef text) {
       .Default(std::nullopt);
 }
 
+int64_t classifyMBucket(int64_t M) {
+  if (M == 1)
+    return 0;
+  if (M <= 4)
+    return 1;
+  if (M <= 16)
+    return 2;
+  if (M <= 64)
+    return 3;
+  return 4;
+}
+
 llvm::StringRef stringifyObjectiveDirection(ObjectiveDirection direction) {
   switch (direction) {
   case ObjectiveDirection::Minimize:
