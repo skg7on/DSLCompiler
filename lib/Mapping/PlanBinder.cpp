@@ -4,9 +4,13 @@
 
 #include "LLK/Mapping/WorkloadGraph.h"
 
+#include "mlir/AsmParser/AsmParser.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 
@@ -166,6 +170,106 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
   kernel->setAttr(kRoutesAttr, mlir::ArrayAttr::get(context, routes));
 
   BoundPlan bound;
+  // Named `machineModel` on purpose: a local called `machine` would shadow the
+  // `machine` namespace this file needs for `machine::MemoryNode`.
+  const MachineModel &machineModel = target.machine();
+
+  // --- materialize the movement (design §18.2) -------------------------
+  //
+  // One copy per moved value: the value is produced in one memory and read in
+  // another, so the copy is placed right after the producer and every other
+  // use is rewired to it. Emitting one per *connection* would duplicate the
+  // copy when a value fans out.
+  llvm::DenseSet<WorkloadValueId> moved;
+  mlir::OpBuilder builder(context);
+  for (const PlanConnection &connection : plan.connectionPlans) {
+    if (connection.kind != ConnectionKind::Transfer &&
+        connection.kind != ConnectionKind::TransferAndTransform)
+      continue;
+    if (connection.route.size() < 2)
+      continue;
+    if (!moved.insert(connection.value).second)
+      continue;
+
+    // The producer is the covered node that writes this value; the consumer is
+    // any covered node that reads it.
+    mlir::Value value = binding.valueFor(connection.value);
+    mlir::Operation *producer = nullptr;
+    for (const WorkloadNode &node : graph->getNodes()) {
+      bool writes = llvm::any_of(node.outputs, [&](const WorkloadPort &port) {
+        return port.value == connection.value;
+      });
+      if (writes) {
+        producer = binding.opFor(node.id);
+        break;
+      }
+    }
+    if (!producer || !value) {
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) +
+                                     ": no producing operation in the kernel");
+      continue;
+    }
+    if (!mlir::isa<mlir::ShapedType>(value.getType())) {
+      bound.unmaterialized.push_back(
+          "value " + std::to_string(connection.value) +
+          ": 'micro.tile_async_copy' needs a destination-memory tile type, "
+          "which the binder cannot construct generically");
+      continue;
+    }
+
+    const machine::MemoryNode *source =
+        machineModel.findMemory(connection.route.front());
+    const machine::MemoryNode *destination =
+        machineModel.findMemory(connection.route.back());
+    if (!source || !destination) {
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) +
+                                     ": route names an unknown memory");
+      continue;
+    }
+    mlir::Attribute srcMemory =
+        mlir::parseAttribute(("#micro.memory<" + source->kind + ">"), context);
+    mlir::Attribute dstMemory = mlir::parseAttribute(
+        ("#micro.memory<" + destination->kind + ">"), context);
+    if (!srcMemory || !dstMemory || source->kind == destination->kind) {
+      // `micro.async_copy` insists the two memory spaces differ, and a route
+      // between two memories of the same kind has nothing to express.
+      bound.unmaterialized.push_back(
+          "value " + std::to_string(connection.value) +
+          ": route endpoints share a micro memory kind");
+      continue;
+    }
+    mlir::Type tokenType = mlir::parseType("!micro.async_token", context);
+    if (!tokenType) {
+      bound.unmaterialized.push_back("async token type is not registered");
+      continue;
+    }
+
+    builder.setInsertionPointAfter(producer);
+    llvm::SmallVector<mlir::Type> copyResultTypes{value.getType(), tokenType};
+    mlir::OperationState copyState(producer->getLoc(), "micro.async_copy");
+    copyState.addOperands(value);
+    copyState.addTypes(copyResultTypes);
+    copyState.addAttribute("src_memory", srcMemory);
+    copyState.addAttribute("dst_memory", dstMemory);
+    mlir::Operation *copy = builder.create(copyState);
+
+    llvm::SmallVector<mlir::Type> waitResultTypes;
+    mlir::OperationState waitState(producer->getLoc(), "micro.wait");
+    waitState.addOperands(copy->getResult(1));
+    mlir::Operation *wait = builder.create(waitState);
+    (void)wait;
+
+    // Rewire every other reader to the copy; the copy's own source stays put.
+    llvm::SmallVector<mlir::OpOperand *> uses;
+    for (mlir::OpOperand &use : value.getUses())
+      if (use.getOwner() != copy)
+        uses.push_back(&use);
+    for (mlir::OpOperand *use : uses)
+      use->set(copy->getResult(0));
+  }
+
   bound.planId = plan.id;
   bound.kernel = kernel;
   bound.module = std::move(module);

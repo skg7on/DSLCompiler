@@ -25,6 +25,8 @@
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace mlir::llk::mapping {
 
@@ -33,6 +35,9 @@ struct BoundPlan {
   mlir::OwningOpRef<mlir::ModuleOp> module;
   mlir::Operation *kernel = nullptr;
   PlanId planId = 0;
+  /// Connections the binder could not materialize, with the reason. Empty on a
+  /// fully materialized plan.
+  std::vector<std::string> unmaterialized;
 };
 
 /// Clones `source`, extracts its workload graph, and writes the plan's
@@ -44,12 +49,19 @@ struct BoundPlan {
 /// Fails when the module has no `micro.kernel`, when a covered node is not in
 /// the kernel, or when the plan names a rule the target does not declare.
 ///
-/// Emitting tile copies, allocations, transforms, and waits (design §18.2) is
-/// deliberately **not** done here. A connection's endpoints are inferred, not
-/// chosen by the plan -- D5 falls back to the executor's first visible memory
-/// -- so materializing them would bake an assumption into IR that looks
-/// authoritative. The metadata makes the same selection inspectable and
-/// verifiable until a plan carries chosen memories.
+/// Materialization (design §18.2): a selected connection that moves a value
+/// between two memories is emitted as `micro.async_copy` followed by
+/// `micro.wait` right after the producing operation, and every other use of
+/// the original value is rewired to the copy -- so the value the consumer sees
+/// is the one that lives in its memory.
+///
+/// A connection the binder cannot materialize is *reported*, not silently
+/// dropped: `BoundPlan::unmaterialized` names it and why. The current limits
+/// are deliberate and documented in the implementation: a value whose type is
+/// not a shaped (tensor) type has no generic copy form (`micro.tile_async_copy`
+/// needs a destination-memory-typed tile, which cannot be built without the
+/// dialect's type class), and a target layout id has no Micro operation form at
+/// all (design §13.4 keeps target layout ids out of `#micro.layout`).
 llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
                                    const CoveringPlan &plan,
                                    const MappingTarget &target);
