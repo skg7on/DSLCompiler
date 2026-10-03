@@ -250,8 +250,10 @@ constexpr llvm::StringLiteral kLayouts =
     "layout avx2.blocked_2d(int VW) { param VW in [4..8]; require rank == 2; }";
 
 llvm::Expected<std::unique_ptr<MappingTarget>>
-makeTarget(llvm::StringRef rules, std::vector<std::string> emitters) {
-  llvm::Expected<LayoutRegistry> layouts = parseLayoutText(kLayouts, "<test>");
+makeTargetWithLayouts(llvm::StringRef layoutsText, llvm::StringRef rules,
+                      std::vector<std::string> emitters) {
+  llvm::Expected<LayoutRegistry> layouts =
+      parseLayoutText(layoutsText, "<test>");
   if (!layouts)
     return layouts.takeError();
   llvm::Expected<RuleRegistry> ruleRegistry = parseRuleText(rules, "<test>");
@@ -260,6 +262,11 @@ makeTarget(llvm::StringRef rules, std::vector<std::string> emitters) {
   return std::make_unique<FileMappingTarget>(
       "test", ruleMachine(), std::move(*layouts), std::move(*ruleRegistry),
       std::move(emitters));
+}
+
+llvm::Expected<std::unique_ptr<MappingTarget>>
+makeTarget(llvm::StringRef rules, std::vector<std::string> emitters) {
+  return makeTargetWithLayouts(kLayouts, rules, std::move(emitters));
 }
 
 bool verifies(MappingTarget &target) {
@@ -295,10 +302,13 @@ TEST(MappingTarget, VerifiesGoodRules) {
 }
 
 TEST(MappingTarget, RejectsUnknownLayoutId) {
+  // `operand0` is declared, so the port-name check passes and the rejection
+  // comes from the unknown layout id -- which is what this test pins.
   llvm::Expected<std::unique_ptr<MappingTarget>> target = makeTarget(R"llkmap(
 rule a.bad {
   match micro.vector();
   require layout operand0 satisfies avx2.missing;
+  input "operand0";
   bundle "b";
   emit "e1";
 }
@@ -391,6 +401,39 @@ rule a.bad {
 }
 )llkmap",
                                                                      {"e1"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE(verifies(**target));
+}
+
+TEST(MappingTarget, RejectsAnUnknownMemoryQueryAtLoad) {
+  // The memory half of the same check: `sram.9` is not a declared memory node.
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = makeTarget(R"llkmap(
+rule a.bad {
+  match micro.vector();
+  require machine.memory("sram.9").capacity_bytes > 0;
+  bundle "b";
+  emit "e1";
+}
+)llkmap",
+                                                                     {"e1"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE(verifies(**target));
+}
+
+TEST(MappingTarget, RejectsAnUnknownMachineQueryInALayoutAtLoad) {
+  // A layout's `require` may query the machine too; an unknown subject there is
+  // the same load-time failure, reported against the layout.
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      makeTargetWithLayouts("layout a.bad_layout(int VW) { param VW in [4..8]; "
+                            "require VW == machine.compute(\"bogus\").count; }",
+                            R"llkmap(
+rule a.ok {
+  match micro.vector();
+  bundle "b";
+  emit "e1";
+}
+)llkmap",
+                            {"e1"});
   ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
   EXPECT_FALSE(verifies(**target));
 }

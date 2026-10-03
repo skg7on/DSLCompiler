@@ -169,11 +169,11 @@ public:
   ExprPtr parseExpression();
 
   /// Validates every identifier, call, and member against the vocabulary the
-  /// current declaration allows. When `resolver` is given, every literal
-  /// `machine.<query>("<subject>")` is also resolved against it, so an unknown
-  /// capability subject is a load-time error at the token that names it.
-  bool validateExpr(const ExprPtr &expr, const llvm::StringSet<> &allowed,
-                    MachineQueryResolver resolver = {});
+  /// current declaration allows. A declaration has no machine while it is
+  /// parsed, so a `machine.<query>("<subject>")` is accepted structurally here;
+  /// its subject is resolved later, against the target's machine, by
+  /// `resolveMachineQueries` (design §14.4).
+  bool validateExpr(const ExprPtr &expr, const llvm::StringSet<> &allowed);
 
 protected:
   ExprPtr parseOr();

@@ -100,6 +100,13 @@ llvm::Error verifyMappingTarget(const MappingTarget &target) {
     // that declares no port it references would match a boundary it can never
     // wire, so it is rejected here rather than silently producing a candidate
     // with no ports.
+    //
+    // This is reference-based on purpose. The mapping core has no Micro
+    // op-to-arity table (several workload ops are variadic), so a declared
+    // port cannot be checked against the op's true arity here; and a blanket
+    // "must declare at least one port" would reject live rules that carry an
+    // implicit boundary (`avx2.async_copy`). The residual hole is a rule that
+    // references no port at all: it loads with an empty boundary.
     size_t declaredInputs = 0;
     for (const RulePort &port : rule.ports)
       if (port.isInput)
