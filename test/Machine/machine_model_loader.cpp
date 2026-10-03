@@ -279,6 +279,56 @@ clock_hz: 0
 )yaml"));
 }
 
+TEST(MachineModelLoader, ParsesAccessCostsSetupCyclesAndAccumulatorDtypes) {
+  llvm::Expected<MachineModel> model = parse(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+memories:
+  - id: dram.0
+    kind: dram
+    visible_from: e0
+    capacity_bytes: 1073741824
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+compute:
+  - id: fma.0
+    kind: matrix_engine
+    attached_to: e0
+    element_types: [bf16]
+    accumulator_dtypes: [f32]
+    shapes: [[4, 8, 8]]
+transfer_engines:
+  - id: dma.0
+    kind: dma
+    attached_to: e0
+    setup_cycles: 16
+)yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  const MemoryNode *dram = model->findMemoryOfKind("dram");
+  ASSERT_NE(dram, nullptr);
+  EXPECT_DOUBLE_EQ(dram->bandwidthBytesPerCycle, 32.0);
+  EXPECT_EQ(dram->latencyCycles, 220u);
+  ASSERT_EQ(model->computes.size(), 1u);
+  ASSERT_EQ(model->computes[0].accumulatorDTypes.size(), 1u);
+  EXPECT_EQ(model->computes[0].accumulatorDTypes[0], "f32");
+  ASSERT_EQ(model->transferEngines.size(), 1u);
+  EXPECT_EQ(model->transferEngines[0].setupCycles, 16u);
+}
+
+TEST(MachineModelLoader, ShippedProfilesDeclareMemoryAccessCosts) {
+  for (const char *name : {"/x86-avx2-v2.yaml", "/generic-ai-accel-v2.yaml"}) {
+    llvm::Expected<MachineModel> model =
+        loadMachineModel(std::string(LLK_MACHINE_DIR) + name);
+    ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+    const MemoryNode *dram = model->findMemoryOfKind("dram");
+    ASSERT_NE(dram, nullptr) << name;
+    EXPECT_GT(dram->bandwidthBytesPerCycle, 0.0) << name;
+    EXPECT_GT(dram->latencyCycles, 0u) << name;
+  }
+}
+
 TEST(MachineModelLoader, ShippedProfilesDeclareTheirPerfFacts) {
   for (const char *name : {"/x86-avx2-v2.yaml", "/generic-ai-accel-v2.yaml"}) {
     llvm::Expected<MachineModel> model =

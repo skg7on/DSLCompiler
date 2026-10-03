@@ -65,12 +65,16 @@ memories:
     capacity_bytes: 68719476736
     alignment_bytes: 128
     supported_layouts: [row_major, blocked]
+    bandwidth_bytes_per_cycle: 1024
+    latency_cycles: 300
   - id: sram.0
     kind: sram
     visible_from: core.0
     capacity_bytes: 1048576
     alignment_bytes: 128
     supported_layouts: [row_major, blocked, swizzled]
+    bandwidth_bytes_per_cycle: 4096
+    latency_cycles: 20
     banks: 32
   - id: acc.0
     kind: acc
@@ -78,6 +82,8 @@ memories:
     capacity_bytes: 262144
     alignment_bytes: 64
     supported_layouts: [row_major, blocked]
+    bandwidth_bytes_per_cycle: 8192
+    latency_cycles: 1
     banks: 16
 
 compute:
@@ -85,6 +91,7 @@ compute:
     kind: matrix_engine
     attached_to: pe.0
     element_types: [bf16, f16, i8]
+    accumulator_dtypes: [f32, i32]
     shapes: [[16, 16, 32]]
     issue_cycles: 1
     latency_cycles: 8
@@ -107,6 +114,7 @@ transfer_engines:
     attached_to: core.0
     count: 4
     max_outstanding: 16
+    setup_cycles: 16
 
 links:
   # The two-hop path dram -> sram -> acc that a routing fixture needs; there is

@@ -22,8 +22,8 @@ description: >-
 clock_hz: 3000000000
 worker_threads: 8
 sync:
-  barrier_cycles: 64
-  wait_cycles: 4
+  barrier_cycles: 200
+  wait_cycles: 0
 
 executors:
   - id: package.0
@@ -46,21 +46,27 @@ memories:
   - id: dram.0
     kind: dram
     visible_from: package.0
-    capacity_bytes: 17179869184
+    capacity_bytes: 68719476736
     alignment_bytes: 64
     supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
   - id: l2.0
     kind: l2
     visible_from: package.0
     capacity_bytes: 1048576
     alignment_bytes: 64
     supported_layouts: [row_major, blocked]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
   - id: sram.0
     kind: sram
     visible_from: core.0
     capacity_bytes: 32768
     alignment_bytes: 64
     supported_layouts: [row_major, blocked]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
     banks: 8
   - id: sram.1
     kind: sram
@@ -68,6 +74,8 @@ memories:
     capacity_bytes: 32768
     alignment_bytes: 64
     supported_layouts: [row_major, blocked]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
     banks: 8
   - id: acc.0
     kind: acc
@@ -75,12 +83,16 @@ memories:
     capacity_bytes: 4096
     alignment_bytes: 32
     supported_layouts: [row_major, blocked]
+    bandwidth_bytes_per_cycle: 256
+    latency_cycles: 1
   - id: acc.1
     kind: acc
     visible_from: core.1
     capacity_bytes: 4096
     alignment_bytes: 32
     supported_layouts: [row_major, blocked]
+    bandwidth_bytes_per_cycle: 256
+    latency_cycles: 1
 
 compute:
   - id: vec.0
@@ -107,6 +119,7 @@ compute:
     kind: matrix_engine
     attached_to: core.0
     element_types: [f32, bf16]
+    accumulator_dtypes: [f32]
     shapes: [[1, 8, 8], [4, 8, 8]]
     issue_cycles: 1
     latency_cycles: 5
@@ -116,6 +129,7 @@ compute:
     kind: matrix_engine
     attached_to: core.1
     element_types: [f32, bf16]
+    accumulator_dtypes: [f32]
     shapes: [[1, 8, 8], [4, 8, 8]]
     issue_cycles: 1
     latency_cycles: 5
@@ -128,11 +142,13 @@ transfer_engines:
     attached_to: core.0
     count: 1
     max_outstanding: 8
+    setup_cycles: 0
   - id: dma.1
     kind: dma
     attached_to: core.1
     count: 1
     max_outstanding: 8
+    setup_cycles: 0
 
 links:
   - id: dram_to_l2.0

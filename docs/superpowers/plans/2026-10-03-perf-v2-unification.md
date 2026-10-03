@@ -58,3 +58,31 @@ each optional, defaulting to `0`, `1`, and zero costs respectively.
 
 - `ninja -C build` clean; `MachineModelTest` and `MachineModelV2LoaderTest` extended; full suite recorded.
 - Both shipped v2 profiles declare the new facts and still verify.
+
+## Slice 2a: the cost facts v2 was still missing
+
+Migrating perf onto v2 turned out not to be a rename: the two models disagree
+about **where cost lives**. v1 charges memory *access* from the memory level
+(`bandwidth_bytes_per_cycle`, `latency_cycles`); v2 puts transfer cost on
+*links*. A real hierarchy has both facts, so v2 gains the access side rather
+than losing it:
+
+- `MemoryNode::bandwidthBytesPerCycle`, `MemoryNode::latencyCycles` — access
+  cost, distinct from a link's transfer cost; zero means unmodelled;
+- `TransferEngineNode::setupCycles` — the fixed cost of starting a transfer;
+- `ComputeNode::accumulatorDTypes` — what a capability accumulates into, when
+  that differs from its inputs;
+- `MachineModel::findMemoryOfKind` — profiles describe memory *spaces*
+  (`sram`), nodes are instances (`sram.0`), and the simulator asks by space;
+- `MachineModel::ownerCount` — "8 workers" becomes "the executors that match
+  `worker`, counting their concurrency", which is what the count means once
+  executors are concrete nodes.
+
+Both shipped profiles carry the v1 numbers verbatim (DRAM 32 B/cycle at 220
+cycles, SRAM 64 at 4, ACC 256 at 1; the accelerator's 1024/300, 4096/20,
+8192/1; DMA setup 0 and 16; FMA/MXU accumulators), so the migration that
+follows preserves the existing L0/L1 cycle estimates instead of re-baselining
+them.
+
+Every field is appended to its struct, so existing aggregate initialisers and
+v2 profiles keep working unchanged.

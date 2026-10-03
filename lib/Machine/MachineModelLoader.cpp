@@ -390,6 +390,11 @@ bool Loader::parseMemory(Node *node, size_t index, MemoryNode &out) {
         if (key == "supported_layouts")
           return readStringList(value, path + ".supported_layouts",
                                 out.supportedLayouts);
+        if (key == "bandwidth_bytes_per_cycle")
+          return readDouble(value, path + ".bandwidth_bytes_per_cycle",
+                            out.bandwidthBytesPerCycle);
+        if (key == "latency_cycles")
+          return readUInt(value, path + ".latency_cycles", out.latencyCycles);
         if (key == "banks") {
           uint32_t banks = 0;
           if (!readUInt32(value, path + ".banks", banks))
@@ -428,6 +433,9 @@ bool Loader::parseCompute(Node *node, size_t index, ComputeNode &out) {
         if (key == "element_types")
           return readStringList(value, path + ".element_types",
                                 out.elementTypes);
+        if (key == "accumulator_dtypes")
+          return readStringList(value, path + ".accumulator_dtypes",
+                                out.accumulatorDTypes);
         if (key == "supported_layouts")
           return readStringList(value, path + ".supported_layouts",
                                 out.supportedLayouts);
@@ -483,6 +491,8 @@ bool Loader::parseTransferEngine(Node *node, size_t index,
         if (key == "max_outstanding")
           return readUInt32(value, path + ".max_outstanding",
                             out.maxOutstanding);
+        if (key == "setup_cycles")
+          return readUInt(value, path + ".setup_cycles", out.setupCycles);
         return failAt(keyNode, path + ": unknown key '" + key + "'");
       });
   return parsed && requireKey(sawId, path, "id") &&

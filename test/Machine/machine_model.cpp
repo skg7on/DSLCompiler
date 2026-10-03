@@ -237,3 +237,34 @@ TEST(MachineModel, VerifyRejectsZeroWorkerThreads) {
   model.workerThreads = 0;
   EXPECT_FALSE(verifies(model));
 }
+
+//===----------------------------------------------------------------------===//
+// Cost facts the performance simulator needs
+//===----------------------------------------------------------------------===//
+
+TEST(MachineModel, OwnerCountCountsExecutorsThatMatchTheKind) {
+  MachineModel model = twoCoreMachine();
+  // package.0 is `worker`; core.0 and core.1 refine it.
+  EXPECT_EQ(model.ownerCount("worker"), 3u);
+  EXPECT_EQ(model.ownerCount("core"), 2u);
+  EXPECT_EQ(model.ownerCount("pe"), 0u);
+}
+
+TEST(MachineModel, FindMemoryOfKindReturnsTheFirstDeclaration) {
+  MachineModel model = twoCoreMachine();
+  ASSERT_NE(model.findMemoryOfKind("dram"), nullptr);
+  EXPECT_EQ(model.findMemoryOfKind("dram")->id, "dram.0");
+  EXPECT_EQ(model.findMemoryOfKind("sram")->id, "sram.0");
+  EXPECT_EQ(model.findMemoryOfKind("hbm"), nullptr);
+}
+
+TEST(MachineModel, ContentHashCoversMemoryAccessCost) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.memories[0].bandwidthBytesPerCycle = 128;
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+
+  MachineModel c = twoCoreMachine();
+  c.memories[0].latencyCycles = 7;
+  EXPECT_NE(computeContentHash(a), computeContentHash(c));
+}
