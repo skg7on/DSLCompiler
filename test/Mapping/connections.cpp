@@ -451,3 +451,91 @@ TEST(Connections, FanInProducesOneReducePlan) {
   EXPECT_EQ(plan.producers[2], 3u);
   EXPECT_NE(plan.id, 0u);
 }
+
+//===----------------------------------------------------------------------===//
+// Cost dimensions (design §17.2)
+//===----------------------------------------------------------------------===//
+
+// A route that touches the machine's DRAM-class memory records the bytes moved
+// over the DRAM hop. The DRAM class is recognized from the memory node's
+// declared `kind`, never from a hard-coded node id, so a profile may name its
+// DRAM node anything.
+TEST(Connections, DramRouteRecordsDramBytes) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest(); // dram.0 -> acc.0
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_FALSE(plans->empty());
+  for (const ConnectionPlan &plan : *plans) {
+    ASSERT_EQ(plan.kind, ConnectionKind::Transfer);
+    ASSERT_FALSE(plan.memoryRoute.empty());
+    EXPECT_EQ(plan.memoryRoute.front(), "dram.0");
+    EXPECT_EQ(plan.cost.dramBytes, request.bytes);
+    // The staging bytes are the value itself.
+    EXPECT_EQ(plan.cost.localBytes, request.bytes);
+  }
+}
+
+// A route that never touches DRAM moves no DRAM bytes, but still stages the
+// value locally.
+TEST(Connections, NonDramRouteRecordsNoDramBytes) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.producerMemory = "sram.0";
+  request.consumerMemory = "acc.0";
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_FALSE(plans->empty());
+  EXPECT_EQ((*plans)[0].cost.dramBytes, 0u);
+  EXPECT_EQ((*plans)[0].cost.localBytes, request.bytes);
+}
+
+// Spills are not modelled by the dialect, so the dimension is deliberately
+// left unpopulated until a spill notion exists.
+TEST(Connections, SpillBytesStayUnpopulated) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(baseRequest(), machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_FALSE(plans->empty());
+  EXPECT_EQ((*plans)[0].cost.spillBytes, 0u);
+}
+
+// Transfer utilization is the route's transfer cycles over the cycles the
+// machine's transfer engines had available in one sync period.
+TEST(Connections, TransferUtilizationUsesTheSyncWindow) {
+  MachineModel machine = connectionMachine();
+  machine.clockHz = 3000000000;
+  machine.sync.barrierCycles = 100; // one modelled sync period
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest(); // dram.0 -> acc.0, 1024 bytes
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_FALSE(plans->empty());
+  // Cheapest route is the direct dram.0 -> acc.0 hop: 10 latency cycles plus
+  // 1024 / 32 bytes-per-cycle = 42 cycles, over one engine x 100 cycles.
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Transfer);
+  EXPECT_DOUBLE_EQ((*plans)[0].cost.transferUtilization, 0.42);
+}
+
+// Without a modelled sync period there is no denominator, so utilization stays
+// 0 rather than a fabricated constant.
+TEST(Connections, TransferUtilizationStaysZeroWithoutSyncFacts) {
+  MachineModel machine = connectionMachine(); // sync costs are all zero
+  TopologyService topology(machine);
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(baseRequest(), machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_FALSE(plans->empty());
+  EXPECT_DOUBLE_EQ((*plans)[0].cost.transferUtilization, 0.0);
+}

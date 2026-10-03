@@ -252,6 +252,13 @@ enumeratePlacements(const MappingCandidate &candidate,
           requirement.minBytes;
 
     instance.localCost = candidate.lowerBound;
+    // Compute utilization is the rule-local compute cycles over the cycles the
+    // machine's workers had available in one sync period (design §17.2). Left 0
+    // when the machine models no sync period: a missing denominator is not a
+    // fabricated one.
+    if (std::optional<double> utilization = utilizationEstimate(
+            instance.localCost.latencyCycles, machine, machine.workerThreads))
+      instance.localCost.computeUtilization = *utilization;
     instance.id = computeInstanceId(instance);
     instances.push_back(std::move(instance));
     if (instances.size() >= options.maxInstances) {

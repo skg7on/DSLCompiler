@@ -24,6 +24,13 @@ llvm::Error routeError(llvm::StringRef message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
 }
 
+/// The DRAM class of memory, spelled as the Micro `MemorySpace` vocabulary
+/// spells it. A hop's DRAM cost is keyed on the memory node's declared `kind`,
+/// never on a hard-coded node id, so a profile may name its DRAM node anything.
+constexpr llvm::StringLiteral kDramMemoryKind = "dram";
+
+bool isDramClass(llvm::StringRef kind) { return kind == kDramMemoryKind; }
+
 /// A memory supports an alignment request when its own alignment is a multiple
 /// of the requirement: a 128-byte-aligned memory satisfies a 64-byte request,
 /// not the other way round.
@@ -152,6 +159,20 @@ TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
       route.transferEngines = current.engines;
       route.cost.latencyCycles = current.cost;
       route.cost.localBytes = request.bytes;
+      // DRAM bytes: each hop whose source or destination is the DRAM-class
+      // memory moves the value across the DRAM boundary once.
+      for (size_t hop = 0; hop + 1 < current.nodes.size(); ++hop) {
+        const MemoryNode *from = model_.findMemory(current.nodes[hop]);
+        const MemoryNode *to = model_.findMemory(current.nodes[hop + 1]);
+        if ((from && isDramClass(from->kind)) || (to && isDramClass(to->kind)))
+          route.cost.dramBytes += request.bytes;
+      }
+      // Transfer utilization over the machine's sync window. Left 0 when the
+      // machine models no sync period or offers no transfer engine (design
+      // §17.2): a missing denominator is not a fabricated one.
+      if (std::optional<double> utilization = utilizationEstimate(
+              current.cost, model_, model_.transferEngineCount()))
+        route.cost.transferUtilization = *utilization;
       routes.push_back(std::move(route));
       continue;
     }

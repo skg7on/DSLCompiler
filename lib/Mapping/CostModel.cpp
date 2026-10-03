@@ -2,6 +2,8 @@
 
 #include "LLK/Mapping/CostModel.h"
 
+#include "LLK/Machine/MachineModel.h"
+
 #include "llvm/ADT/Twine.h"
 
 #include <array>
@@ -44,6 +46,16 @@ std::optional<CostMetric> symbolizeMicroMetric(llvm::StringRef text) {
   if (text == "capacity_spill_bytes")
     return CostMetric::SpillBytes;
   return symbolizeCostMetric(text);
+}
+
+/// The machine's synchronization period in cycles, or nullopt when it models no
+/// barrier and no wait (so there is no window to measure utilization against).
+std::optional<double>
+machineSyncPeriodCycles(const machine::MachineModel &machine) {
+  uint64_t cycles = machine.sync.barrierCycles + machine.sync.waitCycles;
+  if (cycles == 0)
+    return std::nullopt;
+  return static_cast<double>(cycles);
 }
 } // namespace
 
@@ -88,6 +100,17 @@ Cost addCost(const Cost &lhs, const Cost &rhs) {
   sum.computeUtilization = lhs.computeUtilization + rhs.computeUtilization;
   sum.transferUtilization = lhs.transferUtilization + rhs.transferUtilization;
   return sum;
+}
+
+std::optional<double> utilizationEstimate(double busyCycles,
+                                          const machine::MachineModel &machine,
+                                          uint32_t parallelUnits) {
+  if (parallelUnits == 0)
+    return std::nullopt;
+  std::optional<double> period = machineSyncPeriodCycles(machine);
+  if (!period)
+    return std::nullopt;
+  return busyCycles / (*period * static_cast<double>(parallelUnits));
 }
 
 bool costLess(const Cost &lhs, const Cost &rhs, const ObjectiveOrder &order) {

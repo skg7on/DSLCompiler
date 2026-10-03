@@ -25,6 +25,10 @@
 #include <string>
 #include <vector>
 
+namespace mlir::llk::machine {
+struct MachineModel;
+} // namespace mlir::llk::machine
+
 namespace mlir::llk::mapping {
 
 /// One cost estimate, kept unranked until an objective orders it. Optimistic
@@ -34,6 +38,9 @@ struct Cost {
   double latencyCycles = 0.0;
   uint64_t dramBytes = 0;
   uint64_t localBytes = 0;
+  /// Deliberately never populated: the Micro dialect models no spill, so there
+  /// is nothing to count. It stays 0 until a spill notion exists rather than
+  /// inventing a model for one (design §17.2).
   uint64_t spillBytes = 0;
   double computeUtilization = 0.0;
   double transferUtilization = 0.0;
@@ -60,6 +67,23 @@ double costMetric(const Cost &cost, CostMetric metric);
 /// Component-wise sum. Used to combine rule-local, route, and transform costs
 /// into a plan total without collapsing the dimensions.
 Cost addCost(const Cost &lhs, const Cost &rhs);
+
+/// First-order component utilization (design §17.2): the `busyCycles` a
+/// resource spent over the cycles it had available in one machine sync period,
+/// spread across `parallelUnits` interchangeable units. The sync period is what
+/// the model says one barrier and one wait cost; a machine that models neither
+/// leaves the denominator unknown, so this returns `nullopt` and the caller
+/// leaves the dimension 0 rather than inventing a window. Returns `nullopt`
+/// likewise when the machine offers no such unit.
+///
+/// The window's length in seconds is `syncPeriodCycles / clockHz`, so its
+/// available cycles are `clockHz * (syncPeriodCycles / clockHz) * units` =
+/// `syncPeriodCycles * units`. `clockHz` therefore cancels in the
+/// dimensionless ratio: an absent clock still permits a cycle ratio, while an
+/// absent sync period does not.
+std::optional<double> utilizationEstimate(double busyCycles,
+                                          const machine::MachineModel &machine,
+                                          uint32_t parallelUnits);
 
 /// How an objective ranks costs: primary metric first, then each secondary
 /// metric in the declared order. `minimize` false means larger is better.

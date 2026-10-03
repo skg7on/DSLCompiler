@@ -287,3 +287,50 @@ TEST(Placement, InstancesAreLegalAndStable) {
     EXPECT_EQ((*first)[i].id, (*second)[i].id);
   }
 }
+
+//===----------------------------------------------------------------------===//
+// Cost dimensions (design §17.2)
+//===----------------------------------------------------------------------===//
+
+// Compute utilization is the candidate's rule-local compute cycles over the
+// cycles the executors had available in one machine sync period
+// (workerThreads x (barrier + wait) cycles).
+TEST(Placement, ComputeUtilizationUsesTheSyncWindow) {
+  MachineModel machine = placementMachine();
+  machine.workerThreads = 4;
+  machine.clockHz = 3000000000;
+  machine.sync.barrierCycles = 200;
+  machine.sync.waitCycles = 50;
+  std::unique_ptr<MappingTarget> target = targetFor(machine);
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate withCompute = candidate();
+  withCompute.lowerBound.latencyCycles = 500.0;
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withCompute, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  // 500 compute cycles over 4 workers x 250 cycles-per-period = 0.5.
+  EXPECT_DOUBLE_EQ(instances->front().localCost.computeUtilization, 0.5);
+}
+
+// A machine without sync facts gives no denominator, so the dimension stays 0
+// rather than a fabricated constant.
+TEST(Placement, ComputeUtilizationStaysZeroWithoutSyncFacts) {
+  std::unique_ptr<MappingTarget> target = targetFor(placementMachine());
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate withCompute = candidate();
+  withCompute.lowerBound.latencyCycles = 500.0;
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withCompute, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  EXPECT_DOUBLE_EQ(instances->front().localCost.computeUtilization, 0.0);
+}
