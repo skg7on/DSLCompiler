@@ -149,18 +149,28 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeConnections(
 
 /// Fan-out (design §15.3): when every consumer reads the producer's memory a
 /// single shared-read plan carries them all; otherwise each consumer gets its
-/// own plan, which is replication.
+/// own plan. A per-consumer plan that copies the value into a different memory
+/// is labelled `ConnectionKind::Replicate`, so the copy's cost and capacity are
+/// visible; a consumer that can still read the producer's memory in place keeps
+/// its `Direct` read.
+///
+/// When `truncated` is non-null it is set to true when a replication route
+/// enumeration hit its cap, so the caller can report truncated search rather
+/// than optimality.
 llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
     const ConnectionRequest &base, llvm::ArrayRef<InstanceId> consumers,
     llvm::ArrayRef<MemoryNodeId> consumerMemories,
     const machine::MachineModel &machine, const TopologyService &topology,
-    const PlacementOptions &options = {});
+    const PlacementOptions &options = {}, bool *truncated = nullptr);
 
-/// Fan-in (design §15.3): one gather plan collecting several producers into
-/// one consumer.
+/// Fan-in (design §15.3): one gather plan collecting several producers into one
+/// consumer. `feedCost` is the summed cost of moving each producer's value to
+/// the consumer -- a gather sums its feeds -- and the plan stages one
+/// intermediate tile of `bytes` on top of them.
 ConnectionPlan synthesizeFanIn(llvm::ArrayRef<InstanceId> producers,
                                InstanceId consumer, WorkloadValueId value,
-                               MemoryNodeId consumerMemory, uint64_t bytes);
+                               MemoryNodeId consumerMemory, uint64_t bytes,
+                               const Cost &feedCost = {});
 
 } // namespace mlir::llk::mapping
 

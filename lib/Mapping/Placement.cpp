@@ -566,10 +566,12 @@ synthesizeConnections(const ConnectionRequest &request,
   return plans;
 }
 
-llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
-    const ConnectionRequest &base, llvm::ArrayRef<InstanceId> consumers,
-    llvm::ArrayRef<MemoryNodeId> consumerMemories, const MachineModel &machine,
-    const TopologyService &topology, const PlacementOptions &options) {
+llvm::Expected<std::vector<ConnectionPlan>>
+synthesizeFanOut(const ConnectionRequest &base,
+                 llvm::ArrayRef<InstanceId> consumers,
+                 llvm::ArrayRef<MemoryNodeId> consumerMemories,
+                 const MachineModel &machine, const TopologyService &topology,
+                 const PlacementOptions &options, bool *truncated) {
   if (consumers.size() != consumerMemories.size())
     return placementError(
         "fan-out: consumers and consumer memories must correspond");
@@ -596,31 +598,45 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
     return plans;
   }
 
-  // Replication: each consumer gets its own connection.
+  // Replication: each consumer gets its own connection. A plan that actually
+  // moves the value into another memory is a copy, so it is labelled
+  // `Replicate` and its transfer cost (and the bytes it stages) can be
+  // accounted by the search; a plan that reads the producer's memory in place
+  // stays `Direct`, because no copy is made.
   for (size_t index = 0; index < consumers.size(); ++index) {
     ConnectionRequest request = base;
     request.consumer = consumers[index];
     request.consumerMemory = consumerMemories[index];
     llvm::Expected<std::vector<ConnectionPlan>> replicated =
-        synthesizeConnections(request, machine, topology, options);
+        synthesizeConnections(request, machine, topology, options, truncated);
     if (!replicated)
       return replicated.takeError();
-    for (ConnectionPlan &plan : *replicated)
+    for (ConnectionPlan &plan : *replicated) {
+      if (plan.kind == ConnectionKind::Transfer ||
+          plan.kind == ConnectionKind::TransferAndTransform) {
+        plan.kind = ConnectionKind::Replicate;
+        // `kind` is part of the canonical string, so the id is recomputed.
+        plan.id = computeConnectionId(plan);
+      }
       plans.push_back(std::move(plan));
+    }
   }
   return plans;
 }
 
 ConnectionPlan synthesizeFanIn(llvm::ArrayRef<InstanceId> producers,
                                InstanceId consumer, WorkloadValueId value,
-                               MemoryNodeId consumerMemory, uint64_t bytes) {
+                               MemoryNodeId consumerMemory, uint64_t bytes,
+                               const Cost &feedCost) {
   ConnectionPlan plan;
   plan.kind = ConnectionKind::Reduce;
   plan.consumers.push_back(consumer);
   plan.producers.assign(producers.begin(), producers.end());
   plan.value = value;
   plan.memoryRoute.push_back(std::move(consumerMemory));
-  plan.cost.localBytes = bytes;
+  // A gather sums what its feeds cost and stages one intermediate tile.
+  plan.cost = feedCost;
+  plan.cost.localBytes = feedCost.localBytes + bytes;
   plan.id = computeConnectionId(plan);
   return plan;
 }

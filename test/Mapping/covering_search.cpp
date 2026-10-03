@@ -195,6 +195,167 @@ rule r.pe_only {
 }
 )llkmap";
 
+/// One producer feeding two consumers across the value `mid`. `producerOp` and
+/// `consumerOp` are the node attributes the rules predicate on, so a fixture
+/// can gate producer and consumer rules apart.
+WorkloadGraph fanOutGraph(mlir::MLIRContext &context,
+                          llvm::StringRef producerOp,
+                          llvm::StringRef consumerOp) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+  WorkloadValueId out1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "o1", /*external=*/false});
+  WorkloadValueId out2 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "o2", /*external=*/false});
+
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.sourceOrdinal = 0;
+  producer.attributes = vectorAttributes(context, producerOp);
+  producer.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(producer));
+
+  WorkloadNode first;
+  first.opName = "micro.vector";
+  first.sourceOrdinal = 1;
+  first.attributes = vectorAttributes(context, consumerOp);
+  first.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  first.outputs.push_back(WorkloadPort{out1, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(first));
+
+  WorkloadNode second;
+  second.opName = "micro.vector";
+  second.sourceOrdinal = 2;
+  second.attributes = vectorAttributes(context, consumerOp);
+  second.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  second.outputs.push_back(WorkloadPort{out2, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(second));
+
+  graph.finalize();
+  return graph;
+}
+
+/// Two producers feeding one consumer across the value `mid`.
+WorkloadGraph fanInGraph(mlir::MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId in1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in1", /*external=*/true});
+  WorkloadValueId in2 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in2", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+  WorkloadValueId out =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+
+  WorkloadNode first;
+  first.opName = "micro.vector";
+  first.sourceOrdinal = 0;
+  first.attributes = vectorAttributes(context, "produce");
+  first.inputs.push_back(WorkloadPort{in1, mlir::Type(), std::nullopt});
+  first.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(first));
+
+  WorkloadNode second;
+  second.opName = "micro.vector";
+  second.sourceOrdinal = 1;
+  second.attributes = vectorAttributes(context, "produce");
+  second.inputs.push_back(WorkloadPort{in2, mlir::Type(), std::nullopt});
+  second.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(second));
+
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.sourceOrdinal = 2;
+  consumer.attributes = vectorAttributes(context, "consume");
+  consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{out, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+/// Two workers with disjoint memory visibility: a producer placed on e0/dram.0
+/// cannot be read in place by a consumer on e1/acc.0, so the value must move.
+/// The single dram.0 -> acc.0 link is the only route.
+MachineModel fanMachine() {
+  MachineModel model;
+  model.target = "fan";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}},
+                     {"e1", "worker", std::nullopt, {}, 1, {}}};
+  MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "e0";
+  dram.capacityBytes = 1u << 30;
+  dram.alignmentBytes = 64;
+  MemoryNode acc;
+  acc.id = "acc.0";
+  acc.kind = "acc";
+  acc.visibleFrom = "e1";
+  acc.capacityBytes = 1u << 20;
+  acc.alignmentBytes = 64;
+  model.memories = {dram, acc};
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+  LinkEdge edge;
+  edge.id = "dram_to_acc.0";
+  edge.source = "dram.0";
+  edge.destination = "acc.0";
+  edge.bandwidthBytesPerCycle = 32;
+  edge.latencyCycles = 10;
+  edge.transactionBytes = 64;
+  edge.transferEngines = {"dma.0"};
+  model.links = {edge};
+  return model;
+}
+
+/// A producer rule gated on `op = "produce"` (dram on e0) and a consumer rule
+/// gated on `op = "consume"` (acc on e1), so each node binds exactly one
+/// placement and the fan shapes are the only thing under test.
+constexpr llvm::StringLiteral kFanRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind acc;
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Every node binds `sram.0`, so a single producer can serve several consumers
+/// from the one placement it wrote.
+constexpr llvm::StringLiteral kSharedReadRules = R"llkmap(
+rule r.sram {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.sram";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The search cost of one producer -> consumer transfer over `fanMachine`:
+/// the link latency (10) plus 4096 assumed bytes at 32 bytes/cycle.
+constexpr double kFanTransferCycles = 10.0 + 4096.0 / 32.0;
+
 std::unique_ptr<MappingTarget> targetWith(MachineModel machine,
                                           llvm::StringRef rules) {
   llvm::Expected<RuleRegistry> registry = parseRuleText(rules, "<test>");
@@ -504,6 +665,153 @@ TEST(CoveringSearch, PerMemoryCapacityRejectsOverSubscription) {
   ASSERT_NE(sram, nullptr);
   ASSERT_GE(sram->capacityBytes, 4096u);
   ASSERT_LT(sram->capacityBytes, 2u * 4096u);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+//===----------------------------------------------------------------------===//
+// Fan-out and fan-in in the search (design §15.3)
+//===----------------------------------------------------------------------===//
+
+// Two consumers that can both read the producer's placement share a single
+// read plan instead of getting one transfer each.
+TEST(CoveringSearch, SharedReadSynthesizesOnePlanForBothConsumers) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanOutGraph(context, /*producerOp=*/"add",
+                                    /*consumerOp=*/"add");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kSharedReadRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  // One shared read for the value, not one connection per consumer.
+  ASSERT_EQ(plan.connections.size(), 1u);
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  EXPECT_EQ(plan.connectionPlans[0].kind, ConnectionKind::Direct);
+  // Three instances at one cycle each; the shared read is free.
+  EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, 3.0);
+}
+
+// Two consumers whose placements their executors cannot read in place each get
+// a copied connection, labelled `Replicate`, and the copies cost a transfer
+// apiece.
+TEST(CoveringSearch, ReplicatedConsumersGetReplicateConnections) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanOutGraph(context, /*producerOp=*/"produce",
+                                    /*consumerOp=*/"consume");
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connections.size(), 2u);
+  for (const PlanConnection &connection : plan.connectionPlans)
+    EXPECT_EQ(connection.kind, ConnectionKind::Replicate);
+  // Three instances at one cycle, plus two replicated copies.
+  EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles,
+                   3.0 + 2.0 * kFanTransferCycles);
+}
+
+// A value fed by two producers is gathered into one `Reduce` connection whose
+// cost is the sum of the two feeds.
+TEST(CoveringSearch, GatherSumsTheProducerFeeds) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanInGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connections.size(), 1u);
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  EXPECT_EQ(plan.connectionPlans[0].kind, ConnectionKind::Reduce);
+  // Three instances at one cycle, plus the two summed transfer feeds.
+  EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles,
+                   3.0 + 2.0 * kFanTransferCycles);
+}
+
+// A route cap reached inside fan-out replication reaches `searchTruncated`
+// through the fan-out out-parameter.
+TEST(CoveringSearch, FanOutRouteCapSetsSearchTruncated) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanOutGraph(context, /*producerOp=*/"produce",
+                                    /*consumerOp=*/"consume");
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  options.maxRoutesPerConnection = 1; // the single route saturates the cap
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->searchTruncated);
+  ASSERT_FALSE(result->plans.empty());
+  bool replicated = false;
+  for (const PlanConnection &connection : result->plans[0].connectionPlans)
+    replicated |= connection.kind == ConnectionKind::Replicate;
+  EXPECT_TRUE(replicated);
+}
+
+// Replicated bytes are charged to the memory that holds the copy: two consumer
+// instances fit acc.0, but the two replicas they need do not.
+TEST(CoveringSearch, ReplicationBytesCountAgainstCapacity) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanOutGraph(context, /*producerOp=*/"produce",
+                                    /*consumerOp=*/"consume");
+  MachineModel machine = fanMachine();
+  // Two consumer instances charge 4096 each (8192); one 4096 replica apiece
+  // pushes acc.0 to 16384. 12000 admits the instances but not the copies.
+  for (MemoryNode &memory : machine.memories)
+    if (memory.kind == "acc")
+      memory.capacityBytes = 12000;
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// A gather's intermediate tile is charged to the consumer's memory too: the
+// consumer instance fits acc.0, but the gathered tile it produces does not.
+TEST(CoveringSearch, GatherIntermediateCountsAgainstCapacity) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanInGraph(context);
+  MachineModel machine = fanMachine();
+  // The consumer instance charges 4096 to acc.0; the gather's intermediate tile
+  // adds another 4096. 5000 admits the instance but not the tile.
+  for (MemoryNode &memory : machine.memories)
+    if (memory.kind == "acc")
+      memory.capacityBytes = 5000;
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kFanRules);
+  ASSERT_NE(target, nullptr);
 
   MappingSearchOptions options;
   options.mode = SearchMode::Deterministic;

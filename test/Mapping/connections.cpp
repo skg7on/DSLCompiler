@@ -78,6 +78,40 @@ ConnectionRequest baseRequest() {
   return request;
 }
 
+/// e0 owns dram.0 and e1 owns acc.0; neither sees the other's memory. A
+/// consumer placed on acc.0 therefore cannot read the producer's dram.0 in
+/// place, so serving it means a real copy over the single dram.0 -> acc.0 link:
+/// replication, not a direct read.
+MachineModel replicationMachine() {
+  MachineModel model;
+  model.target = "replication";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}},
+                     {"e1", "worker", std::nullopt, {}, 1, {}}};
+  MemoryNode dram = memory("dram.0", "dram");
+  dram.visibleFrom = "e0";
+  MemoryNode acc = memory("acc.0", "acc");
+  acc.visibleFrom = "e1";
+  model.memories = {dram, acc};
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+  model.links = {link("dram_to_acc.0", "dram.0", "acc.0")};
+  return model;
+}
+
+/// `baseRequest` against `replicationMachine`: the producer runs on e0/dram.0
+/// and the consumer on e1/acc.0, so no direct read is possible.
+ConnectionRequest replicationRequest() {
+  ConnectionRequest request = baseRequest();
+  request.producerMemory = "dram.0";
+  request.consumerMemory = "acc.0";
+  request.producerExecutor = "e0";
+  request.consumerExecutor = "e1";
+  return request;
+}
+
 /// `(d0, d1) -> (d0, d1)`, the canonical identity relation.
 mlir::AffineMap identity2(mlir::MLIRContext &context) {
   return mlir::AffineMap::getMultiDimIdentityMap(2, &context);
@@ -658,20 +692,68 @@ TEST(Connections, FanOutReplicatesWhenAConsumerNeedsADifferentMemory) {
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
   // Consumer 11 shares the producer's memory (one direct read). Consumer 12 is
   // placed on acc.0: it can read the producer's memory directly *and* it has
-  // both transfer routes into acc.0. Nothing is shared, so every plan serves
-  // one consumer.
+  // both transfer routes into acc.0. The transfer routes are copies, so they
+  // are `Replicate`; the shared-memory read stays `Direct`.
   ASSERT_EQ(plans->size(), 4u);
   size_t direct = 0;
-  size_t transfers = 0;
+  size_t replicates = 0;
   for (const ConnectionPlan &plan : *plans) {
     EXPECT_EQ(plan.consumers.size(), 1u);
     if (plan.kind == ConnectionKind::Direct)
       ++direct;
-    else if (plan.kind == ConnectionKind::Transfer)
-      ++transfers;
+    else if (plan.kind == ConnectionKind::Replicate)
+      ++replicates;
   }
   EXPECT_EQ(direct, 2u);
-  EXPECT_EQ(transfers, 2u);
+  EXPECT_EQ(replicates, 2u);
+}
+
+// Two consumers that must be served from a memory their executors cannot read
+// in place: every consumer gets a copy, and each copy is labelled `Replicate`.
+// Replication multiplies the transfer cost, one transfer per consumer.
+TEST(Connections, FanOutReplicatesWhenConsumersNeedDistinctPlacements) {
+  MachineModel machine = replicationMachine();
+  TopologyService topology(machine);
+  ConnectionRequest base = replicationRequest();
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans = synthesizeFanOut(
+      base, std::vector<InstanceId>{11, 12},
+      std::vector<MemoryNodeId>{"acc.0", "acc.0"}, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 2u);
+  const double perCopy = 10.0 + 1024.0 / 32.0; // link latency + bytes/bandwidth
+  double total = 0.0;
+  for (const ConnectionPlan &plan : *plans) {
+    EXPECT_EQ(plan.kind, ConnectionKind::Replicate);
+    ASSERT_EQ(plan.consumers.size(), 1u);
+    ASSERT_FALSE(plan.memoryRoute.empty());
+    EXPECT_EQ(plan.memoryRoute.back(), "acc.0");
+    EXPECT_DOUBLE_EQ(plan.cost.latencyCycles, perCopy);
+    total += plan.cost.latencyCycles;
+  }
+  // Two copies cost two transfers.
+  EXPECT_DOUBLE_EQ(total, 2.0 * perCopy);
+}
+
+// The fan-out route cap must reach the caller: a route enumeration that hit
+// `maxRoutesPerConnection` inside replication sets the shared `truncated`
+// out-parameter rather than silently dropping alternatives.
+TEST(Connections, FanOutReportsRouteCapThroughTruncated) {
+  MachineModel machine = replicationMachine();
+  TopologyService topology(machine);
+  ConnectionRequest base = replicationRequest();
+  PlacementOptions options;
+  options.maxRoutesPerConnection = 1; // the single route saturates the cap
+
+  bool truncated = false;
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeFanOut(base, std::vector<InstanceId>{11, 12},
+                       std::vector<MemoryNodeId>{"acc.0", "acc.0"}, machine,
+                       topology, options, &truncated);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_TRUE(truncated);
+  ASSERT_FALSE(plans->empty());
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Replicate);
 }
 
 TEST(Connections, FanInProducesOneReducePlan) {
@@ -684,6 +766,23 @@ TEST(Connections, FanInProducesOneReducePlan) {
   ASSERT_EQ(plan.producers.size(), 3u);
   EXPECT_EQ(plan.producers[2], 3u);
   EXPECT_NE(plan.id, 0u);
+}
+
+// A gather sums what its feeds cost, and stages one intermediate tile on top.
+TEST(Connections, FanInSumsTheFeedCost) {
+  Cost feeds;
+  feeds.latencyCycles = 42.0;
+  feeds.dramBytes = 1024;
+  feeds.localBytes = 1024;
+
+  ConnectionPlan plan =
+      synthesizeFanIn(std::vector<InstanceId>{1, 2},
+                      /*consumer=*/9, /*value=*/5, "acc.0", 1024, feeds);
+  EXPECT_EQ(plan.kind, ConnectionKind::Reduce);
+  EXPECT_DOUBLE_EQ(plan.cost.latencyCycles, 42.0);
+  EXPECT_EQ(plan.cost.dramBytes, 1024u);
+  // The gathered tile's bytes join the feeds' staged bytes.
+  EXPECT_EQ(plan.cost.localBytes, 1024u + 1024u);
 }
 
 //===----------------------------------------------------------------------===//
