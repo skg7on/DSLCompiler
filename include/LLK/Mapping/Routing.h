@@ -10,11 +10,12 @@
 //
 // A route is a sequence of memory nodes joined by directed links. Legality is
 // a topology question -- does the link exist, is there an engine that can see
-// its source, does each memory support the requested alignment, does an
-// intermediate have room -- and never a comparison of target ids against the
-// Micro vocabulary. Cost is the summed per-hop transfer cost; routes are
-// ranked by cost, then hop count, then the lexicographic link-id sequence, so
-// two runs on the same machine agree exactly.
+// its source, does each memory support the requested alignment and layout, can
+// the link carry the value in one transaction, does an intermediate have room
+// once live data is accounted for -- and never a comparison of target ids
+// against the Micro vocabulary. Cost is the summed per-hop transfer cost;
+// routes are ranked by cost, then hop count, then the lexicographic link-id
+// sequence, so two runs on the same machine agree exactly.
 //
 // Materializing a chosen route as copies/waits is a later step (design §12.4,
 // D5/plan binding); this layer only enumerates and ranks.
@@ -43,6 +44,14 @@ namespace mlir::llk::mapping {
 /// Design §12.1 also lists an element type. v2 memory and link nodes carry no
 /// element-type facts, so checking it here would be vacuous; type support is a
 /// rule-level concern (compute capabilities declare supported types).
+///
+/// Design §12.2 asks that the value's layout and transaction size be supported
+/// and that liveness be satisfied. Transaction size is checked against every
+/// hop link unconditionally. The layout and liveness facts are opt-in:
+/// `layoutClass` names the layout the value is stored in and must be listed in
+/// every memory's `supportedLayouts`; `liveBytesOnIntermediate` is the caller's
+/// occupancy of an intermediate staging memory. Leaving either unset means the
+/// caller carries no such fact, and its check is skipped rather than guessed.
 struct RouteRequest {
   MemoryNodeId source;
   MemoryNodeId destination;
@@ -50,6 +59,20 @@ struct RouteRequest {
   uint64_t alignmentBytes = 1;
   std::optional<ExecutorId> producerExecutor;
   std::optional<ExecutorId> consumerExecutor;
+
+  /// The declared layout (a layout id or class) the value is held in. When
+  /// set, every memory on a chosen route -- endpoints included -- must list it
+  /// in `supportedLayouts`; a memory that declares none supports none.
+  std::optional<std::string> layoutClass;
+
+  /// Bytes already live in each *intermediate* memory a route stages through.
+  /// A hop into an intermediate is legal only when
+  /// `capacityBytes - liveBytesOnIntermediate` still holds `bytes`. A single
+  /// scalar, not a per-node map, because the routing layer evaluates one
+  /// connection at a time and keeps no node-occupancy vector; 0 means the
+  /// caller models no live data. The destination already holds the value, so
+  /// it is exempt, as it is from the plain capacity check.
+  uint64_t liveBytesOnIntermediate = 0;
 };
 
 /// One legal way to move a value, cheapest-first within an enumeration.
@@ -86,10 +109,14 @@ public:
   /// exists.
   ///
   /// When `truncated` is non-null it is set to true if the enumeration reached
-  /// its effective cap (the smaller of `limit` and `maxRoutes`). This is
-  /// deliberately conservative: it may report truncation when exactly that many
-  /// routes exist, because the caller is never allowed to claim optimality
-  /// after a cap was reached (design §16.2).
+  /// its effective cap (the smaller of `limit` and `maxRoutes`), or if the hop
+  /// cap (`maxHops`) pruned a path that had a further legal hop. Either way the
+  /// space was not exhausted. The route-cap signal is deliberately
+  /// conservative: it may report truncation when exactly that many routes
+  /// exist, because the caller is never allowed to claim optimality after a
+  /// cap was reached (design §16.2). The hop-cap signal fires only when a
+  /// genuinely extendable path was cut, never merely because the frontier
+  /// emptied.
   llvm::Expected<llvm::SmallVector<MemoryRoute>>
   enumerateRoutes(const RouteRequest &request, unsigned limit,
                   bool *truncated = nullptr) const;

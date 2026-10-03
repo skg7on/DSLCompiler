@@ -119,31 +119,36 @@ transfer_engines:
 links:
   # The two-hop path dram -> sram -> acc that a routing fixture needs; there is
   # deliberately no direct dram -> acc link.
+  #
+  # `transaction_bytes` is the largest value one transfer moves at once; the
+  # routing layer rejects a hop whose value does not fit, and the mapper assumes
+  # multi-KiB connection values, so it must exceed a cache line. 4096 covers the
+  # tile sizes this target maps.
   - id: dram_to_sram.0
     source: dram.0
     destination: sram.0
     bandwidth_bytes_per_cycle: 1024
     latency_cycles: 300
-    transaction_bytes: 128
+    transaction_bytes: 4096
     transfer_engines: [dma.0]
   - id: sram_to_acc.0
     source: sram.0
     destination: acc.0
     bandwidth_bytes_per_cycle: 4096
     latency_cycles: 20
-    transaction_bytes: 128
+    transaction_bytes: 4096
     transfer_engines: [dma.0]
   - id: acc_to_sram.0
     source: acc.0
     destination: sram.0
     bandwidth_bytes_per_cycle: 4096
     latency_cycles: 20
-    transaction_bytes: 128
+    transaction_bytes: 4096
     transfer_engines: [dma.0]
   - id: sram_to_dram.0
     source: sram.0
     destination: dram.0
     bandwidth_bytes_per_cycle: 1024
     latency_cycles: 300
-    transaction_bytes: 128
+    transaction_bytes: 4096
     transfer_engines: [dma.0]

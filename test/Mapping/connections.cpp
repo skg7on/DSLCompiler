@@ -37,7 +37,9 @@ LinkEdge link(llvm::StringRef id, llvm::StringRef source,
   edge.destination = destination.str();
   edge.bandwidthBytesPerCycle = 32;
   edge.latencyCycles = 10;
-  edge.transactionBytes = 64;
+  // Comfortably above the 1 KiB values these fixtures move, so the §12.2
+  // transaction-size check does not reject them.
+  edge.transactionBytes = 4096;
   edge.transferEngines = {"dma.0"};
   return edge;
 }

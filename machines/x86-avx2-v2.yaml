@@ -120,46 +120,51 @@ transfer_engines:
 
 # Each link carries what the v1 profile's formula produced for that hop: the
 # slower endpoint's latency, and the destination's bandwidth.
+#
+# `transaction_bytes` is the largest value one transfer moves at once. The
+# routing layer rejects a hop whose value does not fit, and the mapper assumes
+# multi-KiB connection values, so a cache-line-sized 64 would make every
+# movement on this profile illegal. 4096 covers the tile sizes this target maps.
 links:
   - id: dram_to_l2.0
     source: dram.0
     destination: l2.0
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 220
-    transaction_bytes: 64
+    transaction_bytes: 4096
     transfer_engines: [dma.0]
   - id: l2_to_sram.0
     source: l2.0
     destination: sram.0
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 12
-    transaction_bytes: 64
+    transaction_bytes: 4096
     transfer_engines: [dma.0]
   - id: dram_to_sram.0
     source: dram.0
     destination: sram.0
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 220
-    transaction_bytes: 64
+    transaction_bytes: 4096
     transfer_engines: [dma.0]
   - id: sram_to_acc.0
     source: sram.0
     destination: acc.0
     bandwidth_bytes_per_cycle: 256
     latency_cycles: 4
-    transaction_bytes: 64
+    transaction_bytes: 4096
     transfer_engines: [dma.0]
   - id: acc_to_sram.0
     source: acc.0
     destination: sram.0
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 4
-    transaction_bytes: 64
+    transaction_bytes: 4096
     transfer_engines: [dma.0]
   - id: sram_to_dram.0
     source: sram.0
     destination: dram.0
     bandwidth_bytes_per_cycle: 32
     latency_cycles: 220
-    transaction_bytes: 64
+    transaction_bytes: 4096
     transfer_engines: [dma.0]

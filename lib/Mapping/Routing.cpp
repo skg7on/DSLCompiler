@@ -2,6 +2,7 @@
 
 #include "LLK/Mapping/Routing.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
@@ -38,6 +39,13 @@ bool supportsAlignment(const MemoryNode &memory, uint64_t alignmentBytes) {
   return memory.alignmentBytes % alignmentBytes == 0;
 }
 
+/// A memory supports a declared layout when it names it. A memory that
+/// declares no layouts supports none, so a request that asks for one is
+/// rejected rather than assumed: unknown is not the same as unconstrained.
+bool supportsLayout(const MemoryNode &memory, llvm::StringRef layout) {
+  return llvm::is_contained(memory.supportedLayouts, layout);
+}
+
 /// A hop is legal when its link declares an engine that can reach the link's
 /// source memory. The engine's executor must see the memory the data comes
 /// from, which is what makes a transfer physically possible.
@@ -49,6 +57,54 @@ std::optional<ExecutorId> legalEngine(const MachineModel &model,
       return engineId;
   }
   return std::nullopt;
+}
+
+/// The engine for a hop into `next`, or nullopt when the hop violates any
+/// §12.2 fact the machine models: the link cannot carry the value in one
+/// transaction, the destination memory does not support the value's alignment
+/// or layout, the intermediate has no room once live data is counted, or no
+/// engine can reach the link's source. Returns the engine so the caller can
+/// record it and cost the hop.
+std::optional<ExecutorId> legalHop(const MachineModel &model,
+                                   const LinkEdge &link, const MemoryNode &next,
+                                   const RouteRequest &request,
+                                   MemoryNodeId destination) {
+  // The link must move the value in a single transaction.
+  if (request.bytes > link.transactionBytes)
+    return std::nullopt;
+  if (!supportsAlignment(next, request.alignmentBytes))
+    return std::nullopt;
+  if (request.layoutClass && !supportsLayout(next, *request.layoutClass))
+    return std::nullopt;
+  // Intermediate storage must hold the value on top of whatever is already
+  // live there; the destination already holds the value, so it is exempt from
+  // both the capacity and the liveness test.
+  if (next.id != destination) {
+    uint64_t live =
+        std::min(request.liveBytesOnIntermediate, next.capacityBytes);
+    if (next.capacityBytes - live < request.bytes)
+      return std::nullopt;
+  }
+  return legalEngine(model, link);
+}
+
+/// True when `memoryId` has an outgoing link that `legalHop` would accept into
+/// a node not already on the path. Used only at the hop cap: it distinguishes
+/// a path cut short by `maxHops` -- which makes the enumeration truncated --
+/// from one that simply had nowhere legal left to go.
+bool hasLegalExtension(const MachineModel &model, llvm::StringRef memoryId,
+                       llvm::ArrayRef<MemoryNodeId> visited,
+                       const RouteRequest &request, MemoryNodeId destination) {
+  for (const LinkEdge &link : model.links) {
+    if (link.source != memoryId)
+      continue;
+    const MemoryNode *next = model.findMemory(link.destination);
+    if (!next || llvm::is_contained(visited, next->id))
+      continue;
+    if (legalHop(model, link, *next, request, destination))
+      return true;
+  }
+  return false;
 }
 
 /// One partial route under exploration. `linkIds` duplicates the link ids as
@@ -138,6 +194,17 @@ TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
                       std::to_string(request.alignmentBytes) +
                       "-byte alignment");
 
+  if (request.layoutClass) {
+    if (!supportsLayout(*source, *request.layoutClass))
+      return routeError("memory '" + source->id +
+                        "' does not support layout '" + *request.layoutClass +
+                        "'");
+    if (!supportsLayout(*destination, *request.layoutClass))
+      return routeError("memory '" + destination->id +
+                        "' does not support layout '" + *request.layoutClass +
+                        "'");
+  }
+
   unsigned effectiveLimit = std::min(limit, options_.maxRoutes);
   if (effectiveLimit == 0)
     return routeError("route request: limit must be positive");
@@ -146,6 +213,11 @@ TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
   PartialRoute start;
   start.nodes.push_back(source->id);
   work.push(std::move(start));
+
+  // Set when the hop cap, not the route cap, cut a path that could still have
+  // grown. Kept separate from the route-count cap so the two truncations can
+  // be reported honestly.
+  bool hopCapPruned = false;
 
   while (!work.empty() && routes.size() < effectiveLimit) {
     PartialRoute current = work.top();
@@ -178,8 +250,14 @@ TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
       continue;
     }
 
-    if (current.links.size() >= options_.maxHops)
+    if (current.links.size() >= options_.maxHops) {
+      // The cap is the only thing stopping this path when it still has a legal
+      // hop to make; that is a truncation. An exhausted frontier is not.
+      if (hasLegalExtension(model_, currentId, current.nodes, request,
+                            destination->id))
+        hopCapPruned = true;
       continue;
+    }
 
     for (const LinkEdge *link : outgoing(model_, currentId)) {
       const MemoryNode *next = model_.findMemory(link->destination);
@@ -188,15 +266,12 @@ TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
       // Cycle freedom: never revisit a memory already on this path.
       if (llvm::is_contained(current.nodes, next->id))
         continue;
-      // Every hop needs a transfer engine that can reach the link's source.
-      std::optional<ExecutorId> engine = legalEngine(model_, *link);
+      // Every §12.2 fact the machine models must hold: transaction size,
+      // alignment, layout, intermediate capacity and liveness, and a transfer
+      // engine that can reach the link's source.
+      std::optional<ExecutorId> engine =
+          legalHop(model_, *link, *next, request, destination->id);
       if (!engine)
-        continue;
-      if (!supportsAlignment(*next, request.alignmentBytes))
-        continue;
-      // Intermediate storage must hold the value; the destination already
-      // exists.
-      if (next->id != destination->id && next->capacityBytes < request.bytes)
         continue;
 
       PartialRoute advanced = current;
@@ -212,11 +287,11 @@ TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
     }
   }
 
-  // Reaching the effective cap means the space was not exhausted. This is
-  // deliberately conservative -- it also fires when exactly `effectiveLimit`
+  // Either cap being reached means the space was not exhausted. The route cap
+  // is deliberately conservative -- it also fires when exactly `effectiveLimit`
   // routes exist -- because §16.2 forbids implying optimality once a cap was
-  // touched.
-  if (truncated && routes.size() >= effectiveLimit)
+  // touched. The hop cap fires only when a legal extension was actually cut.
+  if (truncated && (hopCapPruned || routes.size() >= effectiveLimit))
     *truncated = true;
 
   if (routes.empty())

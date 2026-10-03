@@ -335,6 +335,11 @@ synthesizeConnections(const ConnectionRequest &request,
   route.alignmentBytes = request.alignmentBytes;
   route.producerExecutor = request.producerExecutor;
   route.consumerExecutor = request.consumerExecutor;
+  // layoutClass and liveBytesOnIntermediate stay unset. A transfer between two
+  // differently laid-out ports carries no single layout fact -- the transform
+  // that reconciles them is a separate connection -- and this layer keeps no
+  // occupancy state, so neither check can be answered here rather than
+  // guessed.
   llvm::Expected<llvm::SmallVector<MemoryRoute>> routes =
       topology.enumerateRoutes(route, options.maxRoutesPerConnection,
                                truncated);
