@@ -6,8 +6,10 @@
 // here. Capability kinds must be ones machines/x86-avx2-v2.yaml declares --
 // `verifyMappingTarget` rejects the file otherwise.
 //
-// Predicates read the operation's attributes by name: `micro.vector` and
-// `micro.reduce` carry `op`, `micro.mma` carries `input`/`accumulator`.
+// Attribute predicates read the operation's attributes by name: `micro.vector`
+// and `micro.reduce` carry `op`. A port predicate reads a boundary value
+// instead: `input[0].element_type = bf16` checks the first operand's element
+// type (`micro.mma`'s lhs), not an attribute.
 
 rule avx2.vector_add v1 {
   match micro.vector(op = "add");
@@ -25,7 +27,7 @@ rule avx2.vector_add v1 {
 }
 
 rule avx2.mma_bf16 v1 {
-  match micro.mma(input = bf16);
+  match micro.mma(input[0].element_type = bf16);
   require executor kind worker;
   require compute kind matrix_engine;
   require layout lhs satisfies avx2.row_major;

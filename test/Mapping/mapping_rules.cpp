@@ -1,9 +1,16 @@
 //===- mapping_rules.cpp - LLKMap rule declarations (D4) -----------------===//
 
+#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/MappingRules.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
+
+#include "mlir/AsmParser/AsmParser.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/MLIRContext.h"
 
 #include "llvm/Support/Error.h"
 
@@ -508,4 +515,257 @@ TEST(RuleMatch, BuildsAMappingCandidate) {
   ASSERT_EQ(candidate.layoutRequirements.size(), 1u);
   EXPECT_EQ(candidate.layoutRequirements[0].layoutClass, "avx2.blocked_2d");
   EXPECT_DOUBLE_EQ(candidate.lowerBound.latencyCycles, 9.0);
+}
+
+//===----------------------------------------------------------------------===//
+// Port-data predicates: element type, shape, and affine map (design §14.1)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A `micro.vector` node with one input and one output carrying `inputType` and
+/// `outputType`. These predicates read port data, not attributes.
+WorkloadNode typedVectorNode(mlir::Type inputType, mlir::Type outputType) {
+  WorkloadNode node;
+  node.id = 21;
+  node.opName = "micro.vector";
+  WorkloadPort input;
+  input.value = 1;
+  input.type = inputType;
+  WorkloadPort output;
+  output.value = 2;
+  output.type = outputType;
+  node.inputs.push_back(input);
+  node.outputs.push_back(output);
+  return node;
+}
+
+/// Renders the matched rule ids, in registry order.
+llvm::Expected<RuleRegistry> parseOne(llvm::StringRef match) {
+  std::string text =
+      "rule r { match " + match.str() + "; bundle \"b\"; emit \"e\"; }";
+  return parse(text);
+}
+
+} // namespace
+
+TEST(RuleMatch, MatchesElementTypeOnAnInputPort) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry =
+      parseOne("micro.vector(element_type = f32)");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  mlir::Type bf16 = mlir::BFloat16Type::get(&context);
+
+  EXPECT_EQ(matchedIds(typedVectorNode(f32, f32), *registry),
+            (std::vector<std::string>{"r"}));
+  // A bf16 operand does not satisfy an f32 predicate.
+  EXPECT_TRUE(matchRules(typedVectorNode(bf16, f32), *registry).empty());
+}
+
+TEST(RuleMatch, MatchesElementTypeOnANamedOutputPort) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry =
+      parseOne("micro.vector(output[0].element_type = f32)");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  mlir::Type bf16 = mlir::BFloat16Type::get(&context);
+
+  EXPECT_EQ(matchedIds(typedVectorNode(bf16, f32), *registry),
+            (std::vector<std::string>{"r"}));
+  EXPECT_TRUE(matchRules(typedVectorNode(f32, bf16), *registry).empty());
+}
+
+TEST(RuleMatch, MatchesAStaticShape) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry =
+      parseOne("micro.vector(shape[0] = 64)");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  mlir::Type wide = mlir::RankedTensorType::get({64, 8}, f32);
+  mlir::Type narrow = mlir::RankedTensorType::get({32, 8}, f32);
+
+  EXPECT_EQ(matchedIds(typedVectorNode(f32, wide), *registry),
+            (std::vector<std::string>{"r"}));
+  EXPECT_TRUE(matchRules(typedVectorNode(f32, narrow), *registry).empty());
+}
+
+TEST(RuleMatch, MatchesAShapeOnANamedInputPort) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry =
+      parseOne("micro.vector(input[0].shape[1] = 32)");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  mlir::Type matching = mlir::RankedTensorType::get({8, 32}, f32);
+  mlir::Type other = mlir::RankedTensorType::get({8, 16}, f32);
+
+  EXPECT_EQ(matchedIds(typedVectorNode(matching, f32), *registry),
+            (std::vector<std::string>{"r"}));
+  EXPECT_TRUE(matchRules(typedVectorNode(other, f32), *registry).empty());
+}
+
+TEST(RuleMatch, MatchesAnAffineMapByEqualityNotText) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.map {
+  match micro.vector(access_map = (d0, d1) -> (d1, d0));
+  bundle "b";
+  emit "e";
+}
+rule r.simplified {
+  match micro.vector(access_map = (d0, d1) -> (d1 + 0, d0));
+  bundle "b";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+
+  // A semantically equal map written differently still matches, and both rules
+  // apply.
+  WorkloadNode equivalent = typedVectorNode(f32, f32);
+  equivalent.inputs[0].accessMap =
+      mlir::AffineMap::get(2, 0,
+                           {mlir::getAffineDimExpr(1, &context),
+                            mlir::getAffineDimExpr(0, &context)},
+                           &context);
+  EXPECT_EQ(matchedIds(equivalent, *registry),
+            (std::vector<std::string>{"r.map", "r.simplified"}));
+
+  // A different map matches neither.
+  WorkloadNode different = typedVectorNode(f32, f32);
+  different.inputs[0].accessMap =
+      mlir::AffineMap::get(2, 0,
+                           {mlir::getAffineDimExpr(0, &context),
+                            mlir::getAffineDimExpr(1, &context)},
+                           &context);
+  EXPECT_TRUE(matchRules(different, *registry).empty());
+}
+
+TEST(RuleMatch, PredicatesOnAbsentPortDataDoNotMatch) {
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+
+  // No access map at all.
+  llvm::Expected<RuleRegistry> mapRule =
+      parseOne("micro.vector(access_map = (d0, d1) -> (d1, d0))");
+  ASSERT_TRUE(static_cast<bool>(mapRule));
+  EXPECT_TRUE(matchRules(typedVectorNode(f32, f32), *mapRule).empty());
+
+  // An opaque type exposes no element type.
+  llvm::Expected<RuleRegistry> elementRule =
+      parseOne("micro.vector(element_type = f32)");
+  ASSERT_TRUE(static_cast<bool>(elementRule));
+  WorkloadNode opaque = typedVectorNode(mlir::NoneType::get(&context), f32);
+  EXPECT_TRUE(matchRules(opaque, *elementRule).empty());
+
+  // A node with no ports at all exposes nothing.
+  WorkloadNode bare;
+  bare.opName = "micro.vector";
+  EXPECT_TRUE(matchRules(bare, *elementRule).empty());
+
+  // A dynamic shape is not a static shape.
+  llvm::Expected<RuleRegistry> shapeRule =
+      parseOne("micro.vector(shape[0] = 64)");
+  ASSERT_TRUE(static_cast<bool>(shapeRule));
+  mlir::Type dynamic =
+      mlir::RankedTensorType::get({mlir::ShapedType::kDynamic, 8}, f32);
+  EXPECT_TRUE(matchRules(typedVectorNode(f32, dynamic), *shapeRule).empty());
+}
+
+TEST(RuleMatch, ReadsElementTypeAndShapeFromAMicroTile) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType(
+      "!micro.tile<16x32xbf16, memory = #micro.memory<sram>>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+
+  llvm::Expected<RuleRegistry> registry = parseOne(
+      "micro.vector(input[0].element_type = bf16, input[0].shape[0] = 16)");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  EXPECT_EQ(matchedIds(typedVectorNode(tile, tile), *registry),
+            (std::vector<std::string>{"r"}));
+
+  llvm::Expected<RuleRegistry> wrongType =
+      parseOne("micro.vector(input[0].element_type = f32)");
+  ASSERT_TRUE(static_cast<bool>(wrongType));
+  EXPECT_TRUE(matchRules(typedVectorNode(tile, tile), *wrongType).empty());
+}
+
+TEST(RuleParse, RejectsMalformedPortPredicates) {
+  // `shape` needs a dimension index.
+  EXPECT_FALSE(parses(R"llkmap(
+rule a { match micro.vector(shape = 4); bundle "b"; emit "e"; }
+)llkmap"));
+  // A port subject admits only the port properties.
+  EXPECT_FALSE(parses(R"llkmap(
+rule a { match micro.vector(input[0].frob = 1); bundle "b"; emit "e"; }
+)llkmap"));
+  // A port index is required after the direction.
+  EXPECT_FALSE(parses(R"llkmap(
+rule a { match micro.vector(input[].element_type = f32); bundle "b"; emit "e"; }
+)llkmap"));
+  // An access map that references an undeclared dimension is rejected.
+  EXPECT_FALSE(parses(R"llkmap(
+rule a { match micro.vector(access_map = (d0) -> (d1)); bundle "b"; emit "e"; }
+)llkmap"));
+  // A non-affine access map is rejected at load time.
+  EXPECT_FALSE(parses(R"llkmap(
+rule a { match micro.vector(access_map = (d0, d1) -> (d0 * d1)); bundle "b"; emit "e"; }
+)llkmap"));
+}
+
+TEST(RuleParse, ParsesPortPredicates) {
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r {
+  match micro.vector(kind = "add", element_type = f32, shape[1] = 64,
+                     output[0].element_type = bf16,
+                     input[2].access_map = (d0, d1) -> (d0 + 1, d1));
+  bundle "b";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r");
+  ASSERT_NE(rule, nullptr);
+  ASSERT_EQ(rule->predicates.size(), 5u);
+
+  EXPECT_EQ(rule->predicates[0].kind, RulePredicateKind::Attribute);
+  EXPECT_EQ(rule->predicates[0].attribute, "kind");
+
+  const RulePredicate &element = rule->predicates[1];
+  EXPECT_EQ(element.kind, RulePredicateKind::ElementType);
+  EXPECT_FALSE(element.directionSet);
+  EXPECT_EQ(std::get<std::string>(element.value), "f32");
+
+  const RulePredicate &shape = rule->predicates[2];
+  EXPECT_EQ(shape.kind, RulePredicateKind::Shape);
+  EXPECT_EQ(shape.dimension, 1);
+  EXPECT_EQ(std::get<int64_t>(shape.value), 64);
+
+  const RulePredicate &output = rule->predicates[3];
+  EXPECT_EQ(output.kind, RulePredicateKind::ElementType);
+  EXPECT_TRUE(output.directionSet);
+  EXPECT_FALSE(output.isInput);
+  EXPECT_EQ(output.portIndex, 0);
+
+  const RulePredicate &map = rule->predicates[4];
+  EXPECT_EQ(map.kind, RulePredicateKind::AccessMap);
+  EXPECT_TRUE(map.directionSet);
+  EXPECT_TRUE(map.isInput);
+  EXPECT_EQ(map.portIndex, 2);
+  ASSERT_TRUE(map.accessMap.has_value());
+  EXPECT_EQ(map.accessMap->dims.size(), 2u);
 }

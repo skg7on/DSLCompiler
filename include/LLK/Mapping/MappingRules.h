@@ -39,10 +39,48 @@
 
 namespace mlir::llk::mapping {
 
-/// One `attribute = value` predicate on the matched operation.
+/// What a rule predicate constrains.
+enum class RulePredicateKind {
+  /// `name = value`: an operation attribute.
+  Attribute,
+  /// `[input[i].]element_type = f32`.
+  ElementType,
+  /// `[output[i].]shape[d] = 64`.
+  Shape,
+  /// `[input[i].]access_map = (d0, d1) -> (d1, d0)`.
+  AccessMap,
+};
+
+/// One predicate on the matched operation: an attribute equality, or a property
+/// of one of the operation's boundary ports.
+///
+/// A port predicate is either qualified (`input[i].`/`output[i].`, naming one
+/// port) or unqualified. An unqualified predicate applies to its property's
+/// default direction -- element type and access map read inputs, shape reads
+/// outputs -- and holds when at least one port in that direction exposes the
+/// property and every port that exposes it agrees.
+///
+/// Port predicates read real port data (`WorkloadPort::type` and `accessMap`).
+/// They are deliberately conservative: a port that does not expose a property
+/// (an opaque type, a dynamic shape, an absent affine map) never satisfies it,
+/// and a predicate with no exposing port does not match.
 struct RulePredicate {
+  RulePredicateKind kind = RulePredicateKind::Attribute;
+  /// Attribute name (`Attribute`) or property name (`element_type`, `shape`,
+  /// `access_map`).
   std::string attribute;
+  /// True when a port subject (`input[i]`/`output[i]`) was written.
+  bool directionSet = false;
+  /// The subject port's direction, when `directionSet`.
+  bool isInput = true;
+  /// The subject port index, when `directionSet`.
+  int64_t portIndex = 0;
+  /// The shape dimension, for `Shape`.
+  int64_t dimension = 0;
+  /// The attribute, element-type, or shape value.
   LayoutValue value;
+  /// The declared map, for `AccessMap`.
+  std::optional<AffineMapSpec> accessMap;
 };
 
 /// A named boundary value of the matched operation.
@@ -109,11 +147,11 @@ llvm::Expected<RuleRegistry> loadRuleFile(llvm::StringRef path);
 // One-operation matching (design §14.2)
 //===----------------------------------------------------------------------===//
 
-/// True when `predicate` holds against `attributes`. An integer predicate
-/// needs an integer attribute of the same value; a symbolic predicate needs a
-/// string attribute. A missing attribute never matches.
-bool predicateMatches(const RulePredicate &predicate,
-                      mlir::DictionaryAttr attributes);
+/// True when `predicate` holds against `node`. An attribute predicate needs an
+/// attribute of the same name and value; a port predicate reads the node's port
+/// types and access maps. Missing data never matches, so every predicate is
+/// conservative.
+bool predicateMatches(const RulePredicate &predicate, const WorkloadNode &node);
 
 /// Rules whose match operation and predicates apply to `node`, in registry
 /// order. A rule with no predicates matches every operation of its name.

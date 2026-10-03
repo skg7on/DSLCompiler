@@ -59,6 +59,16 @@ struct AffineMapSpec {
   std::vector<ExprPtr> results;
 };
 
+/// Builds the concrete `mlir::AffineMap` a map clause describes, substituting
+/// `constants` for integer parameters. `spec.dims` become the map's dimensions
+/// in order. Fails when a result references neither a dimension nor a listed
+/// constant, or is not affine. Shared by the layout solver and the rule
+/// matcher's affine-map predicate, so both interpret a map identically.
+llvm::Expected<mlir::AffineMap>
+buildAffineMap(const AffineMapSpec &spec,
+               const llvm::StringMap<int64_t> &constants,
+               mlir::MLIRContext &context);
+
 struct LayoutDef {
   std::string id;
   std::vector<LayoutParam> params;

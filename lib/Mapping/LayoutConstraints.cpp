@@ -382,15 +382,15 @@ llvm::Expected<mlir::AffineExpr> AffineBuilder::convert(const Expr &expr) {
   return evalError("unhandled map expression");
 }
 
-llvm::Expected<mlir::AffineMap> buildAffineMap(const AffineMapSpec &spec,
-                                               const LayoutSolution &solution,
-                                               mlir::MLIRContext &context) {
-  AffineBuilder builder{context, {}, {}};
+} // namespace
+
+llvm::Expected<mlir::AffineMap>
+buildAffineMap(const AffineMapSpec &spec,
+               const llvm::StringMap<int64_t> &constants,
+               mlir::MLIRContext &context) {
+  AffineBuilder builder{context, {}, constants};
   for (unsigned index = 0; index < spec.dims.size(); ++index)
     builder.dims[spec.dims[index]] = index;
-  for (const auto &entry : solution.values)
-    if (const auto *value = std::get_if<int64_t>(&entry.second))
-      builder.constants[entry.first] = *value;
 
   llvm::SmallVector<mlir::AffineExpr, 4> results;
   for (const ExprPtr &result : spec.results) {
@@ -402,8 +402,6 @@ llvm::Expected<mlir::AffineMap> buildAffineMap(const AffineMapSpec &spec,
   return mlir::AffineMap::get(spec.dims.size(), /*numSymbols=*/0, results,
                               &context);
 }
-
-} // namespace
 
 llvm::Expected<LayoutSolveResult>
 solveLayout(const LayoutDef &def, const MachineModel &machine,
@@ -463,8 +461,12 @@ solveLayout(const LayoutDef &def, const MachineModel &machine,
       for (const auto &entry : bindings)
         solution.values[entry.first().str()] = entry.second;
       if (def.map) {
+        llvm::StringMap<int64_t> constants;
+        for (const auto &entry : bindings)
+          if (const auto *value = std::get_if<int64_t>(&entry.second))
+            constants[entry.first()] = *value;
         llvm::Expected<mlir::AffineMap> map =
-            buildAffineMap(*def.map, solution, context);
+            buildAffineMap(*def.map, constants, context);
         if (!map)
           return map.takeError();
         solution.map = *map;

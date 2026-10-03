@@ -22,7 +22,14 @@ file      ::= rule*
 rule      ::= "rule" id [ "v" int ] "{" stmt* "}"
 stmt      ::= match | domain | require | port | bundle | emit | cost
 match     ::= "match" micro-op "(" [ predicate ("," predicate)* ] ")" ";"
-predicate ::= ident "=" literal
+predicate ::= attr-predicate | port-predicate
+attr-predicate ::= ident "=" literal
+port-predicate ::= [ subject "." ] property
+subject   ::= ( "input" | "output" ) "[" int "]"
+property  ::= "element_type" "=" ident
+            | "shape" "[" int "]" "=" int
+            | "access_map" "=" map
+map       ::= "(" ident ("," ident)* ")" "->" "(" expr ("," expr)* ")"
 domain    ::= "param" ident "in" ( "[" int ".." int "]" | "{" literal ("," literal)* "}" ) ";"
 require   ::= "require" expr ";"
             | "require" executor "kind" ident ";"
@@ -40,11 +47,39 @@ literal   ::= int | string | ident      // a bare name such as `f32`
 An expression is the shared LLKMap grammar: `rank`, `element_type`, arithmetic,
 comparisons, boolean logic, and `machine.*` queries.
 
+## Predicates
+
+An **attribute predicate** (`kind = "add"`) compares the operation's attribute
+of that name, as before. `element_type`, `shape`, and `access_map` are reserved
+property names and instead read a boundary value:
+
+| Predicate | Reads |
+|---|---|
+| `[input[i].]element_type = f32` | the element type of a port's value |
+| `[output[i].]shape[d] = 64` | the static dimension `d` of a port's shape |
+| `[input[i].]access_map = (d0, d1) -> (d1, d0)` | the affine index map of a port |
+
+A `subject` names exactly one port. Without one, the predicate applies to the
+property's **default direction** — element type and access map read inputs,
+shape reads outputs — and holds when at least one port in that direction
+exposes the property and every port that exposes it agrees.
+
+Port properties are matched against real port data (`WorkloadPort::type` and
+`WorkloadPort::accessMap`); a bare `!micro.tile` is unwrapped to its element
+type and shape. Matching is **conservative**: a port that does not expose the
+property (an opaque type, a dynamic shape, an absent affine map) never
+satisfies the predicate, and a predicate with no exposing port does not match.
+The `access_map` value is compared as an MLIR `AffineMap` after simplification,
+never as text, so two spellings of the same map are equivalent.
+
+A bare `input`/`output` without a `[i]` subject is still an attribute name, so
+`micro.mma(input = bf16)` keeps matching the operation's `input` attribute.
+
 ## Example
 
 ```text
 rule avx2.vector_add v1 {
-  match micro.vector(kind = "add", element_type = f32);
+  match micro.vector(kind = "add", element_type = f32, shape[0] = 8);
   param VW in [4..8];
   require VW == machine.compute("vector_engine").lanes(element_type);
   require executor kind worker;
@@ -62,7 +97,7 @@ rule avx2.vector_add v1 {
 
 | Field | Meaning |
 |---|---|
-| `match` | the Micro operation and attribute predicates it must satisfy |
+| `match` | the Micro operation and the attribute and port predicates it must satisfy |
 | `param` | a tunable parameter; a `param` statement both declares and bounds it, so it must appear before its first use |
 | `require expr` | a constraint over parameters and machine facts |
 | `require <role> kind <k>` | an abstract capability requirement; `role` is `executor`, `compute`, or `memory` |
@@ -80,6 +115,11 @@ Parsing rejects, with a `file:line:column` diagnostic:
 - a missing `match`, `bundle`, or `emit`, or a duplicate `match`/`bundle`/`emit`/`cost`;
 - a Micro operation outside the workload vocabulary;
 - a duplicate port name;
+- a `shape` predicate without a dimension index, a port subject naming a
+  property other than `element_type`/`shape`/`access_map`, or a missing
+  non-negative port index;
+- an `access_map` that references a dimension it did not declare, or that is
+  not affine;
 - an identifier in a `require` that is neither a declared parameter nor a builtin;
 - a malformed statement, missing `;`, or unterminated `{`.
 

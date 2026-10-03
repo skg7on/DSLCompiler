@@ -16,13 +16,21 @@
 
 #include "LLK/Mapping/WorkloadGraph.h"
 
+#include "mlir/AsmParser/AsmParser.h"
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinTypes.h"
+
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <cctype>
+#include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 
 namespace mlir::llk::mapping {
 
@@ -38,6 +46,41 @@ bool parseVersionToken(llvm::StringRef text, uint64_t &out) {
   return !text.drop_front().getAsInteger(10, out);
 }
 
+/// True when `expr` is affine in the map sense: constants, dimensions, `+`,
+/// `-`, multiplication by a constant, `floordiv`/`ceildiv`/`mod`, and unary
+/// minus. Mirrors the builder in LayoutConstraints.cpp, so an access-map
+/// predicate that is not affine is rejected at load time instead of silently
+/// never matching.
+bool isAffineSpecExpr(const Expr &expr) {
+  switch (expr.kind) {
+  case ExprKind::IntLit:
+  case ExprKind::Ident:
+    return true;
+  case ExprKind::Unary:
+    return expr.text == "-" && isAffineSpecExpr(*expr.operands[0]);
+  case ExprKind::Binary: {
+    const Expr &lhs = *expr.operands[0];
+    const Expr &rhs = *expr.operands[1];
+    if (expr.text == "*")
+      return (lhs.kind == ExprKind::IntLit || rhs.kind == ExprKind::IntLit) &&
+             isAffineSpecExpr(lhs) && isAffineSpecExpr(rhs);
+    if (expr.text == "+" || expr.text == "-" || expr.text == "/" ||
+        expr.text == "%")
+      return isAffineSpecExpr(lhs) && isAffineSpecExpr(rhs);
+    return false;
+  }
+  case ExprKind::Call:
+    return (expr.text == "floordiv" || expr.text == "ceildiv" ||
+            expr.text == "mod") &&
+           expr.operands.size() == 2 && isAffineSpecExpr(*expr.operands[0]) &&
+           isAffineSpecExpr(*expr.operands[1]);
+  case ExprKind::StringLit:
+  case ExprKind::MemberCall:
+    return false;
+  }
+  return false;
+}
+
 class RuleParser : public LlkMapParser {
 public:
   RuleParser(std::vector<LlkMapToken> tokens, llvm::StringRef source)
@@ -49,6 +92,8 @@ private:
   bool parseRule(RuleDef &out);
   bool parseMatch(RuleDef &out);
   bool parsePredicate(RulePredicate &out);
+  bool parsePredicateValue(LayoutValue &out);
+  bool parseAffineMapSpec(AffineMapSpec &out);
   bool parseDomain(RuleDef &out);
   bool parseRequire(RuleDef &out);
   bool parsePort(RuleDef &out);
@@ -154,28 +199,143 @@ bool RuleParser::parseMatch(RuleDef &out) {
   return expectPunct(";");
 }
 
-bool RuleParser::parsePredicate(RulePredicate &out) {
-  if (!expectIdentifier("an attribute name", out.attribute))
-    return false;
+bool RuleParser::parsePredicateValue(LayoutValue &out) {
   if (!expectPunct("="))
     return false;
   if (current().kind == LlkMapToken::Kind::Int) {
-    out.value = current().intValue;
+    out = current().intValue;
     advance();
     return true;
   }
   if (current().kind == LlkMapToken::Kind::String) {
-    out.value = current().text;
+    out = current().text;
     advance();
     return true;
   }
   // A bare name such as `bf16` is a symbolic value.
   if (current().kind == LlkMapToken::Kind::Identifier) {
-    out.value = current().text;
+    out = current().text;
     advance();
     return true;
   }
   return failAt(current(), "expected a predicate value");
+}
+
+bool RuleParser::parseAffineMapSpec(AffineMapSpec &out) {
+  if (!expectPunct("("))
+    return false;
+  if (!isPunct(")")) {
+    while (true) {
+      std::string dim;
+      if (!expectIdentifier("a map dimension", dim))
+        return false;
+      out.dims.push_back(std::move(dim));
+      if (isPunct(",")) {
+        advance();
+        continue;
+      }
+      break;
+    }
+  }
+  if (!expectPunct(")"))
+    return false;
+  if (!expectPunct("->"))
+    return false;
+  if (!expectPunct("("))
+    return false;
+  while (true) {
+    ExprPtr result = parseExpression();
+    if (!result)
+      return false;
+    out.results.push_back(std::move(result));
+    if (isPunct(",")) {
+      advance();
+      continue;
+    }
+    break;
+  }
+  if (!expectPunct(")"))
+    return false;
+
+  // A map predicate may reference only its own dimensions, and only affinely.
+  llvm::StringSet<> allowed;
+  for (const std::string &dim : out.dims)
+    allowed.insert(dim);
+  for (const ExprPtr &result : out.results) {
+    if (!validateExpr(result, allowed))
+      return false;
+    if (!isAffineSpecExpr(*result))
+      return failAt(current(), "access map is not affine");
+  }
+  return true;
+}
+
+bool RuleParser::parsePredicate(RulePredicate &out) {
+  // A port subject is `input[i]` or `output[i]`. A bare `input`/`output` stays
+  // an attribute name, so `micro.mma(input = bf16)` keeps matching the
+  // operation's `input` attribute.
+  if ((current().text == "input" || current().text == "output") &&
+      peek().kind == LlkMapToken::Kind::Punct && peek().text == "[") {
+    out.directionSet = true;
+    out.isInput = current().text == "input";
+    advance(); // direction
+    advance(); // '['
+    if (current().kind != LlkMapToken::Kind::Int)
+      return failAt(current(), "expected a port index");
+    out.portIndex = current().intValue;
+    if (out.portIndex < 0)
+      return failAt(current(), "expected a non-negative port index");
+    advance();
+    if (!expectPunct("]"))
+      return false;
+    if (!expectPunct("."))
+      return false;
+  }
+
+  std::string name;
+  if (!expectIdentifier("a predicate name", name))
+    return false;
+
+  if (name == "element_type") {
+    out.kind = RulePredicateKind::ElementType;
+    out.attribute = std::move(name);
+    return parsePredicateValue(out.value);
+  }
+  if (name == "shape") {
+    if (!expectPunct("["))
+      return false;
+    if (current().kind != LlkMapToken::Kind::Int)
+      return failAt(current(), "expected a shape dimension");
+    out.dimension = current().intValue;
+    if (out.dimension < 0)
+      return failAt(current(), "expected a non-negative shape dimension");
+    advance();
+    if (!expectPunct("]"))
+      return false;
+    out.kind = RulePredicateKind::Shape;
+    out.attribute = std::move(name);
+    return parsePredicateValue(out.value);
+  }
+  if (name == "access_map") {
+    if (!expectPunct("="))
+      return false;
+    AffineMapSpec spec;
+    if (!parseAffineMapSpec(spec))
+      return false;
+    out.kind = RulePredicateKind::AccessMap;
+    out.attribute = std::move(name);
+    out.accessMap = std::move(spec);
+    return true;
+  }
+
+  if (out.directionSet)
+    return failAt(
+        current(),
+        "port predicates support element_type, shape, and access_map");
+
+  out.kind = RulePredicateKind::Attribute;
+  out.attribute = std::move(name);
+  return parsePredicateValue(out.value);
 }
 
 bool RuleParser::parseDomain(RuleDef &out) {
@@ -359,7 +519,88 @@ llvm::Expected<RuleRegistry> loadRuleFile(llvm::StringRef path) {
 // One-operation matching
 //===----------------------------------------------------------------------===//
 
-bool predicateMatches(const RulePredicate &predicate,
+namespace {
+
+std::string printedType(mlir::Type type) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  type.print(stream);
+  return stream.str();
+}
+
+/// A `!micro.tile<shape x element, ...>` read through its printed form. This
+/// core deliberately does not link the Micro dialect (see WorkloadGraph.h), so
+/// the tile is re-parsed as the `tensor<shape x element>` its head spells. Any
+/// other type yields a null type.
+mlir::Type tileAsTensor(mlir::Type type) {
+  if (!type)
+    return {};
+  std::string printed = printedType(type);
+  llvm::StringRef text(printed);
+  if (!text.consume_front("!micro.tile<"))
+    return {};
+  size_t end = text.find_first_of(",>");
+  if (end == llvm::StringRef::npos)
+    return {};
+  std::string wrapped = ("tensor<" + text.take_front(end) + ">").str();
+  return mlir::parseType(wrapped, type.getContext());
+}
+
+/// The element type a port type exposes, or a null type when this core cannot
+/// read one. A modelled shaped type and a bare float, integer, or index type
+/// state theirs; a `!micro.tile` is unwrapped through its printed form.
+mlir::Type elementTypeOf(mlir::Type type) {
+  if (!type)
+    return {};
+  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
+    return shaped.getElementType();
+  if (mlir::isa<mlir::FloatType, mlir::IntegerType, mlir::IndexType>(type))
+    return type;
+  if (mlir::Type tile = tileAsTensor(type))
+    if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(tile))
+      return shaped.getElementType();
+  return {};
+}
+
+/// The static shape a port type exposes, or nullopt for a dynamic, unranked, or
+/// opaque type. A `!micro.tile` is unwrapped through its printed form.
+std::optional<llvm::SmallVector<int64_t, 4>> shapeOf(mlir::Type type) {
+  if (!type)
+    return std::nullopt;
+  mlir::Type candidate = type;
+  if (!mlir::isa<mlir::ShapedType>(candidate))
+    candidate = tileAsTensor(type);
+  if (!candidate)
+    return std::nullopt;
+  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(candidate))
+    if (shaped.hasStaticShape())
+      return llvm::SmallVector<int64_t, 4>(shaped.getShape());
+  return std::nullopt;
+}
+
+/// The ports a predicate reads: exactly the one it names, or -- for an
+/// unqualified predicate -- every port in the property's default direction.
+/// Element type and access map read inputs; shape reads outputs.
+llvm::SmallVector<const WorkloadPort *, 4>
+subjectPorts(const RulePredicate &predicate, const WorkloadNode &node) {
+  llvm::SmallVector<const WorkloadPort *, 4> selected;
+  if (predicate.directionSet) {
+    llvm::ArrayRef<WorkloadPort> ports =
+        predicate.isInput ? node.inputs : node.outputs;
+    if (predicate.portIndex >= 0 &&
+        static_cast<size_t>(predicate.portIndex) < ports.size())
+      selected.push_back(&ports[predicate.portIndex]);
+    return selected;
+  }
+  bool defaultsToInput = predicate.kind != RulePredicateKind::Shape;
+  llvm::ArrayRef<WorkloadPort> ports =
+      defaultsToInput ? node.inputs : node.outputs;
+  for (const WorkloadPort &port : ports)
+    selected.push_back(&port);
+  return selected;
+}
+
+bool attributeMatches(const RulePredicate &predicate,
                       mlir::DictionaryAttr attributes) {
   if (!attributes)
     return false;
@@ -377,6 +618,63 @@ bool predicateMatches(const RulePredicate &predicate,
   return false;
 }
 
+} // namespace
+
+bool predicateMatches(const RulePredicate &predicate,
+                      const WorkloadNode &node) {
+  switch (predicate.kind) {
+  case RulePredicateKind::Attribute:
+    return attributeMatches(predicate, node.attributes);
+  case RulePredicateKind::ElementType: {
+    const std::string &expected = std::get<std::string>(predicate.value);
+    bool exposed = false;
+    for (const WorkloadPort *port : subjectPorts(predicate, node)) {
+      mlir::Type element = elementTypeOf(port->type);
+      if (!element)
+        continue;
+      if (printedType(element) != expected)
+        return false;
+      exposed = true;
+    }
+    return exposed;
+  }
+  case RulePredicateKind::Shape: {
+    int64_t expected = std::get<int64_t>(predicate.value);
+    bool exposed = false;
+    for (const WorkloadPort *port : subjectPorts(predicate, node)) {
+      std::optional<llvm::SmallVector<int64_t, 4>> shape = shapeOf(port->type);
+      if (!shape || predicate.dimension < 0 ||
+          static_cast<size_t>(predicate.dimension) >= shape->size())
+        continue;
+      if ((*shape)[predicate.dimension] != expected)
+        return false;
+      exposed = true;
+    }
+    return exposed;
+  }
+  case RulePredicateKind::AccessMap: {
+    const AffineMapSpec &spec = *predicate.accessMap;
+    bool exposed = false;
+    for (const WorkloadPort *port : subjectPorts(predicate, node)) {
+      if (!port->accessMap)
+        continue;
+      llvm::Expected<mlir::AffineMap> expected =
+          buildAffineMap(spec, {}, *port->accessMap->getContext());
+      if (!expected) {
+        llvm::consumeError(expected.takeError());
+        return false;
+      }
+      if (mlir::simplifyAffineMap(*expected) !=
+          mlir::simplifyAffineMap(*port->accessMap))
+        return false;
+      exposed = true;
+    }
+    return exposed;
+  }
+  }
+  return false;
+}
+
 std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
                                         const RuleRegistry &rules) {
   std::vector<const RuleDef *> matches;
@@ -385,7 +683,7 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
       continue;
     bool matched = true;
     for (const RulePredicate &predicate : rule.predicates) {
-      if (!predicateMatches(predicate, node.attributes)) {
+      if (!predicateMatches(predicate, node)) {
         matched = false;
         break;
       }
