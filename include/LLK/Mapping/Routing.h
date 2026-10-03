@@ -10,10 +10,11 @@
 //
 // A route is a sequence of memory nodes joined by directed links. Legality is
 // a topology question -- does the link exist, is there an engine that can see
-// its source, does each memory support the requested alignment and layout, can
-// the link carry the value in one transaction, does an intermediate have room
-// once live data is accounted for -- and never a comparison of target ids
-// against the Micro vocabulary. Cost is the summed per-hop transfer cost;
+// its source, does each memory support the requested alignment and layout, does
+// the value tile into whole transactions over the link, does an intermediate
+// have room once live data is accounted for -- and never a comparison of
+// target ids against the Micro vocabulary. Cost is the summed per-hop transfer
+// cost;
 // routes are ranked by cost, then hop count, then the lexicographic link-id
 // sequence, so two runs on the same machine agree exactly.
 //
@@ -52,6 +53,15 @@ namespace mlir::llk::mapping {
 /// every memory's `supportedLayouts`; `liveBytesOnIntermediate` is the caller's
 /// occupancy of an intermediate staging memory. Leaving either unset means the
 /// caller carries no such fact, and its check is skipped rather than guessed.
+/// A memory supports a declared layout when it names it in `supportedLayouts`;
+/// a memory that declares none supports none. The router relies on this to
+/// legalize a hop and connection synthesis relies on it to legalize a
+/// transform's memory, so both call this one definition rather than each
+/// spelling the rule out -- a divergence would let the two disagree about what
+/// a memory can hold.
+bool memorySupportsLayout(const machine::MemoryNode &memory,
+                          llvm::StringRef layout);
+
 struct RouteRequest {
   MemoryNodeId source;
   MemoryNodeId destination;

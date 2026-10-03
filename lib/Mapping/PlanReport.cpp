@@ -200,6 +200,9 @@ std::string writePlanReport(const MappingSearchResult &result,
           });
           json.attributeObject("diagnostics", [&] {
             json.attribute("searchTruncated", plan.diagnostics.searchTruncated);
+            // `errors`/`warnings` are never written by the search, so these
+            // counts are always 0 today; they are emitted so the report shape
+            // is stable for a future producer rather than silently omitted.
             json.attribute("errorCount", static_cast<uint64_t>(
                                              plan.diagnostics.errors.size()));
             json.attribute(

@@ -601,7 +601,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         llvm::Expected<std::vector<ConnectionPlan>> alternatives =
             synthesizeFanOut(consumerRequests.front(), consumerRequests,
                              machine, topology, placementOptions,
-                             &fanOutTruncated);
+                             &fanOutTruncated, options_.objective);
         if (alternatives)
           result.routeCount += alternatives->size();
         reportTruncation(fanOutTruncated);

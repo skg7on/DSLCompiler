@@ -165,13 +165,20 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeConnections(
 /// cost and capacity are visible. A group whose every member can still read the
 /// producer's memory in place keeps a `Direct` read instead of copying.
 ///
+/// When several copies are legal for a group, the one the declared `objective`
+/// prefers is chosen (design §17.1): the comparator is `costLess` under that
+/// order, never a hard-coded dimension, so a non-latency objective (for
+/// example `dram_bytes`) ranks the copies as it does everywhere else. An exact
+/// tie keeps the first alternative, the same stable tie-break `pickBest` uses.
+///
 /// When `truncated` is non-null it is set to true when a replication route
 /// enumeration hit its cap, so the caller can report truncated search rather
 /// than optimality.
 llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
     const ConnectionRequest &base, llvm::ArrayRef<ConnectionRequest> consumers,
     const machine::MachineModel &machine, const TopologyService &topology,
-    const PlacementOptions &options = {}, bool *truncated = nullptr);
+    const PlacementOptions &options = {}, bool *truncated = nullptr,
+    const ObjectiveOrder &objective = {});
 
 /// Fan-in (design §15.3): one gather plan collecting several producers into one
 /// or more consumers that share a destination memory. `feedCost` is the summed

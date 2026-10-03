@@ -176,14 +176,6 @@ bool consumerSeesProducerMemory(const ConnectionRequest &request,
   return machine.isVisible(request.producerMemory, *request.consumerExecutor);
 }
 
-/// A memory supports a declared layout when it names it; a memory that declares
-/// no layouts supports none. This is the same rule `TopologyService` applies to
-/// a route's hops, so the connection engine and the router agree on what a
-/// memory can hold.
-bool memorySupportsLayout(const MemoryNode &memory, llvm::StringRef layout) {
-  return llvm::is_contained(memory.supportedLayouts, layout);
-}
-
 /// The hop a transform runs on (design §15.2 alternative 5, "transform placed
 /// at a legal hop"). The value stays in the producer's layout up to
 /// `nodes[hop]` and is in the consumer's layout from `nodes[hop + 1]` on, so
@@ -602,7 +594,8 @@ llvm::Expected<std::vector<ConnectionPlan>>
 synthesizeFanOut(const ConnectionRequest &base,
                  llvm::ArrayRef<ConnectionRequest> consumers,
                  const MachineModel &machine, const TopologyService &topology,
-                 const PlacementOptions &options, bool *truncated) {
+                 const PlacementOptions &options, bool *truncated,
+                 const ObjectiveOrder &objective) {
   if (consumers.empty())
     return std::vector<ConnectionPlan>{};
 
@@ -701,10 +694,13 @@ synthesizeFanOut(const ConnectionRequest &base,
     }
     if (alternatives.empty())
       return std::vector<ConnectionPlan>{};
-    auto best = llvm::min_element(
-        alternatives, [](const ConnectionPlan &lhs, const ConnectionPlan &rhs) {
-          return lhs.cost.latencyCycles < rhs.cost.latencyCycles;
-        });
+    // §17.1: the copies are ranked by the declared objective, not by a
+    // hard-coded dimension. `min_element` keeps the first alternative on an
+    // exact tie, the same stable tie-break `CoveringSearch::pickBest` uses.
+    auto best = llvm::min_element(alternatives, [&](const ConnectionPlan &lhs,
+                                                    const ConnectionPlan &rhs) {
+      return costLess(lhs.cost, rhs.cost, objective);
+    });
     ConnectionPlan chosen = *best;
     chosen.consumers.clear();
     for (size_t index : group)

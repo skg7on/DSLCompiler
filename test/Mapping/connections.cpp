@@ -812,6 +812,99 @@ TEST(Connections, FanOutReportsRouteCapThroughTruncated) {
   EXPECT_EQ((*plans)[0].kind, ConnectionKind::Replicate);
 }
 
+/// Two routes from `sram.0` to `acc.0` whose latency and DRAM-byte orderings
+/// disagree: the direct `sram.0 -> acc.0` hop is slow but touches no DRAM,
+/// while `sram.0 -> dram.0 -> acc.0` is fast but crosses DRAM on both hops.
+/// Choosing the copy a replicating fan-out emits therefore distinguishes a
+/// latency objective from a `dram_bytes` one -- the default objective does not,
+/// which is why the suite could not see the hard-coded-latency bug.
+MachineModel objectiveReplicationMachine() {
+  MachineModel model;
+  model.target = "objective-replication";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}},
+                     {"e1", "worker", std::nullopt, {}, 1, {}}};
+  MemoryNode sram = memory("sram.0", "sram");
+  sram.visibleFrom = "e0";
+  MemoryNode dram = memory("dram.0", "dram");
+  dram.visibleFrom = "e0";
+  MemoryNode acc = memory("acc.0", "acc");
+  acc.visibleFrom = "e1"; // the consumer's executor owns the destination
+  model.memories = {sram, dram, acc};
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0"; // sees both sram.0 and dram.0, so every hop has one
+  model.transferEngines = {dma};
+  // A link's transfer term is bytes/bandwidth; a large bandwidth keeps the
+  // latency ordering (100 vs 1 + 1) the only ordering that matters here.
+  LinkEdge slowDirect = link("sram_to_acc.0", "sram.0", "acc.0");
+  slowDirect.latencyCycles = 100;
+  slowDirect.bandwidthBytesPerCycle = 1u << 20;
+  LinkEdge toDram = link("sram_to_dram.0", "sram.0", "dram.0");
+  toDram.latencyCycles = 1;
+  toDram.bandwidthBytesPerCycle = 1u << 20;
+  LinkEdge toAcc = link("dram_to_acc.0", "dram.0", "acc.0");
+  toAcc.latencyCycles = 1;
+  toAcc.bandwidthBytesPerCycle = 1u << 20;
+  model.links = {slowDirect, toDram, toAcc};
+  return model;
+}
+
+/// `objectiveReplicationMachine` with the producer on e0/sram.0 and the
+/// consumers on e1/acc.0, so no consumer can read the producer's placement and
+/// the fan-out must replicate.
+ConnectionRequest objectiveReplicationRequest() {
+  ConnectionRequest request = baseRequest();
+  request.producerMemory = "sram.0";
+  request.consumerMemory = "acc.0";
+  request.producerExecutor = "e0";
+  request.consumerExecutor = "e1";
+  return request;
+}
+
+// §17.1: the copy a replicating fan-out emits is a ranked choice, so it must
+// follow the declared `micro.objective`, never a hard-coded `latencyCycles`.
+// Here the two routes order oppositely -- fast-but-DRAM-crossing versus
+// slow-but-DRAM-free -- so a latency objective must take the fast route and a
+// `dram_bytes` objective the DRAM-free one. Before the fix the selection
+// ignored `objective` and always returned the latency-cheapest copy, so the
+// `dram_bytes` half is the regression guard.
+TEST(Connections, FanOutSelectsCopiesByTheDeclaredObjective) {
+  MachineModel machine = objectiveReplicationMachine();
+  TopologyService topology(machine);
+  ConnectionRequest base = objectiveReplicationRequest();
+  std::vector<ConnectionRequest> consumers = {
+      consumerRequest(base, 11, "acc.0"), consumerRequest(base, 12, "acc.0")};
+
+  llvm::Expected<ObjectiveOrder> latency =
+      objectiveOrderFromMicro("latency_cycles", /*minimize=*/true);
+  ASSERT_TRUE(static_cast<bool>(latency))
+      << llvm::toString(latency.takeError());
+  llvm::Expected<std::vector<ConnectionPlan>> byLatency =
+      synthesizeFanOut(base, consumers, machine, topology, PlacementOptions(),
+                       nullptr, *latency);
+  ASSERT_TRUE(static_cast<bool>(byLatency))
+      << llvm::toString(byLatency.takeError());
+  ASSERT_EQ(byLatency->size(), 1u);
+  EXPECT_EQ((*byLatency)[0].kind, ConnectionKind::Replicate);
+  ASSERT_EQ((*byLatency)[0].memoryRoute.size(), 3u); // sram -> dram -> acc
+  EXPECT_EQ((*byLatency)[0].cost.dramBytes, 2u * base.bytes);
+
+  llvm::Expected<ObjectiveOrder> dramBytes =
+      objectiveOrderFromMicro("dram_bytes", /*minimize=*/true);
+  ASSERT_TRUE(static_cast<bool>(dramBytes))
+      << llvm::toString(dramBytes.takeError());
+  llvm::Expected<std::vector<ConnectionPlan>> byDramBytes =
+      synthesizeFanOut(base, consumers, machine, topology, PlacementOptions(),
+                       nullptr, *dramBytes);
+  ASSERT_TRUE(static_cast<bool>(byDramBytes))
+      << llvm::toString(byDramBytes.takeError());
+  ASSERT_EQ(byDramBytes->size(), 1u);
+  EXPECT_EQ((*byDramBytes)[0].kind, ConnectionKind::Replicate);
+  ASSERT_EQ((*byDramBytes)[0].memoryRoute.size(), 2u); // sram -> acc, no DRAM
+  EXPECT_EQ((*byDramBytes)[0].cost.dramBytes, 0u);
+}
+
 TEST(Connections, FanInProducesOneReducePlan) {
   ConnectionPlan plan =
       synthesizeFanIn(std::vector<InstanceId>{1, 2, 3},

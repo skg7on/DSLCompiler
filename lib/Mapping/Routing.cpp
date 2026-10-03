@@ -39,13 +39,6 @@ bool supportsAlignment(const MemoryNode &memory, uint64_t alignmentBytes) {
   return memory.alignmentBytes % alignmentBytes == 0;
 }
 
-/// A memory supports a declared layout when it names it. A memory that
-/// declares no layouts supports none, so a request that asks for one is
-/// rejected rather than assumed: unknown is not the same as unconstrained.
-bool supportsLayout(const MemoryNode &memory, llvm::StringRef layout) {
-  return llvm::is_contained(memory.supportedLayouts, layout);
-}
-
 /// A hop is legal when its link declares an engine that can reach the link's
 /// source memory. The engine's executor must see the memory the data comes
 /// from, which is what makes a transfer physically possible.
@@ -76,7 +69,7 @@ std::optional<ExecutorId> legalHop(const MachineModel &model,
     return std::nullopt;
   if (!supportsAlignment(next, request.alignmentBytes))
     return std::nullopt;
-  if (request.layoutClass && !supportsLayout(next, *request.layoutClass))
+  if (request.layoutClass && !memorySupportsLayout(next, *request.layoutClass))
     return std::nullopt;
   // Intermediate storage must hold the value on top of whatever is already
   // live there; the destination already holds the value, so it is exempt from
@@ -148,6 +141,10 @@ std::vector<const LinkEdge *> outgoing(const MachineModel &model,
 
 } // namespace
 
+bool memorySupportsLayout(const MemoryNode &memory, llvm::StringRef layout) {
+  return llvm::is_contained(memory.supportedLayouts, layout);
+}
+
 TopologyService::TopologyService(const MachineModel &model,
                                  RouteOptions options)
     : model_(model), options_(options) {}
@@ -200,11 +197,11 @@ TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
                       "-byte alignment");
 
   if (request.layoutClass) {
-    if (!supportsLayout(*source, *request.layoutClass))
+    if (!memorySupportsLayout(*source, *request.layoutClass))
       return routeError("memory '" + source->id +
                         "' does not support layout '" + *request.layoutClass +
                         "'");
-    if (!supportsLayout(*destination, *request.layoutClass))
+    if (!memorySupportsLayout(*destination, *request.layoutClass))
       return routeError("memory '" + destination->id +
                         "' does not support layout '" + *request.layoutClass +
                         "'");
