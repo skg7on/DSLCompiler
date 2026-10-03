@@ -475,6 +475,127 @@ module {
 }
 )mlir";
 
+/// Two movements that share their endpoint *kinds* (`l2 -> sram`) but target
+/// different nodes of the same kind. Each copy carries the identity the binder
+/// stamps on a per-hop copy -- its connection value and destination node -- so
+/// the two links are told apart by node id, not by kind.
+constexpr llvm::StringLiteral kTwoSameKindRoutes = R"mlir(
+module {
+  micro.kernel @two_routes attributes {micro.routes = [{value = 0 : i64, kind = "transfer", route = ["l2.0", "sram.0"]}, {value = 1 : i64, kind = "transfer", route = ["l2.0", "sram.1"]}]} {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %b = tensor.empty() : tensor<8x8xf32>
+    %ta, %toka = micro.async_copy %a {src_memory = #micro.memory<l2>, dst_memory = #micro.memory<sram>, micro.value = 0 : i64, micro.dst_node = "sram.0"} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    %tb, %tokb = micro.async_copy %b {src_memory = #micro.memory<l2>, dst_memory = #micro.memory<sram>, micro.value = 1 : i64, micro.dst_node = "sram.1"} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.wait %toka, %tokb
+    micro.yield
+  }
+}
+)mlir";
+
+/// A copy that carries the connection value but not a stamped destination
+/// node: the route is applied as a whole, so the value alone must pick the
+/// right one when two routes share the endpoint kind pair.
+constexpr llvm::StringLiteral kValueTaggedCopy = R"mlir(
+module {
+  micro.kernel @valued attributes {micro.routes = [{value = 0 : i64, kind = "transfer", route = ["dram.0", "l2.0", "sram.0"]}, {value = 1 : i64, kind = "transfer", route = ["dram.0", "l2.0", "sram.1"]}]} {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>, micro.value = 1 : i64} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.yield
+  }
+}
+)mlir";
+
+/// A routed copy inside a two-trip loop. The same op is built for every
+/// unrolled iteration, so a route claimed once must stay claimed by that op.
+constexpr llvm::StringLiteral kRoutedLoopCopy = R"mlir(
+module {
+  micro.kernel @loop_copy attributes {micro.routes = [{value = 0 : i64, kind = "transfer", route = ["dram.0", "l2.0", "sram.0"]}]} {
+    %c0 = arith.constant 0 : index
+    %c2 = arith.constant 2 : index
+    %c1 = arith.constant 1 : index
+    micro.for %i = %c0 to %c2 step %c1 {
+      %ext = tensor.empty() : tensor<8x8xf32>
+      %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+      micro.yield
+    }
+    micro.yield
+  }
+}
+)mlir";
+
+/// A machine with two SRAM nodes of the same kind, reached by links that cost
+/// 5 and 50 cycles, so a wrong-link charge is visible as equal cost.
+constexpr llvm::StringLiteral kTwoSramMachine = R"yaml(
+schema: llk.machine.v2
+target: two-sram
+clock_hz: 1000000000
+worker_threads: 1
+executors:
+  - id: cluster.0
+    kind: cluster
+memories:
+  - id: dram.0
+    kind: dram
+    visible_from: cluster.0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 1
+  - id: l2.0
+    kind: l2
+    visible_from: cluster.0
+    capacity_bytes: 262144
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 1
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.0
+    capacity_bytes: 65536
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 1
+  - id: sram.1
+    kind: sram
+    visible_from: cluster.0
+    capacity_bytes: 65536
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 1
+transfer_engines:
+  - id: dma.0
+    kind: dma
+    attached_to: cluster.0
+    count: 1
+    max_outstanding: 1
+links:
+  - id: dram_to_l2.0
+    source: dram.0
+    destination: l2.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 20
+    transaction_bytes: 64
+    transfer_engines: [dma.0]
+  - id: l2_to_sram.0
+    source: l2.0
+    destination: sram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 5
+    transaction_bytes: 64
+    transfer_engines: [dma.0]
+  - id: l2_to_sram.1
+    source: l2.0
+    destination: sram.1
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 50
+    transaction_bytes: 64
+    transfer_engines: [dma.0]
+)yaml";
+
 } // namespace
 
 TEST(L1ResourceDag, ARoutedMovementIsChargedPerHop) {
@@ -502,6 +623,63 @@ TEST(L1ResourceDag, ARoutedMovementIsChargedPerHop) {
   // The second hop waits for the first: data has to arrive before it moves on.
   ASSERT_EQ(routedDag->events[1].deps.size(), 1u);
   EXPECT_EQ(routedDag->events[1].deps[0], routedDag->events[0].id);
+}
+
+TEST(L1ResourceDag, SameKindEndpointsChargeTheirOwnRoute) {
+  // Two movements from L2 to SRAM, routed to two different SRAM nodes of the
+  // same kind. Matching by kind alone would charge both the first route; the
+  // node-id identity is what gives each movement its own link.
+  auto parsed = parseKernel(kTwoSameKindRoutes);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(kTwoSramMachine);
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  // Two copies plus the wait that joins them.
+  ASSERT_EQ(dag->events.size(), 3u);
+  ASSERT_EQ(dag->events[0].kind, EventKind::AsyncCopy);
+  ASSERT_EQ(dag->events[1].kind, EventKind::AsyncCopy);
+
+  // Same bytes, same bandwidth, different links: the copy stamped `sram.0`
+  // charges the 5-cycle link (5 + 256/64 = 9) and the one stamped `sram.1` the
+  // 50-cycle link (54). Equal costs would mean both were charged the same link;
+  // these exact numbers pin each copy to its own node's link.
+  EXPECT_EQ(dag->events[0].minCycles, 9u);
+  EXPECT_EQ(dag->events[1].minCycles, 54u);
+}
+
+TEST(L1ResourceDag, AValueTaggedCopyTakesItsOwnRoute) {
+  // Two routes share the `dram -> sram` kind pair but end at different SRAM
+  // nodes. The copy names the connection value (1) but no destination node, so
+  // the value alone must select the `sram.1` route -- the order fallback would
+  // take the first (`sram.0`) route.
+  auto parsed = parseKernel(kValueTaggedCopy);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(kTwoSramMachine);
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 2u);
+  // dram -> l2 (20 + 4 = 24) then l2 -> sram.1 (50 + 4 = 54).
+  EXPECT_EQ(dag->events[0].minCycles, 24u);
+  EXPECT_EQ(dag->events[1].minCycles, 54u);
+}
+
+TEST(L1ResourceDag, AnUnrolledRoutedCopyKeepsItsRoute) {
+  // One routed copy in a two-trip loop. Every unrolled iteration builds the
+  // same op, so the route it was matched to must stay with that op -- not be
+  // consumed by the first iteration and leave the second charged end to end.
+  auto parsed = parseKernel(kRoutedLoopCopy);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+
+  // Two iterations times the two hops of dram -> l2 -> sram.
+  ASSERT_EQ(dag->events.size(), 4u);
+  for (const MicroEvent &event : dag->events)
+    EXPECT_EQ(event.costKind, mapping::CostEventKind::TransferHop);
 }
 
 TEST(L1ResourceDag, EveryEventCarriesItsSharedCostCategory) {

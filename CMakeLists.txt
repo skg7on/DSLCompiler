@@ -726,6 +726,11 @@ endfunction()
 add_llk_perf_test(L0StaticBoundTest test/Perf/l0_static_bound.cpp)
 add_llk_perf_test(L1ResourceDAGTest test/Perf/l1_resource_dag.cpp)
 
+# Binder -> perf route identity: builds a real plan, binds it, and charges the
+# bound kernel. Crosses the mapping/perf boundary, so it links LLKMapping too.
+add_llk_perf_test(RouteIdentityTest test/Perf/route_identity.cpp)
+target_link_libraries(RouteIdentityTest PRIVATE LLKMapping)
+
 # Tuning-core tests (issue #49): the search-space loader, candidate
 # generation, and machine-aware legality. The loader test parses micro IR;
 # the other two build typed spaces directly, so a failure points at one layer.

@@ -280,6 +280,14 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       copyState.addTypes(copyResultTypes);
       copyState.addAttribute("src_memory", hopSrc);
       copyState.addAttribute("dst_memory", hopDst);
+      // Target-neutral identity for the performance model (design
+      // §12.4/§23.3): which connection this hop belongs to, and the concrete
+      // memory node it lands in. Without it a movement is indistinguishable
+      // from the other movements that share its endpoint memory *kinds*, and
+      // is charged the wrong link.
+      copyState.addAttribute("micro.value", u64Attr(context, connection.value));
+      copyState.addAttribute("micro.dst_node",
+                             mlir::StringAttr::get(context, to->id));
       mlir::Operation *copy = builder.create(copyState);
 
       mlir::OperationState waitState(producer->getLoc(), "micro.wait");

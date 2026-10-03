@@ -45,6 +45,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -143,11 +144,23 @@ struct MicroDAG {
   std::vector<std::string> ownerWarnings;
 };
 
-/// A route the selected plan chose: the links it crosses, in order, keyed by
-/// the memory *spaces* its endpoints belong to. A concrete `micro.async_copy`
-/// names spaces (`dram` to `sram`), while a route names nodes (`dram.0`), so
-/// this is how the two are matched.
+/// A route the selected plan chose: the concrete endpoint *nodes* it connects
+/// and the links it crosses, in order. The identity a movement is matched by is
+/// the one the binder stamps on its copy -- the connection value and the hop's
+/// destination node (`micro.value` / `micro.dst_node`); a hand-written kernel
+/// that stamps neither falls back to the node pair its endpoint spaces resolve
+/// to, and only when a space names several nodes to the plan's route order. The
+/// spaces are carried alongside to narrow the candidates.
 struct PlannedRoute {
+  /// The connection this route carries, when the binder recorded it. Two
+  /// movements can share an endpoint-kind pair (`l2 -> sram`), so the node pair
+  /// and this value are what tell their routes apart.
+  std::optional<uint64_t> value;
+  /// False for a route that is not materialized as a movement (a reduce, a
+  /// pure layout transform), so it is never charged to a copy op.
+  bool moves = true;
+  std::string srcNode;
+  std::string dstNode;
   std::string srcSpace;
   std::string dstSpace;
   std::vector<const machine::LinkEdge *> hops;
