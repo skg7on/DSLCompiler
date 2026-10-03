@@ -33,3 +33,11 @@ rule accel.mma_bf16 {
   emit "accel_mxu";
   cost 8;
 }
+
+rule accel.async_copy {
+  match micro.async_copy();
+  require executor kind pe;
+  bundle "accel.copy";
+  emit "accel_copy";
+  cost 1;
+}

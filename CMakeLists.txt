@@ -762,6 +762,7 @@ add_llk_mapping_test(MappingCoveringSearchTest test/Mapping/covering_search.cpp)
 add_llk_mapping_test(MappingAvx2TargetTest test/Mapping/avx2_target.cpp)
 add_llk_mapping_test(MappingGenericAcceleratorTargetTest test/Mapping/generic_accelerator_target.cpp)
 add_llk_mapping_test(MappingPlanBinderTest test/Mapping/plan_binder.cpp)
+add_llk_mapping_test(MappingE2EWorkflowTest test/Mapping/e2e_workflow.cpp)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
