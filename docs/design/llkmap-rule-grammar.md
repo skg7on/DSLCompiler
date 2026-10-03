@@ -26,7 +26,7 @@ predicate ::= attr-predicate | port-predicate
 attr-predicate ::= ident "=" literal
 port-predicate ::= [ subject "." ] property
 subject   ::= ( "input" | "output" ) "[" int "]"
-property  ::= "element_type" "=" ident
+property  ::= "element_type" "=" ( ident | string )
             | "shape" "[" int "]" "=" int
             | "access_map" "=" map
 map       ::= "(" ident ("," ident)* ")" "->" "(" expr ("," expr)* ")"
@@ -118,6 +118,8 @@ Parsing rejects, with a `file:line:column` diagnostic:
 - a `shape` predicate without a dimension index, a port subject naming a
   property other than `element_type`/`shape`/`access_map`, or a missing
   non-negative port index;
+- a malformed predicate value: `element_type` must be symbolic and `shape`
+  must be an integer;
 - an `access_map` that references a dimension it did not declare, or that is
   not affine;
 - an identifier in a `require` that is neither a declared parameter nor a builtin;

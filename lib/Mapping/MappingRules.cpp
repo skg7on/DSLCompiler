@@ -81,6 +81,11 @@ bool isAffineSpecExpr(const Expr &expr) {
   return false;
 }
 
+/// The literal a predicate is allowed to take. Typing the value at parse time
+/// keeps a malformed rule (`element_type = 4`) a load-time diagnostic rather
+/// than a `std::bad_variant_access` on the first match.
+enum class PredicateValueKind { Any, Int, Symbol };
+
 class RuleParser : public LlkMapParser {
 public:
   RuleParser(std::vector<LlkMapToken> tokens, llvm::StringRef source)
@@ -92,7 +97,7 @@ private:
   bool parseRule(RuleDef &out);
   bool parseMatch(RuleDef &out);
   bool parsePredicate(RulePredicate &out);
-  bool parsePredicateValue(LayoutValue &out);
+  bool parsePredicateValue(LayoutValue &out, PredicateValueKind expected);
   bool parseAffineMapSpec(AffineMapSpec &out);
   bool parseDomain(RuleDef &out);
   bool parseRequire(RuleDef &out);
@@ -199,25 +204,28 @@ bool RuleParser::parseMatch(RuleDef &out) {
   return expectPunct(";");
 }
 
-bool RuleParser::parsePredicateValue(LayoutValue &out) {
+bool RuleParser::parsePredicateValue(LayoutValue &out,
+                                     PredicateValueKind expected) {
   if (!expectPunct("="))
     return false;
-  if (current().kind == LlkMapToken::Kind::Int) {
+  if (expected != PredicateValueKind::Symbol &&
+      current().kind == LlkMapToken::Kind::Int) {
     out = current().intValue;
     advance();
     return true;
   }
-  if (current().kind == LlkMapToken::Kind::String) {
+  // A bare name such as `bf16`, or a quoted name, is a symbolic value.
+  if (expected != PredicateValueKind::Int &&
+      (current().kind == LlkMapToken::Kind::String ||
+       current().kind == LlkMapToken::Kind::Identifier)) {
     out = current().text;
     advance();
     return true;
   }
-  // A bare name such as `bf16` is a symbolic value.
-  if (current().kind == LlkMapToken::Kind::Identifier) {
-    out = current().text;
-    advance();
-    return true;
-  }
+  if (expected == PredicateValueKind::Int)
+    return failAt(current(), "expected an integer predicate value");
+  if (expected == PredicateValueKind::Symbol)
+    return failAt(current(), "expected a symbolic predicate value");
   return failAt(current(), "expected a predicate value");
 }
 
@@ -299,7 +307,7 @@ bool RuleParser::parsePredicate(RulePredicate &out) {
   if (name == "element_type") {
     out.kind = RulePredicateKind::ElementType;
     out.attribute = std::move(name);
-    return parsePredicateValue(out.value);
+    return parsePredicateValue(out.value, PredicateValueKind::Symbol);
   }
   if (name == "shape") {
     if (!expectPunct("["))
@@ -314,7 +322,7 @@ bool RuleParser::parsePredicate(RulePredicate &out) {
       return false;
     out.kind = RulePredicateKind::Shape;
     out.attribute = std::move(name);
-    return parsePredicateValue(out.value);
+    return parsePredicateValue(out.value, PredicateValueKind::Int);
   }
   if (name == "access_map") {
     if (!expectPunct("="))
@@ -335,7 +343,7 @@ bool RuleParser::parsePredicate(RulePredicate &out) {
 
   out.kind = RulePredicateKind::Attribute;
   out.attribute = std::move(name);
-  return parsePredicateValue(out.value);
+  return parsePredicateValue(out.value, PredicateValueKind::Any);
 }
 
 bool RuleParser::parseDomain(RuleDef &out) {
@@ -626,33 +634,39 @@ bool predicateMatches(const RulePredicate &predicate,
   case RulePredicateKind::Attribute:
     return attributeMatches(predicate, node.attributes);
   case RulePredicateKind::ElementType: {
-    const std::string &expected = std::get<std::string>(predicate.value);
+    const auto *expected = std::get_if<std::string>(&predicate.value);
+    if (!expected)
+      return false;
     bool exposed = false;
     for (const WorkloadPort *port : subjectPorts(predicate, node)) {
       mlir::Type element = elementTypeOf(port->type);
       if (!element)
         continue;
-      if (printedType(element) != expected)
+      if (printedType(element) != *expected)
         return false;
       exposed = true;
     }
     return exposed;
   }
   case RulePredicateKind::Shape: {
-    int64_t expected = std::get<int64_t>(predicate.value);
+    const auto *expected = std::get_if<int64_t>(&predicate.value);
+    if (!expected)
+      return false;
     bool exposed = false;
     for (const WorkloadPort *port : subjectPorts(predicate, node)) {
       std::optional<llvm::SmallVector<int64_t, 4>> shape = shapeOf(port->type);
       if (!shape || predicate.dimension < 0 ||
           static_cast<size_t>(predicate.dimension) >= shape->size())
         continue;
-      if ((*shape)[predicate.dimension] != expected)
+      if ((*shape)[predicate.dimension] != *expected)
         return false;
       exposed = true;
     }
     return exposed;
   }
   case RulePredicateKind::AccessMap: {
+    if (!predicate.accessMap)
+      return false;
     const AffineMapSpec &spec = *predicate.accessMap;
     bool exposed = false;
     for (const WorkloadPort *port : subjectPorts(predicate, node)) {

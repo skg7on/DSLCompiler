@@ -25,7 +25,7 @@ namespace {
 constexpr llvm::StringLiteral kRules = R"llkmap(
 // AVX2 mapping rules.
 rule avx2.vector_add v1 {
-  match micro.vector(kind = "add", element_type = f32);
+  match micro.vector(kind = "add", input[0].element_type = f32);
   param VW in [4..8];
   require VW == machine.compute("vector_engine").lanes(element_type);
   require executor kind worker;
@@ -39,7 +39,7 @@ rule avx2.vector_add v1 {
 }
 
 rule avx2.mma_bf16 {
-  match micro.mma(element_type = bf16);
+  match micro.mma(input[0].element_type = bf16);
   require executor kind worker;
   require compute kind matrix_engine;
   bundle "avx2.mma.bf16";
@@ -83,7 +83,13 @@ TEST(RuleParse, ParsesRuleDeclarations) {
   EXPECT_EQ(rule->matchOp, "micro.vector");
   ASSERT_EQ(rule->predicates.size(), 2u);
   EXPECT_EQ(predicateText(*rule, 0), "kind=add");
-  EXPECT_EQ(predicateText(*rule, 1), "element_type=f32");
+  // The second predicate is the port element type, not an `element_type`
+  // attribute: the fixture spells it explicitly so the two cannot drift.
+  EXPECT_EQ(rule->predicates[1].kind, RulePredicateKind::ElementType);
+  EXPECT_TRUE(rule->predicates[1].directionSet);
+  EXPECT_TRUE(rule->predicates[1].isInput);
+  EXPECT_EQ(rule->predicates[1].portIndex, 0);
+  EXPECT_EQ(std::get<std::string>(rule->predicates[1].value), "f32");
   EXPECT_EQ(rule->params.size(), 1u);
   EXPECT_EQ(rule->domains.size(), 1u);
   EXPECT_EQ(rule->constraints.size(), 1u);
@@ -118,6 +124,11 @@ TEST(RuleParse, DefaultsVersionToOne) {
   ASSERT_NE(rule, nullptr);
   EXPECT_EQ(rule->version, 1u);
   EXPECT_FALSE(rule->costLowerBound.has_value());
+  // The fixture matches the first operand's dtype, so the predicates cannot
+  // silently revert to an `element_type` attribute.
+  ASSERT_EQ(rule->predicates.size(), 1u);
+  EXPECT_EQ(rule->predicates[0].kind, RulePredicateKind::ElementType);
+  EXPECT_EQ(rule->predicates[0].portIndex, 0);
 }
 
 TEST(RuleParse, RejectsDuplicateRuleId) {
@@ -703,6 +714,49 @@ TEST(RuleMatch, ReadsElementTypeAndShapeFromAMicroTile) {
   EXPECT_TRUE(matchRules(typedVectorNode(tile, tile), *wrongType).empty());
 }
 
+TEST(RuleMatch, MatchesMmaOnItsFirstOperandDtype) {
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  mlir::Type bf16 = mlir::BFloat16Type::get(&context);
+
+  llvm::Expected<RuleRegistry> registry =
+      parseOne("micro.mma(input[0].element_type = bf16)");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+
+  // The shipped `avx2.mma_bf16` rule uses exactly this predicate: it reads the
+  // lhs (first operand) dtype, not the operation's `input` attribute.
+  WorkloadNode bf16Operands;
+  bf16Operands.opName = "micro.mma";
+  for (mlir::Type type : {bf16, bf16, f32}) {
+    WorkloadPort port;
+    port.type = type;
+    bf16Operands.inputs.push_back(port);
+  }
+  EXPECT_EQ(matchedIds(bf16Operands, *registry),
+            (std::vector<std::string>{"r"}));
+
+  WorkloadNode f32Operands;
+  f32Operands.opName = "micro.mma";
+  for (mlir::Type type : {f32, f32, f32}) {
+    WorkloadPort port;
+    port.type = type;
+    f32Operands.inputs.push_back(port);
+  }
+  EXPECT_TRUE(matchRules(f32Operands, *registry).empty());
+}
+
+TEST(RuleMatch, AnOutOfRangePortIndexDoesNotMatch) {
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  llvm::Expected<RuleRegistry> registry =
+      parseOne("micro.vector(input[2].element_type = f32)");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  // The node has one input, so input[2] is absent, never a wildcard.
+  EXPECT_TRUE(matchRules(typedVectorNode(f32, f32), *registry).empty());
+}
+
 TEST(RuleParse, RejectsMalformedPortPredicates) {
   // `shape` needs a dimension index.
   EXPECT_FALSE(parses(R"llkmap(
@@ -723,6 +777,14 @@ rule a { match micro.vector(access_map = (d0) -> (d1)); bundle "b"; emit "e"; }
   // A non-affine access map is rejected at load time.
   EXPECT_FALSE(parses(R"llkmap(
 rule a { match micro.vector(access_map = (d0, d1) -> (d0 * d1)); bundle "b"; emit "e"; }
+)llkmap"));
+  // An element type must be symbolic, a shape must be an integer: a malformed
+  // value is a load-time error, never a bad-variant abort on first match.
+  EXPECT_FALSE(parses(R"llkmap(
+rule a { match micro.vector(element_type = 4); bundle "b"; emit "e"; }
+)llkmap"));
+  EXPECT_FALSE(parses(R"llkmap(
+rule a { match micro.vector(shape[0] = f32); bundle "b"; emit "e"; }
 )llkmap"));
 }
 
