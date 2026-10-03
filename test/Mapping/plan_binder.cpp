@@ -373,14 +373,14 @@ links:
     destination: l2.0
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 220
-    transaction_bytes: 4096
+    transaction_bytes: 64
     transfer_engines: [dma.0]
   - id: l2_to_sram.0
     source: l2.0
     destination: sram.0
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 12
-    transaction_bytes: 4096
+    transaction_bytes: 64
     transfer_engines: [dma.0]
 )yaml";
 

@@ -65,13 +65,16 @@ struct RouteRequest {
   /// in `supportedLayouts`; a memory that declares none supports none.
   std::optional<std::string> layoutClass;
 
-  /// Bytes already live in each *intermediate* memory a route stages through.
-  /// A hop into an intermediate is legal only when
-  /// `capacityBytes - liveBytesOnIntermediate` still holds `bytes`. A single
-  /// scalar, not a per-node map, because the routing layer evaluates one
-  /// connection at a time and keeps no node-occupancy vector; 0 means the
-  /// caller models no live data. The destination already holds the value, so
-  /// it is exempt, as it is from the plain capacity check.
+  /// Live bytes charged against *every* intermediate memory a route stages
+  /// through -- one scalar, not a per-node occupancy figure. A hop into an
+  /// intermediate is legal only when
+  /// `capacityBytes - min(liveBytesOnIntermediate, capacityBytes) >= bytes`.
+  /// The single scalar is deliberate: the routing layer evaluates one
+  /// connection at a time and keeps no node-occupancy vector, so it cannot
+  /// distinguish the intermediates' occupancies; a caller that needs per-node
+  /// precision must supply the tightest figure. 0 means the caller models no
+  /// live data. The destination already holds the value, so it is exempt, as
+  /// it is from the plain capacity check.
   uint64_t liveBytesOnIntermediate = 0;
 };
 

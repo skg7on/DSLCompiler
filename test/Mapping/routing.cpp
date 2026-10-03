@@ -42,18 +42,14 @@ MemoryNode memory(llvm::StringRef id, llvm::StringRef visibleFrom,
 
 LinkEdge link(llvm::StringRef id, llvm::StringRef source,
               llvm::StringRef destination, double bandwidth, uint64_t latency,
-              std::vector<std::string> engines = {"dma.0"},
-              uint64_t transactionBytes = 4096) {
+              std::vector<std::string> engines = {"dma.0"}) {
   LinkEdge edge;
   edge.id = id.str();
   edge.source = source.str();
   edge.destination = destination.str();
   edge.bandwidthBytesPerCycle = bandwidth;
   edge.latencyCycles = latency;
-  // 4096 bytes by default, comfortably above the 1 KiB values these fixtures
-  // move, so the §12.2 transaction-size check does not reject them. Tests that
-  // exercise the check lower this explicitly.
-  edge.transactionBytes = transactionBytes;
+  edge.transactionBytes = 64;
   edge.transferEngines = std::move(engines);
   return edge;
 }
@@ -237,6 +233,18 @@ TEST(Routing, DoesNotReportTruncationWhenTheHopCapHasNoLegalExtension) {
   EXPECT_FALSE(truncated);
 }
 
+TEST(Routing, DoesNotReportTruncationWhenARouteIsFoundWithinTheHopCap) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  // The two-hop route fits under a four-hop cap and no path reaches it.
+  TopologyService service(model, RouteOptions{/*maxRoutes=*/8, /*maxHops=*/4});
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  bool truncated = false;
+  auto result = service.enumerateRoutes(request, 8, &truncated);
+  ASSERT_TRUE(static_cast<bool>(result));
+  EXPECT_EQ(result->front().hopCount(), 2u);
+  EXPECT_FALSE(truncated);
+}
+
 TEST(Routing, SameMemoryIsATrivialRoute) {
   MachineModel model = diamond();
   TopologyService service(model);
@@ -318,18 +326,54 @@ TEST(Routing, AcceptsLayoutEveryHopSupports) {
   EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
-TEST(Routing, RejectsValueLargerThanTheLinkTransaction) {
+TEST(Routing, RejectsLayoutNoMemoryDeclares) {
+  // chain() declares no layouts; unknown is not unconstrained, so a request
+  // that names one is rejected rather than allowed through.
   MachineModel model = chain(/*sramCapacity=*/32768);
-  // The first hop can only move 64-byte transactions but the value is 1 KiB.
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  request.layoutClass = "row_major";
+  EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, ReportsTheEndpointLayoutDiagnostic) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  model.memories[0].supportedLayouts = {"row_major"}; // dram supports it
+  // acc declares tiled only, so the destination endpoint rejects the layout.
+  model.memories[2].supportedLayouts = {"tiled"};
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  request.layoutClass = "row_major";
+  auto result = service.enumerateRoutes(request, 8);
+  ASSERT_FALSE(static_cast<bool>(result));
+  std::string message = llvm::toString(result.takeError());
+  EXPECT_NE(message.find("does not support layout"), std::string::npos)
+      << message;
+}
+
+TEST(Routing, RejectsValueNotExpressibleInWholeTransactions) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  // The link moves 64-byte transactions; a 100-byte value is one full
+  // transaction plus a 36-byte remainder, so it is not transferable.
   model.links[0].transactionBytes = 64;
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 100, 32);
+  EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, RejectsZeroTransactionGranularity) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  // A zero granularity admits no whole transaction (and would divide by zero).
+  model.links[0].transactionBytes = 0;
   TopologyService service(model);
   RouteRequest request = routeRequest("dram", "acc", 1024, 32);
   EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
-TEST(Routing, AcceptsValueFittingTheLinkTransaction) {
+TEST(Routing, AcceptsValueThatTilesTheLinkGranularity) {
   MachineModel model = chain(/*sramCapacity=*/32768);
-  model.links[0].transactionBytes = 1024;
+  // 1 KiB is sixteen 64-byte transactions.
+  model.links[0].transactionBytes = 64;
   TopologyService service(model);
   RouteRequest request = routeRequest("dram", "acc", 1024, 32);
   EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));

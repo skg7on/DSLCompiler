@@ -60,17 +60,19 @@ std::optional<ExecutorId> legalEngine(const MachineModel &model,
 }
 
 /// The engine for a hop into `next`, or nullopt when the hop violates any
-/// §12.2 fact the machine models: the link cannot carry the value in one
-/// transaction, the destination memory does not support the value's alignment
-/// or layout, the intermediate has no room once live data is counted, or no
-/// engine can reach the link's source. Returns the engine so the caller can
-/// record it and cost the hop.
+/// §12.2 fact the machine models: the value is not expressible in whole
+/// transactions over the link, the destination memory does not support the
+/// value's alignment or layout, the intermediate has no room once live data is
+/// counted, or no engine can reach the link's source. Returns the engine so the
+/// caller can record it and cost the hop.
 std::optional<ExecutorId> legalHop(const MachineModel &model,
                                    const LinkEdge &link, const MemoryNode &next,
                                    const RouteRequest &request,
                                    MemoryNodeId destination) {
-  // The link must move the value in a single transaction.
-  if (request.bytes > link.transactionBytes)
+  // `transactionBytes` is a granularity, not a size cap: a value must tile
+  // into whole transactions. A zero granularity admits none (and would divide
+  // by zero), so it is rejected rather than assumed.
+  if (link.transactionBytes == 0 || request.bytes % link.transactionBytes != 0)
     return std::nullopt;
   if (!supportsAlignment(next, request.alignmentBytes))
     return std::nullopt;
@@ -178,7 +180,10 @@ TopologyService::enumerateRoutes(const RouteRequest &request, unsigned limit,
 
   llvm::SmallVector<MemoryRoute> routes;
   if (source->id == destination->id) {
-    // Nothing to move; a route with no hops is the honest answer.
+    // Nothing to move; a route with no hops is the honest answer. No transfer
+    // is attempted, so the endpoint alignment and layout checks below do not
+    // apply -- a value already sitting in its endpoint memory is not moved
+    // through that memory's transfer path.
     MemoryRoute trivial;
     trivial.nodes.push_back(source->id);
     routes.push_back(std::move(trivial));

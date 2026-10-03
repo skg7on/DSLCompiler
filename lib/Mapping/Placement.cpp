@@ -335,11 +335,15 @@ synthesizeConnections(const ConnectionRequest &request,
   route.alignmentBytes = request.alignmentBytes;
   route.producerExecutor = request.producerExecutor;
   route.consumerExecutor = request.consumerExecutor;
-  // layoutClass and liveBytesOnIntermediate stay unset. A transfer between two
-  // differently laid-out ports carries no single layout fact -- the transform
-  // that reconciles them is a separate connection -- and this layer keeps no
-  // occupancy state, so neither check can be answered here rather than
-  // guessed.
+  // The value leaves the producer in its layout, so that is the layout the hop
+  // memories must support; the consumer's (possibly different) layout is
+  // reached by the transform a later connection materializes. Threaded only
+  // when the producer states it.
+  if (request.producerLayout)
+    route.layoutClass = *request.producerLayout;
+  // liveBytesOnIntermediate stays unset: this layer keeps no occupancy state,
+  // so it has no live-byte figure to supply rather than a zero that would
+  // silently assert the intermediates are empty.
   llvm::Expected<llvm::SmallVector<MemoryRoute>> routes =
       topology.enumerateRoutes(route, options.maxRoutesPerConnection,
                                truncated);
