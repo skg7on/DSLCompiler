@@ -69,6 +69,11 @@ struct MemoryNode {
   uint64_t alignmentBytes = 1;
   std::vector<std::string> supportedLayouts;
   std::optional<uint32_t> banks;
+  /// Cost of *accessing* this memory, as opposed to moving between two of
+  /// them: a link carries transfer cost, a memory carries access cost. Zero
+  /// means the profile does not model it.
+  double bandwidthBytesPerCycle = 0.0;
+  uint64_t latencyCycles = 0;
 };
 
 /// A capability attached to an executor.
@@ -88,6 +93,10 @@ struct ComputeNode {
   uint64_t latencyCycles = 0;
   std::optional<double> throughputPerCycle;
   uint32_t concurrency = 1;
+  /// Element types this capability accumulates into, when it distinguishes
+  /// them from its inputs. Ranked by the checks that guard accumulator
+  /// capacity and MMA compatibility.
+  std::vector<std::string> accumulatorDTypes;
 };
 
 /// A resource that moves data over links, attached to an executor.
@@ -97,6 +106,8 @@ struct TransferEngineNode {
   std::string attachedTo;
   uint32_t count = 1;
   uint32_t maxOutstanding = 1;
+  /// Fixed cost of starting a transfer, independent of its size.
+  uint64_t setupCycles = 0;
 };
 
 /// A directed data path between two memories.
@@ -111,10 +122,25 @@ struct LinkEdge {
   uint32_t concurrency = 1;
 };
 
+/// Synchronization costs a machine charges for its barriers and waits.
+struct SyncModel {
+  uint64_t barrierCycles = 0;
+  uint64_t waitCycles = 0;
+};
+
 struct MachineModel {
   uint32_t schemaMajor = kSupportedSchemaMajor;
   std::string target;
   std::string description;
+
+  /// Clock rate, absent when the profile does not model one. A cycle estimate
+  /// is still meaningful without it; a *nanosecond* estimate is not, which is
+  /// why this is optional rather than zero.
+  std::optional<uint64_t> clockHz;
+  /// Host workers available to the target. Defaults to 1: a machine that does
+  /// not model thread-level parallelism still executes somewhere.
+  uint32_t workerThreads = 1;
+  SyncModel sync;
 
   std::vector<ExecutorNode> executors;
   std::vector<MemoryNode> memories;
@@ -147,6 +173,15 @@ struct MachineModel {
   /// `computeKind`, or nullopt when no such capability or dtype is modelled.
   std::optional<int64_t> lanesFor(llvm::StringRef computeKind,
                                   llvm::StringRef elementType) const;
+
+  /// The first memory of `kind`, in declaration order, or null. Profiles
+  /// describe memory *spaces* (`sram`), while nodes are instances (`sram.0`).
+  const MemoryNode *findMemoryOfKind(llvm::StringRef kind) const;
+
+  /// How many executors the machine offers for an owner kind, counting each
+  /// executor's own concurrency. This is what a "worker count" means once
+  /// executors are concrete nodes rather than a kind with a multiplicity.
+  uint32_t ownerCount(llvm::StringRef ownerKind) const;
 
   /// Compute capabilities and transfer engines directly attached to
   /// `executorId`, in declaration order.

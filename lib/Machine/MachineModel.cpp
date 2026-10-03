@@ -87,6 +87,10 @@ std::string renderMemory(const MemoryNode &node) {
   out += joinStrings(layouts, ",");
   out += "|banks=";
   out += optionalNumber(node.banks);
+  out += "|bandwidth=";
+  out += formatDouble(node.bandwidthBytesPerCycle);
+  out += "|latency=";
+  out += std::to_string(node.latencyCycles);
   return out;
 }
 
@@ -128,6 +132,10 @@ std::string renderCompute(const ComputeNode &node) {
                                  : "<none>";
   out += "|concurrency=";
   out += std::to_string(node.concurrency);
+  out += "|accumulator_dtypes=";
+  std::vector<std::string> accumulators(node.accumulatorDTypes);
+  llvm::sort(accumulators);
+  out += joinStrings(accumulators, ",");
   return out;
 }
 
@@ -142,6 +150,8 @@ std::string renderTransferEngine(const TransferEngineNode &node) {
   out += std::to_string(node.count);
   out += "|max_outstanding=";
   out += std::to_string(node.maxOutstanding);
+  out += "|setup=";
+  out += std::to_string(node.setupCycles);
   return out;
 }
 
@@ -243,6 +253,21 @@ bool MachineModel::isVisible(llvm::StringRef memoryId,
   return isWithin(executorId, memory->visibleFrom);
 }
 
+const MemoryNode *MachineModel::findMemoryOfKind(llvm::StringRef kind) const {
+  for (const MemoryNode &node : memories)
+    if (node.kind == kind)
+      return &node;
+  return nullptr;
+}
+
+uint32_t MachineModel::ownerCount(llvm::StringRef ownerKind) const {
+  uint32_t count = 0;
+  for (const ExecutorNode &executor : executors)
+    if (ownerMatches(ownerKind, executor.id))
+      count += std::max(1u, executor.concurrency);
+  return count;
+}
+
 std::optional<int64_t>
 MachineModel::lanesFor(llvm::StringRef computeKind,
                        llvm::StringRef elementType) const {
@@ -284,6 +309,14 @@ std::string canonicalMachineString(const MachineModel &model) {
   out += model.target;
   out += "\ndescription=";
   out += model.description;
+  out += "\nclock_hz=";
+  out += model.clockHz ? std::to_string(*model.clockHz) : "<none>";
+  out += "\nworker_threads=";
+  out += std::to_string(model.workerThreads);
+  out += "\nsync=barrier:";
+  out += std::to_string(model.sync.barrierCycles);
+  out += ",wait:";
+  out += std::to_string(model.sync.waitCycles);
   out += '\n';
   renderSection(out, model.executors, renderExecutor);
   renderSection(out, model.memories, renderMemory);
@@ -328,6 +361,12 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
                    std::to_string(kSupportedSchemaMajor));
   if (model.target.empty())
     return invalid("target: must not be empty");
+  // A declared clock of zero would make every nanosecond estimate infinite;
+  // an *absent* clock is fine -- cycles are still meaningful.
+  if (model.clockHz && *model.clockHz == 0)
+    return invalid("clock_hz: must be positive when declared");
+  if (model.workerThreads == 0)
+    return invalid("worker_threads: must be positive");
 
   // Ids share one namespace across every node kind, so a memory and an
   // executor can never collide silently.

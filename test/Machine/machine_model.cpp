@@ -208,3 +208,63 @@ TEST(MachineModel, ContentHashCoversLanes) {
   b.computes[0].lanes = {{"f32", 16}};
   EXPECT_NE(computeContentHash(a), computeContentHash(b));
 }
+
+TEST(MachineModel, ContentHashCoversClockAndSync) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.clockHz = 2000000000;
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+
+  MachineModel c = twoCoreMachine();
+  c.sync.barrierCycles = 128;
+  EXPECT_NE(computeContentHash(a), computeContentHash(c));
+}
+
+TEST(MachineModel, VerifyRejectsADeclaredZeroClock) {
+  MachineModel model = twoCoreMachine();
+  model.clockHz = 0; // declared, and meaningless for a cycle estimate
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyAcceptsAModelThatDoesNotDeclareAClock) {
+  MachineModel model = twoCoreMachine();
+  model.clockHz.reset();
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsZeroWorkerThreads) {
+  MachineModel model = twoCoreMachine();
+  model.workerThreads = 0;
+  EXPECT_FALSE(verifies(model));
+}
+
+//===----------------------------------------------------------------------===//
+// Cost facts the performance simulator needs
+//===----------------------------------------------------------------------===//
+
+TEST(MachineModel, OwnerCountCountsExecutorsThatMatchTheKind) {
+  MachineModel model = twoCoreMachine();
+  // package.0 is `worker`; core.0 and core.1 refine it.
+  EXPECT_EQ(model.ownerCount("worker"), 3u);
+  EXPECT_EQ(model.ownerCount("core"), 2u);
+  EXPECT_EQ(model.ownerCount("pe"), 0u);
+}
+
+TEST(MachineModel, FindMemoryOfKindReturnsTheFirstDeclaration) {
+  MachineModel model = twoCoreMachine();
+  ASSERT_NE(model.findMemoryOfKind("dram"), nullptr);
+  EXPECT_EQ(model.findMemoryOfKind("dram")->id, "dram.0");
+  EXPECT_EQ(model.findMemoryOfKind("sram")->id, "sram.0");
+  EXPECT_EQ(model.findMemoryOfKind("hbm"), nullptr);
+}
+
+TEST(MachineModel, ContentHashCoversMemoryAccessCost) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.memories[0].bandwidthBytesPerCycle = 128;
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+
+  MachineModel c = twoCoreMachine();
+  c.memories[0].latencyCycles = 7;
+  EXPECT_NE(computeContentHash(a), computeContentHash(c));
+}

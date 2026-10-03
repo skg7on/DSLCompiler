@@ -109,6 +109,7 @@ private:
 
   // --- sections -----------------------------------------------------------
   bool parseRoot(Node *root, MachineModel &model);
+  bool parseSync(Node *node, MachineModel &model);
   bool parseExecutor(Node *node, size_t index, ExecutorNode &out);
   bool parseMemory(Node *node, size_t index, MemoryNode &out);
   bool parseCompute(Node *node, size_t index, ComputeNode &out);
@@ -389,6 +390,11 @@ bool Loader::parseMemory(Node *node, size_t index, MemoryNode &out) {
         if (key == "supported_layouts")
           return readStringList(value, path + ".supported_layouts",
                                 out.supportedLayouts);
+        if (key == "bandwidth_bytes_per_cycle")
+          return readDouble(value, path + ".bandwidth_bytes_per_cycle",
+                            out.bandwidthBytesPerCycle);
+        if (key == "latency_cycles")
+          return readUInt(value, path + ".latency_cycles", out.latencyCycles);
         if (key == "banks") {
           uint32_t banks = 0;
           if (!readUInt32(value, path + ".banks", banks))
@@ -427,6 +433,9 @@ bool Loader::parseCompute(Node *node, size_t index, ComputeNode &out) {
         if (key == "element_types")
           return readStringList(value, path + ".element_types",
                                 out.elementTypes);
+        if (key == "accumulator_dtypes")
+          return readStringList(value, path + ".accumulator_dtypes",
+                                out.accumulatorDTypes);
         if (key == "supported_layouts")
           return readStringList(value, path + ".supported_layouts",
                                 out.supportedLayouts);
@@ -482,6 +491,8 @@ bool Loader::parseTransferEngine(Node *node, size_t index,
         if (key == "max_outstanding")
           return readUInt32(value, path + ".max_outstanding",
                             out.maxOutstanding);
+        if (key == "setup_cycles")
+          return readUInt(value, path + ".setup_cycles", out.setupCycles);
         return failAt(keyNode, path + ": unknown key '" + key + "'");
       });
   return parsed && requireKey(sawId, path, "id") &&
@@ -532,6 +543,18 @@ bool Loader::parseLink(Node *node, size_t index, LinkEdge &out) {
          requireKey(sawBandwidth, path, "bandwidth_bytes_per_cycle");
 }
 
+bool Loader::parseSync(Node *node, MachineModel &model) {
+  return forEachEntry(
+      node, "sync", [&](StringRef key, Node *value, Node *keyNode) -> bool {
+        if (key == "barrier_cycles")
+          return readUInt(value, "sync.barrier_cycles",
+                          model.sync.barrierCycles);
+        if (key == "wait_cycles")
+          return readUInt(value, "sync.wait_cycles", model.sync.waitCycles);
+        return failAt(keyNode, "sync: unknown key '" + key + "'");
+      });
+}
+
 bool Loader::parseRoot(Node *root, MachineModel &model) {
   bool sawSchema = false;
   bool sawTarget = false;
@@ -555,6 +578,17 @@ bool Loader::parseRoot(Node *root, MachineModel &model) {
         }
         if (key == "description")
           return readText(value, "description", model.description);
+        if (key == "clock_hz") {
+          uint64_t clock = 0;
+          if (!readUInt(value, "clock_hz", clock))
+            return false;
+          model.clockHz = clock;
+          return true;
+        }
+        if (key == "worker_threads")
+          return readUInt32(value, "worker_threads", model.workerThreads);
+        if (key == "sync")
+          return parseSync(value, model);
         if (key == "executors")
           return forEachElement(
               value, "executors", [&](Node *element, size_t index) -> bool {
