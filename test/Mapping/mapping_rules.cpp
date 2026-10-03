@@ -612,6 +612,32 @@ rule r.p {
   EXPECT_EQ(layout.getValue(), "blocked_2d");
 }
 
+TEST(RuleBundle, FailsLoudlyWhenTheNodeCannotTypeItsParameters) {
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.p {
+  match micro.vector();
+  bundle "b" { tile_m = 8 };
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.p");
+  ASSERT_NE(rule, nullptr);
+
+  // A node with neither attributes nor typed ports has no MLIR context, so the
+  // rule's declared parameters cannot be typed. The bridge must fail loudly
+  // rather than silently produce a parameterless bundle.
+  WorkloadNode node;
+  node.id = 5;
+  node.opName = "micro.vector";
+  EXPECT_DEATH(
+      {
+        (void)toMappingCandidate(*rule, node, MachineModel{}, LayoutContext{});
+      },
+      "no MLIR context");
+}
+
 //===----------------------------------------------------------------------===//
 // `require <expr>` constraint evaluation (design §14.1)
 //===----------------------------------------------------------------------===//

@@ -20,9 +20,8 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
+#include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingRules.h"
-
-#include "mlir/IR/BuiltinAttributes.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -32,9 +31,6 @@
 #include <vector>
 
 namespace mlir::llk::mapping {
-
-// `TargetBundle` (an opaque name, typed parameters, and an emitter key) is
-// defined in MappingPlan.h, which the plan value types embed it in.
 
 /// The interface target-independent mapping code uses.
 class MappingTarget {

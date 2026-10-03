@@ -156,8 +156,9 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     attributes.emplace_back(
         mlir::StringAttr::get(context, "bundle"),
         mlir::StringAttr::get(context, placement.bundle.name));
-    attributes.emplace_back(mlir::StringAttr::get(context, "emitter"),
-                            mlir::StringAttr::get(context, rule->emitter));
+    attributes.emplace_back(
+        mlir::StringAttr::get(context, "emitter"),
+        mlir::StringAttr::get(context, placement.bundle.emitterKey));
     attributes.emplace_back(mlir::StringAttr::get(context, "executor"),
                             mlir::StringAttr::get(context, placement.executor));
     attributes.emplace_back(mlir::StringAttr::get(context, "memories"),

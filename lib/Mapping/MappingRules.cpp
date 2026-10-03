@@ -23,6 +23,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -930,8 +931,9 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
 
 /// An MLIR context to type a rule's bundle parameters with, taken from the node
 /// they matched. A rule that declares parameters only ever matches a node built
-/// from real IR, so a context is available; the null return is the belt-and-
-/// braces case of a synthetic node with no attributes and no port types.
+/// from real IR, so a context is available; the null return marks a synthetic
+/// or context-free node, which the caller turns into a loud failure rather than
+/// a silently parameterless bundle.
 mlir::MLIRContext *nodeContext(const WorkloadNode &node) {
   if (node.attributes)
     return node.attributes.getContext();
@@ -947,14 +949,26 @@ mlir::MLIRContext *nodeContext(const WorkloadNode &node) {
 /// Materializes a rule's context-free bundle parameters as a typed
 /// `DictionaryAttr`: an integer value becomes an `IntegerAttr` (i64) and a
 /// symbolic value a `StringAttr`. Null when the rule declares no parameters.
-mlir::DictionaryAttr buildBundleParameters(
-    mlir::MLIRContext *context,
-    const std::vector<std::pair<std::string, LayoutValue>> &parameters) {
-  if (parameters.empty() || !context)
+///
+/// A rule that *does* declare parameters must never reach the plan as a
+/// parameterless bundle, so a node with no MLIR context (synthetic, or built
+/// with neither attributes nor typed ports) is a fatal error naming the rule
+/// and node -- not a silent empty result two parameterizations could collide
+/// on.
+mlir::DictionaryAttr buildBundleParameters(const RuleDef &rule,
+                                           const WorkloadNode &node) {
+  if (rule.bundleParameters.empty())
     return {};
+  mlir::MLIRContext *context = nodeContext(node);
+  if (!context) {
+    std::string message =
+        "rule '" + rule.id + "' declares bundle parameters but workload node " +
+        std::to_string(node.id) + " has no MLIR context to type them with";
+    llvm::report_fatal_error(llvm::StringRef(message));
+  }
   llvm::SmallVector<mlir::NamedAttribute> attributes;
-  attributes.reserve(parameters.size());
-  for (const auto &entry : parameters) {
+  attributes.reserve(rule.bundleParameters.size());
+  for (const auto &entry : rule.bundleParameters) {
     mlir::Attribute value;
     if (const auto *integer = std::get_if<int64_t>(&entry.second))
       value =
@@ -991,8 +1005,7 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   candidate.coveredNodes.push_back(node.id);
   candidate.bundle.name = rule.bundle;
   candidate.bundle.emitterKey = rule.emitter;
-  candidate.bundle.parameters =
-      buildBundleParameters(nodeContext(node), rule.bundleParameters);
+  candidate.bundle.parameters = buildBundleParameters(rule, node);
   candidate.resolvedParameters = std::move(resolution.parameters);
   if (rule.costLowerBound)
     candidate.lowerBound.latencyCycles =
