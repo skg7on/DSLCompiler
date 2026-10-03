@@ -1,6 +1,7 @@
 //===- mapping_rules.cpp - LLKMap rule declarations (D4) -----------------===//
 
 #include "LLK/Mapping/MappingRules.h"
+#include "LLK/Mapping/MappingTarget.h"
 
 #include "llvm/Support/Error.h"
 
@@ -185,4 +186,191 @@ rule a.one {
   emit "e";
 }
 )llkmap"));
+}
+
+//===----------------------------------------------------------------------===//
+// Target validation
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+using mlir::llk::machine::ComputeNode;
+using mlir::llk::machine::MachineModel;
+using mlir::llk::machine::MemoryNode;
+
+MachineModel ruleMachine() {
+  MachineModel model;
+  model.target = "rules";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}}};
+
+  ComputeNode vector;
+  vector.id = "vec.0";
+  vector.kind = "vector_engine";
+  vector.attachedTo = "e0";
+  vector.shapes = {{8}};
+  ComputeNode matrix;
+  matrix.id = "mxu.0";
+  matrix.kind = "matrix_engine";
+  matrix.attachedTo = "e0";
+  matrix.shapes = {{16, 16, 32}};
+  model.computes = {vector, matrix};
+
+  MemoryNode memory;
+  memory.id = "sram.0";
+  memory.kind = "sram";
+  memory.visibleFrom = "e0";
+  memory.capacityBytes = 4096;
+  memory.alignmentBytes = 64;
+  model.memories = {memory};
+  return model;
+}
+
+constexpr llvm::StringLiteral kLayouts =
+    "layout avx2.blocked_2d(int VW) { param VW in [4..8]; require rank == 2; }";
+
+llvm::Expected<std::unique_ptr<MappingTarget>>
+makeTarget(llvm::StringRef rules, std::vector<std::string> emitters) {
+  llvm::Expected<LayoutRegistry> layouts = parseLayoutText(kLayouts, "<test>");
+  if (!layouts)
+    return layouts.takeError();
+  llvm::Expected<RuleRegistry> ruleRegistry = parseRuleText(rules, "<test>");
+  if (!ruleRegistry)
+    return ruleRegistry.takeError();
+  return std::make_unique<FileMappingTarget>(
+      "test", ruleMachine(), std::move(*layouts), std::move(*ruleRegistry),
+      std::move(emitters));
+}
+
+bool verifies(MappingTarget &target) {
+  if (llvm::Error error = verifyMappingTarget(target)) {
+    llvm::consumeError(std::move(error));
+    return false;
+  }
+  return true;
+}
+
+constexpr llvm::StringLiteral kGoodRules = R"llkmap(
+rule a.vector_add {
+  match micro.vector(kind = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies avx2.blocked_2d;
+  bundle "b";
+  emit "e1";
+}
+)llkmap";
+
+} // namespace
+
+TEST(MappingTarget, VerifiesGoodRules) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      makeTarget(kGoodRules, {"e1", "e2"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_TRUE(verifies(**target));
+  EXPECT_TRUE((*target)->isKnownEmitter("e1"));
+  EXPECT_FALSE((*target)->isKnownEmitter("nope"));
+}
+
+TEST(MappingTarget, RejectsUnknownLayoutId) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = makeTarget(R"llkmap(
+rule a.bad {
+  match micro.vector();
+  require layout operand0 satisfies avx2.missing;
+  bundle "b";
+  emit "e1";
+}
+)llkmap",
+                                                                     {"e1"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE(verifies(**target));
+}
+
+TEST(MappingTarget, RejectsKindTheMachineDoesNotOffer) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = makeTarget(R"llkmap(
+rule a.bad {
+  match micro.vector();
+  require compute kind tensor_core;
+  bundle "b";
+  emit "e1";
+}
+)llkmap",
+                                                                     {"e1"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE(verifies(**target));
+}
+
+TEST(MappingTarget, RejectsUnknownExecutorKind) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = makeTarget(R"llkmap(
+rule a.bad {
+  match micro.vector();
+  require executor kind pe;
+  bundle "b";
+  emit "e1";
+}
+)llkmap",
+                                                                     {"e1"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE(verifies(**target));
+}
+
+TEST(MappingTarget, RejectsUnknownEmitter) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      makeTarget(kGoodRules, {"different_emitter"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE(verifies(**target));
+}
+
+//===----------------------------------------------------------------------===//
+// Shipped AVX2 rules
+//===----------------------------------------------------------------------===//
+
+namespace {
+constexpr llvm::StringLiteral kShippedMachine =
+    LLK_MACHINE_DIR "/x86-avx2-v2.yaml";
+constexpr llvm::StringLiteral kShippedLayouts =
+    LLK_MAPPING_DIR "/x86-avx2/layouts.llkmap";
+constexpr llvm::StringLiteral kShippedRules =
+    LLK_MAPPING_DIR "/x86-avx2/rules.llkmap";
+constexpr llvm::StringLiteral kInvalidRules =
+    LLK_MAPPING_DIR "/../test/Mapping/Inputs/invalid-rules.llkmap";
+
+llvm::Expected<std::unique_ptr<MappingTarget>> loadShippedAvx2() {
+  return loadMappingTarget("x86-avx2", kShippedMachine, kShippedLayouts,
+                           kShippedRules,
+                           {"avx2_vector_add", "avx2_mma", "avx2_reduce"});
+}
+} // namespace
+
+TEST(MappingTarget, LoadsShippedAvx2RulesAndVerifiesThem) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadShippedAvx2();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_EQ((*target)->name(), "x86-avx2");
+  EXPECT_EQ((*target)->rules().all().size(), 3u);
+  EXPECT_FALSE((*target)->machine().executors.empty());
+  EXPECT_FALSE((*target)->layouts().all().empty());
+  // `loadMappingTarget` verifies before returning; assert it directly too.
+  EXPECT_TRUE(verifies(**target));
+}
+
+TEST(MappingTarget, ShippedRulesOnlyEmitDeclaredKeys) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadShippedAvx2();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  for (const RuleDef &rule : (*target)->rules().all())
+    EXPECT_TRUE((*target)->isKnownEmitter(rule.emitter)) << rule.id;
+}
+
+TEST(MappingTarget, ShippedRulesResolveTheirLayouts) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadShippedAvx2();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  for (const RuleDef &rule : (*target)->rules().all())
+    for (const LayoutRequirement &requirement : rule.layoutRequirements)
+      EXPECT_NE((*target)->layouts().find(requirement.layoutId), nullptr)
+          << rule.id << " -> " << requirement.layoutId;
+}
+
+TEST(MappingTarget, RejectsTheInvalidRuleFixture) {
+  llvm::Expected<RuleRegistry> registry = loadRuleFile(kInvalidRules);
+  EXPECT_FALSE(static_cast<bool>(registry));
+  if (!registry)
+    llvm::consumeError(registry.takeError());
 }

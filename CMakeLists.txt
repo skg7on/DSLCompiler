@@ -267,6 +267,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/LlkMap.cpp
     lib/Mapping/LayoutConstraints.cpp
     lib/Mapping/MappingRules.cpp
+    lib/Mapping/MappingTarget.cpp
     lib/Mapping/Routing.cpp
 )
 target_include_directories(LLKMapping PUBLIC
@@ -713,7 +714,8 @@ function(add_llk_mapping_test test_name test_file)
   target_link_libraries(${test_name} PRIVATE
       LLKMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
   target_compile_definitions(${test_name} PRIVATE
-      LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping")
+      LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping"
+      LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines")
   add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 

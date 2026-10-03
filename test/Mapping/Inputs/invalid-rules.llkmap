@@ -1,0 +1,14 @@
+// A deliberately invalid LLKMap rule file: two rules share an id. Loading it
+// must fail with a diagnostic, so a target can never be assembled from a rule
+// set whose ids are ambiguous.
+rule broken.one {
+  match micro.vector();
+  bundle "b";
+  emit "e";
+}
+
+rule broken.one {
+  match micro.vector();
+  bundle "b";
+  emit "e";
+}

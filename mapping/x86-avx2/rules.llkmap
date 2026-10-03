@@ -1,0 +1,50 @@
+// AVX2 mapping rules.
+//
+// A rule names one Micro operation pattern and the bundle that implements it.
+// `bundle` and `emit` are opaque: this file names them, the AVX2 plugin gives
+// them meaning. Layout ids refer to layouts.llkmap and are never redefined
+// here. Capability kinds must be ones machines/x86-avx2-v2.yaml declares --
+// `verifyMappingTarget` rejects the file otherwise.
+//
+// The predicates are structural for now: the attribute names are not checked
+// against each operation's definition, only the operation itself is.
+
+rule avx2.vector_add v1 {
+  match micro.vector(kind = "add", element_type = f32);
+  param VW in [4..8];
+  require VW == machine.compute("vector_engine").lanes(element_type);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies avx2.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "avx2.vector.add.f32";
+  emit "avx2_vector_add";
+  cost 4;
+}
+
+rule avx2.mma_bf16 v1 {
+  match micro.mma(element_type = bf16);
+  require executor kind worker;
+  require compute kind matrix_engine;
+  require layout lhs satisfies avx2.row_major;
+  input "lhs";
+  input "rhs";
+  input "acc";
+  output "result";
+  bundle "avx2.mma.bf16";
+  emit "avx2_mma";
+  cost 16;
+}
+
+rule avx2.reduce_sum_f32 v1 {
+  match micro.reduce(kind = "sum", element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  input "operand0";
+  output "result";
+  bundle "avx2.reduce.sum.f32";
+  emit "avx2_reduce";
+  cost 3;
+}
