@@ -14,6 +14,7 @@
 
 #include "LLK/Mapping/MappingRules.h"
 
+#include "LLK/Mapping/StableHash.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/AsmParser/AsmParser.h"
@@ -538,6 +539,90 @@ const LayoutParam *RuleDef::findParam(llvm::StringRef name) const {
   return nullptr;
 }
 
+namespace {
+
+llvm::StringRef predicateKindName(RulePredicateKind kind) {
+  switch (kind) {
+  case RulePredicateKind::Attribute:
+    return "attribute";
+  case RulePredicateKind::ElementType:
+    return "element_type";
+  case RulePredicateKind::Shape:
+    return "shape";
+  case RulePredicateKind::AccessMap:
+    return "access_map";
+  }
+  return "unknown";
+}
+
+/// Canonical rendering of one rule declaration. Declaration-order sequences
+/// (predicates, ports, requirements) are rendered in that order -- which is
+/// deterministic -- and each scalar is length-prefixed so no field's bytes can
+/// be read as another's.
+std::string canonicalRuleDefString(const RuleDef &def) {
+  std::string out;
+  auto field = [&](llvm::StringRef key, llvm::StringRef value) {
+    out += key.str();
+    out += ':';
+    out += std::to_string(value.size());
+    out += ':';
+    out += value.str();
+    out += '\n';
+  };
+
+  field("id", def.id);
+  field("version", std::to_string(def.version));
+  field("match", def.matchOp);
+
+  for (const RulePredicate &predicate : def.predicates) {
+    std::string text = predicateKindName(predicate.kind).str();
+    text += ' ';
+    text += predicate.attribute;
+    text += predicate.directionSet ? " port=" : " unqualified=";
+    if (predicate.directionSet) {
+      text += predicate.isInput ? "input[" : "output[";
+      text += std::to_string(predicate.portIndex);
+      text += ']';
+    }
+    text += " dim=" + std::to_string(predicate.dimension);
+    text += " value=" + canonicalValueString(predicate.value);
+    if (predicate.accessMap)
+      text += " map=" + canonicalAffineMapSpecString(*predicate.accessMap);
+    field("predicate", text);
+  }
+  for (const LayoutParam &param : def.params)
+    field("param", param.name + (param.symbolic ? ":symbolic" : ":integer"));
+  for (const auto &entry : def.domains) {
+    std::string values;
+    for (const LayoutValue &value : entry.second.values) {
+      if (!values.empty())
+        values += ',';
+      values += canonicalValueString(value);
+    }
+    field("domain", entry.first + "=" + values);
+  }
+  for (const ExprPtr &constraint : def.constraints)
+    field("constraint",
+          constraint ? canonicalExprString(*constraint) : "<null>");
+  for (const KindRequirement &requirement : def.kindRequirements)
+    field("require", requirement.role + ":" + requirement.kind);
+  for (const RuleLayoutRequirement &requirement : def.layoutRequirements)
+    field("layout", requirement.port + ":" + requirement.layoutId);
+  for (const RulePort &port : def.ports)
+    field("port", port.name + (port.isInput ? ":input" : ":output"));
+  field("bundle", def.bundle);
+  // `bundleParameters` is kept sorted by name, so the order is canonical.
+  for (const auto &parameter : def.bundleParameters)
+    field("bundle_parameter",
+          parameter.first + "=" + canonicalValueString(parameter.second));
+  field("emitter", def.emitter);
+  if (def.costLowerBound)
+    field("cost", std::to_string(*def.costLowerBound));
+  return out;
+}
+
+} // namespace
+
 bool RuleRegistry::add(RuleDef def, std::string &error) {
   if (find(def.id)) {
     error = "duplicate rule id '" + def.id + "'";
@@ -552,6 +637,15 @@ bool RuleRegistry::add(RuleDef def, std::string &error) {
       [](const RuleDef &rule, llvm::StringRef key) { return rule.id < key; });
   defs_.insert(position, std::move(def));
   return true;
+}
+
+uint64_t RuleRegistry::computeContentHash() const {
+  // `defs_` is stored in id order (see `add`), which is exactly the canonical
+  // order a content hash needs.
+  std::string canonical;
+  for (const RuleDef &def : defs_)
+    canonical += canonicalRuleDefString(def);
+  return stableHash(canonical);
 }
 
 const RuleDef *RuleRegistry::find(llvm::StringRef id) const {

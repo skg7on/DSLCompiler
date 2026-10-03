@@ -6,9 +6,12 @@
 
 #include "LLK/Mapping/LayoutConstraints.h"
 
+#include "LLK/Mapping/StableHash.h"
+
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
@@ -238,6 +241,60 @@ bool LayoutDef::isSymbolic(llvm::StringRef name) const {
   return param && param->symbolic;
 }
 
+std::string canonicalAffineMapSpecString(const AffineMapSpec &spec) {
+  std::string out;
+  for (size_t index = 0; index < spec.dims.size(); ++index) {
+    if (index)
+      out += ',';
+    out += spec.dims[index];
+  }
+  out += "->";
+  for (size_t index = 0; index < spec.results.size(); ++index) {
+    if (index)
+      out += ',';
+    out += spec.results[index] ? canonicalExprString(*spec.results[index])
+                               : "<null>";
+  }
+  return out;
+}
+
+namespace {
+
+/// Canonical rendering of one layout declaration: every field that shapes the
+/// declaration, with a length-prefixed line per field so no field's bytes can
+/// be read as another's.
+std::string canonicalLayoutDefString(const LayoutDef &def) {
+  std::string out;
+  auto field = [&](llvm::StringRef key, llvm::StringRef value) {
+    out += key.str();
+    out += ':';
+    out += std::to_string(value.size());
+    out += ':';
+    out += value.str();
+    out += '\n';
+  };
+  field("id", def.id);
+  for (const LayoutParam &param : def.params)
+    field("param", param.name + (param.symbolic ? ":symbolic" : ":integer"));
+  for (const auto &entry : def.domains) {
+    std::string values;
+    for (const LayoutValue &value : entry.second.values) {
+      if (!values.empty())
+        values += ',';
+      values += canonicalValueString(value);
+    }
+    field("domain", entry.first + "=" + values);
+  }
+  for (const ExprPtr &constraint : def.constraints)
+    field("constraint",
+          constraint ? canonicalExprString(*constraint) : "<null>");
+  if (def.map)
+    field("map", canonicalAffineMapSpecString(*def.map));
+  return out;
+}
+
+} // namespace
+
 bool LayoutRegistry::add(LayoutDef def, std::string &error) {
   if (find(def.id)) {
     error = "duplicate layout id '" + def.id + "'";
@@ -245,6 +302,23 @@ bool LayoutRegistry::add(LayoutDef def, std::string &error) {
   }
   defs_.push_back(std::move(def));
   return true;
+}
+
+uint64_t LayoutRegistry::computeContentHash() const {
+  // Declaration order is not part of a layout library's identity, so sort by id
+  // first -- exactly the canonical order `all()` reports.
+  std::vector<const LayoutDef *> sorted;
+  sorted.reserve(defs_.size());
+  for (const LayoutDef &def : defs_)
+    sorted.push_back(&def);
+  llvm::sort(sorted, [](const LayoutDef *lhs, const LayoutDef *rhs) {
+    return lhs->id < rhs->id;
+  });
+
+  std::string canonical;
+  for (const LayoutDef *def : sorted)
+    canonical += canonicalLayoutDefString(*def);
+  return stableHash(canonical);
 }
 
 const LayoutDef *LayoutRegistry::find(llvm::StringRef id) const {

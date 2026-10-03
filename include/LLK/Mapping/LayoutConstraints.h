@@ -59,6 +59,10 @@ struct AffineMapSpec {
   std::vector<ExprPtr> results;
 };
 
+/// Canonical rendering of a map clause: dimensions, then result expressions in
+/// order. Shared by layout and rule content hashing.
+std::string canonicalAffineMapSpecString(const AffineMapSpec &spec);
+
 /// Builds the concrete `mlir::AffineMap` a map clause describes, substituting
 /// `constants` for integer parameters. `spec.dims` become the map's dimensions
 /// in order. Fails when a result references neither a dimension nor a listed
@@ -88,6 +92,12 @@ public:
 
   const LayoutDef *find(llvm::StringRef id) const;
   llvm::ArrayRef<LayoutDef> all() const { return defs_; }
+
+  /// FNV-1a 64 hash over every declaration's canonical rendering, folded in id
+  /// order so it is independent of file or insertion order and stable across
+  /// runs and toolchains (design §22.1/§22.2). An empty registry hashes its
+  /// empty input, never zero-by-accident.
+  uint64_t computeContentHash() const;
 
 private:
   std::vector<LayoutDef> defs_;

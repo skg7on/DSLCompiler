@@ -217,6 +217,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   // if a future caller reaches these in a different order.
   llvm::StringSet<> recordedDiagnostics;
   auto report = [&](DiagnosticCode code, std::string message) {
+    // Count every occurrence (design §22.2), even when the distinct
+    // (code, message) pair is already recorded, so a recurring cause is
+    // visible as a tally.
+    ++result.frontier.codeCounts[code];
     std::string key = stringifyDiagnosticCode(code).str();
     key += '\x1f';
     key += message;
@@ -281,6 +285,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         continue;
       }
       producedCandidate = true;
+      ++result.candidateCount;
       PlacementFailure placementFailure = PlacementFailure::None;
       bool placementTruncated = false;
       llvm::Expected<std::vector<CandidateInstance>> instances =
@@ -289,6 +294,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                               &placementFailure);
       if (!instances)
         return instances.takeError();
+      result.instanceCount += instances->size();
       if (placementTruncated) {
         result.searchTruncated = true;
         report(DiagnosticCode::SearchTruncated,
@@ -480,6 +486,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       llvm::Expected<std::vector<ConnectionPlan>> alternatives =
           synthesizeConnections(request, machine, topology, placementOptions,
                                 &connectionTruncated);
+      if (alternatives)
+        result.routeCount += alternatives->size();
       if (connectionTruncated) {
         result.searchTruncated = true;
         report(DiagnosticCode::SearchTruncated,
@@ -648,6 +656,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   llvm::sort(complete, [&](const Partial &lhs, const Partial &rhs) {
     return ranksBefore(lhs.cost, lhs.id, rhs.cost, rhs.id, options_.objective);
   });
+  // Tally complete plans before the top-K cap drops the tail (design §22.2).
+  result.planCount = complete.size();
   if (complete.size() > options_.topK) {
     complete.resize(options_.topK);
     result.searchTruncated = true;

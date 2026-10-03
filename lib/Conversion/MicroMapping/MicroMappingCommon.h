@@ -17,6 +17,8 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanBinder.h"
+#include "LLK/Mapping/PlanReport.h"
+#include "LLK/Mapping/StableHash.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -29,6 +31,7 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <memory>
 #include <optional>
@@ -146,8 +149,23 @@ objectiveOrderFromModule(ModuleOp module) {
 struct MappingRun {
   std::unique_ptr<mapping::MappingTarget> target;
   Operation *kernel = nullptr;
+  /// The options the search actually ran with -- including a forced
+  /// deterministic mode and the module's declared objective -- so a report can
+  /// state them without reconstructing them from the CLI.
+  mapping::MappingSearchOptions searchOptions;
   mapping::MappingSearchResult result;
 };
+
+/// Content hash of the module's printed form. Printing is deterministic for a
+/// given IR, so two runs over identical input agree byte for byte -- which is
+/// what lets the plan report name the exact input it was produced from. Call it
+/// before binding, while the module is still the unmodified input.
+inline uint64_t computeModuleHash(ModuleOp module) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  module->print(stream);
+  return mapping::stableHash(stream.str());
+}
 
 /// The five file/label keys every mapping pass must be given. An empty value is
 /// a missing key, reported rather than defaulted.
@@ -225,6 +243,7 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     return objective.takeError();
   if (*objective)
     searchOptions.objective = **objective;
+  run.searchOptions = searchOptions;
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),
                                  deriveLayoutContext(*graph), searchOptions);
   llvm::Expected<mapping::MappingSearchResult> result = search.search();

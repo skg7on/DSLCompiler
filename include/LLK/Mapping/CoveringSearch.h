@@ -33,6 +33,7 @@
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -93,6 +94,12 @@ struct FailureFrontier {
   /// the tallies.
   std::vector<Diagnostic> diagnostics;
 
+  /// Every reporting event counted per stable code (design §22.2): unlike
+  /// `diagnostics`, which lists each distinct (code, message) once, this
+  /// tallies every occurrence, so a cause hit on many branches is visible as a
+  /// count. Ordered by code (a `std::map`), so it is deterministic.
+  std::map<DiagnosticCode, uint64_t> codeCounts;
+
   /// True when any diagnostic carries `code`.
   bool has(DiagnosticCode code) const;
 };
@@ -105,6 +112,18 @@ struct MappingSearchResult {
   FailureFrontier frontier;
   /// Partial plans the search expanded, for diagnostics.
   uint64_t expandedStates = 0;
+
+  // Search-wide tallies (design §22.2). These count the whole search -- not
+  // just the retained top-K -- so a report can state how much of the space was
+  // covered. Deterministic for identical inputs.
+  /// Rule-to-candidate matches produced across all nodes.
+  uint64_t candidateCount = 0;
+  /// Candidate instances enumerated across all candidates.
+  uint64_t instanceCount = 0;
+  /// Connection alternatives synthesized across all branches.
+  uint64_t routeCount = 0;
+  /// Complete plans found before the top-K cap truncated `plans`.
+  uint64_t planCount = 0;
 };
 
 /// Searches one workload graph against one target.

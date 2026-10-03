@@ -67,6 +67,18 @@ struct LayoutContext {
   std::string elementType;
 };
 
+/// Canonical, fully-tagged rendering of `expr`: every node carries its kind and
+/// its operands follow in order, so two structurally different expressions
+/// never render alike. This is a hash input, not a source-faithful printer --
+/// its exact spelling may change between releases, but never within one, and
+/// it is dependency-free and platform-stable (design §22.1).
+std::string canonicalExprString(const Expr &expr);
+
+/// Canonical, type-tagged rendering of a value: integer `8` and string `"8"`
+/// render differently, so a declaration that only changes a value's kind still
+/// changes its content hash.
+std::string canonicalValueString(const LayoutValue &value);
+
 /// The result of evaluating an expression. `Handle` is the intermediate value
 /// a `machine.compute(...)` / `machine.memory(...)` query produces before a
 /// member query is applied; it never escapes as a solution value.

@@ -14,6 +14,7 @@
 
 #include "llvm/Support/Error.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -52,6 +53,10 @@ struct MicroMapPass
   Option<unsigned> beamWidth{*this, "beam-width",
                              llvm::cl::desc("Beam mode's frontier width"),
                              llvm::cl::init(64)};
+  Option<std::string> report{
+      *this, "report",
+      llvm::cl::desc("Write the versioned JSON plan report (design §22.2) to "
+                     "this path; the report never changes the IR")};
 
   StringRef getArgument() const override { return "micro-map"; }
 
@@ -75,19 +80,34 @@ struct MicroMapPass
     options.mode = mode.getValue();
     options.topK = topK.getValue();
     options.beamWidth = beamWidth.getValue();
+    options.reportPath = report.getValue();
     return options;
   }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    MicroMapOptions options = currentOptions();
     llvm::Expected<micro_mapping_detail::MappingRun> run =
-        micro_mapping_detail::runMappingSearch(module, "micro-map",
-                                               currentOptions(),
+        micro_mapping_detail::runMappingSearch(module, "micro-map", options,
                                                /*forceDeterministic=*/false);
     if (!run) {
       module.emitError() << llvm::toString(run.takeError());
       signalPassFailure();
       return;
+    }
+    // The report describes the input module the search ran over, so it is
+    // written before binding, while the module is still unmodified. It is
+    // metadata only -- the IR below is bound exactly as it would be without a
+    // report.
+    if (!options.reportPath.empty()) {
+      uint64_t moduleHash = micro_mapping_detail::computeModuleHash(module);
+      if (llvm::Error error = mapping::writePlanReportFile(
+              options.reportPath, run->result, run->target->machine(),
+              *run->target, run->searchOptions, moduleHash)) {
+        module.emitError() << llvm::toString(std::move(error));
+        signalPassFailure();
+        return;
+      }
     }
     if (llvm::Error error = micro_mapping_detail::bindPlanOntoModule(
             module, run->result.plans.front(), *run->target)) {
@@ -120,6 +140,7 @@ std::unique_ptr<Pass> createMicroMapPass(const MicroMapOptions &options) {
   pass->mode = options.mode;
   pass->topK = options.topK;
   pass->beamWidth = options.beamWidth;
+  pass->report = options.reportPath;
   return pass;
 }
 

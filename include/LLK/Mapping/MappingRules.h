@@ -140,6 +140,11 @@ public:
   const RuleDef *find(llvm::StringRef id) const;
   llvm::ArrayRef<RuleDef> all() const { return defs_; }
 
+  /// FNV-1a 64 hash over every rule's canonical rendering, folded in id order
+  /// (the order `all()` already returns). Stable across runs and toolchains,
+  /// so a report can name the exact rule library it searched (design §22.2).
+  uint64_t computeContentHash() const;
+
 private:
   std::vector<RuleDef> defs_; // sorted by id
 };

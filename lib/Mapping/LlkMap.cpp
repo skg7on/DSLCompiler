@@ -733,4 +733,65 @@ llvm::Expected<std::vector<LlkMapToken>> lexLlkMap(llvm::StringRef text,
   return tokens;
 }
 
+//===----------------------------------------------------------------------===//
+// Canonical rendering for content hashing
+//===----------------------------------------------------------------------===//
+
+std::string canonicalExprString(const Expr &expr) {
+  switch (expr.kind) {
+  case ExprKind::IntLit:
+    return "int:" + std::to_string(expr.intValue);
+  case ExprKind::StringLit:
+    // Length-prefixed so a string's own bytes cannot be mistaken for a
+    // separator between fields.
+    return "str:" + std::to_string(expr.text.size()) + ":" + expr.text;
+  case ExprKind::Ident:
+    return "id:" + expr.text;
+  case ExprKind::Call:
+    break;
+  case ExprKind::MemberCall:
+    break;
+  case ExprKind::Unary:
+    break;
+  case ExprKind::Binary:
+    break;
+  }
+
+  llvm::StringRef prefix;
+  switch (expr.kind) {
+  case ExprKind::Call:
+    prefix = "call:";
+    break;
+  case ExprKind::MemberCall:
+    prefix = "member:";
+    break;
+  case ExprKind::Unary:
+    prefix = "unary:";
+    break;
+  case ExprKind::Binary:
+    prefix = "binary:";
+    break;
+  default:
+    break;
+  }
+  std::string out = prefix.str();
+  out += expr.text;
+  out += '(';
+  for (size_t index = 0; index < expr.operands.size(); ++index) {
+    if (index)
+      out += ',';
+    out += expr.operands[index] ? canonicalExprString(*expr.operands[index])
+                                : "<null>";
+  }
+  out += ')';
+  return out;
+}
+
+std::string canonicalValueString(const LayoutValue &value) {
+  if (const int64_t *integer = std::get_if<int64_t>(&value))
+    return "i:" + std::to_string(*integer);
+  const std::string &text = std::get<std::string>(value);
+  return "s:" + std::to_string(text.size()) + ":" + text;
+}
+
 } // namespace mlir::llk::mapping

@@ -47,6 +47,9 @@ struct MicroMapOptions {
   std::string mode = "beam";
   unsigned topK = 8;
   unsigned beamWidth = 64;
+  /// When non-empty, the pass writes the versioned JSON plan report (design
+  /// §22.2) to this path. The report is metadata: it never changes the IR.
+  std::string reportPath;
 };
 
 /// `micro-bind-plan` runs the same search deterministically and binds the one
