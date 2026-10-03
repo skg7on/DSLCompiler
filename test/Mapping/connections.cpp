@@ -416,8 +416,9 @@ TEST(Connections, NoRouteAndNoDirectReadYieldsNoAlternatives) {
   MachineModel machine = connectionMachine();
   machine.links.clear();
   machine.executors.push_back({"e1", "worker", std::nullopt, {}, 1, {}});
-  // A destination only e1 can address, so the missing route is the only
-  // reason there is no path -- not an endpoint the consumer cannot see.
+  // A destination only e1 can address. The route is gone (links cleared) and
+  // the consumer cannot address the producer's memory, so there is no direct
+  // read either: the pair is genuinely incompatible.
   MemoryNode acc1 = memory("acc.1", "acc");
   acc1.visibleFrom = "e1";
   machine.memories.push_back(acc1);
@@ -748,8 +749,16 @@ TEST(Connections, SpillBytesStayUnpopulated) {
   llvm::Expected<std::vector<ConnectionPlan>> plans =
       synthesizeConnections(baseRequest(), machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
-  ASSERT_FALSE(plans->empty());
-  EXPECT_EQ((*plans)[0].cost.spillBytes, 0u);
+  // The transfer plan, not the rank-1 direct read: the direct read's
+  // default-constructed cost would make this assertion vacuous.
+  const ConnectionPlan *transfer = nullptr;
+  for (const ConnectionPlan &plan : *plans)
+    if (plan.kind == ConnectionKind::Transfer) {
+      transfer = &plan;
+      break;
+    }
+  ASSERT_NE(transfer, nullptr);
+  EXPECT_EQ(transfer->cost.spillBytes, 0u);
 }
 
 // Transfer utilization is the route's transfer cycles over the cycles the
@@ -787,6 +796,14 @@ TEST(Connections, TransferUtilizationStaysZeroWithoutSyncFacts) {
   llvm::Expected<std::vector<ConnectionPlan>> plans =
       synthesizeConnections(baseRequest(), machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
-  ASSERT_FALSE(plans->empty());
-  EXPECT_DOUBLE_EQ((*plans)[0].cost.transferUtilization, 0.0);
+  // The transfer plan, not the rank-1 direct read: the direct read's
+  // default-constructed cost would make this assertion vacuous.
+  const ConnectionPlan *transfer = nullptr;
+  for (const ConnectionPlan &plan : *plans)
+    if (plan.kind == ConnectionKind::Transfer) {
+      transfer = &plan;
+      break;
+    }
+  ASSERT_NE(transfer, nullptr);
+  EXPECT_DOUBLE_EQ(transfer->cost.transferUtilization, 0.0);
 }
