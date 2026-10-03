@@ -2,7 +2,10 @@
 
 #include "LLK/Mapping/Placement.h"
 
+#include "mlir/IR/BuiltinTypes.h"
+
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 
@@ -72,7 +75,88 @@ reduceSymmetric(const MachineModel &machine,
   return representatives;
 }
 
+/// The element type a port type exposes for §10.2 comparison, or nullopt when
+/// this target-independent core cannot read one. A modelled shaped type
+/// (`tensor`, `memref`, `vector`) states its element type; a bare float or
+/// integer type *is* an element type. A `!micro.tile` is opaque here -- the
+/// core never names the Micro dialect -- so it yields nullopt rather than a
+/// guessed element type.
+std::optional<mlir::Type> comparableElementType(mlir::Type type) {
+  if (!type)
+    return std::nullopt;
+  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
+    return shaped.getElementType();
+  if (mlir::isa<mlir::FloatType, mlir::IntegerType, mlir::IndexType>(type))
+    return type;
+  return std::nullopt;
+}
+
+/// The static logical shape a port type exposes, or nullopt for a dynamic,
+/// unranked, or opaque type.
+std::optional<llvm::SmallVector<int64_t, 4>> staticShape(mlir::Type type) {
+  if (!type)
+    return std::nullopt;
+  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
+    if (shaped.hasStaticShape())
+      return llvm::SmallVector<int64_t, 4>(shaped.getShape());
+  return std::nullopt;
+}
+
+/// §10.2: a changed element type or logical tile shape admits no alternative --
+/// neither a layout transform nor a transfer rewrites it -- so it rejects the
+/// pair outright. Only a fact both ends state is compared.
+bool elementAndShapeCompatible(const ConnectionRequest &request) {
+  std::optional<mlir::Type> producer =
+      comparableElementType(request.elementType);
+  std::optional<mlir::Type> consumer =
+      comparableElementType(request.consumerType);
+  if (producer && consumer && *producer != *consumer)
+    return false;
+
+  std::optional<llvm::SmallVector<int64_t, 4>> producerShape =
+      staticShape(request.elementType);
+  std::optional<llvm::SmallVector<int64_t, 4>> consumerShape =
+      staticShape(request.consumerType);
+  if (producerShape && consumerShape && *producerShape != *consumerShape)
+    return false;
+  return true;
+}
+
+/// §10.2: an index relation both ends state must match. When only one end
+/// states one there is nothing to prove a mismatch from, so the pair is left
+/// alone. Comparison goes through `simplifyAffineMap` and MLIR's own equality,
+/// never a rendering (design §10.2 forbids ad hoc map comparison).
+bool affineCompatible(const ConnectionRequest &request) {
+  if (!request.producerMap || !request.consumerMap)
+    return true;
+  return mlir::simplifyAffineMap(*request.producerMap) ==
+         mlir::simplifyAffineMap(*request.consumerMap);
+}
+
+/// The consumer can read the producer's memory only when its executor can
+/// address that memory (design §11.2 `dominates`). An unstated executor is not
+/// checkable, so it never rejects.
+bool consumerSeesProducerMemory(const ConnectionRequest &request,
+                                const MachineModel &machine) {
+  if (!request.consumerExecutor)
+    return true;
+  return machine.isVisible(request.producerMemory, *request.consumerExecutor);
+}
+
 } // namespace
+
+bool portsDirectCompatible(const ConnectionRequest &request,
+                           const machine::MachineModel &machine) {
+  if (!elementAndShapeCompatible(request))
+    return false;
+  // Different layouts are a transform, not a direct connection.
+  if (request.producerLayout && request.consumerLayout &&
+      *request.producerLayout != *request.consumerLayout)
+    return false;
+  if (!affineCompatible(request))
+    return false;
+  return consumerSeesProducerMemory(request, machine);
+}
 
 llvm::Expected<std::vector<CandidateInstance>>
 enumeratePlacements(const MappingCandidate &candidate,
@@ -196,6 +280,12 @@ synthesizeConnections(const ConnectionRequest &request,
   if (request.bytes == 0)
     return placementError("connection: bytes must be positive");
 
+  // §10.2: an element type or index relation the two ends disagree on admits no
+  // alternative -- no layout transform or transfer rewrites it -- so the pair
+  // is rejected outright rather than given a plan.
+  if (!elementAndShapeCompatible(request) || !affineCompatible(request))
+    return std::vector<ConnectionPlan>{};
+
   bool transformRequired = request.producerLayout && request.consumerLayout &&
                            *request.producerLayout != *request.consumerLayout;
   auto transformOf = [&]() -> std::optional<LayoutTransform> {
@@ -209,13 +299,20 @@ synthesizeConnections(const ConnectionRequest &request,
 
   std::vector<ConnectionPlan> plans;
   if (request.producerMemory == request.consumerMemory) {
-    // Nothing to move: either a direct connection or an in-place transform.
+    // Nothing to move: either a direct connection or an in-place transform. A
+    // consumer that cannot address the producer's memory cannot read the value
+    // from it, and with both ends in one memory there is no transfer
+    // alternative, so the pair is incompatible (design §10.2).
+    if (!consumerSeesProducerMemory(request, machine))
+      return std::vector<ConnectionPlan>{};
+
     ConnectionPlan plan;
     plan.producer = request.producer;
     plan.consumers.push_back(request.consumer);
     plan.value = request.value;
-    plan.kind = transformRequired ? ConnectionKind::LayoutTransform
-                                  : ConnectionKind::Direct;
+    plan.kind = portsDirectCompatible(request, machine)
+                    ? ConnectionKind::Direct
+                    : ConnectionKind::LayoutTransform;
     plan.memoryRoute.push_back(request.producerMemory);
     plan.transform = transformOf();
     plan.cost.localBytes = request.bytes;
@@ -229,6 +326,8 @@ synthesizeConnections(const ConnectionRequest &request,
   route.destination = request.consumerMemory;
   route.bytes = request.bytes;
   route.alignmentBytes = request.alignmentBytes;
+  route.producerExecutor = request.producerExecutor;
+  route.consumerExecutor = request.consumerExecutor;
   llvm::Expected<llvm::SmallVector<MemoryRoute>> routes =
       topology.enumerateRoutes(route, options.maxRoutesPerConnection,
                                truncated);
@@ -270,7 +369,8 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
       allShareProducerMemory = false;
 
   std::vector<ConnectionPlan> plans;
-  if (allShareProducerMemory && !consumers.empty()) {
+  if (allShareProducerMemory && !consumers.empty() &&
+      portsDirectCompatible(base, machine)) {
     ConnectionPlan plan;
     plan.producer = base.producer;
     plan.value = base.value;

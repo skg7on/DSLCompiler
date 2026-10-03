@@ -68,6 +68,10 @@ struct Edge {
   size_t consumer = 0;
   /// The value the edge carries, so a connection names what it moves.
   WorkloadValueId value = 0;
+  /// The ports the value crosses, so a connection can state the element type,
+  /// logical shape, and affine relation §10.2 compares.
+  const WorkloadPort *producerPort = nullptr;
+  const WorkloadPort *consumerPort = nullptr;
 };
 
 /// A partial cover: one instance chosen per covered node.
@@ -209,15 +213,19 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
 
   // --- dataflow edges --------------------------------------------------
   llvm::DenseMap<WorkloadValueId, size_t> producerOf;
+  llvm::DenseMap<WorkloadValueId, const WorkloadPort *> producerPortOf;
   for (size_t index = 0; index < tables.size(); ++index)
-    for (const WorkloadPort &port : tables[index].workload->outputs)
+    for (const WorkloadPort &port : tables[index].workload->outputs) {
       producerOf[port.value] = index;
+      producerPortOf[port.value] = &port;
+    }
   std::vector<Edge> edges;
   for (size_t index = 0; index < tables.size(); ++index)
     for (const WorkloadPort &port : tables[index].workload->inputs) {
       auto producer = producerOf.find(port.value);
       if (producer != producerOf.end() && producer->second != index)
-        edges.push_back({producer->second, index, port.value});
+        edges.push_back({producer->second, index, port.value,
+                         producerPortOf.lookup(port.value), &port});
     }
 
   TopologyService topology(machine,
@@ -280,6 +288,23 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       request.consumerMemory = primaryMemory(machine, *consumer);
       request.bytes = kAssumedValueBytes;
       request.alignmentBytes = kAssumedAlignment;
+      // §10.2 compatibility facts: the moved value's type, the consumer's
+      // expected type, and the affine relation each port states (extraction
+      // records one where a logical view supplies it).
+      if (const WorkloadValue *moved = workload_.findValue(edge.value))
+        request.elementType = moved->type;
+      if (edge.consumerPort)
+        request.consumerType = edge.consumerPort->type;
+      if (edge.producerPort)
+        request.producerMap = edge.producerPort->accessMap;
+      if (edge.consumerPort)
+        request.consumerMap = edge.consumerPort->accessMap;
+      if (ExecutorId executor = producer->executorBindings.lookup("executor");
+          !executor.empty())
+        request.producerExecutor = executor;
+      if (ExecutorId executor = consumer->executorBindings.lookup("executor");
+          !executor.empty())
+        request.consumerExecutor = executor;
       llvm::Expected<std::vector<ConnectionPlan>> alternatives =
           synthesizeConnections(request, machine, topology, placementOptions,
                                 &result.searchTruncated);

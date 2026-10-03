@@ -3,6 +3,10 @@
 #include "LLK/Mapping/Placement.h"
 #include "LLK/Mapping/Routing.h"
 
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/MLIRContext.h"
+
 #include "llvm/Support/Error.h"
 
 #include <gtest/gtest.h>
@@ -68,6 +72,31 @@ ConnectionRequest baseRequest() {
   request.bytes = 1024;
   request.alignmentBytes = 32;
   return request;
+}
+
+/// `(d0, d1) -> (d0, d1)`, the canonical identity relation.
+mlir::AffineMap identity2(mlir::MLIRContext &context) {
+  return mlir::AffineMap::getMultiDimIdentityMap(2, &context);
+}
+
+/// `(d0, d1) -> (d0 + 0, d1 * 1)`: equal to the identity only after MLIR
+/// canonicalization. §10.2 requires comparing maps through that path, never by
+/// string rendering.
+mlir::AffineMap equivalentIdentity2(mlir::MLIRContext &context) {
+  mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, &context);
+  mlir::AffineExpr d1 = mlir::getAffineDimExpr(1, &context);
+  mlir::AffineExpr zero = mlir::getAffineConstantExpr(0, &context);
+  mlir::AffineExpr one = mlir::getAffineConstantExpr(1, &context);
+  return mlir::AffineMap::get(2, 0, {d0 + zero, d1 * one}, &context);
+}
+
+/// `(d0, d1) -> (d0 + 1, d1)`: a shifted window, not affinely equal to the
+/// identity.
+mlir::AffineMap shifted2(mlir::MLIRContext &context) {
+  mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, &context);
+  mlir::AffineExpr d1 = mlir::getAffineDimExpr(1, &context);
+  mlir::AffineExpr one = mlir::getAffineConstantExpr(1, &context);
+  return mlir::AffineMap::get(2, 0, {d0 + one, d1}, &context);
 }
 
 } // namespace
@@ -180,6 +209,178 @@ TEST(Connections, UnknownMemoryIsAnError) {
   EXPECT_FALSE(static_cast<bool>(plans));
   if (!plans)
     llvm::consumeError(plans.takeError());
+}
+
+//===----------------------------------------------------------------------===//
+// Direct compatibility (design §10.2): element type, logical tile shape,
+// memory visibility, and affine index relation.
+//===----------------------------------------------------------------------===//
+
+TEST(Connections, RejectsElementTypeMismatch) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory; // in place: nothing to move
+  request.elementType = mlir::Float32Type::get(&context);
+  request.consumerType = mlir::BFloat16Type::get(&context);
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_TRUE(plans->empty());
+}
+
+TEST(Connections, RejectsShapedElementTypeMismatch) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.elementType =
+      mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
+  request.consumerType =
+      mlir::RankedTensorType::get({8, 8}, mlir::BFloat16Type::get(&context));
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_TRUE(plans->empty());
+}
+
+TEST(Connections, RejectsLogicalTileShapeMismatch) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.elementType =
+      mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
+  request.consumerType =
+      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context));
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_TRUE(plans->empty());
+}
+
+TEST(Connections, DirectWhenElementTypesAndShapesAgree) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.elementType =
+      mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
+  request.consumerType =
+      mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+}
+
+TEST(Connections, AcceptsAffinelyEquivalentMaps) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.producerMap = equivalentIdentity2(context);
+  request.consumerMap = identity2(context);
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+}
+
+TEST(Connections, RejectsAffinelyDifferentMaps) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.producerMap = identity2(context);
+  request.consumerMap = shifted2(context);
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_TRUE(plans->empty());
+}
+
+TEST(Connections, AcceptsMapsWhenOnlyOneEndpointDeclaresOne) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.producerMap = identity2(context); // consumer map unknown
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_FALSE(plans->empty());
+}
+
+TEST(Connections, RejectsMemoryVisibilityMismatch) {
+  MachineModel machine = connectionMachine();
+  machine.executors.push_back({"e1", "worker", std::nullopt, {}, 1, {}});
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory; // in place
+  request.producerExecutor = "e0";
+  request.consumerExecutor = "e1"; // outside the memory's visibility scope
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_TRUE(plans->empty());
+}
+
+TEST(Connections, DirectWhenTheConsumerSeesTheProducersMemory) {
+  MachineModel machine = connectionMachine();
+  machine.executors.push_back({"e1", "worker", std::nullopt, {}, 1, {}});
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.producerExecutor = "e0";
+  request.consumerExecutor = "e0";
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+}
+
+TEST(Connections, VisibilityMismatchDoesNotForbidATransfer) {
+  MachineModel machine = connectionMachine();
+  machine.executors.push_back({"e1", "worker", std::nullopt, {}, 1, {}});
+  // A memory only e1 can address, so the transfer has a legal destination even
+  // though e1 cannot see the producer's memory.
+  MemoryNode acc1 = memory("acc.1", "acc");
+  acc1.visibleFrom = "e1";
+  machine.memories.push_back(acc1);
+  machine.links.push_back(link("dram_to_acc1.0", "dram.0", "acc.1"));
+  TopologyService topology(machine);
+
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = "acc.1";
+  request.producerExecutor = "e0";
+  request.consumerExecutor = "e1";
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_FALSE(plans->empty());
+  for (const ConnectionPlan &plan : *plans)
+    EXPECT_EQ(plan.kind, ConnectionKind::Transfer);
 }
 
 //===----------------------------------------------------------------------===//

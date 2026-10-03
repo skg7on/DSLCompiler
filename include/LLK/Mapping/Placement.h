@@ -23,6 +23,9 @@
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/Routing.h"
 
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Types.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/Error.h"
 
@@ -64,6 +67,10 @@ llvm::Expected<std::vector<CandidateInstance>> enumeratePlacements(
 
 /// One dataflow edge to connect: where the value is produced, where the
 /// consumer expects it, and whether the two ends want different layouts.
+///
+/// The optional fields carry what §10.2 direct-compatibility compares. They are
+/// deliberately nullable: a caller that does not know a fact leaves it unset
+/// and the corresponding check is skipped, never guessed.
 struct ConnectionRequest {
   InstanceId producer = 0;
   InstanceId consumer = 0;
@@ -72,15 +79,44 @@ struct ConnectionRequest {
   MemoryNodeId consumerMemory;
   std::optional<LayoutId> producerLayout;
   std::optional<LayoutId> consumerLayout;
+  /// The moved value's type, as far as it is known. A modelled shaped type
+  /// (`tensor`, `memref`, `vector`) states both its element type and its
+  /// logical shape; a `!micro.tile` is opaque to this target-independent core,
+  /// so a tile here contributes no comparable fact.
+  mlir::Type elementType;
+  /// The consumer port's expected type. When both it and `elementType` expose
+  /// an element type or a static shape, they must agree.
+  mlir::Type consumerType;
+  /// Executor that runs each side, when known; the visibility check needs the
+  /// consumer's so it can ask whether the producer's memory is addressable.
+  std::optional<ExecutorId> producerExecutor;
+  std::optional<ExecutorId> consumerExecutor;
+  /// Affine relationship between each port's index space and the value.
+  std::optional<mlir::AffineMap> producerMap;
+  std::optional<mlir::AffineMap> consumerMap;
   uint64_t bytes = 0;
   uint64_t alignmentBytes = 1;
 };
+
+/// True when the two ports can connect directly -- no transfer, no layout
+/// transform -- under design §10.2: their element type, logical tile shape,
+/// memory visibility, and affine index relation must agree. A property is
+/// checked only when both ends state it, so an absent fact can never reject a
+/// pair. Affine maps are compared through MLIR's own equality after
+/// `simplifyAffineMap`, never by rendering them.
+bool portsDirectCompatible(const ConnectionRequest &request,
+                           const machine::MachineModel &machine);
 
 /// Synthesizes every legal way to move the value (design §15.2), cheapest
 /// shape first: a direct connection, an in-place layout transform, a transfer,
 /// a transfer plus transform, and one plan per route D2 found -- so a
 /// multi-hop route appears as a transfer whose route has intermediate nodes.
 /// An empty result means the pair is incompatible; it does not fail.
+///
+/// Compatibility follows §10.2: an element type or affine index relation the
+/// two ends disagree on rejects the pair; a layout difference becomes a
+/// transform; and a consumer that cannot address the producer's memory cannot
+/// take a direct connection.
 ///
 /// When `truncated` is non-null it is set to true if a route enumeration hit
 /// its cap, so the caller can report truncated search rather than optimality.
