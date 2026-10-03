@@ -62,9 +62,11 @@ struct BoundPlan {
 /// needs a destination-memory-typed tile, which cannot be built without the
 /// dialect's type class), and a target layout id has no Micro operation form at
 /// all (design §13.4 keeps target layout ids out of `#micro.layout`). Every
-/// reported entry names the connection's value id and carries a stable reason
-/// token -- a `LayoutTransform` connection, for instance, is reported as
-/// `layout_transform_requires_dialect_op`.
+/// reported entry names the connection's value id; when the binder cannot
+/// materialize a whole connection kind, the entry also carries a stable reason
+/// token (a `LayoutTransform` connection is reported as
+/// `layout_transform_requires_dialect_op`), while a movement that fails reports
+/// its own specific cause.
 llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
                                    const CoveringPlan &plan,
                                    const MappingTarget &target);

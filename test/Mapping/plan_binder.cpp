@@ -335,12 +335,9 @@ TEST(PlanBinder, ReportsALayoutTransformConnectionItCannotMaterialize) {
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   ASSERT_EQ(bound->unmaterialized.size(), 1u);
-  const std::string &note = bound->unmaterialized.front();
-  // The entry names the value and carries a stable, greppable reason.
-  EXPECT_NE(note.find("7"), std::string::npos) << note;
-  EXPECT_NE(note.find("layout_transform_requires_dialect_op"),
-            std::string::npos)
-      << note;
+  // The entry is exactly "value <id>: <token>".
+  EXPECT_EQ(bound->unmaterialized.front(),
+            "value 7: layout_transform_requires_dialect_op");
 }
 
 TEST(PlanBinder, ReportsOtherConnectionKindsItCannotMaterialize) {
@@ -352,11 +349,11 @@ TEST(PlanBinder, ReportsOtherConnectionKindsItCannotMaterialize) {
   ASSERT_TRUE(fixture.module);
   ASSERT_NE(fixture.target, nullptr);
 
-  const std::pair<ConnectionKind, llvm::StringRef> cases[] = {
-      {ConnectionKind::Replicate, "replicate_not_materialized"},
-      {ConnectionKind::Reduce, "reduce_not_materialized"},
+  const std::pair<ConnectionKind, std::string> cases[] = {
+      {ConnectionKind::Replicate, "value 9: replicate_not_materialized"},
+      {ConnectionKind::Reduce, "value 9: reduce_not_materialized"},
   };
-  for (const auto &[kind, reason] : cases) {
+  for (const auto &[kind, expected] : cases) {
     CoveringPlan plan;
     plan.id = 1;
     PlanConnection connection;
@@ -369,9 +366,63 @@ TEST(PlanBinder, ReportsOtherConnectionKindsItCannotMaterialize) {
         bindPlan(*fixture.module, plan, *fixture.target);
     ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
     ASSERT_EQ(bound->unmaterialized.size(), 1u);
-    const std::string &note = bound->unmaterialized.front();
-    EXPECT_NE(note.find(reason.str()), std::string::npos) << note;
+    EXPECT_EQ(bound->unmaterialized.front(), expected);
   }
+}
+
+TEST(PlanBinder, ReportsADuplicateValueConnectionWithADifferentRoute) {
+  // One value can be reached by several connections when a producer feeds
+  // several consumers. A single copy chain can only serve the routes it takes,
+  // so a duplicate with a *different* route must be reported -- otherwise the
+  // second consumer silently reads the first route's memory.
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+  const PlanConnection &first = plan->connectionPlans.front();
+  ASSERT_EQ(first.kind, ConnectionKind::Transfer);
+  ASSERT_GE(first.route.size(), 2u);
+
+  const WorkloadValueId value = first.value;
+  PlanConnection duplicate = first;
+  duplicate.id = first.id + 1;
+  duplicate.route.push_back(first.route.back()); // a different route
+  plan->connectionPlans.push_back(duplicate);
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  ASSERT_EQ(bound->unmaterialized.size(), 1u);
+  EXPECT_EQ(bound->unmaterialized.front(),
+            "value " + std::to_string(value) + ": duplicate_route_for_value");
+}
+
+TEST(PlanBinder, MergesADuplicateValueConnectionWithTheSameRoute) {
+  // The same duplicate with the same route is a genuine fan-out merge: one
+  // chain serves both connections, so nothing is reported.
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+  const PlanConnection &first = plan->connectionPlans.front();
+  ASSERT_EQ(first.kind, ConnectionKind::Transfer);
+
+  PlanConnection duplicate = first;
+  duplicate.id = first.id + 1;
+  plan->connectionPlans.push_back(duplicate); // identical route
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  EXPECT_TRUE(bound->unmaterialized.empty());
 }
 
 //===----------------------------------------------------------------------===//

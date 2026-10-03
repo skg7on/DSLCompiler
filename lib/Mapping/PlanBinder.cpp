@@ -10,7 +10,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 
-#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 
@@ -34,10 +34,14 @@ constexpr llvm::StringLiteral kRoutesAttr = "micro.routes";
 /// constants rather than free-form prose.
 constexpr llvm::StringLiteral kLayoutTransformReason =
     "layout_transform_requires_dialect_op";
+constexpr llvm::StringLiteral kTransferAndTransformReason =
+    "transfer_and_transform_layout_not_applied";
 constexpr llvm::StringLiteral kReplicateReason = "replicate_not_materialized";
 constexpr llvm::StringLiteral kReduceReason = "reduce_not_materialized";
 constexpr llvm::StringLiteral kHoplessRouteReason =
     "route_has_no_hop_to_materialize";
+constexpr llvm::StringLiteral kDuplicateRouteReason =
+    "duplicate_route_for_value";
 
 /// The reason a non-movement connection cannot be materialized. `Direct` and
 /// the movements are handled inline and must never reach here.
@@ -208,7 +212,15 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
   // read in another, so the copies are placed right after the producer and
   // every other use is rewired to the last of them. Emitting one chain per
   // *connection* would duplicate it when a value fans out.
-  llvm::DenseSet<WorkloadValueId> moved;
+  //
+  // A value reached by several connections (a producer feeding several
+  // consumers) is handled once. When every such connection takes the same
+  // route, one chain serves them all, so a duplicate is merged silently. When
+  // a duplicate takes a *different* route, that single chain cannot serve it --
+  // the second consumer would silently read the first route's memory -- and the
+  // binder cannot yet emit a second chain and rewire only that consumer, so the
+  // duplicate is reported instead of dropped.
+  llvm::DenseMap<WorkloadValueId, llvm::SmallVector<MemoryNodeId>> movedRoutes;
   mlir::OpBuilder builder(context);
   for (const PlanConnection &connection : plan.connectionPlans) {
     // A `Direct` connection is materialized by construction: the producer wrote
@@ -237,8 +249,16 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
                                      kHoplessRouteReason.str());
       continue;
     }
-    if (!moved.insert(connection.value).second)
+    auto handled = movedRoutes.find(connection.value);
+    if (handled != movedRoutes.end()) {
+      if (handled->second == connection.route)
+        continue; // the same movement: one chain serves both connections
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) + ": " +
+                                     kDuplicateRouteReason.str());
       continue;
+    }
+    movedRoutes.try_emplace(connection.value, connection.route);
 
     // The producer is the covered node that writes this value; the consumer is
     // any covered node that reads it.
@@ -291,7 +311,9 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     }
     mlir::Type tokenType = mlir::parseType("!micro.async_token", context);
     if (!tokenType) {
-      bound.unmaterialized.push_back("async token type is not registered");
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) +
+                                     ": async token type is not registered");
       continue;
     }
 
@@ -359,11 +381,13 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     // A transfer-and-transform moved the value, but the selected layout
     // transform itself has no Micro operation form (design §13.4). The
     // movement is real, so the connection is not dropped -- but the transform
-    // must still be reported, or it vanishes without a trace.
+    // must still be reported, or it vanishes without a trace. The token differs
+    // from the transform-only case so "nothing materialized" stays
+    // distinguishable from "movement done, transform dropped".
     if (connection.kind == ConnectionKind::TransferAndTransform)
       bound.unmaterialized.push_back("value " +
                                      std::to_string(connection.value) + ": " +
-                                     kLayoutTransformReason.str());
+                                     kTransferAndTransformReason.str());
 
     // Rewire every other reader to the last hop's value; the copies themselves
     // already read the previous one.
