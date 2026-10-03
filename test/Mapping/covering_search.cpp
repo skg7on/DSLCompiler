@@ -70,8 +70,12 @@ mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context,
                                       mlir::StringAttr::get(&context, op))});
 }
 
-/// producer -> consumer, both `micro.vector`.
-WorkloadGraph twoNodeGraph(mlir::MLIRContext &context) {
+/// producer -> consumer, both `micro.vector`. `producerOp` and `consumerOp` are
+/// the nodes' `op` attributes, so a fixture can gate the two nodes onto
+/// different rules (and thus different memories).
+WorkloadGraph twoNodeGraph(mlir::MLIRContext &context,
+                           llvm::StringRef producerOp = "add",
+                           llvm::StringRef consumerOp = "add") {
   WorkloadGraph graph;
   WorkloadValueId input =
       graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
@@ -82,14 +86,14 @@ WorkloadGraph twoNodeGraph(mlir::MLIRContext &context) {
 
   WorkloadNode producer;
   producer.opName = "micro.vector";
-  producer.attributes = vectorAttributes(context);
+  producer.attributes = vectorAttributes(context, producerOp);
   producer.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
   producer.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
   graph.addNode(std::move(producer));
 
   WorkloadNode consumer;
   consumer.opName = "micro.vector";
-  consumer.attributes = vectorAttributes(context);
+  consumer.attributes = vectorAttributes(context, consumerOp);
   consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
   consumer.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
   graph.addNode(std::move(consumer));
@@ -833,6 +837,56 @@ TEST(CoveringSearch, PerMemoryCapacityRejectsOverSubscription) {
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   EXPECT_TRUE(result->plans.empty());
   EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// A connection across two *different* memories must run producer -> consumer,
+// not the reverse. The #97 bug reversed the endpoints when the connection was
+// synthesized as the consumer instance completed the edge, and every fixture
+// that placed both ends in one memory hid it: a same-memory route has one node,
+// so reversing it is invisible. Here the producer is placed on dram.0 (visible
+// to e0) and the consumer on acc.0 (visible to e1), so the only legal route is
+// the single dram.0 -> acc.0 link. The route's endpoints pin the direction.
+TEST(CoveringSearch, CrossMemoryConnectionRunsFromProducerToConsumer) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, /*producerOp=*/"produce",
+                                     /*consumerOp=*/"consume");
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+
+  // The two endpoints are placed in genuinely different memories, named by each
+  // placement's own rule so the direction claim does not rest on node ids.
+  const PlanPlacement *producer = nullptr;
+  const PlanPlacement *consumer = nullptr;
+  for (const PlanPlacement &placement : plan.placements) {
+    if (placement.rule == "r.produce")
+      producer = &placement;
+    else if (placement.rule == "r.consume")
+      consumer = &placement;
+  }
+  ASSERT_NE(producer, nullptr);
+  ASSERT_NE(consumer, nullptr);
+  const MemoryNodeId producerMemory = producer->memories.lookup("dram");
+  const MemoryNodeId consumerMemory = consumer->memories.lookup("acc");
+  EXPECT_EQ(producerMemory, "dram.0");
+  EXPECT_EQ(consumerMemory, "acc.0");
+  ASSERT_NE(producerMemory, consumerMemory);
+
+  // One connection whose route starts at the producer's memory and ends at the
+  // consumer's -- producer first.
+  ASSERT_EQ(plan.connections.size(), 1u);
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  const PlanConnection &connection = plan.connectionPlans[0];
+  ASSERT_FALSE(connection.route.empty());
+  EXPECT_EQ(connection.route.front(), producerMemory);
+  EXPECT_EQ(connection.route.back(), consumerMemory);
 }
 
 //===----------------------------------------------------------------------===//
