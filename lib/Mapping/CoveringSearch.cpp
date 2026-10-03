@@ -254,9 +254,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       const CandidateInstance *producer = nullptr;
       const CandidateInstance *consumer = nullptr;
       if (edge.consumer == nodeIndex) {
+        // The instance being added reads the edge, so the *other* end produces.
         other = partial.chosen[edge.producer];
-        producer = &instance;
-        consumer = other;
+        producer = other;
+        consumer = &instance;
       } else if (edge.producer == nodeIndex) {
         other = partial.chosen[edge.consumer];
         producer = &instance;
@@ -278,11 +279,17 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       llvm::Expected<std::vector<ConnectionPlan>> alternatives =
           synthesizeConnections(request, machine, topology, placementOptions);
       if (!alternatives) {
-        pendingError = alternatives.takeError();
+        result.frontier.messages.push_back(
+            "connection " + request.producerMemory + " -> " +
+            request.consumerMemory + ": " +
+            llvm::toString(alternatives.takeError()));
         return false;
       }
       if (alternatives->empty()) {
         ++result.frontier.incompatibleInstancePairs;
+        result.frontier.messages.push_back(
+            "connection " + request.producerMemory + " -> " +
+            request.consumerMemory + ": no legal route");
         return false;
       }
       // The cheapest alternative is the one a plan would use.

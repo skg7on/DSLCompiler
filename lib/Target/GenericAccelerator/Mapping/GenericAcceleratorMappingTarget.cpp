@@ -8,7 +8,8 @@
 namespace mlir::llk::target::generic_accel {
 
 llvm::ArrayRef<llvm::StringRef> emitterKeys() {
-  static const llvm::StringRef kKeys[] = {"accel_vector_add", "accel_mxu"};
+  static const llvm::StringRef kKeys[] = {"accel_vector_add", "accel_mxu",
+                                          "accel_copy"};
   return kKeys;
 }
 

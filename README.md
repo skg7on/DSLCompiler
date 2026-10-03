@@ -157,6 +157,7 @@ Future targets should reuse the same Micro-IR contract with different MachineMod
 | [docs/design/m4-parallel-execution.md](docs/design/m4-parallel-execution.md) | M4 design: thread pool, parallel decomposition, dispatch thresholds |
 | [docs/design/m5-specialization-tuning.md](docs/design/m5-specialization-tuning.md) | M5 design: M-bucketing, JIT cache, schedule DB, autotuning foundation |
 | [docs/design/m6-multi-kernel.md](docs/design/m6-multi-kernel.md) | M6 design: RoPE, Attention, online softmax, shared infrastructure |
+| [docs/design/micro-ir-mapping-workflow.md](docs/design/micro-ir-mapping-workflow.md) | **Start here to use the compiler**: the tile-centric workflow, the tools, MachineModel customization, and the target-independent mapping chain |
 | [docs/design/m9-canonical-micro-ir-architecture.md](docs/design/m9-canonical-micro-ir-architecture.md) | M9+ architecture: canonical Micro-IR, MachineModel, performance evaluation, auto-search |
 | [docs/design/m9-micro-ir-core-concepts.md](docs/design/m9-micro-ir-core-concepts.md) | Core `micro` concepts: execution IR, search IR, attributes, verifier invariants |
 | [docs/superpowers/specs/2026-08-11-canonical-micro-ir-redesign.md](docs/superpowers/specs/2026-08-11-canonical-micro-ir-redesign.md) | Full canonical Micro-IR redesign spec and milestone contract |
