@@ -129,17 +129,19 @@ struct RuleDef {
   const LayoutParam *findParam(llvm::StringRef name) const;
 };
 
-/// Loaded rules, keyed by id.
+/// Loaded rules, kept sorted by id: `all()` is the deterministic output order
+/// (design §22.1), so file declaration order never reaches it.
 class RuleRegistry {
 public:
   /// Adds `def`, or fails with a stable message when the id is a duplicate.
+  /// The rule is stored in id order.
   bool add(RuleDef def, std::string &error);
 
   const RuleDef *find(llvm::StringRef id) const;
   llvm::ArrayRef<RuleDef> all() const { return defs_; }
 
 private:
-  std::vector<RuleDef> defs_;
+  std::vector<RuleDef> defs_; // sorted by id
 };
 
 /// Parses a complete rule file. `sourceName` appears in diagnostics.
@@ -159,8 +161,11 @@ llvm::Expected<RuleRegistry> loadRuleFile(llvm::StringRef path);
 /// conservative.
 bool predicateMatches(const RulePredicate &predicate, const WorkloadNode &node);
 
-/// Rules whose match operation and predicates apply to `node`, in registry
-/// order. A rule with no predicates matches every operation of its name.
+/// Rules whose match operation and predicates apply to `node`, in canonical
+/// order (design §22.1): covered-node sequence, rule id, then candidate id. A
+/// single-node match fixes the covered sequence, and one rule yields at most
+/// one candidate for it, so this is rule-id order. A rule with no predicates
+/// matches every operation of its name.
 std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
                                         const RuleRegistry &rules);
 

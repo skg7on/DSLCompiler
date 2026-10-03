@@ -543,15 +543,24 @@ bool RuleRegistry::add(RuleDef def, std::string &error) {
     error = "duplicate rule id '" + def.id + "'";
     return false;
   }
-  defs_.push_back(std::move(def));
+  // Insert in id order: `all()` is an output order, so file declaration order
+  // must never reach it (design §22.1). `find`'s lower_bound search stays
+  // valid.
+  std::string id = def.id;
+  auto position = llvm::lower_bound(
+      defs_, id,
+      [](const RuleDef &rule, llvm::StringRef key) { return rule.id < key; });
+  defs_.insert(position, std::move(def));
   return true;
 }
 
 const RuleDef *RuleRegistry::find(llvm::StringRef id) const {
-  for (const RuleDef &def : defs_)
-    if (def.id == id)
-      return &def;
-  return nullptr;
+  auto position = llvm::lower_bound(
+      defs_, id,
+      [](const RuleDef &rule, llvm::StringRef key) { return rule.id < key; });
+  if (position == defs_.end() || position->id != id)
+    return nullptr;
+  return &*position;
 }
 
 llvm::Expected<RuleRegistry> parseRuleText(llvm::StringRef text,
@@ -754,6 +763,12 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
     if (matched)
       matches.push_back(&rule);
   }
+  // Canonical candidate order (design §22.1): (covered-node sequence, rule id,
+  // candidate id). The covered sequence is this one node for every match, and a
+  // rule yields at most one candidate for it, so rule id is the whole key.
+  llvm::sort(matches, [](const RuleDef *lhs, const RuleDef *rhs) {
+    return lhs->id < rhs->id;
+  });
   return matches;
 }
 

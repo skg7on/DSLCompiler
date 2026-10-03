@@ -60,11 +60,12 @@ MachineModel smallMemoryMachine() {
   return model;
 }
 
-/// A `micro.vector` with `op = "add"`, as the shipped rules predicate on.
-mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context) {
+/// A `micro.vector` with `op = <op>`, as the shipped rules predicate on.
+mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context,
+                                      llvm::StringRef op = "add") {
   return mlir::DictionaryAttr::get(
       &context, {mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
-                                      mlir::StringAttr::get(&context, "add"))});
+                                      mlir::StringAttr::get(&context, op))});
 }
 
 /// producer -> consumer, both `micro.vector`.
@@ -90,6 +91,66 @@ WorkloadGraph twoNodeGraph(mlir::MLIRContext &context) {
   consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
   consumer.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
   graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+/// Two executors whose ids sort opposite to their kinds, so ordering placements
+/// by node and by the executor binding tuple give different answers.
+MachineModel oppositeOrderMachine() {
+  MachineModel model;
+  model.target = "opposite";
+  model.executors = {{"z0", "worker", std::nullopt, {}, 1, {}},
+                     {"a0", "dma", std::nullopt, {}, 1, {}}};
+  return model;
+}
+
+/// One rule per executor kind, each gated on the node's `op` attribute so a
+/// node takes exactly one of them.
+constexpr llvm::StringLiteral kExecutorRules = R"llkmap(
+rule r.work {
+  match micro.vector(op = "a");
+  require executor kind worker;
+  bundle "b.work";
+  emit "e1";
+}
+rule r.dma {
+  match micro.vector(op = "z");
+  require executor kind dma;
+  bundle "b.dma";
+  emit "e1";
+}
+)llkmap";
+
+/// Two independent `micro.vector` nodes: `op = "a"` (which binds executor `z0`)
+/// and `op = "z"` (which binds executor `a0`). `finalize` orders nodes by
+/// content, so the node bound to the *lexicographically smaller* executor gets
+/// the *greater* node id -- node order and binding-tuple order disagree.
+WorkloadGraph oppositeBindingGraph(mlir::MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId in0 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in0", /*external=*/true});
+  WorkloadValueId out0 = graph.addValue(
+      WorkloadValue{0, mlir::Type(), "out0", /*external=*/false});
+  WorkloadValueId in1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in1", /*external=*/true});
+  WorkloadValueId out1 = graph.addValue(
+      WorkloadValue{0, mlir::Type(), "out1", /*external=*/false});
+
+  WorkloadNode first;
+  first.opName = "micro.vector";
+  first.attributes = vectorAttributes(context, "a");
+  first.inputs.push_back(WorkloadPort{in0, mlir::Type(), std::nullopt});
+  first.outputs.push_back(WorkloadPort{out0, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(first));
+
+  WorkloadNode second;
+  second.opName = "micro.vector";
+  second.attributes = vectorAttributes(context, "z");
+  second.inputs.push_back(WorkloadPort{in1, mlir::Type(), std::nullopt});
+  second.outputs.push_back(WorkloadPort{out1, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(second));
 
   graph.finalize();
   return graph;
@@ -211,6 +272,32 @@ TEST(CoveringSearch, DeterministicReturnsTheFirstCompletePlan) {
   EXPECT_EQ(result->plans[0].instances.size(), 2u);
   EXPECT_EQ(result->plans[0].connections.size(), 1u);
   EXPECT_FALSE(result->searchTruncated);
+}
+
+TEST(CoveringSearch, PlacementsAreOrderedByTheirBindingTuple) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = oppositeBindingGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(oppositeOrderMachine(), kExecutorRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const llvm::SmallVector<PlanPlacement> &placements =
+      result->plans[0].placements;
+  ASSERT_EQ(placements.size(), 2u);
+
+  // §22.1 orders placements by the (executor, memory, layout) binding tuple,
+  // not by node: executor `a0` sorts before `z0`, and it belongs to the node
+  // with the greater id.
+  EXPECT_EQ(placements[0].executor, "a0");
+  EXPECT_EQ(placements[0].node, 1u);
+  EXPECT_EQ(placements[1].executor, "z0");
+  EXPECT_EQ(placements[1].node, 0u);
 }
 
 TEST(CoveringSearch, ReportsNodesWithoutRules) {

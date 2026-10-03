@@ -207,7 +207,9 @@ struct CoveringPlan {
   llvm::SmallVector<InstanceId> instances;
   llvm::SmallVector<ConnectionId> connections;
   /// The same selections, resolved: which node each instance covers and how
-  /// each connection runs. Sorted by node / connection id.
+  /// each connection runs. Placements are ordered by their (executor, memory,
+  /// layout) binding tuple, then node / instance id (design §22.1);
+  /// `connectionPlans` by connection id.
   llvm::SmallVector<PlanPlacement> placements;
   llvm::SmallVector<PlanConnection> connectionPlans;
   llvm::StringMap<SearchValue> globalParameters;

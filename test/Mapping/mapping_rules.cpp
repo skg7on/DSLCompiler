@@ -566,6 +566,98 @@ std::vector<std::string> matchedIds(const WorkloadNode &node,
 
 } // namespace
 
+//===----------------------------------------------------------------------===//
+// Canonical ordering (design §22.1)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Three rules in a deliberately non-canonical file order: the registry must
+/// expose them by rule id, never in declaration order.
+constexpr llvm::StringLiteral kDeclaredOutOfOrder = R"llkmap(
+rule r.zeta {
+  match micro.vector();
+  bundle "b.zeta";
+  emit "e";
+}
+rule r.alpha {
+  match micro.vector();
+  bundle "b.alpha";
+  emit "e";
+}
+rule r.middle {
+  match micro.vector();
+  bundle "b.middle";
+  emit "e";
+}
+)llkmap";
+
+/// The same rules declared in the reverse order, so two registries built from
+/// the same content can be compared.
+constexpr llvm::StringLiteral kReversedDeclaration = R"llkmap(
+rule r.middle {
+  match micro.vector();
+  bundle "b.middle";
+  emit "e";
+}
+rule r.alpha {
+  match micro.vector();
+  bundle "b.alpha";
+  emit "e";
+}
+rule r.zeta {
+  match micro.vector();
+  bundle "b.zeta";
+  emit "e";
+}
+)llkmap";
+
+std::vector<std::string> ruleIds(const RuleRegistry &registry) {
+  std::vector<std::string> ids;
+  for (const RuleDef &rule : registry.all())
+    ids.push_back(rule.id);
+  return ids;
+}
+
+} // namespace
+
+TEST(RuleOrdering, RegistryIterationIsByRuleId) {
+  llvm::Expected<RuleRegistry> registry = parse(kDeclaredOutOfOrder);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  // `all()` is the deterministic output order, so it is by rule id, not file
+  // order.
+  EXPECT_EQ(ruleIds(*registry),
+            (std::vector<std::string>{"r.alpha", "r.middle", "r.zeta"}));
+  // Lookup still resolves every rule after sorting by id.
+  EXPECT_NE(registry->find("r.alpha"), nullptr);
+  EXPECT_NE(registry->find("r.middle"), nullptr);
+  EXPECT_NE(registry->find("r.zeta"), nullptr);
+  EXPECT_EQ(registry->find("r.missing"), nullptr);
+}
+
+TEST(RuleOrdering, MatchRulesAreCanonicallyOrderedRegardlessOfDeclaration) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(kDeclaredOutOfOrder);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  WorkloadNode node = vectorNode(context, "add");
+
+  // No rule has a predicate, so all three match. A single-node match fixes the
+  // covered-node sequence, and one rule yields at most one candidate for it, so
+  // §22.1's (covered-node sequence, rule id, id) order is rule id order here.
+  EXPECT_EQ(matchedIds(node, *registry),
+            (std::vector<std::string>{"r.alpha", "r.middle", "r.zeta"}));
+
+  // Rebuilding the same content in a different declaration order yields the
+  // identical registry and match ordering.
+  llvm::Expected<RuleRegistry> reversed = parse(kReversedDeclaration);
+  ASSERT_TRUE(static_cast<bool>(reversed))
+      << llvm::toString(reversed.takeError());
+  EXPECT_EQ(ruleIds(*reversed), ruleIds(*registry));
+  EXPECT_EQ(matchedIds(node, *reversed), matchedIds(node, *registry));
+}
+
 TEST(RuleMatch, MatchesByOperationAndPredicates) {
   mlir::MLIRContext context;
   llvm::Expected<RuleRegistry> registry = parse(kMatchingRules);

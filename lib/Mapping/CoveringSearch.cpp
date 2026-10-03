@@ -119,6 +119,56 @@ uint64_t partialId(const std::vector<const CandidateInstance *> &chosen) {
   return hash;
 }
 
+/// A binding map's `name=value` entries, sorted. A placement's memory and
+/// layout binding tuples compare through this, never through `StringMap`
+/// iteration order (design §22.1).
+template <typename ValueT>
+std::vector<std::string>
+sortedBindings(const llvm::StringMap<ValueT> &bindings) {
+  std::vector<std::string> entries;
+  entries.reserve(bindings.size());
+  for (const auto &entry : bindings) {
+    std::string text = entry.first().str();
+    text += '=';
+    text += entry.second;
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return entries;
+}
+
+/// A map's keys in sorted order, so an unordered container is never walked as
+/// output order (design §22.1).
+template <typename ValueT>
+llvm::SmallVector<llvm::StringRef, 8>
+sortedKeys(const llvm::StringMap<ValueT> &map) {
+  llvm::SmallVector<llvm::StringRef, 8> keys;
+  keys.reserve(map.size());
+  for (const auto &entry : map)
+    keys.push_back(entry.first());
+  llvm::sort(keys);
+  return keys;
+}
+
+/// Canonical placement order (design §22.1): the executor id, then the sorted
+/// memory bindings, then the sorted layout bindings. Node and instance ids
+/// break a tie so the order over a complete plan is total.
+bool placementBefore(const PlanPlacement &lhs, const PlanPlacement &rhs) {
+  if (lhs.executor != rhs.executor)
+    return lhs.executor < rhs.executor;
+  std::vector<std::string> lhsMemories = sortedBindings(lhs.memories);
+  std::vector<std::string> rhsMemories = sortedBindings(rhs.memories);
+  if (lhsMemories != rhsMemories)
+    return lhsMemories < rhsMemories;
+  std::vector<std::string> lhsLayouts = sortedBindings(lhs.layouts);
+  std::vector<std::string> rhsLayouts = sortedBindings(rhs.layouts);
+  if (lhsLayouts != rhsLayouts)
+    return lhsLayouts < rhsLayouts;
+  if (lhs.node != rhs.node)
+    return lhs.node < rhs.node;
+  return lhs.instance < rhs.instance;
+}
+
 } // namespace
 
 CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
@@ -285,22 +335,25 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     }
 
     // §9.3: no memory's own capacity may be exceeded (per-node), on top of the
-    // global byte ceiling (whole plan).
+    // global byte ceiling (whole plan). Keys are walked sorted: which memory is
+    // inspected first decides whether an unknown binding is reported as an
+    // error or an over-capacity one merely rejects the branch, so `StringMap`
+    // iteration order must not reach that decision (design §22.1).
     uint64_t totalBytes = 0;
-    for (const auto &entry : partial.memoryBytes) {
-      totalBytes += entry.second;
-      const MemoryNode *memory = machine.findMemory(entry.first());
+    for (llvm::StringRef key : sortedKeys(partial.memoryBytes)) {
+      uint64_t bytes = partial.memoryBytes.lookup(key);
+      totalBytes += bytes;
+      const MemoryNode *memory = machine.findMemory(key);
       if (!memory) {
         // Defensive: an id no machine node names cannot be checked. Surface it
         // as an error rather than silently treating it as unlimited.
         if (!pendingError)
           pendingError = llvm::createStringError(
               llvm::inconvertibleErrorCode(),
-              "covering search: plan binds unknown memory '" +
-                  entry.first().str() + "'");
+              "covering search: plan binds unknown memory '" + key.str() + "'");
         return false;
       }
-      if (entry.second > memory->capacityBytes) {
+      if (bytes > memory->capacityBytes) {
         ++result.frontier.plansRejectedByCapacity;
         return false;
       }
@@ -556,10 +609,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       placement.layouts = instance->layoutBindings;
       plan.placements.push_back(std::move(placement));
     }
-    llvm::sort(plan.placements,
-               [](const PlanPlacement &lhs, const PlanPlacement &rhs) {
-                 return lhs.node < rhs.node;
-               });
+    llvm::sort(plan.placements, placementBefore);
 
     for (size_t index : partial.connections) {
       const ConnectionPlan &connection = pool[index];
