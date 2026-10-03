@@ -160,12 +160,39 @@ struct PlanDiagnostics {
   bool searchTruncated = false;
 };
 
+/// One selected placement: which node an instance covers, and the target facts
+/// a materializer needs (design §18.1). Everything here is a target-neutral
+/// container -- a rule id, a bundle id, a machine node id, a layout id.
+struct PlanPlacement {
+  WorkloadNodeId node = 0;
+  InstanceId instance = 0;
+  std::string rule;
+  std::string bundle;
+  ExecutorId executor;
+  llvm::StringMap<MemoryNodeId> memories;
+  llvm::StringMap<LayoutId> layouts;
+};
+
+/// One selected connection, with the route it takes.
+struct PlanConnection {
+  ConnectionId id = 0;
+  WorkloadValueId value = 0;
+  ConnectionKind kind = ConnectionKind::Direct;
+  llvm::SmallVector<MemoryNodeId> route;
+  llvm::SmallVector<ExecutorId> engines;
+  std::optional<LayoutTransform> transform;
+};
+
 /// A complete executable proposal covering every required node.
 struct CoveringPlan {
   PlanId id = 0;
   uint64_t sourceBindingHash = 0;
   llvm::SmallVector<InstanceId> instances;
   llvm::SmallVector<ConnectionId> connections;
+  /// The same selections, resolved: which node each instance covers and how
+  /// each connection runs. Sorted by node / connection id.
+  llvm::SmallVector<PlanPlacement> placements;
+  llvm::SmallVector<PlanConnection> connectionPlans;
   llvm::StringMap<SearchValue> globalParameters;
   Cost totalCost;
   PlanDiagnostics diagnostics;

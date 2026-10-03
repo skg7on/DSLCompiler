@@ -48,3 +48,11 @@ rule avx2.reduce_sum_f32 v1 {
   emit "avx2_reduce";
   cost 3;
 }
+
+rule avx2.async_copy v1 {
+  match micro.async_copy();
+  require executor kind worker;
+  bundle "avx2.copy";
+  emit "avx2_copy";
+  cost 2;
+}

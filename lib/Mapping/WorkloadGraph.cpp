@@ -120,7 +120,8 @@ const WorkloadValue *WorkloadGraph::findValue(WorkloadValueId id) const {
   return &values[id];
 }
 
-void WorkloadGraph::finalize() {
+void WorkloadGraph::finalize(
+    llvm::DenseMap<WorkloadValueId, WorkloadValueId> *valueRemapOut) {
   llvm::SmallVector<std::string> nodeKeys;
   nodeKeys.reserve(nodes.size());
   for (const WorkloadNode &node : nodes)
@@ -183,8 +184,22 @@ void WorkloadGraph::finalize() {
     newNodes.push_back(std::move(node));
   }
 
+  if (valueRemapOut)
+    for (unsigned index = 0; index < valueRemap.size(); ++index)
+      (*valueRemapOut)[static_cast<WorkloadValueId>(index)] = valueRemap[index];
+
   nodes = std::move(newNodes);
   values = std::move(newValues);
+}
+
+Operation *WorkloadGraphBinding::opFor(WorkloadNodeId node) const {
+  auto it = nodeOps.find(node);
+  return it == nodeOps.end() ? nullptr : it->second;
+}
+
+Value WorkloadGraphBinding::valueFor(WorkloadValueId value) const {
+  auto it = values.find(value);
+  return it == values.end() ? Value() : it->second;
 }
 
 std::string WorkloadGraph::canonicalString() const {
@@ -223,13 +238,18 @@ std::string WorkloadGraph::canonicalString() const {
   return out;
 }
 
-llvm::Expected<WorkloadGraph> extractWorkloadGraph(Operation *kernel) {
+llvm::Expected<WorkloadGraph>
+extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
   if (!kernel || kernel->getName().getStringRef() != "micro.kernel")
     return llvm::createStringError(
         "expected a micro.kernel op to extract a workload graph from");
 
   WorkloadGraph graph;
   llvm::DenseMap<Value, WorkloadValueId> valueIds;
+  // Filled alongside the graph: temporary value ids, and the op each node's
+  // source ordinal belongs to.
+  llvm::DenseMap<WorkloadValueId, Value> pendingValues;
+  llvm::DenseMap<unsigned, Operation *> ordinalOps;
   unsigned ordinal = 0;
 
   std::function<WorkloadValueId(Value)> resolve =
@@ -250,6 +270,7 @@ llvm::Expected<WorkloadGraph> extractWorkloadGraph(Operation *kernel) {
     WorkloadValueId id = graph.addValue(
         WorkloadValue{0, value.getType(), nameFor(value), /*external=*/true});
     valueIds[value] = id;
+    pendingValues[id] = value;
     return id;
   };
 
@@ -269,7 +290,9 @@ llvm::Expected<WorkloadGraph> extractWorkloadGraph(Operation *kernel) {
       WorkloadNode node;
       node.opName = name.getStringRef().str();
       node.attributes = op->getAttrDictionary();
-      node.sourceOrdinal = ordinal++;
+      node.sourceOrdinal = ordinal;
+      ordinalOps[ordinal] = op;
+      ++ordinal;
       for (Value operand : op->getOperands()) {
         if (isAsyncToken(operand.getType()))
           continue;
@@ -300,7 +323,17 @@ llvm::Expected<WorkloadGraph> extractWorkloadGraph(Operation *kernel) {
     }
   });
 
-  graph.finalize();
+  llvm::DenseMap<WorkloadValueId, WorkloadValueId> remap;
+  graph.finalize(&remap);
+  if (binding) {
+    for (const auto &entry : pendingValues)
+      binding->values[remap[entry.first]] = entry.second;
+    for (const WorkloadNode &node : graph.getNodes()) {
+      auto it = ordinalOps.find(node.sourceOrdinal);
+      if (it != ordinalOps.end())
+        binding->nodeOps[node.id] = it->second;
+    }
+  }
   return std::move(graph);
 }
 

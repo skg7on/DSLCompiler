@@ -3,6 +3,7 @@
 #include "LLK/Mapping/MappingRules.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/WorkloadGraph.h"
+#include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
 #include "llvm/Support/Error.h"
 
@@ -335,10 +336,15 @@ constexpr llvm::StringLiteral kShippedRules =
 constexpr llvm::StringLiteral kInvalidRules =
     LLK_MAPPING_DIR "/../test/Mapping/Inputs/invalid-rules.llkmap";
 
+/// The shipped AVX2 rules against the emitter keys the AVX2 package actually
+/// declares. Reading them from the package rather than repeating the list
+/// here keeps this test from drifting when the target grows a rule.
 llvm::Expected<std::unique_ptr<MappingTarget>> loadShippedAvx2() {
+  std::vector<std::string> keys;
+  for (llvm::StringLiteral key : mlir::llk::target::avx2::emitterKeys())
+    keys.push_back(key.str());
   return loadMappingTarget("x86-avx2", kShippedMachine, kShippedLayouts,
-                           kShippedRules,
-                           {"avx2_vector_add", "avx2_mma", "avx2_reduce"});
+                           kShippedRules, std::move(keys));
 }
 } // namespace
 
@@ -346,7 +352,11 @@ TEST(MappingTarget, LoadsShippedAvx2RulesAndVerifiesThem) {
   llvm::Expected<std::unique_ptr<MappingTarget>> target = loadShippedAvx2();
   ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
   EXPECT_EQ((*target)->name(), "x86-avx2");
-  EXPECT_EQ((*target)->rules().all().size(), 3u);
+  // Assert the rules that must be there rather than an exact count, so adding
+  // a rule to the shipped set does not fail this test.
+  EXPECT_NE((*target)->rules().find("avx2.vector_add"), nullptr);
+  EXPECT_NE((*target)->rules().find("avx2.async_copy"), nullptr);
+  EXPECT_FALSE((*target)->rules().all().empty());
   EXPECT_FALSE((*target)->machine().executors.empty());
   EXPECT_FALSE((*target)->layouts().all().empty());
   // `loadMappingTarget` verifies before returning; assert it directly too.
