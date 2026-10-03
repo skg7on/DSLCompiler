@@ -237,6 +237,21 @@ target_link_libraries(LLKPerf PUBLIC LLVMSupport MicroDialect)
 # keeping a single copy of MLIR in every consumer.
 mlir_target_link_libraries(LLKPerf PRIVATE MLIRTensorDialect)
 
+# Library: versioned machine topology (issue #82, epic #67).
+# Target facts only -- executor/memory/compute/transfer nodes, their edges, and
+# the normalized queries placement and routing ask of them. It must not depend
+# on LLKPerf, LLKMapping, or any backend; a target package describes a machine,
+# it does not change this code.
+add_library(LLKMachine STATIC
+    lib/Machine/MachineModel.cpp
+    lib/Machine/MachineModelLoader.cpp
+)
+target_include_directories(LLKMachine PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+target_link_libraries(LLKMachine PUBLIC LLVMSupport)
+
 # Library: target-independent mapping data model (issue #80, epic #67 D1).
 # Generic planning types only -- workload graphs, search bindings, plan
 # structures, costs, and stable ids. It must not depend on LLKPerf or any
@@ -670,6 +685,20 @@ add_llk_perf_test(CandidateBindingTest test/Perf/candidate_binding.cpp)
 # and the persisted record. Uses the shipped machine model, so the model the
 # driver tunes against is the one under test.
 add_llk_perf_test(TuningSessionTest test/Perf/tuning_session.cpp)
+
+# Machine topology tests (issue #82, epic #67): the v2 model, its normalized
+# queries, validation, and the YAML loader. They are plain-data tests -- no
+# micro IR -- so they link only LLKMachine and gtest.
+function(add_llk_machine_test test_name test_file)
+  add_llvm_executable(${test_name} ${test_file})
+  target_link_libraries(${test_name} PRIVATE LLKMachine GTest::gtest_main)
+  target_compile_definitions(${test_name} PRIVATE
+      LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines")
+  add_test(NAME ${test_name} COMMAND ${test_name})
+endfunction()
+
+add_llk_machine_test(MachineModelTest test/Machine/machine_model.cpp)
+add_llk_machine_test(MachineModelV2LoaderTest test/Machine/machine_model_loader.cpp)
 
 # Mapping-engine tests (epic #67, workstream D1). They parse micro IR to build
 # workload graphs, so they follow the same MLIR exec-lib rule as the perf tests:
