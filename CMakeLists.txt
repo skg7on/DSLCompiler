@@ -591,6 +591,14 @@ target_compile_definitions(MachineModelLoaderTest PRIVATE
     LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines")
 add_test(NAME MachineModelLoaderTest COMMAND MachineModelLoaderTest)
 
+# The schedule loader test loads the shipped database as well as inline
+# fixtures, so the file the passes read for real is covered by the suite.
+add_llvm_executable(ScheduleLoaderTest test/Transforms/schedule_loader.cpp)
+target_link_libraries(ScheduleLoaderTest PRIVATE LLKCommon GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(ScheduleLoaderTest PRIVATE
+    LLK_SCHEDULE_DB="${CMAKE_SOURCE_DIR}/schedules/schedule_db.json")
+add_test(NAME ScheduleLoaderTest COMMAND ScheduleLoaderTest)
+
 # Performance-model tests. Unlike the loader test these parse micro IR. They
 # must not name MLIR components directly: LLK_MLIR_EXEC_LIBS already carries
 # MLIRParser, and resolves to the MLIR dylib when there is one. Naming a
@@ -651,6 +659,22 @@ if(LLK_BUILD_TOOLS)
   )
   add_test(NAME LLKToMicroMatmul
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/matmul_to_micro.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/matmul_to_micro.mlir"
+  )
+  # The search-space export, anchored on a fixture database that spells out the
+  # Micro/tile schedule fields for one operation and leaves the other on the
+  # pre-M11 fields, so one run covers both loaded and defaulted values.
+  add_test(NAME LLKToMicroSearchSpace
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro-search-space=\"schedule-db=${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/search_space_schedule.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/search_space_from_schedule.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/search_space_from_schedule.mlir"
+  )
+  # The M-bucket rules prune BM choices: bucket 0 allows only BM = 1, and the
+  # large-M buckets reject tiles of 4 rows or fewer.
+  add_test(NAME LLKToMicroSearchSpaceMBucket
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro-search-space=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/search_space_m_bucket.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/search_space_m_bucket.mlir"
+  )
+  # `llk-compile --emit=micro-search` prints the search space and exits without
+  # reaching the JIT: the input's llk ops are never lowered to LLVM.
+  add_test(NAME LLKCompileMicroSearch
+      COMMAND sh -c "$<TARGET_FILE:llk-compile> --emit=micro-search ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/search_space_from_schedule.mlir | ${FILECHECK_BIN} --check-prefix=COMPILE ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/search_space_from_schedule.mlir"
   )
   # The acceptance check that the exported Micro-IR is self-describing: the
   # performance simulator evaluates the kernel the export produced, using only

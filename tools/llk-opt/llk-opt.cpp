@@ -70,6 +70,11 @@ int main(int argc, char **argv) {
     return mlir::llk::createLLKToMicroPass();
   });
 
+  // Register the LLK-to-Micro search-space export pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createLLKToMicroSearchSpacePass();
+  });
+
   // Register the TileAndVectorize pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createTileAndVectorizePass();

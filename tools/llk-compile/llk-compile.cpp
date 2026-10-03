@@ -86,7 +86,8 @@ static cl::opt<int64_t> optK("K", cl::desc("K dimension (hidden)"),
 static cl::opt<std::string> emitMode(
     "emit",
     cl::desc("What to emit: llvm (JIT-compile, the default), mlir (print the "
-             "fully lowered module), or micro (print concrete Micro-IR)"),
+             "fully lowered module), micro (print concrete Micro-IR), or "
+             "micro-search (print the tile search space)"),
     cl::init("llvm"));
 
 // ---------------------------------------------------------------------------
@@ -221,6 +222,14 @@ static mlir::LogicalResult runMicroExport(mlir::ModuleOp module) {
   return pm.run(module);
 }
 
+/// Runs the Micro-IR search-space export on its own, like the concrete export:
+/// it lowers straight from the LLK root operations and never reaches the JIT.
+static mlir::LogicalResult runMicroSearchSpaceExport(mlir::ModuleOp module) {
+  mlir::PassManager pm(module->getContext());
+  pm.addPass(mlir::llk::createLLKToMicroSearchSpacePass());
+  return pm.run(module);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -265,14 +274,18 @@ int main(int argc, char **argv) {
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createLLKToMicroPass();
   });
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createLLKToMicroSearchSpacePass();
+  });
 
   // Parse command line.
   cl::ParseCommandLineOptions(argc, argv, "LLK kernel compiler\n");
 
   const std::string emit = emitMode.getValue();
-  if (emit != "llvm" && emit != "mlir" && emit != "micro") {
+  if (emit != "llvm" && emit != "mlir" && emit != "micro" &&
+      emit != "micro-search") {
     llvm::errs() << "Unsupported --emit=" << emit
-                 << "; expected llvm, mlir, or micro\n";
+                 << "; expected llvm, mlir, micro, or micro-search\n";
     return 1;
   }
 
@@ -317,8 +330,11 @@ int main(int argc, char **argv) {
   }
 
   // Micro-IR export runs on its own and never reaches the JIT.
-  if (emit == "micro") {
-    if (mlir::failed(runMicroExport(*module))) {
+  if (emit == "micro" || emit == "micro-search") {
+    mlir::LogicalResult result = emit == "micro"
+                                     ? runMicroExport(*module)
+                                     : runMicroSearchSpaceExport(*module);
+    if (mlir::failed(result)) {
       llvm::errs() << "Micro-IR export failed\n";
       return 1;
     }
