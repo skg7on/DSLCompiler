@@ -270,6 +270,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/StableHash.cpp
     lib/Mapping/CostModel.cpp
     lib/Mapping/CostEvent.cpp
+    lib/Mapping/LatencyProvider.cpp
     lib/Mapping/SearchBinding.cpp
     lib/Mapping/WorkloadGraph.cpp
     lib/Mapping/MappingPlan.cpp

@@ -163,3 +163,33 @@ formula. Nothing in the existing suite moved.
 - New: `L1ResourceDag.ARoutedMovementIsChargedPerHop` (two events, chained, for a
   two-hop route) and `L1ResourceDag.EveryEventCarriesItsSharedCostCategory`;
   `CostEvent.EveryKindRoundTripsThroughItsName`.
+
+## Slice 4: an optional LatencyProvider (2026-10-03)
+
+`LLK/Mapping/LatencyProvider.h` adds the last piece the four items needed: an
+optional source of measured or calibrated cycles, with static cost as the
+fallback.
+
+- `OperationSignature` carries the whole cache key (design §17.4) -- operation,
+  rule and version, bundle, layout, placement class, route class, and the
+  cost-model version -- and renders canonically, so two lookups describing the
+  same work compare equal.
+- `TargetContext` names the target and the machine profile's content hash, so a
+  measurement from another machine, or from this one before its profile
+  changed, is not this measurement.
+- `LatencyProvider::lookupCycles` returns `nullopt` for "no entry".
+- `MappingTarget::latencyProvider()` defaults to null, so a target that
+  predates measurement works unchanged.
+
+The covering search consults the provider once per placed instance and keeps
+the static estimate when it declines. **Legality is not revisited**: a
+measurement that says work is expensive does not make a plan illegal, which is
+what the design means by measurement changing cost estimates without redefining
+legality.
+
+### Verification
+
+- `ninja -C build` clean; `ctest` **102 registered, 100 passed, 2 skipped, 0 failed**.
+- New: a measurement re-ranks the plans and the measured rule wins; an entryless
+  provider falls back to the declared cost; and a provider claiming every rule
+  is enormously expensive still yields a legal plan.

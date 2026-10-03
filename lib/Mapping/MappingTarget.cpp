@@ -51,10 +51,11 @@ bool isKnownRole(llvm::StringRef role) {
 
 FileMappingTarget::FileMappingTarget(std::string name, MachineModel machine,
                                      LayoutRegistry layouts, RuleRegistry rules,
-                                     std::vector<std::string> emitterKeys)
+                                     std::vector<std::string> emitterKeys,
+                                     const LatencyProvider *provider)
     : name_(std::move(name)), machine_(std::move(machine)),
       layouts_(std::move(layouts)), rules_(std::move(rules)),
-      emitterKeys_(std::move(emitterKeys)) {}
+      emitterKeys_(std::move(emitterKeys)), provider_(provider) {}
 
 bool FileMappingTarget::isKnownEmitter(llvm::StringRef key) const {
   return llvm::is_contained(emitterKeys_, key);
