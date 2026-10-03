@@ -52,6 +52,21 @@ MachineModel placementMachine() {
   return model;
 }
 
+/// One executor carrying two compute capabilities and two memories: every
+/// requirement has more than one compatible attachment, so placement must
+/// enumerate the combinations rather than pick the first.
+MachineModel attachmentMachine() {
+  MachineModel model;
+  model.target = "attachment";
+  model.executors = {{"core.0", "core", std::nullopt, {0}, 1, {}}};
+  model.computes = {compute("vec.a", "vector_engine", "core.0"),
+                    compute("vec.b", "vector_engine", "core.0"),
+                    compute("mxu.a", "matrix_engine", "core.0")};
+  model.memories = {memory("sram.a", "sram", "core.0"),
+                    memory("sram.b", "sram", "core.0")};
+  return model;
+}
+
 constexpr llvm::StringLiteral kLayouts = R"llkmap(
 layout t.rank2(int N) {
   param N in [1..8];
@@ -89,6 +104,14 @@ boundExecutors(const std::vector<CandidateInstance> &instances) {
   for (const CandidateInstance &instance : instances)
     ids.push_back(instance.executorBindings.lookup("executor"));
   return ids;
+}
+
+/// A candidate that must run on `core`, so it matches the single-executor
+/// attachment machine.
+MappingCandidate coreCandidate() {
+  MappingCandidate result = candidate();
+  result.executorRequirements[0].capability = "core";
+  return result;
 }
 
 } // namespace
@@ -159,6 +182,139 @@ TEST(Placement, BindsAVisibleMemoryOfTheRequiredKind) {
   EXPECT_EQ((*instances)[1].memoryBindings.lookup("sram"), "sram.1");
 }
 
+TEST(Placement, EnumeratesEveryCompatibleComputeAttachment) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withCompute = coreCandidate();
+  ComputeRequirement requirement;
+  requirement.kind = "vector_engine";
+  withCompute.computeRequirements.push_back(requirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withCompute, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // core.0 carries two vector engines; both are compatible attachments, so the
+  // candidate places twice rather than collapsing to the first.
+  ASSERT_EQ(instances->size(), 2u);
+  EXPECT_EQ((*instances)[0].computeBindings.lookup("vector_engine"), "vec.a");
+  EXPECT_EQ((*instances)[1].computeBindings.lookup("vector_engine"), "vec.b");
+}
+
+TEST(Placement, EnumeratesEveryVisibleMemoryAttachment) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withMemory = coreCandidate();
+  MemoryRequirement requirement;
+  requirement.kind = "sram";
+  withMemory.memoryRequirements.push_back(requirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withMemory, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // core.0 sees two sram nodes; each is a legal attachment.
+  ASSERT_EQ(instances->size(), 2u);
+  EXPECT_EQ((*instances)[0].memoryBindings.lookup("sram"), "sram.a");
+  EXPECT_EQ((*instances)[1].memoryBindings.lookup("sram"), "sram.b");
+}
+
+TEST(Placement, EnumeratesComputeMemoryAttachmentCombinations) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withAll = coreCandidate();
+  ComputeRequirement computeRequirement;
+  computeRequirement.kind = "vector_engine";
+  withAll.computeRequirements.push_back(computeRequirement);
+  MemoryRequirement memoryRequirement;
+  memoryRequirement.kind = "sram";
+  withAll.memoryRequirements.push_back(memoryRequirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withAll, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // The two compute attachments and two memories cross to four instances, in
+  // machine-declaration order with the last requirement varying fastest.
+  ASSERT_EQ(instances->size(), 4u);
+  EXPECT_EQ((*instances)[0].computeBindings.lookup("vector_engine"), "vec.a");
+  EXPECT_EQ((*instances)[0].memoryBindings.lookup("sram"), "sram.a");
+  EXPECT_EQ((*instances)[1].computeBindings.lookup("vector_engine"), "vec.a");
+  EXPECT_EQ((*instances)[1].memoryBindings.lookup("sram"), "sram.b");
+  EXPECT_EQ((*instances)[2].computeBindings.lookup("vector_engine"), "vec.b");
+  EXPECT_EQ((*instances)[2].memoryBindings.lookup("sram"), "sram.a");
+  EXPECT_EQ((*instances)[3].computeBindings.lookup("vector_engine"), "vec.b");
+  EXPECT_EQ((*instances)[3].memoryBindings.lookup("sram"), "sram.b");
+}
+
+TEST(Placement, BindsTheSolvedLayoutForEveryEnumeratedAttachment) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withAll = coreCandidate();
+  ComputeRequirement computeRequirement;
+  computeRequirement.kind = "vector_engine";
+  withAll.computeRequirements.push_back(computeRequirement);
+  LayoutRequirement layoutRequirement;
+  layoutRequirement.layoutClass = "t.rank2";
+  withAll.layoutRequirements.push_back(layoutRequirement);
+  mlir::MLIRContext context;
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withAll, *target, context, layoutContext);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_EQ(instances->size(), 2u);
+  for (const CandidateInstance &instance : *instances) {
+    // Each enumerated attachment carries the concrete solved layout id, and it
+    // resolves in the target's registry -- a declared layout definition, not an
+    // unvalidated echo of the requirement's string.
+    const std::string bound = instance.layoutBindings.lookup("t.rank2");
+    EXPECT_FALSE(bound.empty());
+    EXPECT_NE((*target).layouts().find(bound), nullptr);
+  }
+}
+
+TEST(Placement, TheInstanceCapCapsEnumeratedAttachmentsAndReportsTruncation) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withAll = coreCandidate();
+  ComputeRequirement computeRequirement;
+  computeRequirement.kind = "vector_engine";
+  withAll.computeRequirements.push_back(computeRequirement);
+  MemoryRequirement memoryRequirement;
+  memoryRequirement.kind = "sram";
+  withAll.memoryRequirements.push_back(memoryRequirement);
+  mlir::MLIRContext context;
+
+  // Four legal combinations, capped at three: the cap genuinely stops
+  // enumeration and must be reported.
+  PlacementOptions capped;
+  capped.maxInstances = 3;
+  bool truncated = false;
+  llvm::Expected<std::vector<CandidateInstance>> cappedInstances =
+      enumeratePlacements(withAll, *target, context, LayoutContext{}, capped,
+                          &truncated);
+  ASSERT_TRUE(static_cast<bool>(cappedInstances))
+      << llvm::toString(cappedInstances.takeError());
+  EXPECT_EQ(cappedInstances->size(), 3u);
+  EXPECT_TRUE(truncated);
+
+  // A cap that admits every combination reports no truncation.
+  PlacementOptions roomy;
+  roomy.maxInstances = 8;
+  bool notTruncated = false;
+  llvm::Expected<std::vector<CandidateInstance>> all = enumeratePlacements(
+      withAll, *target, context, LayoutContext{}, roomy, &notTruncated);
+  ASSERT_TRUE(static_cast<bool>(all));
+  EXPECT_EQ(all->size(), 4u);
+  EXPECT_FALSE(notTruncated);
+}
+
 TEST(Placement, RequiresTheLayoutToSolve) {
   std::unique_ptr<MappingTarget> target = targetFor(placementMachine());
   ASSERT_NE(target, nullptr);
@@ -181,7 +337,15 @@ TEST(Placement, RequiresTheLayoutToSolve) {
       enumeratePlacements(withLayout, *target, context, rank3);
   ASSERT_TRUE(static_cast<bool>(solvable));
   EXPECT_EQ(solvable->size(), 3u);
-  EXPECT_EQ((*solvable)[0].layoutBindings.lookup("t.rank3"), "t.rank3");
+  // The binding carries the concrete target layout id the solver solved
+  // (design §13.4): a layout definition the target declares, resolvable in its
+  // registry -- not a bare echo of the requirement's string. A rule's
+  // `require layout p satisfies <id>` names the definition id directly, so the
+  // solved definition's id and the requirement's class coincide; the property
+  // that changed is that the value now comes from the solved definition.
+  const std::string bound = (*solvable)[0].layoutBindings.lookup("t.rank3");
+  EXPECT_FALSE(bound.empty());
+  EXPECT_NE((*target).layouts().find(bound), nullptr);
 }
 
 TEST(Placement, TreatsATruncatedLayoutSolveAsUnplaceable) {

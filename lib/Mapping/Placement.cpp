@@ -176,7 +176,20 @@ enumeratePlacements(const MappingCandidate &candidate,
   // independently of which executor would run it. Solved through the
   // `LayoutSolver` interface (design §13.3), not the free function, so a future
   // backend drops in here without touching placement.
+  //
+  // The solved definition is kept, not discarded: a placed instance binds that
+  // definition's id -- the concrete target layout id (design §13.4), a layout
+  // the target declares and the solver proved satisfiable -- rather than an
+  // echo of the requirement's string. A rule's `require layout p satisfies
+  // <id>` names a layout definition id directly, so there is no separate
+  // abstract class to resolve and no single parameterised instantiation to
+  // name (a solve reports several parameter assignments and placement does not
+  // choose among them); the definition id is the concrete solved id. The solve
+  // result's parameter values have no home on `CandidateInstance`, so none are
+  // recorded here.
   std::unique_ptr<LayoutSolver> layoutSolver = makeBoundedLayoutSolver();
+  std::vector<const LayoutDef *> solvedLayouts;
+  solvedLayouts.reserve(candidate.layoutRequirements.size());
   for (const LayoutRequirement &requirement : candidate.layoutRequirements) {
     const LayoutDef *def = target.layouts().find(requirement.layoutClass);
     if (!def)
@@ -197,6 +210,7 @@ enumeratePlacements(const MappingCandidate &candidate,
       reportFailure(PlacementFailure::NoLegalLayout);
       return std::vector<CandidateInstance>{};
     }
+    solvedLayouts.push_back(def);
   }
 
   std::vector<const ExecutorNode *> executors;
@@ -220,29 +234,25 @@ enumeratePlacements(const MappingCandidate &candidate,
   // The first failing executor in machine order decides the reported reason,
   // so the code does not depend on which executor happened to be visited last.
   bool executorReasonRecorded = false;
+  bool instanceCapReached = false;
   std::vector<CandidateInstance> instances;
   for (const ExecutorNode *executor : executors) {
-    CandidateInstance instance;
-    instance.candidate = candidate.id;
-    instance.bundle = candidate.bundle;
-    instance.executorBindings["executor"] = executor->id;
-
-    // Compute attachments: the first attached capability of each required kind.
+    // §15.1 step 2: enumerate every compatible compute attachment -- each
+    // attached capability of each required kind, in machine declaration order.
+    // Every one is a legal alternative, so all of them are kept.
+    std::vector<std::vector<const ComputeNode *>> computeChoices;
     bool computesOk = true;
     for (const ComputeRequirement &requirement :
          candidate.computeRequirements) {
-      const ComputeNode *match = nullptr;
-      for (const ComputeNode *node : machine.computesFor(executor->id)) {
-        if (node->kind == requirement.kind) {
-          match = node;
-          break;
-        }
-      }
-      if (!match) {
+      std::vector<const ComputeNode *> matches;
+      for (const ComputeNode *node : machine.computesFor(executor->id))
+        if (node->kind == requirement.kind)
+          matches.push_back(node);
+      if (matches.empty()) {
         computesOk = false;
         break;
       }
-      instance.computeBindings[requirement.kind] = match->id;
+      computeChoices.push_back(std::move(matches));
     }
     if (!computesOk) {
       if (!executorReasonRecorded) {
@@ -252,22 +262,21 @@ enumeratePlacements(const MappingCandidate &candidate,
       continue;
     }
 
-    // Memory attachments: the first visible memory of each required kind.
+    // Memory attachments: every visible memory of each required kind, likewise
+    // in machine declaration order.
+    std::vector<std::vector<const MemoryNode *>> memoryChoices;
     bool memoriesOk = true;
     for (const MemoryRequirement &requirement : candidate.memoryRequirements) {
-      const MemoryNode *match = nullptr;
-      for (const MemoryNode &node : machine.memories) {
+      std::vector<const MemoryNode *> matches;
+      for (const MemoryNode &node : machine.memories)
         if (node.kind == requirement.kind &&
-            machine.isVisible(node.id, executor->id)) {
-          match = &node;
-          break;
-        }
-      }
-      if (!match) {
+            machine.isVisible(node.id, executor->id))
+          matches.push_back(&node);
+      if (matches.empty()) {
         memoriesOk = false;
         break;
       }
-      instance.memoryBindings[requirement.kind] = match->id;
+      memoryChoices.push_back(std::move(matches));
     }
     if (!memoriesOk) {
       if (!executorReasonRecorded) {
@@ -277,33 +286,70 @@ enumeratePlacements(const MappingCandidate &candidate,
       continue;
     }
 
-    for (const LayoutRequirement &requirement : candidate.layoutRequirements)
-      instance.layoutBindings[requirement.layoutClass] =
-          requirement.layoutClass;
+    // The legal placements of this executor are the cartesian product of the
+    // per-requirement choices. An odometer visits them in machine-declaration
+    // order with the last requirement varying fastest; with no requirements it
+    // yields the single unadorned placement.
+    std::vector<size_t> sizes;
+    sizes.reserve(computeChoices.size() + memoryChoices.size());
+    for (const auto &choices : computeChoices)
+      sizes.push_back(choices.size());
+    for (const auto &choices : memoryChoices)
+      sizes.push_back(choices.size());
 
-    instance.resourceUsage.executorSlots = 1;
-    for (const MemoryRequirement &requirement : candidate.memoryRequirements)
-      instance.resourceUsage.memoryBytes[requirement.kind] =
-          requirement.minBytes;
+    std::vector<size_t> pick(sizes.size(), 0);
+    auto advance = [&]() {
+      for (size_t dimension = sizes.size(); dimension-- > 0;) {
+        if (++pick[dimension] < sizes[dimension])
+          return true;
+        pick[dimension] = 0; // wrapped: carry into the next dimension
+      }
+      return false; // every dimension wrapped: the product is exhausted
+    };
 
-    instance.localCost = candidate.lowerBound;
-    // Compute utilization is the rule-local compute cycles over the cycles the
-    // machine's workers had available in one sync period (design §17.2). Left 0
-    // when the machine models no sync period: a missing denominator is not a
-    // fabricated one.
-    if (std::optional<double> utilization = utilizationEstimate(
-            instance.localCost.latencyCycles, machine, machine.workerThreads))
-      instance.localCost.computeUtilization = *utilization;
-    instance.id = computeInstanceId(instance);
-    instances.push_back(std::move(instance));
-    if (instances.size() >= options.maxInstances) {
-      // Conservative: also fires when the candidate has exactly maxInstances
-      // legal placements. A caller may not claim optimality after touching the
-      // cap (design §16.2).
-      if (truncated)
-        *truncated = true;
+    do {
+      CandidateInstance instance;
+      instance.candidate = candidate.id;
+      instance.bundle = candidate.bundle;
+      instance.executorBindings["executor"] = executor->id;
+      for (size_t i = 0; i < computeChoices.size(); ++i)
+        instance.computeBindings[candidate.computeRequirements[i].kind] =
+            computeChoices[i][pick[i]]->id;
+      for (size_t j = 0; j < memoryChoices.size(); ++j)
+        instance.memoryBindings[candidate.memoryRequirements[j].kind] =
+            memoryChoices[j][pick[computeChoices.size() + j]]->id;
+      for (size_t i = 0; i < solvedLayouts.size(); ++i)
+        instance.layoutBindings[candidate.layoutRequirements[i].layoutClass] =
+            solvedLayouts[i]->id;
+
+      instance.resourceUsage.executorSlots = 1;
+      for (const MemoryRequirement &requirement : candidate.memoryRequirements)
+        instance.resourceUsage.memoryBytes[requirement.kind] =
+            requirement.minBytes;
+
+      instance.localCost = candidate.lowerBound;
+      // Compute utilization is the rule-local compute cycles over the cycles
+      // the machine's workers had available in one sync period (design §17.2).
+      // Left 0 when the machine models no sync period: a missing denominator is
+      // not a fabricated one.
+      if (std::optional<double> utilization = utilizationEstimate(
+              instance.localCost.latencyCycles, machine, machine.workerThreads))
+        instance.localCost.computeUtilization = *utilization;
+      instance.id = computeInstanceId(instance);
+      instances.push_back(std::move(instance));
+      if (instances.size() >= options.maxInstances) {
+        // Conservative: also fires when the candidate has exactly maxInstances
+        // legal placements. A caller may not claim optimality after touching
+        // the cap (design §16.2).
+        if (truncated)
+          *truncated = true;
+        instanceCapReached = true;
+        break;
+      }
+    } while (advance());
+
+    if (instanceCapReached)
       break;
-    }
   }
   // Instances produced means the candidate placed; clear any reason recorded
   // while some other executor was tried and skipped.
