@@ -72,6 +72,10 @@ inline constexpr llvm::StringLiteral kSchemaName = "llk.machine.v2";
 /// Co-residency -- several owners sharing one executor -- is not a separate
 /// field: `concurrency` already says how many slots share the executor, and
 /// this describes how each slot schedules.
+///
+/// Representational today: the field is loaded, validated, and content-hashed,
+/// but the simulator does not yet consult it (tracked follow-up: let the
+/// simulator overlap work on `OutOfOrder` executors).
 enum class SchedulingClass : uint8_t { InOrder, OutOfOrder };
 
 /// The name a v2 file writes for `value` (`in_order` / `out_of_order`).
@@ -79,12 +83,19 @@ llvm::StringRef stringifySchedulingClass(SchedulingClass value);
 /// The inverse of stringifySchedulingClass; nullopt for an unknown name.
 std::optional<SchedulingClass> symbolizeSchedulingClass(llvm::StringRef text);
 
-/// Whether a link carries the reverse transfer at the same cost. `source` and
-/// `destination` already fix the transfer's direction; this says whether the
-/// *opposite* direction is modelled by the same edge (and so is routable at
-/// the same cost) or needs its own link. It is the directionality half of
-/// design §11.3's "directionality and concurrency class"; concurrency is
-/// `LinkEdge::concurrency`.
+/// Whether a link is meant to carry the reverse transfer as well. `source` and
+/// `destination` fix the transfer's direction; this records whether the
+/// *opposite* direction is intended to be modelled by the same edge or by its
+/// own link. It is the directionality half of design §11.3's "directionality
+/// and concurrency class"; concurrency is `LinkEdge::concurrency`.
+///
+/// Representational today: the router follows `source -> destination` only and
+/// does not yet consume `Bidirectional`, so declaring it does NOT by itself
+/// make the reverse hop routable (tracked follow-up: make routing honour it).
+/// Until then, model a reverse path with an explicit reverse link -- which is
+/// what the shipped profiles do -- and do not declare `Bidirectional` on an
+/// edge that already has an explicit reverse link, or a reader that later
+/// honours the field would count the reverse hop twice.
 enum class LinkDirectionality : uint8_t { Unidirectional, Bidirectional };
 
 /// The name a v2 file writes for `value`
@@ -105,7 +116,8 @@ struct ExecutorNode {
   std::vector<std::string> refines;
   /// Defaults to in-order: it is the conservative assumption and the one the
   /// model implied before the field existed, so existing profiles keep their
-  /// meaning.
+  /// meaning. Loaded, hashed, and verified, but not yet consulted by the
+  /// simulator.
   SchedulingClass schedulingClass = SchedulingClass::InOrder;
 };
 
@@ -124,12 +136,17 @@ struct MemoryNode {
   /// means the profile does not model it.
   double bandwidthBytesPerCycle = 0.0;
   uint64_t latencyCycles = 0;
-  /// Smallest unit a single access moves, when the profile models one. This is
-  /// the transaction half of design §11.3's "optional banking and transaction
-  /// properties"; `banks` is the independent capacity/parallelism half. Absent
-  /// means "not modelled": a consumer falls back to `alignmentBytes`, the
-  /// smallest addressable granule, and a declared value must be positive.
-  std::optional<uint64_t> transactionBytes = std::nullopt;
+  /// Smallest unit a single *access* moves, when the profile models one. Named
+  /// for access, not transfer, to distinguish it from `LinkEdge::
+  /// transactionBytes`, which is the transfer granule the router divides a
+  /// copy's size by; this one describes one access into the memory itself and
+  /// is not consulted by the router. It is the transaction half of design
+  /// §11.3's "optional banking and transaction properties"; `banks` is the
+  /// independent capacity/parallelism half. Absent means "not modelled": a
+  /// consumer falls back to `alignmentBytes`, the smallest addressable granule,
+  /// and a declared value must be positive. Loaded, hashed, and verified, but
+  /// not yet consulted by the router or simulator.
+  std::optional<uint64_t> accessGranularityBytes = std::nullopt;
 };
 
 /// A capability attached to an executor.
@@ -159,7 +176,8 @@ struct ComputeNode {
   /// and the two are independent (resident items may outnumber issue slots).
   /// Absent means "unconstrained" -- the slots are the only bound, which is
   /// what the model assumed before the field existed -- and a declared value
-  /// must be positive.
+  /// must be positive. Loaded, hashed, and verified, but not yet consulted by
+  /// the simulator.
   std::optional<uint32_t> occupancyLimit = std::nullopt;
 };
 
@@ -181,11 +199,19 @@ struct LinkEdge {
   std::string destination;
   double bandwidthBytesPerCycle = 0.0;
   uint64_t latencyCycles = 0;
+  /// Granularity of one *transfer* over this link: the router requires a copy's
+  /// size to tile into whole transactions (design §11.3 "transaction
+  /// granularity"; ruling P9: granularity, not a size cap). Distinct from
+  /// `MemoryNode::accessGranularityBytes`, which describes an access into a
+  /// memory and which the router does not read.
   uint64_t transactionBytes = 1;
   std::vector<std::string> transferEngines;
   uint32_t concurrency = 1;
   /// Defaults to unidirectional: a transfer runs from `source` to
   /// `destination` only, the semantics the edge had before the field existed.
+  /// Representational today -- the router follows `source -> destination` only
+  /// and does not consume `Bidirectional`; see the enum for the follow-up and
+  /// the explicit-reverse-link caveat.
   LinkDirectionality directionality = LinkDirectionality::Unidirectional;
 };
 

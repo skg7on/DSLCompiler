@@ -460,7 +460,7 @@ TEST(MachineModelLoader, AppliesDocumentedDefaultsForTheAddedProperties) {
   for (const ExecutorNode &executor : model->executors)
     EXPECT_EQ(executor.schedulingClass, SchedulingClass::InOrder);
   for (const MemoryNode &memory : model->memories)
-    EXPECT_FALSE(memory.transactionBytes.has_value());
+    EXPECT_FALSE(memory.accessGranularityBytes.has_value());
   for (const ComputeNode &compute : model->computes)
     EXPECT_FALSE(compute.occupancyLimit.has_value());
   for (const LinkEdge &link : model->links)
@@ -468,7 +468,7 @@ TEST(MachineModelLoader, AppliesDocumentedDefaultsForTheAddedProperties) {
 }
 
 TEST(MachineModelLoader,
-     ParsesSchedulingTransactionOccupancyAndDirectionality) {
+     ParsesSchedulingGranularityOccupancyAndDirectionality) {
   llvm::Expected<MachineModel> model = parse(R"yaml(
 schema: llk.machine.v2
 target: t
@@ -481,7 +481,7 @@ memories:
     kind: sram
     visible_from: e0
     capacity_bytes: 32768
-    transaction_bytes: 32
+    access_granularity_bytes: 32
 compute:
   - id: c0
     kind: vector_engine
@@ -500,8 +500,8 @@ links:
   ASSERT_EQ(model->executors.size(), 1u);
   EXPECT_EQ(model->executors[0].schedulingClass, SchedulingClass::OutOfOrder);
   ASSERT_EQ(model->memories.size(), 1u);
-  ASSERT_TRUE(model->memories[0].transactionBytes.has_value());
-  EXPECT_EQ(*model->memories[0].transactionBytes, 32u);
+  ASSERT_TRUE(model->memories[0].accessGranularityBytes.has_value());
+  EXPECT_EQ(*model->memories[0].accessGranularityBytes, 32u);
   ASSERT_EQ(model->computes.size(), 1u);
   ASSERT_TRUE(model->computes[0].occupancyLimit.has_value());
   EXPECT_EQ(*model->computes[0].occupancyLimit, 4u);
@@ -531,14 +531,14 @@ links:
 )yaml"));
 }
 
-TEST(MachineModelLoader, RejectsZeroMemoryTransactionBytes) {
+TEST(MachineModelLoader, RejectsZeroMemoryAccessGranularity) {
   EXPECT_FALSE(loads(R"yaml(
 schema: llk.machine.v2
 target: t
 executors:
   - {id: e0, kind: worker}
 memories:
-  - {id: m0, kind: sram, visible_from: e0, capacity_bytes: 32768, transaction_bytes: 0}
+  - {id: m0, kind: sram, visible_from: e0, capacity_bytes: 32768, access_granularity_bytes: 0}
 )yaml"));
 }
 

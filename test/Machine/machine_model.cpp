@@ -319,23 +319,23 @@ TEST(MachineModel, ContentHashCoversSchedulingClass) {
   EXPECT_NE(computeContentHash(a), computeContentHash(b));
 }
 
-TEST(MachineModel, MemoryTransactionGranularityIsUnmodelledByDefault) {
+TEST(MachineModel, MemoryAccessGranularityIsUnmodelledByDefault) {
   MachineModel model = twoCoreMachine();
-  EXPECT_FALSE(model.memories[0].transactionBytes.has_value());
-  model.memories[0].transactionBytes = 32;
+  EXPECT_FALSE(model.memories[0].accessGranularityBytes.has_value());
+  model.memories[0].accessGranularityBytes = 32;
   EXPECT_TRUE(verifies(model));
 }
 
-TEST(MachineModel, VerifyRejectsZeroMemoryTransactionBytes) {
+TEST(MachineModel, VerifyRejectsZeroMemoryAccessGranularity) {
   MachineModel model = twoCoreMachine();
-  model.memories[0].transactionBytes = 0;
+  model.memories[0].accessGranularityBytes = 0;
   EXPECT_FALSE(verifies(model));
 }
 
-TEST(MachineModel, ContentHashCoversMemoryTransactionBytes) {
+TEST(MachineModel, ContentHashCoversMemoryAccessGranularity) {
   MachineModel a = twoCoreMachine();
   MachineModel b = twoCoreMachine();
-  b.memories[0].transactionBytes = 32;
+  b.memories[0].accessGranularityBytes = 32;
   EXPECT_NE(computeContentHash(a), computeContentHash(b));
 }
 

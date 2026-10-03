@@ -462,11 +462,11 @@ bool Loader::parseMemory(Node *node, size_t index, MemoryNode &out) {
           out.banks = banks;
           return true;
         }
-        if (key == "transaction_bytes") {
-          uint64_t transaction = 0;
-          if (!readUInt(value, path + ".transaction_bytes", transaction))
+        if (key == "access_granularity_bytes") {
+          uint64_t granularity = 0;
+          if (!readUInt(value, path + ".access_granularity_bytes", granularity))
             return false;
-          out.transactionBytes = transaction;
+          out.accessGranularityBytes = granularity;
           return true;
         }
         return deferUnknownKey(keyNode, path, key);

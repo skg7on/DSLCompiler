@@ -131,8 +131,8 @@ std::string renderMemory(const MemoryNode &node) {
   out += formatDouble(node.bandwidthBytesPerCycle);
   out += "|latency=";
   out += std::to_string(node.latencyCycles);
-  out += "|transaction=";
-  out += optionalNumber(node.transactionBytes);
+  out += "|access_granularity=";
+  out += optionalNumber(node.accessGranularityBytes);
   return out;
 }
 
@@ -535,11 +535,11 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
       return invalid(path + ".capacity_bytes: must be positive");
     if (memory.alignmentBytes == 0)
       return invalid(path + ".alignment_bytes: must be positive");
-    // A zero-granule transaction can never move anything; absent is fine, and
-    // means the profile does not model a granularity (fall back to alignment).
-    if (memory.transactionBytes && *memory.transactionBytes == 0)
-      return invalid(path +
-                     ".transaction_bytes: must be positive when declared");
+    // A zero access granule can never move anything; absent is fine, and means
+    // the profile does not model one (fall back to alignment).
+    if (memory.accessGranularityBytes && *memory.accessGranularityBytes == 0)
+      return invalid(
+          path + ".access_granularity_bytes: must be positive when declared");
   }
 
   for (size_t i = 0; i < model.computes.size(); ++i) {
