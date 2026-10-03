@@ -22,6 +22,8 @@
 
 #include "LLK/Machine/MachineModel.h"
 
+#include "mlir/IR/AffineMap.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -142,6 +144,39 @@ llvm::Expected<EvalValue>
 evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
              const machine::MachineModel &machine,
              const LayoutContext &context);
+
+//===----------------------------------------------------------------------===//
+// Solving
+//===----------------------------------------------------------------------===//
+
+/// One legal instantiation of a layout: the parameter values that satisfy
+/// every constraint, and the affine map with those values substituted in.
+struct LayoutSolution {
+  std::map<std::string, LayoutValue> values;
+  mlir::AffineMap map;
+};
+
+/// Bounds on a solve. `truncated` in the result reports when either bound ended
+/// the search early, so a caller never reads a capped result as complete.
+struct SolverLimits {
+  uint64_t maxAssignments = 100000;
+  uint64_t maxSolutions = 8;
+};
+
+struct LayoutSolveResult {
+  std::vector<LayoutSolution> solutions;
+  /// True when the search stopped before exhausting the assignment space.
+  bool truncated = false;
+};
+
+/// Solves `def` against `machine` by bounded enumeration over the declared
+/// finite domains, in declaration order. Fails on a parameter without a
+/// domain, an empty domain, a constraint that cannot be evaluated, or a map
+/// clause that is not affine.
+llvm::Expected<LayoutSolveResult>
+solveLayout(const LayoutDef &def, const machine::MachineModel &machine,
+            mlir::MLIRContext &context, const LayoutContext &layoutContext,
+            const SolverLimits &limits = {});
 
 } // namespace mlir::llk::mapping
 

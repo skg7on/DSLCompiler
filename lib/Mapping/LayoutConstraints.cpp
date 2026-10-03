@@ -9,7 +9,11 @@
 
 #include "LLK/Mapping/LayoutConstraints.h"
 
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
+
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
@@ -18,6 +22,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -1007,6 +1012,218 @@ evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
     return evalMember(expr, eval, machine);
   }
   return evalError("unhandled expression");
+}
+
+//===----------------------------------------------------------------------===//
+// Solving
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+using machine::MachineModel;
+
+/// Translates a `map` clause into affine expressions. Clause dimensions become
+/// dims; solved integer parameters are substituted as constants, so a solution
+/// carries a fully concrete map.
+struct AffineBuilder {
+  mlir::MLIRContext &context;
+  llvm::StringMap<unsigned> dims;
+  llvm::StringMap<int64_t> constants;
+
+  llvm::Expected<mlir::AffineExpr> convert(const Expr &expr);
+};
+
+bool isConstant(const mlir::AffineExpr &expr) {
+  return mlir::isa<mlir::AffineConstantExpr>(expr);
+}
+
+llvm::Expected<mlir::AffineExpr> AffineBuilder::convert(const Expr &expr) {
+  switch (expr.kind) {
+  case ExprKind::IntLit:
+    return mlir::getAffineConstantExpr(expr.intValue, &context);
+  case ExprKind::Ident: {
+    auto dim = dims.find(expr.text);
+    if (dim != dims.end())
+      return mlir::getAffineDimExpr(dim->second, &context);
+    auto constant = constants.find(expr.text);
+    if (constant != constants.end())
+      return mlir::getAffineConstantExpr(constant->second, &context);
+    return evalError(
+        "map references '" + expr.text +
+        "', which is neither a dimension nor an integer parameter");
+  }
+  case ExprKind::Unary: {
+    llvm::Expected<mlir::AffineExpr> operand = convert(*expr.operands[0]);
+    if (!operand)
+      return operand.takeError();
+    if (expr.text == "-")
+      return mlir::getAffineBinaryOpExpr(
+          mlir::AffineExprKind::Mul, mlir::getAffineConstantExpr(-1, &context),
+          *operand);
+    return evalError("non-affine unary operator '" + expr.text + "' in map");
+  }
+  case ExprKind::Binary: {
+    llvm::Expected<mlir::AffineExpr> lhs = convert(*expr.operands[0]);
+    if (!lhs)
+      return lhs.takeError();
+    llvm::Expected<mlir::AffineExpr> rhs = convert(*expr.operands[1]);
+    if (!rhs)
+      return rhs.takeError();
+    mlir::AffineExprKind kind;
+    if (expr.text == "+")
+      kind = mlir::AffineExprKind::Add;
+    else if (expr.text == "-")
+      kind = mlir::AffineExprKind::Add; // lhs + (-1 * rhs), built below
+    else if (expr.text == "*") {
+      // Affine multiplication is by a constant only.
+      if (!isConstant(*lhs) && !isConstant(*rhs))
+        return evalError("non-affine multiplication in map");
+      kind = mlir::AffineExprKind::Mul;
+    } else if (expr.text == "/")
+      kind = mlir::AffineExprKind::FloorDiv;
+    else if (expr.text == "%")
+      kind = mlir::AffineExprKind::Mod;
+    else
+      return evalError("non-affine operator '" + expr.text + "' in map");
+    if (expr.text == "-")
+      return mlir::getAffineBinaryOpExpr(
+          mlir::AffineExprKind::Add, *lhs,
+          mlir::getAffineBinaryOpExpr(mlir::AffineExprKind::Mul,
+                                      mlir::getAffineConstantExpr(-1, &context),
+                                      *rhs));
+    return mlir::getAffineBinaryOpExpr(kind, *lhs, *rhs);
+  }
+  case ExprKind::Call: {
+    if (expr.operands.size() != 2)
+      return evalError("'" + expr.text + "' in a map takes two arguments");
+    llvm::Expected<mlir::AffineExpr> lhs = convert(*expr.operands[0]);
+    if (!lhs)
+      return lhs.takeError();
+    llvm::Expected<mlir::AffineExpr> rhs = convert(*expr.operands[1]);
+    if (!rhs)
+      return rhs.takeError();
+    if (expr.text == "floordiv")
+      return mlir::getAffineBinaryOpExpr(mlir::AffineExprKind::FloorDiv, *lhs,
+                                         *rhs);
+    if (expr.text == "ceildiv")
+      return mlir::getAffineBinaryOpExpr(mlir::AffineExprKind::CeilDiv, *lhs,
+                                         *rhs);
+    if (expr.text == "mod")
+      return mlir::getAffineBinaryOpExpr(mlir::AffineExprKind::Mod, *lhs, *rhs);
+    return evalError("non-affine function '" + expr.text + "' in map");
+  }
+  case ExprKind::StringLit:
+  case ExprKind::MemberCall:
+    return evalError("non-affine expression in map");
+  }
+  return evalError("unhandled map expression");
+}
+
+llvm::Expected<mlir::AffineMap> buildAffineMap(const AffineMapSpec &spec,
+                                               const LayoutSolution &solution,
+                                               mlir::MLIRContext &context) {
+  AffineBuilder builder{context, {}, {}};
+  for (unsigned index = 0; index < spec.dims.size(); ++index)
+    builder.dims[spec.dims[index]] = index;
+  for (const auto &entry : solution.values)
+    if (const auto *value = std::get_if<int64_t>(&entry.second))
+      builder.constants[entry.first] = *value;
+
+  llvm::SmallVector<mlir::AffineExpr, 4> results;
+  for (const ExprPtr &result : spec.results) {
+    llvm::Expected<mlir::AffineExpr> expr = builder.convert(*result);
+    if (!expr)
+      return expr.takeError();
+    results.push_back(*expr);
+  }
+  return mlir::AffineMap::get(spec.dims.size(), /*numSymbols=*/0, results,
+                              &context);
+}
+
+} // namespace
+
+llvm::Expected<LayoutSolveResult>
+solveLayout(const LayoutDef &def, const MachineModel &machine,
+            mlir::MLIRContext &context, const LayoutContext &layoutContext,
+            const SolverLimits &limits) {
+  // Every declared parameter must have a finite domain to enumerate.
+  llvm::SmallVector<const LayoutParam *, 4> enumerable;
+  uint64_t total = 1;
+  for (const LayoutParam &param : def.params) {
+    auto domain = def.domains.find(param.name);
+    if (domain == def.domains.end())
+      return evalError("layout '" + def.id + "': parameter '" + param.name +
+                       "' has no declared domain");
+    uint64_t size = domain->second.values.size();
+    if (size == 0)
+      return evalError("layout '" + def.id + "': parameter '" + param.name +
+                       "' has an empty domain");
+    enumerable.push_back(&param);
+    // Saturate rather than overflow when a domain is enormous.
+    if (total > std::numeric_limits<uint64_t>::max() / size)
+      total = std::numeric_limits<uint64_t>::max();
+    else
+      total *= size;
+  }
+
+  auto domainOf = [&](const LayoutParam &param) -> const ParamDomain & {
+    return def.domains.find(param.name)->second;
+  };
+
+  LayoutSolveResult result;
+  llvm::SmallVector<size_t, 4> index(enumerable.size(), 0);
+  uint64_t assignments = 0;
+  bool exhausted = false;
+  while (!exhausted) {
+    if (assignments >= limits.maxAssignments)
+      break;
+
+    llvm::StringMap<LayoutValue> bindings;
+    for (size_t i = 0; i < enumerable.size(); ++i)
+      bindings[enumerable[i]->name] = domainOf(*enumerable[i]).values[index[i]];
+    ++assignments;
+
+    bool satisfied = true;
+    for (const ExprPtr &constraint : def.constraints) {
+      llvm::Expected<EvalValue> value =
+          evaluateExpr(*constraint, bindings, machine, layoutContext);
+      if (!value)
+        return value.takeError();
+      if (value->kind != EvalValue::Kind::Int || value->intValue == 0) {
+        satisfied = false;
+        break;
+      }
+    }
+
+    if (satisfied) {
+      LayoutSolution solution;
+      for (const auto &entry : bindings)
+        solution.values[entry.first().str()] = entry.second;
+      if (def.map) {
+        llvm::Expected<mlir::AffineMap> map =
+            buildAffineMap(*def.map, solution, context);
+        if (!map)
+          return map.takeError();
+        solution.map = *map;
+      }
+      result.solutions.push_back(std::move(solution));
+      if (result.solutions.size() >= limits.maxSolutions)
+        break;
+    }
+
+    // Advance the odometer: the last declared parameter varies fastest.
+    exhausted = true;
+    for (size_t i = enumerable.size(); i-- > 0;) {
+      if (++index[i] < domainOf(*enumerable[i]).values.size()) {
+        exhausted = false;
+        break;
+      }
+      index[i] = 0;
+    }
+  }
+
+  result.truncated = assignments < total;
+  return result;
 }
 
 } // namespace mlir::llk::mapping

@@ -267,3 +267,141 @@ TEST(LayoutEval, EvaluatesParameterBindings) {
   ASSERT_TRUE(static_cast<bool>(value));
   EXPECT_EQ(value->intValue, 1);
 }
+
+//===----------------------------------------------------------------------===//
+// Solving
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+constexpr llvm::StringLiteral kSolvable = R"llkmap(
+layout t.block(int M, int N, int VW) {
+  param M in [1..2];
+  param N in [4..8];
+  param VW in [2..4];
+  require rank == 2;
+  require N % VW == 0;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap";
+
+llvm::Expected<LayoutSolveResult>
+solveText(llvm::StringRef text, llvm::StringRef id, const MachineModel &machine,
+          mlir::MLIRContext &context, LayoutContext layoutContext = {},
+          SolverLimits limits = {}) {
+  llvm::Expected<LayoutRegistry> registry = parseLayoutText(text, "<test>");
+  if (!registry)
+    return registry.takeError();
+  const LayoutDef *def = registry->find(id);
+  if (!def)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "missing layout '" + id + "'");
+  return solveLayout(*def, machine, context, layoutContext, limits);
+}
+
+int64_t solutionInt(const LayoutSolution &solution, llvm::StringRef name) {
+  auto it = solution.values.find(name.str());
+  if (it == solution.values.end())
+    return INT64_MIN;
+  const auto *value = std::get_if<int64_t>(&it->second);
+  return value ? *value : INT64_MIN;
+}
+
+std::string mapText(const mlir::AffineMap &map) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  map.print(stream);
+  return stream.str();
+}
+
+} // namespace
+
+TEST(LayoutSolve, SolvesDeterministicallyInDomainOrder) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  // The default solution cap is small; raise it to see the whole space.
+  SolverLimits limits;
+  limits.maxSolutions = 64;
+  llvm::Expected<LayoutSolveResult> result =
+      solveText(kSolvable, "t.block", machine, context, layoutContext, limits);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->truncated);
+  // M in {1,2}; (N,VW) in {(4,2),(4,4),(6,2),(6,3),(8,2),(8,4)}.
+  ASSERT_EQ(result->solutions.size(), 12u);
+  EXPECT_EQ(solutionInt(result->solutions.front(), "M"), 1);
+  EXPECT_EQ(solutionInt(result->solutions.front(), "N"), 4);
+  EXPECT_EQ(solutionInt(result->solutions.front(), "VW"), 2);
+}
+
+TEST(LayoutSolve, BuildsAffineMapFromTheSolution) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  llvm::Expected<LayoutSolveResult> result =
+      solveText(kSolvable, "t.block", machine, context, layoutContext);
+  ASSERT_TRUE(static_cast<bool>(result));
+  ASSERT_FALSE(result->solutions.empty());
+  EXPECT_EQ(mapText(result->solutions.front().map),
+            "(d0, d1) -> (d0, d1 floordiv 2, d1 mod 2)");
+}
+
+TEST(LayoutSolve, ReturnsNoSolutionsWhenConstraintsCannotHold) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  LayoutContext layoutContext;
+  layoutContext.rank = 3; // `rank == 2` fails for every assignment
+  llvm::Expected<LayoutSolveResult> result =
+      solveText(kSolvable, "t.block", machine, context, layoutContext);
+  ASSERT_TRUE(static_cast<bool>(result));
+  EXPECT_TRUE(result->solutions.empty());
+  EXPECT_FALSE(result->truncated);
+}
+
+TEST(LayoutSolve, RejectsUnboundParameter) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::Expected<LayoutSolveResult> result = solveText(R"llkmap(
+layout t.x(int M, int N) {
+  param M in [1..2];
+  require N > 0;
+}
+)llkmap",
+                                                       "t.x", machine, context);
+  EXPECT_FALSE(static_cast<bool>(result));
+}
+
+TEST(LayoutSolve, ReportsTruncationWhenAssignmentsAreExhausted) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  SolverLimits limits;
+  limits.maxAssignments = 1000;
+  llvm::Expected<LayoutSolveResult> result =
+      solveText(R"llkmap(
+layout t.big(int M) {
+  param M in [1..200000];
+  require M > 200000;
+}
+)llkmap",
+                "t.big", machine, context, {}, limits);
+  ASSERT_TRUE(static_cast<bool>(result));
+  EXPECT_TRUE(result->solutions.empty());
+  EXPECT_TRUE(result->truncated);
+}
+
+TEST(LayoutSolve, RespectsMaxSolutionsAndDisclosesIt) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  SolverLimits limits;
+  limits.maxSolutions = 3;
+  llvm::Expected<LayoutSolveResult> result =
+      solveText(kSolvable, "t.block", machine, context, layoutContext, limits);
+  ASSERT_TRUE(static_cast<bool>(result));
+  EXPECT_EQ(result->solutions.size(), 3u);
+  // Hitting the solution cap is a cap: the caller must be told.
+  EXPECT_TRUE(result->truncated);
+}
