@@ -79,15 +79,19 @@ mlir::AffineMap identity2(mlir::MLIRContext &context) {
   return mlir::AffineMap::getMultiDimIdentityMap(2, &context);
 }
 
-/// `(d0, d1) -> (d0 + 0, d1 * 1)`: equal to the identity only after MLIR
-/// canonicalization. §10.2 requires comparing maps through that path, never by
-/// string rendering.
+/// `(d0, d1) -> (d0 + d1 - d1, d1)`: affine-equal to the identity, but
+/// *structurally distinct* from it. It must survive MLIR's construction-time
+/// folding to do that, which is why the cancellation is split across a sum and
+/// a difference: `d0 + 0` and `d1 * 1` are already collapsed by
+/// `simplifyAdd`/`simplifyMul` as the expression is built, and so is a
+/// same-operand `x + x - x`, so a map written either way is the identity before
+/// `simplifyAffineMap` is ever consulted. Only a genuinely distinct map makes
+/// the §10.2 comparison falsifiable: if the simplify step were removed, the raw
+/// `operator==` would reject this pair.
 mlir::AffineMap equivalentIdentity2(mlir::MLIRContext &context) {
   mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, &context);
   mlir::AffineExpr d1 = mlir::getAffineDimExpr(1, &context);
-  mlir::AffineExpr zero = mlir::getAffineConstantExpr(0, &context);
-  mlir::AffineExpr one = mlir::getAffineConstantExpr(1, &context);
-  return mlir::AffineMap::get(2, 0, {d0 + zero, d1 * one}, &context);
+  return mlir::AffineMap::get(2, 0, {d0 + d1 - d1, d1}, &context);
 }
 
 /// `(d0, d1) -> (d0 + 1, d1)`: a shifted window, not affinely equal to the
@@ -291,6 +295,12 @@ TEST(Connections, AcceptsAffinelyEquivalentMaps) {
   request.consumerMemory = request.producerMemory;
   request.producerMap = equivalentIdentity2(context);
   request.consumerMap = identity2(context);
+
+  // The whole point: the two maps must be *different objects* before
+  // canonicalization, so accepting them can only come from simplifyAffineMap.
+  ASSERT_NE(*request.producerMap, *request.consumerMap);
+  EXPECT_EQ(mlir::simplifyAffineMap(*request.producerMap),
+            mlir::simplifyAffineMap(*request.consumerMap));
 
   llvm::Expected<std::vector<ConnectionPlan>> plans =
       synthesizeConnections(request, machine, topology);
