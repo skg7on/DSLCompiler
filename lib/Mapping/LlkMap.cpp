@@ -135,7 +135,7 @@ bool lex(llvm::StringRef text, std::vector<LlkMapToken> &out,
     if (matched)
       continue;
 
-    static const std::string kOneChar = "(){}[],;.<>!+-*/%";
+    static const std::string kOneChar = "(){}[],;.<>!+-*/%=";
     if (kOneChar.find(c) == std::string::npos) {
       error = (llvm::Twine("unexpected character '") +
                llvm::Twine(std::string(1, c)) + "'")
