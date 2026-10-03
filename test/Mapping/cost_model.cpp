@@ -1,5 +1,6 @@
 //===- cost_model.cpp - Multi-dimensional Cost tests (issue #80 / D1) ----===//
 
+#include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CostModel.h"
 
 #include <gtest/gtest.h>
@@ -74,4 +75,14 @@ TEST(CostModel, CanonicalStringIsStableAndDistinct) {
   b.dramBytes = 1;
   EXPECT_EQ(canonicalCostString(a), canonicalCostString(cycles(1.0)));
   EXPECT_NE(canonicalCostString(a), canonicalCostString(b));
+}
+
+TEST(CostEvent, EveryKindRoundTripsThroughItsName) {
+  for (CostEventKind kind :
+       {CostEventKind::Compute, CostEventKind::TransferHop,
+        CostEventKind::Transform, CostEventKind::Synchronization,
+        CostEventKind::Capacity}) {
+    EXPECT_EQ(symbolizeCostEventKind(stringifyCostEventKind(kind)), kind);
+  }
+  EXPECT_FALSE(symbolizeCostEventKind("not_a_kind").has_value());
 }

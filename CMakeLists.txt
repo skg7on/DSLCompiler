@@ -228,7 +228,9 @@ target_include_directories(LLKPerf PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
 )
-target_link_libraries(LLKPerf PUBLIC LLVMSupport MicroDialect LLKMachine)
+# LLKPerf consumes mapped events, so it shares LLKMapping's cost and event
+# vocabulary (design §17.2).
+target_link_libraries(LLKPerf PUBLIC LLVMSupport MicroDialect LLKMachine LLKMapping)
 # Candidate binding builds concrete micro IR, which references tensor.empty for
 # the kernel's external tensors. MLIRTensorDialect is named through
 # mlir_target_link_libraries() so it resolves to the MLIR dylib when one exists,
@@ -267,6 +269,7 @@ target_compile_options(LLKMachine PRIVATE -fno-rtti -fno-exceptions)
 add_library(LLKMapping STATIC
     lib/Mapping/StableHash.cpp
     lib/Mapping/CostModel.cpp
+    lib/Mapping/CostEvent.cpp
     lib/Mapping/SearchBinding.cpp
     lib/Mapping/WorkloadGraph.cpp
     lib/Mapping/MappingPlan.cpp

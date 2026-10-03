@@ -38,6 +38,7 @@
 #define LLK_PERF_MICRODAG_H
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/CostEvent.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -92,6 +93,10 @@ enum class ResourceKind {
 llvm::StringRef stringifyEventKind(EventKind kind);
 llvm::StringRef stringifyResourceKind(ResourceKind kind);
 
+/// The shared cost category an event belongs to, so the mapping search and the
+/// simulator account for the same kinds of work (design §17.2).
+mapping::CostEventKind costEventKindOf(EventKind kind);
+
 struct MicroEvent {
   uint32_t id = 0;
   EventKind kind = EventKind::Vector;
@@ -111,6 +116,8 @@ struct MicroEvent {
   uint64_t minCycles = 0;
   std::vector<uint32_t> deps;
   std::string sourceOpName;
+  /// The normalized cost category this event belongs to.
+  mapping::CostEventKind costKind = mapping::CostEventKind::Compute;
 
   std::string tileShape;
   std::string tileLayout;
@@ -134,6 +141,16 @@ struct MicroDAG {
   std::vector<std::string> warnings;
   std::vector<std::string> layoutWarnings;
   std::vector<std::string> ownerWarnings;
+};
+
+/// A route the selected plan chose: the links it crosses, in order, keyed by
+/// the memory *spaces* its endpoints belong to. A concrete `micro.async_copy`
+/// names spaces (`dram` to `sram`), while a route names nodes (`dram.0`), so
+/// this is how the two are matched.
+struct PlannedRoute {
+  std::string srcSpace;
+  std::string dstSpace;
+  std::vector<const machine::LinkEdge *> hops;
 };
 
 /// Builds the event DAG for `kernel` against `machine`. `kernel` must be a
