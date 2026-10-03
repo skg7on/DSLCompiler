@@ -403,6 +403,28 @@ target_include_directories(LLKTargetMapping PUBLIC
 target_link_libraries(LLKTargetMapping PUBLIC LLKMapping LLKMachine)
 target_compile_options(LLKTargetMapping PRIVATE -fno-rtti -fno-exceptions)
 
+# Library: mapping passes (design §21). The `--micro-map` and
+# `--micro-bind-plan` passes are the compiler front door to the mapping engine.
+# They are strictly target-neutral: a target is loaded from files on disk, so
+# the library depends on the mapping core and the target packages, never the
+# reverse.
+add_library(LLKMicroMapping STATIC
+    lib/Conversion/MicroMapping/MicroMapPass.cpp
+    lib/Conversion/MicroMapping/MicroBindPlanPass.cpp
+)
+target_include_directories(LLKMicroMapping PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine)
+# LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
+# not inherit those. Match the toolchain, exactly as LLKMapping does.
+target_compile_options(LLKMicroMapping PRIVATE -fno-rtti -fno-exceptions)
+# PassWrapper/OperationPass come from MLIRPass; ShapedType and Operation from
+# MLIRIR. Named through mlir_target_link_libraries() so the dylib/archive split
+# stays correct.
+mlir_target_link_libraries(LLKMicroMapping PRIVATE MLIRIR MLIRParser MLIRPass)
+
 # Library: AArch64 target feature detection (SVE/SVE2/NEON)
 add_library(LLKTargetAArch64 STATIC
     lib/Target/AArch64/TargetSVE.cpp
@@ -576,7 +598,7 @@ endif()
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection LLKToMicro TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection LLKToMicro LLKMicroMapping TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -787,8 +809,11 @@ if(LLK_BUILD_TOOLS)
       # COMMAND mode does not support < redirection natively).
       # Execute the RUN line: llk-opt %s | llk-opt | FileCheck %s
       # This round-trips the IR through llk-opt twice to verify parse+print stability.
+      # Arguments after the input file are placed on the first llk-opt
+      # invocation only, so a test can select a pass; the second invocation
+      # stays the bare parse/print round-trip.
       add_test(NAME ${test_name}
-          COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
+          COMMAND sh -c "$<TARGET_FILE:llk-opt> ${ARGN} ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
       )
   endfunction()
 
@@ -796,6 +821,14 @@ if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
   add_llk_filecheck_test(MicroDialectSearchSpace test/Dialect/Micro/search_space.mlir)
+
+  # MicroMappingMap: the --micro-map pass runs the mapping chain (extract ->
+  # search -> bind) and writes the selected plan's metadata onto the kernel.
+  # The pass options are quoted so sh hands llk-opt one argv token; the whole
+  # option string is the user-facing contract from design §21.
+  add_llk_filecheck_test(MicroMappingMap test/Conversion/MicroMapping/micro_map.mlir
+      "\"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_mma,avx2_reduce,avx2_copy mode=deterministic\"")
+
   # LLKToMicro lowering tests. The schedule database is pointed at a path that
   # does not exist on purpose: the export then uses its built-in conservative
   # schedule, so the expected tile sizes do not depend on the working directory
