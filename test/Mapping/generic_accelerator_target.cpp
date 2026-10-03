@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -113,15 +114,29 @@ TEST(GenericAcceleratorTarget, MapsAVectorNodeEndToEnd) {
 /// The point of the second target: no target vocabulary reached the canonical
 /// dialect. If this fails, a target-specific name leaked into generic ODS.
 TEST(GenericAcceleratorTarget, TargetVocabularyStaysOutOfGenericMicroOds) {
+  // Generated ODS *and* hand-written headers: MicroEnums.h carries the Owner
+  // enumerants and is exactly where a target word can hide (CLAUDE.md warns it
+  // is hand-written and not tablegen'd).
   const std::vector<std::string> files = {
       "/include/LLK/Dialect/Micro/MicroDialect.td",
       "/include/LLK/Dialect/Micro/MicroTypes.td",
       "/include/LLK/Dialect/Micro/MicroOps.td",
+      "/include/LLK/Dialect/Micro/MicroDialect.h",
+      "/include/LLK/Dialect/Micro/MicroEnums.h",
   };
+  // Target-family words that must never name a generic Micro concept.
   const std::vector<std::string> targetWords = {
-      "avx2", "nvidia", "ampere", "sm80", "ttgir", "npu", "accel", "mxu", "vpu",
+      "avx2", "nvidia", "ampere", "sm80", "ttgir",    "npu",  "accel",
+      "mxu",  "vpu",    "warp",   "wave", "subgroup", "lane", "pe_group",
+  };
+  // Debt, not policy: generic Micro already ships warp-class owner names
+  // (Owner::warp, wave, subgroup, pe_group, pe, lane). Tracked so the debt is
+  // visible; a NEW leak fails, and removing one fails until this set shrinks.
+  const std::set<std::string> kKnownGenericLeaks = {
+      "warp", "wave", "subgroup", "pe_group", "lane",
   };
 
+  std::set<std::string> found;
   for (const std::string &file : files) {
     std::string path = std::string(LLK_SOURCE_DIR) + file;
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
@@ -129,7 +144,10 @@ TEST(GenericAcceleratorTarget, TargetVocabularyStaysOutOfGenericMicroOds) {
     ASSERT_TRUE(static_cast<bool>(buffer)) << path;
     std::string lowered = buffer.get()->getBuffer().lower();
     for (const std::string &word : targetWords)
-      EXPECT_FALSE(mentionsWord(lowered, word))
-          << file << " mentions target-specific '" << word << "'";
+      if (mentionsWord(lowered, word))
+        found.insert(word);
   }
+  EXPECT_EQ(found, kKnownGenericLeaks)
+      << "generic Micro leaks changed; update kKnownGenericLeaks only when the "
+         "dialect genuinely changed";
 }
