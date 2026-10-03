@@ -101,26 +101,45 @@ inline Operation *findMicroKernel(ModuleOp module) {
   return kernel;
 }
 
-/// The comparison order the module's `micro.objective` declares, if it has one
-/// and the cost model understands its metric. Absence is not an error: the
-/// caller keeps its default (latency minimized). An unknown metric is already
-/// rejected by the dialect verifier, so here it is skipped rather than guessed.
-inline std::optional<mapping::ObjectiveOrder>
+/// The comparison order the module's `micro.objective` declares, if it has one.
+/// Absence is not an error: the caller keeps its default (latency minimized).
+/// A *declared* objective the cost model cannot honor is an error, never a
+/// silent downgrade to latency (§17.1: a target may not replace the declared
+/// objective).
+inline llvm::Expected<std::optional<mapping::ObjectiveOrder>>
 objectiveOrderFromModule(ModuleOp module) {
-  std::optional<mapping::ObjectiveOrder> order;
+  Operation *objectiveOp = nullptr;
   module.walk([&](Operation *op) {
-    if (order)
-      return;
-    if (op->getName().getStringRef() != "micro.objective")
-      return;
-    auto metric = op->getAttrOfType<StringAttr>("metric");
-    auto direction = op->getAttrOfType<StringAttr>("direction");
-    if (!metric || !direction)
-      return;
-    order = mapping::objectiveOrderFromMicro(
-        metric.getValue(), direction.getValue() != "maximize");
+    if (!objectiveOp && op->getName().getStringRef() == "micro.objective")
+      objectiveOp = op;
   });
-  return order;
+  if (!objectiveOp)
+    return std::optional<mapping::ObjectiveOrder>{};
+
+  auto metric = objectiveOp->getAttrOfType<StringAttr>("metric");
+  auto direction = objectiveOp->getAttrOfType<StringAttr>("direction");
+  if (!metric || !direction)
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "micro.objective is missing its 'metric' or 'direction' attribute");
+
+  llvm::SmallVector<llvm::StringRef, 4> secondary;
+  if (auto metrics = objectiveOp->getAttrOfType<ArrayAttr>("secondary"))
+    for (Attribute entry : metrics) {
+      auto spelling = dyn_cast<StringAttr>(entry);
+      if (!spelling)
+        return llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
+            "micro.objective has a non-string secondary metric");
+      secondary.push_back(spelling.getValue());
+    }
+
+  llvm::Expected<mapping::ObjectiveOrder> order =
+      mapping::objectiveOrderFromMicro(
+          metric.getValue(), direction.getValue() != "maximize", secondary);
+  if (!order)
+    return order.takeError();
+  return std::optional<mapping::ObjectiveOrder>(std::move(*order));
 }
 
 /// A target loaded from disk plus the search it produced over one kernel.
@@ -198,10 +217,14 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   searchOptions.topK = options.topK;
   searchOptions.beamWidth = options.beamWidth;
   // §17.1: the declared `micro.objective` supplies the comparison order. A
-  // module without one leaves the default (latency minimized) in place.
-  if (std::optional<mapping::ObjectiveOrder> objective =
-          objectiveOrderFromModule(module))
-    searchOptions.objective = *objective;
+  // module without one leaves the default (latency minimized) in place; one
+  // the cost model cannot honor fails the pass rather than being downgraded.
+  llvm::Expected<std::optional<mapping::ObjectiveOrder>> objective =
+      objectiveOrderFromModule(module);
+  if (!objective)
+    return objective.takeError();
+  if (*objective)
+    searchOptions.objective = **objective;
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),
                                  deriveLayoutContext(*graph), searchOptions);
   llvm::Expected<mapping::MappingSearchResult> result = search.search();

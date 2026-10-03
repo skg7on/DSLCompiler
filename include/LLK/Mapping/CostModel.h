@@ -16,7 +16,9 @@
 #ifndef LLK_MAPPING_COSTMODEL_H
 #define LLK_MAPPING_COSTMODEL_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Error.h"
 
 #include <cstdint>
 #include <optional>
@@ -79,13 +81,15 @@ bool ranksBefore(const Cost &lhs, uint64_t lhsId, const Cost &rhs,
                  uint64_t rhsId, const ObjectiveOrder &order);
 
 /// Builds the comparison order a `micro.objective` declares from its metric
-/// spelling and direction (`minimize == false` means maximize). A metric the
-/// cost model does not know yields no order, never a guess -- the caller keeps
-/// its default. Only the metric spellings shared by both vocabularies
-/// (`latency_cycles`, `dram_bytes`) resolve today; secondary metrics are out of
-/// scope until the `micro` and `CostMetric` spellings are reconciled.
-std::optional<ObjectiveOrder> objectiveOrderFromMicro(llvm::StringRef metric,
-                                                      bool minimize);
+/// spelling, direction (`minimize == false` means maximize), and optional
+/// secondary metrics, which are kept in the declared order as tie-breakers
+/// (design §17.1). Every metric spelling the Micro dialect verifier accepts is
+/// resolved to its `CostMetric`; a spelling the cost model cannot honor is an
+/// error, never a silent fall back to the default -- §17.1 forbids replacing a
+/// declared objective.
+llvm::Expected<ObjectiveOrder>
+objectiveOrderFromMicro(llvm::StringRef metric, bool minimize,
+                        llvm::ArrayRef<llvm::StringRef> secondary = {});
 
 /// Fixed-format rendering of every dimension, byte-stable across runs and
 /// platforms so it can key hashes and reports.

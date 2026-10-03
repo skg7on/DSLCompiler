@@ -78,23 +78,64 @@ TEST(CostModel, CanonicalStringIsStableAndDistinct) {
 }
 
 // The bridge that carries a `micro.objective`'s declared metric and direction
-// into the mapping's comparison order.
-TEST(CostModel, ObjectiveBridgeReadsTheMicroMetricAndDirection) {
-  std::optional<ObjectiveOrder> minimize =
-      objectiveOrderFromMicro("latency_cycles", /*minimize=*/true);
-  ASSERT_TRUE(minimize.has_value());
-  EXPECT_EQ(minimize->primary, CostMetric::LatencyCycles);
-  EXPECT_TRUE(minimize->minimize);
-  EXPECT_TRUE(minimize->secondary.empty());
+// into the mapping's comparison order. Every spelling the Micro verifier
+// accepts must resolve (design §17.1).
+TEST(CostModel, ObjectiveBridgeResolvesEveryDialectMetricSpelling) {
+  struct Case {
+    const char *spelling;
+    CostMetric metric;
+  };
+  const Case cases[] = {
+      {"latency_cycles", CostMetric::LatencyCycles},
+      {"dram_bytes", CostMetric::DramBytes},
+      {"sram_bytes", CostMetric::LocalBytes},
+      {"matrix_utilization", CostMetric::ComputeUtilization},
+      {"dma_utilization", CostMetric::TransferUtilization},
+      {"capacity_spill_bytes", CostMetric::SpillBytes},
+  };
+  for (const Case &entry : cases) {
+    llvm::Expected<ObjectiveOrder> order =
+        objectiveOrderFromMicro(entry.spelling, /*minimize=*/true);
+    ASSERT_TRUE(static_cast<bool>(order)) << entry.spelling;
+    EXPECT_EQ(order->primary, entry.metric) << entry.spelling;
+    EXPECT_TRUE(order->minimize);
+    EXPECT_TRUE(order->secondary.empty());
+  }
 
-  std::optional<ObjectiveOrder> maximize =
+  llvm::Expected<ObjectiveOrder> maximize =
       objectiveOrderFromMicro("dram_bytes", /*minimize=*/false);
-  ASSERT_TRUE(maximize.has_value());
+  ASSERT_TRUE(static_cast<bool>(maximize));
   EXPECT_EQ(maximize->primary, CostMetric::DramBytes);
   EXPECT_FALSE(maximize->minimize);
+}
 
-  // A spelling the cost model does not know yields no order, never a guess.
-  EXPECT_FALSE(objectiveOrderFromMicro("nonsense", true).has_value());
+// Secondary metrics become tie-breakers, kept in the declared order (§17.1).
+TEST(CostModel, ObjectiveBridgeKeepsSecondaryMetricsInDeclaredOrder) {
+  llvm::StringRef secondary[] = {"matrix_utilization", "dram_bytes"};
+  llvm::Expected<ObjectiveOrder> order =
+      objectiveOrderFromMicro("latency_cycles", /*minimize=*/true, secondary);
+  ASSERT_TRUE(static_cast<bool>(order));
+  EXPECT_EQ(order->primary, CostMetric::LatencyCycles);
+  ASSERT_EQ(order->secondary.size(), 2u);
+  EXPECT_EQ(order->secondary[0], CostMetric::ComputeUtilization);
+  EXPECT_EQ(order->secondary[1], CostMetric::DramBytes);
+}
+
+// A declared objective the cost model cannot honor is rejected, never silently
+// replaced by the default.
+TEST(CostModel, ObjectiveBridgeRejectsAnUnknownMetric) {
+  llvm::Expected<ObjectiveOrder> unknown =
+      objectiveOrderFromMicro("not_a_metric", /*minimize=*/true);
+  EXPECT_FALSE(static_cast<bool>(unknown));
+  if (!unknown)
+    llvm::consumeError(unknown.takeError());
+
+  llvm::StringRef badSecondary[] = {"not_a_metric"};
+  llvm::Expected<ObjectiveOrder> unknownSecondary = objectiveOrderFromMicro(
+      "latency_cycles", /*minimize=*/true, badSecondary);
+  EXPECT_FALSE(static_cast<bool>(unknownSecondary));
+  if (!unknownSecondary)
+    llvm::consumeError(unknownSecondary.takeError());
 }
 
 TEST(CostEvent, EveryKindRoundTripsThroughItsName) {

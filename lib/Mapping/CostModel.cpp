@@ -2,6 +2,8 @@
 
 #include "LLK/Mapping/CostModel.h"
 
+#include "llvm/ADT/Twine.h"
+
 #include <array>
 #include <cstdio>
 
@@ -22,6 +24,27 @@ constexpr std::array<MetricInfo, 6> kMetrics{{
     {CostMetric::ComputeUtilization, "compute_utilization"},
     {CostMetric::TransferUtilization, "transfer_utilization"},
 }};
+
+/// Resolves a `micro.objective` metric spelling. The Micro dialect verifier
+/// (`ObjectiveOp::verify`) accepts six names; only two coincide with a
+/// `CostMetric` spelling, so the four that differ are aliased here. A
+/// `CostMetric` spelling is also accepted, so the bridge is usable from either
+/// vocabulary.
+std::optional<CostMetric> symbolizeMicroMetric(llvm::StringRef text) {
+  if (text == "latency_cycles")
+    return CostMetric::LatencyCycles;
+  if (text == "dram_bytes")
+    return CostMetric::DramBytes;
+  if (text == "sram_bytes")
+    return CostMetric::LocalBytes;
+  if (text == "matrix_utilization")
+    return CostMetric::ComputeUtilization;
+  if (text == "dma_utilization")
+    return CostMetric::TransferUtilization;
+  if (text == "capacity_spill_bytes")
+    return CostMetric::SpillBytes;
+  return symbolizeCostMetric(text);
+}
 } // namespace
 
 llvm::StringRef stringifyCostMetric(CostMetric metric) {
@@ -94,14 +117,29 @@ bool ranksBefore(const Cost &lhs, uint64_t lhsId, const Cost &rhs,
   return lhsId < rhsId;
 }
 
-std::optional<ObjectiveOrder> objectiveOrderFromMicro(llvm::StringRef metric,
-                                                      bool minimize) {
-  std::optional<CostMetric> primary = symbolizeCostMetric(metric);
+llvm::Expected<ObjectiveOrder>
+objectiveOrderFromMicro(llvm::StringRef metric, bool minimize,
+                        llvm::ArrayRef<llvm::StringRef> secondary) {
+  std::optional<CostMetric> primary = symbolizeMicroMetric(metric);
   if (!primary)
-    return std::nullopt;
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        llvm::Twine("micro.objective names an unknown metric '") + metric +
+            "'");
+
   ObjectiveOrder order;
   order.primary = *primary;
   order.minimize = minimize;
+  order.secondary.reserve(secondary.size());
+  for (llvm::StringRef spelling : secondary) {
+    std::optional<CostMetric> resolved = symbolizeMicroMetric(spelling);
+    if (!resolved)
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          llvm::Twine("micro.objective names an unknown secondary metric '") +
+              spelling + "'");
+    order.secondary.push_back(*resolved);
+  }
   return order;
 }
 
