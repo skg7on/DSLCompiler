@@ -305,8 +305,9 @@ bool LayoutRegistry::add(LayoutDef def, std::string &error) {
 }
 
 uint64_t LayoutRegistry::computeContentHash() const {
-  // Declaration order is not part of a layout library's identity, so sort by id
-  // first -- exactly the canonical order `all()` reports.
+  // `defs_` is insertion order (`all()` reports it as-is), and declaration
+  // order is not part of a layout library's identity, so sort by id before
+  // folding.
   std::vector<const LayoutDef *> sorted;
   sorted.reserve(defs_.size());
   for (const LayoutDef &def : defs_)

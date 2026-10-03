@@ -640,11 +640,19 @@ bool RuleRegistry::add(RuleDef def, std::string &error) {
 }
 
 uint64_t RuleRegistry::computeContentHash() const {
-  // `defs_` is stored in id order (see `add`), which is exactly the canonical
-  // order a content hash needs.
-  std::string canonical;
+  // `defs_` is stored in id order (see `add`), but sort a view defensively so
+  // the hash stays content-derived even if the storage invariant ever changes.
+  std::vector<const RuleDef *> sorted;
+  sorted.reserve(defs_.size());
   for (const RuleDef &def : defs_)
-    canonical += canonicalRuleDefString(def);
+    sorted.push_back(&def);
+  llvm::sort(sorted, [](const RuleDef *lhs, const RuleDef *rhs) {
+    return lhs->id < rhs->id;
+  });
+
+  std::string canonical;
+  for (const RuleDef *def : sorted)
+    canonical += canonicalRuleDefString(*def);
   return stableHash(canonical);
 }
 

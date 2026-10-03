@@ -15,6 +15,7 @@
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Version.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
@@ -43,8 +44,25 @@ llvm::StringRef stringifySearchMode(SearchMode mode) {
   return "unknown";
 }
 
+/// True when `code` names a *rejection* -- something the search refused -- as
+/// opposed to a notice. §22.2 asks for "rejected counts", so `search_truncated`
+/// (a cap, not a rejection) and `latency_cache_miss` (a provider gap, not a
+/// rejection) are reported separately and never inflate the rejection tally.
+bool isRejection(DiagnosticCode code) {
+  switch (code) {
+  case DiagnosticCode::SearchTruncated:
+  case DiagnosticCode::LatencyCacheMiss:
+    return false;
+  default:
+    return true;
+  }
+}
+
 /// Fixed six-decimal rendering of a double, matching `canonicalCostString`, so
 /// a cost component is byte-stable and never printed in exponent form.
+/// `snprintf`'s `%f` honours the C locale's decimal separator; the report
+/// assumes `LC_NUMERIC=C`, which is the process default and what the rest of
+/// the toolchain (including `canonicalCostString`) already relies on.
 std::string fixedDouble(double value) {
   char buffer[32];
   std::snprintf(buffer, sizeof(buffer), "%.6f", value);
@@ -52,6 +70,8 @@ std::string fixedDouble(double value) {
 }
 
 } // namespace
+
+llvm::StringRef compilerVersion() { return LLK_COMPILER_VERSION; }
 
 std::string writePlanReport(const MappingSearchResult &result,
                             const machine::MachineModel &machine,
@@ -68,7 +88,7 @@ std::string writePlanReport(const MappingSearchResult &result,
   json.object([&] {
     // --- provenance (fixed key order) -----------------------------------
     json.attribute("version", kPlanReportVersion);
-    json.attribute("compilerVersion", kCompilerVersion);
+    json.attribute("compilerVersion", compilerVersion());
     json.attribute("costModelVersion", kCostModelVersion);
     json.attribute("target", target.name());
     json.attribute("inputModuleHash", hexId(moduleHash));
@@ -124,11 +144,25 @@ std::string writePlanReport(const MappingSearchResult &result,
       json.attribute("plans", result.planCount);
     });
 
-    // --- rejections grouped by stable code ------------------------------
+    // --- coded events grouped by stable code ----------------------------
     // `codeCounts` is a `std::map`, so iteration is by code and the grouping is
-    // deterministic.
+    // deterministic. §22.2's "rejected counts" are separated from notices: a
+    // cap hit or a cache miss is not a rejection, so it never inflates the
+    // rejection tally.
     json.attributeArray("rejections", [&] {
       for (const auto &entry : result.frontier.codeCounts) {
+        if (!isRejection(entry.first))
+          continue;
+        json.object([&] {
+          json.attribute("code", stringifyDiagnosticCode(entry.first));
+          json.attribute("count", entry.second);
+        });
+      }
+    });
+    json.attributeArray("notices", [&] {
+      for (const auto &entry : result.frontier.codeCounts) {
+        if (isRejection(entry.first))
+          continue;
         json.object([&] {
           json.attribute("code", stringifyDiagnosticCode(entry.first));
           json.attribute("count", entry.second);

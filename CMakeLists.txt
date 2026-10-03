@@ -75,10 +75,32 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
   endif()
 endif()
 
-project(llk-compiler LANGUAGES CXX C)
+project(llk-compiler VERSION 0.1.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# The compiler version the plan report (§22.2) records. It is the project
+# version plus a `git describe` suffix when the checkout is a git tree, so two
+# compiler revisions never print the same string. A git failure leaves the
+# bare project version, which is still a real version rather than a name.
+set(LLK_COMPILER_VERSION "${PROJECT_VERSION}")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE LLK_GIT_DESCRIBE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE LLK_GIT_RESULT)
+  if(LLK_GIT_RESULT EQUAL 0 AND LLK_GIT_DESCRIBE)
+    set(LLK_COMPILER_VERSION "${PROJECT_VERSION}+${LLK_GIT_DESCRIBE}")
+  endif()
+endif()
+configure_file(include/LLK/Version.h.in
+    "${CMAKE_BINARY_DIR}/include/LLK/Version.h" @ONLY)
+message(STATUS "LLK compiler version: ${LLK_COMPILER_VERSION}")
 
 # Emit compile_commands.json for clangd and other editors. Honoured by the Ninja
 # and Makefile generators; other generators ignore it.
@@ -845,6 +867,17 @@ if(LLK_BUILD_TOOLS)
   # add_llk_filecheck_test() pipes stdout only and cannot set --check-prefix.
   add_test(NAME MicroMappingUnmaterialized
       COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=WARN ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir"
+  )
+
+  # MicroMappingReport: the `report=<path>` option's contract -- the report file
+  # is produced, the mapped IR is byte-identical with and without it (the report
+  # is metadata), and two separate llk-opt runs produce identical reports. A
+  # script because FileCheck only speaks about one stdout stream, while this
+  # compares two IR outputs and two report files.
+  add_test(NAME MicroMappingReport
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_report.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingReport
   )
 
   # LLKToMicro lowering tests. The schedule database is pointed at a path that

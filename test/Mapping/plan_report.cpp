@@ -101,29 +101,42 @@ MappingSearchResult searchKernel(MLIRContext &context, Operation *kernel,
   return std::move(*result);
 }
 
-} // namespace
-
-// The report carries every field §22.2 names and is byte-identical across runs.
-TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
-  Parsed parsed = parseKernel(kKernel);
-  ASSERT_TRUE(parsed.module);
+/// A complete, independent run: parse a fresh context and module, load a fresh
+/// target from disk, search, and serialize the report. Calling it twice models
+/// two separate process invocations, so comparing its outputs tests the whole
+/// chain's determinism, not just `writePlanReport`'s.
+std::string runReportOnce(llvm::StringRef kernel) {
+  Parsed parsed = parseKernel(kernel);
+  EXPECT_TRUE(parsed.module);
+  if (!parsed.module)
+    return {};
 
   llvm::Expected<std::unique_ptr<MappingTarget>> target =
       avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
-  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  if (!target)
+    return {};
 
   MappingSearchOptions options;
   options.mode = SearchMode::Deterministic;
   MappingSearchResult result =
       searchKernel(*parsed.context, parsed.kernel, **target, options);
-  ASSERT_FALSE(result.plans.empty());
+  return writePlanReport(result, (**target).machine(), **target, options,
+                         stableHash(kernel));
+}
 
-  const uint64_t moduleHash = stableHash(kKernel);
+} // namespace
 
-  std::string first = writePlanReport(result, (**target).machine(), **target,
-                                      options, moduleHash);
-  std::string second = writePlanReport(result, (**target).machine(), **target,
-                                       options, moduleHash);
+// The report carries every field §22.2 names, and two independent runs are
+// byte-identical.
+TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
+  // Two full runs -- fresh context, fresh target loaded from disk -- must
+  // agree byte for byte. This is the §29.12 contract; two calls on one
+  // in-memory result could not catch search-level or cross-process
+  // nondeterminism.
+  std::string first = runReportOnce(kKernel);
+  std::string second = runReportOnce(kKernel);
+  ASSERT_FALSE(first.empty());
   EXPECT_EQ(first, second);
 
   llvm::Expected<llvm::json::Value> json = llvm::json::parse(first);
@@ -133,6 +146,7 @@ TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
 
   EXPECT_TRUE(root->getInteger("version").has_value());
   EXPECT_TRUE(root->getString("compilerVersion").has_value());
+  EXPECT_NE(*root->getString("compilerVersion"), "llk-compiler");
   EXPECT_TRUE(root->getInteger("costModelVersion").has_value());
   EXPECT_TRUE(root->getString("inputModuleHash").has_value());
   EXPECT_TRUE(root->getString("sourceBindingHash").has_value());
@@ -144,7 +158,7 @@ TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
   EXPECT_TRUE(root->getString("selectedPlanId").has_value());
 
   // The input hash names the module the caller supplied.
-  EXPECT_EQ(*root->getString("inputModuleHash"), hexId(moduleHash));
+  EXPECT_EQ(*root->getString("inputModuleHash"), hexId(stableHash(kKernel)));
 
   // Search options are recorded, not just their effect.
   const llvm::json::Object *searchOptions = root->getObject("searchOptions");
@@ -159,20 +173,19 @@ TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
   EXPECT_TRUE(counts->getInteger("instances").has_value());
   EXPECT_TRUE(counts->getInteger("routes").has_value());
   EXPECT_TRUE(counts->getInteger("plans").has_value());
-  EXPECT_GE(*counts->getInteger("plans"),
-            static_cast<int64_t>(result.plans.size()));
   EXPECT_GE(*counts->getInteger("instances"), 1);
 
-  // Rejections are grouped by stable code: each code appears at most once.
+  // Both coded-event arrays exist; each is grouped by code, one entry each.
   ASSERT_TRUE(root->getArray("rejections"));
+  ASSERT_TRUE(root->getArray("notices"));
 
   // Top-K plans with their component costs.
   const llvm::json::Array *plans = root->getArray("plans");
   ASSERT_TRUE(plans);
-  ASSERT_EQ(plans->size(), result.plans.size());
+  ASSERT_FALSE(plans->empty());
+  EXPECT_GE(*counts->getInteger("plans"), static_cast<int64_t>(plans->size()));
   const llvm::json::Object *best = (*plans)[0].getAsObject();
   ASSERT_TRUE(best);
-  EXPECT_EQ(*best->getString("id"), hexId(result.plans.front().id));
   EXPECT_TRUE(best->getString("totalCost").has_value());
   const llvm::json::Object *components = best->getObject("costComponents");
   ASSERT_TRUE(components);
@@ -181,10 +194,11 @@ TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
   EXPECT_TRUE(components->getString("computeUtilization").has_value());
 
   // The selected plan is the best plan.
-  EXPECT_EQ(*root->getString("selectedPlanId"), hexId(result.plans.front().id));
+  EXPECT_EQ(*root->getString("selectedPlanId"), *best->getString("id"));
 }
 
-// Rejections are grouped by code, each code once, counts positive.
+// Rejections are grouped by code, one entry per code, counts positive -- and a
+// truncation is a *notice*, not a rejection, so it never inflates the tally.
 TEST(MappingPlanReportTest, RejectionCountsAreGroupedByCode) {
   Parsed parsed = parseKernel(kKernel);
   ASSERT_TRUE(parsed.module);
@@ -208,13 +222,15 @@ TEST(MappingPlanReportTest, RejectionCountsAreGroupedByCode) {
                                        options, stableHash(kKernel));
   llvm::Expected<llvm::json::Value> json = llvm::json::parse(report);
   ASSERT_TRUE(static_cast<bool>(json)) << llvm::toString(json.takeError());
-  const llvm::json::Array *rejections =
-      json->getAsObject()->getArray("rejections");
+  const llvm::json::Object *root = json->getAsObject();
+  ASSERT_TRUE(root);
+
+  const llvm::json::Array *rejections = root->getArray("rejections");
   ASSERT_TRUE(rejections);
   ASSERT_FALSE(rejections->empty());
 
   llvm::StringSet<> seen;
-  bool sawTruncated = false;
+  bool sawNoMatchingRule = false;
   for (const llvm::json::Value &entry : *rejections) {
     const llvm::json::Object *object = entry.getAsObject();
     ASSERT_TRUE(object);
@@ -225,6 +241,20 @@ TEST(MappingPlanReportTest, RejectionCountsAreGroupedByCode) {
     EXPECT_GT(*count, 0);
     EXPECT_TRUE(seen.insert(*code).second) << "duplicate code " << code->str();
     if (*code == "search_truncated")
+      ADD_FAILURE() << "a cap is a notice, not a rejection";
+    if (*code == "no_matching_rule")
+      sawNoMatchingRule = true;
+  }
+  EXPECT_TRUE(sawNoMatchingRule);
+
+  // The truncation is reported, but under notices.
+  const llvm::json::Array *notices = root->getArray("notices");
+  ASSERT_TRUE(notices);
+  bool sawTruncated = false;
+  for (const llvm::json::Value &entry : *notices) {
+    const llvm::json::Object *object = entry.getAsObject();
+    ASSERT_TRUE(object);
+    if (object->getString("code") == "search_truncated")
       sawTruncated = true;
   }
   EXPECT_TRUE(sawTruncated);
@@ -243,4 +273,45 @@ TEST(MappingPlanReportTest, RegistryHashesAreContentDerivedAndStable) {
   EXPECT_NE(ruleHash, 0u);
   EXPECT_NE(layoutHash, ruleHash);
   EXPECT_EQ(layoutHash, (**target).layouts().computeContentHash());
+}
+
+// A library hash is content-derived: changing or adding a declaration changes
+// it. A constant hash would pass the stability checks above, so this pins the
+// property those checks cannot.
+TEST(MappingPlanReportTest, RegistryHashChangesWithContent) {
+  std::string error;
+
+  // Same id, different body; and a different id. Both must move the hash.
+  LayoutRegistry base;
+  LayoutDef layout;
+  layout.id = "test.layout";
+  ASSERT_TRUE(base.add(layout, error)) << error;
+
+  LayoutRegistry renamed;
+  LayoutDef renamedDef = layout;
+  renamedDef.id = "test.layout.other";
+  ASSERT_TRUE(renamed.add(renamedDef, error)) << error;
+
+  LayoutRegistry parameterized;
+  LayoutDef parameterizedDef = layout;
+  parameterizedDef.params.push_back(LayoutParam{"VW", /*symbolic=*/false});
+  ASSERT_TRUE(parameterized.add(parameterizedDef, error)) << error;
+
+  EXPECT_NE(base.computeContentHash(), renamed.computeContentHash());
+  EXPECT_NE(base.computeContentHash(), parameterized.computeContentHash());
+  EXPECT_EQ(base.computeContentHash(), base.computeContentHash());
+
+  RuleRegistry ruleBase;
+  RuleDef rule;
+  rule.id = "test.rule";
+  rule.matchOp = "micro.vector";
+  ASSERT_TRUE(ruleBase.add(rule, error)) << error;
+
+  RuleRegistry ruleChanged;
+  RuleDef changedRule = rule;
+  changedRule.bundle = "bundle.changed";
+  ASSERT_TRUE(ruleChanged.add(changedRule, error)) << error;
+
+  EXPECT_NE(ruleBase.computeContentHash(), ruleChanged.computeContentHash());
+  EXPECT_EQ(ruleBase.computeContentHash(), ruleBase.computeContentHash());
 }
