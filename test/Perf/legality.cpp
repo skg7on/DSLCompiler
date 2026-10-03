@@ -369,9 +369,14 @@ TEST(Legality, LayoutSupportedByAnyMemoryOnThePathIsLegal) {
   SearchSpace space =
       spaceWith(ConstraintKind::LayoutSupported, {"tile_layout"}, fullParams());
   Candidate candidate = preferred();
-  candidate.symbolicValues["memory_path"] = "dram:l2:sram:acc";
   candidate.symbolicValues["tile_layout"] = "blocked";
 
+  // Both multi-level paths the export offers, including the three-space form
+  // the schedule database anchors on.
+  candidate.symbolicValues["memory_path"] = "dram:l2:sram:acc";
+  EXPECT_TRUE(checkLegality(space, candidate, swigluShape(), avx2()).legal);
+
+  candidate.symbolicValues["memory_path"] = "dram:l2:sram";
   EXPECT_TRUE(checkLegality(space, candidate, swigluShape(), avx2()).legal);
 }
 
