@@ -237,11 +237,75 @@ rule t.vector {
 }
 )llkmap";
 
-/// The shipped AVX2 machine with these rules.
+/// A machine whose two memories live in different visibility scopes, so a node
+/// placed on one cannot read the other's memory: the edge between them is a
+/// real transfer, not a direct read. (Under §10.2 a single-scope machine -- the
+/// shipped AVX2 profile among them -- lets any worker read any memory, so every
+/// cross-memory edge is a `Direct` read and nothing has to move; that is why
+/// this fixture defines its own machine.)
+constexpr llvm::StringLiteral kMovementMachine = R"yaml(
+schema: llk.machine.v2
+target: movement
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.a
+    kind: cluster
+  - id: worker.a
+    kind: worker
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+  - id: worker.b
+    kind: worker
+    parent: cluster.b
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.a
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+  - id: dram.0
+    kind: dram
+    visible_from: cluster.b
+    capacity_bytes: 1073741824
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.a
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+transfer_engines:
+  - id: dma.a
+    kind: dma
+    attached_to: cluster.a
+    count: 1
+    max_outstanding: 1
+links:
+  - id: sram_to_dram.0
+    source: sram.0
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+)yaml";
+
+/// The movement machine with these rules. The copy rule binds SRAM (visible
+/// only in cluster A) and the vector rule binds DRAM (visible only in cluster
+/// B), so the two instances sit on different executors and the consumer cannot
+/// read the producer's memory.
 llvm::Expected<std::unique_ptr<MappingTarget>> movementTarget() {
   llvm::Expected<mlir::llk::machine::MachineModel> machine =
-      mlir::llk::machine::loadMachineModel(std::string(LLK_SOURCE_DIR) +
-                                           "/machines/x86-avx2-v2.yaml");
+      mlir::llk::machine::parseMachineModel(kMovementMachine, "<test>");
   if (!machine)
     return machine.takeError();
   llvm::Expected<LayoutRegistry> layouts = parseLayoutText("", "<test>");
@@ -436,22 +500,29 @@ TEST(PlanBinder, MergesADuplicateValueConnectionWithTheSameRoute) {
 namespace {
 
 /// A machine whose only way from DRAM to SRAM is through L2, so a routed
-/// movement between them has two hops rather than one.
+/// movement between them has two hops rather than one. The two memories live in
+/// different visibility scopes, so the node reading SRAM cannot read DRAM and
+/// the edge between them is a real transfer (see `kMovementMachine`).
 constexpr llvm::StringLiteral kTwoHopMachine = R"yaml(
 schema: llk.machine.v2
 target: two-hop
 clock_hz: 1000000000
-worker_threads: 1
+worker_threads: 2
 executors:
-  - id: cluster.0
+  - id: cluster.a
     kind: cluster
-  - id: worker.0
+  - id: worker.a
     kind: worker
-    parent: cluster.0
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+  - id: worker.b
+    kind: worker
+    parent: cluster.b
 memories:
   - id: dram.0
     kind: dram
-    visible_from: cluster.0
+    visible_from: cluster.b
     capacity_bytes: 1048576
     alignment_bytes: 64
     supported_layouts: [row_major]
@@ -459,7 +530,7 @@ memories:
     latency_cycles: 220
   - id: l2.0
     kind: l2
-    visible_from: cluster.0
+    visible_from: cluster.b
     capacity_bytes: 262144
     alignment_bytes: 64
     supported_layouts: [row_major]
@@ -467,7 +538,7 @@ memories:
     latency_cycles: 12
   - id: sram.0
     kind: sram
-    visible_from: cluster.0
+    visible_from: cluster.a
     capacity_bytes: 32768
     alignment_bytes: 64
     supported_layouts: [row_major]
@@ -476,14 +547,14 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
-    attached_to: worker.0
+    attached_to: worker.a
     element_types: [f32]
     shapes: [[8]]
     lanes: {f32: 8}
 transfer_engines:
-  - id: dma.0
+  - id: dma.b
     kind: dma
-    attached_to: cluster.0
+    attached_to: cluster.b
     count: 1
     max_outstanding: 1
 links:
@@ -493,14 +564,14 @@ links:
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 220
     transaction_bytes: 64
-    transfer_engines: [dma.0]
+    transfer_engines: [dma.b]
   - id: l2_to_sram.0
     source: l2.0
     destination: sram.0
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 12
     transaction_bytes: 64
-    transfer_engines: [dma.0]
+    transfer_engines: [dma.b]
 )yaml";
 
 /// The copy lands in DRAM and the add reads from SRAM, so the connection has to

@@ -74,21 +74,28 @@ rule t.vector {
 /// DRAM reaches SRAM only through L2. The second L2->SRAM link (to `sram.1`)
 /// is declared *first* and costs far more, so a kind-first lookup charges the
 /// wrong node; only the stamped destination node charges the right link.
+/// The two memories live in different visibility scopes, so the SRAM consumer
+/// cannot read DRAM directly and the edge is a real transfer (design §10.2).
 constexpr llvm::StringLiteral kMachine = R"yaml(
 schema: llk.machine.v2
 target: route-identity
 clock_hz: 1000000000
-worker_threads: 1
+worker_threads: 2
 executors:
-  - id: cluster.0
+  - id: cluster.a
     kind: cluster
-  - id: worker.0
+  - id: worker.a
     kind: worker
-    parent: cluster.0
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+  - id: worker.b
+    kind: worker
+    parent: cluster.b
 memories:
   - id: dram.0
     kind: dram
-    visible_from: cluster.0
+    visible_from: cluster.b
     capacity_bytes: 1048576
     alignment_bytes: 64
     supported_layouts: [row_major]
@@ -96,7 +103,7 @@ memories:
     latency_cycles: 1
   - id: l2.0
     kind: l2
-    visible_from: cluster.0
+    visible_from: cluster.b
     capacity_bytes: 262144
     alignment_bytes: 64
     supported_layouts: [row_major]
@@ -104,7 +111,7 @@ memories:
     latency_cycles: 1
   - id: sram.0
     kind: sram
-    visible_from: cluster.0
+    visible_from: cluster.a
     capacity_bytes: 65536
     alignment_bytes: 64
     supported_layouts: [row_major]
@@ -112,7 +119,7 @@ memories:
     latency_cycles: 1
   - id: sram.1
     kind: sram
-    visible_from: cluster.0
+    visible_from: cluster.a
     capacity_bytes: 65536
     alignment_bytes: 64
     supported_layouts: [row_major]
@@ -121,7 +128,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
-    attached_to: worker.0
+    attached_to: worker.a
     element_types: [f32]
     shapes: [[8]]
     lanes: {f32: 8}
@@ -129,9 +136,9 @@ compute:
     latency_cycles: 1
     supported_layouts: [row_major]
 transfer_engines:
-  - id: dma.0
+  - id: dma.b
     kind: dma
-    attached_to: cluster.0
+    attached_to: cluster.b
     count: 1
     max_outstanding: 1
 links:
@@ -141,21 +148,21 @@ links:
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 220
     transaction_bytes: 64
-    transfer_engines: [dma.0]
+    transfer_engines: [dma.b]
   - id: l2_to_sram.1
     source: l2.0
     destination: sram.1
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 77
     transaction_bytes: 64
-    transfer_engines: [dma.0]
+    transfer_engines: [dma.b]
   - id: l2_to_sram.0
     source: l2.0
     destination: sram.0
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 12
     transaction_bytes: 64
-    transfer_engines: [dma.0]
+    transfer_engines: [dma.b]
 )yaml";
 
 Operation *findKernel(ModuleOp module) {

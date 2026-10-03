@@ -188,7 +188,13 @@ TEST(Connections, TransformOnlyWhenLayoutsDifferInPlace) {
   EXPECT_EQ((*plans)[0].transform->dstLayout, "t.b");
 }
 
-TEST(Connections, TransferWhenOnlyMemoryDiffers) {
+TEST(Connections, DirectReadAndTransferRoutesWhenOnlyMemoryDiffers) {
+  // §10.2 defines direct compatibility by memory *visibility*, not by the two
+  // memories being the same node: a consumer that can address the producer's
+  // memory reads the value there with no transfer. So a different-memory,
+  // same-layout pair exposes a Direct alternative *and* the transfer routes.
+  // (The previous version of this test asserted every plan was a Transfer,
+  // enshrining the memory-id-equality reading.)
   MachineModel machine = connectionMachine();
   TopologyService topology(machine);
   ConnectionRequest request = baseRequest();
@@ -197,14 +203,25 @@ TEST(Connections, TransferWhenOnlyMemoryDiffers) {
       synthesizeConnections(request, machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
   ASSERT_FALSE(plans->empty());
+  bool direct = false;
+  size_t transfers = 0;
   for (const ConnectionPlan &plan : *plans) {
-    EXPECT_EQ(plan.kind, ConnectionKind::Transfer);
     EXPECT_FALSE(plan.transform.has_value());
     EXPECT_EQ(plan.producer, 1u);
     ASSERT_EQ(plan.consumers.size(), 1u);
     EXPECT_EQ(plan.consumers[0], 2u);
     EXPECT_EQ(plan.value, 5u);
+    if (plan.kind == ConnectionKind::Direct) {
+      direct = true;
+      EXPECT_EQ(plan.memoryRoute.size(), 1u);
+      EXPECT_EQ(plan.memoryRoute[0], "dram.0");
+    } else {
+      EXPECT_EQ(plan.kind, ConnectionKind::Transfer);
+      ++transfers;
+    }
   }
+  EXPECT_TRUE(direct);
+  EXPECT_EQ(transfers, 2u);
 }
 
 TEST(Connections, TransferAndTransformWhenBothDiffer) {
@@ -338,10 +355,11 @@ TEST(Connections, AlternativesAreAttemptedInSection15Order) {
     request.consumerLayout = "t.b";
     EXPECT_EQ(ranksOf(request), (std::vector<unsigned>{2u}));
   }
-  // Different memory, same layout: a direct transfer then a multi-hop transfer.
+  // Different memory, same layout: the direct read (alternative 1) precedes a
+  // direct transfer (3) and a multi-hop transfer (5).
   {
     ConnectionRequest request = baseRequest();
-    EXPECT_EQ(ranksOf(request), (std::vector<unsigned>{3u, 5u}));
+    EXPECT_EQ(ranksOf(request), (std::vector<unsigned>{1u, 3u, 5u}));
   }
   // Different memory, different layout: the layout-only transform precedes the
   // direct transfer-plus-transform, which precedes the multi-hop one.
@@ -354,7 +372,7 @@ TEST(Connections, AlternativesAreAttemptedInSection15Order) {
   }
 }
 
-TEST(Connections, EmitsBothTheDirectAndTheTwoHopRoute) {
+TEST(Connections, EmitsTheDirectReadAndBothTransferRoutes) {
   MachineModel machine = connectionMachine();
   TopologyService topology(machine);
   ConnectionRequest request = baseRequest();
@@ -362,20 +380,52 @@ TEST(Connections, EmitsBothTheDirectAndTheTwoHopRoute) {
   llvm::Expected<std::vector<ConnectionPlan>> plans =
       synthesizeConnections(request, machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans));
-  ASSERT_EQ(plans->size(), 2u);
-  // Cheapest first: the direct link beats the two-hop path.
-  EXPECT_EQ((*plans)[0].memoryRoute.size(), 2u);
-  EXPECT_EQ((*plans)[1].memoryRoute.size(), 3u);
-  EXPECT_EQ((*plans)[1].memoryRoute[1], "sram.0");
+  ASSERT_EQ(plans->size(), 3u);
+  // Alternative 1 first: the consumer reads the producer's memory directly.
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+  EXPECT_EQ((*plans)[0].memoryRoute.size(), 1u);
+  // Then the transfer routes, cheapest first: the direct link beats the
+  // two-hop path.
+  EXPECT_EQ((*plans)[1].kind, ConnectionKind::Transfer);
+  EXPECT_EQ((*plans)[1].memoryRoute.size(), 2u);
+  EXPECT_EQ((*plans)[2].kind, ConnectionKind::Transfer);
+  EXPECT_EQ((*plans)[2].memoryRoute.size(), 3u);
+  EXPECT_EQ((*plans)[2].memoryRoute[1], "sram.0");
   // Every hop's engine is recorded, so a cost model can see each one.
-  EXPECT_FALSE((*plans)[1].transferEngines.empty());
+  EXPECT_FALSE((*plans)[2].transferEngines.empty());
 }
 
-TEST(Connections, NoRouteYieldsNoAlternatives) {
+// A direct read needs no route, so clearing the links cannot remove it -- the
+// pair is not incompatible.
+TEST(Connections, NoRouteStillYieldsADirectReadWhenVisibilityAllows) {
   MachineModel machine = connectionMachine();
   machine.links.clear();
   TopologyService topology(machine);
   ConnectionRequest request = baseRequest();
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+}
+
+// No route and no direct read: the pair is incompatible, which is an empty
+// result, never an error.
+TEST(Connections, NoRouteAndNoDirectReadYieldsNoAlternatives) {
+  MachineModel machine = connectionMachine();
+  machine.links.clear();
+  machine.executors.push_back({"e1", "worker", std::nullopt, {}, 1, {}});
+  // A destination only e1 can address, so the missing route is the only
+  // reason there is no path -- not an endpoint the consumer cannot see.
+  MemoryNode acc1 = memory("acc.1", "acc");
+  acc1.visibleFrom = "e1";
+  machine.memories.push_back(acc1);
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = "acc.1";
+  request.producerExecutor = "e0";
+  request.consumerExecutor = "e1"; // cannot address the producer's memory
 
   llvm::Expected<std::vector<ConnectionPlan>> plans =
       synthesizeConnections(request, machine, topology);
@@ -605,9 +655,11 @@ TEST(Connections, FanOutReplicatesWhenAConsumerNeedsADifferentMemory) {
                        std::vector<MemoryNodeId>{base.producerMemory, "acc.0"},
                        machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
-  // Consumer 11 shares the producer's memory (direct); consumer 12 needs both
-  // routes into acc.0. Nothing is shared, so every plan serves one consumer.
-  ASSERT_EQ(plans->size(), 3u);
+  // Consumer 11 shares the producer's memory (one direct read). Consumer 12 is
+  // placed on acc.0: it can read the producer's memory directly *and* it has
+  // both transfer routes into acc.0. Nothing is shared, so every plan serves
+  // one consumer.
+  ASSERT_EQ(plans->size(), 4u);
   size_t direct = 0;
   size_t transfers = 0;
   for (const ConnectionPlan &plan : *plans) {
@@ -617,7 +669,7 @@ TEST(Connections, FanOutReplicatesWhenAConsumerNeedsADifferentMemory) {
     else if (plan.kind == ConnectionKind::Transfer)
       ++transfers;
   }
-  EXPECT_EQ(direct, 1u);
+  EXPECT_EQ(direct, 2u);
   EXPECT_EQ(transfers, 2u);
 }
 
@@ -650,14 +702,19 @@ TEST(Connections, DramRouteRecordsDramBytes) {
       synthesizeConnections(request, machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
   ASSERT_FALSE(plans->empty());
+  bool sawTransfer = false;
   for (const ConnectionPlan &plan : *plans) {
+    if (plan.kind == ConnectionKind::Direct)
+      continue; // a direct read touches no link, so no DRAM hop
     ASSERT_EQ(plan.kind, ConnectionKind::Transfer);
     ASSERT_FALSE(plan.memoryRoute.empty());
     EXPECT_EQ(plan.memoryRoute.front(), "dram.0");
     EXPECT_EQ(plan.cost.dramBytes, request.bytes);
     // The staging bytes are the value itself.
     EXPECT_EQ(plan.cost.localBytes, request.bytes);
+    sawTransfer = true;
   }
+  EXPECT_TRUE(sawTransfer);
 }
 
 // A route that never touches DRAM moves no DRAM bytes, but still stages the
@@ -672,9 +729,15 @@ TEST(Connections, NonDramRouteRecordsNoDramBytes) {
   llvm::Expected<std::vector<ConnectionPlan>> plans =
       synthesizeConnections(request, machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
-  ASSERT_FALSE(plans->empty());
-  EXPECT_EQ((*plans)[0].cost.dramBytes, 0u);
-  EXPECT_EQ((*plans)[0].cost.localBytes, request.bytes);
+  const ConnectionPlan *transfer = nullptr;
+  for (const ConnectionPlan &plan : *plans)
+    if (plan.kind == ConnectionKind::Transfer) {
+      transfer = &plan;
+      break;
+    }
+  ASSERT_NE(transfer, nullptr);
+  EXPECT_EQ(transfer->cost.dramBytes, 0u);
+  EXPECT_EQ(transfer->cost.localBytes, request.bytes);
 }
 
 // Spills are not modelled by the dialect, so the dimension is deliberately
@@ -702,11 +765,17 @@ TEST(Connections, TransferUtilizationUsesTheSyncWindow) {
   llvm::Expected<std::vector<ConnectionPlan>> plans =
       synthesizeConnections(request, machine, topology);
   ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
-  ASSERT_FALSE(plans->empty());
-  // Cheapest route is the direct dram.0 -> acc.0 hop: 10 latency cycles plus
+  // The transfer routes are cost-ranked, so the first Transfer plan is the
+  // cheapest route: the direct dram.0 -> acc.0 hop, 10 latency cycles plus
   // 1024 / 32 bytes-per-cycle = 42 cycles, over one engine x 100 cycles.
-  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Transfer);
-  EXPECT_DOUBLE_EQ((*plans)[0].cost.transferUtilization, 0.42);
+  const ConnectionPlan *cheapestTransfer = nullptr;
+  for (const ConnectionPlan &plan : *plans)
+    if (plan.kind == ConnectionKind::Transfer) {
+      cheapestTransfer = &plan;
+      break;
+    }
+  ASSERT_NE(cheapestTransfer, nullptr);
+  EXPECT_DOUBLE_EQ(cheapestTransfer->cost.transferUtilization, 0.42);
 }
 
 // Without a modelled sync period there is no denominator, so utilization stays

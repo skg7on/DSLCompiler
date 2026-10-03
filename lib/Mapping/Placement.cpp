@@ -441,9 +441,14 @@ synthesizeConnections(const ConnectionRequest &request,
   // `plans` is that attempt order.
   std::vector<ConnectionPlan> plans;
 
-  // Alternative 1: a direct connection -- same memory, nothing moved, nothing
-  // transformed, and the §10.2 direct-compatibility checks all hold.
-  if (sameMemory && portsDirectCompatible(request, machine)) {
+  // Alternative 1: a direct connection -- nothing is moved and nothing is
+  // transformed. §10.2 defines direct compatibility by element type, logical
+  // tile shape, memory *visibility*, and affine index relation, so the two
+  // memories need not be the same node: a consumer that can address the
+  // producer's memory reads the value there. That visibility check (and the
+  // element-type, shape, and affine checks) is inside `portsDirectCompatible`,
+  // so gating on it -- rather than on memory-id equality -- is what §10.2 asks.
+  if (portsDirectCompatible(request, machine)) {
     ConnectionPlan plan;
     plan.producer = request.producer;
     plan.consumers.push_back(request.consumer);
@@ -457,11 +462,15 @@ synthesizeConnections(const ConnectionRequest &request,
 
   // Alternative 2: a layout-only transform in a memory both endpoints can see.
   // The value already sits in the producer's memory, so the transform runs
-  // there and the consumer reads the result -- there is no transfer. This is
+  // there and the consumer reads the result -- there is no transfer. It is
   // emitted even when the two ends are *placed* on different memories, because
-  // the consumer may legally read the producer's memory (that is exactly the
-  // property `portsDirectCompatible` checks). The memory must be able to hold
-  // both layouts, or the transform cannot occur in it.
+  // the consumer may legally read the producer's memory: `mutuallyVisible` is
+  // exactly that `consumerSeesProducerMemory` check, the same visibility fact
+  // alternative 1 relies on. The memory must be able to hold both layouts, or
+  // the transform cannot occur in it. (Like the alt-5 transform hop, the plan
+  // does not record that the consumer reads the producer's memory rather than
+  // its own bound memory -- see the note on `ConnectionPlan` at the
+  // chosen-hop site.)
   if (transformRequired && mutuallyVisible &&
       memorySupportsLayout(*producerMemory, *request.producerLayout) &&
       memorySupportsLayout(*producerMemory, *request.consumerLayout)) {
@@ -529,6 +538,10 @@ synthesizeConnections(const ConnectionRequest &request,
       // chosen hop is not a `ConnectionPlan` field -- the plan carries the
       // route and the layout pair, and the boundary the two meet at is implied
       // by them -- so this validation is what fixes where the transform runs.
+      // No current consumer materializes a transform (`PlanBinder` reports an
+      // unmaterialized transform), so nothing is lost yet; a future transform
+      // materializer must re-derive this first-legal-hop rule, or a hop field
+      // must be added to `ConnectionPlan`, before it can place the transform.
       if (!legalTransformHop(memoryRoute.nodes, machine,
                              *request.producerLayout, *request.consumerLayout))
         return;

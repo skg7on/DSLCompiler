@@ -1,4 +1,4 @@
-// RUN: llk-opt %s --micro-map="target=probe machine=%p/../../../machines/x86-avx2-v2.yaml layouts=%p/../../../mapping/x86-avx2/layouts.llkmap rules=%p/../../../test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic" 2>&1 | FileCheck --check-prefix=WARN %s
+// RUN: llk-opt %s --micro-map="target=probe machine=%p/../../../test/Conversion/MicroMapping/probe_machine.yaml layouts=%p/../../../mapping/x86-avx2/layouts.llkmap rules=%p/../../../test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic" 2>&1 | FileCheck --check-prefix=WARN %s
 //
 // The RUN line is documentation only; the real invocation is the
 // MicroMappingUnmaterialized CTest entry. It merges stderr, because the pass's
