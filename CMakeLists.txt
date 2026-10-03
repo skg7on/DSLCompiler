@@ -218,6 +218,10 @@ add_library(LLKPerf STATIC
     lib/Perf/MicroDAG.cpp
     lib/Perf/MicroCostModel.cpp
     lib/Perf/MicroPerfReport.cpp
+    lib/Perf/SearchSpace.cpp
+    lib/Perf/Candidate.cpp
+    lib/Perf/CandidateGenerator.cpp
+    lib/Perf/Legality.cpp
 )
 target_include_directories(LLKPerf PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -618,6 +622,13 @@ endfunction()
 
 add_llk_perf_test(L0StaticBoundTest test/Perf/l0_static_bound.cpp)
 add_llk_perf_test(L1ResourceDAGTest test/Perf/l1_resource_dag.cpp)
+
+# Tuning-core tests (issue #49): the search-space loader, candidate
+# generation, and machine-aware legality. The loader test parses micro IR;
+# the other two build typed spaces directly, so a failure points at one layer.
+add_llk_perf_test(SearchSpaceLoaderTest test/Perf/search_space_loader.cpp)
+add_llk_perf_test(CandidateGeneratorTest test/Perf/candidate_generator.cpp)
+add_llk_perf_test(LegalityTest test/Perf/legality.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
