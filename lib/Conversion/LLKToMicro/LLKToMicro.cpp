@@ -50,7 +50,11 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
+
+#include <algorithm>
+#include <iterator>
 
 // LLK attribute and op declarations.
 #define GET_ATTRDEF_CLASSES
@@ -102,6 +106,97 @@ FailureOr<SmallVector<int64_t, 3>> parseShapeTriple(StringRef text) {
     shape.push_back(value);
   }
   return shape;
+}
+
+//===----------------------------------------------------------------------===//
+// Search-space choice builders
+//===----------------------------------------------------------------------===//
+
+// The numeric values each dimension is searched over -- the same grid
+// `llk-tune` generates candidates from. A search space that offered choices the
+// tuner cannot generate, or omitted the ones it can, would describe a different
+// search. `BM` is pruned per M bucket rather than used as-is.
+constexpr int64_t kSearchBM[] = {1, 4, 8, 16, 32, 64};
+constexpr int64_t kSearchBN[] = {16, 32, 64, 128, 256};
+constexpr int64_t kSearchBK[] = {32, 64, 128, 256};
+constexpr int64_t kSearchVM[] = {1, 2, 4};
+constexpr int64_t kSearchVN[] = {4, 8};
+constexpr int64_t kSearchVectorWidth[] = {8};
+constexpr int64_t kSearchThreads[] = {1, 2, 4, 8};
+constexpr int64_t kSearchGrain[] = {1, 2, 4};
+constexpr int64_t kSearchStages[] = {1, 2};
+constexpr int64_t kSearchPrefetch[] = {1, 2};
+
+/// Builds an integer choice list. The dialect requires integer choices to be
+/// positive and strictly increasing, so the values are filtered, sorted, and
+/// deduplicated; a non-positive value is dropped because it is not legal.
+ArrayAttr makeIntegerChoices(MLIRContext *context, ArrayRef<int64_t> values) {
+  SmallVector<int64_t, 8> sorted;
+  for (int64_t value : values)
+    if (value > 0)
+      sorted.push_back(value);
+  llvm::sort(sorted);
+  sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+
+  SmallVector<Attribute, 8> choices;
+  for (int64_t value : sorted)
+    choices.push_back(IntegerAttr::get(IntegerType::get(context, 64), value));
+  return ArrayAttr::get(context, choices);
+}
+
+/// Builds a string choice list, keeping the first occurrence of each value and
+/// preserving order so the scheduled value can be printed first.
+ArrayAttr makeStringChoices(MLIRContext *context,
+                            ArrayRef<std::string> values) {
+  SmallVector<Attribute, 8> choices;
+  llvm::StringSet<> seen;
+  for (const std::string &value : values) {
+    if (value.empty() || !seen.insert(value).second)
+      continue;
+    choices.push_back(StringAttr::get(context, value));
+  }
+  return ArrayAttr::get(context, choices);
+}
+
+/// The numeric grid `llk-tune` searches, plus the scheduled value when the grid
+/// does not already contain it. Keeping the scheduled value in the space is
+/// what lets the tuner reproduce the schedule in hand.
+ArrayAttr makeNumericChoices(MLIRContext *context, ArrayRef<int64_t> grid,
+                             int64_t scheduled) {
+  SmallVector<int64_t, 8> values(grid);
+  values.push_back(scheduled);
+  return makeIntegerChoices(context, values);
+}
+
+/// Legal BM choices for `mBucket`. The llk-tune M-bucket rules become search
+/// legality here: a bucket-0 problem is GEMV-like, so only BM = 1 is legal, and
+/// the large-M buckets reject tiles no larger than 4.
+ArrayAttr makeBmChoices(MLIRContext *context, int64_t scheduled,
+                        int64_t mBucket) {
+  SmallVector<int64_t, 8> candidates(std::begin(kSearchBM),
+                                     std::end(kSearchBM));
+  candidates.push_back(scheduled);
+
+  SmallVector<int64_t, 8> legal;
+  for (int64_t value : candidates) {
+    if (mBucket == 0 && value != 1)
+      continue;
+    if (mBucket >= 3 && value <= 4)
+      continue;
+    legal.push_back(value);
+  }
+  return makeIntegerChoices(context, legal);
+}
+
+/// The tile-hierarchy choices: the hierarchy the schedule selected, then the
+/// two-level alternatives the export can lower. `outer` and `inner` are the
+/// resolved owner names, so a single-owner entry is completed with the
+/// machine's innermost compute scope exactly as the concrete export does.
+ArrayAttr makeOwnerChoices(MLIRContext *context, StringRef outer,
+                           StringRef inner) {
+  std::string selected = (outer + "/" + inner).str();
+  return makeStringChoices(context,
+                           {selected, "worker/lane", "worker/vector_engine"});
 }
 
 /// Returns the spatial mapping target of the same name as `owner`.
@@ -189,16 +284,17 @@ struct TilePlan {
   micro::MemorySpace accumulatorSpace = micro::MemorySpace::acc;
 };
 
-/// Resolves the schedule entry against the operation's shapes, reporting every
-/// problem on `root` so the diagnostic points at the operation being lowered.
-LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
-                          int64_t M, int64_t N, int64_t K, TilePlan &plan) {
+/// Parses the schedule's memory path into its source and staging levels,
+/// checking that it names at least two known spaces and stages through on-chip
+/// memory. Shared by both exports so they accept the same memory paths.
+LogicalResult parseMemoryPath(Operation *root, const ScheduleEntry &schedule,
+                              micro::MemorySpace &src,
+                              micro::MemorySpace &staging) {
   auto fail = [&](const Twine &message) {
     root->emitError() << message;
     return failure();
   };
 
-  // --- memory path -------------------------------------------------------
   SmallVector<StringRef, 4> spaces;
   StringRef(schedule.memory_path).split(spaces, ':');
   if (spaces.size() < 2)
@@ -209,11 +305,73 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
       return fail("schedule memory_path '" + schedule.memory_path +
                   "' names unknown memory space '" + space + "'");
 
-  plan.srcSpace = *micro::symbolizeMemorySpace(spaces[0]);
-  plan.stagingSpace = *micro::symbolizeMemorySpace(spaces[1]);
-  if (plan.stagingSpace == micro::MemorySpace::dram)
+  src = *micro::symbolizeMemorySpace(spaces[0]);
+  staging = *micro::symbolizeMemorySpace(spaces[1]);
+  if (staging == micro::MemorySpace::dram)
     return fail("schedule memory_path '" + schedule.memory_path +
                 "' stages tiles in dram; the staged level must be on-chip");
+  return success();
+}
+
+/// Parses the schedule's owner hierarchy into at most two owner levels and
+/// their spatial mapping targets. A single owner names the tiled axis; the
+/// other tiled axis keeps the machine's innermost compute scope, which is what
+/// `lane` is for the AVX2 validation backend.
+LogicalResult parseOwnerHierarchy(Operation *root,
+                                  const ScheduleEntry &schedule,
+                                  micro::Owner &outer, micro::Owner &inner,
+                                  micro::MappingTarget &outerMap,
+                                  micro::MappingTarget &innerMap) {
+  auto fail = [&](const Twine &message) {
+    root->emitError() << message;
+    return failure();
+  };
+
+  // Splitting an empty string yields one empty part, so the empty case is
+  // checked before splitting.
+  if (schedule.owner_mapping.empty())
+    return fail("schedule owner_mapping must name at least one owner");
+  SmallVector<StringRef, 4> owners;
+  StringRef(schedule.owner_mapping).split(owners, '/');
+  if (owners.size() > 2)
+    return fail("schedule owner_mapping '" + schedule.owner_mapping +
+                "' names more than two owner levels; the export emits one "
+                "spatial loop per tiled axis");
+  for (StringRef owner : owners)
+    if (!micro::symbolizeOwner(owner))
+      return fail("schedule owner_mapping '" + schedule.owner_mapping +
+                  "' names unknown owner '" + owner + "'");
+
+  outer = *micro::symbolizeOwner(owners[0]);
+  inner = *micro::symbolizeOwner(owners.size() > 1 ? owners[1] : "lane");
+
+  std::optional<micro::MappingTarget> outerTarget = spatialTargetFor(outer);
+  std::optional<micro::MappingTarget> innerTarget = spatialTargetFor(inner);
+  if (!outerTarget)
+    return fail("schedule owner_mapping owner '" +
+                micro::stringifyOwner(outer) +
+                "' has no spatial axis to map onto");
+  if (!innerTarget)
+    return fail("schedule owner_mapping owner '" +
+                micro::stringifyOwner(inner) +
+                "' has no spatial axis to map onto");
+  outerMap = *outerTarget;
+  innerMap = *innerTarget;
+  return success();
+}
+
+/// Resolves the schedule entry against the operation's shapes, reporting every
+/// problem on `root` so the diagnostic points at the operation being lowered.
+LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
+                          int64_t M, int64_t N, int64_t K, TilePlan &plan) {
+  auto fail = [&](const Twine &message) {
+    root->emitError() << message;
+    return failure();
+  };
+
+  // --- memory path -------------------------------------------------------
+  if (failed(parseMemoryPath(root, schedule, plan.srcSpace, plan.stagingSpace)))
+    return failure();
 
   std::optional<micro::MemorySpace> accumulator =
       micro::symbolizeMemorySpace(schedule.accumulator_space);
@@ -233,42 +391,10 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
   plan.layoutKind = *layout;
 
   // --- owner hierarchy ---------------------------------------------------
-  // Splitting an empty string yields one empty part, so the empty case is
-  // checked before splitting.
-  if (schedule.owner_mapping.empty())
-    return fail("schedule owner_mapping must name at least one owner");
-  SmallVector<StringRef, 4> owners;
-  StringRef(schedule.owner_mapping).split(owners, '/');
-  if (owners.size() > 2)
-    return fail("schedule owner_mapping '" + schedule.owner_mapping +
-                "' names more than two owner levels; the export emits one "
-                "spatial loop per tiled axis");
-  for (StringRef owner : owners)
-    if (!micro::symbolizeOwner(owner))
-      return fail("schedule owner_mapping '" + schedule.owner_mapping +
-                  "' names unknown owner '" + owner + "'");
-
-  plan.outerOwner = *micro::symbolizeOwner(owners[0]);
-  // A single owner names the tiled axis. The other tiled axis keeps the
-  // machine's innermost compute scope, which is what `lane` is for the AVX2
-  // validation backend.
-  plan.innerOwner =
-      *micro::symbolizeOwner(owners.size() > 1 ? owners[1] : "lane");
-
-  std::optional<micro::MappingTarget> outerMap =
-      spatialTargetFor(plan.outerOwner);
-  std::optional<micro::MappingTarget> innerMap =
-      spatialTargetFor(plan.innerOwner);
-  if (!outerMap)
-    return fail("schedule owner_mapping owner '" +
-                micro::stringifyOwner(plan.outerOwner) +
-                "' has no spatial axis to map onto");
-  if (!innerMap)
-    return fail("schedule owner_mapping owner '" +
-                micro::stringifyOwner(plan.innerOwner) +
-                "' has no spatial axis to map onto");
-  plan.outerMap = *outerMap;
-  plan.innerMap = *innerMap;
+  if (failed(parseOwnerHierarchy(root, schedule, plan.outerOwner,
+                                 plan.innerOwner, plan.outerMap,
+                                 plan.innerMap)))
+    return failure();
 
   std::optional<micro::Owner> fragment =
       micro::symbolizeOwner(schedule.fragment_owner);
@@ -558,66 +684,74 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   return success();
 }
 
-/// Validates the root operation's shapes and dtypes, resolves its schedule, and
-/// emits its kernel.
-LogicalResult lowerRootOp(ModuleOp module, Operation *root, StringRef dbPath,
-                          StringRef target, SymbolTable &symbols) {
+/// The workload, problem shape, and element types of one supported LLK root
+/// operation, resolved and validated. Shared by both exports so they accept
+/// exactly the same operations and agree on the schedule.
+struct RootInfo {
+  std::string workload;
+  int64_t M = 0, N = 0, K = 0;
+  Type inputElemType, accumulatorElemType, outputElemType;
+  int64_t mBucket = 0;
+};
+
+/// Checks that `value` is a static rank-2 tensor of a Micro tile dtype.
+LogicalResult checkTensor(Operation *root, Value value, const char *what) {
+  auto shaped = dyn_cast<ShapedType>(value.getType());
+  if (!shaped || !shaped.hasRank() || shaped.getRank() != 2)
+    return root->emitError() << what << " must be a rank-2 tensor";
+  if (!shaped.hasStaticShape())
+    return root->emitError()
+           << what
+           << " must have a static shape; dynamic shapes are not supported "
+              "by the Micro-IR export";
+  if (!micro::dtypeOfElementType(shaped.getElementType()))
+    return root->emitError()
+           << what << " element type is not a Micro tile dtype "
+           << "(expected f32, f16, bf16, i32, or i8)";
+  return success();
+}
+
+/// Validates `root`'s shapes, dtypes, and accumulator type and fills `info`.
+LogicalResult inferRootInfo(Operation *root, RootInfo &info) {
   auto fused = dyn_cast<llk::FusedSwiGLUOp>(root);
   auto matmul = dyn_cast<llk::MatmulOp>(root);
-  StringRef workload = fused ? "fused_swiglu" : "matmul";
-
-  /// Checks that `value` is a static rank-2 tensor of a Micro tile dtype.
-  auto checkTensor = [&](Value value, const char *what) -> LogicalResult {
-    auto shaped = dyn_cast<ShapedType>(value.getType());
-    if (!shaped || !shaped.hasRank() || shaped.getRank() != 2)
-      return root->emitError() << what << " must be a rank-2 tensor";
-    if (!shaped.hasStaticShape())
-      return root->emitError()
-             << what
-             << " must have a static shape; dynamic shapes are not supported "
-                "by the Micro-IR export";
-    if (!micro::dtypeOfElementType(shaped.getElementType()))
-      return root->emitError()
-             << what << " element type is not a Micro tile dtype "
-             << "(expected f32, f16, bf16, i32, or i8)";
-    return success();
-  };
+  info.workload = fused ? "fused_swiglu" : "matmul";
 
   Value lhs = fused ? fused.getX() : matmul.getA();
   Value rhs = fused ? fused.getWg() : matmul.getB();
   Value out = fused ? fused.getResult() : matmul.getResult();
-  if (failed(checkTensor(lhs, "left-hand side")) ||
-      failed(checkTensor(rhs, "right-hand side")) ||
-      failed(checkTensor(out, "result")))
+  if (failed(checkTensor(root, lhs, "left-hand side")) ||
+      failed(checkTensor(root, rhs, "right-hand side")) ||
+      failed(checkTensor(root, out, "result")))
     return failure();
 
   auto lhsShaped = cast<ShapedType>(lhs.getType());
   auto rhsShaped = cast<ShapedType>(rhs.getType());
   auto outShaped = cast<ShapedType>(out.getType());
-  int64_t M = lhsShaped.getDimSize(0);
-  int64_t K = lhsShaped.getDimSize(1);
-  int64_t N = rhsShaped.getDimSize(1);
+  info.M = lhsShaped.getDimSize(0);
+  info.K = lhsShaped.getDimSize(1);
+  info.N = rhsShaped.getDimSize(1);
 
-  if (rhsShaped.getDimSize(0) != K)
+  if (rhsShaped.getDimSize(0) != info.K)
     return root->emitError()
            << "contraction dimension mismatch: the left-hand side contracts "
               "over "
-           << K << " but the right-hand side has " << rhsShaped.getDimSize(0)
-           << " rows";
+           << info.K << " but the right-hand side has "
+           << rhsShaped.getDimSize(0) << " rows";
 
-  if (outShaped.getDimSize(0) != M || outShaped.getDimSize(1) != N)
+  if (outShaped.getDimSize(0) != info.M || outShaped.getDimSize(1) != info.N)
     return root->emitError()
-           << "result shape does not match the contraction: expected M = " << M
-           << " and N = " << N;
+           << "result shape does not match the contraction: expected M = "
+           << info.M << " and N = " << info.N;
 
   if (fused) {
-    if (failed(checkTensor(fused.getWu(), "up-projection weight")))
+    if (failed(checkTensor(root, fused.getWu(), "up-projection weight")))
       return failure();
     auto wuShaped = cast<ShapedType>(fused.getWu().getType());
-    if (wuShaped.getDimSize(0) != K || wuShaped.getDimSize(1) != N)
+    if (wuShaped.getDimSize(0) != info.K || wuShaped.getDimSize(1) != info.N)
       return root->emitError()
-             << "the up-projection weight must be shaped [K, N] = [" << K
-             << ", " << N << "]";
+             << "the up-projection weight must be shaped [K, N] = [" << info.K
+             << ", " << info.N << "]";
     if (fused.getActivation() != llk::Activation::silu)
       return root->emitError()
              << "unsupported SwiGLU activation; the Micro-IR export emits "
@@ -632,23 +766,187 @@ LogicalResult lowerRootOp(ModuleOp module, Operation *root, StringRef dbPath,
            << "accumulator_type must be a type attribute naming a Micro tile "
               "dtype";
 
-  int64_t mBucket = llk::classifyM(M);
+  info.inputElemType = lhsShaped.getElementType();
+  info.accumulatorElemType = accumulatorTypeAttr.getValue();
+  info.outputElemType = outShaped.getElementType();
+  info.mBucket = llk::classifyM(info.M);
+  return success();
+}
+
+/// Loads the schedule entries matching `info` and selects one, warning when the
+/// database has nothing to offer. Shared so the concrete and search-space
+/// exports cannot disagree about which schedule an operation runs under.
+ScheduleEntry selectSchedule(Operation *root, const RootInfo &info,
+                             StringRef dbPath) {
   std::vector<ScheduleEntry> matches =
-      llk::loadScheduleDB(dbPath, mBucket, N, K, workload);
+      llk::loadScheduleDB(dbPath, info.mBucket, info.N, info.K, info.workload);
   if (matches.empty())
-    root->emitWarning() << "no schedule entry for " << workload
-                        << " M_bucket=" << mBucket << " in " << dbPath
+    root->emitWarning() << "no schedule entry for " << info.workload
+                        << " M_bucket=" << info.mBucket << " in " << dbPath
                         << "; using the built-in conservative schedule";
-  ScheduleEntry schedule = llk::selectBestSchedule(matches, N, K);
+  return llk::selectBestSchedule(matches, info.N, info.K);
+}
+
+/// Validates the root operation's shapes and dtypes, resolves its schedule, and
+/// emits its kernel.
+LogicalResult lowerRootOp(ModuleOp module, Operation *root, StringRef dbPath,
+                          StringRef target, SymbolTable &symbols) {
+  RootInfo info;
+  if (failed(inferRootInfo(root, info)))
+    return failure();
+  ScheduleEntry schedule = selectSchedule(root, info, dbPath);
 
   TilePlan plan;
-  plan.inputElemType = lhsShaped.getElementType();
-  plan.accumulatorElemType = accumulatorTypeAttr.getValue();
-  plan.outputElemType = outShaped.getElementType();
-  if (failed(resolvePlan(root, schedule, M, N, K, plan)))
+  plan.inputElemType = info.inputElemType;
+  plan.accumulatorElemType = info.accumulatorElemType;
+  plan.outputElemType = info.outputElemType;
+  if (failed(resolvePlan(root, schedule, info.M, info.N, info.K, plan)))
     return failure();
 
-  return buildKernel(module, root, plan, schedule, target, mBucket, symbols);
+  return buildKernel(module, root, plan, schedule, target, info.mBucket,
+                     symbols);
+}
+
+//===----------------------------------------------------------------------===//
+// Search-space emission
+//===----------------------------------------------------------------------===//
+
+/// Returns true when the module already holds a search space named `name`.
+/// Unlike `micro.kernel`, `micro.search_space` is not a symbol, so uniqueness
+/// is maintained here rather than by a SymbolTable.
+bool searchSpaceNameTaken(ModuleOp module, StringRef name) {
+  for (micro::SearchSpaceOp space : module.getOps<micro::SearchSpaceOp>())
+    if (space.getSymName() == name)
+      return true;
+  return false;
+}
+
+/// Emits one `micro.search_space` for `root`, holding the legal choices around
+/// the schedule the database selected.
+///
+/// Numeric dimensions come from the tuner grid; symbolic dimensions are
+/// schedule-anchored, with the scheduled value printed first so the selected
+/// schedule is the space's first candidate.
+LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
+                               const RootInfo &info,
+                               const ScheduleEntry &schedule) {
+  // The symbolic choices copy values out of the schedule, so each has to be a
+  // value the dialect accepts before it can become a micro.param choice. The
+  // checks are the concrete export's, so a search space is only ever emitted
+  // for a schedule the concrete export could also lower.
+  micro::MemorySpace srcSpace = micro::MemorySpace::dram;
+  micro::MemorySpace stagingSpace = micro::MemorySpace::sram;
+  if (failed(parseMemoryPath(root, schedule, srcSpace, stagingSpace)))
+    return failure();
+
+  micro::Owner outerOwner = micro::Owner::worker;
+  micro::Owner innerOwner = micro::Owner::lane;
+  micro::MappingTarget outerMap = micro::MappingTarget::worker;
+  micro::MappingTarget innerMap = micro::MappingTarget::lane;
+  if (failed(parseOwnerHierarchy(root, schedule, outerOwner, innerOwner,
+                                 outerMap, innerMap)))
+    return failure();
+
+  if (!micro::symbolizeLayoutKind(schedule.tile_layout))
+    return root->emitError() << "schedule tile_layout '" << schedule.tile_layout
+                             << "' is not a known layout kind";
+  if (failed(parseShapeTriple(schedule.fragment_shape)))
+    return root->emitError()
+           << "schedule fragment_shape '" << schedule.fragment_shape
+           << "' must be a positive MxNxK triple";
+
+  MLIRContext *context = module.getContext();
+  Location loc = root->getLoc();
+
+  // --- symbol name ---
+  std::string base = (info.workload + "_M" + Twine(info.M) + "_N" +
+                      Twine(info.N) + "_K" + Twine(info.K))
+                         .str();
+  std::string symName = base;
+  for (unsigned suffix = 1; searchSpaceNameTaken(module, symName); ++suffix)
+    symName = base + "_" + Twine(suffix).str();
+
+  OpBuilder builder(context);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto space = micro::SearchSpaceOp::create(
+      builder, loc, symName, StringAttr::get(context, info.workload));
+  startRegionBody(builder, space.getBody(), loc);
+
+  auto addParam = [&](StringRef name, StringRef kind, ArrayAttr choices) {
+    micro::ParamOp::create(builder, loc, name, kind, choices);
+  };
+  auto addConstraint = [&](StringRef kind, ArrayRef<StringRef> params) {
+    SmallVector<Attribute, 4> names;
+    for (StringRef param : params)
+      names.push_back(StringAttr::get(context, param));
+    micro::ConstraintOp::create(builder, loc, kind,
+                                ArrayAttr::get(context, names));
+  };
+
+  // --- numeric parameters ---
+  addParam("BM", "integer", makeBmChoices(context, schedule.BM, info.mBucket));
+  addParam("BN", "integer",
+           makeNumericChoices(context, kSearchBN, schedule.BN));
+  addParam("BK", "integer",
+           makeNumericChoices(context, kSearchBK, schedule.BK));
+  addParam("VM", "integer",
+           makeNumericChoices(context, kSearchVM, schedule.VM));
+  addParam("VN", "integer",
+           makeNumericChoices(context, kSearchVN, schedule.VN));
+  addParam(
+      "vector_width", "integer",
+      makeNumericChoices(context, kSearchVectorWidth, schedule.vector_width));
+  addParam("num_threads", "integer",
+           makeNumericChoices(context, kSearchThreads, schedule.num_threads));
+  addParam("grain_size", "integer",
+           makeNumericChoices(context, kSearchGrain, schedule.grain_size));
+  addParam(
+      "pipeline_stages", "integer",
+      makeNumericChoices(context, kSearchStages, schedule.pipeline_stages));
+  // Prefetch distance 0 means "no prefetch" -- a schedule decision rather than
+  // a search choice -- so it is not part of the domain.
+  addParam(
+      "prefetch_distance", "integer",
+      makeNumericChoices(context, kSearchPrefetch, schedule.prefetch_distance));
+
+  // --- symbolic parameters ---
+  addParam("tile_layout", "layout",
+           makeStringChoices(context,
+                             {schedule.tile_layout, "row_major", "blocked"}));
+  addParam("memory_path", "memory_path",
+           makeStringChoices(context, {schedule.memory_path, "dram:sram:acc",
+                                       "dram:l2:sram:acc"}));
+  addParam("owner_mapping", "owner_mapping",
+           makeOwnerChoices(context, micro::stringifyOwner(outerOwner),
+                            micro::stringifyOwner(innerOwner)));
+  addParam("fragment_shape", "fragment_shape",
+           makeStringChoices(context,
+                             {schedule.fragment_shape, "16x16x32", "8x8x32"}));
+  addParam("tail_policy", "tail_policy", makeStringChoices(context, {"mask"}));
+
+  // --- legality records ---
+  // Machine-independent legality only: capacity and compatibility are named
+  // here and evaluated against the MachineModel by the tuner.
+  addConstraint("sram_capacity", {"BM", "BN", "BK"});
+  addConstraint("acc_capacity", {"BM", "BN"});
+  addConstraint("mma_compatible", {"BM", "BN", "BK"});
+  addConstraint("tile_hierarchy_compatible", {"owner_mapping"});
+  addConstraint("layout_supported", {"tile_layout"});
+  addConstraint("owner_supported", {"owner_mapping"});
+  addConstraint("fragment_compatible", {"fragment_shape", "BM", "BN", "BK"});
+  addConstraint("vector_width_supported", {"vector_width"});
+  addConstraint("mapping_extent", {"num_threads", "BM", "BN"});
+  addConstraint("pipeline_live_tiles",
+                {"pipeline_stages", "prefetch_distance", "BM", "BN", "BK"});
+  addConstraint("tail_supported", {"BM", "BN", "BK"});
+
+  // --- objective ---
+  micro::ObjectiveOp::create(
+      builder, loc, "minimize", "latency_cycles",
+      ArrayAttr::get(context, {StringAttr::get(context, "matrix_utilization"),
+                               StringAttr::get(context, "dram_bytes")}));
+
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -715,6 +1013,67 @@ struct LLKToMicroPass
   }
 };
 
+/// Exports the legal choices around the selected schedule. The pass runs on
+/// the same root operations the concrete export lowers, and reads the schedule
+/// through the same loader, so the search space always contains the schedule
+/// the concrete kernel was built from.
+struct LLKToMicroSearchSpacePass
+    : public PassWrapper<LLKToMicroSearchSpacePass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LLKToMicroSearchSpacePass)
+
+  LLKToMicroSearchSpacePass() = default;
+  LLKToMicroSearchSpacePass(const LLKToMicroSearchSpacePass &other)
+      : PassWrapper(other) {}
+
+  Option<std::string> scheduleDb{
+      *this, "schedule-db",
+      llvm::cl::desc(
+          "Schedule database whose selected entry anchors the search space. A "
+          "path that cannot be read falls back to the built-in schedule."),
+      llvm::cl::init("schedules/schedule_db.json")};
+
+  StringRef getArgument() const override { return "llk-to-micro-search-space"; }
+  StringRef getDescription() const override {
+    return "Export tile-aware micro.search_space IR from the selected schedule";
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+
+    // The search space is built programmatically rather than parsed, so the
+    // dialect it emits has to be loaded explicitly.
+    MLIRContext *context = module.getContext();
+    if (!context->getOrLoadDialect<micro::MicroDialect>()) {
+      module.emitError()
+          << "the micro dialect must be registered in this context";
+      signalPassFailure();
+      return;
+    }
+
+    SmallVector<Operation *> roots;
+    module.walk([&](Operation *op) {
+      if (isa<llk::FusedSwiGLUOp, llk::MatmulOp>(op))
+        roots.push_back(op);
+    });
+    if (roots.empty())
+      return;
+
+    for (Operation *root : roots) {
+      RootInfo info;
+      if (failed(inferRootInfo(root, info))) {
+        signalPassFailure();
+        return;
+      }
+      ScheduleEntry schedule =
+          selectSchedule(root, info, scheduleDb.getValue());
+      if (failed(buildSearchSpace(module, root, info, schedule))) {
+        signalPassFailure();
+        return;
+      }
+    }
+  }
+};
+
 } // namespace
 
 namespace mlir {
@@ -722,6 +1081,10 @@ namespace llk {
 
 std::unique_ptr<Pass> createLLKToMicroPass() {
   return std::make_unique<LLKToMicroPass>();
+}
+
+std::unique_ptr<Pass> createLLKToMicroSearchSpacePass() {
+  return std::make_unique<LLKToMicroSearchSpacePass>();
 }
 
 } // namespace llk

@@ -1,10 +1,15 @@
-//===- LLKToMicro.h - LLK -> concrete micro.kernel lowering -----*- C++ -*-===//
+//===- LLKToMicro.h - LLK -> Micro-IR export --------------------*- C++ -*-===//
 //
 // Export path from the LLK scheduling pipeline into tile-centric Micro-IR.
 //
-// The pass is non-destructive: it adds one concrete `micro.kernel` per
-// supported LLK root operation and leaves the original functions alone, so the
-// AVX2/JIT pipeline downstream of it is untouched.
+// Two passes, both non-destructive: they add IR to the module and leave the
+// original functions alone, so the AVX2/JIT pipeline downstream of them is
+// untouched.
+//
+//   * LLKToMicroPass exports one concrete `micro.kernel` per supported LLK
+//     root operation -- the selected schedule bound to execution tiles.
+//   * LLKToMicroSearchSpacePass exports one `micro.search_space` per root
+//     operation -- the legal choices around that schedule, for the tuner.
 //
 //===----------------------------------------------------------------------===//
 
@@ -20,6 +25,10 @@ namespace llk {
 
 /// Lowers each supported LLK root operation to a concrete `micro.kernel`.
 std::unique_ptr<mlir::Pass> createLLKToMicroPass();
+
+/// Exports a tile-aware `micro.search_space` for each supported LLK root
+/// operation, holding the legal choices around the schedule it selects.
+std::unique_ptr<mlir::Pass> createLLKToMicroSearchSpacePass();
 
 } // namespace llk
 } // namespace mlir

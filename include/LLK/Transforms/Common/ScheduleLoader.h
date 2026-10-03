@@ -40,6 +40,8 @@ struct ScheduleEntry {
   // are here: a field nothing consumes would be indistinguishable from one
   // that was forgotten.
   int64_t pipeline_stages{1};
+  /// Tiles prefetched ahead of the consuming stage; 0 means no prefetch.
+  int64_t prefetch_distance{0};
   std::string memory_path{"dram:sram:acc"};
   std::string mma_shape{"16x16x32"};
   std::string accumulator_space{"acc"};

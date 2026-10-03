@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "operation": "matmul",
+      "target": "x86-avx2",
+      "shape": { "M_bucket": 2, "N": 64, "K": 64 },
+      "dtype": "bf16",
+      "math_mode": "bounded_fast",
+      "schedule": {
+        "BM": 16, "BN": 64, "BK": 64,
+        "VM": 2, "VN": 8,
+        "vector_width": 8,
+        "num_threads": 4,
+        "parallel_axis": "n",
+        "grain_size": 2,
+        "pipeline_stages": 2,
+        "prefetch_distance": 3,
+        "memory_path": "dram:l2:sram",
+        "tile_layout": "blocked",
+        "owner_mapping": "worker/vector_engine",
+        "fragment_shape": "8x8x32"
+      }
+    },
+    {
+      "operation": "fused_swiglu",
+      "target": "x86-avx2",
+      "shape": { "M_bucket": 2, "N": 64, "K": 64 },
+      "dtype": "bf16",
+      "math_mode": "bounded_fast",
+      "schedule": {
+        "BM": 8, "BN": 32, "BK": 64,
+        "VM": 1, "VN": 4,
+        "vector_width": 8,
+        "num_threads": 2,
+        "parallel_axis": "n",
+        "grain_size": 1
+      }
+    }
+  ]
+}

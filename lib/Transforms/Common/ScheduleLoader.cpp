@@ -11,6 +11,8 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
+
 using namespace mlir;
 
 namespace mlir {
@@ -95,6 +97,10 @@ std::vector<ScheduleEntry> loadScheduleDB(llvm::StringRef dbPath, int M_bucket,
     // default when absent, so the pre-M11 entries in schedules/schedule_db.json
     // load unchanged.
     se.pipeline_stages = sched->getInteger("pipeline_stages").value_or(1);
+    // A negative prefetch distance is not a distance; treat it as "no
+    // prefetch" rather than letting it invert the pipeline.
+    se.prefetch_distance = std::max<int64_t>(
+        0, sched->getInteger("prefetch_distance").value_or(0));
     if (auto path = sched->getString("memory_path"))
       se.memory_path = path->str();
     if (auto shape = sched->getString("mma_shape"))
