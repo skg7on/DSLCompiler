@@ -477,3 +477,19 @@ TEST(MappingPlan, SortUniqueEnforcesCoveredNodeContract) {
 **Deferred (correctly out of D1):** routing D2, layouts D3, rules D4, placement D5, covering D6, AVX2 target D7, `perf::Candidate` migration (revised #50).
 
 **Type-consistency check:** `SearchValue` is defined once (Task 3) and reused in Task 5; `WorkloadNodeId`/`WorkloadValueId` defined once (Task 4) and reused in Task 5; every `computeXId` returns `uint64_t` and every `canonicalXString` returns `std::string`. `hexId` used by Task 3+ canonical strings is defined in Task 1.
+
+## Verification Results (2026-10-03)
+
+Recorded per the epic's requirement to report the exact verified subset.
+
+- **Build:** `ninja -C build` — clean, no errors; `-Werror=deprecated-declarations` honoured.
+- **New tests:** `ctest -R Mapping` — 5/5 passed (`MappingStableHashTest`, `MappingCostModelTest`, `MappingSearchBindingTest`, `MappingWorkloadGraphTest`, `MappingPlanTest`).
+- **Full suite:** `ctest --test-dir build --output-on-failure` — 92 registered, **90 passed, 2 skipped, 0 failed**. Skips are the pre-existing host-gated `SwigluScalar` and `SwiGLUVector`.
+- **Deprecated-API audit:** clean across `include/LLK/Mapping`, `lib/Mapping`, `test/Mapping`.
+
+### Deviations from the design's illustrative snippets
+
+1. **Namespace `mlir::llk::mapping`** rather than the spec's `llk::mapping`, to match the existing `mlir::llk::perf`.
+2. **`WorkloadNode::opName` is a `std::string`**, not an `OperationName`: `OperationName` has no public default constructor in LLVM 24 and would tie the graph to the builder's MLIR context. The graph is context-free and serialized; classification already works on strings.
+3. **Added `StableHash.h`** (not in the design's §20 file list) as the single home for the toolchain-stable hash used by every id.
+4. **`stableHashCombine` is a plain fold**; order-independence is provided by `stableHashSortedSet` and by sorting at each call site, which is what the design's canonical-ordering rule requires.
