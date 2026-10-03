@@ -1,0 +1,117 @@
+//===- LayoutConstraints.h - LLKMap layout declarations (D3) --------------===//
+//
+// Part of the target-independent mapping core (epic #67, workstream D3).
+//
+// LLKMap is a small declarative language for target layout legality. A
+// `layout` declaration names a target implementation layout, its parameters,
+// the finite domains those parameters range over, the constraints that make it
+// legal, and the affine logical-to-physical map it describes.
+//
+// Layout ids are target-owned strings (`avx2.blocked_2d`). They are results of
+// mapping, never new enumerants in the Micro dialect or `#micro.layout`
+// (design §13.4) -- which is why this header lives in LLK/Mapping and knows
+// nothing about the target it is describing.
+//
+// The grammar this parser accepts is documented in
+// `docs/design/llkmap-layout-grammar.md`.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLK_MAPPING_LAYOUTCONSTRAINTS_H
+#define LLK_MAPPING_LAYOUTCONSTRAINTS_H
+
+#include "LLK/Machine/MachineModel.h"
+
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/Error.h"
+
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <variant>
+#include <vector>
+
+namespace mlir::llk::mapping {
+
+/// A concrete value a layout expression can take: an integer or a symbolic
+/// name. Boolean expressions evaluate to integers 0 and 1.
+using LayoutValue = std::variant<int64_t, std::string>;
+
+enum class ExprKind {
+  IntLit,     ///< integer literal
+  StringLit,  ///< quoted string
+  Ident,      ///< parameter or builtin (`rank`, `element_type`)
+  Call,       ///< `floordiv(a, b)`, `machine.compute("vector_engine")`
+  MemberCall, ///< `receiver.lanes(dtype)`, `receiver.count`
+  Unary,      ///< `!a`, `-a`
+  Binary      ///< `a + b`, `a % b`, `a == b`, `a && b`
+};
+
+struct Expr;
+using ExprPtr = std::shared_ptr<const Expr>;
+
+struct Expr {
+  ExprKind kind = ExprKind::IntLit;
+  /// Integer literal value, or a boolean result materialized during parsing.
+  int64_t intValue = 0;
+  /// Identifier name, call callee, member name, or operator spelling.
+  std::string text;
+  /// Call/member arguments; for a member call, `operands[0]` is the receiver.
+  std::vector<ExprPtr> operands;
+};
+
+/// One declared parameter. `symbolic` parameters range over a declared set of
+/// names; integer parameters range over integer intervals.
+struct LayoutParam {
+  std::string name;
+  bool symbolic = false;
+};
+
+/// The finite set a parameter ranges over, in ascending declaration order.
+struct ParamDomain {
+  std::vector<LayoutValue> values;
+};
+
+/// `map (m, n) -> (m, floordiv(n, VW), mod(n, VW))`.
+struct AffineMapSpec {
+  std::vector<std::string> dims;
+  std::vector<ExprPtr> results;
+};
+
+struct LayoutDef {
+  std::string id;
+  std::vector<LayoutParam> params;
+  std::map<std::string, ParamDomain> domains;
+  std::vector<ExprPtr> constraints;
+  std::optional<AffineMapSpec> map;
+
+  const LayoutParam *findParam(llvm::StringRef name) const;
+  bool isSymbolic(llvm::StringRef name) const;
+};
+
+/// Loaded layout declarations, keyed by id.
+class LayoutRegistry {
+public:
+  /// Adds `def`, or fails with a stable message when its id is a duplicate.
+  bool add(LayoutDef def, std::string &error);
+
+  const LayoutDef *find(llvm::StringRef id) const;
+  llvm::ArrayRef<LayoutDef> all() const { return defs_; }
+
+private:
+  std::vector<LayoutDef> defs_;
+};
+
+/// Parses a complete LLKMap file. `sourceName` appears in diagnostics.
+llvm::Expected<LayoutRegistry> parseLayoutText(llvm::StringRef text,
+                                               llvm::StringRef sourceName);
+
+/// Reads and parses the file at `path`.
+llvm::Expected<LayoutRegistry> loadLayoutFile(llvm::StringRef path);
+
+} // namespace mlir::llk::mapping
+
+#endif // LLK_MAPPING_LAYOUTCONSTRAINTS_H
