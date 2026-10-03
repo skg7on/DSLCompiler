@@ -86,3 +86,41 @@ Both need a generic Micro representation the dialect does not have yet (a
 destination-memory tile type is constructible only with the dialect's type
 class; a target layout id is not a `#micro.layout`). Transfers -- the case the
 plan actually determines a route for -- are emitted.
+
+## §18.2 completed: one copy per route hop (2026-10-03)
+
+Emission now materializes **every hop of a route**, not just its endpoints: a
+movement whose plan chose `dram -> l2 -> sram` becomes two `micro.async_copy`
+operations, each with its own `micro.wait`, the second reading what the first
+produced. Every other use of the original value is rewired to the last hop's
+value.
+
+**Intermediate storage needs no allocation.** `micro.async_copy` *produces* a
+value in its destination memory; it does not write into a pre-allocated buffer.
+The intermediate value the first hop produces *is* the staging storage, so
+`micro.alloc` would be dead IR. Design §18.2's "tile allocations for required
+intermediate memories" therefore has nothing to materialize under this
+dialect's copy semantics.
+
+**Still not emitted: the layout-transform operation.** A transform connection
+carries its `srcLayout`/`dstLayout` in `micro.routes` already, but expressing it
+as an op needs a Micro layout property for a *target* layout id, which design
+§13.4 deliberately keeps out of `#micro.layout`. That is a dialect question
+(two options: let a target layout declare the Micro layout it implements, or
+express the re-layout as a copy plus metadata), not a binder one.
+
+### A real bug this exposed
+
+Building the two-hop fixture found that `CoveringSearch` had **reversed every
+connection's direction**: when the instance being added was the *consumer* of
+an edge, `extend` still assigned it as the producer. Nothing failed earlier
+because in every existing fixture both endpoints landed in the same memory,
+where "producer" and "consumer" are indistinguishable. The fix also corrects
+the direction of the copy the earlier single-hop emission test produces.
+
+### Verification
+
+- `ninja -C build` clean; `ctest` **103 registered, 101 passed, 2 skipped, 0 failed**.
+- New: `PlanBinder.EmitsOneCopyPerRouteHop`, plus a direct routing assertion on
+  the fixture's two-hop path. The covering search now also names the failing
+  pair and the reason in its failure frontier, which is what located the bug.

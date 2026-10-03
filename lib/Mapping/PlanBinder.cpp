@@ -176,10 +176,10 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
 
   // --- materialize the movement (design §18.2) -------------------------
   //
-  // One copy per moved value: the value is produced in one memory and read in
-  // another, so the copy is placed right after the producer and every other
-  // use is rewired to it. Emitting one per *connection* would duplicate the
-  // copy when a value fans out.
+  // One copy chain per moved value: the value is produced in one memory and
+  // read in another, so the copies are placed right after the producer and
+  // every other use is rewired to the last of them. Emitting one chain per
+  // *connection* would duplicate it when a value fans out.
   llvm::DenseSet<WorkloadValueId> moved;
   mlir::OpBuilder builder(context);
   for (const PlanConnection &connection : plan.connectionPlans) {
@@ -233,8 +233,8 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     mlir::Attribute dstMemory = mlir::parseAttribute(
         ("#micro.memory<" + destination->kind + ">"), context);
     if (!srcMemory || !dstMemory || source->kind == destination->kind) {
-      // `micro.async_copy` insists the two memory spaces differ, and a route
-      // between two memories of the same kind has nothing to express.
+      // A route whose endpoints are the same memory space has nothing to move
+      // between, and `micro.async_copy` insists its two spaces differ.
       bound.unmaterialized.push_back(
           "value " + std::to_string(connection.value) +
           ": route endpoints share a micro memory kind");
@@ -246,28 +246,67 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       continue;
     }
 
+    // One copy per hop, chained: the value moves to the first staging memory,
+    // then on to the next, until it reaches the consumer's. Each hop is
+    // followed by its own wait, and the intermediate value *is* the staging
+    // storage -- `micro.async_copy` produces a value in the destination
+    // memory, so there is no separate buffer to allocate for it.
     builder.setInsertionPointAfter(producer);
-    llvm::SmallVector<mlir::Type> copyResultTypes{value.getType(), tokenType};
-    mlir::OperationState copyState(producer->getLoc(), "micro.async_copy");
-    copyState.addOperands(value);
-    copyState.addTypes(copyResultTypes);
-    copyState.addAttribute("src_memory", srcMemory);
-    copyState.addAttribute("dst_memory", dstMemory);
-    mlir::Operation *copy = builder.create(copyState);
+    mlir::Value current = value;
+    mlir::Operation *firstCopy = nullptr;
+    mlir::Operation *lastCopy = nullptr;
+    bool materialized = true;
+    for (size_t hop = 1; hop < connection.route.size(); ++hop) {
+      const machine::MemoryNode *from =
+          machineModel.findMemory(connection.route[hop - 1]);
+      const machine::MemoryNode *to =
+          machineModel.findMemory(connection.route[hop]);
+      if (!from || !to || from->kind == to->kind) {
+        materialized = false;
+        break;
+      }
+      mlir::Attribute hopSrc =
+          mlir::parseAttribute(("#micro.memory<" + from->kind + ">"), context);
+      mlir::Attribute hopDst =
+          mlir::parseAttribute(("#micro.memory<" + to->kind + ">"), context);
+      if (!hopSrc || !hopDst) {
+        materialized = false;
+        break;
+      }
 
-    llvm::SmallVector<mlir::Type> waitResultTypes;
-    mlir::OperationState waitState(producer->getLoc(), "micro.wait");
-    waitState.addOperands(copy->getResult(1));
-    mlir::Operation *wait = builder.create(waitState);
-    (void)wait;
+      llvm::SmallVector<mlir::Type> copyResultTypes{value.getType(), tokenType};
+      mlir::OperationState copyState(producer->getLoc(), "micro.async_copy");
+      copyState.addOperands(current);
+      copyState.addTypes(copyResultTypes);
+      copyState.addAttribute("src_memory", hopSrc);
+      copyState.addAttribute("dst_memory", hopDst);
+      mlir::Operation *copy = builder.create(copyState);
 
-    // Rewire every other reader to the copy; the copy's own source stays put.
+      mlir::OperationState waitState(producer->getLoc(), "micro.wait");
+      waitState.addOperands(copy->getResult(1));
+      builder.create(waitState);
+
+      if (!firstCopy)
+        firstCopy = copy;
+      lastCopy = copy;
+      current = copy->getResult(0);
+    }
+
+    if (!materialized || !lastCopy) {
+      bound.unmaterialized.push_back(
+          "value " + std::to_string(connection.value) +
+          ": a route hop names memories the machine cannot carry data between");
+      continue;
+    }
+
+    // Rewire every other reader to the last hop's value; the copies themselves
+    // already read the previous one.
     llvm::SmallVector<mlir::OpOperand *> uses;
     for (mlir::OpOperand &use : value.getUses())
-      if (use.getOwner() != copy)
+      if (use.getOwner() != firstCopy)
         uses.push_back(&use);
     for (mlir::OpOperand *use : uses)
-      use->set(copy->getResult(0));
+      use->set(lastCopy->getResult(0));
   }
 
   bound.planId = plan.id;
