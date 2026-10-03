@@ -247,6 +247,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/CostModel.cpp
     lib/Mapping/SearchBinding.cpp
     lib/Mapping/WorkloadGraph.cpp
+    lib/Mapping/MappingPlan.cpp
 )
 target_include_directories(LLKMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -684,6 +685,7 @@ add_llk_mapping_test(MappingStableHashTest test/Mapping/stable_hash.cpp)
 add_llk_mapping_test(MappingCostModelTest test/Mapping/cost_model.cpp)
 add_llk_mapping_test(MappingSearchBindingTest test/Mapping/search_binding.cpp)
 add_llk_mapping_test(MappingWorkloadGraphTest test/Mapping/workload_graph.cpp)
+add_llk_mapping_test(MappingPlanTest test/Mapping/mapping_plan.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on

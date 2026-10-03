@@ -55,6 +55,12 @@ uint64_t computeSearchBindingHash(const llvm::StringMap<SearchValue> &values);
 SearchBinding makeSearchBinding(std::string candidateId,
                                 llvm::StringMap<SearchValue> values);
 
+/// Sorted, type-tagged rendering of a value map: `a=s:z;b=i:2`. Sorted for
+/// determinism and tagged so an integer and a symbolic value never print
+/// alike. Shared with other plan structures that carry parameter maps.
+std::string
+canonicalSearchValueString(const llvm::StringMap<SearchValue> &values);
+
 /// Sorted, type-tagged rendering: `a=s:z;b=i:2`. Sorted for determinism and
 /// tagged so an integer and a symbolic value never print alike.
 std::string canonicalSearchBindingString(const SearchBinding &binding);

@@ -54,14 +54,15 @@ SearchBinding makeSearchBinding(std::string candidateId,
   return binding;
 }
 
-std::string canonicalSearchBindingString(const SearchBinding &binding) {
+std::string
+canonicalSearchValueString(const llvm::StringMap<SearchValue> &values) {
   std::string out;
-  for (llvm::StringRef key : sortedKeys(binding.values)) {
+  for (llvm::StringRef key : sortedKeys(values)) {
     if (!out.empty())
       out += ';';
     out += key.str();
     out += '=';
-    const SearchValue &value = binding.values.find(key)->second;
+    const SearchValue &value = values.find(key)->second;
     if (const auto *integer = std::get_if<int64_t>(&value)) {
       out += "i:";
       out += std::to_string(*integer);
@@ -71,6 +72,10 @@ std::string canonicalSearchBindingString(const SearchBinding &binding) {
     }
   }
   return out;
+}
+
+std::string canonicalSearchBindingString(const SearchBinding &binding) {
+  return canonicalSearchValueString(binding.values);
 }
 
 bool searchBindingLess(const SearchBinding &lhs, const SearchBinding &rhs) {
