@@ -58,6 +58,7 @@ struct MappingSearchOptions {
   unsigned maxInstancesPerCandidate = 64;
   unsigned maxRoutesPerConnection = 8;
   uint64_t memoryBudgetBytes = 512ULL << 20;
+  bool enableLatencyCache = true;
   bool enableSymmetryReduction = true;
 };
 

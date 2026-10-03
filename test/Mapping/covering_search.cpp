@@ -134,9 +134,13 @@ class FixedLatencyProvider : public LatencyProvider {
 public:
   std::map<std::string, double> byRule;
   mutable std::vector<std::string> lookups;
+  /// How many times `lookupCycles` was entered, so a test can prove the search
+  /// did (or did not) consult the provider at all.
+  mutable size_t lookupCount = 0;
 
   std::optional<double> lookupCycles(const OperationSignature &signature,
                                      const TargetContext &) const override {
+    ++lookupCount;
     lookups.push_back(signature.canonicalString());
     auto it = byRule.find(signature.rule);
     if (it == byRule.end())
@@ -411,4 +415,51 @@ TEST(CoveringSearch, AnExpensiveMeasurementDoesNotMakeAPlanIllegal) {
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   // Measurement changes what work costs, never what is allowed.
   EXPECT_FALSE(result->plans.empty());
+}
+
+TEST(CoveringSearch, LatencyCacheCanBeDisabled) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  FixedLatencyProvider provider;
+  // The declared-cheap rule is measured to be slow, and the other fast. With
+  // the cache enabled this flips the ranking, exactly as the test above shows.
+  provider.byRule["r.cheap"] = 100.0;
+  provider.byRule["r.expensive"] = 2.0;
+
+  std::unique_ptr<MappingTarget> target =
+      targetWithProvider(searchMachine(), kRules, &provider);
+  ASSERT_NE(target, nullptr);
+  ASSERT_EQ(target->latencyProvider(), &provider);
+
+  MappingSearchOptions disabled;
+  disabled.mode = SearchMode::Exact;
+  disabled.enableLatencyCache = false;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, disabled);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // The provider was never consulted, so the declared 1-cycle rule still wins
+  // and the cost is the static estimate.
+  EXPECT_EQ(provider.lookupCount, 0u);
+  EXPECT_TRUE(provider.lookups.empty());
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 2.0);
+
+  // The default (`true`) does consult it, and the measurement takes effect.
+  FixedLatencyProvider measured;
+  measured.byRule["r.cheap"] = 100.0;
+  measured.byRule["r.expensive"] = 2.0;
+  std::unique_ptr<MappingTarget> measuredTarget =
+      targetWithProvider(searchMachine(), kRules, &measured);
+  ASSERT_NE(measuredTarget, nullptr);
+
+  MappingSearchOptions enabled;
+  enabled.mode = SearchMode::Exact;
+  CoveringSearch enabledSearch(graph, *measuredTarget, context, LayoutContext{},
+                               enabled);
+  llvm::Expected<MappingSearchResult> enabledResult = enabledSearch.search();
+  ASSERT_TRUE(static_cast<bool>(enabledResult))
+      << llvm::toString(enabledResult.takeError());
+  ASSERT_FALSE(enabledResult->plans.empty());
+  EXPECT_GT(measured.lookupCount, 0u);
+  EXPECT_DOUBLE_EQ(enabledResult->plans[0].totalCost.latencyCycles, 4.0);
 }

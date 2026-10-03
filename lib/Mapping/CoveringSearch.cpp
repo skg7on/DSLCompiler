@@ -175,27 +175,29 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       for (CandidateInstance &instance : *instances) {
         InstanceEntry entry{std::move(instance), rule, {}};
         entry.cost = entry.instance.localCost;
-        if (const LatencyProvider *provider = target_.latencyProvider()) {
-          OperationSignature signature;
-          signature.operation = node->opName;
-          signature.rule = rule->id;
-          signature.ruleVersion = rule->version;
-          signature.bundle = rule->bundle;
-          if (!entry.instance.layoutBindings.empty()) {
-            std::vector<std::string> layouts;
-            for (const auto &binding : entry.instance.layoutBindings)
-              layouts.push_back(binding.second);
-            llvm::sort(layouts);
-            signature.layout = layouts.front();
+        if (options_.enableLatencyCache) {
+          if (const LatencyProvider *provider = target_.latencyProvider()) {
+            OperationSignature signature;
+            signature.operation = node->opName;
+            signature.rule = rule->id;
+            signature.ruleVersion = rule->version;
+            signature.bundle = rule->bundle;
+            if (!entry.instance.layoutBindings.empty()) {
+              std::vector<std::string> layouts;
+              for (const auto &binding : entry.instance.layoutBindings)
+                layouts.push_back(binding.second);
+              llvm::sort(layouts);
+              signature.layout = layouts.front();
+            }
+            if (const machine::ExecutorNode *executor = machine.findExecutor(
+                    entry.instance.executorBindings.lookup("executor")))
+              signature.placementClass = executor->kind;
+            TargetContext context{target_.name().str(),
+                                  hexId(machine.contentHash)};
+            if (std::optional<double> measured =
+                    provider->lookupCycles(signature, context))
+              entry.cost.latencyCycles = *measured;
           }
-          if (const machine::ExecutorNode *executor = machine.findExecutor(
-                  entry.instance.executorBindings.lookup("executor")))
-            signature.placementClass = executor->kind;
-          TargetContext context{target_.name().str(),
-                                hexId(machine.contentHash)};
-          if (std::optional<double> measured =
-                  provider->lookupCycles(signature, context))
-            entry.cost.latencyCycles = *measured;
         }
         table.instances.push_back(std::move(entry));
       }
