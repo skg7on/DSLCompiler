@@ -16,6 +16,7 @@
 
 #include "LLK/Machine/MachineModel.h"
 
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -24,6 +25,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -82,6 +84,25 @@ llvm::Expected<EvalValue>
 evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
              const machine::MachineModel &machine,
              const LayoutContext &context);
+
+/// Resolves the literal subject of a `machine.<callee>("<subject>")` query
+/// against a machine. Returns `std::nullopt` when the subject is known, or the
+/// diagnostic describing why it is not (an unknown compute kind, memory, ...).
+///
+/// A declaration file has no machine while it is parsed, so the check is
+/// deferred: `validateExpr` accepts the query structurally, and the target
+/// loader resolves the subjects against its machine once one exists (design
+/// §14.4 -- an unknown capability query is a load-time failure, never a late
+/// search failure).
+using MachineQueryResolver = llvm::function_ref<std::optional<std::string>(
+    llvm::StringRef callee, llvm::StringRef subject)>;
+
+/// Walks `expr`, asking `resolver` about every literal `machine.compute` /
+/// `machine.memory` query subject. Returns the first diagnostic, in expression
+/// order, or an empty string when every subject resolves. A query whose subject
+/// is not a string literal is left to evaluation, which cannot know it either.
+std::string resolveMachineQueries(const Expr &expr,
+                                  MachineQueryResolver resolver);
 
 //===----------------------------------------------------------------------===//
 // Tokens
@@ -148,8 +169,11 @@ public:
   ExprPtr parseExpression();
 
   /// Validates every identifier, call, and member against the vocabulary the
-  /// current declaration allows.
-  bool validateExpr(const ExprPtr &expr, const llvm::StringSet<> &allowed);
+  /// current declaration allows. When `resolver` is given, every literal
+  /// `machine.<query>("<subject>")` is also resolved against it, so an unknown
+  /// capability subject is a load-time error at the token that names it.
+  bool validateExpr(const ExprPtr &expr, const llvm::StringSet<> &allowed,
+                    MachineQueryResolver resolver = {});
 
 protected:
   ExprPtr parseOr();

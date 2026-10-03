@@ -7,6 +7,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -47,6 +48,31 @@ bool isKnownRole(llvm::StringRef role) {
   return role == "executor" || role == "compute" || role == "memory";
 }
 
+/// Resolves a `machine.compute`/`machine.memory` query subject against the
+/// machine, for `resolveMachineQueries`. A compute subject is a capability
+/// *kind* (`vector_engine`); a memory subject is a node *id* (`sram.0`), which
+/// is what the evaluator looks memory facts up by. Returns the diagnostic when
+/// the subject is unknown, or nullopt when it resolves.
+std::optional<std::string> resolveMachineQuery(const MachineModel &machine,
+                                               llvm::StringRef callee,
+                                               llvm::StringRef subject) {
+  if (callee == "machine.compute") {
+    if (llvm::any_of(machine.computes, [&](const machine::ComputeNode &node) {
+          return node.kind == subject;
+        }))
+      return std::nullopt;
+    return "unknown compute kind '" + subject.str() + "'";
+  }
+  if (callee == "machine.memory") {
+    if (machine.findMemory(subject))
+      return std::nullopt;
+    return "unknown memory '" + subject.str() + "'";
+  }
+  // The grammar knows no other machine query; `isKnownCall` already rejected
+  // an unknown callee at parse time.
+  return std::nullopt;
+}
+
 } // namespace
 
 FileMappingTarget::FileMappingTarget(std::string name, MachineModel machine,
@@ -63,11 +89,51 @@ bool FileMappingTarget::isKnownEmitter(llvm::StringRef key) const {
 
 llvm::Error verifyMappingTarget(const MappingTarget &target) {
   const MachineModel &machine = target.machine();
+  auto resolver = [&](llvm::StringRef callee, llvm::StringRef subject) {
+    return resolveMachineQuery(machine, callee, subject);
+  };
   for (const RuleDef &rule : target.rules().all()) {
+    // Port adequacy: a rule's declared ports must cover every port it
+    // references. A port predicate reads the matched node by index, so the
+    // rule must declare an input/output port for each index it names; a layout
+    // requirement names a port by name (design §14.4, "missing ports"). A rule
+    // that declares no port it references would match a boundary it can never
+    // wire, so it is rejected here rather than silently producing a candidate
+    // with no ports.
+    size_t declaredInputs = 0;
+    for (const RulePort &port : rule.ports)
+      if (port.isInput)
+        ++declaredInputs;
+    size_t declaredOutputs = rule.ports.size() - declaredInputs;
+    for (const RulePredicate &predicate : rule.predicates) {
+      if (!predicate.directionSet)
+        continue;
+      size_t declared = predicate.isInput ? declaredInputs : declaredOutputs;
+      if (predicate.portIndex >= 0 &&
+          static_cast<size_t>(predicate.portIndex) >= declared)
+        return targetError("rule '" + rule.id + "': port predicate " +
+                           (predicate.isInput ? "input[" : "output[") +
+                           std::to_string(predicate.portIndex) +
+                           "] names a port the rule does not declare");
+    }
     for (const RuleLayoutRequirement &requirement : rule.layoutRequirements) {
+      if (!llvm::any_of(rule.ports, [&](const RulePort &port) {
+            return port.name == requirement.port;
+          }))
+        return targetError("rule '" + rule.id +
+                           "': layout requirement names undeclared port '" +
+                           requirement.port + "'");
       if (!target.layouts().find(requirement.layoutId))
         return targetError("rule '" + rule.id + "': unknown layout '" +
                            requirement.layoutId + "'");
+    }
+    // A `require` expression may query the machine; an unknown capability
+    // subject (a compute kind or memory id) is a load-time error, not a
+    // failure deferred to the first match.
+    for (const ExprPtr &constraint : rule.constraints) {
+      std::string message = resolveMachineQueries(*constraint, resolver);
+      if (!message.empty())
+        return targetError("rule '" + rule.id + "': " + message);
     }
     for (const KindRequirement &requirement : rule.kindRequirements) {
       if (!isKnownRole(requirement.role))
@@ -82,6 +148,15 @@ llvm::Error verifyMappingTarget(const MappingTarget &target) {
     if (!target.isKnownEmitter(rule.emitter))
       return targetError("rule '" + rule.id + "': unknown emitter '" +
                          rule.emitter + "'");
+  }
+  // Layout declarations carry machine queries too; resolve them against the
+  // same machine so a bad subject is a load-time diagnostic there as well.
+  for (const LayoutDef &layout : target.layouts().all()) {
+    for (const ExprPtr &constraint : layout.constraints) {
+      std::string message = resolveMachineQueries(*constraint, resolver);
+      if (!message.empty())
+        return targetError("layout '" + layout.id + "': " + message);
+    }
   }
   return llvm::Error::success();
 }

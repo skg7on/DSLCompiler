@@ -403,7 +403,8 @@ bool LlkMapParser::expectIdentifier(llvm::StringRef what, std::string &out) {
 }
 
 bool LlkMapParser::validateExpr(const ExprPtr &expr,
-                                const llvm::StringSet<> &allowed) {
+                                const llvm::StringSet<> &allowed,
+                                MachineQueryResolver resolver) {
   switch (expr->kind) {
   case ExprKind::IntLit:
   case ExprKind::StringLit:
@@ -412,10 +413,18 @@ bool LlkMapParser::validateExpr(const ExprPtr &expr,
     if (!allowed.contains(expr->text))
       return failAt(current(), "unknown identifier '" + expr->text + "'");
     return true;
-  case ExprKind::Call:
+  case ExprKind::Call: {
     if (!isKnownCall(expr->text))
       return failAt(current(), "unknown function '" + expr->text + "'");
+    if (resolver &&
+        (expr->text == "machine.compute" || expr->text == "machine.memory") &&
+        expr->operands.size() == 1 &&
+        expr->operands[0]->kind == ExprKind::StringLit)
+      if (std::optional<std::string> message =
+              resolver(expr->text, expr->operands[0]->text))
+        return failAt(current(), *message);
     break;
+  }
   case ExprKind::MemberCall:
     if (!isKnownMember(expr->text))
       return failAt(current(), "unknown machine query '" + expr->text + "'");
@@ -425,7 +434,7 @@ bool LlkMapParser::validateExpr(const ExprPtr &expr,
     break;
   }
   for (const ExprPtr &operand : expr->operands)
-    if (!validateExpr(operand, allowed))
+    if (!validateExpr(operand, allowed, resolver))
       return false;
   return true;
 }
@@ -659,6 +668,24 @@ evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
     return evalMember(expr, eval, machine);
   }
   return evalError("unhandled expression");
+}
+
+std::string resolveMachineQueries(const Expr &expr,
+                                  MachineQueryResolver resolver) {
+  if (expr.kind == ExprKind::Call &&
+      (expr.text == "machine.compute" || expr.text == "machine.memory") &&
+      expr.operands.size() == 1 &&
+      expr.operands[0]->kind == ExprKind::StringLit) {
+    if (std::optional<std::string> message =
+            resolver(expr.text, expr.operands[0]->text))
+      return *message;
+  }
+  for (const ExprPtr &operand : expr.operands) {
+    std::string message = resolveMachineQueries(*operand, resolver);
+    if (!message.empty())
+      return message;
+  }
+  return {};
 }
 
 bool LlkMapParser::parseDomainValues(std::vector<LayoutValue> &out) {

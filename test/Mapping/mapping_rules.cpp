@@ -276,6 +276,8 @@ rule a.vector_add {
   require executor kind worker;
   require compute kind vector_engine;
   require layout operand0 satisfies avx2.blocked_2d;
+  input "operand0";
+  output "result";
   bundle "b";
   emit "e1";
 }
@@ -337,6 +339,58 @@ rule a.bad {
 TEST(MappingTarget, RejectsUnknownEmitter) {
   llvm::Expected<std::unique_ptr<MappingTarget>> target =
       makeTarget(kGoodRules, {"different_emitter"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE(verifies(**target));
+}
+
+TEST(MappingTarget, RejectsARuleThatDeclaresNoPortsItGoverns) {
+  // The rule predicates on the first input but declares no input port, so the
+  // boundary it matched can never be wired. A rule's declared ports must cover
+  // every port it references (design §14.4, "missing ports"); the rule parses,
+  // but loading the target rejects it.
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = makeTarget(R"llkmap(
+rule a.bad {
+  match micro.vector(input[0].element_type = f32);
+  bundle "b";
+  emit "e1";
+}
+)llkmap",
+                                                                     {"e1"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE(verifies(**target));
+}
+
+TEST(MappingTarget, RejectsALayoutRequirementOnAnUndeclaredPort) {
+  // The rule declares `operand0` but requires a layout on `operand1`, which it
+  // never declares: the requirement can never be discharged.
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = makeTarget(R"llkmap(
+rule a.bad {
+  match micro.vector();
+  require layout operand1 satisfies avx2.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "b";
+  emit "e1";
+}
+)llkmap",
+                                                                     {"e1"});
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE(verifies(**target));
+}
+
+TEST(MappingTarget, RejectsAnUnknownMachineQueryAtLoad) {
+  // `machine.compute("bogus")` parses -- the grammar knows the call -- but the
+  // machine declares no such compute kind. The registry must reject it at load
+  // time, not defer to a failure when the rule is first matched.
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = makeTarget(R"llkmap(
+rule a.bad {
+  match micro.vector();
+  require machine.compute("bogus").count > 0;
+  bundle "b";
+  emit "e1";
+}
+)llkmap",
+                                                                     {"e1"});
   ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
   EXPECT_FALSE(verifies(**target));
 }
