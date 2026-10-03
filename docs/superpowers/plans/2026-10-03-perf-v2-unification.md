@@ -131,3 +131,35 @@ performance suite's baselines are those numbers. Three translations were needed:
   name in reports (`x86-avx2-cpu` -> `x86-avx2`, the v2 profile's `target`), and
   the engine named in a layout warning (`avx2-vector` -> `vpu`). Every cycle
   estimate, bottleneck, capacity check, and overlap number is unchanged.
+
+## Slice 3: route-hop accounting and a shared cost vocabulary (2026-10-03)
+
+### One vocabulary
+
+The mapping search and the evaluator now name machine work the same way.
+`LLK/Mapping/CostEvent.h` defines the five categories -- compute, transfer hop,
+transform, synchronization, capacity -- and `CostEvent { kind, resource, cost }`.
+Every `MicroEvent` carries a `costKind`, assigned once in the builder's
+`addEvent`, so a report and a selected plan can be compared category by
+category. `LLKPerf` links `LLKMapping` for it: the evaluator consumes mapped
+events, which is the direction the design already draws.
+
+### Every route hop is observed
+
+A mapped kernel carries the routes its plan chose in `micro.routes`. The DAG
+builder reads them before walking and, for a movement whose endpoint *spaces*
+match a route's endpoints, emits **one event per hop** -- each charged from its
+own link's latency and bandwidth, each chained behind the previous one -- rather
+than a single endpoint-to-endpoint transfer. A concrete `micro.async_copy` names
+spaces (`dram` to `sram`) while a route names nodes (`dram.0`), so the two are
+matched on the endpoints' kinds.
+
+An unrouted movement is unchanged: still one event, still charged by the v1
+formula. Nothing in the existing suite moved.
+
+### Verification
+
+- `ninja -C build` clean; `ctest` **102 registered, 100 passed, 2 skipped, 0 failed**.
+- New: `L1ResourceDag.ARoutedMovementIsChargedPerHop` (two events, chained, for a
+  two-hop route) and `L1ResourceDag.EveryEventCarriesItsSharedCostCategory`;
+  `CostEvent.EveryKindRoundTripsThroughItsName`.

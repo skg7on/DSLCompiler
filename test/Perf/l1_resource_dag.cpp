@@ -92,6 +92,7 @@ std::string testMachine(unsigned dmaEngines, unsigned workers,
 
   yaml += "memories:\n";
   for (const auto &level : {std::pair<const char *, uint64_t>{"dram", 1048576},
+                            {"l2", 262144},
                             {"sram", 65536},
                             {"acc", 65536}}) {
     yaml += "  - id: " + std::string(level.first) +
@@ -126,9 +127,10 @@ std::string testMachine(unsigned dmaEngines, unsigned workers,
             "    count: 1\n    max_outstanding: 1\n";
 
   yaml += "links:\n";
-  const char *paths[4][2] = {
-      {"dram", "sram"}, {"sram", "dram"}, {"sram", "acc"}, {"acc", "sram"}};
-  for (unsigned i = 0; i < 4; ++i)
+  const char *paths[6][2] = {{"dram", "sram"}, {"sram", "dram"},
+                             {"sram", "acc"},  {"acc", "sram"},
+                             {"dram", "l2"},   {"l2", "sram"}};
+  for (unsigned i = 0; i < 6; ++i)
     yaml += "  - id: " + std::string(paths[i][0]) + "_to_" + paths[i][1] +
             ".0\n    source: " + paths[i][0] +
             ".0\n    destination: " + paths[i][1] +
@@ -441,4 +443,75 @@ TEST(L1ResourceDag, ScheduleBeatsTheStaticBoundOnlyWhenItOverlaps) {
 }
 
 } // namespace
+} // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+
+//===----------------------------------------------------------------------===//
+// Route-hop accounting
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The same copy twice: once as written, once carrying the route a selected
+/// plan chose through the hierarchy.
+constexpr llvm::StringLiteral kPlainCopy = R"mlir(
+module {
+  micro.kernel @copy {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.yield
+  }
+}
+)mlir";
+
+constexpr llvm::StringLiteral kRoutedCopy = R"mlir(
+module {
+  micro.kernel @copy attributes {micro.routes = [{value = 0 : i64, kind = "transfer", route = ["dram.0", "l2.0", "sram.0"]}]} {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.yield
+  }
+}
+)mlir";
+
+} // namespace
+
+TEST(L1ResourceDag, ARoutedMovementIsChargedPerHop) {
+  auto plain = parseKernel(kPlainCopy);
+  auto routed = parseKernel(kRoutedCopy);
+  ASSERT_TRUE(plain);
+  ASSERT_TRUE(routed);
+
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  auto plainDag = buildMicroDAG(plain->kernel, model);
+  auto routedDag = buildMicroDAG(routed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(plainDag))
+      << llvm::toString(plainDag.takeError());
+  ASSERT_TRUE(static_cast<bool>(routedDag))
+      << llvm::toString(routedDag.takeError());
+
+  // Unrouted: one transfer from endpoint to endpoint.
+  EXPECT_EQ(plainDag->events.size(), 1u);
+  // Routed: the plan chose dram -> l2 -> sram, so the simulator sees both
+  // links.
+  ASSERT_EQ(routedDag->events.size(), 2u);
+  for (const MicroEvent &event : routedDag->events)
+    EXPECT_EQ(event.costKind, mapping::CostEventKind::TransferHop);
+
+  // The second hop waits for the first: data has to arrive before it moves on.
+  ASSERT_EQ(routedDag->events[1].deps.size(), 1u);
+  EXPECT_EQ(routedDag->events[1].deps[0], routedDag->events[0].id);
+}
+
+TEST(L1ResourceDag, EveryEventCarriesItsSharedCostCategory) {
+  auto parsed = parseKernel(kPlainCopy);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag));
+  ASSERT_FALSE(dag->events.empty());
+  EXPECT_EQ(dag->events[0].costKind, mapping::CostEventKind::TransferHop);
+}
+
 } // namespace mlir::llk::perf

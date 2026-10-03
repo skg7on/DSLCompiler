@@ -152,8 +152,15 @@ private:
   llvm::Error requireReachable(mlir::Operation &op, llvm::StringRef src,
                                llvm::StringRef dst);
 
+  /// Reads `micro.routes` from a mapped kernel, so a routed movement is
+  /// charged hop by hop instead of endpoint to endpoint.
+  void loadRoutes(mlir::Operation *kernel);
+  std::vector<const machine::LinkEdge *>
+  routeHops(llvm::StringRef srcSpace, llvm::StringRef dstSpace) const;
+
   const machine::MachineModel &machine;
   std::string kernelName;
+  std::vector<PlannedRoute> routes;
   MicroDAG dag;
   llvm::DenseMap<mlir::Value, uint32_t> producers;
   llvm::SmallPtrSet<mlir::Operation *, 32> countedStorage;
@@ -233,6 +240,60 @@ void DAGBuilder::noteStorage(mlir::Operation &op, llvm::StringRef space,
 //===----------------------------------------------------------------------===//
 // Costs
 //===----------------------------------------------------------------------===//
+
+void DAGBuilder::loadRoutes(mlir::Operation *kernel) {
+  auto declared = kernel->getAttrOfType<mlir::ArrayAttr>("micro.routes");
+  if (!declared)
+    return;
+  for (mlir::Attribute entry : declared) {
+    auto route = mlir::dyn_cast<mlir::DictionaryAttr>(entry);
+    if (!route)
+      continue;
+    auto nodes = route.getAs<mlir::ArrayAttr>("route");
+    if (!nodes || nodes.size() < 2)
+      continue;
+
+    PlannedRoute built;
+    bool complete = true;
+    for (size_t i = 1; i < nodes.size(); ++i) {
+      std::string from =
+          mlir::cast<mlir::StringAttr>(nodes[i - 1]).getValue().str();
+      std::string to = mlir::cast<mlir::StringAttr>(nodes[i]).getValue().str();
+      const machine::LinkEdge *link = nullptr;
+      for (const machine::LinkEdge &candidate : machine.links)
+        if (candidate.source == from && candidate.destination == to) {
+          link = &candidate;
+          break;
+        }
+      if (!link) {
+        complete = false;
+        break;
+      }
+      built.hops.push_back(link);
+    }
+    if (!complete || built.hops.empty())
+      continue;
+
+    const machine::MemoryNode *source =
+        machine.findMemory(built.hops.front()->source);
+    const machine::MemoryNode *destination =
+        machine.findMemory(built.hops.back()->destination);
+    if (!source || !destination)
+      continue;
+    built.srcSpace = source->kind;
+    built.dstSpace = destination->kind;
+    routes.push_back(std::move(built));
+  }
+}
+
+std::vector<const machine::LinkEdge *>
+DAGBuilder::routeHops(llvm::StringRef srcSpace,
+                      llvm::StringRef dstSpace) const {
+  for (const PlannedRoute &route : routes)
+    if (route.srcSpace == srcSpace && route.dstSpace == dstSpace)
+      return route.hops;
+  return {};
+}
 
 uint64_t DAGBuilder::copyCycles(llvm::StringRef src, llvm::StringRef dst,
                                 uint64_t bytes) const {
@@ -381,6 +442,10 @@ uint32_t DAGBuilder::addEvent(MicroEvent event, State &state,
                               llvm::ArrayRef<uint32_t> extraDeps) {
   if (event.tileOwner.empty())
     event.tileOwner = state.owner;
+
+  // Every event carries its shared cost category, so a report and a plan can
+  // be compared category by category rather than event by event.
+  event.costKind = costEventKindOf(event.kind);
 
   event.id = static_cast<uint32_t>(dag.events.size());
   ResourceKind kind = event.resource;
@@ -805,22 +870,63 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
   noteUnsizable(sourceInfo, op);
   noteUnsizable(resultInfo, op);
 
-  MicroEvent event;
-  event.kind = kind;
-  event.resource = ResourceKind::Dma;
-  event.resourceName = "dma";
-  event.workItems = shapeInfo.elements();
-  event.bytes = bytes;
-  event.minCycles = copyCycles(srcMemory, dstMemory, bytes);
-  event.sourceOpName = op.getName().getStringRef().str();
-  event.tileShape = shapeString(shapeInfo.shape);
-  event.tileLayout =
-      resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
-  event.tileMemory = dstMemory.str();
-  event.srcMemory = srcMemory.str();
-  event.tileOwner = resultInfo.owner;
+  // A movement the selected plan routed is charged per hop: the mapper chose a
+  // path through the hierarchy, and the simulator has to see every link on it
+  // rather than a single endpoint-to-endpoint transfer.
+  std::vector<const machine::LinkEdge *> hops = routeHops(srcMemory, dstMemory);
 
-  uint32_t id = addEvent(std::move(event), state);
+  auto describe = [&](const machine::LinkEdge &link, uint64_t cycles) {
+    MicroEvent event;
+    event.kind = kind;
+    event.resource = ResourceKind::Dma;
+    event.resourceName =
+        link.transferEngines.empty() ? "dma" : link.transferEngines.front();
+    event.workItems = shapeInfo.elements();
+    event.bytes = bytes;
+    event.minCycles = cycles;
+    event.sourceOpName = op.getName().getStringRef().str();
+    event.tileShape = shapeString(shapeInfo.shape);
+    event.tileLayout =
+        resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
+    const machine::MemoryNode *destination =
+        machine.findMemory(link.destination);
+    const machine::MemoryNode *source = machine.findMemory(link.source);
+    event.tileMemory = destination ? destination->kind : dstMemory.str();
+    event.srcMemory = source ? source->kind : srcMemory.str();
+    event.tileOwner = resultInfo.owner;
+    return event;
+  };
+
+  uint32_t id = 0;
+  if (hops.empty()) {
+    MicroEvent event;
+    event.kind = kind;
+    event.resource = ResourceKind::Dma;
+    event.resourceName = "dma";
+    event.workItems = shapeInfo.elements();
+    event.bytes = bytes;
+    event.minCycles = copyCycles(srcMemory, dstMemory, bytes);
+    event.sourceOpName = op.getName().getStringRef().str();
+    event.tileShape = shapeString(shapeInfo.shape);
+    event.tileLayout =
+        resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
+    event.tileMemory = dstMemory.str();
+    event.srcMemory = srcMemory.str();
+    event.tileOwner = resultInfo.owner;
+    id = addEvent(std::move(event), state);
+  } else {
+    for (size_t hop = 0; hop < hops.size(); ++hop) {
+      const machine::LinkEdge &link = *hops[hop];
+      uint64_t cycles = link.latencyCycles;
+      if (link.bandwidthBytesPerCycle > 0)
+        cycles += static_cast<uint64_t>(std::ceil(static_cast<double>(bytes) /
+                                                  link.bandwidthBytesPerCycle));
+      llvm::SmallVector<uint32_t, 1> chain;
+      if (hop > 0)
+        chain.push_back(id);
+      id = addEvent(describe(link, cycles), state, chain);
+    }
+  }
   for (mlir::Value result : results)
     producers[result] = id;
 
@@ -895,6 +1001,9 @@ llvm::Error DAGBuilder::requireReachable(mlir::Operation &op,
 //===----------------------------------------------------------------------===//
 
 llvm::Expected<MicroDAG> DAGBuilder::run(mlir::Operation *kernel) {
+  // A mapped kernel carries the routes its plan chose; read them before the
+  // walk so a routed movement is charged per hop.
+  loadRoutes(kernel);
   State state;
   std::vector<uint32_t> created;
   if (llvm::Error err = walkBlock(kernel->getRegion(0).front(), state, created))
@@ -969,6 +1078,26 @@ llvm::StringRef stringifyEventKind(EventKind kind) {
     return "barrier";
   }
   return "unknown";
+}
+
+mapping::CostEventKind costEventKindOf(EventKind kind) {
+  switch (kind) {
+  case EventKind::Mma:
+  case EventKind::Vector:
+  case EventKind::Reduce:
+    return mapping::CostEventKind::Compute;
+  case EventKind::AsyncCopy:
+  case EventKind::Load:
+  case EventKind::Store:
+    return mapping::CostEventKind::TransferHop;
+  case EventKind::TileView:
+  case EventKind::TilePartition:
+    return mapping::CostEventKind::Transform;
+  case EventKind::Wait:
+  case EventKind::Barrier:
+    return mapping::CostEventKind::Synchronization;
+  }
+  return mapping::CostEventKind::Compute;
 }
 
 llvm::StringRef stringifyResourceKind(ResourceKind kind) {
