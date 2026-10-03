@@ -278,6 +278,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/MappingTarget.cpp
     lib/Mapping/Placement.cpp
     lib/Mapping/CoveringSearch.cpp
+    lib/Mapping/PlanBinder.cpp
     lib/Mapping/Routing.cpp
 )
 target_include_directories(LLKMapping PUBLIC
@@ -762,6 +763,7 @@ add_llk_mapping_test(MappingConnectionsTest test/Mapping/connections.cpp)
 add_llk_mapping_test(MappingCoveringSearchTest test/Mapping/covering_search.cpp)
 add_llk_mapping_test(MappingAvx2TargetTest test/Mapping/avx2_target.cpp)
 add_llk_mapping_test(MappingGenericAcceleratorTargetTest test/Mapping/generic_accelerator_target.cpp)
+add_llk_mapping_test(MappingPlanBinderTest test/Mapping/plan_binder.cpp)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside

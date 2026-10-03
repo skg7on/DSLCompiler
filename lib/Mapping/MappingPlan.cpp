@@ -245,6 +245,46 @@ std::string canonicalConnectionString(const ConnectionPlan &connection) {
 }
 
 std::string canonicalPlanString(const CoveringPlan &plan) {
+  std::vector<std::string> placements;
+  placements.reserve(plan.placements.size());
+  for (const PlanPlacement &placement : plan.placements) {
+    std::string text = std::to_string(placement.node);
+    text += '=';
+    text += std::to_string(placement.instance);
+    text += ':';
+    text += placement.rule;
+    text += ':';
+    text += placement.bundle;
+    text += ':';
+    text += placement.executor;
+    text += ":mem=";
+    text += joinStrings(sortedEntries(placement.memories), ",");
+    text += ":layout=";
+    text += joinStrings(sortedEntries(placement.layouts), ",");
+    placements.push_back(std::move(text));
+  }
+  llvm::sort(placements);
+
+  std::vector<std::string> connectionPlans;
+  connectionPlans.reserve(plan.connectionPlans.size());
+  for (const PlanConnection &connection : plan.connectionPlans) {
+    std::string text = std::to_string(connection.id);
+    text += ':';
+    text += stringifyConnectionKind(connection.kind).str();
+    text += ":route=";
+    llvm::SmallVector<MemoryNodeId> route(connection.route);
+    llvm::sort(route);
+    text +=
+        joinStrings(std::vector<std::string>(route.begin(), route.end()), ",");
+    text += ":engines=";
+    llvm::SmallVector<ExecutorId> engines(connection.engines);
+    llvm::sort(engines);
+    text += joinStrings(
+        std::vector<std::string>(engines.begin(), engines.end()), ",");
+    connectionPlans.push_back(std::move(text));
+  }
+  llvm::sort(connectionPlans);
+
   llvm::SmallVector<InstanceId> instances(plan.instances);
   llvm::SmallVector<ConnectionId> connections(plan.connections);
   std::vector<std::string> errors(plan.diagnostics.errors);
@@ -258,6 +298,10 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
   out += joinNumbers(instances);
   out += "|connections=";
   out += joinNumbers(connections);
+  out += "|placements=";
+  out += joinStrings(placements, ";");
+  out += "|routes=";
+  out += joinStrings(connectionPlans, ";");
   out += "|params=";
   out += canonicalSearchValueString(plan.globalParameters);
   out += "|cost=";
