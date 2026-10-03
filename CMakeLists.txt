@@ -268,6 +268,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/LayoutConstraints.cpp
     lib/Mapping/MappingRules.cpp
     lib/Mapping/MappingTarget.cpp
+    lib/Mapping/Placement.cpp
     lib/Mapping/Routing.cpp
 )
 target_include_directories(LLKMapping PUBLIC
@@ -726,6 +727,7 @@ add_llk_mapping_test(MappingWorkloadGraphTest test/Mapping/workload_graph.cpp)
 add_llk_mapping_test(MappingPlanTest test/Mapping/mapping_plan.cpp)
 add_llk_mapping_test(MappingLayoutTest test/Mapping/layout_constraints.cpp)
 add_llk_mapping_test(MappingRulesTest test/Mapping/mapping_rules.cpp)
+add_llk_mapping_test(MappingPlacementTest test/Mapping/placement.cpp)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside

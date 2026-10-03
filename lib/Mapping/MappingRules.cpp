@@ -431,6 +431,10 @@ MappingCandidate toMappingCandidate(const RuleDef &rule,
       MemoryRequirement resolved;
       resolved.kind = requirement.kind;
       candidate.memoryRequirements.push_back(std::move(resolved));
+    } else if (requirement.role == "compute") {
+      ComputeRequirement resolved;
+      resolved.kind = requirement.kind;
+      candidate.computeRequirements.push_back(std::move(resolved));
     }
   }
 

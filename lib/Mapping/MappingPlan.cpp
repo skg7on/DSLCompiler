@@ -152,6 +152,12 @@ std::string canonicalCandidateString(const MappingCandidate &candidate) {
     layouts.push_back(requirement.layoutClass);
   llvm::sort(layouts);
 
+  std::vector<std::string> computes;
+  computes.reserve(candidate.computeRequirements.size());
+  for (const ComputeRequirement &requirement : candidate.computeRequirements)
+    computes.push_back(requirement.kind);
+  llvm::sort(computes);
+
   llvm::SmallVector<WorkloadNodeId> covered(candidate.coveredNodes);
   sortUnique(covered);
 
@@ -169,6 +175,8 @@ std::string canonicalCandidateString(const MappingCandidate &candidate) {
   out += joinStrings(memories, ";");
   out += "|layout=";
   out += joinStrings(layouts, ";");
+  out += "|compute=";
+  out += joinStrings(computes, ";");
   out += "|params=";
   out += canonicalSearchValueString(candidate.resolvedParameters);
   out += "|lower=";
@@ -185,6 +193,8 @@ std::string canonicalInstanceString(const CandidateInstance &instance) {
   out += joinStrings(sortedEntries(instance.memoryBindings), ",");
   out += "|layout=";
   out += joinStrings(sortedEntries(instance.layoutBindings), ",");
+  out += "|compute=";
+  out += joinStrings(sortedEntries(instance.computeBindings), ",");
   out += "|slots=";
   out += std::to_string(instance.resourceUsage.executorSlots);
   out += "|membytes=";

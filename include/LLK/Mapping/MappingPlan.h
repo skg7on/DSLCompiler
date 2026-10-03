@@ -76,6 +76,11 @@ struct LayoutRequirement {
   std::string layoutClass;
 };
 
+/// An abstract compute capability a placement must attach (design §15.1).
+struct ComputeRequirement {
+  std::string kind;
+};
+
 /// Concrete resource consumption of one placed instance.
 struct ResourceUsage {
   uint64_t executorSlots = 0;
@@ -100,6 +105,7 @@ struct MappingCandidate {
   llvm::SmallVector<ExecutorRequirement> executorRequirements;
   llvm::SmallVector<MemoryRequirement> memoryRequirements;
   llvm::SmallVector<LayoutRequirement> layoutRequirements;
+  llvm::SmallVector<ComputeRequirement> computeRequirements;
   llvm::StringMap<SearchValue> resolvedParameters;
   Cost lowerBound;
 };
@@ -110,6 +116,7 @@ struct CandidateInstance {
   CandidateId candidate = 0;
   llvm::StringMap<ExecutorId> executorBindings;
   llvm::StringMap<MemoryNodeId> memoryBindings;
+  llvm::StringMap<std::string> computeBindings;
   llvm::StringMap<LayoutId> layoutBindings;
   ResourceUsage resourceUsage;
   Cost localCost;
