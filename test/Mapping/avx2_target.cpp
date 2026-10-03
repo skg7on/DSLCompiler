@@ -3,6 +3,8 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
+#include "mlir/IR/BuiltinAttributes.h"
+
 #include "llvm/Support/Error.h"
 
 #include <gtest/gtest.h>
@@ -49,6 +51,20 @@ llvm::Expected<std::unique_ptr<MappingTarget>> loadTarget() {
   return avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
 }
 
+/// A bundle naming `emitterKey` with one well-typed integer parameter.
+TargetBundle makeBundle(llvm::StringRef emitterKey,
+                        mlir::MLIRContext &context) {
+  TargetBundle bundle;
+  bundle.name = "avx2.vector_add";
+  bundle.emitterKey = emitterKey.str();
+  bundle.parameters = mlir::DictionaryAttr::get(
+      &context,
+      {mlir::NamedAttribute(
+          mlir::StringAttr::get(&context, "rows"),
+          mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), 4))});
+  return bundle;
+}
+
 } // namespace
 
 TEST(Avx2Target, LoadsAndVerifiesItsConfiguration) {
@@ -67,6 +83,55 @@ TEST(Avx2Target, EveryRuleEmitterIsDeclared) {
     EXPECT_TRUE((*target)->isKnownEmitter(rule.emitter)) << rule.id;
   // The plugin's key list is target-private and reachable only from here.
   EXPECT_FALSE(avx2_mapping::emitterKeys().empty());
+}
+
+TEST(Avx2Target, ExposesAnEmitterForEachDeclaredKey) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  // The design §19 factory creates a target-owned emitter; its key is one the
+  // target declares, so generic code can hand it a bundle without knowing the
+  // AVX2 vocabulary.
+  std::unique_ptr<TargetEmitter> primary = (*target)->createEmitter();
+  ASSERT_NE(primary, nullptr);
+  EXPECT_TRUE((*target)->isKnownEmitter(primary->key()));
+
+  for (llvm::StringLiteral key : avx2_mapping::emitterKeys()) {
+    std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter(key);
+    ASSERT_NE(emitter, nullptr) << key.data();
+    EXPECT_EQ(emitter->key(), key);
+  }
+  // An undeclared key has no emitter rather than a fabricated one.
+  EXPECT_EQ((*target)->createEmitter("avx2_missing"), nullptr);
+}
+
+TEST(Avx2Target, EmitterVerifiesBundleCompleteness) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter();
+  ASSERT_NE(emitter, nullptr);
+  mlir::MLIRContext context;
+
+  // A bundle for the emitter's own key with well-typed parameters is complete.
+  EXPECT_FALSE(
+      static_cast<bool>(emitter->verify(makeBundle(emitter->key(), context))));
+
+  // A bundle naming an emitter the target does not declare is rejected.
+  llvm::Error unknown = emitter->verify(makeBundle("avx2_missing", context));
+  ASSERT_TRUE(static_cast<bool>(unknown));
+  EXPECT_NE(llvm::toString(std::move(unknown)).find("avx2_missing"),
+            std::string::npos);
+
+  // A parameter whose value is not the integer/string shape the plugin
+  // contract permits is rejected.
+  TargetBundle malformed = makeBundle(emitter->key(), context);
+  malformed.parameters = mlir::DictionaryAttr::get(
+      &context, {mlir::NamedAttribute(mlir::StringAttr::get(&context, "rows"),
+                                      mlir::UnitAttr::get(&context))});
+  llvm::Error badParameters = emitter->verify(malformed);
+  ASSERT_TRUE(static_cast<bool>(badParameters));
+  EXPECT_NE(llvm::toString(std::move(badParameters)).find("rows"),
+            std::string::npos);
 }
 
 TEST(Avx2Target, MatchesItsOwnRuleForTheVectorOperation) {

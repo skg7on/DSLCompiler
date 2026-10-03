@@ -3,6 +3,8 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.h"
 
+#include "mlir/IR/BuiltinAttributes.h"
+
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 
@@ -52,6 +54,20 @@ llvm::Expected<std::unique_ptr<MappingTarget>> loadTarget() {
   return accel_mapping::createMappingTarget(LLK_SOURCE_DIR);
 }
 
+/// A bundle naming `emitterKey` with one well-typed integer parameter.
+TargetBundle makeBundle(llvm::StringRef emitterKey,
+                        mlir::MLIRContext &context) {
+  TargetBundle bundle;
+  bundle.name = "accel.vector_add";
+  bundle.emitterKey = emitterKey.str();
+  bundle.parameters = mlir::DictionaryAttr::get(
+      &context,
+      {mlir::NamedAttribute(
+          mlir::StringAttr::get(&context, "tile"),
+          mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), 16))});
+  return bundle;
+}
+
 /// Whole-word search: `npu` must not match inside `$inputs`, and `npu_engine`
 /// must still be caught.
 bool mentionsWord(const std::string &text, const std::string &word) {
@@ -90,6 +106,47 @@ TEST(GenericAcceleratorTarget, EveryRuleEmitterIsDeclared) {
   for (const RuleDef &rule : (*target)->rules().all())
     EXPECT_TRUE((*target)->isKnownEmitter(rule.emitter)) << rule.id;
   EXPECT_FALSE(accel_mapping::emitterKeys().empty());
+}
+
+TEST(GenericAcceleratorTarget, ExposesAnEmitterForEachDeclaredKey) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  std::unique_ptr<TargetEmitter> primary = (*target)->createEmitter();
+  ASSERT_NE(primary, nullptr);
+  EXPECT_TRUE((*target)->isKnownEmitter(primary->key()));
+
+  for (llvm::StringRef key : accel_mapping::emitterKeys()) {
+    std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter(key);
+    ASSERT_NE(emitter, nullptr) << key.data();
+    EXPECT_EQ(emitter->key(), key);
+  }
+  EXPECT_EQ((*target)->createEmitter("accel_missing"), nullptr);
+}
+
+TEST(GenericAcceleratorTarget, EmitterVerifiesBundleCompleteness) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter();
+  ASSERT_NE(emitter, nullptr);
+  mlir::MLIRContext context;
+
+  EXPECT_FALSE(
+      static_cast<bool>(emitter->verify(makeBundle(emitter->key(), context))));
+
+  llvm::Error unknown = emitter->verify(makeBundle("accel_missing", context));
+  ASSERT_TRUE(static_cast<bool>(unknown));
+  EXPECT_NE(llvm::toString(std::move(unknown)).find("accel_missing"),
+            std::string::npos);
+
+  TargetBundle malformed = makeBundle(emitter->key(), context);
+  malformed.parameters = mlir::DictionaryAttr::get(
+      &context, {mlir::NamedAttribute(mlir::StringAttr::get(&context, "tile"),
+                                      mlir::UnitAttr::get(&context))});
+  llvm::Error badParameters = emitter->verify(malformed);
+  ASSERT_TRUE(static_cast<bool>(badParameters));
+  EXPECT_NE(llvm::toString(std::move(badParameters)).find("tile"),
+            std::string::npos);
 }
 
 TEST(GenericAcceleratorTarget, MapsAVectorNodeEndToEnd) {

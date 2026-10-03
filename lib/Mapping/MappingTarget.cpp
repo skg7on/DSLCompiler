@@ -73,6 +73,39 @@ std::optional<std::string> resolveMachineQuery(const MachineModel &machine,
   return std::nullopt;
 }
 
+/// The default emitter a `FileMappingTarget` hands out. It knows the one
+/// emitter key it handles and the full set the target declared, so it can
+/// reject a bundle the plugin cannot lower without the core ever reading the
+/// bundle as target semantics (design §14.3): the bundle's key is compared as
+/// an opaque string, and a parameter is checked only for the integer/string
+/// *shape* the rule parser types bundle parameters with -- never for meaning.
+class DeclaredEmitter : public TargetEmitter {
+public:
+  DeclaredEmitter(std::string key, std::vector<std::string> declaredKeys)
+      : key_(std::move(key)), declaredKeys_(std::move(declaredKeys)) {}
+
+  llvm::StringRef key() const override { return key_; }
+
+  llvm::Error verify(const TargetBundle &bundle) const override {
+    if (!llvm::is_contained(declaredKeys_, bundle.emitterKey))
+      return targetError("bundle names emitter '" + bundle.emitterKey +
+                         "', which this target does not declare");
+    if (bundle.emitterKey != key_)
+      return targetError("bundle names emitter '" + bundle.emitterKey +
+                         "', but this emitter handles '" + key_ + "'");
+    for (mlir::NamedAttribute entry : bundle.parameters)
+      if (!mlir::isa<mlir::IntegerAttr>(entry.getValue()) &&
+          !mlir::isa<mlir::StringAttr>(entry.getValue()))
+        return targetError("bundle parameter '" + entry.getName().str() +
+                           "' is not an integer or string value");
+    return llvm::Error::success();
+  }
+
+private:
+  std::string key_;
+  std::vector<std::string> declaredKeys_;
+};
+
 } // namespace
 
 FileMappingTarget::FileMappingTarget(std::string name, MachineModel machine,
@@ -85,6 +118,19 @@ FileMappingTarget::FileMappingTarget(std::string name, MachineModel machine,
 
 bool FileMappingTarget::isKnownEmitter(llvm::StringRef key) const {
   return llvm::is_contained(emitterKeys_, key);
+}
+
+std::unique_ptr<TargetEmitter>
+FileMappingTarget::createEmitter(llvm::StringRef key) const {
+  if (!isKnownEmitter(key))
+    return nullptr;
+  return std::make_unique<DeclaredEmitter>(key.str(), emitterKeys_);
+}
+
+std::unique_ptr<TargetEmitter> FileMappingTarget::createEmitter() const {
+  if (emitterKeys_.empty())
+    return nullptr;
+  return createEmitter(emitterKeys_.front());
 }
 
 llvm::Error verifyMappingTarget(const MappingTarget &target) {
