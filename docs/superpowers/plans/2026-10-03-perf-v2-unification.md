@@ -86,3 +86,110 @@ them.
 
 Every field is appended to its struct, so existing aggregate initialisers and
 v2 profiles keep working unchanged.
+
+## Slice 2b: LLKPerf runs on v2, and v1 is retired (2026-10-03)
+
+`LLKPerf`'s five consumers -- `MicroDAG`, `MicroCostModel`, `Legality`,
+`MicroPerfReport`, `TuningSession` -- now read `LLKMachine`'s v2 model. The v1
+model, its loader, its test, and both v1 profiles are deleted; `LLKPerf` links
+`LLKMachine`.
+
+### Semantic mappings
+
+- **resource kinds -> nodes.** `machine.dma.engines` becomes
+  `transferEngineCount()`; an engine's multiplicity is a node's `concurrency`;
+  `findMemory("sram")` becomes `findMemoryOfKind("sram")`.
+- **a kind hierarchy -> executor containment.** v1 nested owner *kinds*
+  (`vector_engine` under `lane` under `worker`); v2 nests concrete executors, so
+  `nestedUnder` now looks for an executor of the inner kind beneath one of the
+  outer kind.
+- **fixed triples -> variable rank.** `tile_shapes` were `[m, n, k]`; v2
+  `shapes` are arbitrary-rank, so fragment arithmetic filters by rank.
+- **a value clock -> an optional one.** `predictedNs` is zero without a clock.
+
+### The profile is a translation, not a redesign
+
+`machines/x86-avx2-v2.yaml` was re-authored to carry v1's numbers, because the
+performance suite's baselines are those numbers. Three translations were needed:
+
+1. v1's owner kinds with multiplicities became one executor per kind carrying
+   the count as `concurrency`, chained by v1's parent relation
+   (`worker.0 -> lane.0 -> veng.0`). This is also what keeps
+   `owner_mapping = "worker/vector_engine"` legal.
+2. v1's engine classes (`matrix_engines: count 8`) became **one** capability
+   node with `concurrency: 8`, not eight nodes of one. A schedule that names an
+   engine must share its slots; eight nodes would give it one slot each, and the
+   spatial-overlap tests caught exactly that.
+3. Each link carries what v1's copy formula produced for that hop -- the slower
+   endpoint's latency, the destination's bandwidth -- since v1 charged copies
+   from their endpoints and v2 charges them from the link.
+
+### Verification
+
+- `ninja -C build` clean; `ctest` **102 registered, 100 passed, 2 skipped, 0 failed**.
+- The only expectations that changed are *identities*, not numbers: the machine
+  name in reports (`x86-avx2-cpu` -> `x86-avx2`, the v2 profile's `target`), and
+  the engine named in a layout warning (`avx2-vector` -> `vpu`). Every cycle
+  estimate, bottleneck, capacity check, and overlap number is unchanged.
+
+## Slice 3: route-hop accounting and a shared cost vocabulary (2026-10-03)
+
+### One vocabulary
+
+The mapping search and the evaluator now name machine work the same way.
+`LLK/Mapping/CostEvent.h` defines the five categories -- compute, transfer hop,
+transform, synchronization, capacity -- and `CostEvent { kind, resource, cost }`.
+Every `MicroEvent` carries a `costKind`, assigned once in the builder's
+`addEvent`, so a report and a selected plan can be compared category by
+category. `LLKPerf` links `LLKMapping` for it: the evaluator consumes mapped
+events, which is the direction the design already draws.
+
+### Every route hop is observed
+
+A mapped kernel carries the routes its plan chose in `micro.routes`. The DAG
+builder reads them before walking and, for a movement whose endpoint *spaces*
+match a route's endpoints, emits **one event per hop** -- each charged from its
+own link's latency and bandwidth, each chained behind the previous one -- rather
+than a single endpoint-to-endpoint transfer. A concrete `micro.async_copy` names
+spaces (`dram` to `sram`) while a route names nodes (`dram.0`), so the two are
+matched on the endpoints' kinds.
+
+An unrouted movement is unchanged: still one event, still charged by the v1
+formula. Nothing in the existing suite moved.
+
+### Verification
+
+- `ninja -C build` clean; `ctest` **102 registered, 100 passed, 2 skipped, 0 failed**.
+- New: `L1ResourceDag.ARoutedMovementIsChargedPerHop` (two events, chained, for a
+  two-hop route) and `L1ResourceDag.EveryEventCarriesItsSharedCostCategory`;
+  `CostEvent.EveryKindRoundTripsThroughItsName`.
+
+## Slice 4: an optional LatencyProvider (2026-10-03)
+
+`LLK/Mapping/LatencyProvider.h` adds the last piece the four items needed: an
+optional source of measured or calibrated cycles, with static cost as the
+fallback.
+
+- `OperationSignature` carries the whole cache key (design §17.4) -- operation,
+  rule and version, bundle, layout, placement class, route class, and the
+  cost-model version -- and renders canonically, so two lookups describing the
+  same work compare equal.
+- `TargetContext` names the target and the machine profile's content hash, so a
+  measurement from another machine, or from this one before its profile
+  changed, is not this measurement.
+- `LatencyProvider::lookupCycles` returns `nullopt` for "no entry".
+- `MappingTarget::latencyProvider()` defaults to null, so a target that
+  predates measurement works unchanged.
+
+The covering search consults the provider once per placed instance and keeps
+the static estimate when it declines. **Legality is not revisited**: a
+measurement that says work is expensive does not make a plan illegal, which is
+what the design means by measurement changing cost estimates without redefining
+legality.
+
+### Verification
+
+- `ninja -C build` clean; `ctest` **102 registered, 100 passed, 2 skipped, 0 failed**.
+- New: a measurement re-ranks the plans and the measured rule wins; an entryless
+  provider falls back to the declared cost; and a provider claiming every rule
+  is enormously expensive still yields a legal plan.

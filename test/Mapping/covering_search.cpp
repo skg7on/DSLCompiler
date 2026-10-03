@@ -1,6 +1,7 @@
 //===- covering_search.cpp - Complete-plan search (D6) -------------------===//
 
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/LatencyProvider.h"
 
 #include "llvm/Support/Error.h"
 
@@ -115,6 +116,34 @@ std::unique_ptr<MappingTarget> targetWith(MachineModel machine,
   return std::make_unique<FileMappingTarget>(
       "test", std::move(machine), LayoutRegistry{}, std::move(*registry),
       std::vector<std::string>{"e1"});
+}
+
+/// A provider that answers from a table keyed by rule id, and records what it
+/// was asked for.
+class FixedLatencyProvider : public LatencyProvider {
+public:
+  std::map<std::string, double> byRule;
+  mutable std::vector<std::string> lookups;
+
+  std::optional<double> lookupCycles(const OperationSignature &signature,
+                                     const TargetContext &) const override {
+    lookups.push_back(signature.canonicalString());
+    auto it = byRule.find(signature.rule);
+    if (it == byRule.end())
+      return std::nullopt;
+    return it->second;
+  }
+};
+
+std::unique_ptr<MappingTarget>
+targetWithProvider(MachineModel machine, llvm::StringRef rules,
+                   const LatencyProvider *provider) {
+  llvm::Expected<RuleRegistry> registry = parseRuleText(rules, "<test>");
+  if (!registry)
+    return nullptr;
+  return std::make_unique<FileMappingTarget>(
+      "test", std::move(machine), LayoutRegistry{}, std::move(*registry),
+      std::vector<std::string>{"e1"}, provider);
 }
 
 std::vector<PlanId> planIds(const MappingSearchResult &result) {
@@ -271,4 +300,88 @@ TEST(CoveringSearch, ReportsCapacityRejection) {
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   EXPECT_TRUE(result->plans.empty());
   EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+//===----------------------------------------------------------------------===//
+// Measured latencies
+//===----------------------------------------------------------------------===//
+
+TEST(CoveringSearch, NoProviderLeavesTheStaticEstimate) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+  EXPECT_EQ(target->latencyProvider(), nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result));
+  ASSERT_FALSE(result->plans.empty());
+  // The cheapest declared rule is 1 per node.
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 2.0);
+}
+
+TEST(CoveringSearch, AMeasurementChangesTheCostAndTheRanking) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  FixedLatencyProvider provider;
+  // The declared-cheap rule is measured to be slow, and the other fast.
+  provider.byRule["r.cheap"] = 100.0;
+  provider.byRule["r.expensive"] = 2.0;
+
+  std::unique_ptr<MappingTarget> target =
+      targetWithProvider(searchMachine(), kRules, &provider);
+  ASSERT_NE(target, nullptr);
+  EXPECT_EQ(target->latencyProvider(), &provider);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // Two nodes at the measured 2 cycles each; the declared 1 no longer wins.
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 4.0);
+  ASSERT_FALSE(result->plans[0].placements.empty());
+  EXPECT_EQ(result->plans[0].placements[0].rule, "r.expensive");
+  EXPECT_FALSE(provider.lookups.empty());
+}
+
+TEST(CoveringSearch, AnEntrylessProviderFallsBackToStaticCost) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  FixedLatencyProvider provider; // no entries at all
+
+  std::unique_ptr<MappingTarget> target =
+      targetWithProvider(searchMachine(), kRules, &provider);
+  ASSERT_NE(target, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result));
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 2.0);
+  EXPECT_FALSE(provider.lookups.empty()); // it was asked, and declined
+}
+
+TEST(CoveringSearch, AnExpensiveMeasurementDoesNotMakeAPlanIllegal) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  FixedLatencyProvider provider;
+  provider.byRule["r.cheap"] = 1e9;
+  provider.byRule["r.expensive"] = 1e9;
+
+  std::unique_ptr<MappingTarget> target =
+      targetWithProvider(searchMachine(), kRules, &provider);
+  ASSERT_NE(target, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  // Measurement changes what work costs, never what is allowed.
+  EXPECT_FALSE(result->plans.empty());
 }

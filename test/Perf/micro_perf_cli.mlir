@@ -5,7 +5,7 @@
 // the acceptance criteria for the tool cover both, and neither run sees the
 // other's prefixes.
 //
-// RUN: micro-perf --machine=machines/x86-avx2-cpu.yaml --level=1 %s | FileCheck %s
+// RUN: micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 %s | FileCheck %s
 // RUN: micro-perf --help 2>&1 | FileCheck --check-prefix=HELP %s
 
 // A concrete tile GEMM: stage A and B from DRAM through SRAM, run one
@@ -34,7 +34,7 @@ module {
 }
 
 // CHECK: schema_version: 1
-// CHECK: machine: x86-avx2-cpu
+// CHECK: machine: x86-avx2
 // CHECK: kernel: gemm_tile
 // CHECK: level: 1
 // CHECK: totals:
@@ -75,4 +75,4 @@ module {
 // composed from both endpoints and the report says so rather than inventing a
 // cost silently.
 // CHECK: warnings:
-// CHECK:   - "machine 'x86-avx2-cpu' declares no copy path 'acc -> dram'; its cost is composed from both endpoints"
+// CHECK:   - "machine 'x86-avx2' declares no copy path 'acc -> dram'; its cost is composed from both endpoints"

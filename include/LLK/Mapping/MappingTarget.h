@@ -18,6 +18,7 @@
 #define LLK_MAPPING_MAPPINGTARGET_H
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
 #include "LLK/Mapping/MappingRules.h"
 
@@ -50,6 +51,13 @@ public:
   virtual const LayoutRegistry &layouts() const = 0;
   virtual const RuleRegistry &rules() const = 0;
   virtual bool isKnownEmitter(llvm::StringRef key) const = 0;
+
+  /// Optional measured or calibrated latencies. Null means the target has
+  /// none -- and a provider with no entry for a signature is the same as null
+  /// *for that lookup*: the static estimate stands and legality is unaffected
+  /// (design §17.3). Defaulting to null keeps a target that predates
+  /// measurement working unchanged.
+  virtual const LatencyProvider *latencyProvider() const { return nullptr; }
 };
 
 /// A target built from already-loaded registries. `loadMappingTarget` is the
@@ -57,15 +65,19 @@ public:
 /// assemble a target in memory.
 class FileMappingTarget : public MappingTarget {
 public:
+  /// `provider` is borrowed, not owned: the caller keeps it alive for as long
+  /// as the target is used.
   FileMappingTarget(std::string name, machine::MachineModel machine,
                     LayoutRegistry layouts, RuleRegistry rules,
-                    std::vector<std::string> emitterKeys);
+                    std::vector<std::string> emitterKeys,
+                    const LatencyProvider *provider = nullptr);
 
   llvm::StringRef name() const override { return name_; }
   const machine::MachineModel &machine() const override { return machine_; }
   const LayoutRegistry &layouts() const override { return layouts_; }
   const RuleRegistry &rules() const override { return rules_; }
   bool isKnownEmitter(llvm::StringRef key) const override;
+  const LatencyProvider *latencyProvider() const override { return provider_; }
 
 private:
   std::string name_;
@@ -73,6 +85,7 @@ private:
   LayoutRegistry layouts_;
   RuleRegistry rules_;
   std::vector<std::string> emitterKeys_;
+  const LatencyProvider *provider_ = nullptr;
 };
 
 /// Loads a target from a machine profile, a layout file, a rule file, and the

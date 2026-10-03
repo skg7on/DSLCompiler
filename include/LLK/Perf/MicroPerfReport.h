@@ -18,7 +18,7 @@
 #ifndef LLK_PERF_MICROPERFREPORT_H
 #define LLK_PERF_MICROPERFREPORT_H
 
-#include "LLK/Perf/MachineModel.h"
+#include "LLK/Machine/MachineModel.h"
 #include "LLK/Perf/MicroCostModel.h"
 #include "LLK/Perf/MicroDAG.h"
 
@@ -64,9 +64,9 @@ struct MicroPerfReport {
 
 /// Analyzes one `micro.kernel` against `machine`. `level` selects how far the
 /// analysis goes: 0 stops at the static bound, 1 also schedules.
-llvm::Expected<MicroPerfReport> analyzeKernel(mlir::Operation *kernel,
-                                              const MachineModel &machine,
-                                              unsigned level);
+llvm::Expected<MicroPerfReport>
+analyzeKernel(mlir::Operation *kernel, const machine::MachineModel &machine,
+              unsigned level);
 
 void printMicroPerfYaml(llvm::raw_ostream &os, const MicroPerfReport &report);
 void printMicroPerfText(llvm::raw_ostream &os, const MicroPerfReport &report);

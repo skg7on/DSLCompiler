@@ -18,7 +18,9 @@
 
 #include "LLK/Mapping/CoveringSearch.h"
 
+#include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/Routing.h"
+#include "LLK/Mapping/StableHash.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -50,6 +52,9 @@ constexpr uint64_t kAssumedAlignment = 32;
 struct InstanceEntry {
   CandidateInstance instance;
   const RuleDef *rule = nullptr;
+  /// The instance's cost, after any measurement the target provides. Legality
+  /// was decided before this and is not revisited.
+  Cost cost;
 };
 
 struct NodeTable {
@@ -167,8 +172,33 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                                            ": rule '" + rule->id +
                                            "' has no legal placement");
       }
-      for (CandidateInstance &instance : *instances)
-        table.instances.push_back(InstanceEntry{std::move(instance), rule});
+      for (CandidateInstance &instance : *instances) {
+        InstanceEntry entry{std::move(instance), rule, {}};
+        entry.cost = entry.instance.localCost;
+        if (const LatencyProvider *provider = target_.latencyProvider()) {
+          OperationSignature signature;
+          signature.operation = node->opName;
+          signature.rule = rule->id;
+          signature.ruleVersion = rule->version;
+          signature.bundle = rule->bundle;
+          if (!entry.instance.layoutBindings.empty()) {
+            std::vector<std::string> layouts;
+            for (const auto &binding : entry.instance.layoutBindings)
+              layouts.push_back(binding.second);
+            llvm::sort(layouts);
+            signature.layout = layouts.front();
+          }
+          if (const machine::ExecutorNode *executor = machine.findExecutor(
+                  entry.instance.executorBindings.lookup("executor")))
+            signature.placementClass = executor->kind;
+          TargetContext context{target_.name().str(),
+                                hexId(machine.contentHash)};
+          if (std::optional<double> measured =
+                  provider->lookupCycles(signature, context))
+            entry.cost.latencyCycles = *measured;
+        }
+        table.instances.push_back(std::move(entry));
+      }
     }
     tables.push_back(std::move(table));
   }
@@ -197,7 +227,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   // connection whose other endpoint is already chosen. Returns false when the
   // branch is illegal or over budget.
   auto extend = [&](Partial &partial, size_t nodeIndex,
-                    const CandidateInstance &instance) -> bool {
+                    const InstanceEntry &entry) -> bool {
+    const CandidateInstance &instance = entry.instance;
     partial.chosen[nodeIndex] = &instance;
     ++partial.covered;
     partial.executorSlots += instance.resourceUsage.executorSlots;
@@ -216,16 +247,17 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     }
 
     Cost cost = partial.cost;
-    cost = addCost(cost, instance.localCost);
+    cost = addCost(cost, entry.cost);
 
     for (const Edge &edge : edges) {
       const CandidateInstance *other = nullptr;
       const CandidateInstance *producer = nullptr;
       const CandidateInstance *consumer = nullptr;
       if (edge.consumer == nodeIndex) {
+        // The instance being added reads the edge, so the *other* end produces.
         other = partial.chosen[edge.producer];
-        producer = &instance;
-        consumer = other;
+        producer = other;
+        consumer = &instance;
       } else if (edge.producer == nodeIndex) {
         other = partial.chosen[edge.consumer];
         producer = &instance;
@@ -247,11 +279,17 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       llvm::Expected<std::vector<ConnectionPlan>> alternatives =
           synthesizeConnections(request, machine, topology, placementOptions);
       if (!alternatives) {
-        pendingError = alternatives.takeError();
+        result.frontier.messages.push_back(
+            "connection " + request.producerMemory + " -> " +
+            request.consumerMemory + ": " +
+            llvm::toString(alternatives.takeError()));
         return false;
       }
       if (alternatives->empty()) {
         ++result.frontier.incompatibleInstancePairs;
+        result.frontier.messages.push_back(
+            "connection " + request.producerMemory + " -> " +
+            request.consumerMemory + ": no legal route");
         return false;
       }
       // The cheapest alternative is the one a plan would use.
@@ -309,7 +347,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           continue;
         for (const InstanceEntry &entry : tables[*node].instances) {
           Partial branch = partial;
-          if (extend(branch, *node, entry.instance)) {
+          if (extend(branch, *node, entry)) {
             branch.lowerBound = bound(branch);
             next.push_back(std::move(branch));
           }
@@ -355,7 +393,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         if (stop)
           return;
         Partial branch = partial;
-        if (!extend(branch, *node, entry.instance))
+        if (!extend(branch, *node, entry))
           continue;
         if (exact) {
           branch.lowerBound = bound(branch);

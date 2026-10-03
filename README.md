@@ -157,6 +157,7 @@ Future targets should reuse the same Micro-IR contract with different MachineMod
 | [docs/design/m4-parallel-execution.md](docs/design/m4-parallel-execution.md) | M4 design: thread pool, parallel decomposition, dispatch thresholds |
 | [docs/design/m5-specialization-tuning.md](docs/design/m5-specialization-tuning.md) | M5 design: M-bucketing, JIT cache, schedule DB, autotuning foundation |
 | [docs/design/m6-multi-kernel.md](docs/design/m6-multi-kernel.md) | M6 design: RoPE, Attention, online softmax, shared infrastructure |
+| [docs/design/micro-ir-mapping-workflow.md](docs/design/micro-ir-mapping-workflow.md) | **Start here to use the compiler**: the tile-centric workflow, the tools, MachineModel customization, and the target-independent mapping chain |
 | [docs/design/m9-canonical-micro-ir-architecture.md](docs/design/m9-canonical-micro-ir-architecture.md) | M9+ architecture: canonical Micro-IR, MachineModel, performance evaluation, auto-search |
 | [docs/design/m9-micro-ir-core-concepts.md](docs/design/m9-micro-ir-core-concepts.md) | Core `micro` concepts: execution IR, search IR, attributes, verifier invariants |
 | [docs/superpowers/specs/2026-08-11-canonical-micro-ir-redesign.md](docs/superpowers/specs/2026-08-11-canonical-micro-ir-redesign.md) | Full canonical Micro-IR redesign spec and milestone contract |
@@ -225,8 +226,8 @@ Machine profiles are YAML files under `machines/` and are loaded into typed C++ 
 
 Initial profiles:
 
-- `machines/x86-avx2-cpu.yaml`
-- `machines/generic-ai-accel-v1.yaml`
+- `machines/x86-avx2-v2.yaml`
+- `machines/generic-ai-accel-v2.yaml`
 
 ### 5. Evaluation and Optimization Layer
 
@@ -252,10 +253,10 @@ llk-compile --emit=micro input.mlir
 llk-compile --emit=micro-search input.mlir
 
 # Evaluate concrete Micro-IR against a machine profile
-micro-perf --machine machines/x86-avx2-cpu.yaml --level l1 input.micro.mlir
+micro-perf --machine machines/x86-avx2-v2.yaml --level l1 input.micro.mlir
 
 # Tune candidates from a Micro search space
-llk-tune --search-space swiglu.micro.mlir --machine machines/x86-avx2-cpu.yaml
+llk-tune --search-space swiglu.micro.mlir --machine machines/x86-avx2-v2.yaml
 ```
 
 These commands document the intended M9-M13 interface. They become available as the corresponding issues land.

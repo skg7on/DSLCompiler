@@ -16,7 +16,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
-#include "LLK/Perf/MachineModelLoader.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Perf/MicroCostModel.h"
 #include "LLK/Perf/MicroDAG.h"
 
@@ -72,80 +72,78 @@ std::unique_ptr<Parsed> parseKernel(llvm::StringRef source,
 
 /// A machine with one flop per cycle per matrix engine, a wide accumulator, and
 /// DMA slots the caller chooses. Only the parts the scheduler reads are set.
+///
+/// Built in the v2 shape: `workers` are executors, `matrixEngines` and
+/// `dmaEngines` are counts of concrete capability and transfer nodes, which is
+/// what the scheduler's slot arithmetic reads.
 std::string testMachine(unsigned dmaEngines, unsigned workers,
                         unsigned matrixEngines) {
-  return llvm::formatv(R"YAML(
-schema_version: 1
-name: test-machine
-clock_hz: 1000000000
+  std::string yaml = "schema: llk.machine.v2\n"
+                     "target: test-machine\n"
+                     "clock_hz: 1000000000\n"
+                     "worker_threads: " +
+                     std::to_string(workers) +
+                     "\nsync:\n  barrier_cycles: 1\n  wait_cycles: 0\n"
+                     "executors:\n"
+                     "  - id: cluster.0\n    kind: cluster\n";
+  for (unsigned i = 0; i < workers; ++i)
+    yaml += "  - id: worker." + std::to_string(i) +
+            "\n    kind: worker\n    parent: cluster.0\n";
 
-compute:
-  owners:
-    worker:
-      count: {0}
-  matrix_engines:
-    - name: mxu
-      count: {1}
-      tile_shapes:
-        - [1, 1, 1]
-      input_dtypes: [f32, bf16]
-      accumulator_dtypes: [f32]
-      issue_cycles: 1
-      latency_cycles: 1
-      flops_per_cycle: 1
-      supported_layouts: [row_major]
-  vector_engines:
-    - name: vpu
-      count: 1
-      lanes:
-        f32: 8
-        bf16: 16
-      issue_cycles: 1
-      latency_cycles: 1
-      supported_layouts: [row_major]
+  yaml += "memories:\n";
+  for (const auto &level : {std::pair<const char *, uint64_t>{"dram", 1048576},
+                            {"l2", 262144},
+                            {"sram", 65536},
+                            {"acc", 65536}}) {
+    yaml += "  - id: " + std::string(level.first) +
+            ".0\n    kind: " + level.first +
+            "\n    visible_from: cluster.0\n    capacity_bytes: " +
+            std::to_string(level.second) +
+            "\n    alignment_bytes: 64\n"
+            "    supported_layouts: [row_major]\n"
+            "    bandwidth_bytes_per_cycle: 64\n    latency_cycles: 1\n";
+  }
 
-memory:
-  dram:
-    capacity_bytes: 1048576
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 1
-    supported_layouts: [row_major]
-  sram:
-    capacity_bytes: 65536
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 1
-    supported_layouts: [row_major]
-  acc:
-    capacity_bytes: 65536
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 1
-    supported_layouts: [row_major]
+  // One capability node carrying the whole multiplicity: v1's
+  // `matrix_engines: count: N` is one engine *class*, and a schedule that
+  // names it must share all N slots rather than get one.
+  yaml += "compute:\n";
+  yaml += "  - id: mxu\n    kind: matrix_engine\n    attached_to: worker.0\n"
+          "    element_types: [f32, bf16]\n    accumulator_dtypes: [f32]\n"
+          "    shapes: [[1, 1, 1]]\n    issue_cycles: 1\n"
+          "    latency_cycles: 1\n    throughput_per_cycle: 1\n"
+          "    concurrency: " +
+          std::to_string(matrixEngines) +
+          "\n    supported_layouts: [row_major]\n";
+  yaml += "  - id: vpu\n    kind: vector_engine\n    attached_to: worker.0\n"
+          "    element_types: [f32, bf16]\n    shapes: [[8]]\n"
+          "    lanes: {f32: 8, bf16: 16}\n    issue_cycles: 1\n"
+          "    latency_cycles: 1\n    supported_layouts: [row_major]\n";
 
-dma:
-  engines: {2}
-  max_outstanding: 1
-  paths:
-    - src: dram
-      dst: sram
-    - src: sram
-      dst: dram
-    - src: sram
-      dst: acc
-    - src: acc
-      dst: sram
+  yaml += "transfer_engines:\n";
+  for (unsigned i = 0; i < dmaEngines; ++i)
+    yaml += "  - id: dma." + std::to_string(i) +
+            "\n    kind: dma\n    attached_to: cluster.0\n"
+            "    count: 1\n    max_outstanding: 1\n";
 
-sync:
-  barrier_cycles: 1
-  wait_cycles: 0
-)YAML",
-                       workers, matrixEngines, dmaEngines);
+  yaml += "links:\n";
+  const char *paths[6][2] = {{"dram", "sram"}, {"sram", "dram"},
+                             {"sram", "acc"},  {"acc", "sram"},
+                             {"dram", "l2"},   {"l2", "sram"}};
+  for (unsigned i = 0; i < 6; ++i)
+    yaml += "  - id: " + std::string(paths[i][0]) + "_to_" + paths[i][1] +
+            ".0\n    source: " + paths[i][0] +
+            ".0\n    destination: " + paths[i][1] +
+            ".0\n    bandwidth_bytes_per_cycle: 64\n    latency_cycles: 1\n"
+            "    transaction_bytes: 64\n    transfer_engines: [dma.0]\n";
+  return yaml;
 }
 
-MachineModel parseMachine(llvm::StringRef yaml) {
-  auto model = parseMachineModel(yaml, "test-machine.yaml");
+machine::MachineModel parseMachine(llvm::StringRef yaml) {
+  auto model = machine::parseMachineModel(yaml, "test-machine.yaml");
   if (!model) {
     ADD_FAILURE() << llvm::toString(model.takeError());
-    return MachineModel();
+    return machine::MachineModel();
   }
   return *model;
 }
@@ -239,7 +237,8 @@ std::string withStages(llvm::StringRef source, unsigned stages) {
 TEST(L1ResourceDag, CopyWaitMmaIsScheduledInOrder) {
   auto parsed = parseKernel(kChainKernel);
   ASSERT_TRUE(parsed);
-  MachineModel model = parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
+  machine::MachineModel model =
+      parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -264,9 +263,9 @@ TEST(L1ResourceDag, IndependentCopiesOverlapWithMoreDmaEngines) {
   auto parsed = parseKernel(kCopiesKernel);
   ASSERT_TRUE(parsed);
 
-  MachineModel serialMachine =
+  machine::MachineModel serialMachine =
       parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
-  MachineModel parallelMachine =
+  machine::MachineModel parallelMachine =
       parseMachine(testMachine(/*dmaEngines=*/2, 2, 4));
 
   auto dag = buildMicroDAG(parsed->kernel, serialMachine);
@@ -286,7 +285,8 @@ TEST(L1ResourceDag, IndependentCopiesOverlapWithMoreDmaEngines) {
 TEST(L1ResourceDag, PipeliningOverlapsMovementWithCompute) {
   auto parsed = parseKernel(withStages(kPipelinedKernel, 2));
   ASSERT_TRUE(parsed);
-  MachineModel model = parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
+  machine::MachineModel model =
+      parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
 
   auto pipelined = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(pipelined))
@@ -308,8 +308,9 @@ TEST(L1ResourceDag, OwnerCountCapsConcurrentExecutionTiles) {
   auto parsed = parseKernel(kSpatialKernel);
   ASSERT_TRUE(parsed);
 
-  MachineModel wideMachine = parseMachine(testMachine(/*dmaEngines=*/1, 4, 4));
-  MachineModel narrowMachine =
+  machine::MachineModel wideMachine =
+      parseMachine(testMachine(/*dmaEngines=*/1, 4, 4));
+  machine::MachineModel narrowMachine =
       parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
 
   auto dag = buildMicroDAG(parsed->kernel, wideMachine);
@@ -340,7 +341,8 @@ TEST(L1ResourceDag, OwnerOccupancyCanBeTheBottleneck) {
   ASSERT_TRUE(parsed);
   // One worker and plenty of matrix engines: nothing but the owner limits how
   // much of the kernel runs at once, so that is the bottleneck.
-  MachineModel model = parseMachine(testMachine(/*dmaEngines=*/1, 1, 4));
+  machine::MachineModel model =
+      parseMachine(testMachine(/*dmaEngines=*/1, 1, 4));
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -379,7 +381,8 @@ TEST(L1ResourceDag, NamingAnEngineDoesNotDuplicateItsSlots) {
 
   auto parsed = parseKernel(source);
   ASSERT_TRUE(parsed);
-  MachineModel model = parseMachine(testMachine(/*dmaEngines=*/1, 4, 4));
+  machine::MachineModel model =
+      parseMachine(testMachine(/*dmaEngines=*/1, 4, 4));
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -394,7 +397,8 @@ TEST(L1ResourceDag, NamingAnEngineDoesNotDuplicateItsSlots) {
 TEST(L1ResourceDag, BottleneckNamesTheBusiestResource) {
   auto copies = parseKernel(kCopiesKernel);
   ASSERT_TRUE(copies);
-  MachineModel model = parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
+  machine::MachineModel model =
+      parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
 
   auto copyDag = buildMicroDAG(copies->kernel, model);
   ASSERT_TRUE(static_cast<bool>(copyDag))
@@ -423,7 +427,8 @@ TEST(L1ResourceDag, BottleneckNamesTheBusiestResource) {
 TEST(L1ResourceDag, ScheduleBeatsTheStaticBoundOnlyWhenItOverlaps) {
   auto parsed = parseKernel(kChainKernel);
   ASSERT_TRUE(parsed);
-  MachineModel model = parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
+  machine::MachineModel model =
+      parseMachine(testMachine(/*dmaEngines=*/1, 2, 4));
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -438,4 +443,75 @@ TEST(L1ResourceDag, ScheduleBeatsTheStaticBoundOnlyWhenItOverlaps) {
 }
 
 } // namespace
+} // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+
+//===----------------------------------------------------------------------===//
+// Route-hop accounting
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The same copy twice: once as written, once carrying the route a selected
+/// plan chose through the hierarchy.
+constexpr llvm::StringLiteral kPlainCopy = R"mlir(
+module {
+  micro.kernel @copy {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.yield
+  }
+}
+)mlir";
+
+constexpr llvm::StringLiteral kRoutedCopy = R"mlir(
+module {
+  micro.kernel @copy attributes {micro.routes = [{value = 0 : i64, kind = "transfer", route = ["dram.0", "l2.0", "sram.0"]}]} {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.yield
+  }
+}
+)mlir";
+
+} // namespace
+
+TEST(L1ResourceDag, ARoutedMovementIsChargedPerHop) {
+  auto plain = parseKernel(kPlainCopy);
+  auto routed = parseKernel(kRoutedCopy);
+  ASSERT_TRUE(plain);
+  ASSERT_TRUE(routed);
+
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  auto plainDag = buildMicroDAG(plain->kernel, model);
+  auto routedDag = buildMicroDAG(routed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(plainDag))
+      << llvm::toString(plainDag.takeError());
+  ASSERT_TRUE(static_cast<bool>(routedDag))
+      << llvm::toString(routedDag.takeError());
+
+  // Unrouted: one transfer from endpoint to endpoint.
+  EXPECT_EQ(plainDag->events.size(), 1u);
+  // Routed: the plan chose dram -> l2 -> sram, so the simulator sees both
+  // links.
+  ASSERT_EQ(routedDag->events.size(), 2u);
+  for (const MicroEvent &event : routedDag->events)
+    EXPECT_EQ(event.costKind, mapping::CostEventKind::TransferHop);
+
+  // The second hop waits for the first: data has to arrive before it moves on.
+  ASSERT_EQ(routedDag->events[1].deps.size(), 1u);
+  EXPECT_EQ(routedDag->events[1].deps[0], routedDag->events[0].id);
+}
+
+TEST(L1ResourceDag, EveryEventCarriesItsSharedCostCategory) {
+  auto parsed = parseKernel(kPlainCopy);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag));
+  ASSERT_FALSE(dag->events.empty());
+  EXPECT_EQ(dag->events[0].costKind, mapping::CostEventKind::TransferHop);
+}
+
 } // namespace mlir::llk::perf

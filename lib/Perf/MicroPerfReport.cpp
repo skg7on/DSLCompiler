@@ -107,9 +107,9 @@ std::string joinCounters(const std::map<std::string, uint64_t> &counters) {
 // Analysis
 //===----------------------------------------------------------------------===//
 
-llvm::Expected<MicroPerfReport> analyzeKernel(mlir::Operation *kernel,
-                                              const MachineModel &machine,
-                                              unsigned level) {
+llvm::Expected<MicroPerfReport>
+analyzeKernel(mlir::Operation *kernel, const machine::MachineModel &machine,
+              unsigned level) {
   if (level > 1)
     return invalid("unsupported analysis level " + llvm::Twine(level) +
                    "; micro-perf knows level 0 (static bound) and level 1 "
@@ -120,9 +120,9 @@ llvm::Expected<MicroPerfReport> analyzeKernel(mlir::Operation *kernel,
     return dag.takeError();
 
   MicroPerfReport report;
-  report.machine = machine.name;
+  report.machine = machine.target;
   report.level = level;
-  report.clockHz = machine.clockHz;
+  report.clockHz = machine.clockHz.value_or(0);
   if (auto symbol = kernel->getAttrOfType<mlir::StringAttr>("sym_name"))
     report.kernel = symbol.getValue().str();
   else

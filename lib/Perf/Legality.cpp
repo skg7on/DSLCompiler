@@ -95,14 +95,17 @@ std::string tripleText(llvm::ArrayRef<int64_t> shape) {
 /// The largest fragment an engine can issue, measured by volume. This is the
 /// fragment the cost model divides an execution tile by, so legality uses the
 /// same one.
-const std::array<int64_t, 3> &
-largestTileShape(const MatrixEngineModel &engine) {
-  const std::array<int64_t, 3> *best = &engine.tileShapes.front();
-  auto volume = [](const std::array<int64_t, 3> &shape) {
-    return shape[0] * shape[1] * shape[2];
+const std::vector<int64_t> &
+largestTileShape(const machine::ComputeNode &engine) {
+  auto volume = [](llvm::ArrayRef<int64_t> shape) {
+    int64_t product = 1;
+    for (int64_t extent : shape)
+      product *= extent;
+    return product;
   };
-  for (const std::array<int64_t, 3> &shape : engine.tileShapes)
-    if (volume(shape) > volume(*best))
+  const std::vector<int64_t> *best = &engine.shapes.front();
+  for (const std::vector<int64_t> &shape : engine.shapes)
+    if (shape.size() == best->size() && volume(shape) > volume(*best))
       best = &shape;
   return *best;
 }
@@ -168,16 +171,32 @@ std::optional<uint64_t> stagedTileBytes(const SearchSpace &space,
              *weightBytes;
 }
 
-bool nestedUnder(const MachineModel &machine, StringRef inner,
+bool isOfKind(const machine::MachineModel &machine,
+              const machine::ExecutorNode &executor, StringRef kind) {
+  return machine.ownerMatches(kind, executor.id);
+}
+
+bool nestedUnder(const machine::MachineModel &machine, StringRef inner,
                  StringRef outer) {
-  const OwnerModel *current = machine.findOwner(inner);
-  llvm::StringSet<> visited;
-  while (current && current->parent) {
-    if (*current->parent == outer)
-      return true;
-    if (!visited.insert(*current->parent).second)
-      break; // a cycle would otherwise spin; verifyMachineModel rejects these
-    current = machine.findOwner(*current->parent);
+  // v1 asked whether one owner *kind* sat under another in a kind hierarchy;
+  // v2 asks the same question of concrete executors, since that is where
+  // containment now lives.
+  for (const machine::ExecutorNode &executor : machine.executors) {
+    if (!isOfKind(machine, executor, inner))
+      continue;
+    const machine::ExecutorNode *current = &executor;
+    llvm::StringSet<> visited;
+    while (current && current->parent) {
+      const machine::ExecutorNode *parent =
+          machine.findExecutor(*current->parent);
+      if (!parent)
+        break;
+      if (isOfKind(machine, *parent, outer))
+        return true;
+      if (!visited.insert(parent->id).second)
+        break; // a cycle would otherwise spin; verifyMachineModel rejects these
+      current = parent;
+    }
   }
   return false;
 }
@@ -189,11 +208,11 @@ bool nestedUnder(const MachineModel &machine, StringRef inner,
 LegalityResult checkSramCapacity(const SearchSpace &space,
                                  const Candidate &candidate,
                                  const WorkloadShape &shape,
-                                 const MachineModel &machine) {
+                                 const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::SramCapacity;
-  const MemoryLevelModel *sram = machine.findMemory("sram");
+  const machine::MemoryNode *sram = machine.findMemoryOfKind("sram");
   if (!sram)
-    return illegal(kind, "machine '" + machine.name +
+    return illegal(kind, "machine '" + machine.target +
                              "' does not model memory 'sram'");
 
   IntResolver resolver{candidate, {}};
@@ -226,11 +245,11 @@ LegalityResult checkSramCapacity(const SearchSpace &space,
 LegalityResult checkAccCapacity(const SearchSpace &space,
                                 const Candidate &candidate,
                                 const WorkloadShape &shape,
-                                const MachineModel &machine) {
+                                const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::AccCapacity;
-  const MemoryLevelModel *acc = machine.findMemory("acc");
+  const machine::MemoryNode *acc = machine.findMemoryOfKind("acc");
   if (!acc)
-    return illegal(kind, "machine '" + machine.name +
+    return illegal(kind, "machine '" + machine.target +
                              "' does not model memory 'acc'");
 
   std::optional<int64_t> accBytes = dtypeBytes(shape.accumulatorDType);
@@ -257,34 +276,36 @@ LegalityResult checkAccCapacity(const SearchSpace &space,
 LegalityResult checkMmaCompatible(const SearchSpace &space,
                                   const Candidate &candidate,
                                   const WorkloadShape &shape,
-                                  const MachineModel &machine) {
+                                  const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::MmaCompatible;
-  if (machine.matrixEngines.empty())
-    return illegal(kind,
-                   "machine '" + machine.name + "' declares no matrix engine");
+  if (machine.computesOfKind("matrix_engine").empty())
+    return illegal(kind, "machine '" + machine.target +
+                             "' declares no matrix engine");
 
   // Any engine that accepts the dtype pair can run the contraction; the first
   // matching one is used, so a machine is not rejected because its *first*
   // engine happens to have a different dtype mix.
-  const MatrixEngineModel *engine = nullptr;
-  for (const MatrixEngineModel &candidateEngine : machine.matrixEngines)
-    if (llvm::is_contained(candidateEngine.inputDTypes, shape.inputDType) &&
-        llvm::is_contained(candidateEngine.accumulatorDTypes,
+  const machine::ComputeNode *engine = nullptr;
+  for (const machine::ComputeNode *candidateEngine :
+       machine.computesOfKind("matrix_engine"))
+    if (llvm::is_contained(candidateEngine->elementTypes, shape.inputDType) &&
+        llvm::is_contained(candidateEngine->accumulatorDTypes,
                            shape.accumulatorDType)) {
-      engine = &candidateEngine;
+      engine = candidateEngine;
       break;
     }
   if (!engine) {
-    const MatrixEngineModel &first = machine.matrixEngines.front();
-    if (!llvm::is_contained(first.inputDTypes, shape.inputDType))
-      return illegal(kind, "engine '" + first.name +
+    const machine::ComputeNode *first =
+        machine.computesOfKind("matrix_engine").front();
+    if (!llvm::is_contained(first->elementTypes, shape.inputDType))
+      return illegal(kind, "engine '" + first->id +
                                "' does not support input dtype '" +
                                shape.inputDType + "' (supported: " +
-                               llvm::join(first.inputDTypes, ", ") + ")");
+                               llvm::join(first->elementTypes, ", ") + ")");
     return illegal(kind, "no matrix engine supports accumulator dtype '" +
                              shape.accumulatorDType + "' (engine '" +
-                             first.name + "' supports: " +
-                             llvm::join(first.accumulatorDTypes, ", ") + ")");
+                             first->id + "' supports: " +
+                             llvm::join(first->accumulatorDTypes, ", ") + ")");
   }
 
   if (isMasked(space, candidate))
@@ -297,11 +318,11 @@ LegalityResult checkMmaCompatible(const SearchSpace &space,
   if (!resolver.error.empty())
     return illegal(kind, resolver.error);
 
-  const std::array<int64_t, 3> &fragment = largestTileShape(*engine);
+  const std::vector<int64_t> &fragment = largestTileShape(*engine);
   if (*BM % fragment[0] != 0 || *BN % fragment[1] != 0 ||
       *BK % fragment[2] != 0)
     return illegal(kind, "tile " + tripleText({*BM, *BN, *BK}) +
-                             " is not a multiple of engine '" + engine->name +
+                             " is not a multiple of engine '" + engine->id +
                              "' fragment " + tripleText(fragment) +
                              " and tail_policy is not 'mask'");
   return legal();
@@ -310,7 +331,7 @@ LegalityResult checkMmaCompatible(const SearchSpace &space,
 LegalityResult checkMappingExtent(const SearchSpace &,
                                   const Candidate &candidate,
                                   const WorkloadShape &,
-                                  const MachineModel &machine) {
+                                  const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::MappingExtent;
   std::optional<int64_t> threads = candidate.integer("num_threads");
   if (!threads)
@@ -321,7 +342,7 @@ LegalityResult checkMappingExtent(const SearchSpace &,
   // search parameter in the current export, so only the thread count is bound.
   if (uint64_t(*threads) > machine.workerThreads)
     return illegal(kind, "num_threads " + llvm::Twine(*threads) +
-                             " exceeds machine '" + machine.name +
+                             " exceeds machine '" + machine.target +
                              "' worker_threads " +
                              llvm::Twine(machine.workerThreads));
   return legal();
@@ -330,7 +351,7 @@ LegalityResult checkMappingExtent(const SearchSpace &,
 LegalityResult checkTailSupported(const SearchSpace &space,
                                   const Candidate &candidate,
                                   const WorkloadShape &shape,
-                                  const MachineModel &) {
+                                  const machine::MachineModel &) {
   ConstraintKind kind = ConstraintKind::TailSupported;
   if (isMasked(space, candidate))
     return legal();
@@ -353,7 +374,7 @@ LegalityResult checkTailSupported(const SearchSpace &space,
 LegalityResult checkVectorWidthSupported(const SearchSpace &,
                                          const Candidate &candidate,
                                          const WorkloadShape &shape,
-                                         const MachineModel &machine) {
+                                         const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::VectorWidthSupported;
   std::optional<int64_t> width = candidate.integer("vector_width");
   if (!width)
@@ -361,17 +382,18 @@ LegalityResult checkVectorWidthSupported(const SearchSpace &,
   if (*width < 1)
     return illegal(kind, "vector_width must be positive");
 
-  if (machine.vectorEngines.empty())
-    return illegal(kind,
-                   "machine '" + machine.name + "' declares no vector engine");
+  if (machine.computesOfKind("vector_engine").empty())
+    return illegal(kind, "machine '" + machine.target +
+                             "' declares no vector engine");
 
-  const VectorEngineModel *best = nullptr;
+  const machine::ComputeNode *best = nullptr;
   int64_t lanes = 0;
-  for (const VectorEngineModel &engine : machine.vectorEngines) {
-    auto it = engine.lanes.find(shape.inputDType);
-    if (it != engine.lanes.end() && it->second > lanes) {
+  for (const machine::ComputeNode *engine :
+       machine.computesOfKind("vector_engine")) {
+    auto it = engine->lanes.find(shape.inputDType);
+    if (it != engine->lanes.end() && it->second > lanes) {
       lanes = it->second;
-      best = &engine;
+      best = engine;
     }
   }
   if (!best)
@@ -379,7 +401,7 @@ LegalityResult checkVectorWidthSupported(const SearchSpace &,
                              shape.inputDType + "'");
   if (*width > lanes)
     return illegal(kind, "vector_width " + llvm::Twine(*width) +
-                             " exceeds engine '" + best->name + "' lanes " +
+                             " exceeds engine '" + best->id + "' lanes " +
                              llvm::Twine(lanes) + " for dtype '" +
                              shape.inputDType + "'");
   return legal();
@@ -388,7 +410,7 @@ LegalityResult checkVectorWidthSupported(const SearchSpace &,
 LegalityResult checkLayoutSupported(const SearchSpace &space,
                                     const Candidate &candidate,
                                     const WorkloadShape &,
-                                    const MachineModel &machine) {
+                                    const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::LayoutSupported;
   std::optional<StringRef> layout = symbolOfKind(space, candidate, "layout");
   if (!layout)
@@ -412,7 +434,7 @@ LegalityResult checkLayoutSupported(const SearchSpace &space,
   for (StringRef level : path) {
     if (level == "dram")
       continue;
-    const MemoryLevelModel *model = machine.findMemory(level);
+    const machine::MemoryNode *model = machine.findMemoryOfKind(level);
     if (!model)
       continue;
     sawModeledLevel = true;
@@ -421,7 +443,7 @@ LegalityResult checkLayoutSupported(const SearchSpace &space,
   }
 
   if (!sawModeledLevel)
-    return illegal(kind, "machine '" + machine.name +
+    return illegal(kind, "machine '" + machine.target +
                              "' models no memory on the path '" +
                              llvm::join(path, ":") + "'");
   return illegal(kind, "no memory supports layout '" + *layout + "'");
@@ -430,7 +452,7 @@ LegalityResult checkLayoutSupported(const SearchSpace &space,
 LegalityResult checkOwnerSupported(const SearchSpace &space,
                                    const Candidate &candidate,
                                    const WorkloadShape &,
-                                   const MachineModel &machine) {
+                                   const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::OwnerSupported;
   std::optional<StringRef> mapping =
       symbolOfKind(space, candidate, "owner_mapping");
@@ -443,9 +465,9 @@ LegalityResult checkOwnerSupported(const SearchSpace &space,
     return illegal(kind, "owner_mapping is empty");
 
   for (StringRef owner : owners)
-    if (!machine.findOwner(owner))
+    if (!machine.hasOwnerKind(owner))
       return illegal(kind, "owner '" + owner + "' is not modeled by machine '" +
-                               machine.name + "'");
+                               machine.target + "'");
 
   // Outer comes first: each owner must sit inside the one to its left.
   for (size_t i = 1; i < owners.size(); ++i)
@@ -458,7 +480,7 @@ LegalityResult checkOwnerSupported(const SearchSpace &space,
 LegalityResult checkFragmentCompatible(const SearchSpace &space,
                                        const Candidate &candidate,
                                        const WorkloadShape &,
-                                       const MachineModel &machine) {
+                                       const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::FragmentCompatible;
   std::optional<StringRef> text =
       symbolOfKind(space, candidate, "fragment_shape");
@@ -471,8 +493,9 @@ LegalityResult checkFragmentCompatible(const SearchSpace &space,
                              "' is not a positive MxNxK triple");
 
   bool supported = false;
-  for (const MatrixEngineModel &engine : machine.matrixEngines) {
-    const std::array<int64_t, 3> &shape = largestTileShape(engine);
+  for (const machine::ComputeNode *engine :
+       machine.computesOfKind("matrix_engine")) {
+    const std::vector<int64_t> &shape = largestTileShape(*engine);
     if ((*fragment)[0] >= shape[0] && (*fragment)[1] >= shape[1] &&
         (*fragment)[2] >= shape[2]) {
       supported = true;
@@ -503,7 +526,7 @@ LegalityResult checkFragmentCompatible(const SearchSpace &space,
 LegalityResult checkTileHierarchyCompatible(const SearchSpace &space,
                                             const Candidate &candidate,
                                             const WorkloadShape &,
-                                            const MachineModel &) {
+                                            const machine::MachineModel &) {
   ConstraintKind kind = ConstraintKind::TileHierarchyCompatible;
   std::optional<StringRef> text =
       symbolOfKind(space, candidate, "fragment_shape");
@@ -535,11 +558,11 @@ LegalityResult checkTileHierarchyCompatible(const SearchSpace &space,
 LegalityResult checkPipelineLiveTiles(const SearchSpace &space,
                                       const Candidate &candidate,
                                       const WorkloadShape &shape,
-                                      const MachineModel &machine) {
+                                      const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::PipelineLiveTiles;
-  const MemoryLevelModel *sram = machine.findMemory("sram");
+  const machine::MemoryNode *sram = machine.findMemoryOfKind("sram");
   if (!sram)
-    return illegal(kind, "machine '" + machine.name +
+    return illegal(kind, "machine '" + machine.target +
                              "' does not model memory 'sram'");
 
   int64_t stages =
@@ -549,11 +572,13 @@ LegalityResult checkPipelineLiveTiles(const SearchSpace &space,
   // Only a pipelined kernel keeps copies in flight: a single-stage loop
   // completes each movement before issuing the next.
   uint64_t outstanding = stages > 1 ? static_cast<uint64_t>(prefetch) : 0;
-  if (outstanding > machine.dma.maxOutstanding)
+  const machine::TransferEngineNode *transfer = machine.primaryTransferEngine();
+  uint64_t maxOutstanding = transfer ? transfer->maxOutstanding : 1;
+  if (outstanding > maxOutstanding)
     return illegal(kind, llvm::Twine(outstanding) +
                              " outstanding async copies exceed machine '" +
-                             machine.name + "' dma.max_outstanding " +
-                             llvm::Twine(machine.dma.maxOutstanding));
+                             machine.target + "' transfer engine limit " +
+                             llvm::Twine(maxOutstanding));
 
   IntResolver resolver{candidate, {}};
   std::optional<int64_t> BM = resolver.get("BM");
@@ -584,7 +609,7 @@ LegalityResult checkConstraint(const SearchConstraint &constraint,
                                const SearchSpace &space,
                                const Candidate &candidate,
                                const WorkloadShape &shape,
-                               const MachineModel &machine) {
+                               const machine::MachineModel &machine) {
   // A rule cannot be evaluated against a value the candidate never bound; that
   // is a malformed candidate, not a legal one.
   for (const std::string &name : constraint.params)
@@ -622,7 +647,7 @@ LegalityResult checkConstraint(const SearchConstraint &constraint,
 LegalityResult checkLegality(const SearchSpace &space,
                              const Candidate &candidate,
                              const WorkloadShape &shape,
-                             const MachineModel &machine) {
+                             const machine::MachineModel &machine) {
   for (const SearchConstraint &constraint : space.constraints) {
     LegalityResult result =
         checkConstraint(constraint, space, candidate, shape, machine);

@@ -16,7 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "LLK/Perf/MachineModelLoader.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Perf/ScheduleRecord.h"
 #include "LLK/Perf/TuningSession.h"
 
@@ -144,7 +144,7 @@ ScheduleRecord sampleRecord() {
   ScheduleRecord record;
   record.workload = "fused_swiglu";
   record.target = "x86-avx2-cpu";
-  record.machine = "machines/x86-avx2-cpu.yaml";
+  record.machine = "machines/x86-avx2-v2.yaml";
   record.shape.M = 8;
   record.shape.N = 64;
   record.shape.K = 64;
@@ -194,7 +194,7 @@ TEST(ScheduleRecord, WritesTheIdentityShapeAndTileDecisions) {
   EXPECT_NE(yaml.find("schema_version: 1\n"), std::string::npos);
   EXPECT_NE(yaml.find("workload: fused_swiglu\n"), std::string::npos);
   EXPECT_NE(yaml.find("target: x86-avx2-cpu\n"), std::string::npos);
-  EXPECT_NE(yaml.find("machine: machines/x86-avx2-cpu.yaml\n"),
+  EXPECT_NE(yaml.find("machine: machines/x86-avx2-v2.yaml\n"),
             std::string::npos);
   EXPECT_NE(yaml.find("M_bucket: 2\n"), std::string::npos);
   EXPECT_NE(yaml.find("  M: 8\n"), std::string::npos);
@@ -250,15 +250,15 @@ TEST(ScheduleRecord, SeparatesMultipleRecordsIntoDocuments) {
 // Tuning session
 //===----------------------------------------------------------------------===//
 
-const MachineModel &avx2() {
-  static std::optional<MachineModel> model = [] {
-    auto loaded =
-        loadMachineModel(std::string(LLK_MACHINE_DIR) + "/x86-avx2-cpu.yaml");
+const machine::MachineModel &avx2() {
+  static std::optional<machine::MachineModel> model = [] {
+    auto loaded = machine::loadMachineModel(std::string(LLK_MACHINE_DIR) +
+                                            "/x86-avx2-v2.yaml");
     if (!loaded) {
       ADD_FAILURE() << llvm::toString(loaded.takeError());
-      return std::optional<MachineModel>();
+      return std::optional<machine::MachineModel>();
     }
-    return std::optional<MachineModel>(std::move(*loaded));
+    return std::optional<machine::MachineModel>(std::move(*loaded));
   }();
   return *model;
 }
@@ -323,7 +323,7 @@ TEST(TuningSession, RanksLegalCandidatesAndRejectsTheRest) {
   auto context = perfContext();
   TuningSessionOptions options;
   options.topK = 10;
-  options.machinePath = "machines/x86-avx2-cpu.yaml";
+  options.machinePath = "machines/x86-avx2-v2.yaml";
 
   auto report = runTuningSession(*context, threadChoiceSpace(), swigluShape(),
                                  avx2(), options);
@@ -338,13 +338,13 @@ TEST(TuningSession, RanksLegalCandidatesAndRejectsTheRest) {
   EXPECT_EQ(
       report->rejected.front().rejectionReason.rfind("mapping_extent:", 0), 0u);
   EXPECT_GT(report->ranked.front().result.metrics.predictedCycles, 0u);
-  EXPECT_EQ(report->machineName, "x86-avx2-cpu");
+  EXPECT_EQ(report->machineName, "x86-avx2");
 }
 
 TEST(TuningSession, IsDeterministicAcrossRuns) {
   auto context = perfContext();
   TuningSessionOptions options;
-  options.machinePath = "machines/x86-avx2-cpu.yaml";
+  options.machinePath = "machines/x86-avx2-v2.yaml";
 
   auto first = runTuningSession(*context, threadChoiceSpace(), swigluShape(),
                                 avx2(), options);
@@ -369,7 +369,7 @@ TEST(TuningSession, KeepsAtMostTopK) {
   auto context = perfContext();
   TuningSessionOptions options;
   options.topK = 2;
-  options.machinePath = "machines/x86-avx2-cpu.yaml";
+  options.machinePath = "machines/x86-avx2-v2.yaml";
   options.perfLevel = 0;
 
   auto report =
@@ -385,7 +385,7 @@ TEST(TuningSession, KeepsAtMostTopK) {
 TEST(TuningSession, BuildsScheduleRecordsWithTileDecisions) {
   auto context = perfContext();
   TuningSessionOptions options;
-  options.machinePath = "machines/x86-avx2-cpu.yaml";
+  options.machinePath = "machines/x86-avx2-v2.yaml";
 
   SearchSpace space = threadChoiceSpace();
   WorkloadShape shape = swigluShape();
@@ -399,8 +399,8 @@ TEST(TuningSession, BuildsScheduleRecordsWithTileDecisions) {
   const ScheduleRecord &record = records.front();
   EXPECT_EQ(record.schemaVersion, 1u);
   EXPECT_EQ(record.workload, "fused_swiglu");
-  EXPECT_EQ(record.target, "x86-avx2-cpu");
-  EXPECT_EQ(record.machine, "machines/x86-avx2-cpu.yaml");
+  EXPECT_EQ(record.target, "x86-avx2");
+  EXPECT_EQ(record.machine, "machines/x86-avx2-v2.yaml");
   EXPECT_EQ(record.shape.M, 8);
   EXPECT_EQ(record.candidate.values.at("BM"), 8);
   EXPECT_EQ(record.tile.workerTile, (std::vector<int64_t>{8, 64, 64}));

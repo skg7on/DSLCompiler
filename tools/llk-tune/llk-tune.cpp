@@ -3,9 +3,9 @@
 // Two modes, selected by whether a Micro search space is given:
 //
 //   * Micro mode (--input=<space.mlir>): load one `micro.search_space` and a
-//     MachineModel, generate candidates, reject the illegal ones, bind the rest
-//     to concrete kernels, cost them with the L0/L1 models, and write the
-//     ranked top-K as schedule YAML. This is the M12 tuning flow (#50).
+//     machine::MachineModel, generate candidates, reject the illegal ones, bind
+//     the rest to concrete kernels, cost them with the L0/L1 models, and write
+//     the ranked top-K as schedule YAML. This is the M12 tuning flow (#50).
 //   * Legacy mode (no --input): the pre-Micro grid over BM/BN/BK/VM/VN,
 //     num_threads, and grain_size, filtered by an L1 footprint estimate and
 //     written as a JSON schedule_db entry to -o. Preserved so the existing
@@ -15,7 +15,7 @@
 
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
-#include "LLK/Perf/MachineModelLoader.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Perf/ScheduleRecord.h"
 #include "LLK/Perf/TuningSession.h"
 
@@ -61,7 +61,7 @@ static cl::opt<std::string> tuneWorkload(
 static cl::opt<std::string>
     tuneMachine("machine",
                 cl::desc("Machine model to evaluate candidates against"),
-                cl::init("machines/x86-avx2-cpu.yaml"));
+                cl::init("machines/x86-avx2-v2.yaml"));
 static cl::opt<std::string>
     tuneSearch("search", cl::desc("Candidate search: grid or random"),
                cl::init("grid"));
@@ -333,7 +333,7 @@ int runMicroSearch() {
     return reportError("unsupported --search=" + llvm::Twine(tuneSearch) +
                        "; expected grid or random (staged is not implemented)");
 
-  auto machine = perf::loadMachineModel(tuneMachine);
+  auto machine = ::mlir::llk::machine::loadMachineModel(tuneMachine);
   if (!machine)
     return reportError(llvm::toString(machine.takeError()));
 
@@ -389,7 +389,7 @@ int runMicroSearch() {
   }
 
   llvm::outs() << "workload " << space.workload << " M=" << tuneM
-               << " N=" << tuneN << " K=" << tuneK << " on " << machine->name
+               << " N=" << tuneN << " K=" << tuneK << " on " << machine->target
                << "\n";
   llvm::outs() << "Generated " << report->generated
                << " candidates: " << report->ranked.size() << " ranked, "
@@ -413,7 +413,8 @@ int main(int argc, char **argv) {
       "LLK schedule tuner\n"
       "\n"
       "With --input=<micro.search_space.mlir> this runs the Micro-IR tuning\n"
-      "flow: generate candidates, check legality against a MachineModel, bind\n"
+      "flow: generate candidates, check legality against a "
+      "machine::MachineModel, bind\n"
       "them to concrete micro kernels, rank by predicted cycles, and write "
       "the\n"
       "top-K as schedule YAML.\n"

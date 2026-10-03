@@ -4,7 +4,7 @@
 //
 // A tuning session is the whole loop the driver runs:
 //
-//   SearchSpace + WorkloadShape + MachineModel
+//   SearchSpace + WorkloadShape + machine::MachineModel
 //     -> generated candidates
 //     -> legality verdicts (illegal ones are reported, not run)
 //     -> bound concrete micro.kernel per legal candidate
@@ -25,10 +25,10 @@
 #ifndef LLK_PERF_TUNINGSESSION_H
 #define LLK_PERF_TUNINGSESSION_H
 
+#include "LLK/Machine/MachineModel.h"
 #include "LLK/Perf/Candidate.h"
 #include "LLK/Perf/CandidateBinding.h"
 #include "LLK/Perf/CandidateGenerator.h"
-#include "LLK/Perf/MachineModel.h"
 #include "LLK/Perf/ScheduleRecord.h"
 #include "LLK/Perf/SearchSpace.h"
 
@@ -91,7 +91,8 @@ std::vector<TuningResult> rankTuningResults(std::vector<TuningResult> results,
 /// session creates and destroys, so the caller's IR is never touched.
 llvm::Expected<TuningSessionReport>
 runTuningSession(mlir::MLIRContext &context, const SearchSpace &space,
-                 const WorkloadShape &shape, const MachineModel &machine,
+                 const WorkloadShape &shape,
+                 const machine::MachineModel &machine,
                  const TuningSessionOptions &options = {});
 
 /// Turns the ranked candidates into schedule records, carrying the workload

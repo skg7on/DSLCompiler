@@ -89,9 +89,18 @@ llvm::Expected<CoveringPlan> selectPlan(MLIRContext &context, ModuleOp module,
   llvm::Expected<MappingSearchResult> result = search.search();
   if (!result)
     return result.takeError();
-  if (result->plans.empty())
-    return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                   "no plan was found");
+  if (result->plans.empty()) {
+    std::string reason =
+        "no plan was found: nodesWithoutRules=" +
+        std::to_string(result->frontier.nodesWithoutRules) +
+        " candidatesWithoutPlacement=" +
+        std::to_string(result->frontier.candidatesWithoutPlacement) +
+        " incompatiblePairs=" +
+        std::to_string(result->frontier.incompatibleInstancePairs);
+    for (const std::string &message : result->frontier.messages)
+      reason += "\n  " + message;
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), reason);
+  }
   return result->plans.front();
 }
 
@@ -299,4 +308,161 @@ TEST(PlanBinder, ReportsConnectionsItCannotMaterialize) {
       bindPlan(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   EXPECT_TRUE(bound->unmaterialized.empty());
+}
+
+//===----------------------------------------------------------------------===//
+// Multi-hop materialization
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A machine whose only way from DRAM to SRAM is through L2, so a routed
+/// movement between them has two hops rather than one.
+constexpr llvm::StringLiteral kTwoHopMachine = R"yaml(
+schema: llk.machine.v2
+target: two-hop
+clock_hz: 1000000000
+worker_threads: 1
+executors:
+  - id: cluster.0
+    kind: cluster
+  - id: worker.0
+    kind: worker
+    parent: cluster.0
+memories:
+  - id: dram.0
+    kind: dram
+    visible_from: cluster.0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+  - id: l2.0
+    kind: l2
+    visible_from: cluster.0
+    capacity_bytes: 262144
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.0
+    capacity_bytes: 32768
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.0
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+transfer_engines:
+  - id: dma.0
+    kind: dma
+    attached_to: cluster.0
+    count: 1
+    max_outstanding: 1
+links:
+  - id: dram_to_l2.0
+    source: dram.0
+    destination: l2.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.0]
+  - id: l2_to_sram.0
+    source: l2.0
+    destination: sram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    transaction_bytes: 64
+    transfer_engines: [dma.0]
+)yaml";
+
+/// The copy lands in DRAM and the add reads from SRAM, so the connection has to
+/// cross the hierarchy.
+constexpr llvm::StringLiteral kTwoHopRules = R"llkmap(
+rule t.copy {
+  match micro.async_copy();
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.copy";
+  emit "e1";
+  cost 1;
+}
+rule t.vector {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.vector";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+llvm::Expected<std::unique_ptr<MappingTarget>> twoHopTarget() {
+  llvm::Expected<mlir::llk::machine::MachineModel> machine =
+      mlir::llk::machine::parseMachineModel(kTwoHopMachine, "<test>");
+  if (!machine)
+    return machine.takeError();
+  llvm::Expected<LayoutRegistry> layouts = parseLayoutText("", "<test>");
+  if (!layouts)
+    return layouts.takeError();
+  llvm::Expected<RuleRegistry> rules = parseRuleText(kTwoHopRules, "<test>");
+  if (!rules)
+    return rules.takeError();
+  return std::make_unique<FileMappingTarget>(
+      "two-hop", std::move(*machine), std::move(*layouts), std::move(*rules),
+      std::vector<std::string>{"e1"});
+}
+
+} // namespace
+
+TEST(PlanBinder, EmitsOneCopyPerRouteHop) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = twoHopTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  // The fixture's whole point is that DRAM reaches SRAM only through L2.
+  {
+    TopologyService topology((*target)->machine());
+    RouteRequest request;
+    request.source = "dram.0";
+    request.destination = "sram.0";
+    request.bytes = 4096;
+    request.alignmentBytes = 32;
+    llvm::Expected<llvm::SmallVector<MemoryRoute>> routes =
+        topology.enumerateRoutes(request, 8);
+    ASSERT_TRUE(static_cast<bool>(routes))
+        << llvm::toString(routes.takeError());
+    ASSERT_EQ(routes->size(), 1u);
+    EXPECT_EQ((*routes)[0].nodes.size(), 3u);
+  }
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+  ASSERT_EQ(plan->connectionPlans[0].route.size(), 3u); // dram -> l2 -> sram
+
+  const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
+  const size_t waitsBefore = countOps(*fixture.module, "micro.wait");
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  for (const std::string &note : bound->unmaterialized)
+    ADD_FAILURE() << note;
+
+  // Two hops, so two copies and two waits -- not one of each for the whole
+  // route.
+  EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore + 2);
+  EXPECT_EQ(countOps(*bound->module, "micro.wait"), waitsBefore + 2);
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
 }
