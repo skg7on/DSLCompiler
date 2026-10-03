@@ -1,0 +1,192 @@
+# Machine model (v2): Intel x86 CPU with AVX2, the first validation backend.
+#
+# This is the topology form of x86-avx2-cpu.yaml. The v1 file stays for the
+# performance simulator; this one adds the containment, visibility, and link
+# edges placement and routing need.
+#
+# AVX2 is a vector machine, not a systolic array. `core` is a thread-pool
+# worker and `refines: [worker]`, so a kernel written against the abstract
+# `worker` owner maps onto it without the mapping code knowing about cores.
+# There are deliberately no `pe`/`pe_group` executors: modeling SIMD lanes as
+# processing elements would make every later comparison against a real
+# accelerator lie.
+#
+# The numbers are calibration seeds, not claims about any SKU.
+
+schema: llk.machine.v2
+target: x86-avx2
+description: >-
+  Intel AVX2 CPU validation backend. Two worker cores with private L1 and
+  accumulator storage behind a shared L2 and DRAM.
+
+executors:
+  - id: package.0
+    kind: worker
+    concurrency: 1
+  - id: core.0
+    kind: core
+    parent: package.0
+    coordinates: [0]
+    concurrency: 1
+    refines: [worker]
+  - id: core.1
+    kind: core
+    parent: package.0
+    coordinates: [1]
+    concurrency: 1
+    refines: [worker]
+
+memories:
+  - id: dram.0
+    kind: dram
+    visible_from: package.0
+    capacity_bytes: 17179869184
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+  - id: l2.0
+    kind: l2
+    visible_from: package.0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major, blocked]
+  - id: sram.0
+    kind: sram
+    visible_from: core.0
+    capacity_bytes: 32768
+    alignment_bytes: 64
+    supported_layouts: [row_major, blocked]
+    banks: 8
+  - id: sram.1
+    kind: sram
+    visible_from: core.1
+    capacity_bytes: 32768
+    alignment_bytes: 64
+    supported_layouts: [row_major, blocked]
+    banks: 8
+  - id: acc.0
+    kind: acc
+    visible_from: core.0
+    capacity_bytes: 4096
+    alignment_bytes: 32
+    supported_layouts: [row_major, blocked]
+  - id: acc.1
+    kind: acc
+    visible_from: core.1
+    capacity_bytes: 4096
+    alignment_bytes: 32
+    supported_layouts: [row_major, blocked]
+
+compute:
+  - id: vec.0
+    kind: vector_engine
+    attached_to: core.0
+    element_types: [f32, bf16]
+    shapes: [[8], [16]]
+    issue_cycles: 1
+    latency_cycles: 5
+    throughput_per_cycle: 16
+    supported_layouts: [row_major, vectorized]
+  - id: vec.1
+    kind: vector_engine
+    attached_to: core.1
+    element_types: [f32, bf16]
+    shapes: [[8], [16]]
+    issue_cycles: 1
+    latency_cycles: 5
+    throughput_per_cycle: 16
+    supported_layouts: [row_major, vectorized]
+  - id: fma.0
+    kind: matrix_engine
+    attached_to: core.0
+    element_types: [f32, bf16]
+    shapes: [[1, 8, 8], [4, 8, 8]]
+    issue_cycles: 1
+    latency_cycles: 5
+    throughput_per_cycle: 16
+    supported_layouts: [row_major, blocked]
+  - id: fma.1
+    kind: matrix_engine
+    attached_to: core.1
+    element_types: [f32, bf16]
+    shapes: [[1, 8, 8], [4, 8, 8]]
+    issue_cycles: 1
+    latency_cycles: 5
+    throughput_per_cycle: 16
+    supported_layouts: [row_major, blocked]
+
+transfer_engines:
+  - id: dma.0
+    kind: dma
+    attached_to: core.0
+    count: 1
+    max_outstanding: 8
+  - id: dma.1
+    kind: dma
+    attached_to: core.1
+    count: 1
+    max_outstanding: 8
+
+links:
+  - id: dram_to_l2.0
+    source: dram.0
+    destination: l2.0
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 160
+    transaction_bytes: 64
+    transfer_engines: [dma.0, dma.1]
+  - id: l2_to_sram.0
+    source: l2.0
+    destination: sram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    transaction_bytes: 64
+    transfer_engines: [dma.0]
+  - id: l2_to_sram.1
+    source: l2.0
+    destination: sram.1
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    transaction_bytes: 64
+    transfer_engines: [dma.1]
+  - id: sram_to_dram.0
+    source: sram.0
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 160
+    transaction_bytes: 64
+    transfer_engines: [dma.0]
+  - id: sram_to_dram.1
+    source: sram.1
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 160
+    transaction_bytes: 64
+    transfer_engines: [dma.1]
+  - id: sram_to_acc.0
+    source: sram.0
+    destination: acc.0
+    bandwidth_bytes_per_cycle: 128
+    latency_cycles: 2
+    transaction_bytes: 32
+    transfer_engines: [dma.0]
+  - id: sram_to_acc.1
+    source: sram.1
+    destination: acc.1
+    bandwidth_bytes_per_cycle: 128
+    latency_cycles: 2
+    transaction_bytes: 32
+    transfer_engines: [dma.1]
+  - id: acc_to_sram.0
+    source: acc.0
+    destination: sram.0
+    bandwidth_bytes_per_cycle: 128
+    latency_cycles: 2
+    transaction_bytes: 32
+    transfer_engines: [dma.0]
+  - id: acc_to_sram.1
+    source: acc.1
+    destination: sram.1
+    bandwidth_bytes_per_cycle: 128
+    latency_cycles: 2
+    transaction_bytes: 32
+    transfer_engines: [dma.1]

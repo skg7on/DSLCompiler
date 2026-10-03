@@ -171,3 +171,36 @@ compute:
   - {id: c0, kind: vector_engine, attached_to: nope, element_types: [f32], shapes: [[8]]}
 )yaml"));
 }
+
+#ifndef LLK_MACHINE_DIR
+#error "LLK_MACHINE_DIR must name the shipped machines directory"
+#endif
+
+TEST(MachineModelLoader, LoadsShippedAvx2Profile) {
+  llvm::Expected<MachineModel> model =
+      loadMachineModel(std::string(LLK_MACHINE_DIR) + "/x86-avx2-v2.yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  EXPECT_FALSE(model->executors.empty());
+  EXPECT_FALSE(model->memories.empty());
+  EXPECT_FALSE(model->computes.empty());
+  EXPECT_FALSE(model->links.empty());
+  // The profile exposes a scope a kernel's abstract `worker` owner can match.
+  bool hasWorkerScope = false;
+  for (const ExecutorNode &executor : model->executors)
+    hasWorkerScope |= model->ownerMatches("worker", executor.id);
+  EXPECT_TRUE(hasWorkerScope);
+}
+
+TEST(MachineModelLoader, LoadsShippedGenericProfile) {
+  llvm::Expected<MachineModel> model = loadMachineModel(
+      std::string(LLK_MACHINE_DIR) + "/generic-ai-accel-v2.yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  // A PE declares it refines `worker`, so a worker-owned kernel can map onto it
+  // without the generic code knowing the word "pe".
+  ASSERT_NE(model->findExecutor("pe.0"), nullptr);
+  EXPECT_TRUE(model->ownerMatches("pe", "pe.0"));
+  EXPECT_TRUE(model->ownerMatches("worker", "pe.0"));
+  // The two-hop memory path the routing fixture will need is present.
+  EXPECT_NE(model->findLink("dram_to_sram.0"), nullptr);
+  EXPECT_NE(model->findLink("sram_to_acc.0"), nullptr);
+}
