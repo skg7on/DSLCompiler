@@ -155,3 +155,19 @@ Design §13.2 queries `machine.compute("vector_engine").lanes(element_type)`, a 
 **Non-scope respected:** mapping rules (D4) reuse this language later; no placement/covering; no Micro dialect changes.
 
 **Type consistency:** `LayoutValue` is defined once and reused by the evaluator and solutions; `LayoutDef`/`LayoutRegistry`/`LayoutSolution` appear in both the header and the tests with matching field names; `MachineModel` is used only through queries.
+
+## Verification Results (2026-10-03)
+
+- **Build:** `ninja -C build` — clean.
+- **New tests:** `MappingLayoutTest` **30/30** (parser, evaluator, solver, shipped layouts).
+- **Full suite:** `ctest --test-dir build --output-on-failure` — 95 registered, **93 passed, 2 skipped, 0 failed**.
+- **Deprecated-API audit:** clean across `LayoutConstraints.h`, `LayoutConstraints.cpp`, `layout_constraints.cpp`.
+
+### Decisions taken while implementing
+
+1. **Grammar fixed in `docs/design/llkmap-layout-grammar.md`.** Identifiers may contain dots, so `avx2.blocked_2d` and the `machine.` prefix are single tokens. Member queries take optional arguments (`.count` is a property, `.lanes(dtype)` is a call).
+2. **`LayoutDef::constraints`** is not named `requires` — `requires` is a C++20 keyword.
+3. **`truncated` covers both caps**: exceeding `maxAssignments` *or* stopping at `maxSolutions` sets it, so a capped result is never read as complete.
+4. **Solutions carry a concrete `AffineMap`**: solved integer parameters are substituted as constants, and MLIR has no `Sub` affine node, so subtraction is built as `lhs + (-1 * rhs)`.
+5. **`ComputeNode::lanes` was added to `LLKMachine`** (additive) because design §13.2's `machine.compute(kind).lanes(dtype)` query needs a dtype→width association the v2 model lacked.
+6. **Out of scope, as planned:** LLKMap *rules* (D4), placement, covering. `LLKMapping` now links `LLKMachine`.
