@@ -134,9 +134,25 @@ TEST(GenericAcceleratorTarget, EmitterVerifiesBundleCompleteness) {
   EXPECT_FALSE(
       static_cast<bool>(emitter->verify(makeBundle(emitter->key(), context))));
 
+  // A parameterless bundle carries a null DictionaryAttr; that is the common
+  // shape and must be accepted, not dereferenced.
+  TargetBundle parameterless = makeBundle(emitter->key(), context);
+  parameterless.parameters = {};
+  EXPECT_FALSE(static_cast<bool>(emitter->verify(parameterless)));
+
   llvm::Error unknown = emitter->verify(makeBundle("accel_missing", context));
   ASSERT_TRUE(static_cast<bool>(unknown));
   EXPECT_NE(llvm::toString(std::move(unknown)).find("accel_missing"),
+            std::string::npos);
+
+  // A bundle naming a different but declared emitter key is rejected.
+  llvm::ArrayRef<llvm::StringRef> keys = accel_mapping::emitterKeys();
+  ASSERT_GE(keys.size(), 2u);
+  std::unique_ptr<TargetEmitter> first = (*target)->createEmitter(keys[0]);
+  ASSERT_NE(first, nullptr);
+  llvm::Error otherKey = first->verify(makeBundle(keys[1], context));
+  ASSERT_TRUE(static_cast<bool>(otherKey));
+  EXPECT_NE(llvm::toString(std::move(otherKey)).find("handles"),
             std::string::npos);
 
   TargetBundle malformed = makeBundle(emitter->key(), context);

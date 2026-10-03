@@ -69,15 +69,22 @@ public:
 
   /// The emitter for `key`, or null when the target does not declare that key.
   /// A target that declares several emitter keys exposes each one here; the
-  /// caller passes the key a bundle's `emitterKey` names.
+  /// caller passes the key a bundle's `emitterKey` names. This is the one
+  /// factory a target must implement.
   virtual std::unique_ptr<TargetEmitter>
   createEmitter(llvm::StringRef key) const = 0;
 
-  /// The target's default emitter -- the one for its first declared key -- or
-  /// null for a target that declares no emitter keys (design §19). Kept for
-  /// the common single-entry case; a multi-key target is reached through
-  /// `createEmitter(key)`.
-  virtual std::unique_ptr<TargetEmitter> createEmitter() const = 0;
+  /// A target's single default emitter, if it has one (design §19). The base
+  /// returns null: a target that declares several keys has no single default,
+  /// so callers reach each key through `createEmitter(key)` and a target opts
+  /// in to a default only when it genuinely has a principal emitter. Because
+  /// this is non-pure, an out-of-tree target need implement only the keyed
+  /// factory. The default `FileMappingTarget` supplies is declaration-order
+  /// dependent (its first declared key), so it is meaningful for a
+  /// single-key target and a convenience otherwise -- prefer the keyed form.
+  virtual std::unique_ptr<TargetEmitter> createEmitter() const {
+    return nullptr;
+  }
 
   /// Optional measured or calibrated latencies. Null means the target has
   /// none -- and a provider with no entry for a signature is the same as null

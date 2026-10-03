@@ -116,10 +116,28 @@ TEST(Avx2Target, EmitterVerifiesBundleCompleteness) {
   EXPECT_FALSE(
       static_cast<bool>(emitter->verify(makeBundle(emitter->key(), context))));
 
+  // A rule with no bundle parameters produces a bundle whose `parameters` is a
+  // null DictionaryAttr; that is the most common shape and must be accepted,
+  // not dereferenced.
+  TargetBundle parameterless = makeBundle(emitter->key(), context);
+  parameterless.parameters = {};
+  EXPECT_FALSE(static_cast<bool>(emitter->verify(parameterless)));
+
   // A bundle naming an emitter the target does not declare is rejected.
   llvm::Error unknown = emitter->verify(makeBundle("avx2_missing", context));
   ASSERT_TRUE(static_cast<bool>(unknown));
   EXPECT_NE(llvm::toString(std::move(unknown)).find("avx2_missing"),
+            std::string::npos);
+
+  // A bundle naming a *different but declared* emitter key is rejected too:
+  // an emitter handles exactly one key.
+  llvm::ArrayRef<llvm::StringLiteral> keys = avx2_mapping::emitterKeys();
+  ASSERT_GE(keys.size(), 2u);
+  std::unique_ptr<TargetEmitter> first = (*target)->createEmitter(keys[0]);
+  ASSERT_NE(first, nullptr);
+  llvm::Error otherKey = first->verify(makeBundle(keys[1], context));
+  ASSERT_TRUE(static_cast<bool>(otherKey));
+  EXPECT_NE(llvm::toString(std::move(otherKey)).find("handles"),
             std::string::npos);
 
   // A parameter whose value is not the integer/string shape the plugin

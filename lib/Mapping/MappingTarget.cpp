@@ -93,11 +93,15 @@ public:
     if (bundle.emitterKey != key_)
       return targetError("bundle names emitter '" + bundle.emitterKey +
                          "', but this emitter handles '" + key_ + "'");
-    for (mlir::NamedAttribute entry : bundle.parameters)
-      if (!mlir::isa<mlir::IntegerAttr>(entry.getValue()) &&
-          !mlir::isa<mlir::StringAttr>(entry.getValue()))
-        return targetError("bundle parameter '" + entry.getName().str() +
-                           "' is not an integer or string value");
+    // A rule with no bundle parameters yields a null DictionaryAttr (see
+    // buildBundleParameters), so there is nothing to walk rather than an empty
+    // walk -- iterating a null attribute would dereference a null impl.
+    if (bundle.parameters)
+      for (mlir::NamedAttribute entry : bundle.parameters)
+        if (!mlir::isa<mlir::IntegerAttr>(entry.getValue()) &&
+            !mlir::isa<mlir::StringAttr>(entry.getValue()))
+          return targetError("bundle parameter '" + entry.getName().str() +
+                             "' is not an integer or string value");
     return llvm::Error::success();
   }
 
