@@ -127,3 +127,143 @@ layout t.one(N) {
 TEST(LayoutParse, RejectsUnterminatedLayout) {
   EXPECT_FALSE(parses("layout t.one(N) { param N in [1..8];"));
 }
+
+//===----------------------------------------------------------------------===//
+// Expression evaluation
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+using mlir::llk::machine::ComputeNode;
+using mlir::llk::machine::MachineModel;
+
+MachineModel evalMachine() {
+  MachineModel model;
+  model.target = "eval";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}}};
+  model.memories = {
+      {"sram.0", "sram", "e0", 32768, 64, {"row_major"}, std::nullopt}};
+  ComputeNode vector;
+  vector.id = "vec.0";
+  vector.kind = "vector_engine";
+  vector.attachedTo = "e0";
+  vector.elementTypes = {"f32"};
+  vector.shapes = {{8}};
+  vector.lanes = {{"f32", 8}, {"bf16", 16}};
+  model.computes.push_back(vector);
+  return model;
+}
+
+/// Parses `layout t() { require <expr>; }` and evaluates the constraint.
+llvm::Expected<EvalValue>
+evalExpr(llvm::StringRef expression, const MachineModel &machine,
+         LayoutContext context = {},
+         const llvm::StringMap<LayoutValue> &bindings = {}) {
+  std::string params;
+  for (const auto &binding : bindings) {
+    if (!params.empty())
+      params += ", ";
+    params += ("int " + binding.first()).str();
+  }
+  std::string text =
+      ("layout t(" + params + ") { require " + expression + "; }").str();
+  llvm::Expected<LayoutRegistry> registry = parseLayoutText(text, "<test>");
+  if (!registry)
+    return registry.takeError();
+  const LayoutDef *def = registry->find("t");
+  return evaluateExpr(*def->constraints[0], bindings, machine, context);
+}
+
+int64_t evalInt(llvm::StringRef expression, const MachineModel &machine,
+                LayoutContext context = {}) {
+  llvm::Expected<EvalValue> value = evalExpr(expression, machine, context);
+  if (!value || value->kind != EvalValue::Kind::Int)
+    return INT64_MIN;
+  return value->intValue;
+}
+
+} // namespace
+
+TEST(LayoutEval, ArithmeticPrecedence) {
+  MachineModel machine = evalMachine();
+  EXPECT_EQ(evalInt("1 + 2 * 3 == 7", machine), 1);
+  EXPECT_EQ(evalInt("(1 + 2) * 3 == 9", machine), 1);
+  EXPECT_EQ(evalInt("-3 + 5 == 2", machine), 1);
+}
+
+TEST(LayoutEval, DivisibilityAndComparison) {
+  MachineModel machine = evalMachine();
+  EXPECT_EQ(evalInt("8 % 4 == 0 && 3 > 2", machine), 1);
+  EXPECT_EQ(evalInt("8 % 5 == 0 || 3 >= 3", machine), 1);
+  EXPECT_EQ(evalInt("!(1 == 2)", machine), 1);
+}
+
+TEST(LayoutEval, StringEquality) {
+  MachineModel machine = evalMachine();
+  EXPECT_EQ(evalInt("\"a\" == \"a\"", machine), 1);
+  EXPECT_EQ(evalInt("\"a\" != \"b\"", machine), 1);
+}
+
+TEST(LayoutEval, BuiltinsComeFromContext) {
+  MachineModel machine = evalMachine();
+  LayoutContext context;
+  context.rank = 2;
+  context.elementType = "f32";
+  EXPECT_EQ(evalInt("rank == 2 && element_type == \"f32\"", machine, context),
+            1);
+}
+
+TEST(LayoutEval, MachineLanesAndCountQueries) {
+  MachineModel machine = evalMachine();
+  LayoutContext context;
+  context.elementType = "bf16";
+  EXPECT_EQ(
+      evalInt("machine.compute(\"vector_engine\").lanes(element_type) == 16",
+              machine, context),
+      1);
+  EXPECT_EQ(evalInt("machine.compute(\"vector_engine\").count == 1", machine),
+            1);
+}
+
+TEST(LayoutEval, MachineMemoryQueries) {
+  MachineModel machine = evalMachine();
+  EXPECT_EQ(
+      evalInt("machine.memory(\"sram.0\").capacity_bytes == 32768", machine),
+      1);
+  EXPECT_EQ(
+      evalInt("machine.memory(\"sram.0\").alignment_bytes == 64", machine), 1);
+}
+
+TEST(LayoutEval, RejectsTypeMismatch) {
+  MachineModel machine = evalMachine();
+  EXPECT_FALSE(static_cast<bool>(evalExpr("1 == \"a\"", machine)));
+  EXPECT_FALSE(static_cast<bool>(evalExpr("1 + \"a\" == 2", machine)));
+}
+
+TEST(LayoutEval, RejectsDivisionByZero) {
+  MachineModel machine = evalMachine();
+  EXPECT_FALSE(static_cast<bool>(evalExpr("1 / 0 == 1", machine)));
+}
+
+TEST(LayoutEval, RejectsUnknownMachineFacts) {
+  MachineModel machine = evalMachine();
+  EXPECT_FALSE(static_cast<bool>(
+      evalExpr("machine.compute(\"matrix_engine\").count == 0", machine)));
+  EXPECT_FALSE(static_cast<bool>(
+      evalExpr("machine.memory(\"dram.9\").capacity_bytes > 0", machine)));
+  LayoutContext context;
+  context.elementType = "f64";
+  EXPECT_FALSE(static_cast<bool>(
+      evalExpr("machine.compute(\"vector_engine\").lanes(element_type) > 0",
+               machine, context)));
+}
+
+TEST(LayoutEval, EvaluatesParameterBindings) {
+  MachineModel machine = evalMachine();
+  llvm::StringMap<LayoutValue> bindings;
+  bindings["N"] = int64_t{3};
+  llvm::Expected<EvalValue> value =
+      evalExpr("N * 2 == 6", machine, {}, bindings);
+  ASSERT_TRUE(static_cast<bool>(value));
+  EXPECT_EQ(value->intValue, 1);
+}

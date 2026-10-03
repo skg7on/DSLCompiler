@@ -9,15 +9,19 @@
 
 #include "LLK/Mapping/LayoutConstraints.h"
 
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/MemoryBuffer.h"
 
+#include <algorithm>
 #include <cctype>
+#include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 
 namespace mlir::llk::mapping {
 
@@ -664,8 +668,11 @@ ExprPtr Parser::parsePostfix() {
     if (!expectIdentifier("a member name", member))
       return nullptr;
     std::vector<ExprPtr> args;
-    if (!parseCallArgs(args))
-      return nullptr;
+    // A member query may take arguments (`.lanes(dtype)`) or be a property
+    // (`.count`, `.capacity_bytes`).
+    if (isPunct("("))
+      if (!parseCallArgs(args))
+        return nullptr;
     args.insert(args.begin(), expr);
     expr = makeExpr(ExprKind::MemberCall, std::move(member), std::move(args));
   }
@@ -763,6 +770,243 @@ llvm::Expected<LayoutRegistry> loadLayoutFile(llvm::StringRef path) {
     return llvm::createStringError(buffer.getError(),
                                    "cannot read LLKMap file '" + path + "'");
   return parseLayoutText(buffer.get()->getBuffer(), path);
+}
+
+//===----------------------------------------------------------------------===//
+// Expression evaluation
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+using machine::MachineModel;
+
+llvm::Error evalError(llvm::StringRef message) {
+  return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+}
+
+EvalValue makeInt(int64_t value) {
+  EvalValue result;
+  result.kind = EvalValue::Kind::Int;
+  result.intValue = value;
+  return result;
+}
+
+EvalValue makeStr(std::string value) {
+  EvalValue result;
+  result.kind = EvalValue::Kind::Str;
+  result.text = std::move(value);
+  return result;
+}
+
+EvalValue makeHandle(std::string value) {
+  EvalValue result;
+  result.kind = EvalValue::Kind::Handle;
+  result.text = std::move(value);
+  return result;
+}
+
+using EvalFn = llvm::function_ref<llvm::Expected<EvalValue>(const Expr &)>;
+
+llvm::Expected<EvalValue> evalBinary(const Expr &expr, EvalFn eval) {
+  llvm::Expected<EvalValue> lhs = eval(*expr.operands[0]);
+  if (!lhs)
+    return lhs.takeError();
+  llvm::Expected<EvalValue> rhs = eval(*expr.operands[1]);
+  if (!rhs)
+    return rhs.takeError();
+
+  const std::string &op = expr.text;
+  if (op == "&&" || op == "||") {
+    if (lhs->kind != EvalValue::Kind::Int || rhs->kind != EvalValue::Kind::Int)
+      return evalError("'" + op + "' requires integer operands");
+    bool left = lhs->intValue != 0;
+    bool right = rhs->intValue != 0;
+    return makeInt(op == "&&" ? (left && right) : (left || right));
+  }
+
+  if (op == "==" || op == "!=") {
+    if (lhs->kind != rhs->kind)
+      return evalError("cannot compare an integer with a string");
+    bool equal = lhs->kind == EvalValue::Kind::Int
+                     ? lhs->intValue == rhs->intValue
+                     : lhs->text == rhs->text;
+    return makeInt((op == "==") == equal ? 1 : 0);
+  }
+
+  if (lhs->kind != EvalValue::Kind::Int || rhs->kind != EvalValue::Kind::Int)
+    return evalError("'" + op + "' requires integer operands");
+  int64_t left = lhs->intValue;
+  int64_t right = rhs->intValue;
+  if (op == "<")
+    return makeInt(left < right);
+  if (op == "<=")
+    return makeInt(left <= right);
+  if (op == ">")
+    return makeInt(left > right);
+  if (op == ">=")
+    return makeInt(left >= right);
+  if (op == "+")
+    return makeInt(left + right);
+  if (op == "-")
+    return makeInt(left - right);
+  if (op == "*")
+    return makeInt(left * right);
+  if (op == "/" || op == "%") {
+    if (right == 0)
+      return evalError("division by zero");
+    return makeInt(op == "/" ? left / right : left % right);
+  }
+  return evalError("unknown operator '" + op + "'");
+}
+
+llvm::Expected<EvalValue> evalCall(const Expr &expr, EvalFn eval) {
+  const std::string &callee = expr.text;
+  if (callee == "machine.compute" || callee == "machine.memory") {
+    if (expr.operands.size() != 1)
+      return evalError("'" + callee + "' takes exactly one argument");
+    llvm::Expected<EvalValue> argument = eval(*expr.operands[0]);
+    if (!argument)
+      return argument.takeError();
+    if (argument->kind != EvalValue::Kind::Str)
+      return evalError("'" + callee + "' needs a string argument");
+    return makeHandle(callee + ":" + argument->text);
+  }
+
+  if (expr.operands.size() != 2)
+    return evalError("'" + callee + "' takes exactly two arguments");
+  llvm::Expected<EvalValue> lhs = eval(*expr.operands[0]);
+  if (!lhs)
+    return lhs.takeError();
+  llvm::Expected<EvalValue> rhs = eval(*expr.operands[1]);
+  if (!rhs)
+    return rhs.takeError();
+  if (lhs->kind != EvalValue::Kind::Int || rhs->kind != EvalValue::Kind::Int)
+    return evalError("'" + callee + "' requires integer arguments");
+  int64_t left = lhs->intValue;
+  int64_t right = rhs->intValue;
+
+  if (callee == "floordiv" || callee == "mod") {
+    if (right == 0)
+      return evalError("division by zero");
+    return makeInt(callee == "floordiv" ? left / right : left % right);
+  }
+  if (callee == "ceildiv") {
+    if (right <= 0)
+      return evalError("'ceildiv' needs a positive divisor");
+    return makeInt((left + right - 1) / right);
+  }
+  if (callee == "min")
+    return makeInt(std::min(left, right));
+  if (callee == "max")
+    return makeInt(std::max(left, right));
+  return evalError("unknown function '" + callee + "'");
+}
+
+llvm::Expected<EvalValue> evalMember(const Expr &expr, EvalFn eval,
+                                     const MachineModel &machine) {
+  llvm::Expected<EvalValue> receiver = eval(*expr.operands[0]);
+  if (!receiver)
+    return receiver.takeError();
+  if (receiver->kind != EvalValue::Kind::Handle)
+    return evalError("'" + expr.text + "' applied to a non-machine value");
+
+  // The handle text is "<machine.compute|machine.memory>:<subject>".
+  size_t colon = receiver->text.find(':');
+  if (colon == std::string::npos)
+    return evalError("malformed machine handle");
+  bool isCompute = receiver->text.starts_with("machine.compute:");
+  llvm::StringRef subject = llvm::StringRef(receiver->text).substr(colon + 1);
+  const std::string &member = expr.text;
+
+  if (member == "count") {
+    if (!isCompute)
+      return evalError("'count' applies to a compute capability");
+    int64_t count = 0;
+    for (const auto &compute : machine.computes)
+      if (compute.kind == subject)
+        ++count;
+    if (count == 0)
+      return evalError("unknown compute kind '" + subject.str() + "'");
+    return makeInt(count);
+  }
+
+  if (member == "lanes") {
+    if (!isCompute)
+      return evalError("'lanes' applies to a compute capability");
+    if (expr.operands.size() != 2)
+      return evalError("'lanes' takes one dtype argument");
+    llvm::Expected<EvalValue> dtype = eval(*expr.operands[1]);
+    if (!dtype)
+      return dtype.takeError();
+    if (dtype->kind != EvalValue::Kind::Str)
+      return evalError("'lanes' needs a string dtype");
+    std::optional<int64_t> lanes = machine.lanesFor(subject, dtype->text);
+    if (!lanes)
+      return evalError("compute '" + subject.str() +
+                       "' does not model dtype '" + dtype->text + "'");
+    return makeInt(*lanes);
+  }
+
+  if (member == "capacity_bytes" || member == "alignment_bytes") {
+    if (isCompute)
+      return evalError("'" + member + "' applies to a memory, not a compute");
+    const machine::MemoryNode *memory = machine.findMemory(subject);
+    if (!memory)
+      return evalError("unknown memory '" + subject.str() + "'");
+    return makeInt(member == "capacity_bytes"
+                       ? static_cast<int64_t>(memory->capacityBytes)
+                       : static_cast<int64_t>(memory->alignmentBytes));
+  }
+
+  return evalError("unknown machine query '" + member + "'");
+}
+
+} // namespace
+
+llvm::Expected<EvalValue>
+evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
+             const MachineModel &machine, const LayoutContext &context) {
+  auto eval = [&](const Expr &node) {
+    return evaluateExpr(node, bindings, machine, context);
+  };
+
+  switch (expr.kind) {
+  case ExprKind::IntLit:
+    return makeInt(expr.intValue);
+  case ExprKind::StringLit:
+    return makeStr(expr.text);
+  case ExprKind::Ident: {
+    auto it = bindings.find(expr.text);
+    if (it != bindings.end()) {
+      const LayoutValue &value = it->second;
+      if (const auto *integer = std::get_if<int64_t>(&value))
+        return makeInt(*integer);
+      return makeStr(std::get<std::string>(value));
+    }
+    if (expr.text == "rank")
+      return makeInt(context.rank);
+    if (expr.text == "element_type")
+      return makeStr(context.elementType);
+    return evalError("unknown identifier '" + expr.text + "'");
+  }
+  case ExprKind::Unary: {
+    llvm::Expected<EvalValue> operand = eval(*expr.operands[0]);
+    if (!operand)
+      return operand.takeError();
+    if (operand->kind != EvalValue::Kind::Int)
+      return evalError("'" + expr.text + "' requires an integer operand");
+    if (expr.text == "!")
+      return makeInt(operand->intValue == 0 ? 1 : 0);
+    return makeInt(-operand->intValue);
+  }
+  case ExprKind::Binary:
+    return evalBinary(expr, eval);
+  case ExprKind::Call:
+    return evalCall(expr, eval);
+  case ExprKind::MemberCall:
+    return evalMember(expr, eval, machine);
+  }
+  return evalError("unhandled expression");
 }
 
 } // namespace mlir::llk::mapping

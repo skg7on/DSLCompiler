@@ -36,7 +36,7 @@ relational ::= additive (("<" | "<=" | ">" | ">=") additive)*
 additive   ::= multiplicative (("+" | "-") multiplicative)*
 multiplicative ::= unary (("*" | "/" | "%") unary)*
 unary      ::= ("!" | "-") unary | postfix
-postfix    ::= primary ("." ident "(" args ")")*
+postfix    ::= primary ("." ident [ "(" args ")" ])*
 primary    ::= int | string | ident | "(" expr ")" | call
 call       ::= ident "(" args ")"
 id         ::= (letter | "_") (alnum | "_" | ".")*

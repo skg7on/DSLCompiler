@@ -23,6 +23,7 @@
 #include "LLK/Machine/MachineModel.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
@@ -111,6 +112,36 @@ llvm::Expected<LayoutRegistry> parseLayoutText(llvm::StringRef text,
 
 /// Reads and parses the file at `path`.
 llvm::Expected<LayoutRegistry> loadLayoutFile(llvm::StringRef path);
+
+//===----------------------------------------------------------------------===//
+// Expression evaluation
+//===----------------------------------------------------------------------===//
+
+/// The values a declaration is instantiated against: the rank and element type
+/// of the value being laid out. They back the `rank` and `element_type`
+/// builtins.
+struct LayoutContext {
+  int64_t rank = 0;
+  std::string elementType;
+};
+
+/// The result of evaluating an expression. `Handle` is the intermediate value
+/// a `machine.compute(...)` / `machine.memory(...)` query produces before a
+/// member query is applied; it never escapes as a solution value.
+struct EvalValue {
+  enum class Kind { Int, Str, Handle };
+  Kind kind = Kind::Int;
+  int64_t intValue = 0;
+  std::string text;
+};
+
+/// Evaluates a parsed expression. Booleans are integers (0 and 1). Fails on an
+/// unknown identifier, an unknown machine fact, a type mismatch between an
+/// integer and a string, or division by zero.
+llvm::Expected<EvalValue>
+evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
+             const machine::MachineModel &machine,
+             const LayoutContext &context);
 
 } // namespace mlir::llk::mapping
 
