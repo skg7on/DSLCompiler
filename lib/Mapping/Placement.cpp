@@ -162,8 +162,14 @@ llvm::Expected<std::vector<CandidateInstance>>
 enumeratePlacements(const MappingCandidate &candidate,
                     const MappingTarget &target, mlir::MLIRContext &context,
                     const LayoutContext &layoutContext,
-                    const PlacementOptions &options, bool *truncated) {
+                    const PlacementOptions &options, bool *truncated,
+                    PlacementFailure *failure) {
   const MachineModel &machine = target.machine();
+
+  auto reportFailure = [&](PlacementFailure reason) {
+    if (failure)
+      *failure = reason;
+  };
 
   // A layout requirement that cannot solve makes the candidate unplaceable,
   // independently of which executor would run it.
@@ -176,8 +182,10 @@ enumeratePlacements(const MappingCandidate &candidate,
         solveLayout(*def, machine, context, layoutContext);
     if (!solved)
       return solved.takeError();
-    if (solved->solutions.empty())
+    if (solved->solutions.empty()) {
+      reportFailure(PlacementFailure::NoLegalLayout);
       return std::vector<CandidateInstance>{};
+    }
   }
 
   std::vector<const ExecutorNode *> executors;
@@ -195,7 +203,12 @@ enumeratePlacements(const MappingCandidate &candidate,
   }
   if (options.reduceSymmetry)
     executors = reduceSymmetric(machine, executors);
+  if (executors.empty())
+    reportFailure(PlacementFailure::NoLegalExecutor);
 
+  // The first failing executor in machine order decides the reported reason,
+  // so the code does not depend on which executor happened to be visited last.
+  bool executorReasonRecorded = false;
   std::vector<CandidateInstance> instances;
   for (const ExecutorNode *executor : executors) {
     CandidateInstance instance;
@@ -220,8 +233,13 @@ enumeratePlacements(const MappingCandidate &candidate,
       }
       instance.computeBindings[requirement.kind] = match->id;
     }
-    if (!computesOk)
+    if (!computesOk) {
+      if (!executorReasonRecorded) {
+        reportFailure(PlacementFailure::UnsupportedComputeFragment);
+        executorReasonRecorded = true;
+      }
       continue;
+    }
 
     // Memory attachments: the first visible memory of each required kind.
     bool memoriesOk = true;
@@ -240,8 +258,13 @@ enumeratePlacements(const MappingCandidate &candidate,
       }
       instance.memoryBindings[requirement.kind] = match->id;
     }
-    if (!memoriesOk)
+    if (!memoriesOk) {
+      if (!executorReasonRecorded) {
+        reportFailure(PlacementFailure::NoLegalMemory);
+        executorReasonRecorded = true;
+      }
       continue;
+    }
 
     for (const LayoutRequirement &requirement : candidate.layoutRequirements)
       instance.layoutBindings[requirement.layoutClass] =
@@ -271,6 +294,10 @@ enumeratePlacements(const MappingCandidate &candidate,
       break;
     }
   }
+  // Instances produced means the candidate placed; clear any reason recorded
+  // while some other executor was tried and skipped.
+  if (!instances.empty())
+    reportFailure(PlacementFailure::None);
   return instances;
 }
 

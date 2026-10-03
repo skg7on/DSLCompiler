@@ -25,6 +25,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
 #include <limits>
@@ -169,7 +170,31 @@ bool placementBefore(const PlanPlacement &lhs, const PlanPlacement &rhs) {
   return lhs.instance < rhs.instance;
 }
 
+/// The §22.3 code naming a placement failure. `NoLegalMemory` has no dedicated
+/// code in the minimum set: the executor that matched cannot supply a memory
+/// the rule requires, so the executor is what is not legal.
+DiagnosticCode placementFailureCode(PlacementFailure failure) {
+  switch (failure) {
+  case PlacementFailure::NoLegalLayout:
+    return DiagnosticCode::NoLegalLayout;
+  case PlacementFailure::UnsupportedComputeFragment:
+    return DiagnosticCode::UnsupportedComputeFragment;
+  case PlacementFailure::NoLegalExecutor:
+  case PlacementFailure::NoLegalMemory:
+  case PlacementFailure::None:
+    return DiagnosticCode::NoLegalExecutor;
+  }
+  return DiagnosticCode::NoLegalExecutor;
+}
+
 } // namespace
+
+bool FailureFrontier::has(DiagnosticCode code) const {
+  for (const Diagnostic &diagnostic : diagnostics)
+    if (diagnostic.code == code)
+      return true;
+  return false;
+}
 
 CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
                                const MappingTarget &target,
@@ -184,6 +209,20 @@ CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
 llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   const MachineModel &machine = target_.machine();
   MappingSearchResult result;
+
+  // Records a stable-coded failure once per (code, message) pair. A cause that
+  // recurs on every branch -- a memory overflow, a provider that never caches a
+  // rule, a cap hit -- stays a single frontier entry; the category counts carry
+  // the tally. Order here is deterministic, and the final sort makes it so even
+  // if a future caller reaches these in a different order.
+  llvm::StringSet<> recordedDiagnostics;
+  auto report = [&](DiagnosticCode code, std::string message) {
+    std::string key = stringifyDiagnosticCode(code).str();
+    key += '\x1f';
+    key += message;
+    if (recordedDiagnostics.insert(key).second)
+      result.frontier.diagnostics.push_back({code, std::move(message)});
+  };
 
   // --- node tables -----------------------------------------------------
   std::vector<const WorkloadNode *> ordered;
@@ -208,12 +247,15 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     if (matches.size() > options_.maxCandidatesPerNode) {
       matches.resize(options_.maxCandidatesPerNode);
       result.searchTruncated = true;
+      report(DiagnosticCode::SearchTruncated,
+             "candidate cap reached (maxCandidatesPerNode=" +
+                 std::to_string(options_.maxCandidatesPerNode) + ")");
     }
     if (matches.empty()) {
       ++result.frontier.nodesWithoutRules;
-      result.frontier.messages.push_back("node " + std::to_string(node->id) +
-                                         " ('" + node->opName +
-                                         "'): no matching rule");
+      report(DiagnosticCode::NoMatchingRule,
+             "node " + std::to_string(node->id) + " ('" + node->opName +
+                 "'): no matching rule");
     }
     // A rule whose `require` constraints no assignment satisfies produces no
     // candidate: that is a non-match, so a node with only such rules has no
@@ -227,24 +269,38 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       std::optional<MappingCandidate> candidate = toMappingCandidate(
           *rule, *node, machine, layoutContext_, &reason, &truncated);
       if (!candidate) {
-        if (truncated)
+        if (truncated) {
           result.searchTruncated = true;
-        result.frontier.messages.push_back("node " + std::to_string(node->id) +
-                                           ": rule '" + rule->id +
-                                           "' not applicable: " + reason);
+          report(DiagnosticCode::SearchTruncated,
+                 "constraint assignment cap reached while matching rule '" +
+                     rule->id + "'");
+        }
+        report(DiagnosticCode::NoMatchingRule,
+               "node " + std::to_string(node->id) + ": rule '" + rule->id +
+                   "' not applicable: " + reason);
         continue;
       }
       producedCandidate = true;
+      PlacementFailure placementFailure = PlacementFailure::None;
+      bool placementTruncated = false;
       llvm::Expected<std::vector<CandidateInstance>> instances =
           enumeratePlacements(*candidate, target_, context_, layoutContext_,
-                              placementOptions, &result.searchTruncated);
+                              placementOptions, &placementTruncated,
+                              &placementFailure);
       if (!instances)
         return instances.takeError();
+      if (placementTruncated) {
+        result.searchTruncated = true;
+        report(DiagnosticCode::SearchTruncated,
+               "instance cap reached (maxInstancesPerCandidate=" +
+                   std::to_string(options_.maxInstancesPerCandidate) + ")");
+      }
       if (instances->empty()) {
         ++result.frontier.candidatesWithoutPlacement;
-        result.frontier.messages.push_back("node " + std::to_string(node->id) +
-                                           ": rule '" + rule->id +
-                                           "' has no legal placement");
+        DiagnosticCode code = placementFailureCode(placementFailure);
+        report(code, "node " + std::to_string(node->id) + ": rule '" +
+                         rule->id + "' has no legal placement (" +
+                         stringifyDiagnosticCode(code).str() + ")");
       }
       for (CandidateInstance &instance : *instances) {
         InstanceEntry entry{std::move(instance), rule, {}};
@@ -271,6 +327,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             if (std::optional<double> measured =
                     provider->lookupCycles(signature, context))
               entry.cost.latencyCycles = *measured;
+            else
+              report(DiagnosticCode::LatencyCacheMiss,
+                     "rule '" + rule->id + "' (op '" + node->opName +
+                         "'): no cached latency; static estimate retained");
           }
         }
         table.instances.push_back(std::move(entry));
@@ -278,9 +338,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     }
     if (!producedCandidate && !matches.empty()) {
       ++result.frontier.nodesWithoutRules;
-      result.frontier.messages.push_back(
-          "node " + std::to_string(node->id) + " ('" + node->opName +
-          "'): no rule satisfies its constraints");
+      report(DiagnosticCode::NoMatchingRule,
+             "node " + std::to_string(node->id) + " ('" + node->opName +
+                 "'): no rule satisfies its constraints");
     }
     tables.push_back(std::move(table));
   }
@@ -355,11 +415,17 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       }
       if (bytes > memory->capacityBytes) {
         ++result.frontier.plansRejectedByCapacity;
+        report(DiagnosticCode::MemoryCapacityExceeded,
+               "memory '" + key.str() + "' over capacity (" +
+                   std::to_string(memory->capacityBytes) + " bytes)");
         return false;
       }
     }
     if (totalBytes > options_.memoryBudgetBytes) {
       ++result.frontier.plansRejectedByCapacity;
+      report(DiagnosticCode::MemoryCapacityExceeded,
+             "plan byte total exceeds the global budget (" +
+                 std::to_string(options_.memoryBudgetBytes) + " bytes)");
       return false;
     }
 
@@ -410,21 +476,30 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (ExecutorId executor = consumer->executorBindings.lookup("executor");
           !executor.empty())
         request.consumerExecutor = executor;
+      bool connectionTruncated = false;
       llvm::Expected<std::vector<ConnectionPlan>> alternatives =
           synthesizeConnections(request, machine, topology, placementOptions,
-                                &result.searchTruncated);
+                                &connectionTruncated);
+      if (connectionTruncated) {
+        result.searchTruncated = true;
+        report(DiagnosticCode::SearchTruncated,
+               "route cap reached (maxRoutesPerConnection=" +
+                   std::to_string(options_.maxRoutesPerConnection) + ")");
+      }
       if (!alternatives) {
-        result.frontier.messages.push_back(
-            "connection " + request.producerMemory + " -> " +
-            request.consumerMemory + ": " +
-            llvm::toString(alternatives.takeError()));
+        // A malformed connection request: it fails this branch, and the closest
+        // §22.3 code is the one that names a connection that cannot be built.
+        report(DiagnosticCode::NoMemoryRoute,
+               "connection " + request.producerMemory + " -> " +
+                   request.consumerMemory + ": " +
+                   llvm::toString(alternatives.takeError()));
         return false;
       }
       if (alternatives->empty()) {
         ++result.frontier.incompatibleInstancePairs;
-        result.frontier.messages.push_back(
-            "connection " + request.producerMemory + " -> " +
-            request.consumerMemory + ": no legal route");
+        report(DiagnosticCode::NoMemoryRoute,
+               "connection " + request.producerMemory + " -> " +
+                   request.consumerMemory + ": no legal route");
         return false;
       }
       // The alternative the declared objective prefers is the one a plan
@@ -500,6 +575,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (next.size() > options_.beamWidth) {
         next.resize(options_.beamWidth);
         result.searchTruncated = true;
+        report(DiagnosticCode::SearchTruncated,
+               "beam width reached (beamWidth=" +
+                   std::to_string(options_.beamWidth) + ")");
       }
       beam = std::move(next);
       if (beam.empty())
@@ -540,6 +618,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             // plan we would keep -- but the space was not exhausted, and the
             // caller is told so.
             result.searchTruncated = true;
+            report(DiagnosticCode::SearchTruncated,
+                   "exact search pruned by the top-K bound (topK=" +
+                       std::to_string(options_.topK) + ")");
             continue;
           }
         }
@@ -570,6 +651,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   if (complete.size() > options_.topK) {
     complete.resize(options_.topK);
     result.searchTruncated = true;
+    report(DiagnosticCode::SearchTruncated,
+           "top-K cap reached (topK=" + std::to_string(options_.topK) + ")");
   }
 
   for (const Partial &partial : complete) {
@@ -638,6 +721,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     plan.id = computePlanId(plan);
     result.plans.push_back(std::move(plan));
   }
+
+  // §22.1/§22.3: the frontier's codes are the stable interface, so their order
+  // must not depend on the order branches happened to be explored.
+  llvm::sort(result.frontier.diagnostics, diagnosticLess);
   return result;
 }
 

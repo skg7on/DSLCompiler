@@ -98,8 +98,12 @@ llvm::Expected<CoveringPlan> selectPlan(MLIRContext &context, ModuleOp module,
         std::to_string(result->frontier.candidatesWithoutPlacement) +
         " incompatiblePairs=" +
         std::to_string(result->frontier.incompatibleInstancePairs);
-    for (const std::string &message : result->frontier.messages)
-      reason += "\n  " + message;
+    for (const mlir::llk::mapping::Diagnostic &diagnostic :
+         result->frontier.diagnostics)
+      reason +=
+          "\n  " +
+          mlir::llk::mapping::stringifyDiagnosticCode(diagnostic.code).str() +
+          ": " + diagnostic.message;
     return llvm::createStringError(llvm::inconvertibleErrorCode(), reason);
   }
   return result->plans.front();

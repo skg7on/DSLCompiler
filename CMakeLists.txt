@@ -268,6 +268,7 @@ target_compile_options(LLKMachine PRIVATE -fno-rtti -fno-exceptions)
 # LLKMachine's topology.
 add_library(LLKMapping STATIC
     lib/Mapping/StableHash.cpp
+    lib/Mapping/Diagnostics.cpp
     lib/Mapping/CostModel.cpp
     lib/Mapping/CostEvent.cpp
     lib/Mapping/LatencyProvider.cpp

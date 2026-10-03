@@ -240,8 +240,9 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
         (passName + ": the search produced no complete plan").str();
     if (run.result.searchTruncated)
       message += " (a search cap was hit)";
-    for (const std::string &detail : run.result.frontier.messages)
-      message += "\n  " + detail;
+    for (const mapping::Diagnostic &detail : run.result.frontier.diagnostics)
+      message += "\n  " + mapping::stringifyDiagnosticCode(detail.code).str() +
+                 ": " + detail.message;
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    std::move(message));
   }

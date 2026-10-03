@@ -1,6 +1,7 @@
 //===- covering_search.cpp - Complete-plan search (D6) -------------------===//
 
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/LatencyProvider.h"
 
 #include "llvm/Support/Error.h"
@@ -9,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -203,6 +205,23 @@ std::unique_ptr<MappingTarget> targetWith(MachineModel machine,
       std::vector<std::string>{"e1"});
 }
 
+/// `targetWith`, with a layout library so a rule's layout requirement can be
+/// solved (or fail to be).
+std::unique_ptr<MappingTarget> targetWithLayouts(MachineModel machine,
+                                                 llvm::StringRef rules,
+                                                 llvm::StringRef layouts) {
+  llvm::Expected<RuleRegistry> ruleRegistry = parseRuleText(rules, "<test>");
+  if (!ruleRegistry)
+    return nullptr;
+  llvm::Expected<LayoutRegistry> layoutRegistry =
+      parseLayoutText(layouts, "<test>");
+  if (!layoutRegistry)
+    return nullptr;
+  return std::make_unique<FileMappingTarget>(
+      "test", std::move(machine), std::move(*layoutRegistry),
+      std::move(*ruleRegistry), std::vector<std::string>{"e1"});
+}
+
 /// A provider that answers from a table keyed by rule id, and records what it
 /// was asked for.
 class FixedLatencyProvider : public LatencyProvider {
@@ -240,6 +259,13 @@ std::vector<PlanId> planIds(const MappingSearchResult &result) {
   for (const CoveringPlan &plan : result.plans)
     ids.push_back(plan.id);
   return ids;
+}
+
+bool hasDiagnostic(const MappingSearchResult &result, DiagnosticCode code) {
+  for (const Diagnostic &diagnostic : result.frontier.diagnostics)
+    if (diagnostic.code == code)
+      return true;
+  return false;
 }
 
 llvm::StringMap<SearchValue>
@@ -311,7 +337,7 @@ TEST(CoveringSearch, ReportsNodesWithoutRules) {
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   EXPECT_TRUE(result->plans.empty());
   EXPECT_EQ(result->frontier.nodesWithoutRules, 2u);
-  EXPECT_FALSE(result->frontier.messages.empty());
+  EXPECT_FALSE(result->frontier.diagnostics.empty());
 }
 
 TEST(CoveringSearch, ReportsCandidatesWithoutPlacement) {
@@ -353,11 +379,11 @@ rule r.big {
   EXPECT_TRUE(result->plans.empty());
   EXPECT_TRUE(result->searchTruncated);
   EXPECT_EQ(result->frontier.nodesWithoutRules, 2u);
-  ASSERT_FALSE(result->frontier.messages.empty());
+  ASSERT_FALSE(result->frontier.diagnostics.empty());
   // The cap reason reaches the frontier, where the pass surfaces it.
   bool mentionsCap = false;
-  for (const std::string &message : result->frontier.messages)
-    mentionsCap |= message.find("assignments") != std::string::npos;
+  for (const Diagnostic &diagnostic : result->frontier.diagnostics)
+    mentionsCap |= diagnostic.message.find("assignments") != std::string::npos;
   EXPECT_TRUE(mentionsCap);
 }
 
@@ -796,4 +822,196 @@ TEST(CoveringSearch, NoBindingLeavesTheHashZeroAndThePlanIdUnchanged) {
   EXPECT_EQ(result->plans[0].sourceBindingHash, 0u);
   EXPECT_TRUE(result->plans[0].globalParameters.empty());
   EXPECT_EQ(result->plans[0].id, kNoBindingPlanId);
+}
+
+//===----------------------------------------------------------------------===//
+// Stable diagnostic codes (design §22.3)
+//===----------------------------------------------------------------------===//
+
+// Every code has a stable string, and that string maps back to the same code.
+TEST(MappingDiagnostics, EveryCodeRoundTripsThroughItsString) {
+  const DiagnosticCode codes[] = {
+      DiagnosticCode::NoMatchingRule,
+      DiagnosticCode::NoLegalLayout,
+      DiagnosticCode::NoLegalExecutor,
+      DiagnosticCode::MemoryCapacityExceeded,
+      DiagnosticCode::UnsupportedComputeFragment,
+      DiagnosticCode::NoMemoryRoute,
+      DiagnosticCode::NoLayoutTransform,
+      DiagnosticCode::GlobalConstraintFailed,
+      DiagnosticCode::SearchTruncated,
+      DiagnosticCode::LatencyCacheMiss,
+      DiagnosticCode::TargetBundleInvalid,
+  };
+  for (DiagnosticCode code : codes) {
+    llvm::StringRef text = stringifyDiagnosticCode(code);
+    EXPECT_FALSE(text.empty());
+    std::optional<DiagnosticCode> back = symbolizeDiagnosticCode(text);
+    ASSERT_TRUE(back.has_value()) << text.str();
+    EXPECT_EQ(*back, code);
+  }
+  // An unknown string is not silently mapped to a code.
+  EXPECT_FALSE(symbolizeDiagnosticCode("not_a_code").has_value());
+}
+
+TEST(MappingDiagnostics, NoRuleGraphCarriesNoMatchingRule) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), "");
+  ASSERT_NE(target, nullptr);
+
+  CoveringSearch search(graph, *target, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
+}
+
+TEST(MappingDiagnostics, PlacementFailureCarriesNoLegalExecutor) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kNoPlacementRules);
+  ASSERT_NE(target, nullptr);
+
+  CoveringSearch search(graph, *target, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoLegalExecutor));
+}
+
+TEST(MappingDiagnostics, UnsolvableLayoutCarriesNoLegalLayout) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  constexpr llvm::StringLiteral kLayoutRule = R"llkmap(
+rule r.layout {
+  match micro.vector(op = "add");
+  require layout operand0 satisfies t.rank3;
+  bundle "b.layout";
+  emit "e1";
+}
+)llkmap";
+  // The layout needs rank 3; the search's default context is rank 0, so the
+  // requirement cannot solve and no placement is legal.
+  constexpr llvm::StringLiteral kRank3Layout = R"llkmap(
+layout t.rank3(int N) {
+  param N in [1..8];
+  require rank == 3;
+}
+)llkmap";
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(searchMachine(), kLayoutRule, kRank3Layout);
+  ASSERT_NE(target, nullptr);
+
+  CoveringSearch search(graph, *target, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoLegalLayout));
+}
+
+TEST(MappingDiagnostics, MissingComputeCapabilityIsUnsupportedComputeFragment) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  // The rule needs a matrix engine; the machine's only executor attaches no
+  // compute node, so the executor matches but its fragment support does not.
+  constexpr llvm::StringLiteral kComputeRule = R"llkmap(
+rule r.compute {
+  match micro.vector(op = "add");
+  require compute kind matrix_engine;
+  bundle "b.compute";
+  emit "e1";
+}
+)llkmap";
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kComputeRule);
+  ASSERT_NE(target, nullptr);
+
+  CoveringSearch search(graph, *target, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(
+      hasDiagnostic(*result, DiagnosticCode::UnsupportedComputeFragment));
+}
+
+TEST(MappingDiagnostics, CapacityRejectionCarriesMemoryCapacityExceeded) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  options.memoryBudgetBytes = 1; // any bound memory overflows this
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+TEST(MappingDiagnostics, TruncationCarriesSearchTruncated) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1; // four plans exist; asking for one is a cap
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->searchTruncated);
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::SearchTruncated));
+}
+
+TEST(MappingDiagnostics, LatencyMissCarriesLatencyCacheMiss) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  FixedLatencyProvider provider; // entryless: every lookup misses
+
+  std::unique_ptr<MappingTarget> target =
+      targetWithProvider(searchMachine(), kRules, &provider);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(provider.lookups.empty()); // it was asked, and declined
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::LatencyCacheMiss));
+}
+
+// The codes are the stable interface, so a caller can group by them rather
+// than parse prose. Two distinct root causes produce two distinct codes.
+TEST(MappingDiagnostics, DistinctFailuresCarryDistinctCodes) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), "");
+  ASSERT_NE(target, nullptr);
+
+  CoveringSearch search(graph, *target, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
+  EXPECT_FALSE(hasDiagnostic(*result, DiagnosticCode::SearchTruncated));
+  // Codes are deterministically ordered by (code, message), so two identical
+  // searches produce byte-identical frontier diagnostics.
+  CoveringSearch again(graph, *target, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> againResult = again.search();
+  ASSERT_TRUE(static_cast<bool>(againResult))
+      << llvm::toString(againResult.takeError());
+  ASSERT_EQ(result->frontier.diagnostics.size(),
+            againResult->frontier.diagnostics.size());
+  for (size_t index = 0; index < result->frontier.diagnostics.size(); ++index) {
+    EXPECT_EQ(result->frontier.diagnostics[index].code,
+              againResult->frontier.diagnostics[index].code);
+    EXPECT_EQ(result->frontier.diagnostics[index].message,
+              againResult->frontier.diagnostics[index].message);
+  }
 }

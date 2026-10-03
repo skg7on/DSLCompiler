@@ -22,6 +22,7 @@
 #ifndef LLK_MAPPING_COVERINGSEARCH_H
 #define LLK_MAPPING_COVERINGSEARCH_H
 
+#include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/LlkMap.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingTarget.h"
@@ -72,11 +73,28 @@ struct MappingSearchOptions {
 struct FailureFrontier {
   /// Nodes with no rule in effect: either no rule names the operation, or every
   /// rule that names it was rejected by its `require` constraints.
+  /// Reported with `DiagnosticCode::NoMatchingRule`.
   uint64_t nodesWithoutRules = 0;
+  /// Candidates whose rule matched but placed nothing. The stable code on the
+  /// accompanying diagnostic says which requirement failed
+  /// (`no_legal_executor`, `no_legal_layout`, or
+  /// `unsupported_compute_fragment`).
   uint64_t candidatesWithoutPlacement = 0;
+  /// Chosen instance pairs no connection could join. Reported with
+  /// `DiagnosticCode::NoMemoryRoute`.
   uint64_t incompatibleInstancePairs = 0;
+  /// Plans a memory's own capacity or the whole-plan budget rejected.
+  /// Reported with `DiagnosticCode::MemoryCapacityExceeded`.
   uint64_t plansRejectedByCapacity = 0;
-  std::vector<std::string> messages;
+  /// Stable-coded reasons (design §22.3), deterministically ordered by code
+  /// then message before `search()` returns. Recurring causes -- a capacity
+  /// overflow hit on every branch, a provider never caching a rule -- are
+  /// recorded once each, so the frontier stays bounded; the counts above are
+  /// the tallies.
+  std::vector<Diagnostic> diagnostics;
+
+  /// True when any diagnostic carries `code`.
+  bool has(DiagnosticCode code) const;
 };
 
 struct MappingSearchResult {

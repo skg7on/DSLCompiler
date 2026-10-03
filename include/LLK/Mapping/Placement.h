@@ -51,6 +51,22 @@ struct PlacementOptions {
   unsigned maxRoutesPerConnection = 4;
 };
 
+/// Why a candidate produced no legal placement. Reported only when the result
+/// is empty, so a caller can attach the stable §22.3 diagnostic code that says
+/// *which* requirement could not be met rather than a single "unplaceable".
+enum class PlacementFailure {
+  /// At least one instance was placed.
+  None,
+  /// No executor satisfies the candidate's executor requirements.
+  NoLegalExecutor,
+  /// A required layout has no solution on the machine.
+  NoLegalLayout,
+  /// An executor matched but attaches no compute node of a required kind.
+  UnsupportedComputeFragment,
+  /// An executor matched but no visible memory of a required kind exists.
+  NoLegalMemory,
+};
+
 /// Enumerates legal placements of `candidate` on `target`, in machine
 /// declaration order. Returns an empty vector when the candidate cannot be
 /// placed; fails only on a malformed input, such as a layout requirement that
@@ -60,10 +76,16 @@ struct PlacementOptions {
 /// reached. The check is conservative: it also fires when the candidate has
 /// exactly `maxInstances` legal placements, because a caller may not claim
 /// optimality once the cap was touched (design §16.2).
+///
+/// When `failure` is non-null it is set to the reason the result is empty (or
+/// `PlacementFailure::None` when instances were produced). Its value is
+/// deterministic: when several executors fail for different reasons, the first
+/// failing executor in machine order decides.
 llvm::Expected<std::vector<CandidateInstance>> enumeratePlacements(
     const MappingCandidate &candidate, const MappingTarget &target,
     mlir::MLIRContext &context, const LayoutContext &layoutContext,
-    const PlacementOptions &options = {}, bool *truncated = nullptr);
+    const PlacementOptions &options = {}, bool *truncated = nullptr,
+    PlacementFailure *failure = nullptr);
 
 /// One dataflow edge to connect: where the value is produced, where the
 /// consumer expects it, and whether the two ends want different layouts.
