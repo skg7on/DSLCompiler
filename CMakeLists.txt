@@ -236,6 +236,16 @@ mlir_target_link_libraries(LLKToLinalg PUBLIC
     MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
+# Library: LLK -> concrete micro.kernel export (M11)
+add_mlir_library(LLKToMicro
+    lib/Conversion/LLKToMicro/LLKToMicro.cpp
+    DEPENDS LLKDialect MicroDialect LLKCommon
+    LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon
+)
+mlir_target_link_libraries(LLKToMicro PUBLIC
+    MLIRArithDialect MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
+)
+
 # Library: JIT cache runtime + weight packing
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
@@ -475,11 +485,11 @@ endif()
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection LLKToMicro TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
-target_link_libraries(llk-compile PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection TritonToLLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-compile PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection LLKToMicro TritonToLLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-bench (benchmarking harness)
 add_llvm_executable(llk-bench tools/llk-bench/llk-bench.cpp)
@@ -491,7 +501,7 @@ target_link_libraries(llk-tune PRIVATE LLKRuntime)
 
 # Tool: micro-perf (Micro-IR performance simulator, M10)
 add_llvm_executable(micro-perf tools/micro-perf/micro-perf.cpp)
-target_link_libraries(micro-perf PRIVATE LLKPerf MicroDialect ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(micro-perf PRIVATE LLKPerf MicroDialect LLKDialect ${LLK_MLIR_EXEC_LIBS})
 endif()
 
 # Tests
@@ -632,6 +642,22 @@ if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
   add_llk_filecheck_test(MicroDialectSearchSpace test/Dialect/Micro/search_space.mlir)
+  # LLKToMicro lowering tests. The schedule database is pointed at a path that
+  # does not exist on purpose: the export then uses its built-in conservative
+  # schedule, so the expected tile sizes do not depend on the working directory
+  # or on the contents of schedules/schedule_db.json.
+  add_test(NAME LLKToMicroSwiGLU
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/swiglu_to_micro.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/swiglu_to_micro.mlir"
+  )
+  add_test(NAME LLKToMicroMatmul
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/matmul_to_micro.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/matmul_to_micro.mlir"
+  )
+  # The acceptance check that the exported Micro-IR is self-describing: the
+  # performance simulator evaluates the kernel the export produced, using only
+  # the metadata carried by the IR.
+  add_test(NAME LLKToMicroPerfRoundTrip
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/swiglu_to_micro.mlir | $<TARGET_FILE:micro-perf> --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-cpu.yaml --level=1 - | ${FILECHECK_BIN} --check-prefix=PERF ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/swiglu_to_micro.mlir"
+  )
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
@@ -852,6 +878,13 @@ add_test(NAME MicroDialectTileOpsInvalid
 add_test(NAME MicroDialectSearchSpaceInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
             ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/search_space_invalid.mlir
+)
+# LLKToMicro rejection tests: shapes and schedules the export must refuse with
+# a diagnostic naming the offending axis.
+add_test(NAME LLKToMicroLoweringInvalid
+    COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+            --llk-to-micro=schedule-db=missing.json
+            ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/lowering_invalid.mlir
 )
 # ScratchAnalysis test: verify-diagnostics validates expected-warning comments
 add_test(NAME ScratchAnalysis

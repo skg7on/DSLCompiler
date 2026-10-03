@@ -14,6 +14,7 @@
 
 // Include the LLK dialect public header to register it.
 #include "LLK/Conversion/LLKToLinalg.h"
+#include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/TritonToLLK/AtomicToLLRT.h"
 #include "LLK/Conversion/TritonToLLK/BlockPointerToVector.h"
 #include "LLK/Conversion/TritonToLLK/GridToForall.h"
@@ -62,6 +63,11 @@ int main(int argc, char **argv) {
   // Register the FuseDoubleContraction pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createFuseDoubleContractionPass();
+  });
+
+  // Register the LLK-to-Micro export pass.
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createLLKToMicroPass();
   });
 
   // Register the TileAndVectorize pass.
