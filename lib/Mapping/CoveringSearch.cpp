@@ -121,9 +121,11 @@ CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
                                const MappingTarget &target,
                                mlir::MLIRContext &context,
                                const LayoutContext &layoutContext,
-                               const MappingSearchOptions &options)
+                               const MappingSearchOptions &options,
+                               std::optional<SearchBinding> binding)
     : workload_(workload), target_(target), context_(context),
-      layoutContext_(layoutContext), options_(options) {}
+      layoutContext_(layoutContext), options_(options),
+      binding_(std::move(binding)) {}
 
 llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   const MachineModel &machine = target_.machine();
@@ -496,6 +498,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
 
     plan.totalCost = partial.cost;
     plan.diagnostics.searchTruncated = result.searchTruncated;
+    // Record the search point this plan came from before its content id is
+    // folded, so two plans differing only by their binding do not collide.
+    if (binding_) {
+      plan.sourceBindingHash = binding_->stableHash;
+      plan.globalParameters = binding_->values;
+    }
     plan.id = computePlanId(plan);
     result.plans.push_back(std::move(plan));
   }

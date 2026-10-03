@@ -7,8 +7,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <variant>
 #include <vector>
 
 using namespace mlir::llk::machine;
@@ -166,6 +168,18 @@ std::vector<PlanId> planIds(const MappingSearchResult &result) {
     ids.push_back(plan.id);
   return ids;
 }
+
+llvm::StringMap<SearchValue>
+values(std::initializer_list<std::pair<llvm::StringRef, SearchValue>> entries) {
+  llvm::StringMap<SearchValue> map;
+  for (const auto &entry : entries)
+    map[entry.first] = entry.second;
+  return map;
+}
+
+/// The plan id the deterministic two-node fixture produced before bindings
+/// were recorded. Pinned so the no-binding path cannot drift silently.
+constexpr PlanId kNoBindingPlanId = 3353624054279393187ULL;
 
 } // namespace
 
@@ -462,4 +476,94 @@ TEST(CoveringSearch, LatencyCacheCanBeDisabled) {
   ASSERT_FALSE(enabledResult->plans.empty());
   EXPECT_GT(measured.lookupCount, 0u);
   EXPECT_DOUBLE_EQ(enabledResult->plans[0].totalCost.latencyCycles, 4.0);
+}
+
+//===----------------------------------------------------------------------===//
+// Source binding provenance
+//===----------------------------------------------------------------------===//
+
+TEST(CoveringSearch, PlansCarryTheSourceBindingHash) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  SearchBinding binding = makeSearchBinding(
+      "candidate_17",
+      values({{"BM", int64_t{64}}, {"tile_layout", std::string("blocked")}}));
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                        binding);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  // Every emitted plan records the binding it came from (design §8.3/§9.5).
+  EXPECT_EQ(result->plans[0].sourceBindingHash, binding.stableHash);
+  EXPECT_NE(result->plans[0].sourceBindingHash, 0u);
+  EXPECT_NE(result->plans[0].id, 0u);
+
+  // ...and carries its parameters, so a plan is traceable to its search point.
+  EXPECT_EQ(result->plans[0].globalParameters.size(), 2u);
+  EXPECT_EQ(
+      std::get<std::string>(result->plans[0].globalParameters["tile_layout"]),
+      "blocked");
+  EXPECT_EQ(std::get<int64_t>(result->plans[0].globalParameters["BM"]),
+            int64_t{64});
+}
+
+TEST(CoveringSearch, DifferentBindingsYieldDifferentPlanIds) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  SearchBinding bindingA = makeSearchBinding(
+      "candidate_17",
+      values({{"BM", int64_t{64}}, {"tile_layout", std::string("blocked")}}));
+  SearchBinding bindingB = makeSearchBinding(
+      "candidate_17",
+      values({{"BM", int64_t{32}}, {"tile_layout", std::string("blocked")}}));
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch searchA(graph, *target, context, LayoutContext{}, options,
+                         bindingA);
+  CoveringSearch searchB(graph, *target, context, LayoutContext{}, options,
+                         bindingB);
+  llvm::Expected<MappingSearchResult> resultA = searchA.search();
+  llvm::Expected<MappingSearchResult> resultB = searchB.search();
+  ASSERT_TRUE(static_cast<bool>(resultA))
+      << llvm::toString(resultA.takeError());
+  ASSERT_TRUE(static_cast<bool>(resultB))
+      << llvm::toString(resultB.takeError());
+  ASSERT_FALSE(resultA->plans.empty());
+  ASSERT_FALSE(resultB->plans.empty());
+
+  // Two plans that differ only by their search point must not collide.
+  EXPECT_NE(resultA->plans[0].sourceBindingHash,
+            resultB->plans[0].sourceBindingHash);
+  EXPECT_NE(resultA->plans[0].id, resultB->plans[0].id);
+}
+
+TEST(CoveringSearch, NoBindingLeavesTheHashZeroAndThePlanIdUnchanged) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  // The default (no binding) folds a zero hash and no parameters, so the plan
+  // id is exactly what it was before bindings were recorded.
+  EXPECT_EQ(result->plans[0].sourceBindingHash, 0u);
+  EXPECT_TRUE(result->plans[0].globalParameters.empty());
+  EXPECT_EQ(result->plans[0].id, kNoBindingPlanId);
 }

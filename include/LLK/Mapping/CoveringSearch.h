@@ -32,6 +32,7 @@
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -87,7 +88,8 @@ class CoveringSearch {
 public:
   CoveringSearch(const WorkloadGraph &workload, const MappingTarget &target,
                  mlir::MLIRContext &context, const LayoutContext &layoutContext,
-                 const MappingSearchOptions &options = {});
+                 const MappingSearchOptions &options = {},
+                 std::optional<SearchBinding> binding = std::nullopt);
 
   llvm::Expected<MappingSearchResult> search();
 
@@ -97,6 +99,10 @@ private:
   mlir::MLIRContext &context_;
   LayoutContext layoutContext_;
   MappingSearchOptions options_;
+  /// The search-space point this search evaluates, when known. Every emitted
+  /// plan records its hash and parameters (design §8.3/§9.5); a search with no
+  /// binding leaves both default so its plan ids are unchanged.
+  std::optional<SearchBinding> binding_;
 };
 
 } // namespace mlir::llk::mapping
