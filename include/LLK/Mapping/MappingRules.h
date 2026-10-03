@@ -22,6 +22,10 @@
 
 #include "LLK/Mapping/LayoutConstraints.h"
 #include "LLK/Mapping/LlkMap.h"
+#include "LLK/Mapping/MappingPlan.h"
+#include "LLK/Mapping/WorkloadGraph.h"
+
+#include "mlir/IR/BuiltinAttributes.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
@@ -55,7 +59,7 @@ struct KindRequirement {
 };
 
 /// A layout the value on `port` must satisfy, named by layout id.
-struct LayoutRequirement {
+struct RuleLayoutRequirement {
   std::string port;
   std::string layoutId;
 };
@@ -70,7 +74,7 @@ struct RuleDef {
   std::map<std::string, ParamDomain> domains;
   std::vector<ExprPtr> constraints;
   std::vector<KindRequirement> kindRequirements;
-  std::vector<LayoutRequirement> layoutRequirements;
+  std::vector<RuleLayoutRequirement> layoutRequirements;
   std::vector<RulePort> ports;
   /// Opaque target-owned names; generic code never interprets them.
   std::string bundle;
@@ -100,6 +104,27 @@ llvm::Expected<RuleRegistry> parseRuleText(llvm::StringRef text,
 
 /// Reads and parses the file at `path`.
 llvm::Expected<RuleRegistry> loadRuleFile(llvm::StringRef path);
+
+//===----------------------------------------------------------------------===//
+// One-operation matching (design §14.2)
+//===----------------------------------------------------------------------===//
+
+/// True when `predicate` holds against `attributes`. An integer predicate
+/// needs an integer attribute of the same value; a symbolic predicate needs a
+/// string attribute. A missing attribute never matches.
+bool predicateMatches(const RulePredicate &predicate,
+                      mlir::DictionaryAttr attributes);
+
+/// Rules whose match operation and predicates apply to `node`, in registry
+/// order. A rule with no predicates matches every operation of its name.
+std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
+                                        const RuleRegistry &rules);
+
+/// Bridges a matched rule onto the workload node it covers: the result is the
+/// unplaced `MappingCandidate` the placement engine consumes. Rule ports are
+/// wired positionally to the node's inputs and then its outputs.
+MappingCandidate toMappingCandidate(const RuleDef &rule,
+                                    const WorkloadNode &node);
 
 } // namespace mlir::llk::mapping
 

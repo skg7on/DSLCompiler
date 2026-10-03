@@ -6,11 +6,11 @@
 // here. Capability kinds must be ones machines/x86-avx2-v2.yaml declares --
 // `verifyMappingTarget` rejects the file otherwise.
 //
-// The predicates are structural for now: the attribute names are not checked
-// against each operation's definition, only the operation itself is.
+// Predicates read the operation's attributes by name: `micro.vector` and
+// `micro.reduce` carry `op`, `micro.mma` carries `input`/`accumulator`.
 
 rule avx2.vector_add v1 {
-  match micro.vector(kind = "add", element_type = f32);
+  match micro.vector(op = "add");
   param VW in [4..8];
   require VW == machine.compute("vector_engine").lanes(element_type);
   require executor kind worker;
@@ -25,7 +25,7 @@ rule avx2.vector_add v1 {
 }
 
 rule avx2.mma_bf16 v1 {
-  match micro.mma(element_type = bf16);
+  match micro.mma(input = bf16);
   require executor kind worker;
   require compute kind matrix_engine;
   require layout lhs satisfies avx2.row_major;
@@ -39,7 +39,7 @@ rule avx2.mma_bf16 v1 {
 }
 
 rule avx2.reduce_sum_f32 v1 {
-  match micro.reduce(kind = "sum", element_type = f32);
+  match micro.reduce(op = "sum");
   require executor kind worker;
   require compute kind vector_engine;
   input "operand0";

@@ -63,7 +63,7 @@ bool FileMappingTarget::isKnownEmitter(llvm::StringRef key) const {
 llvm::Error verifyMappingTarget(const MappingTarget &target) {
   const MachineModel &machine = target.machine();
   for (const RuleDef &rule : target.rules().all()) {
-    for (const LayoutRequirement &requirement : rule.layoutRequirements) {
+    for (const RuleLayoutRequirement &requirement : rule.layoutRequirements) {
       if (!target.layouts().find(requirement.layoutId))
         return targetError("rule '" + rule.id + "': unknown layout '" +
                            requirement.layoutId + "'");
