@@ -473,6 +473,40 @@ TEST(Placement, DeclaredEquivalenceRespectsTheSymmetrySwitch) {
             (std::vector<std::string>{"c.0", "c.1"}));
 }
 
+TEST(Placement, IgnoresCrossKindEquivalenceInAHandBuiltModel) {
+  // A hand-built model bypasses `verifyMachineModel`, so placement must not
+  // trust a cross-kind declaration: collapsing a `pe` onto a `worker` would
+  // bind the wrong executor class. Both executors match the `worker` owner
+  // (the `pe` refines it), but the kinds differ, so neither the declaration
+  // nor the structural heuristic collapses them.
+  MachineModel machine;
+  machine.target = "hand-built";
+  ExecutorNode worker;
+  worker.id = "e0";
+  worker.kind = "worker";
+  worker.equivalentTo = {"e1"};
+  ExecutorNode pe;
+  pe.id = "e1";
+  pe.kind = "pe";
+  pe.refines = {"worker"};
+  pe.equivalentTo = {"e0"};
+  machine.executors = {worker, pe};
+  std::unique_ptr<MappingTarget> target = targetFor(std::move(machine));
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate workerCandidate = candidate();
+  workerCandidate.executorRequirements[0].capability = "worker";
+  mlir::MLIRContext context;
+
+  PlacementOptions reduced; // reduceSymmetry defaults on
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(workerCandidate, *target, context, LayoutContext{},
+                          reduced);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances), (std::vector<std::string>{"e0", "e1"}));
+}
+
 TEST(Placement, DoesNotCollapseExecutorsThatDifferInConcurrencyOrCoordinates) {
   // The structural heuristic must compare the facts that make two executors
   // behave differently: logical coordinates, concurrency, and scheduling class.

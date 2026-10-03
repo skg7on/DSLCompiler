@@ -121,11 +121,14 @@ struct ExecutorNode {
   SchedulingClass schedulingClass = SchedulingClass::InOrder;
   /// Executor ids this executor declares interchangeable (YAML
   /// `equivalent_to`). Design §15.1: "symmetric placements may be canonicalized
-  /// when *the target declares* executors equivalent". A declaration is a
-  /// target assertion that two executors can be swapped without changing a
-  /// binding or a cost; the symmetry reducer collapses a declared group to one
-  /// representative while `PlacementOptions::reduceSymmetry` remains the on/off
-  /// switch.
+  /// when *the target declares* executors equivalent". A declaration is the
+  /// target's assertion that two executors can be swapped without changing a
+  /// binding; it is not a cost proof -- the model cannot guarantee
+  /// cost-invariance, and a declared group may differ in concurrency, so a
+  /// declaration deliberately collapses even executors the structural
+  /// heuristic would keep apart. The symmetry reducer collapses a declared
+  /// group to one representative while `PlacementOptions::reduceSymmetry`
+  /// remains the on/off switch.
   ///
   /// The declaration must be *mutual*, name an *existing* executor, and join
   /// executors of the *same kind*; `verifyMachineModel` rejects a one-sided,
@@ -136,7 +139,7 @@ struct ExecutorNode {
   /// concurrency, scheduling class, and the attached compute and visible memory
   /// nodes -- so two executors with distinct performance characteristics are
   /// not collapsed merely because they look alike.
-  std::vector<std::string> equivalentTo;
+  std::vector<std::string> equivalentTo{};
 };
 
 /// A place data can reside. `visibleFrom` names the executor scope that can

@@ -53,21 +53,31 @@ std::vector<std::string> visibleMemories(const MachineModel &machine,
 /// executors equivalent"). A loaded model is guaranteed symmetric and same-kind
 /// by `verifyMachineModel`; checking either direction keeps the rule robust for
 /// a hand-built model, and a *valid* declaration read from YAML always holds
-/// both ways.
+/// both ways. The kind-equality guard likewise duplicates a verified rule, but
+/// `declaredEquivalent` is also reachable from a hand-built model that never
+/// passed `verifyMachineModel` (a `MappingTarget` constructor does not verify),
+/// and collapsing across kinds would bind the wrong executor class -- so the
+/// check is repeated here rather than trusted.
 bool declaredEquivalent(const ExecutorNode &lhs, const ExecutorNode &rhs) {
+  if (lhs.kind != rhs.kind)
+    return false;
   return llvm::is_contained(lhs.equivalentTo, rhs.id) ||
          llvm::is_contained(rhs.equivalentTo, lhs.id);
 }
 
-/// Two executors are interchangeable when swapping them cannot change any
-/// binding or any cost, so symmetry reduction is sound. A target-declared
-/// equivalence settles the question outright; otherwise the structural
-/// heuristic requires the same kind, parent, logical coordinates, concurrency,
-/// and scheduling class, and exactly the same attached compute and visible
-/// memory nodes. Coordinates, concurrency, and scheduling class are compared
-/// because two executors that differ in any of them occupy a different
-/// spatial/parallelism/overlap position -- collapsing distinct-performance
-/// executors into one representative would hide a placement and misstate cost.
+/// Two executors are interchangeable when swapping them cannot change a
+/// binding, so symmetry reduction is sound. A target-declared equivalence
+/// settles the question outright: it is the target's assertion, not a cost
+/// proof -- the model cannot guarantee cost-invariance, and a declared group
+/// may legitimately differ in concurrency -- so by design it collapses even
+/// executors the structural heuristic would keep apart. With no declaration the
+/// structural heuristic requires the same kind, parent, logical coordinates,
+/// concurrency, and scheduling class, and exactly the same attached compute and
+/// visible memory nodes. Coordinates, concurrency, and scheduling class are
+/// compared because two executors that differ in any of them occupy a different
+/// spatial/parallelism/overlap position -- collapsing such distinct-performance
+/// executors into one representative (absent a declaration) would hide a
+/// placement and misstate cost.
 bool interchangeable(const MachineModel &machine, const ExecutorNode &lhs,
                      const ExecutorNode &rhs) {
   if (declaredEquivalent(lhs, rhs))
