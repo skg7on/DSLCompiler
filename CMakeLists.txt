@@ -235,6 +235,10 @@ target_link_libraries(LLKPerf PUBLIC LLVMSupport MicroDialect)
 # the kernel's external tensors. MLIRTensorDialect is named through
 # mlir_target_link_libraries() so it resolves to the MLIR dylib when one exists,
 # keeping a single copy of MLIR in every consumer.
+# LLVM builds without RTTI or exceptions; a plain add_library does not inherit
+# that, and the mismatch makes llvm::Error vtable emission reference a typeinfo
+# the LLVM build does not contain.
+target_compile_options(LLKPerf PRIVATE -fno-rtti -fno-exceptions)
 mlir_target_link_libraries(LLKPerf PRIVATE MLIRTensorDialect)
 
 # Library: versioned machine topology (issue #82, epic #67).
@@ -251,6 +255,10 @@ target_include_directories(LLKMachine PUBLIC
     ${LLVM_INCLUDE_DIRS}
 )
 target_link_libraries(LLKMachine PUBLIC LLVMSupport)
+# LLVM builds without RTTI or exceptions; a plain add_library does not inherit
+# that, and the mismatch makes llvm::Error vtable emission reference a typeinfo
+# the LLVM build does not contain.
+target_compile_options(LLKMachine PRIVATE -fno-rtti -fno-exceptions)
 
 # Library: target-independent mapping data model (issue #80, epic #67 D1).
 # Generic planning types only -- workload graphs, search bindings, plan
@@ -276,6 +284,12 @@ target_include_directories(LLKMapping PUBLIC
     ${LLVM_INCLUDE_DIRS}
 )
 target_link_libraries(LLKMapping PUBLIC LLVMSupport LLKMachine)
+# LLVM and MLIR are built without RTTI or exceptions. A plain add_library does
+# not inherit those, and without -fno-rtti the vtable LLVM emits for
+# llvm::ErrorInfo (used when llvm::Expected carries a non-trivial payload)
+# references a typeinfo the LLVM build does not contain -- an undefined symbol
+# at link time. Match the toolchain.
+target_compile_options(LLKMapping PRIVATE -fno-rtti -fno-exceptions)
 # AffineMap, OperationName, DictionaryAttr, and Type are MLIR IR values used by
 # the workload graph. They are named through mlir_target_link_libraries() so the
 # dylib/archive split stays correct, exactly as LLKPerf does.
@@ -728,6 +742,7 @@ add_llk_mapping_test(MappingPlanTest test/Mapping/mapping_plan.cpp)
 add_llk_mapping_test(MappingLayoutTest test/Mapping/layout_constraints.cpp)
 add_llk_mapping_test(MappingRulesTest test/Mapping/mapping_rules.cpp)
 add_llk_mapping_test(MappingPlacementTest test/Mapping/placement.cpp)
+add_llk_mapping_test(MappingConnectionsTest test/Mapping/connections.cpp)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside

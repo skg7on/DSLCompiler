@@ -206,6 +206,7 @@ std::string canonicalInstanceString(const CandidateInstance &instance) {
 
 std::string canonicalConnectionString(const ConnectionPlan &connection) {
   llvm::SmallVector<InstanceId> consumers(connection.consumers);
+  llvm::SmallVector<InstanceId> producers(connection.producers);
   llvm::SmallVector<MemoryNodeId> route(connection.memoryRoute);
   llvm::SmallVector<ExecutorId> engines(connection.transferEngines);
   std::vector<std::string> consumerMaps;
@@ -218,6 +219,8 @@ std::string canonicalConnectionString(const ConnectionPlan &connection) {
   out += std::to_string(connection.producer);
   out += "|consumers=";
   out += joinNumbers(consumers);
+  out += "|producers=";
+  out += joinNumbers(producers);
   out += "|value=";
   out += std::to_string(connection.value);
   out += "|kind=";

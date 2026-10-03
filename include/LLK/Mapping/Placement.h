@@ -21,12 +21,14 @@
 #include "LLK/Mapping/LlkMap.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingTarget.h"
+#include "LLK/Mapping/Routing.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace mlir {
@@ -55,6 +57,44 @@ enumeratePlacements(const MappingCandidate &candidate,
                     const MappingTarget &target, mlir::MLIRContext &context,
                     const LayoutContext &layoutContext,
                     const PlacementOptions &options = {});
+
+/// One dataflow edge to connect: where the value is produced, where the
+/// consumer expects it, and whether the two ends want different layouts.
+struct ConnectionRequest {
+  InstanceId producer = 0;
+  InstanceId consumer = 0;
+  WorkloadValueId value = 0;
+  MemoryNodeId producerMemory;
+  MemoryNodeId consumerMemory;
+  std::optional<LayoutId> producerLayout;
+  std::optional<LayoutId> consumerLayout;
+  uint64_t bytes = 0;
+  uint64_t alignmentBytes = 1;
+};
+
+/// Synthesizes every legal way to move the value (design §15.2), cheapest
+/// shape first: a direct connection, an in-place layout transform, a transfer,
+/// a transfer plus transform, and one plan per route D2 found -- so a
+/// multi-hop route appears as a transfer whose route has intermediate nodes.
+/// An empty result means the pair is incompatible; it does not fail.
+llvm::Expected<std::vector<ConnectionPlan>> synthesizeConnections(
+    const ConnectionRequest &request, const machine::MachineModel &machine,
+    const TopologyService &topology, const PlacementOptions &options = {});
+
+/// Fan-out (design §15.3): when every consumer reads the producer's memory a
+/// single shared-read plan carries them all; otherwise each consumer gets its
+/// own plan, which is replication.
+llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
+    const ConnectionRequest &base, llvm::ArrayRef<InstanceId> consumers,
+    llvm::ArrayRef<MemoryNodeId> consumerMemories,
+    const machine::MachineModel &machine, const TopologyService &topology,
+    const PlacementOptions &options = {});
+
+/// Fan-in (design §15.3): one gather plan collecting several producers into
+/// one consumer.
+ConnectionPlan synthesizeFanIn(llvm::ArrayRef<InstanceId> producers,
+                               InstanceId consumer, WorkloadValueId value,
+                               MemoryNodeId consumerMemory, uint64_t bytes);
 
 } // namespace mlir::llk::mapping
 

@@ -139,6 +139,9 @@ struct ConnectionPlan {
   ConnectionId id = 0;
   InstanceId producer = 0;
   llvm::SmallVector<InstanceId> consumers;
+  /// The several producers a `Reduce` gathers; empty for every other kind,
+  /// where `producer` is the single source.
+  llvm::SmallVector<InstanceId> producers;
   WorkloadValueId value = 0;
   ConnectionKind kind = ConnectionKind::Direct;
   llvm::SmallVector<MemoryNodeId> memoryRoute;
