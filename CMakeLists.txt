@@ -252,6 +252,28 @@ target_include_directories(LLKMachine PUBLIC
 )
 target_link_libraries(LLKMachine PUBLIC LLVMSupport)
 
+# Library: target-independent mapping data model (issue #80, epic #67 D1).
+# Generic planning types only -- workload graphs, search bindings, plan
+# structures, costs, and stable ids. It must not depend on LLKPerf or any
+# backend: mapping is below performance modeling, and a target package plugs
+# into it rather than the reverse.
+add_library(LLKMapping STATIC
+    lib/Mapping/StableHash.cpp
+    lib/Mapping/CostModel.cpp
+    lib/Mapping/SearchBinding.cpp
+    lib/Mapping/WorkloadGraph.cpp
+    lib/Mapping/MappingPlan.cpp
+)
+target_include_directories(LLKMapping PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+target_link_libraries(LLKMapping PUBLIC LLVMSupport)
+# AffineMap, OperationName, DictionaryAttr, and Type are MLIR IR values used by
+# the workload graph. They are named through mlir_target_link_libraries() so the
+# dylib/archive split stays correct, exactly as LLKPerf does.
+mlir_target_link_libraries(LLKMapping PRIVATE MLIRIR)
+
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
@@ -677,6 +699,22 @@ endfunction()
 
 add_llk_machine_test(MachineModelTest test/Machine/machine_model.cpp)
 add_llk_machine_test(MachineModelV2LoaderTest test/Machine/machine_model_loader.cpp)
+
+# Mapping-engine tests (epic #67, workstream D1). They parse micro IR to build
+# workload graphs, so they follow the same MLIR exec-lib rule as the perf tests:
+# name MLIR components only through LLK_MLIR_EXEC_LIBS, never alongside it.
+function(add_llk_mapping_test test_name test_file)
+  add_llvm_executable(${test_name} ${test_file})
+  target_link_libraries(${test_name} PRIVATE
+      LLKMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+  add_test(NAME ${test_name} COMMAND ${test_name})
+endfunction()
+
+add_llk_mapping_test(MappingStableHashTest test/Mapping/stable_hash.cpp)
+add_llk_mapping_test(MappingCostModelTest test/Mapping/cost_model.cpp)
+add_llk_mapping_test(MappingSearchBindingTest test/Mapping/search_binding.cpp)
+add_llk_mapping_test(MappingWorkloadGraphTest test/Mapping/workload_graph.cpp)
+add_llk_mapping_test(MappingPlanTest test/Mapping/mapping_plan.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
