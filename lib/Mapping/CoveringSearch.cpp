@@ -350,11 +350,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             request.consumerMemory + ": no legal route");
         return false;
       }
-      // The cheapest alternative is the one a plan would use.
+      // The alternative the declared objective prefers is the one a plan
+      // would use. `min_element` keeps the first on an exact tie, which is the
+      // stable deterministic tie-break here.
       auto best =
-          llvm::min_element(*alternatives, [](const ConnectionPlan &lhs,
-                                              const ConnectionPlan &rhs) {
-            return lhs.cost.latencyCycles < rhs.cost.latencyCycles;
+          llvm::min_element(*alternatives, [&](const ConnectionPlan &lhs,
+                                               const ConnectionPlan &rhs) {
+            return costLess(lhs.cost, rhs.cost, options_.objective);
           });
       pool.push_back(*best);
       partial.connections.push_back(pool.size() - 1);
@@ -483,10 +485,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return std::move(pendingError);
 
   // --- finalize --------------------------------------------------------
-  llvm::sort(complete, [](const Partial &lhs, const Partial &rhs) {
-    if (lhs.cost.latencyCycles != rhs.cost.latencyCycles)
-      return lhs.cost.latencyCycles < rhs.cost.latencyCycles;
-    return lhs.id < rhs.id;
+  // The declared objective ranks complete plans; the stable id breaks an exact
+  // tie so the order is deterministic (design §17.1).
+  llvm::sort(complete, [&](const Partial &lhs, const Partial &rhs) {
+    return ranksBefore(lhs.cost, lhs.id, rhs.cost, rhs.id, options_.objective);
   });
   if (complete.size() > options_.topK) {
     complete.resize(options_.topK);

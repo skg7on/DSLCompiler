@@ -61,6 +61,10 @@ struct MappingSearchOptions {
   uint64_t memoryBudgetBytes = 512ULL << 20;
   bool enableLatencyCache = true;
   bool enableSymmetryReduction = true;
+  /// How complete plans are ranked (design §17.1). The default -- latency
+  /// minimized -- preserves the pre-objective behaviour, so a caller that does
+  /// not consult `micro.objective` is unaffected.
+  ObjectiveOrder objective = {};
 };
 
 /// Why no complete plan was found (design §16.5), counted per category. The

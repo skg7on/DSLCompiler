@@ -19,6 +19,7 @@
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
@@ -100,6 +101,28 @@ inline Operation *findMicroKernel(ModuleOp module) {
   return kernel;
 }
 
+/// The comparison order the module's `micro.objective` declares, if it has one
+/// and the cost model understands its metric. Absence is not an error: the
+/// caller keeps its default (latency minimized). An unknown metric is already
+/// rejected by the dialect verifier, so here it is skipped rather than guessed.
+inline std::optional<mapping::ObjectiveOrder>
+objectiveOrderFromModule(ModuleOp module) {
+  std::optional<mapping::ObjectiveOrder> order;
+  module.walk([&](Operation *op) {
+    if (order)
+      return;
+    if (op->getName().getStringRef() != "micro.objective")
+      return;
+    auto metric = op->getAttrOfType<StringAttr>("metric");
+    auto direction = op->getAttrOfType<StringAttr>("direction");
+    if (!metric || !direction)
+      return;
+    order = mapping::objectiveOrderFromMicro(
+        metric.getValue(), direction.getValue() != "maximize");
+  });
+  return order;
+}
+
 /// A target loaded from disk plus the search it produced over one kernel.
 struct MappingRun {
   std::unique_ptr<mapping::MappingTarget> target;
@@ -174,6 +197,11 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   searchOptions.mode = mode;
   searchOptions.topK = options.topK;
   searchOptions.beamWidth = options.beamWidth;
+  // §17.1: the declared `micro.objective` supplies the comparison order. A
+  // module without one leaves the default (latency minimized) in place.
+  if (std::optional<mapping::ObjectiveOrder> objective =
+          objectiveOrderFromModule(module))
+    searchOptions.objective = *objective;
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),
                                  deriveLayoutContext(*graph), searchOptions);
   llvm::Expected<mapping::MappingSearchResult> result = search.search();

@@ -72,6 +72,21 @@ struct ObjectiveOrder {
 /// the tie by stable id.
 bool costLess(const Cost &lhs, const Cost &rhs, const ObjectiveOrder &order);
 
+/// Total order used to rank plans and partial plans: the declared objective
+/// decides, and an exact cost tie falls back to the smaller stable id, so the
+/// same inputs always produce the same order.
+bool ranksBefore(const Cost &lhs, uint64_t lhsId, const Cost &rhs,
+                 uint64_t rhsId, const ObjectiveOrder &order);
+
+/// Builds the comparison order a `micro.objective` declares from its metric
+/// spelling and direction (`minimize == false` means maximize). A metric the
+/// cost model does not know yields no order, never a guess -- the caller keeps
+/// its default. Only the metric spellings shared by both vocabularies
+/// (`latency_cycles`, `dram_bytes`) resolve today; secondary metrics are out of
+/// scope until the `micro` and `CostMetric` spellings are reconciled.
+std::optional<ObjectiveOrder> objectiveOrderFromMicro(llvm::StringRef metric,
+                                                      bool minimize);
+
 /// Fixed-format rendering of every dimension, byte-stable across runs and
 /// platforms so it can key hashes and reports.
 std::string canonicalCostString(const Cost &cost);

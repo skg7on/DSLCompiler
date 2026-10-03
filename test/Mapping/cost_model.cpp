@@ -77,6 +77,26 @@ TEST(CostModel, CanonicalStringIsStableAndDistinct) {
   EXPECT_NE(canonicalCostString(a), canonicalCostString(b));
 }
 
+// The bridge that carries a `micro.objective`'s declared metric and direction
+// into the mapping's comparison order.
+TEST(CostModel, ObjectiveBridgeReadsTheMicroMetricAndDirection) {
+  std::optional<ObjectiveOrder> minimize =
+      objectiveOrderFromMicro("latency_cycles", /*minimize=*/true);
+  ASSERT_TRUE(minimize.has_value());
+  EXPECT_EQ(minimize->primary, CostMetric::LatencyCycles);
+  EXPECT_TRUE(minimize->minimize);
+  EXPECT_TRUE(minimize->secondary.empty());
+
+  std::optional<ObjectiveOrder> maximize =
+      objectiveOrderFromMicro("dram_bytes", /*minimize=*/false);
+  ASSERT_TRUE(maximize.has_value());
+  EXPECT_EQ(maximize->primary, CostMetric::DramBytes);
+  EXPECT_FALSE(maximize->minimize);
+
+  // A spelling the cost model does not know yields no order, never a guess.
+  EXPECT_FALSE(objectiveOrderFromMicro("nonsense", true).has_value());
+}
+
 TEST(CostEvent, EveryKindRoundTripsThroughItsName) {
   for (CostEventKind kind :
        {CostEventKind::Compute, CostEventKind::TransferHop,

@@ -85,6 +85,26 @@ bool costLess(const Cost &lhs, const Cost &rhs, const ObjectiveOrder &order) {
   return false;
 }
 
+bool ranksBefore(const Cost &lhs, uint64_t lhsId, const Cost &rhs,
+                 uint64_t rhsId, const ObjectiveOrder &order) {
+  if (costLess(lhs, rhs, order))
+    return true;
+  if (costLess(rhs, lhs, order))
+    return false;
+  return lhsId < rhsId;
+}
+
+std::optional<ObjectiveOrder> objectiveOrderFromMicro(llvm::StringRef metric,
+                                                      bool minimize) {
+  std::optional<CostMetric> primary = symbolizeCostMetric(metric);
+  if (!primary)
+    return std::nullopt;
+  ObjectiveOrder order;
+  order.primary = *primary;
+  order.minimize = minimize;
+  return order;
+}
+
 std::string canonicalCostString(const Cost &cost) {
   std::string out;
   for (const MetricInfo &info : kMetrics) {

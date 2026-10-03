@@ -516,6 +516,78 @@ TEST(CoveringSearch, LatencyCacheCanBeDisabled) {
 }
 
 //===----------------------------------------------------------------------===//
+// Objective-declared ranking (§17.1)
+//===----------------------------------------------------------------------===//
+
+// `micro.objective` supplies the comparison order, so the search must obey the
+// declared objective rather than a hard-coded latency minimum. Maximizing
+// latency makes the effect visible: the pricier rule per node must rank first.
+TEST(CoveringSearch, TheDeclaredObjectiveDirectionDecidesTheRanking) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Beam;
+  options.objective =
+      ObjectiveOrder{CostMetric::LatencyCycles, {}, /*minimize=*/false};
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  // The 10-cycle rule per node is the *worst* under the default objective and
+  // the best under this declared one -- proving the option reaches the final
+  // ranking instead of a hard-coded minimum.
+  ASSERT_FALSE(result->plans[0].placements.empty());
+  EXPECT_EQ(result->plans[0].placements[0].rule, "r.expensive");
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 20.0);
+}
+
+// The default objective is the pre-existing behaviour: latency minimized.
+TEST(CoveringSearch, TheDefaultObjectiveStillMinimizesLatency) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Beam;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_FALSE(result->plans[0].placements.empty());
+  EXPECT_EQ(result->plans[0].placements[0].rule, "r.cheap");
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 2.0);
+}
+
+// Two plans that differ in DRAM: a slow plan moving fewer bytes ranks ahead of
+// a fast plan moving more, because the objective names DRAM first. An exact
+// cost tie falls back to the smaller stable id.
+TEST(CoveringSearch, DramObjectiveRanksBeforeLatency) {
+  Cost fastManyDram;
+  fastManyDram.latencyCycles = 1.0;
+  fastManyDram.dramBytes = 100;
+  Cost slowFewDram;
+  slowFewDram.latencyCycles = 9.0;
+  slowFewDram.dramBytes = 10;
+
+  ObjectiveOrder byDram{CostMetric::DramBytes, {}, true};
+  EXPECT_TRUE(ranksBefore(slowFewDram, 2, fastManyDram, 1, byDram));
+  EXPECT_FALSE(ranksBefore(fastManyDram, 1, slowFewDram, 2, byDram));
+
+  Cost a;
+  a.latencyCycles = 5.0;
+  Cost b;
+  b.latencyCycles = 5.0;
+  ObjectiveOrder byLatency{CostMetric::LatencyCycles, {}, true};
+  EXPECT_TRUE(ranksBefore(a, 1, b, 2, byLatency));
+  EXPECT_FALSE(ranksBefore(b, 2, a, 1, byLatency));
+}
+
+//===----------------------------------------------------------------------===//
 // Source binding provenance
 //===----------------------------------------------------------------------===//
 
