@@ -8,7 +8,7 @@
 // roles (BM/BN/BK, vector_width, pipeline_stages, prefetch_distance,
 // num_threads) by name, symbolic roles (layout, memory_path, owner_mapping,
 // fragment_shape, tail_policy) by the dialect `kind` -- and compares them
-// against MachineModel resources.
+// against machine::MachineModel resources.
 //
 // The rules are deliberately analytical: they are the cheap, machine-only half
 // of the picture, evaluated before any IR is built. The simulator (#46) still
@@ -25,8 +25,8 @@
 #ifndef LLK_PERF_LEGALITY_H
 #define LLK_PERF_LEGALITY_H
 
+#include "LLK/Machine/MachineModel.h"
 #include "LLK/Perf/Candidate.h"
-#include "LLK/Perf/MachineModel.h"
 #include "LLK/Perf/SearchSpace.h"
 
 #include <string>
@@ -50,14 +50,14 @@ LegalityResult checkConstraint(const SearchConstraint &constraint,
                                const SearchSpace &space,
                                const Candidate &candidate,
                                const WorkloadShape &shape,
-                               const MachineModel &machine);
+                               const machine::MachineModel &machine);
 
 /// Evaluates every constraint in declaration order and returns the first
 /// rejection. A space with no constraints is legal.
 LegalityResult checkLegality(const SearchSpace &space,
                              const Candidate &candidate,
                              const WorkloadShape &shape,
-                             const MachineModel &machine);
+                             const machine::MachineModel &machine);
 
 } // namespace mlir::llk::perf
 

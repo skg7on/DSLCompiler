@@ -37,7 +37,7 @@
 #ifndef LLK_PERF_MICRODAG_H
 #define LLK_PERF_MICRODAG_H
 
-#include "LLK/Perf/MachineModel.h"
+#include "LLK/Machine/MachineModel.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -140,7 +140,7 @@ struct MicroDAG {
 /// `micro.kernel`. Fails when the kernel uses a memory space the machine does
 /// not model, or expands past kMaxEvents.
 llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
-                                       const MachineModel &machine);
+                                       const machine::MachineModel &machine);
 
 /// Locates the `micro.kernel` to simulate anywhere under `root`: the one named
 /// `symbol`, or the only one present when `symbol` is empty. Fails when the

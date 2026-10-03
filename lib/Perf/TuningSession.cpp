@@ -56,7 +56,7 @@ bool lowerIsBetter(StringRef name) {
 }
 
 CandidateMetrics metricsFrom(const MicroPerfReport &report,
-                             const MachineModel &machine) {
+                             const machine::MachineModel &machine) {
   CandidateMetrics metrics;
   if (report.l1) {
     metrics.predictedCycles = report.l1->predictedCycles;
@@ -68,7 +68,7 @@ CandidateMetrics metricsFrom(const MicroPerfReport &report,
     metrics.predictedCycles = report.l0.predictedCycles;
     metrics.predictedNs = machine.clockHz
                               ? static_cast<double>(metrics.predictedCycles) *
-                                    1e9 / static_cast<double>(machine.clockHz)
+                                    1e9 / static_cast<double>(*machine.clockHz)
                               : 0.0;
     metrics.bottleneck = report.l0.bottleneck;
   }
@@ -114,7 +114,8 @@ std::vector<TuningResult> rankTuningResults(std::vector<TuningResult> results,
 
 llvm::Expected<TuningSessionReport>
 runTuningSession(mlir::MLIRContext &context, const SearchSpace &space,
-                 const WorkloadShape &shape, const MachineModel &machine,
+                 const WorkloadShape &shape,
+                 const machine::MachineModel &machine,
                  const TuningSessionOptions &options) {
   if (options.perfLevel > 1)
     return llvm::make_error<llvm::StringError>(
@@ -123,7 +124,7 @@ runTuningSession(mlir::MLIRContext &context, const SearchSpace &space,
 
   TuningSessionReport report;
   report.machinePath = options.machinePath;
-  report.machineName = machine.name;
+  report.machineName = machine.target;
   report.perfLevel = options.perfLevel;
 
   std::vector<Candidate> candidates =

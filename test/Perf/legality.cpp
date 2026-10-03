@@ -21,8 +21,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/Legality.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Perf/CandidateGenerator.h"
-#include "LLK/Perf/MachineModelLoader.h"
 
 #include "llvm/Support/Error.h"
 
@@ -117,15 +117,15 @@ WorkloadShape swigluShape() {
   return shape;
 }
 
-const MachineModel &avx2() {
-  static std::optional<MachineModel> model = [] {
-    auto loaded =
-        loadMachineModel(std::string(LLK_MACHINE_DIR) + "/x86-avx2-cpu.yaml");
+const machine::MachineModel &avx2() {
+  static std::optional<machine::MachineModel> model = [] {
+    auto loaded = machine::loadMachineModel(std::string(LLK_MACHINE_DIR) +
+                                            "/x86-avx2-v2.yaml");
     if (!loaded) {
       ADD_FAILURE() << llvm::toString(loaded.takeError());
-      return std::optional<MachineModel>();
+      return std::optional<machine::MachineModel>();
     }
-    return std::optional<MachineModel>(std::move(*loaded));
+    return std::optional<machine::MachineModel>(std::move(*loaded));
   }();
   return *model;
 }

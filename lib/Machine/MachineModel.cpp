@@ -253,6 +253,39 @@ bool MachineModel::isVisible(llvm::StringRef memoryId,
   return isWithin(executorId, memory->visibleFrom);
 }
 
+const LinkEdge *
+MachineModel::findLinkByKinds(llvm::StringRef sourceKind,
+                              llvm::StringRef destinationKind) const {
+  for (const LinkEdge &link : links) {
+    const MemoryNode *source = findMemory(link.source);
+    const MemoryNode *destination = findMemory(link.destination);
+    if (source && destination && source->kind == sourceKind &&
+        destination->kind == destinationKind)
+      return &link;
+  }
+  return nullptr;
+}
+
+std::vector<const ComputeNode *>
+MachineModel::computesOfKind(llvm::StringRef kind) const {
+  std::vector<const ComputeNode *> result;
+  for (const ComputeNode &node : computes)
+    if (node.kind == kind)
+      result.push_back(&node);
+  return result;
+}
+
+uint32_t MachineModel::transferEngineCount() const {
+  uint32_t count = 0;
+  for (const TransferEngineNode &engine : transferEngines)
+    count += engine.count;
+  return count;
+}
+
+const TransferEngineNode *MachineModel::primaryTransferEngine() const {
+  return transferEngines.empty() ? nullptr : &transferEngines.front();
+}
+
 const MemoryNode *MachineModel::findMemoryOfKind(llvm::StringRef kind) const {
   for (const MemoryNode &node : memories)
     if (node.kind == kind)

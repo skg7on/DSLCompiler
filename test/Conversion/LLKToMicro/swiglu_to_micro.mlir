@@ -1,6 +1,6 @@
 // RUN: llk-opt --llk-to-micro="schedule-db=missing.json" %s | FileCheck %s --check-prefix=CHECK
 // RUN: llk-opt --llk-to-micro="schedule-db=missing.json" %s \
-// RUN:   | micro-perf --machine=%S/../../../machines/x86-avx2-cpu.yaml --level=1 - \
+// RUN:   | micro-perf --machine=%S/../../../machines/x86-avx2-v2.yaml --level=1 - \
 // RUN:   | FileCheck %s --check-prefix=PERF
 
 // Fused SwiGLU exported to concrete tile-centric Micro-IR.
@@ -121,7 +121,7 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // mapping the M axis to `worker` (8) and the N axis to `lane` (8) claims 64
 // concurrent copies of every tile, and 64 x 4 KiB of accumulator cannot fit in
 // a 4 KiB register file. They are deliberately not asserted here.
-// PERF: machine: x86-avx2-cpu
+// PERF: machine: x86-avx2
 // PERF: kernel: fused_swiglu_M16_N64_K64
 // PERF: level: 1
 // PERF: flops: 262144

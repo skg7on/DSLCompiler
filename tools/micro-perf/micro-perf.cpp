@@ -17,7 +17,7 @@
 
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
-#include "LLK/Perf/MachineModelLoader.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Perf/MicroPerfReport.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -90,7 +90,7 @@ int main(int argc, char **argv) {
     return reportError("unsupported --format=" + format +
                        "; expected yaml or text");
 
-  auto model = mlir::llk::perf::loadMachineModel(machinePath.getValue());
+  auto model = ::mlir::llk::machine::loadMachineModel(machinePath.getValue());
   if (!model)
     return reportError(toString(model.takeError()));
 

@@ -69,26 +69,27 @@ template <typename EngineRange>
 uint32_t totalSlots(const EngineRange &engines) {
   uint32_t total = 0;
   for (const auto &engine : engines)
-    total += engine.count;
+    total += engine->concurrency;
   return std::max<uint32_t>(1, total);
 }
 
 /// How many of these events can run at once. Each engine name is a separate
 /// pool, so two events that name the same engine share its slots rather than
 /// each getting the whole machine.
-uint32_t resourceSlots(const MicroEvent &event, const MachineModel &machine) {
+uint32_t resourceSlots(const MicroEvent &event,
+                       const machine::MachineModel &machine) {
   switch (event.resource) {
   case ResourceKind::Dma:
-    return std::max<uint32_t>(1, machine.dma.engines);
+    return std::max<uint32_t>(1, machine.transferEngineCount());
   case ResourceKind::MatrixEngine: {
-    const MatrixEngineModel *engine =
-        machine.findMatrixEngine(event.resourceName);
-    return std::max<uint32_t>(1, engine ? engine->count : 1);
+    const machine::ComputeNode *engine =
+        machine.findCompute(event.resourceName);
+    return std::max<uint32_t>(1, engine ? engine->concurrency : 1);
   }
   case ResourceKind::VectorEngine: {
-    const VectorEngineModel *engine =
-        machine.findVectorEngine(event.resourceName);
-    return std::max<uint32_t>(1, engine ? engine->count : 1);
+    const machine::ComputeNode *engine =
+        machine.findCompute(event.resourceName);
+    return std::max<uint32_t>(1, engine ? engine->concurrency : 1);
   }
   case ResourceKind::MemoryRead:
   case ResourceKind::MemoryWrite:
@@ -130,7 +131,7 @@ private:
 //===----------------------------------------------------------------------===//
 
 L0Report computeL0StaticBound(const MicroDAG &dag,
-                              const MachineModel &machine) {
+                              const machine::MachineModel &machine) {
   L0Report report;
   report.liveTileBytesByMemory = dag.liveTileBytesByMemory;
 
@@ -180,8 +181,10 @@ L0Report computeL0StaticBound(const MicroDAG &dag,
   // worker_threads -- are what L1 schedules against, so dividing by anything
   // else could let L0 come out slower than L1 and stop being a bound at all.
   // On the shipped AVX2 model the two agree: eight workers, eight engines.
-  const uint64_t matrixSlots = totalSlots(machine.matrixEngines);
-  const uint64_t vectorSlots = totalSlots(machine.vectorEngines);
+  const uint64_t matrixSlots =
+      totalSlots(machine.computesOfKind("matrix_engine"));
+  const uint64_t vectorSlots =
+      totalSlots(machine.computesOfKind("vector_engine"));
 
   // Matrix and vector work run on the pools the machine declares, which may be
   // disjoint, so a bound may assume they overlap. Synchronization does not
@@ -195,7 +198,7 @@ L0Report computeL0StaticBound(const MicroDAG &dag,
   // may assume the levels overlap.
   std::string dominantMemory;
   for (const auto &[space, bytes] : report.bytesByMemory) {
-    const MemoryLevelModel *level = machine.findMemory(space);
+    const machine::MemoryNode *level = machine.findMemoryOfKind(space);
     if (!level || level->bandwidthBytesPerCycle <= 0)
       continue;
     uint64_t cycles =
@@ -228,7 +231,7 @@ L0Report computeL0StaticBound(const MicroDAG &dag,
 // L1 resource schedule
 //===----------------------------------------------------------------------===//
 
-L1Report scheduleL1(const MicroDAG &dag, const MachineModel &machine) {
+L1Report scheduleL1(const MicroDAG &dag, const machine::MachineModel &machine) {
   L1Report report;
   const size_t count = dag.events.size();
   if (count == 0) {
@@ -282,7 +285,7 @@ L1Report scheduleL1(const MicroDAG &dag, const MachineModel &machine) {
     if (!event.tileOwner.empty()) {
       ownerKey = "owner/" + event.tileOwner;
       uint32_t slots =
-          std::max<uint32_t>(1, machine.getOwnerCount(event.tileOwner));
+          std::max<uint32_t>(1, machine.ownerCount(event.tileOwner));
       ownerSlots.emplace(ownerKey, slots);
       ownerPool = &poolFor(ownerKey, slots);
     }
@@ -338,10 +341,10 @@ L1Report scheduleL1(const MicroDAG &dag, const MachineModel &machine) {
     criticalId = 0;
 
   report.predictedCycles = predicted;
-  report.predictedNs = machine.clockHz == 0
-                           ? 0.0
-                           : static_cast<double>(predicted) * 1e9 /
-                                 static_cast<double>(machine.clockHz);
+  report.predictedNs = machine.clockHz
+                           ? static_cast<double>(predicted) * 1e9 /
+                                 static_cast<double>(*machine.clockHz)
+                           : 0.0;
 
   report.schedule.reserve(count);
   for (const MicroEvent &event : dag.events)
@@ -355,21 +358,24 @@ L1Report scheduleL1(const MicroDAG &dag, const MachineModel &machine) {
   };
 
   uint64_t matrixSlots = 0;
-  for (const MatrixEngineModel &engine : machine.matrixEngines)
-    matrixSlots += engine.count;
+  for (const machine::ComputeNode *engine :
+       machine.computesOfKind("matrix_engine"))
+    matrixSlots += engine->concurrency;
   uint64_t vectorSlots = 0;
-  for (const VectorEngineModel &engine : machine.vectorEngines)
-    vectorSlots += engine.count;
+  for (const machine::ComputeNode *engine :
+       machine.computesOfKind("vector_engine"))
+    vectorSlots += engine->concurrency;
 
   report.matrixUtilization = utilization(
       busyByKind[static_cast<size_t>(ResourceKind::MatrixEngine)], matrixSlots);
   report.vectorUtilization = utilization(
       busyByKind[static_cast<size_t>(ResourceKind::VectorEngine)], vectorSlots);
-  report.dmaUtilization = utilization(
-      busyByKind[static_cast<size_t>(ResourceKind::Dma)], machine.dma.engines);
+  report.dmaUtilization =
+      utilization(busyByKind[static_cast<size_t>(ResourceKind::Dma)],
+                  machine.transferEngineCount());
 
   auto bandwidthUtilization = [&](llvm::StringRef space, uint64_t bytes) {
-    const MemoryLevelModel *level = machine.findMemory(space);
+    const machine::MemoryNode *level = machine.findMemoryOfKind(space);
     if (!level || predicted == 0 || level->bandwidthBytesPerCycle <= 0)
       return 0.0;
     return static_cast<double>(bytes) /
@@ -419,10 +425,10 @@ L1Report scheduleL1(const MicroDAG &dag, const MachineModel &machine) {
 //===----------------------------------------------------------------------===//
 
 std::vector<std::string> checkCapacity(const MicroDAG &dag,
-                                       const MachineModel &machine) {
+                                       const machine::MachineModel &machine) {
   std::vector<std::string> violations;
   for (const auto &[space, bytes] : dag.liveTileBytesByMemory) {
-    const MemoryLevelModel *level = machine.findMemory(space);
+    const machine::MemoryNode *level = machine.findMemoryOfKind(space);
     if (!level || bytes <= level->capacityBytes)
       continue;
     violations.push_back(("memory " + space + " requires " +

@@ -86,3 +86,48 @@ them.
 
 Every field is appended to its struct, so existing aggregate initialisers and
 v2 profiles keep working unchanged.
+
+## Slice 2b: LLKPerf runs on v2, and v1 is retired (2026-10-03)
+
+`LLKPerf`'s five consumers -- `MicroDAG`, `MicroCostModel`, `Legality`,
+`MicroPerfReport`, `TuningSession` -- now read `LLKMachine`'s v2 model. The v1
+model, its loader, its test, and both v1 profiles are deleted; `LLKPerf` links
+`LLKMachine`.
+
+### Semantic mappings
+
+- **resource kinds -> nodes.** `machine.dma.engines` becomes
+  `transferEngineCount()`; an engine's multiplicity is a node's `concurrency`;
+  `findMemory("sram")` becomes `findMemoryOfKind("sram")`.
+- **a kind hierarchy -> executor containment.** v1 nested owner *kinds*
+  (`vector_engine` under `lane` under `worker`); v2 nests concrete executors, so
+  `nestedUnder` now looks for an executor of the inner kind beneath one of the
+  outer kind.
+- **fixed triples -> variable rank.** `tile_shapes` were `[m, n, k]`; v2
+  `shapes` are arbitrary-rank, so fragment arithmetic filters by rank.
+- **a value clock -> an optional one.** `predictedNs` is zero without a clock.
+
+### The profile is a translation, not a redesign
+
+`machines/x86-avx2-v2.yaml` was re-authored to carry v1's numbers, because the
+performance suite's baselines are those numbers. Three translations were needed:
+
+1. v1's owner kinds with multiplicities became one executor per kind carrying
+   the count as `concurrency`, chained by v1's parent relation
+   (`worker.0 -> lane.0 -> veng.0`). This is also what keeps
+   `owner_mapping = "worker/vector_engine"` legal.
+2. v1's engine classes (`matrix_engines: count 8`) became **one** capability
+   node with `concurrency: 8`, not eight nodes of one. A schedule that names an
+   engine must share its slots; eight nodes would give it one slot each, and the
+   spatial-overlap tests caught exactly that.
+3. Each link carries what v1's copy formula produced for that hop -- the slower
+   endpoint's latency, the destination's bandwidth -- since v1 charged copies
+   from their endpoints and v2 charges them from the link.
+
+### Verification
+
+- `ninja -C build` clean; `ctest` **102 registered, 100 passed, 2 skipped, 0 failed**.
+- The only expectations that changed are *identities*, not numbers: the machine
+  name in reports (`x86-avx2-cpu` -> `x86-avx2`, the v2 profile's `target`), and
+  the engine named in a layout warning (`avx2-vector` -> `vpu`). Every cycle
+  estimate, bottleneck, capacity check, and overlap number is unchanged.

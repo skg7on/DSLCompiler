@@ -183,6 +183,30 @@ struct MachineModel {
   /// executors are concrete nodes rather than a kind with a multiplicity.
   uint32_t ownerCount(llvm::StringRef ownerKind) const;
 
+  /// True when `ownerKind` names at least one executor.
+  bool hasOwnerKind(llvm::StringRef ownerKind) const {
+    return ownerCount(ownerKind) > 0;
+  }
+
+  /// The first directed link from a memory of `sourceKind` to one of
+  /// `destinationKind`, or null. Callers name memory *spaces* (`dram` to
+  /// `sram`); links join concrete nodes, so this resolves the pair.
+  const LinkEdge *findLinkByKinds(llvm::StringRef sourceKind,
+                                  llvm::StringRef destinationKind) const;
+
+  /// Every compute capability of `kind`, in declaration order. The simulator
+  /// asks for all matrix engines, then picks one; a placement asks for the
+  /// ones attached to one executor.
+  std::vector<const ComputeNode *> computesOfKind(llvm::StringRef kind) const;
+
+  /// Total transfer engines the machine offers, summed over the nodes.
+  uint32_t transferEngineCount() const;
+
+  /// The first transfer engine, or null. A machine that models one engine
+  /// class answers per-engine questions (setup cost, outstanding limit) from
+  /// it; a machine with several is expected to be asked per node.
+  const TransferEngineNode *primaryTransferEngine() const;
+
   /// Compute capabilities and transfer engines directly attached to
   /// `executorId`, in declaration order.
   std::vector<const ComputeNode *>

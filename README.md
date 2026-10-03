@@ -225,8 +225,8 @@ Machine profiles are YAML files under `machines/` and are loaded into typed C++ 
 
 Initial profiles:
 
-- `machines/x86-avx2-cpu.yaml`
-- `machines/generic-ai-accel-v1.yaml`
+- `machines/x86-avx2-v2.yaml`
+- `machines/generic-ai-accel-v2.yaml`
 
 ### 5. Evaluation and Optimization Layer
 
@@ -252,10 +252,10 @@ llk-compile --emit=micro input.mlir
 llk-compile --emit=micro-search input.mlir
 
 # Evaluate concrete Micro-IR against a machine profile
-micro-perf --machine machines/x86-avx2-cpu.yaml --level l1 input.micro.mlir
+micro-perf --machine machines/x86-avx2-v2.yaml --level l1 input.micro.mlir
 
 # Tune candidates from a Micro search space
-llk-tune --search-space swiglu.micro.mlir --machine machines/x86-avx2-cpu.yaml
+llk-tune --search-space swiglu.micro.mlir --machine machines/x86-avx2-v2.yaml
 ```
 
 These commands document the intended M9-M13 interface. They become available as the corresponding issues land.

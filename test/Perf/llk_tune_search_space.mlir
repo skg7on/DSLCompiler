@@ -35,8 +35,8 @@ micro.search_space @fused_swiglu_M8_N64_K64 attributes {workload = "fused_swiglu
 // identity, tile decisions, and predicted metrics.
 // YAML: schema_version: 1
 // YAML: workload: fused_swiglu
-// YAML: target: x86-avx2-cpu
-// YAML: machine: {{.*}}machines/x86-avx2-cpu.yaml
+// YAML: target: x86-avx2
+// YAML: machine: {{.*}}machines/x86-avx2-v2.yaml
 // YAML: shape:
 // YAML:   M_bucket: 2
 // YAML:   M: 8

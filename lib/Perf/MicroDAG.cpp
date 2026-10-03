@@ -76,7 +76,7 @@ namespace {
 
 class DAGBuilder {
 public:
-  DAGBuilder(const MachineModel &machine, llvm::StringRef kernelName)
+  DAGBuilder(const machine::MachineModel &machine, llvm::StringRef kernelName)
       : machine(machine), kernelName(kernelName.str()) {}
 
   llvm::Expected<MicroDAG> run(mlir::Operation *kernel);
@@ -133,14 +133,14 @@ private:
   /// Cost helpers, all answered by the machine model.
   uint64_t copyCycles(llvm::StringRef src, llvm::StringRef dst,
                       uint64_t bytes) const;
-  uint64_t vectorCycles(const VectorEngineModel *engine, llvm::StringRef dtype,
-                        uint64_t elements) const;
-  uint64_t mmaCycles(const MatrixEngineModel &engine,
+  uint64_t vectorCycles(const machine::ComputeNode *engine,
+                        llvm::StringRef dtype, uint64_t elements) const;
+  uint64_t mmaCycles(const machine::ComputeNode &engine,
                      llvm::ArrayRef<int64_t> shape, uint64_t flops) const;
 
-  const MatrixEngineModel *pickMatrixEngine(llvm::StringRef requested,
-                                            std::string &reason) const;
-  const VectorEngineModel *pickVectorEngine(std::string &reason) const;
+  const machine::ComputeNode *pickMatrixEngine(llvm::StringRef requested,
+                                               std::string &reason) const;
+  const machine::ComputeNode *pickVectorEngine(std::string &reason) const;
 
   llvm::SmallVector<uint32_t, 4> producerDeps(mlir::ValueRange values) const;
   void inheritProducer(mlir::Value result, mlir::Value source);
@@ -152,7 +152,7 @@ private:
   llvm::Error requireReachable(mlir::Operation &op, llvm::StringRef src,
                                llvm::StringRef dst);
 
-  const MachineModel &machine;
+  const machine::MachineModel &machine;
   std::string kernelName;
   MicroDAG dag;
   llvm::DenseMap<mlir::Value, uint32_t> producers;
@@ -171,16 +171,17 @@ void DAGBuilder::noteWarning(std::string message) {
 }
 
 void DAGBuilder::noteDiagnostics(const MicroEvent &event) {
-  if (!event.tileOwner.empty() && !machine.findOwner(event.tileOwner)) {
+  if (!event.tileOwner.empty() && !machine.hasOwnerKind(event.tileOwner)) {
     std::string message = "owner '" + event.tileOwner +
-                          "' is not modeled by machine '" + machine.name + "'";
+                          "' is not modeled by machine '" + machine.target +
+                          "'";
     if (seenWarnings.insert(message).second)
       dag.ownerWarnings.push_back(std::move(message));
   }
 
   if (event.tileLayout.empty() || event.tileMemory.empty())
     return;
-  const MemoryLevelModel *level = machine.findMemory(event.tileMemory);
+  const machine::MemoryNode *level = machine.findMemoryOfKind(event.tileMemory);
   if (!level || llvm::is_contained(level->supportedLayouts, event.tileLayout))
     return;
   std::string message =
@@ -235,9 +236,9 @@ void DAGBuilder::noteStorage(mlir::Operation &op, llvm::StringRef space,
 
 uint64_t DAGBuilder::copyCycles(llvm::StringRef src, llvm::StringRef dst,
                                 uint64_t bytes) const {
-  const MemoryLevelModel *srcLevel = machine.findMemory(src);
-  const MemoryLevelModel *dstLevel = machine.findMemory(dst);
-  const CopyPathModel *path = machine.findCopyPath(src, dst);
+  const machine::MemoryNode *srcLevel = machine.findMemoryOfKind(src);
+  const machine::MemoryNode *dstLevel = machine.findMemoryOfKind(dst);
+  const machine::LinkEdge *path = machine.findLinkByKinds(src, dst);
 
   // A copy waits on the slower endpoint's latency; the destination's port sets
   // the rate unless the machine models the path separately.
@@ -250,19 +251,20 @@ uint64_t DAGBuilder::copyCycles(llvm::StringRef src, llvm::StringRef dst,
 
   if (path) {
     if (path->latencyCycles)
-      latency = *path->latencyCycles;
-    if (path->bandwidthBytesPerCycle)
-      bandwidth = *path->bandwidthBytesPerCycle;
+      latency = path->latencyCycles;
+    if (path->bandwidthBytesPerCycle > 0)
+      bandwidth = path->bandwidthBytesPerCycle;
   }
 
-  uint64_t cycles = latency + machine.dma.setupCycles;
+  const machine::TransferEngineNode *engine = machine.primaryTransferEngine();
+  uint64_t cycles = latency + (engine ? engine->setupCycles : 0);
   if (bandwidth > 0)
     cycles += static_cast<uint64_t>(
         std::ceil(static_cast<double>(bytes) / bandwidth));
   return cycles;
 }
 
-uint64_t DAGBuilder::vectorCycles(const VectorEngineModel *engine,
+uint64_t DAGBuilder::vectorCycles(const machine::ComputeNode *engine,
                                   llvm::StringRef dtype,
                                   uint64_t elements) const {
   if (!engine)
@@ -277,53 +279,65 @@ uint64_t DAGBuilder::vectorCycles(const VectorEngineModel *engine,
   return issues * std::max<uint64_t>(1, engine->issueCycles);
 }
 
-uint64_t DAGBuilder::mmaCycles(const MatrixEngineModel &engine,
+uint64_t DAGBuilder::mmaCycles(const machine::ComputeNode &engine,
                                llvm::ArrayRef<int64_t> shape,
                                uint64_t flops) const {
-  if (engine.flopsPerCycle && *engine.flopsPerCycle > 0)
+  if (engine.throughputPerCycle && *engine.throughputPerCycle > 0)
     return static_cast<uint64_t>(
-        std::ceil(static_cast<double>(flops) / *engine.flopsPerCycle));
+        std::ceil(static_cast<double>(flops) / *engine.throughputPerCycle));
 
   // No throughput figure: count how many declared fragments the shape needs.
-  auto volume = [](const std::array<int64_t, 3> &fragment) {
-    return fragment[0] * fragment[1] * fragment[2];
+  // A v2 capability may declare fragments of any rank; only the ones matching
+  // the MMA's rank can be counted against it.
+  auto volume = [](llvm::ArrayRef<int64_t> fragment) {
+    int64_t product = 1;
+    for (int64_t extent : fragment)
+      product *= extent;
+    return product;
   };
-  const std::array<int64_t, 3> *fragment = &engine.tileShapes.front();
-  for (const std::array<int64_t, 3> &candidate : engine.tileShapes)
-    if (volume(candidate) > volume(*fragment))
+  const std::vector<int64_t> *fragment = nullptr;
+  for (const std::vector<int64_t> &candidate : engine.shapes)
+    if (candidate.size() == shape.size() &&
+        (!fragment || volume(candidate) > volume(*fragment)))
       fragment = &candidate;
+  if (!fragment)
+    return std::max<uint64_t>(1, engine.issueCycles);
 
   uint64_t issues = 1;
-  for (size_t i = 0; i < 3; ++i)
+  for (size_t i = 0; i < shape.size(); ++i)
     issues *= llvm::divideCeil(static_cast<uint64_t>(shape[i]),
                                static_cast<uint64_t>((*fragment)[i]));
   return issues * std::max<uint64_t>(1, engine.issueCycles);
 }
 
-const MatrixEngineModel *
+const machine::ComputeNode *
 DAGBuilder::pickMatrixEngine(llvm::StringRef requested,
                              std::string &reason) const {
   if (!requested.empty()) {
-    if (const MatrixEngineModel *engine = machine.findMatrixEngine(requested))
+    if (const machine::ComputeNode *engine = machine.findCompute(requested))
       return engine;
     reason = "engine '" + requested.str() + "' is not declared by machine '" +
-             machine.name + "'";
+             machine.target + "'";
     return nullptr;
   }
-  if (machine.matrixEngines.empty()) {
-    reason = "machine '" + machine.name + "' declares no matrix engine";
+  std::vector<const machine::ComputeNode *> engines =
+      machine.computesOfKind("matrix_engine");
+  if (engines.empty()) {
+    reason = "machine '" + machine.target + "' declares no matrix engine";
     return nullptr;
   }
-  return &machine.matrixEngines.front();
+  return engines.front();
 }
 
-const VectorEngineModel *
+const machine::ComputeNode *
 DAGBuilder::pickVectorEngine(std::string &reason) const {
-  if (machine.vectorEngines.empty()) {
-    reason = "machine '" + machine.name + "' declares no vector engine";
+  std::vector<const machine::ComputeNode *> engines =
+      machine.computesOfKind("vector_engine");
+  if (engines.empty()) {
+    reason = "machine '" + machine.target + "' declares no vector engine";
     return nullptr;
   }
-  return &machine.vectorEngines.front();
+  return engines.front();
 }
 
 //===----------------------------------------------------------------------===//
@@ -486,7 +500,7 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
     if (micro::symbolizeOwner(mapTarget)) {
       owner = mapTarget.str();
       // Each owner needs its own copy of the tiles the body materializes.
-      storageFactor *= std::max<uint64_t>(1, machine.getOwnerCount(owner));
+      storageFactor *= std::max<uint64_t>(1, machine.ownerCount(owner));
     } else {
       noteWarning("micro.spatial_for maps to '" + mapTarget.str() +
                   "', which is not an owner scope; owner occupancy is not "
@@ -598,7 +612,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     if (auto engineAttr = mma.getEngine())
       requested = *engineAttr;
     std::string reason;
-    const MatrixEngineModel *engine = pickMatrixEngine(requested, reason);
+    const machine::ComputeNode *engine = pickMatrixEngine(requested, reason);
     if (!engine)
       return invalid("kernel '" + kernelName + "' uses micro.mma: " + reason);
 
@@ -612,15 +626,15 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     std::string inputDtype = micro::stringifyDType(mma.getInput()).str();
     std::string accumulatorDtype =
         micro::stringifyDType(mma.getAccumulator()).str();
-    if (!llvm::is_contained(engine->inputDTypes, inputDtype))
+    if (!llvm::is_contained(engine->elementTypes, inputDtype))
       noteWarning("micro.mma input dtype '" + inputDtype +
-                  "' is not supported by engine '" + engine->name +
-                  "' (supported: " + llvm::join(engine->inputDTypes, ", ") +
+                  "' is not supported by engine '" + engine->id +
+                  "' (supported: " + llvm::join(engine->elementTypes, ", ") +
                   ")");
     if (!llvm::is_contained(engine->accumulatorDTypes, accumulatorDtype))
       noteWarning(
           "micro.mma accumulator dtype '" + accumulatorDtype +
-          "' is not supported by engine '" + engine->name +
+          "' is not supported by engine '" + engine->id +
           "' (supported: " + llvm::join(engine->accumulatorDTypes, ", ") + ")");
 
     TileInfo lhsInfo = describeType(mma.getLhs().getType());
@@ -633,7 +647,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     // that names an engine runs there. Either way the event names a single
     // pool, so two events naming the same engine share its slots instead of
     // each being handed the whole machine.
-    event.resourceName = engine->name;
+    event.resourceName = engine->id;
     event.workItems = macs;
     event.minCycles = mmaCycles(*engine, shape, 2 * macs);
     event.sourceOpName = op.getName().getStringRef().str();
@@ -641,7 +655,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.tileLayout = lhsInfo.layout.empty() ? accInfo.layout : lhsInfo.layout;
     event.tileMemory = accInfo.memory;
     event.tileOwner = accInfo.owner;
-    noteLayoutUsage(engine->name, engine->supportedLayouts, event.tileLayout);
+    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
 
     uint32_t id =
         addEvent(std::move(event), state,
@@ -652,7 +666,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
 
   if (auto vector = llvm::dyn_cast<micro::VectorOp>(op)) {
     std::string reason;
-    const VectorEngineModel *engine = pickVectorEngine(reason);
+    const machine::ComputeNode *engine = pickVectorEngine(reason);
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.vector: " + reason);
@@ -661,7 +675,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     MicroEvent event;
     event.kind = EventKind::Vector;
     event.resource = ResourceKind::VectorEngine;
-    event.resourceName = engine->name;
+    event.resourceName = engine->id;
     event.workItems = resultInfo.elements();
     event.minCycles =
         vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
@@ -670,7 +684,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.tileLayout = resultInfo.layout;
     event.tileMemory = resultInfo.memory;
     event.tileOwner = resultInfo.owner;
-    noteLayoutUsage(engine->name, engine->supportedLayouts, event.tileLayout);
+    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
 
     uint32_t id =
         addEvent(std::move(event), state, producerDeps(vector.getInputs()));
@@ -680,7 +694,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
 
   if (auto reduce = llvm::dyn_cast<micro::ReduceOp>(op)) {
     std::string reason;
-    const VectorEngineModel *engine = pickVectorEngine(reason);
+    const machine::ComputeNode *engine = pickVectorEngine(reason);
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.reduce: " + reason);
@@ -689,7 +703,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     MicroEvent event;
     event.kind = EventKind::Reduce;
     event.resource = ResourceKind::VectorEngine;
-    event.resourceName = engine->name;
+    event.resourceName = engine->id;
     event.workItems = inputInfo.elements();
     event.minCycles =
         vectorCycles(engine, inputInfo.dtype, inputInfo.elements());
@@ -698,7 +712,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.tileLayout = inputInfo.layout;
     event.tileMemory = inputInfo.memory;
     event.tileOwner = inputInfo.owner;
-    noteLayoutUsage(engine->name, engine->supportedLayouts, event.tileLayout);
+    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
 
     uint32_t id =
         addEvent(std::move(event), state, producerDeps({reduce.getInput()}));
@@ -745,7 +759,7 @@ llvm::Error DAGBuilder::buildLogicalTileOp(
     return llvm::Error::success();
 
   std::string reason;
-  const VectorEngineModel *engine = pickVectorEngine(reason);
+  const machine::ComputeNode *engine = pickVectorEngine(reason);
   if (!engine)
     return invalid("kernel '" + kernelName +
                    "' performs a layout transform but " + reason);
@@ -753,7 +767,7 @@ llvm::Error DAGBuilder::buildLogicalTileOp(
   MicroEvent event;
   event.kind = kind;
   event.resource = ResourceKind::VectorEngine;
-  event.resourceName = engine->name;
+  event.resourceName = engine->id;
   event.workItems = resultInfo.elements();
   event.bytes = resultInfo.bytes();
   event.minCycles =
@@ -765,7 +779,7 @@ llvm::Error DAGBuilder::buildLogicalTileOp(
       resultInfo.memory.empty() ? sourceInfo.memory : resultInfo.memory;
   event.srcMemory = sourceInfo.memory;
   event.tileOwner = resultInfo.owner;
-  noteLayoutUsage(engine->name, engine->supportedLayouts, event.tileLayout);
+  noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
 
   std::string destination = event.tileMemory;
   uint32_t id = addEvent(std::move(event), state);
@@ -830,11 +844,11 @@ llvm::Error DAGBuilder::noteAllocation(mlir::Operation &op,
                 "counted against capacity");
     return llvm::Error::success();
   }
-  if (!machine.findMemory(space)) {
+  if (!machine.findMemoryOfKind(space)) {
     // An allocation needs no bandwidth or latency, so an unmodeled space only
     // costs us the capacity check.
     noteWarning("allocations target memory space '" + space.str() +
-                "', which machine '" + machine.name +
+                "', which machine '" + machine.target +
                 "' does not model; capacity is not checked for it");
     return llvm::Error::success();
   }
@@ -849,12 +863,12 @@ llvm::Error DAGBuilder::requireMemory(mlir::Operation &op,
                    "': " + op.getName().getStringRef() +
                    " moves data through a memory space that is neither named "
                    "on the value nor modeled by machine '" +
-                   machine.name + "'");
-  if (!machine.findMemory(space))
+                   machine.target + "'");
+  if (!machine.findMemoryOfKind(space))
     return invalid("kernel '" + kernelName +
                    "': " + op.getName().getStringRef() +
                    " moves data through memory space '" + space +
-                   "', which machine '" + machine.name + "' does not model");
+                   "', which machine '" + machine.target + "' does not model");
   return llvm::Error::success();
 }
 
@@ -869,8 +883,8 @@ llvm::Error DAGBuilder::requireReachable(mlir::Operation &op,
   // A machine declares the copy paths it can perform. A pair it does not list
   // is still charged through both endpoints' latencies, but the gap is worth
   // reporting: that cost comes from a composition the machine never described.
-  if (!machine.findCopyPath(src, dst))
-    noteWarning("machine '" + machine.name + "' declares no copy path '" +
+  if (!machine.findLinkByKinds(src, dst))
+    noteWarning("machine '" + machine.target + "' declares no copy path '" +
                 src.str() + " -> " + dst.str() +
                 "'; its cost is composed from both endpoints");
   return llvm::Error::success();
@@ -901,7 +915,7 @@ llvm::Expected<MicroDAG> DAGBuilder::run(mlir::Operation *kernel) {
 //===----------------------------------------------------------------------===//
 
 llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
-                                       const MachineModel &machine) {
+                                       const machine::MachineModel &machine) {
   auto kernelOp = llvm::dyn_cast<micro::KernelOp>(kernel);
   if (!kernelOp)
     return invalid("expected a micro.kernel, got '" +

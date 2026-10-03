@@ -17,7 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
-#include "LLK/Perf/MachineModelLoader.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Perf/MicroCostModel.h"
 #include "LLK/Perf/MicroDAG.h"
 #include "LLK/Perf/MicroPerfReport.h"
@@ -73,12 +73,12 @@ std::unique_ptr<Parsed> parseKernel(llvm::StringRef source,
   return parsed;
 }
 
-MachineModel avx2Model() {
-  auto model =
-      loadMachineModel(std::string(LLK_MACHINE_DIR) + "/x86-avx2-cpu.yaml");
+machine::MachineModel avx2Model() {
+  auto model = machine::loadMachineModel(std::string(LLK_MACHINE_DIR) +
+                                         "/x86-avx2-v2.yaml");
   if (!model) {
     ADD_FAILURE() << llvm::toString(model.takeError());
-    return MachineModel();
+    return machine::MachineModel();
   }
   return *model;
 }
@@ -106,7 +106,7 @@ module {
 TEST(L0StaticBound, CountsGemmFragmentWorkAndBytes) {
   auto parsed = parseKernel(kGemmKernel);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -130,7 +130,7 @@ TEST(L0StaticBound, CountsGemmFragmentWorkAndBytes) {
 TEST(L0StaticBound, PredictedCyclesIsTheWorseBound) {
   auto parsed = parseKernel(kGemmKernel);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -145,7 +145,7 @@ TEST(L0StaticBound, PredictedCyclesIsTheWorseBound) {
 TEST(L0StaticBound, BottleneckNamesTheDominantPath) {
   auto parsed = parseKernel(kGemmKernel);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -159,7 +159,7 @@ TEST(L0StaticBound, BottleneckNamesTheDominantPath) {
 TEST(L0StaticBound, LogicalTileViewsProduceNoEvent) {
   auto parsed = parseKernel(kGemmKernel);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -193,7 +193,7 @@ module {
 
   auto parsed = parseKernel(kLooped);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -228,7 +228,7 @@ module {
 
   auto parsed = parseKernel(kDynamicLoop);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -261,7 +261,7 @@ module {
 }
 )MLIR";
 
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto logical = parseKernel(kSameLayout);
   ASSERT_TRUE(logical);
@@ -295,12 +295,12 @@ module {
 
   auto parsed = parseKernel(kTooBig);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto report = analyzeKernel(parsed->kernel, model, /*level=*/0);
   ASSERT_TRUE(static_cast<bool>(report)) << llvm::toString(report.takeError());
 
-  const MemoryLevelModel *sram = model.findMemory("sram");
+  const machine::MemoryNode *sram = model.findMemoryOfKind("sram");
   ASSERT_NE(sram, nullptr);
   ASSERT_EQ(report->capacityViolations.size(), 1u);
   EXPECT_EQ(report->capacityViolations.front(),
@@ -333,7 +333,7 @@ module {
 
   auto parsed = parseKernel(kSwizzled);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -345,7 +345,7 @@ module {
       << (dag->layoutWarnings.empty() ? "no layout warnings"
                                       : dag->layoutWarnings.front());
   EXPECT_TRUE(mentions(dag->layoutWarnings,
-                       "engine 'avx2-vector' does not support layout "
+                       "engine 'vpu' does not support layout "
                        "'swizzled'"));
 }
 
@@ -366,7 +366,7 @@ module {
 
   auto parsed = parseKernel(kF64);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -392,7 +392,7 @@ module {
 
   auto parsed = parseKernel(kUnmodeledOwner);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
@@ -400,7 +400,7 @@ module {
   // 'pe' is a micro owner, but this machine is a thread-parallel CPU and does
   // not declare one, so the occupancy constraint cannot be modeled.
   EXPECT_TRUE(mentions(dag->ownerWarnings,
-                       "owner 'pe' is not modeled by machine 'x86-avx2-cpu'"))
+                       "owner 'pe' is not modeled by machine 'x86-avx2'"))
       << (dag->ownerWarnings.empty() ? "no owner warnings"
                                      : dag->ownerWarnings.front());
 }
@@ -419,7 +419,7 @@ module {
 
   auto parsed = parseKernel(kScratchCopy);
   ASSERT_TRUE(parsed);
-  MachineModel model = avx2Model();
+  machine::MachineModel model = avx2Model();
 
   auto dag = buildMicroDAG(parsed->kernel, model);
   ASSERT_FALSE(static_cast<bool>(dag));

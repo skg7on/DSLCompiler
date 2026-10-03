@@ -213,8 +213,6 @@ mlir_target_link_libraries(MicroDialect PUBLIC
 # goes through mlir_target_link_libraries() inside MicroDialect itself, so the
 # dylib/archive split described below stays correct for every consumer.
 add_library(LLKPerf STATIC
-    lib/Perf/MachineModel.cpp
-    lib/Perf/MachineModelLoader.cpp
     lib/Perf/MicroDAG.cpp
     lib/Perf/MicroCostModel.cpp
     lib/Perf/MicroPerfReport.cpp
@@ -230,7 +228,7 @@ target_include_directories(LLKPerf PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
 )
-target_link_libraries(LLKPerf PUBLIC LLVMSupport MicroDialect)
+target_link_libraries(LLKPerf PUBLIC LLVMSupport MicroDialect LLKMachine)
 # Candidate binding builds concrete micro IR, which references tensor.empty for
 # the kernel's external tensors. MLIRTensorDialect is named through
 # mlir_target_link_libraries() so it resolves to the MLIR dylib when one exists,
@@ -673,13 +671,6 @@ add_llvm_executable(CacheEviction test/Execution/cache_eviction.cpp)
 target_link_libraries(CacheEviction PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME CacheEviction COMMAND CacheEviction)
 
-# The loader test loads the shipped machine files, not just inline fixtures, so
-# the models used for real must parse and verify.
-add_llvm_executable(MachineModelLoaderTest test/Perf/machine_model_loader.cpp)
-target_link_libraries(MachineModelLoaderTest PRIVATE LLKPerf GTest::gtest_main)
-target_compile_definitions(MachineModelLoaderTest PRIVATE
-    LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines")
-add_test(NAME MachineModelLoaderTest COMMAND MachineModelLoaderTest)
 
 # The schedule loader test loads the shipped database as well as inline
 # fixtures, so the file the passes read for real is covered by the suite.
@@ -830,7 +821,7 @@ if(LLK_BUILD_TOOLS)
   # performance simulator evaluates the kernel the export produced, using only
   # the metadata carried by the IR.
   add_test(NAME LLKToMicroPerfRoundTrip
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/swiglu_to_micro.mlir | $<TARGET_FILE:micro-perf> --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-cpu.yaml --level=1 - | ${FILECHECK_BIN} --check-prefix=PERF ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/swiglu_to_micro.mlir"
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/swiglu_to_micro.mlir | $<TARGET_FILE:micro-perf> --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml --level=1 - | ${FILECHECK_BIN} --check-prefix=PERF ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/swiglu_to_micro.mlir"
   )
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
@@ -1021,7 +1012,7 @@ if(LLK_BUILD_TOOLS)
   # micro-perf: the simulator report on a concrete tile GEMM must contain the
   # counts, the schedule, the tile summary, and a bottleneck.
   add_test(NAME MicroPerfCli
-      COMMAND sh -c "$<TARGET_FILE:micro-perf> --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-cpu.yaml --level=1 ${CMAKE_SOURCE_DIR}/test/Perf/micro_perf_cli.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Perf/micro_perf_cli.mlir"
+      COMMAND sh -c "$<TARGET_FILE:micro-perf> --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml --level=1 ${CMAKE_SOURCE_DIR}/test/Perf/micro_perf_cli.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Perf/micro_perf_cli.mlir"
   )
   # The help text has to say what the MVP is, so nobody reads "simulator" as
   # "functional emulator". Same fixture, other check prefix.
@@ -1031,7 +1022,7 @@ if(LLK_BUILD_TOOLS)
   # llk-tune in Micro mode: a search space and the AVX2 model go in, a ranked
   # schedule YAML comes out. The fixture's YAML checks describe that output.
   add_test(NAME LLKTuneSearchSpace
-      COMMAND sh -c "$<TARGET_FILE:llk-tune> --input=${CMAKE_SOURCE_DIR}/test/Perf/llk_tune_search_space.mlir --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-cpu.yaml --M=8 --N=64 --K=64 --top-k=2 --output=${CMAKE_CURRENT_BINARY_DIR}/llk_tune_out.yaml && ${FILECHECK_BIN} --check-prefix=YAML ${CMAKE_SOURCE_DIR}/test/Perf/llk_tune_search_space.mlir < ${CMAKE_CURRENT_BINARY_DIR}/llk_tune_out.yaml"
+      COMMAND sh -c "$<TARGET_FILE:llk-tune> --input=${CMAKE_SOURCE_DIR}/test/Perf/llk_tune_search_space.mlir --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml --M=8 --N=64 --K=64 --top-k=2 --output=${CMAKE_CURRENT_BINARY_DIR}/llk_tune_out.yaml && ${FILECHECK_BIN} --check-prefix=YAML ${CMAKE_SOURCE_DIR}/test/Perf/llk_tune_search_space.mlir < ${CMAKE_CURRENT_BINARY_DIR}/llk_tune_out.yaml"
   )
   # Compatibility: with no --input the driver keeps the pre-Micro grid search
   # and writes the JSON schedule_db entry the existing pipeline consumes.

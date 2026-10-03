@@ -22,7 +22,7 @@
 #ifndef LLK_PERF_MICROCOSTMODEL_H
 #define LLK_PERF_MICROCOSTMODEL_H
 
-#include "LLK/Perf/MachineModel.h"
+#include "LLK/Machine/MachineModel.h"
 #include "LLK/Perf/MicroDAG.h"
 
 #include <cstdint>
@@ -93,15 +93,16 @@ struct L1Report {
 };
 
 /// Static bound: work and bytes only, no dependencies.
-L0Report computeL0StaticBound(const MicroDAG &dag, const MachineModel &machine);
+L0Report computeL0StaticBound(const MicroDAG &dag,
+                              const machine::MachineModel &machine);
 
 /// Deterministic list schedule over the event graph.
-L1Report scheduleL1(const MicroDAG &dag, const MachineModel &machine);
+L1Report scheduleL1(const MicroDAG &dag, const machine::MachineModel &machine);
 
 /// Compares peak live tile bytes against modeled capacity. Violations make a
 /// candidate illegal, but they do not fail the run.
 std::vector<std::string> checkCapacity(const MicroDAG &dag,
-                                       const MachineModel &machine);
+                                       const machine::MachineModel &machine);
 
 } // namespace mlir::llk::perf
 
