@@ -589,7 +589,13 @@ solveBounded(const LayoutDef &def, const MachineModel &machine,
   }
 
   // The search is incomplete both when the assignment space was not exhausted
-  // and when a quantifier ran out of budget (design §13.3).
+  // and when a quantifier ran out of budget (design §13.3). Exhausting the
+  // quantifier budget is stronger: it leaves a constraint *undecided*, so the
+  // solutions may not be legal and are withheld -- a consumer must never read
+  // an undecided solve as "these layouts are legal, there may be more".
+  result.undecided = budget.exhausted;
+  if (result.undecided)
+    result.solutions.clear();
   result.truncated = assignments < total || budget.exhausted;
   return result;
 }

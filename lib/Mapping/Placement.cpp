@@ -186,7 +186,14 @@ enumeratePlacements(const MappingCandidate &candidate,
         layoutSolver->solve(*def, machine, context, layoutContext);
     if (!solved)
       return solved.takeError();
-    if (solved->solutions.empty()) {
+    if (solved->undecided || solved->solutions.empty()) {
+      // A solve whose quantifier ran out of budget is *undecided*: an exhausted
+      // quantifier yields 0, and `!undecided` reads as satisfied, so any
+      // solution it reported could be illegal. Fail closed -- the candidate is
+      // not legally placeable -- rather than accept an undecided layout. The
+      // solve withholds those solutions too, so this guard is belt-and-braces.
+      // (`truncated` alone is *not* a failure: it also means "more solutions
+      // may exist", which is not a soundness problem.)
       reportFailure(PlacementFailure::NoLegalLayout);
       return std::vector<CandidateInstance>{};
     }

@@ -7,6 +7,8 @@
 
 #include "LLK/Mapping/LlkMap.h"
 
+#include "LLK/Dialect/Micro/MicroEnums.h"
+
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -727,10 +729,16 @@ evalQuantifier(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
     for (const machine::ExecutorNode &executor : machine.executors)
       if (machine.ownerMatches(kind->text, executor.id))
         domain.push_back(executor.id);
-    // A kind the machine does not offer is an unknown fact, matching the
-    // `machine.compute(<kind>).count` convention -- never a silently empty set.
-    if (domain.empty())
-      return evalError("unknown executor kind '" + kind->text + "'");
+    // A kind with no matching executor is an unknown fact, never a silently
+    // empty set. Distinguish a kind outside the vocabulary from a valid owner
+    // kind the profile simply does not populate: the first is a typo, the
+    // second a machine limitation.
+    if (domain.empty()) {
+      if (!mlir::micro::symbolizeOwner(kind->text))
+        return evalError("unknown executor kind '" + kind->text + "'");
+      return evalError("the machine offers no executors of kind '" +
+                       kind->text + "'");
+    }
   } else {
     return evalError("unknown quantifier domain");
   }

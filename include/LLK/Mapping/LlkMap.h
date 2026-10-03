@@ -92,6 +92,11 @@ struct EvalValue {
   std::string text;
 };
 
+/// The single default bound on quantified evaluation, shared by
+/// `QuantifierBudget::limit` and `SolverLimits::maxQuantifierIterations` so the
+/// two can never drift apart.
+inline constexpr uint64_t kDefaultQuantifierIterations = 100000;
+
 /// A shared, bounded budget for quantified evaluation. Each candidate element a
 /// quantifier examines consumes one unit. When the budget is spent before a
 /// quantifier has decided, `exhausted` is set and the quantifier yields 0 --
@@ -101,7 +106,7 @@ struct EvalValue {
 struct QuantifierBudget {
   /// Total domain elements one evaluation may examine. The solver sets this
   /// from its `SolverLimits`; a direct evaluator call uses the default.
-  uint64_t limit = 65536;
+  uint64_t limit = kDefaultQuantifierIterations;
   uint64_t used = 0;
   bool exhausted = false;
 

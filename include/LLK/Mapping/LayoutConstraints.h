@@ -130,14 +130,25 @@ struct SolverLimits {
   /// (design §13.3 bounds quantification). A quantifier that would exceed it
   /// stops and the solve is reported truncated -- never a silently accepted
   /// "no solution". A declaration without a quantifier never consumes it.
-  uint64_t maxQuantifierIterations = 100000;
+  ///
+  /// This is a bound on *enumeration*: a backend that does not enumerate (a
+  /// symbolic solver, say) may ignore it, since it never scans a domain.
+  uint64_t maxQuantifierIterations = kDefaultQuantifierIterations;
 };
 
 struct LayoutSolveResult {
   std::vector<LayoutSolution> solutions;
-  /// True when the search stopped before exhausting the assignment space or a
-  /// quantifier ran out of its budget (design §13.3).
+  /// True when the search stopped before exhausting the assignment or solution
+  /// space (design §13.3). The reported solutions are legal; there may simply
+  /// be more.
   bool truncated = false;
+  /// True when a quantifier ran out of its budget, so at least one constraint
+  /// is *undecided* and the reported solutions may not be legal: an exhausted
+  /// quantifier yields 0, and a surrounding `!`/`== 0`/`!= 1` can then read as
+  /// satisfied. A caller MUST NOT accept a solution from an undecided solve --
+  /// unlike `truncated`, this is a soundness flag, not a completeness one. It
+  /// implies `truncated`.
+  bool undecided = false;
 };
 
 /// The layout-solving backend (design §13.3). The bounded enumerator is one

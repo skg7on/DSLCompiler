@@ -184,6 +184,38 @@ TEST(Placement, RequiresTheLayoutToSolve) {
   EXPECT_EQ((*solvable)[0].layoutBindings.lookup("t.rank3"), "t.rank3");
 }
 
+TEST(Placement, TreatsATruncatedLayoutSolveAsUnplaceable) {
+  // The domain is larger than the default quantifier budget, so the `forall`
+  // is undecided and `!undecided` reads as satisfied -- the solve is truncated.
+  // Placement must fail closed on the flag, not accept the undecided layout.
+  constexpr llvm::StringLiteral kTruncating = R"llkmap(
+layout t.truncating(int N) {
+  param N in [1..200000];
+  require !(forall v in domain(N) : v >= 1);
+}
+)llkmap";
+  std::unique_ptr<MappingTarget> target =
+      targetFor(placementMachine(), kTruncating);
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate withLayout = candidate();
+  LayoutRequirement requirement;
+  requirement.layoutClass = "t.truncating";
+  withLayout.layoutRequirements.push_back(requirement);
+
+  mlir::MLIRContext context;
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withLayout, *target, context, layoutContext);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // The undecided solve yielded no trustworthy layout, so the candidate does
+  // not place -- it is never accepted on the strength of `!undecided`.
+  EXPECT_TRUE(instances->empty());
+}
+
 TEST(Placement, SymmetryReductionKeepsOneRepresentative) {
   // Three interchangeable executors: same kind, same parent, same attachments.
   MachineModel machine;

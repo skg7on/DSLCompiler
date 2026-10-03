@@ -107,8 +107,10 @@ extends as far right as possible, so a quantifier that must feed a larger
 expression needs parentheses: `(forall v in domain(VW) : p) && q`.
 
 `executors(<kind>)` reads the machine like the other capability queries: a
-`<kind>` the machine does not offer is an unknown fact, reported as an error,
-never a silently empty set.
+`<kind>` with no matching executor is an unknown fact, reported as an error,
+never a silently empty set. The diagnostic distinguishes a kind outside the
+owner vocabulary (`unknown executor kind`) from a valid owner kind the profile
+simply does not populate (`the machine offers no executors of kind`).
 
 An empty domain is vacuous: `forall` over it is 1 and `exists` over it is 0.
 `dimensions` is the only domain that can be empty (a scalar has no dimensions).
@@ -119,9 +121,17 @@ Quantification is bounded and deterministic. Every element a quantifier examines
 consumes one unit of a budget set from `SolverLimits::maxQuantifierIterations`
 (a rule's `require` uses its own assignment bound). When the budget runs out
 before a quantifier has decided, the quantifier yields **0** -- *undecided*,
-never a definite false -- and the solve reports `truncated`, so a caller never
-reads a capped search as a proof that no solution exists. The cap is never
-silently ignored.
+never a definite false -- and the declaration is never silently treated as
+satisfied or unsatisfied.
+
+For a layout, the solve reports two distinct flags: `truncated` (the search did
+not exhaust its space; the reported solutions are legal, there may be more) and
+`undecided` (a quantifier ran out of budget, so a solution could rest on an
+undecided constraint and must not be accepted). An `undecided` solve withholds
+its solutions and `Placement` refuses to place such a candidate. Rejecting a
+layout under an undecided constraint is the conservative direction: it is better
+to fail to place than to accept an illegal layout. For a rule, an undecided
+constraint is a non-match with the search reported truncated.
 
 ## Example
 
@@ -145,9 +155,13 @@ The parser rejects, with a file/line/column diagnostic:
 - a `param ... in` clause for an undeclared parameter, or a duplicate domain;
 - an identifier in a `require`/`map` that is neither a declared parameter, a
   map dimension, nor a builtin;
-- a `domain(<param>)` quantifier whose argument is not a declared parameter, a
-  quantifier domain that is not `domain(...)`, `executors(...)`, or
-  `dimensions`, or a missing `in`/`:` in a quantifier;
+- a quantifier domain that is not `domain(...)`, `executors(...)`, or
+  `dimensions`, a `domain(...)` argument that is not a known identifier, or a
+  missing `in`/`:` in a quantifier. A `domain(<name>)` whose `<name>` is a known
+  identifier that is not a declared parameter -- a builtin such as `rank` or
+  `element_type` -- parses, because it cannot be told from a parameter until the
+  declaration is complete, and is reported as `unknown domain` when solved (a
+  builtin has no declared domain);
 - an unknown function (`floordiv`, `ceildiv`, `mod`, `min`, `max`,
   `machine.compute`, `machine.memory`) or member query (`lanes`, `count`,
   `capacity_bytes`, `alignment_bytes`);

@@ -590,15 +590,33 @@ layout t.q() {
   EXPECT_EQ(evalLayoutInt(noWorker, "t.q", machine), 0);
 }
 
-TEST(LayoutQuantifier, RejectsAnUnknownExecutorKind) {
+TEST(LayoutQuantifier, RejectsExecutorKindsWithNoExecutors) {
   MachineModel machine = evalMachine();
+  // `wormer` is outside the owner vocabulary -- a typo.
   llvm::StringLiteral unknown = R"llkmap(
+layout t.q() {
+  require forall e in executors("wormer") : e != "";
+}
+)llkmap";
+  llvm::Expected<EvalValue> unknownKind =
+      evalLayoutConstraint(unknown, "t.q", machine);
+  ASSERT_FALSE(static_cast<bool>(unknownKind));
+  EXPECT_NE(
+      llvm::toString(unknownKind.takeError()).find("unknown executor kind"),
+      std::string::npos);
+
+  // `dma` is a valid owner kind, just not populated by this machine.
+  llvm::StringLiteral empty = R"llkmap(
 layout t.q() {
   require forall e in executors("dma") : e != "";
 }
 )llkmap";
-  EXPECT_FALSE(
-      static_cast<bool>(evalLayoutConstraint(unknown, "t.q", machine)));
+  llvm::Expected<EvalValue> noExecutors =
+      evalLayoutConstraint(empty, "t.q", machine);
+  ASSERT_FALSE(static_cast<bool>(noExecutors));
+  EXPECT_NE(llvm::toString(noExecutors.takeError())
+                .find("offers no executors of kind"),
+            std::string::npos);
 }
 
 TEST(LayoutQuantifier, OverDimensionsIsVacuouslyTrueWhenEmpty) {
@@ -655,6 +673,29 @@ layout t.q(int N) {
   ASSERT_TRUE(static_cast<bool>(clipped));
   EXPECT_TRUE(clipped->solutions.empty());
   EXPECT_TRUE(clipped->truncated);
+}
+
+TEST(LayoutQuantifier, ATruncatedQuantifierUnderNegationIsReportedNotAccepted) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  // The domain is larger than the default quantifier budget, so the `forall`
+  // is *undecided*; under `!` that reads as satisfied. The solve must flag the
+  // truncation -- the production consumer (Placement) fails closed on it -- so
+  // the undecided constraint is never presented as a clean success.
+  llvm::StringLiteral text = R"llkmap(
+layout t.trunc(int N) {
+  param N in [1..200000];
+  require !(forall v in domain(N) : v >= 1);
+}
+)llkmap";
+  llvm::Expected<LayoutSolveResult> result =
+      solveText(text, "t.trunc", machine, context);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->truncated);
+  EXPECT_TRUE(result->undecided);
+  // Solutions that rest on an undecided constraint are withheld, so no caller
+  // can accept the undecided-derived layout as legal.
+  EXPECT_TRUE(result->solutions.empty());
 }
 
 //===----------------------------------------------------------------------===//

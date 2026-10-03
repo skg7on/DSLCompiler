@@ -967,6 +967,73 @@ rule r.quant {
           .has_value());
 }
 
+TEST(RuleMatch, ATruncatedQuantifierUnderNegationIsNotAMatch) {
+  // The domain exceeds the rule's quantifier budget, so the `forall` is
+  // undecided and `!undecided` reads as satisfied. The rule must fail closed
+  // and report truncation, never match on an undecided constraint.
+  llvm::StringLiteral text = R"llkmap(
+rule r.trunc {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [1..200000];
+  require !(forall v in domain(VW) : v >= 1);
+  input "operand0";
+  output "result";
+  bundle "b.trunc";
+  emit "e";
+}
+)llkmap";
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(text);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.trunc");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  WorkloadNode node = typedVectorNode(f32, f32);
+
+  std::string reason;
+  bool truncated = false;
+  std::optional<MappingCandidate> candidate = toMappingCandidate(
+      *rule, node, machineWithVectorLanes(8), {}, &reason, &truncated);
+  EXPECT_FALSE(candidate.has_value());
+  EXPECT_TRUE(truncated);
+  EXPECT_FALSE(reason.empty());
+}
+
+TEST(RuleMatch, ABoundVariableShadowingAParameterIsNotDerived) {
+  // The bound `VW` shadows the declared parameter `VW`. Only the domain
+  // selector mentions the parameter, so the rule derives no value for its
+  // bundle -- a body reference to the bound variable must not be recorded as
+  // the parameter.
+  llvm::StringLiteral text = R"llkmap(
+rule r.shadow {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  require forall VW in domain(VW) : VW >= 4;
+  input "operand0";
+  output "result";
+  bundle "b.shadow";
+  emit "e";
+}
+)llkmap";
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(text);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.shadow");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  WorkloadNode node = typedVectorNode(f32, f32);
+
+  std::string reason;
+  std::optional<MappingCandidate> candidate =
+      toMappingCandidate(*rule, node, machineWithVectorLanes(8), {}, &reason);
+  ASSERT_TRUE(candidate.has_value()) << reason;
+  EXPECT_TRUE(candidate->resolvedParameters.empty());
+}
+
 TEST(RuleMatch, AConstraintOnFactsTheNodeCannotSupplyIsANonMatch) {
   mlir::MLIRContext context;
   llvm::Expected<RuleRegistry> registry = parse(kLaneRule);

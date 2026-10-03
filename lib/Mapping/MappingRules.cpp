@@ -929,26 +929,31 @@ LayoutContext ruleLayoutContext(const WorkloadNode &node,
 }
 
 /// Adds every identifier an expression references to `out`, so a rule can tell
-/// which of its parameters a constraint actually derives.
-void collectIdentifiers(const Expr &expr, llvm::StringSet<> &out) {
+/// which of its parameters a constraint actually derives. `bound` holds the
+/// quantifier variables currently in scope: they shadow a like-named parameter,
+/// so a reference to one is not a reference to the parameter.
+void collectIdentifiers(const Expr &expr, llvm::StringSet<> &out,
+                        const llvm::StringSet<> &bound) {
   if (expr.kind == ExprKind::Ident) {
-    out.insert(expr.text);
+    if (!bound.contains(expr.text))
+      out.insert(expr.text);
     return;
   }
   if (expr.kind == ExprKind::Quantifier) {
-    // operands: [bound-variable Ident, domain, body]. The bound variable is
-    // local -- not a reference to a rule parameter. `domain(<param>)` names a
+    // operands: [bound-variable Ident, domain, body]. `domain(<param>)` names a
     // domain, not a value, so its argument is not a value reference either;
     // `executors(<expr>)` does evaluate its argument, so that one is walked.
     const Expr &domain = *expr.operands[1];
     if (domain.kind == ExprKind::Call && domain.text == "executors")
       for (const ExprPtr &argument : domain.operands)
-        collectIdentifiers(*argument, out);
-    collectIdentifiers(*expr.operands[2], out);
+        collectIdentifiers(*argument, out, bound);
+    llvm::StringSet<> scoped = bound;
+    scoped.insert(expr.operands[0]->text);
+    collectIdentifiers(*expr.operands[2], out, scoped);
     return;
   }
   for (const ExprPtr &operand : expr.operands)
-    collectIdentifiers(*operand, out);
+    collectIdentifiers(*operand, out, bound);
 }
 
 /// The result of evaluating a rule's `require` constraints against one node:
@@ -994,8 +999,9 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
 
   // The parameters a constraint actually derives: only these are recorded.
   llvm::StringSet<> referenced;
+  llvm::StringSet<> bound; // no quantifier is in scope at the top level
   for (const ExprPtr &constraint : rule.constraints)
-    collectIdentifiers(*constraint, referenced);
+    collectIdentifiers(*constraint, referenced, bound);
 
   auto domainOf = [&](const LayoutParam &param) -> const ParamDomain & {
     return rule.domains.find(param.name)->second;
@@ -1056,6 +1062,18 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
     }
 
     if (satisfied) {
+      // A quantifier that ran out of budget leaves its constraint *undecided*
+      // (it yields 0), so under `!`/`==0`/`!=1` the constraint can read as
+      // satisfied. Do not accept such an assignment: fail closed and report the
+      // search truncated, so the caller never reads it as a rule match.
+      if (budget.exhausted) {
+        result.matched = false;
+        result.truncated = true;
+        result.reason =
+            "require constraint search exceeded the quantifier bound without "
+            "deciding every constraint";
+        return result;
+      }
       for (const auto &entry : bindings)
         if (referenced.contains(entry.first()))
           result.parameters[entry.first().str()] = entry.second;
