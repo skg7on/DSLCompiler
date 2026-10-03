@@ -244,6 +244,7 @@ mlir_target_link_libraries(LLKPerf PRIVATE MLIRTensorDialect)
 # it does not change this code.
 add_library(LLKMachine STATIC
     lib/Machine/MachineModel.cpp
+    lib/Machine/MachineModelLoader.cpp
 )
 target_include_directories(LLKMachine PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -675,6 +676,7 @@ function(add_llk_machine_test test_name test_file)
 endfunction()
 
 add_llk_machine_test(MachineModelTest test/Machine/machine_model.cpp)
+add_llk_machine_test(MachineModelV2LoaderTest test/Machine/machine_model_loader.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
