@@ -198,6 +198,33 @@ rule a.one {
 )llkmap"));
 }
 
+TEST(RuleParse, RejectsDuplicateKindRequirement) {
+  // The same (role, kind) twice would collide in placement's binding map and
+  // emit indistinguishable instances, so it is rejected at load.
+  EXPECT_FALSE(parses(R"llkmap(
+rule a.one {
+  match micro.vector();
+  require compute kind vector_engine;
+  require compute kind vector_engine;
+  bundle "b";
+  emit "e";
+}
+)llkmap"));
+
+  // A different kind under the same role, or the same kind under a different
+  // role, is not a duplicate.
+  EXPECT_TRUE(parses(R"llkmap(
+rule a.two {
+  match micro.vector();
+  require compute kind vector_engine;
+  require compute kind matrix_engine;
+  require memory kind sram;
+  bundle "b";
+  emit "e";
+}
+)llkmap"));
+}
+
 TEST(RuleParse, RejectsUndeclaredParameterInConstraint) {
   EXPECT_FALSE(parses(R"llkmap(
 rule a.one {

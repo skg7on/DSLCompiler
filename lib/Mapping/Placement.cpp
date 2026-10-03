@@ -177,19 +177,19 @@ enumeratePlacements(const MappingCandidate &candidate,
   // `LayoutSolver` interface (design §13.3), not the free function, so a future
   // backend drops in here without touching placement.
   //
-  // The solved definition is kept, not discarded: a placed instance binds that
-  // definition's id -- the concrete target layout id (design §13.4), a layout
-  // the target declares and the solver proved satisfiable -- rather than an
-  // echo of the requirement's string. A rule's `require layout p satisfies
-  // <id>` names a layout definition id directly, so there is no separate
-  // abstract class to resolve and no single parameterised instantiation to
-  // name (a solve reports several parameter assignments and placement does not
-  // choose among them); the definition id is the concrete solved id. The solve
-  // result's parameter values have no home on `CandidateInstance`, so none are
-  // recorded here.
+  // Every requirement must solve before any executor is tried; the resolved
+  // definition is kept so an instance can bind it. `layoutBindings` is a
+  // `StringMap<LayoutId>`, so it carries the layout *definition* id only: that
+  // is the registry-resolved id of the definition the requirement names, and is
+  // therefore string-identical to `requirement.layoutClass` by construction. A
+  // solve's concrete parameter assignment and affine map are not surfaced --
+  // there is no field on `CandidateInstance` for them, and a solve may report
+  // several, none of which placement selects (selection is the tuner's job).
+  // Recording solved parameters would be a data-model change, not a binding
+  // tweak.
   std::unique_ptr<LayoutSolver> layoutSolver = makeBoundedLayoutSolver();
-  std::vector<const LayoutDef *> solvedLayouts;
-  solvedLayouts.reserve(candidate.layoutRequirements.size());
+  std::vector<const LayoutDef *> solvedDefs;
+  solvedDefs.reserve(candidate.layoutRequirements.size());
   for (const LayoutRequirement &requirement : candidate.layoutRequirements) {
     const LayoutDef *def = target.layouts().find(requirement.layoutClass);
     if (!def)
@@ -210,7 +210,7 @@ enumeratePlacements(const MappingCandidate &candidate,
       reportFailure(PlacementFailure::NoLegalLayout);
       return std::vector<CandidateInstance>{};
     }
-    solvedLayouts.push_back(def);
+    solvedDefs.push_back(def);
   }
 
   std::vector<const ExecutorNode *> executors;
@@ -318,9 +318,9 @@ enumeratePlacements(const MappingCandidate &candidate,
       for (size_t j = 0; j < memoryChoices.size(); ++j)
         instance.memoryBindings[candidate.memoryRequirements[j].kind] =
             memoryChoices[j][pick[computeChoices.size() + j]]->id;
-      for (size_t i = 0; i < solvedLayouts.size(); ++i)
+      for (size_t i = 0; i < solvedDefs.size(); ++i)
         instance.layoutBindings[candidate.layoutRequirements[i].layoutClass] =
-            solvedLayouts[i]->id;
+            solvedDefs[i]->id;
 
       instance.resourceUsage.executorSlots = 1;
       for (const MemoryRequirement &requirement : candidate.memoryRequirements)

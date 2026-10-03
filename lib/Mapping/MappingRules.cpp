@@ -394,12 +394,23 @@ bool RuleParser::parseRequire(RuleDef &out) {
       peek().text == "kind") {
     KindRequirement requirement;
     requirement.role = current().text;
+    const LlkMapToken roleToken = current();
     advance(); // role
     advance(); // 'kind'
     if (!expectIdentifier("a capability kind", requirement.kind))
       return false;
     if (!expectPunct(";"))
       return false;
+    // A rule may not require the same (role, kind) twice: placement binds
+    // attachments by kind, so a duplicate would collide in the binding map and
+    // emit indistinguishable instances. Rejected here, in source order, before
+    // any candidate is built.
+    for (const KindRequirement &existing : out.kindRequirements)
+      if (existing.role == requirement.role &&
+          existing.kind == requirement.kind)
+        return failAt(roleToken, "duplicate " + requirement.role +
+                                     " kind requirement '" + requirement.kind +
+                                     "'");
     out.kindRequirements.push_back(std::move(requirement));
     return true;
   }

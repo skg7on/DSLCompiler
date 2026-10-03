@@ -270,11 +270,11 @@ TEST(Placement, BindsTheSolvedLayoutForEveryEnumeratedAttachment) {
       << llvm::toString(instances.takeError());
   ASSERT_EQ(instances->size(), 2u);
   for (const CandidateInstance &instance : *instances) {
-    // Each enumerated attachment carries the concrete solved layout id, and it
-    // resolves in the target's registry -- a declared layout definition, not an
-    // unvalidated echo of the requirement's string.
+    // Each enumerated attachment binds the solved layout: the registry-resolved
+    // definition id, identical to the requirement's declared id by
+    // construction.
     const std::string bound = instance.layoutBindings.lookup("t.rank2");
-    EXPECT_FALSE(bound.empty());
+    EXPECT_EQ(bound, "t.rank2");
     EXPECT_NE((*target).layouts().find(bound), nullptr);
   }
 }
@@ -337,14 +337,14 @@ TEST(Placement, RequiresTheLayoutToSolve) {
       enumeratePlacements(withLayout, *target, context, rank3);
   ASSERT_TRUE(static_cast<bool>(solvable));
   EXPECT_EQ(solvable->size(), 3u);
-  // The binding carries the concrete target layout id the solver solved
-  // (design §13.4): a layout definition the target declares, resolvable in its
-  // registry -- not a bare echo of the requirement's string. A rule's
-  // `require layout p satisfies <id>` names the definition id directly, so the
-  // solved definition's id and the requirement's class coincide; the property
-  // that changed is that the value now comes from the solved definition.
+  // Every placed instance carries the solved layout: the binding is the layout
+  // definition id the requirement resolved to, and it resolves in the target's
+  // registry. A rule's `require layout p satisfies <id>` names that definition
+  // id directly, so the bound value is string-identical to the requirement's
+  // declared id by construction; the solved parameters are not carried
+  // (`layoutBindings` is a `StringMap<LayoutId>`).
   const std::string bound = (*solvable)[0].layoutBindings.lookup("t.rank3");
-  EXPECT_FALSE(bound.empty());
+  EXPECT_EQ(bound, "t.rank3");
   EXPECT_NE((*target).layouts().find(bound), nullptr);
 }
 
