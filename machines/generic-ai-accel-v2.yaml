@@ -1,0 +1,134 @@
+# Machine model (v2): a generic systolic-array-style AI accelerator.
+#
+# The counterpart to x86-avx2-v2.yaml. It exists to prove the schema expresses
+# an accelerator-shaped hierarchy -- chip / core / pe_group / PE -- and a
+# multi-hop memory path, so the same tile program can be mapped onto a CPU and
+# an accelerator without changing the IR.
+#
+# `pe` declares `refines: [worker]`, so a kernel written against the abstract
+# `worker` owner maps here too. That refinement lives in the profile, not in
+# the generic mapping code: the mapping layer matches owner kinds, and only the
+# target decides that a PE counts as a worker.
+#
+# It describes a plausible class of machine, not a product.
+
+schema: llk.machine.v2
+target: generic-ai-accel
+description: >-
+  Generic AI accelerator with a chip/core/pe_group/PE hierarchy, a 16x16x32
+  MXU, a companion vector unit, and a multi-hop DRAM -> SRAM -> ACC path.
+
+executors:
+  - id: chip.0
+    kind: worker
+    concurrency: 1
+  - id: core.0
+    kind: core
+    parent: chip.0
+    coordinates: [0, 0]
+    concurrency: 1
+    refines: [worker]
+  - id: core.1
+    kind: core
+    parent: chip.0
+    coordinates: [0, 1]
+    concurrency: 1
+    refines: [worker]
+  - id: pe_group.0
+    kind: pe_group
+    parent: core.0
+    coordinates: [0, 0]
+    concurrency: 1
+  - id: pe.0
+    kind: pe
+    parent: pe_group.0
+    coordinates: [0, 0]
+    concurrency: 1
+    refines: [worker]
+  - id: pe.1
+    kind: pe
+    parent: pe_group.0
+    coordinates: [0, 1]
+    concurrency: 1
+    refines: [worker]
+
+memories:
+  - id: dram.0
+    kind: dram
+    visible_from: chip.0
+    capacity_bytes: 68719476736
+    alignment_bytes: 128
+    supported_layouts: [row_major, blocked]
+  - id: sram.0
+    kind: sram
+    visible_from: core.0
+    capacity_bytes: 1048576
+    alignment_bytes: 128
+    supported_layouts: [row_major, blocked, swizzled]
+    banks: 32
+  - id: acc.0
+    kind: acc
+    visible_from: pe_group.0
+    capacity_bytes: 262144
+    alignment_bytes: 64
+    supported_layouts: [row_major, blocked]
+    banks: 16
+
+compute:
+  - id: mxu.0
+    kind: matrix_engine
+    attached_to: pe.0
+    element_types: [bf16, f16, i8]
+    shapes: [[16, 16, 32]]
+    issue_cycles: 1
+    latency_cycles: 8
+    throughput_per_cycle: 512
+    supported_layouts: [row_major, blocked]
+  - id: vpu.0
+    kind: vector_engine
+    attached_to: pe.0
+    element_types: [f32, f16]
+    shapes: [[64]]
+    issue_cycles: 1
+    latency_cycles: 6
+    throughput_per_cycle: 64
+    supported_layouts: [row_major, vectorized, blocked]
+
+transfer_engines:
+  - id: dma.0
+    kind: dma
+    attached_to: core.0
+    count: 4
+    max_outstanding: 16
+
+links:
+  # The two-hop path dram -> sram -> acc that a routing fixture needs; there is
+  # deliberately no direct dram -> acc link.
+  - id: dram_to_sram.0
+    source: dram.0
+    destination: sram.0
+    bandwidth_bytes_per_cycle: 1024
+    latency_cycles: 300
+    transaction_bytes: 128
+    transfer_engines: [dma.0]
+  - id: sram_to_acc.0
+    source: sram.0
+    destination: acc.0
+    bandwidth_bytes_per_cycle: 4096
+    latency_cycles: 20
+    transaction_bytes: 128
+    transfer_engines: [dma.0]
+  - id: acc_to_sram.0
+    source: acc.0
+    destination: sram.0
+    bandwidth_bytes_per_cycle: 4096
+    latency_cycles: 20
+    transaction_bytes: 128
+    transfer_engines: [dma.0]
+  - id: sram_to_dram.0
+    source: sram.0
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 1024
+    latency_cycles: 300
+    transaction_bytes: 128
+    transfer_engines: [dma.0]

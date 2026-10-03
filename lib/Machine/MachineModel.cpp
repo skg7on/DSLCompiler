@@ -1,0 +1,444 @@
+//===- MachineModel.cpp - Versioned machine topology ----------------------===//
+
+#include "LLK/Machine/MachineModel.h"
+
+#include "LLK/Dialect/Micro/MicroEnums.h"
+
+#include "MachineHash.h"
+
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringSet.h"
+
+namespace mlir::llk::machine {
+
+namespace {
+
+template <typename NodeT>
+const NodeT *findById(const std::vector<NodeT> &nodes, llvm::StringRef id) {
+  for (const NodeT &node : nodes)
+    if (node.id == id)
+      return &node;
+  return nullptr;
+}
+
+std::string joinStrings(const std::vector<std::string> &parts,
+                        llvm::StringRef separator) {
+  std::string out;
+  for (const std::string &part : parts) {
+    if (!out.empty())
+      out += separator;
+    out += part;
+  }
+  return out;
+}
+
+std::string joinNumbers(const std::vector<int64_t> &values) {
+  std::string out;
+  for (int64_t value : values) {
+    if (!out.empty())
+      out += ',';
+    out += std::to_string(value);
+  }
+  return out;
+}
+
+std::string optionalString(const std::optional<std::string> &value) {
+  return value ? *value : "<none>";
+}
+
+template <typename T>
+std::string optionalNumber(const std::optional<T> &value) {
+  return value ? std::to_string(*value) : "<none>";
+}
+
+std::string renderExecutor(const ExecutorNode &node) {
+  std::vector<std::string> refines(node.refines);
+  llvm::sort(refines);
+  std::string out = "executor|id=";
+  out += node.id;
+  out += "|kind=";
+  out += node.kind;
+  out += "|parent=";
+  out += optionalString(node.parent);
+  out += "|coordinates=";
+  out += joinNumbers(node.coordinates);
+  out += "|concurrency=";
+  out += std::to_string(node.concurrency);
+  out += "|refines=";
+  out += joinStrings(refines, ",");
+  return out;
+}
+
+std::string renderMemory(const MemoryNode &node) {
+  std::vector<std::string> layouts(node.supportedLayouts);
+  llvm::sort(layouts);
+  std::string out = "memory|id=";
+  out += node.id;
+  out += "|kind=";
+  out += node.kind;
+  out += "|visible_from=";
+  out += node.visibleFrom;
+  out += "|capacity=";
+  out += std::to_string(node.capacityBytes);
+  out += "|alignment=";
+  out += std::to_string(node.alignmentBytes);
+  out += "|layouts=";
+  out += joinStrings(layouts, ",");
+  out += "|banks=";
+  out += optionalNumber(node.banks);
+  return out;
+}
+
+std::string renderCompute(const ComputeNode &node) {
+  std::vector<std::string> layouts(node.supportedLayouts);
+  std::vector<std::string> elementTypes(node.elementTypes);
+  llvm::sort(layouts);
+  llvm::sort(elementTypes);
+  std::string out = "compute|id=";
+  out += node.id;
+  out += "|kind=";
+  out += node.kind;
+  out += "|attached_to=";
+  out += node.attachedTo;
+  out += "|element_types=";
+  out += joinStrings(elementTypes, ",");
+  out += "|layouts=";
+  out += joinStrings(layouts, ",");
+  out += "|shapes=";
+  for (const std::vector<int64_t> &shape : node.shapes) {
+    out += '[';
+    out += joinNumbers(shape);
+    out += ']';
+  }
+  out += "|issue=";
+  out += std::to_string(node.issueCycles);
+  out += "|latency=";
+  out += std::to_string(node.latencyCycles);
+  out += "|throughput=";
+  out += node.throughputPerCycle ? formatDouble(*node.throughputPerCycle)
+                                 : "<none>";
+  out += "|concurrency=";
+  out += std::to_string(node.concurrency);
+  return out;
+}
+
+std::string renderTransferEngine(const TransferEngineNode &node) {
+  std::string out = "transfer|id=";
+  out += node.id;
+  out += "|kind=";
+  out += node.kind;
+  out += "|attached_to=";
+  out += node.attachedTo;
+  out += "|count=";
+  out += std::to_string(node.count);
+  out += "|max_outstanding=";
+  out += std::to_string(node.maxOutstanding);
+  return out;
+}
+
+std::string renderLink(const LinkEdge &node) {
+  std::vector<std::string> engines(node.transferEngines);
+  llvm::sort(engines);
+  std::string out = "link|id=";
+  out += node.id;
+  out += "|source=";
+  out += node.source;
+  out += "|destination=";
+  out += node.destination;
+  out += "|bandwidth=";
+  out += formatDouble(node.bandwidthBytesPerCycle);
+  out += "|latency=";
+  out += std::to_string(node.latencyCycles);
+  out += "|transaction=";
+  out += std::to_string(node.transactionBytes);
+  out += "|engines=";
+  out += joinStrings(engines, ",");
+  out += "|concurrency=";
+  out += std::to_string(node.concurrency);
+  return out;
+}
+
+/// Renders a section in id order, so declaration order in the source file does
+/// not affect the canonical string.
+template <typename NodeT, typename RenderFn>
+void renderSection(std::string &out, const std::vector<NodeT> &nodes,
+                   RenderFn render) {
+  std::vector<const NodeT *> ordered;
+  ordered.reserve(nodes.size());
+  for (const NodeT &node : nodes)
+    ordered.push_back(&node);
+  llvm::sort(ordered, [](const NodeT *lhs, const NodeT *rhs) {
+    return lhs->id < rhs->id;
+  });
+  for (const NodeT *node : ordered) {
+    out += render(*node);
+    out += '\n';
+  }
+}
+
+} // namespace
+
+const ExecutorNode *MachineModel::findExecutor(llvm::StringRef id) const {
+  return findById(executors, id);
+}
+
+const MemoryNode *MachineModel::findMemory(llvm::StringRef id) const {
+  return findById(memories, id);
+}
+
+const ComputeNode *MachineModel::findCompute(llvm::StringRef id) const {
+  return findById(computes, id);
+}
+
+const TransferEngineNode *
+MachineModel::findTransferEngine(llvm::StringRef id) const {
+  return findById(transferEngines, id);
+}
+
+const LinkEdge *MachineModel::findLink(llvm::StringRef id) const {
+  return findById(links, id);
+}
+
+bool MachineModel::isWithin(llvm::StringRef nodeId,
+                            llvm::StringRef ancestorId) const {
+  const ExecutorNode *current = findExecutor(nodeId);
+  llvm::SmallPtrSet<const ExecutorNode *, 8> visited;
+  while (current) {
+    if (current->id == ancestorId)
+      return true;
+    if (!current->parent)
+      return false;
+    // A malformed in-memory model must not spin forever; verification rejects
+    // cycles, but queries stay safe on unverified input.
+    if (!visited.insert(current).second)
+      return false;
+    current = findExecutor(*current->parent);
+  }
+  return false;
+}
+
+bool MachineModel::ownerMatches(llvm::StringRef ownerKind,
+                                llvm::StringRef executorId) const {
+  const ExecutorNode *executor = findExecutor(executorId);
+  if (!executor)
+    return false;
+  return executor->kind == ownerKind ||
+         llvm::is_contained(executor->refines, ownerKind);
+}
+
+bool MachineModel::isVisible(llvm::StringRef memoryId,
+                             llvm::StringRef executorId) const {
+  const MemoryNode *memory = findMemory(memoryId);
+  if (!memory)
+    return false;
+  return isWithin(executorId, memory->visibleFrom);
+}
+
+std::vector<const ComputeNode *>
+MachineModel::computesFor(llvm::StringRef executorId) const {
+  std::vector<const ComputeNode *> result;
+  for (const ComputeNode &node : computes)
+    if (node.attachedTo == executorId)
+      result.push_back(&node);
+  return result;
+}
+
+std::vector<const TransferEngineNode *>
+MachineModel::transferEnginesFor(llvm::StringRef executorId) const {
+  std::vector<const TransferEngineNode *> result;
+  for (const TransferEngineNode &node : transferEngines)
+    if (node.attachedTo == executorId)
+      result.push_back(&node);
+  return result;
+}
+
+std::string canonicalMachineString(const MachineModel &model) {
+  std::string out = "schema=";
+  out += std::to_string(model.schemaMajor);
+  out += "\ntarget=";
+  out += model.target;
+  out += "\ndescription=";
+  out += model.description;
+  out += '\n';
+  renderSection(out, model.executors, renderExecutor);
+  renderSection(out, model.memories, renderMemory);
+  renderSection(out, model.computes, renderCompute);
+  renderSection(out, model.transferEngines, renderTransferEngine);
+  renderSection(out, model.links, renderLink);
+  return out;
+}
+
+uint64_t computeContentHash(const MachineModel &model) {
+  return stableHash(canonicalMachineString(model));
+}
+
+namespace {
+
+llvm::Error invalid(const std::string &message) {
+  return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+}
+
+bool isKnownOwnerKind(llvm::StringRef kind) {
+  return micro::symbolizeOwner(kind).has_value();
+}
+
+bool isKnownMemoryKind(llvm::StringRef kind) {
+  return micro::symbolizeMemorySpace(kind).has_value();
+}
+
+/// Compute capabilities the dialect models today. A rule that wants another
+/// capability adds it here and in the profile that declares it.
+bool isKnownComputeKind(llvm::StringRef kind) {
+  return kind == "matrix_engine" || kind == "vector_engine";
+}
+
+bool isKnownTransferKind(llvm::StringRef kind) { return kind == "dma"; }
+
+} // namespace
+
+llvm::Error verifyMachineModel(const MachineModel &model) {
+  if (model.schemaMajor != kSupportedSchemaMajor)
+    return invalid("schema: unsupported major " +
+                   std::to_string(model.schemaMajor) + ", expected " +
+                   std::to_string(kSupportedSchemaMajor));
+  if (model.target.empty())
+    return invalid("target: must not be empty");
+
+  // Ids share one namespace across every node kind, so a memory and an
+  // executor can never collide silently.
+  llvm::StringSet<> seenIds;
+  auto checkId = [&](const std::string &id,
+                     const std::string &path) -> llvm::Error {
+    if (id.empty())
+      return invalid(path + ": id must not be empty");
+    if (!seenIds.insert(id).second)
+      return invalid(path + ": duplicate id '" + id + "'");
+    return llvm::Error::success();
+  };
+  for (size_t i = 0; i < model.executors.size(); ++i)
+    if (auto error = checkId(model.executors[i].id,
+                             "executors[" + std::to_string(i) + "]"))
+      return error;
+  for (size_t i = 0; i < model.memories.size(); ++i)
+    if (auto error = checkId(model.memories[i].id,
+                             "memories[" + std::to_string(i) + "]"))
+      return error;
+  for (size_t i = 0; i < model.computes.size(); ++i)
+    if (auto error =
+            checkId(model.computes[i].id, "compute[" + std::to_string(i) + "]"))
+      return error;
+  for (size_t i = 0; i < model.transferEngines.size(); ++i)
+    if (auto error = checkId(model.transferEngines[i].id,
+                             "transfer_engines[" + std::to_string(i) + "]"))
+      return error;
+  for (size_t i = 0; i < model.links.size(); ++i)
+    if (auto error =
+            checkId(model.links[i].id, "links[" + std::to_string(i) + "]"))
+      return error;
+
+  for (size_t i = 0; i < model.executors.size(); ++i) {
+    const ExecutorNode &executor = model.executors[i];
+    std::string path = "executors[" + std::to_string(i) + "]";
+    if (!isKnownOwnerKind(executor.kind))
+      return invalid(path + ".kind: unknown owner kind '" + executor.kind +
+                     "'");
+    for (const std::string &refined : executor.refines)
+      if (!isKnownOwnerKind(refined))
+        return invalid(path + ".refines: unknown owner kind '" + refined + "'");
+    if (executor.concurrency == 0)
+      return invalid(path + ".concurrency: must be positive");
+    if (executor.parent && !model.findExecutor(*executor.parent))
+      return invalid(path + ".parent: unknown executor '" + *executor.parent +
+                     "'");
+  }
+
+  // Containment must be acyclic: walk each executor's parent chain.
+  for (size_t i = 0; i < model.executors.size(); ++i) {
+    const ExecutorNode *current = &model.executors[i];
+    llvm::SmallPtrSet<const ExecutorNode *, 8> visited;
+    while (current) {
+      if (!visited.insert(current).second)
+        return invalid("executors[" + std::to_string(i) +
+                       "].parent: containment cycle");
+      if (!current->parent)
+        break;
+      current = model.findExecutor(*current->parent);
+    }
+  }
+
+  for (size_t i = 0; i < model.memories.size(); ++i) {
+    const MemoryNode &memory = model.memories[i];
+    std::string path = "memories[" + std::to_string(i) + "]";
+    if (!isKnownMemoryKind(memory.kind))
+      return invalid(path + ".kind: unknown memory kind '" + memory.kind + "'");
+    if (!model.findExecutor(memory.visibleFrom))
+      return invalid(path + ".visible_from: unknown executor '" +
+                     memory.visibleFrom + "'");
+    if (memory.capacityBytes == 0)
+      return invalid(path + ".capacity_bytes: must be positive");
+    if (memory.alignmentBytes == 0)
+      return invalid(path + ".alignment_bytes: must be positive");
+  }
+
+  for (size_t i = 0; i < model.computes.size(); ++i) {
+    const ComputeNode &compute = model.computes[i];
+    std::string path = "compute[" + std::to_string(i) + "]";
+    if (!isKnownComputeKind(compute.kind))
+      return invalid(path + ".kind: unknown capability kind '" + compute.kind +
+                     "'");
+    if (!model.findExecutor(compute.attachedTo))
+      return invalid(path + ".attached_to: unknown executor '" +
+                     compute.attachedTo + "'");
+    if (compute.concurrency == 0)
+      return invalid(path + ".concurrency: must be positive");
+    if (compute.shapes.empty())
+      return invalid(path + ".shapes: must not be empty");
+    for (const std::vector<int64_t> &shape : compute.shapes) {
+      if (shape.empty())
+        return invalid(path + ".shapes: shape must not be empty");
+      for (int64_t extent : shape)
+        if (extent <= 0)
+          return invalid(path + ".shapes: extent must be positive");
+    }
+  }
+
+  for (size_t i = 0; i < model.transferEngines.size(); ++i) {
+    const TransferEngineNode &engine = model.transferEngines[i];
+    std::string path = "transfer_engines[" + std::to_string(i) + "]";
+    if (!isKnownTransferKind(engine.kind))
+      return invalid(path + ".kind: unknown transfer kind '" + engine.kind +
+                     "'");
+    if (!model.findExecutor(engine.attachedTo))
+      return invalid(path + ".attached_to: unknown executor '" +
+                     engine.attachedTo + "'");
+    if (engine.count == 0)
+      return invalid(path + ".count: must be positive");
+    if (engine.maxOutstanding == 0)
+      return invalid(path + ".max_outstanding: must be positive");
+  }
+
+  for (size_t i = 0; i < model.links.size(); ++i) {
+    const LinkEdge &link = model.links[i];
+    std::string path = "links[" + std::to_string(i) + "]";
+    if (!model.findMemory(link.source))
+      return invalid(path + ".source: unknown memory '" + link.source + "'");
+    if (!model.findMemory(link.destination))
+      return invalid(path + ".destination: unknown memory '" +
+                     link.destination + "'");
+    if (link.bandwidthBytesPerCycle <= 0.0)
+      return invalid(path + ".bandwidth_bytes_per_cycle: must be positive");
+    if (link.transactionBytes == 0)
+      return invalid(path + ".transaction_bytes: must be positive");
+    if (link.concurrency == 0)
+      return invalid(path + ".concurrency: must be positive");
+    for (const std::string &engine : link.transferEngines)
+      if (!model.findTransferEngine(engine))
+        return invalid(path + ".transfer_engines: unknown transfer engine '" +
+                       engine + "'");
+  }
+
+  return llvm::Error::success();
+}
+
+} // namespace mlir::llk::machine
