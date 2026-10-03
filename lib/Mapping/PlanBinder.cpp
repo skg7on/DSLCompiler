@@ -29,6 +29,34 @@ constexpr llvm::StringLiteral kPlanAttr = "micro.plan";
 constexpr llvm::StringLiteral kMappingAttr = "micro.mapping";
 constexpr llvm::StringLiteral kRoutesAttr = "micro.routes";
 
+/// Stable, greppable reasons for a connection the binder cannot materialize
+/// (design §18.2). They are part of the report contract, so they are named
+/// constants rather than free-form prose.
+constexpr llvm::StringLiteral kLayoutTransformReason =
+    "layout_transform_requires_dialect_op";
+constexpr llvm::StringLiteral kReplicateReason = "replicate_not_materialized";
+constexpr llvm::StringLiteral kReduceReason = "reduce_not_materialized";
+constexpr llvm::StringLiteral kHoplessRouteReason =
+    "route_has_no_hop_to_materialize";
+
+/// The reason a non-movement connection cannot be materialized. `Direct` and
+/// the movements are handled inline and must never reach here.
+llvm::StringRef unmaterializedReason(ConnectionKind kind) {
+  switch (kind) {
+  case ConnectionKind::LayoutTransform:
+    return kLayoutTransformReason;
+  case ConnectionKind::Replicate:
+    return kReplicateReason;
+  case ConnectionKind::Reduce:
+    return kReduceReason;
+  case ConnectionKind::Direct:
+  case ConnectionKind::Transfer:
+  case ConnectionKind::TransferAndTransform:
+    llvm_unreachable("a direct or movement connection is materialized inline");
+  }
+  llvm_unreachable("all connection kinds handled");
+}
+
 llvm::Error bindError(const std::string &message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
 }
@@ -183,11 +211,32 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
   llvm::DenseSet<WorkloadValueId> moved;
   mlir::OpBuilder builder(context);
   for (const PlanConnection &connection : plan.connectionPlans) {
+    // A `Direct` connection is materialized by construction: the producer wrote
+    // the value to the memory the consumer reads, in a layout the consumer
+    // addresses, so there is nothing to emit and nothing to report.
+    if (connection.kind == ConnectionKind::Direct)
+      continue;
+
+    // Anything else that is not a plain movement cannot be emitted as Micro ops
+    // today. Report it with a stable reason rather than dropping it (design
+    // §18.2).
     if (connection.kind != ConnectionKind::Transfer &&
-        connection.kind != ConnectionKind::TransferAndTransform)
+        connection.kind != ConnectionKind::TransferAndTransform) {
+      bound.unmaterialized.push_back(
+          "value " + std::to_string(connection.value) + ": " +
+          unmaterializedReason(connection.kind).str());
       continue;
-    if (connection.route.size() < 2)
+    }
+
+    // A movement needs at least one hop between two memories; a shorter route
+    // has nothing to emit. This is unreachable for the current placement code,
+    // but a selected connection must never vanish silently.
+    if (connection.route.size() < 2) {
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) + ": " +
+                                     kHoplessRouteReason.str());
       continue;
+    }
     if (!moved.insert(connection.value).second)
       continue;
 
@@ -306,6 +355,15 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
           ": a route hop names memories the machine cannot carry data between");
       continue;
     }
+
+    // A transfer-and-transform moved the value, but the selected layout
+    // transform itself has no Micro operation form (design §13.4). The
+    // movement is real, so the connection is not dropped -- but the transform
+    // must still be reported, or it vanishes without a trace.
+    if (connection.kind == ConnectionKind::TransferAndTransform)
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) + ": " +
+                                     kLayoutTransformReason.str());
 
     // Rewire every other reader to the last hop's value; the copies themselves
     // already read the previous one.

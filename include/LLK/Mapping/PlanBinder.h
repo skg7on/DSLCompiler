@@ -61,7 +61,10 @@ struct BoundPlan {
 /// not a shaped (tensor) type has no generic copy form (`micro.tile_async_copy`
 /// needs a destination-memory-typed tile, which cannot be built without the
 /// dialect's type class), and a target layout id has no Micro operation form at
-/// all (design §13.4 keeps target layout ids out of `#micro.layout`).
+/// all (design §13.4 keeps target layout ids out of `#micro.layout`). Every
+/// reported entry names the connection's value id and carries a stable reason
+/// token -- a `LayoutTransform` connection, for instance, is reported as
+/// `layout_transform_requires_dialect_op`.
 llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
                                    const CoveringPlan &plan,
                                    const MappingTarget &target);

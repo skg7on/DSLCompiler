@@ -18,6 +18,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 
 using namespace mlir;
 using namespace mlir::llk::mapping;
@@ -308,6 +309,69 @@ TEST(PlanBinder, ReportsConnectionsItCannotMaterialize) {
       bindPlan(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   EXPECT_TRUE(bound->unmaterialized.empty());
+}
+
+TEST(PlanBinder, ReportsALayoutTransformConnectionItCannotMaterialize) {
+  // A `LayoutTransform` connection is same-memory: there is nothing to move,
+  // but the selected transform has no Micro operation form (design §13.4). The
+  // binder must report it, not drop it (design §18.2). The plan is built by
+  // hand because today's search never emits a transform-only connection -- the
+  // point is that *if* one is selected, it is named in `unmaterialized`.
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+
+  CoveringPlan plan;
+  plan.id = 42;
+  PlanConnection connection;
+  connection.id = 1;
+  connection.value = 7;
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route.push_back("sram.0"); // a same-memory, in-place transform
+  plan.connectionPlans.push_back(connection);
+
+  llvm::Expected<BoundPlan> bound =
+      bindPlan(*fixture.module, plan, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  ASSERT_EQ(bound->unmaterialized.size(), 1u);
+  const std::string &note = bound->unmaterialized.front();
+  // The entry names the value and carries a stable, greppable reason.
+  EXPECT_NE(note.find("7"), std::string::npos) << note;
+  EXPECT_NE(note.find("layout_transform_requires_dialect_op"),
+            std::string::npos)
+      << note;
+}
+
+TEST(PlanBinder, ReportsOtherConnectionKindsItCannotMaterialize) {
+  // `Replicate` and `Reduce` are not plain movements, so the binder emits
+  // nothing for them today. They must still be reported rather than dropped.
+  // The placement layer does not produce these kinds yet, so the plan is built
+  // by hand -- the contract is what is under test.
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+
+  const std::pair<ConnectionKind, llvm::StringRef> cases[] = {
+      {ConnectionKind::Replicate, "replicate_not_materialized"},
+      {ConnectionKind::Reduce, "reduce_not_materialized"},
+  };
+  for (const auto &[kind, reason] : cases) {
+    CoveringPlan plan;
+    plan.id = 1;
+    PlanConnection connection;
+    connection.id = 1;
+    connection.value = 9;
+    connection.kind = kind;
+    plan.connectionPlans.push_back(connection);
+
+    llvm::Expected<BoundPlan> bound =
+        bindPlan(*fixture.module, plan, *fixture.target);
+    ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+    ASSERT_EQ(bound->unmaterialized.size(), 1u);
+    const std::string &note = bound->unmaterialized.front();
+    EXPECT_NE(note.find(reason.str()), std::string::npos) << note;
+  }
 }
 
 //===----------------------------------------------------------------------===//
