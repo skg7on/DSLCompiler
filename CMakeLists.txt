@@ -256,7 +256,8 @@ target_link_libraries(LLKMachine PUBLIC LLVMSupport)
 # Generic planning types only -- workload graphs, search bindings, plan
 # structures, costs, and stable ids. It must not depend on LLKPerf or any
 # backend: mapping is below performance modeling, and a target package plugs
-# into it rather than the reverse.
+# into it rather than the reverse. Routing (D2) additionally consumes
+# LLKMachine's topology.
 add_library(LLKMapping STATIC
     lib/Mapping/StableHash.cpp
     lib/Mapping/CostModel.cpp
@@ -264,6 +265,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/WorkloadGraph.cpp
     lib/Mapping/MappingPlan.cpp
     lib/Mapping/LayoutConstraints.cpp
+    lib/Mapping/Routing.cpp
 )
 target_include_directories(LLKMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -719,6 +721,7 @@ add_llk_mapping_test(MappingSearchBindingTest test/Mapping/search_binding.cpp)
 add_llk_mapping_test(MappingWorkloadGraphTest test/Mapping/workload_graph.cpp)
 add_llk_mapping_test(MappingPlanTest test/Mapping/mapping_plan.cpp)
 add_llk_mapping_test(MappingLayoutTest test/Mapping/layout_constraints.cpp)
+add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
