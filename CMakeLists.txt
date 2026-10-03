@@ -264,7 +264,10 @@ add_library(LLKMapping STATIC
     lib/Mapping/SearchBinding.cpp
     lib/Mapping/WorkloadGraph.cpp
     lib/Mapping/MappingPlan.cpp
+    lib/Mapping/LlkMap.cpp
     lib/Mapping/LayoutConstraints.cpp
+    lib/Mapping/MappingRules.cpp
+    lib/Mapping/MappingTarget.cpp
     lib/Mapping/Routing.cpp
 )
 target_include_directories(LLKMapping PUBLIC
@@ -711,7 +714,8 @@ function(add_llk_mapping_test test_name test_file)
   target_link_libraries(${test_name} PRIVATE
       LLKMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
   target_compile_definitions(${test_name} PRIVATE
-      LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping")
+      LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping"
+      LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines")
   add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 
@@ -721,6 +725,7 @@ add_llk_mapping_test(MappingSearchBindingTest test/Mapping/search_binding.cpp)
 add_llk_mapping_test(MappingWorkloadGraphTest test/Mapping/workload_graph.cpp)
 add_llk_mapping_test(MappingPlanTest test/Mapping/mapping_plan.cpp)
 add_llk_mapping_test(MappingLayoutTest test/Mapping/layout_constraints.cpp)
+add_llk_mapping_test(MappingRulesTest test/Mapping/mapping_rules.cpp)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside

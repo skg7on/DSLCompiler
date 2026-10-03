@@ -112,6 +112,10 @@ private:
 /// ops that a target must implement.
 bool isWorkloadNodeOp(OperationName op);
 
+/// Same test by operation name, for callers that hold only a string (a mapping
+/// rule's `match` clause, for instance).
+bool isWorkloadNodeOp(llvm::StringRef name);
+
 /// True for logical ops that are folded into their consumer's port rather than
 /// becoming nodes.
 bool isTransparentWorkloadOp(OperationName op);

@@ -85,7 +85,10 @@ std::string nodeContentKey(const WorkloadNode &node) {
 } // namespace
 
 bool isWorkloadNodeOp(OperationName op) {
-  llvm::StringRef name = op.getStringRef();
+  return isWorkloadNodeOp(op.getStringRef());
+}
+
+bool isWorkloadNodeOp(llvm::StringRef name) {
   return llvm::is_contained(kNodeOps, name);
 }
 
