@@ -424,6 +424,84 @@ TEST(L1ResourceDag, BottleneckNamesTheBusiestResource) {
   EXPECT_GE(chainReport.dramBandwidthUtilization, 0.0);
 }
 
+// A transform-only kernel: the conversion is real work, not the zero-cost
+// "everything else" path an unhandled op used to fall through.
+TEST(L1ResourceDag, TransformIsAChargedEvent) {
+  auto parsed = parseKernel(R"mlir(
+module {
+  micro.kernel @transform_only {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %t = micro.transform %a {src_map = affine_map<(d0,d1)->(d0,d1)>, dst_map = affine_map<(d0,d1)->(d1,d0)>} : tensor<8x8xf32> -> tensor<8x8xf32>
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(parsed);
+  auto model = parseMachine(testMachine(1, 1, 1));
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 1u);
+  EXPECT_EQ(dag->events.front().kind, EventKind::Transform);
+  EXPECT_EQ(dag->events.front().costKind, mapping::CostEventKind::Transform);
+  EXPECT_GT(dag->events.front().minCycles, 0u);
+}
+
+/// A copy into SRAM, a layout conversion of what it landed, and a consumer that
+/// reads the converted value. The transform is charged, materializes its own
+/// output buffer, and both edges around it are data dependencies.
+constexpr const char *kTransformChainKernel = R"mlir(
+module {
+  micro.kernel @transform_chain {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    %tv = micro.tile_view %t {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %tr = micro.transform %tv {src_map = affine_map<(d0,d1)->(d0,d1)>, dst_map = affine_map<(d0,d1)->(d1,d0)>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %tr, %tr : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+TEST(L1ResourceDag, TransformChainKeepsItsDependency) {
+  auto parsed = parseKernel(kTransformChainKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  // The tile view is zero-cost metadata, so only copy, transform, vector
+  // remain.
+  ASSERT_EQ(dag->events.size(), 3u);
+
+  const MicroEvent &copy = dag->events[0];
+  const MicroEvent &transform = dag->events[1];
+  const MicroEvent &vector = dag->events[2];
+
+  EXPECT_EQ(llvm::count_if(dag->events,
+                           [](const MicroEvent &event) {
+                             return event.kind == EventKind::Transform;
+                           }),
+            1u);
+  EXPECT_EQ(transform.kind, EventKind::Transform);
+  EXPECT_EQ(transform.costKind, mapping::CostEventKind::Transform);
+  // A nonidentity conversion costs cycles.
+  EXPECT_GT(transform.minCycles, 0u);
+
+  // The conversion depends on what produced its input...
+  ASSERT_EQ(transform.deps.size(), 1u);
+  EXPECT_EQ(transform.deps[0], copy.id);
+  // ...and the consumer depends on the conversion, not on the copy.
+  EXPECT_EQ(vector.kind, EventKind::Vector);
+  ASSERT_EQ(vector.deps.size(), 1u);
+  EXPECT_EQ(vector.deps[0], transform.id);
+
+  // The conversion materializes a fresh output buffer in the memory its input
+  // landed in: the copy's 256 bytes plus the transform's own 256.
+  EXPECT_EQ(transform.tileMemory, "sram");
+  auto live = dag->liveTileBytesByMemory.find("sram");
+  ASSERT_NE(live, dag->liveTileBytesByMemory.end());
+  EXPECT_EQ(live->second, 512u);
+}
+
 TEST(L1ResourceDag, ScheduleBeatsTheStaticBoundOnlyWhenItOverlaps) {
   auto parsed = parseKernel(kChainKernel);
   ASSERT_TRUE(parsed);

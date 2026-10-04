@@ -155,6 +155,7 @@ L0Report computeL0StaticBound(const MicroDAG &dag,
       break;
     case EventKind::Vector:
     case EventKind::Reduce:
+    case EventKind::Transform:
     case EventKind::TileView:
     case EventKind::TilePartition:
       vectorWork += event.minCycles;

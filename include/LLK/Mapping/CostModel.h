@@ -16,6 +16,9 @@
 #ifndef LLK_MAPPING_COSTMODEL_H
 #define LLK_MAPPING_COSTMODEL_H
 
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Types.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -182,6 +185,37 @@ objectiveOrderFromMicro(llvm::StringRef metric, bool minimize,
 /// Fixed-format rendering of every dimension, byte-stable across runs and
 /// platforms so it can key hashes and reports.
 std::string canonicalCostString(const Cost &cost);
+
+/// The static facts one layout conversion is costed from: the value's type on
+/// each side, the logical-to-physical affine map of the layout on each side,
+/// the memory the conversion runs in, and the compute capability selected for
+/// it. `srcMap`/`dstMap` are null when the corresponding layout declares no map
+/// clause.
+struct TransformCostInput {
+  mlir::Type inputType;
+  mlir::Type outputType;
+  mlir::AffineMap srcMap;
+  mlir::AffineMap dstMap;
+  std::string memoryNode;
+  std::string computeResource;
+};
+
+/// Estimates one layout conversion from checked static facts and the machine's
+/// capabilities (design §17.2), so the planner and the performance DAG charge a
+/// `micro.transform` from one shared estimate rather than two. Bytes and issue
+/// cycles are read off the value's type and the selected capability -- never
+/// from a constant in this file.
+///
+/// Fails, rather than returning a silent zero, when the footprint cannot be
+/// computed (a non-shaped or dynamic value, or an element type with no width)
+/// or when a named compute resource or memory node is not modeled by `machine`.
+/// A present and equal source/destination map pair is an explicit identity
+/// re-representation: it is modeled as zero *arithmetic* while still
+/// materializing its output bytes. Every other conversion is charged the
+/// capability's issue cost.
+llvm::Expected<Cost>
+estimateTransformCost(const TransformCostInput &input,
+                      const machine::MachineModel &machine);
 
 } // namespace mlir::llk::mapping
 

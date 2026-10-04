@@ -4,7 +4,10 @@
 
 #include "LLK/Machine/MachineModel.h"
 
+#include "mlir/IR/BuiltinTypes.h"
+
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <algorithm>
 #include <array>
@@ -59,6 +62,46 @@ machineSyncPeriodCycles(const machine::MachineModel &machine) {
   if (cycles == 0)
     return std::nullopt;
   return static_cast<double>(cycles);
+}
+
+/// The machine spelling of an element type (`f32`, `bf16`, `i8`), or empty when
+/// the type has no width a transform could move. This mirrors the micro dtype
+/// vocabulary without depending on the dialect: the cost model sits below it,
+/// so it names element widths itself.
+std::string elementTypeName(mlir::Type type) {
+  if (auto floatType = llvm::dyn_cast<mlir::FloatType>(type)) {
+    if (floatType.isF64())
+      return "f64";
+    if (floatType.isF32())
+      return "f32";
+    if (floatType.isF16())
+      return "f16";
+    if (floatType.isBF16())
+      return "bf16";
+    return "f" + std::to_string(floatType.getWidth());
+  }
+  if (auto intType = llvm::dyn_cast<mlir::IntegerType>(type))
+    return "i" + std::to_string(intType.getWidth());
+  return {};
+}
+
+/// Bytes of one element, or nullopt for an element type with no width.
+std::optional<unsigned> elementByteWidth(mlir::Type type) {
+  if (auto floatType = llvm::dyn_cast<mlir::FloatType>(type))
+    return static_cast<unsigned>(llvm::divideCeil(floatType.getWidth(), 8u));
+  if (auto intType = llvm::dyn_cast<mlir::IntegerType>(type))
+    return static_cast<unsigned>(llvm::divideCeil(intType.getWidth(), 8u));
+  return std::nullopt;
+}
+
+/// A transform footprint must be a shaped value with static extents so the
+/// element count is a checked fact rather than a guess.
+mlir::ShapedType transformFootprintType(const TransformCostInput &input) {
+  for (mlir::Type candidate : {input.outputType, input.inputType})
+    if (candidate)
+      if (auto shaped = llvm::dyn_cast<mlir::ShapedType>(candidate))
+        return shaped;
+  return {};
 }
 } // namespace
 
@@ -236,6 +279,87 @@ std::string canonicalCostString(const Cost &cost) {
     out += buffer;
   }
   return out;
+}
+
+llvm::Expected<Cost>
+estimateTransformCost(const TransformCostInput &input,
+                      const machine::MachineModel &machine) {
+  auto fail = [](const llvm::Twine &message) {
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+  };
+
+  // Footprint first: a value whose size cannot be computed is reported, never
+  // charged as zero.
+  mlir::ShapedType footprint = transformFootprintType(input);
+  if (!footprint)
+    return fail("layout transform cost: neither the input nor the output type "
+                "is a shaped type, so the transform footprint is unknown");
+  if (!footprint.hasStaticShape())
+    return fail("layout transform cost: a dynamic extent leaves the transform "
+                "footprint unknown");
+  std::string dtype = elementTypeName(footprint.getElementType());
+  std::optional<unsigned> width = elementByteWidth(footprint.getElementType());
+  if (dtype.empty() || !width)
+    return fail("layout transform cost: the element type is not a sized float "
+                "or integer, so the transform footprint is unknown");
+  uint64_t elements = static_cast<uint64_t>(footprint.getNumElements());
+  uint64_t bytes = elements * static_cast<uint64_t>(*width);
+
+  // The selected capability. A name the machine does not model is a diagnostic;
+  // an unnamed resource falls back to the machine's declared vector engine --
+  // an explicit default policy, never a branch on a target name.
+  const machine::ComputeNode *engine = nullptr;
+  if (!input.computeResource.empty()) {
+    engine = machine.findCompute(input.computeResource);
+    if (!engine)
+      return fail(llvm::Twine("layout transform cost: compute resource '") +
+                  llvm::Twine(input.computeResource) +
+                  "' is not declared by machine '" +
+                  llvm::Twine(machine.target) + "'");
+  } else {
+    std::vector<const machine::ComputeNode *> engines =
+        machine.computesOfKind("vector_engine");
+    if (engines.empty())
+      return fail(llvm::Twine("layout transform cost: machine '") +
+                  llvm::Twine(machine.target) +
+                  "' declares no compute resource to run a layout conversion");
+    engine = engines.front();
+  }
+
+  // The memory the conversion runs in, when one was named. Both a node id
+  // (`sram.0`) and a space kind (`sram`) are accepted: a hand-written kernel
+  // names the space, a bound plan names the node.
+  if (!input.memoryNode.empty() && !machine.findMemory(input.memoryNode) &&
+      !machine.findMemoryOfKind(input.memoryNode))
+    return fail(llvm::Twine("layout transform cost: memory node '") +
+                llvm::Twine(input.memoryNode) +
+                "' is not modeled by machine '" + llvm::Twine(machine.target) +
+                "'");
+
+  Cost cost;
+  cost.localBytes = bytes;
+
+  // An explicit identity re-representation does not reorder the tile, so it is
+  // modeled as zero arithmetic. A conversion that changes the index relation is
+  // charged what the selected capability takes to issue it -- the machine's
+  // answer, with a one-element-per-issue fallback for a dtype it does not model
+  // (slower than the hardware, never faster).
+  const bool identity =
+      input.srcMap && input.dstMap && input.srcMap == input.dstMap;
+  if (!identity) {
+    int64_t lanes = 1;
+    auto it = engine->lanes.find(dtype);
+    if (it != engine->lanes.end() && it->second > 0)
+      lanes = it->second;
+    uint64_t issues = llvm::divideCeil(elements, static_cast<uint64_t>(lanes));
+    cost.latencyCycles = static_cast<double>(
+        issues * std::max<uint64_t>(1, engine->issueCycles));
+  }
+
+  if (std::optional<double> utilization = utilizationEstimate(
+          cost.latencyCycles, machine, machine.workerThreads))
+    cost.computeUtilization = *utilization;
+  return cost;
 }
 
 } // namespace mlir::llk::mapping

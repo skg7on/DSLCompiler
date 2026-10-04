@@ -16,6 +16,7 @@
 #include "MicroTileInfo.h"
 
 #include "LLK/Dialect/Micro/MicroEnums.h"
+#include "LLK/Mapping/CostModel.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -41,6 +42,18 @@ namespace {
 llvm::Error invalid(const llvm::Twine &message) {
   return llvm::make_error<llvm::StringError>(message.str(),
                                              llvm::inconvertibleErrorCode());
+}
+
+/// The plain shaped type the shared transform-cost model reads. A `!micro.tile`
+/// carries its shape and element type the same way a ranked tensor does, but
+/// the cost model sits below the dialect, so the tile is presented to it as the
+/// shaped type it describes.
+mlir::Type shapedCostType(mlir::Type type) {
+  if (llvm::isa<mlir::ShapedType>(type))
+    return type;
+  if (auto tile = llvm::dyn_cast<micro::TileType>(type))
+    return mlir::RankedTensorType::get(tile.getShape(), tile.getElementType());
+  return type;
 }
 
 /// Trip count of a `micro.for`/`micro.spatial_for` when both bounds and the
@@ -949,6 +962,76 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     return llvm::Error::success();
   }
 
+  if (auto transform = llvm::dyn_cast<micro::TransformOp>(op)) {
+    // A conversion is real work: it runs on a compute capability like the other
+    // mapped elementwise work, and its selected resource is the executor the
+    // plan stamped when the op carries one.
+    std::string reason;
+    const machine::ComputeNode *engine =
+        pickVectorEngine(reason, mappedExecutor(op));
+    if (!engine)
+      return invalid("kernel '" + kernelName +
+                     "' uses micro.transform: " + reason);
+
+    TileInfo sourceInfo = describeType(transform.getSource().getType());
+    TileInfo resultInfo = describeType(transform.getResult().getType());
+    // The conversion reads the memory its source landed in and writes its
+    // output there: a logical view carries no memory of its own, so the
+    // producing event is asked (as `memoryOf` does for a copy source).
+    std::string sourceMemory = memoryOf(transform.getSource());
+    std::string destination =
+        resultInfo.memory.empty() ? sourceMemory : resultInfo.memory;
+
+    // The one shared estimate the planner and the simulator both charge. An
+    // unknown resource or footprint comes back as an error, never a silent
+    // zero, so a mis-modeled conversion cannot vanish from the report.
+    mapping::TransformCostInput costInput;
+    costInput.inputType = shapedCostType(transform.getSource().getType());
+    costInput.outputType = shapedCostType(transform.getResult().getType());
+    if (std::optional<mlir::AffineMap> srcMap = transform.getSrcMap())
+      costInput.srcMap = *srcMap;
+    if (std::optional<mlir::AffineMap> dstMap = transform.getDstMap())
+      costInput.dstMap = *dstMap;
+    costInput.memoryNode = destination;
+    costInput.computeResource = engine->id;
+
+    llvm::Expected<mapping::Cost> cost =
+        mapping::estimateTransformCost(costInput, machine);
+    if (!cost)
+      return invalid("kernel '" + kernelName + "' uses micro.transform: " +
+                     llvm::toString(cost.takeError()));
+
+    MicroEvent event;
+    event.kind = EventKind::Transform;
+    event.resource = ResourceKind::VectorEngine;
+    event.resourceName = engine->id;
+    event.workItems =
+        resultInfo.elements() ? resultInfo.elements() : sourceInfo.elements();
+    event.bytes = cost->localBytes;
+    event.minCycles = static_cast<uint64_t>(std::ceil(cost->latencyCycles));
+    event.sourceOpName = op.getName().getStringRef().str();
+    event.tileShape = shapeString(resultInfo.shape.empty() ? sourceInfo.shape
+                                                           : resultInfo.shape);
+    event.tileLayout =
+        resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
+    event.tileMemory = destination;
+    event.srcMemory = sourceMemory;
+    event.tileOwner =
+        resultInfo.owner.empty() ? sourceInfo.owner : resultInfo.owner;
+    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
+
+    const uint64_t bytes = event.bytes;
+    uint32_t id = addEvent(std::move(event), state,
+                           producerDeps({transform.getSource()}));
+    // The result is produced by this event, so every consumer depends on the
+    // conversion rather than on whatever produced its input.
+    producers[transform.getResult()] = id;
+    // The conversion materializes a fresh output buffer, which the capacity
+    // check must see.
+    noteStorage(op, destination, bytes, state.storageFactor);
+    return llvm::Error::success();
+  }
+
   if (auto wait = llvm::dyn_cast<micro::WaitOp>(op)) {
     MicroEvent event;
     event.kind = EventKind::Wait;
@@ -1228,6 +1311,8 @@ llvm::StringRef stringifyEventKind(EventKind kind) {
     return "tile_view";
   case EventKind::TilePartition:
     return "tile_partition";
+  case EventKind::Transform:
+    return "transform";
   case EventKind::AsyncCopy:
     return "async_copy";
   case EventKind::Load:
@@ -1260,6 +1345,7 @@ mapping::CostEventKind costEventKindOf(EventKind kind) {
     return mapping::CostEventKind::TransferHop;
   case EventKind::TileView:
   case EventKind::TilePartition:
+  case EventKind::Transform:
     return mapping::CostEventKind::Transform;
   case EventKind::Wait:
   case EventKind::Barrier:

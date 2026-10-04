@@ -63,9 +63,12 @@ inline constexpr uint64_t kMaxEvents = 100000;
 /// One machine-visible action. `Load` and `Barrier` are named for the event
 /// families the model is meant to cover but no micro op produces them yet: the
 /// dialect currently expresses every read as a copy and every sync as a wait.
+/// `Transform` *is* produced -- `micro.transform` performs a real layout
+/// conversion, so it is charged instead of falling through the zero-cost path.
 enum class EventKind {
   TileView,
   TilePartition,
+  Transform,
   AsyncCopy,
   Load,
   Store,
