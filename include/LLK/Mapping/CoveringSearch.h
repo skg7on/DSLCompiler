@@ -132,7 +132,8 @@ public:
   CoveringSearch(const WorkloadGraph &workload, const MappingTarget &target,
                  mlir::MLIRContext &context, const LayoutContext &layoutContext,
                  const MappingSearchOptions &options = {},
-                 std::optional<SearchBinding> binding = std::nullopt);
+                 std::optional<SearchBinding> binding = std::nullopt,
+                 std::optional<std::string> boundLayout = std::nullopt);
 
   llvm::Expected<MappingSearchResult> search();
 
@@ -150,6 +151,14 @@ private:
   /// binding's hash and parameters (design §8.3/§9.5); a search with no binding
   /// leaves all of that at its default, so its plan ids are unchanged.
   std::optional<SearchBinding> binding_;
+  /// The layout the binding selects, resolved from its `layout`-kind parameter
+  /// by the caller -- the pass layer, which alone can see the search space, so
+  /// lib/Mapping keeps no LLKPerf dependency. A rule must offer it (`require
+  /// layout ... satisfies <it>`) or it is a non-match for the node; when it
+  /// does, only that layout is materialized, so the binding -- not the rule
+  /// file -- decides which of the rule's declared layouts applies. Absent
+  /// leaves layout selection exactly as it was before bindings.
+  std::optional<std::string> boundLayout_;
 };
 
 } // namespace mlir::llk::mapping

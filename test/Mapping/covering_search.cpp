@@ -2707,6 +2707,192 @@ TEST(CoveringSearch, ABindingThatFailsEveryRuleLeavesTheNodeWithoutARule) {
 }
 
 //===----------------------------------------------------------------------===//
+// A binding constrains layout selection (phase-4 T3)
+//===----------------------------------------------------------------------===//
+
+/// One rule that offers two layouts for the same port (`operand0`). With no
+/// binding both requirements are materialized, exactly as before; a bound
+/// layout selects the one it names and supersedes the other.
+constexpr llvm::StringLiteral kOneRuleTwoLayouts = R"llkmap(
+rule r.laid_out {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  require layout operand0 satisfies t.blocked;
+  input "operand0";
+  output "result";
+  bundle "b.laid_out";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Two sibling rules, each offering exactly one layout. `r.a_plain` sorts
+/// before `r.b_blocked`, so a binding that names `t.blocked` is observable: the
+/// canonical-first rule offers only `t.plain` and is a non-match, while the
+/// sibling still matches.
+constexpr llvm::StringLiteral kSiblingLayoutRules = R"llkmap(
+rule r.a_plain {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  input "operand0";
+  output "result";
+  bundle "b.plain";
+  emit "e1";
+  cost 1;
+}
+rule r.b_blocked {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.blocked;
+  input "operand0";
+  output "result";
+  bundle "b.blocked";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+// (a) + (c): a rule offers two layout ids; a binding that names one selects it,
+// and with no binding the choice is unchanged.
+TEST(CoveringSearch, ABoundLayoutSelectsAmongTheLayoutsARuleOffers) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kOneRuleTwoLayouts, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  // (c) No binding: both declared layouts are materialized, as before. The
+  // plan is still found (the two layouts for one value are unattributable to
+  // an edge, which only costs the transform alternative, not the plan).
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    ASSERT_FALSE(result->plans[0].placements.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements) {
+      EXPECT_EQ(placement.layouts.size(), 2u);
+      EXPECT_NE(placement.layouts.find("t.plain"), placement.layouts.end());
+      EXPECT_NE(placement.layouts.find("t.blocked"), placement.layouts.end());
+    }
+  }
+
+  // (a) The binding names `t.blocked`: that layout is selected and `t.plain`,
+  // which the rule also offered, is not. Red before the fix -- both remain.
+  {
+    SearchBinding binding =
+        makeSearchBinding("candidate_blocked",
+                          values({{"tile_layout", std::string("t.blocked")}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          binding, std::string("t.blocked"));
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    ASSERT_FALSE(result->plans[0].placements.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements) {
+      ASSERT_EQ(placement.layouts.size(), 1u);
+      EXPECT_NE(placement.layouts.find("t.blocked"), placement.layouts.end());
+      EXPECT_EQ(placement.layouts.find("t.plain"), placement.layouts.end());
+    }
+  }
+}
+
+// (b): a binding naming a layout the rule does not offer yields no candidate
+// for that node (a non-match, not an error), and a sibling rule that offers it
+// still matches.
+TEST(CoveringSearch, ABoundLayoutARuleDoesNotOfferIsANonMatch) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kSiblingLayoutRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  // No binding: both rules match; deterministic mode keeps the canonical
+  // first, `r.a_plain`.
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.a_plain");
+  }
+
+  // Bound to `t.blocked`: `r.a_plain` offers only `t.plain`, so it is a
+  // non-match for every node; `r.b_blocked` remains. Red before the fix --
+  // `r.a_plain` is picked regardless.
+  {
+    SearchBinding binding =
+        makeSearchBinding("candidate_blocked",
+                          values({{"tile_layout", std::string("t.blocked")}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          binding, std::string("t.blocked"));
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    ASSERT_FALSE(result->plans[0].placements.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.b_blocked");
+    // The rule the binding rejected is reported, not silently dropped.
+    EXPECT_GE(result->frontier.codeCounts[DiagnosticCode::NoMatchingRule], 1u);
+  }
+}
+
+// The literal edge: a rule that declares no layout requirement at all offers
+// nothing for the binding to select, so a bound layout leaves every node
+// without a rule -- a search failure with the frontier's diagnostics, not an
+// error.
+TEST(CoveringSearch, ABoundLayoutNoRuleOffersLeavesTheNodeWithoutARule) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  // No bound layout: the rules match and plans are found.
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_FALSE(result->plans.empty());
+  }
+
+  // Bound: no rule offers `t.blocked`, so no node has a rule in effect.
+  {
+    SearchBinding binding =
+        makeSearchBinding("candidate_blocked",
+                          values({{"tile_layout", std::string("t.blocked")}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          binding, std::string("t.blocked"));
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_TRUE(result->plans.empty());
+    EXPECT_FALSE(result->searchTruncated);
+    EXPECT_EQ(result->frontier.nodesWithoutRules, 2u);
+    EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Stable diagnostic codes (design §22.3)
 //===----------------------------------------------------------------------===//
 

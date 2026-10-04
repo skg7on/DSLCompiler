@@ -1240,8 +1240,8 @@ std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason,
-                   bool *truncated,
-                   const llvm::StringMap<SearchValue> *pinned) {
+                   bool *truncated, const llvm::StringMap<SearchValue> *pinned,
+                   const std::string *boundLayout) {
   RuleResolution resolution =
       resolveRuleConstraints(rule, node, machine, context, pinned);
   if (!resolution.matched) {
@@ -1252,6 +1252,26 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     if (truncated)
       *truncated = resolution.truncated;
     return std::nullopt;
+  }
+
+  // A bound layout selects which of the rule's declared layouts may apply. The
+  // value was resolved by `kind == "layout"` at the pass layer (lib/Mapping
+  // does not see the search space, and must not depend on LLKPerf); here it is
+  // only string-compared against the rule's declared layout ids, which stay
+  // target-owned. A rule that offers none of them -- including a rule that
+  // declares no layout requirement at all -- cannot honour the binding, so it
+  // is a non-match (ruling S1), never an error: a sibling rule that does offer
+  // the layout may still match.
+  if (boundLayout) {
+    bool offered = false;
+    for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)
+      offered |= requirement.layoutId == *boundLayout;
+    if (!offered) {
+      if (reason)
+        *reason = "binding selects layout '" + *boundLayout +
+                  "', which the rule does not offer";
+      return std::nullopt;
+    }
   }
 
   MappingCandidate candidate;
@@ -1298,6 +1318,13 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   }
 
   for (const RuleLayoutRequirement &requirement : rule.layoutRequirements) {
+    // When a layout is bound, only the requirement(s) naming it are
+    // materialized: the binding, not the rule file, chooses which of the rule's
+    // declared layouts applies, so a rule that offered several selects the one
+    // the search-space point named. Without a bound layout every requirement is
+    // kept exactly as before.
+    if (boundLayout && requirement.layoutId != *boundLayout)
+      continue;
     LayoutRequirement resolved;
     resolved.layoutClass = requirement.layoutId;
     // A layout applies to the operand the requirement names, so resolve that

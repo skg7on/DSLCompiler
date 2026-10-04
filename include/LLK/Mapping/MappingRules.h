@@ -217,12 +217,27 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
 /// The map is the binding's `values` directly -- no filtered projection -- so
 /// the rule stays the single authority on which of its own parameters a name
 /// refers to.
+///
+/// `boundLayout` is the layout the binding selects, when the caller resolved a
+/// `layout`-kind search parameter to a concrete value. It is passed as a bare
+/// value rather than as the binding or the search space because lib/Mapping
+/// must not depend on LLKPerf (the `kind` lives on `perf::SearchParam`), and
+/// because the rule -- not generic code -- owns which layout ids it offers.
+/// A rule that declares at least one `require layout ... satisfies <id>` equal
+/// to the bound value matches, and only the requirements naming that value are
+/// materialized: the binding selects which of the rule's declared layouts
+/// applies. A rule that offers no such requirement (including a rule with no
+/// layout requirement at all) yields `std::nullopt` -- the same non-match as an
+/// unsatisfiable `require`, never an error, so a sibling rule that does offer
+/// the layout may still match. A null `boundLayout` leaves layout selection
+/// byte-identical to the pre-binding behaviour.
 std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason = nullptr,
                    bool *truncated = nullptr,
-                   const llvm::StringMap<SearchValue> *pinned = nullptr);
+                   const llvm::StringMap<SearchValue> *pinned = nullptr,
+                   const std::string *boundLayout = nullptr);
 
 } // namespace mlir::llk::mapping
 
