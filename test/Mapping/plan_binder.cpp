@@ -1261,3 +1261,199 @@ TEST(PlanBinder, RejectsAMappedOperationThatIsNotAWorkloadNode) {
   EXPECT_NE(llvm::toString(std::move(e)).find("invalid_mapping_metadata"),
             std::string::npos);
 }
+
+//===----------------------------------------------------------------------===//
+// Materialized-movement exemption validation (A5)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The binder-emitted movement copy in `module`: an `micro.async_copy` the
+/// binder stamped with a destination node. The source kernel's own copy (when
+/// it has one) carries no such stamp.
+Operation *materializedCopy(ModuleOp module) {
+  Operation *copy = nullptr;
+  module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.async_copy" &&
+        op->hasAttr("micro.dst_node"))
+      copy = op;
+  });
+  return copy;
+}
+
+/// Replaces the `engines` of every `micro.routes` entry with `engines`. Used to
+/// point a genuine materialized movement at a transfer engine the machine does
+/// not support.
+void rewriteAllRouteEngines(Operation *kernel, MLIRContext &context,
+                            llvm::ArrayRef<llvm::StringRef> engines) {
+  auto routes = kernel->getAttrOfType<ArrayAttr>("micro.routes");
+  ASSERT_TRUE(routes) << "the bound kernel carries no micro.routes";
+  llvm::SmallVector<Attribute> rewritten;
+  for (Attribute element : routes) {
+    auto route = dyn_cast<DictionaryAttr>(element);
+    ASSERT_TRUE(route) << "a route entry is not a dictionary";
+    NamedAttrList attributes(route);
+    llvm::SmallVector<Attribute> engineAttrs;
+    for (llvm::StringRef engine : engines)
+      engineAttrs.push_back(StringAttr::get(&context, engine));
+    attributes.set("engines", ArrayAttr::get(&context, engineAttrs));
+    rewritten.push_back(attributes.getDictionary(&context));
+  }
+  kernel->setAttr("micro.routes", ArrayAttr::get(&context, rewritten));
+}
+
+} // namespace
+
+// Regression (issue #67, stage A): the completeness walk exempted *any* op
+// carrying `micro.value` from the requirement that a workload operation be
+// mapped. Deleting a compute op's `micro.mapping` and stamping an arbitrary
+// movement attribute onto it therefore verified successfully. The exemption
+// must require a recognized materialized movement op whose connection
+// provenance resolves, so `micro.value` alone grants nothing.
+TEST(PlanBinder, ValueStampCannotExemptAnUnmappedComputeOperation) {
+  auto f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_TRUE(f.target);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  auto legal = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_FALSE(bool(legal)) << llvm::toString(std::move(legal));
+  unsigned mutations = 0;
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    op->removeAttr("micro.mapping");
+    op->setAttr("micro.value",
+                IntegerAttr::get(IntegerType::get(f.context.get(), 64), 0));
+    ++mutations;
+  });
+  ASSERT_EQ(mutations, 1u);
+  auto error = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("no_matching_rule"),
+            std::string::npos);
+}
+
+// The legal control for every rejection below: a genuine binder-emitted
+// movement is still complete exactly because its connection provenance
+// resolves. Validation must not turn a valid materialized connection into a
+// completeness failure.
+TEST(PlanBinder, MaterializedMovementKeepsItsCompletenessExemption) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_NE(materializedCopy(*b->module), nullptr);
+  auto error = verifyMappedMicroIR(*b->module, **target);
+  EXPECT_FALSE(bool(error)) << llvm::toString(std::move(error));
+}
+
+// A forged value stamp: an emitted copy's connection bookkeeping is removed,
+// leaving the bare `micro.value` the old exemption trusted. It must not grant
+// the exemption.
+TEST(PlanBinder, RejectsAMovementWhoseConnectionStampIsAbsent) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  Operation *copy = materializedCopy(*b->module);
+  ASSERT_NE(copy, nullptr);
+  copy->removeAttr("micro.connection");
+  llvm::Error e = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(e));
+  EXPECT_NE(llvm::toString(std::move(e)).find("invalid_mapping_metadata"),
+            std::string::npos);
+}
+
+// A movement naming a connection the kernel's `micro.routes` does not declare
+// is spoofed, not materialized.
+TEST(PlanBinder, RejectsAMovementNamingAnUnknownConnection) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  Operation *copy = materializedCopy(*b->module);
+  ASSERT_NE(copy, nullptr);
+  copy->setAttr("micro.connection",
+                IntegerAttr::get(IntegerType::get(f.context.get(), 64), 9999));
+  llvm::Error e = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(e));
+  EXPECT_NE(llvm::toString(std::move(e)).find("invalid_mapping_metadata"),
+            std::string::npos);
+}
+
+// A hop index outside the resolved connection's route is spoofed bookkeeping.
+TEST(PlanBinder, RejectsAMovementNamingAHopOutsideItsRoute) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  Operation *copy = materializedCopy(*b->module);
+  ASSERT_NE(copy, nullptr);
+  copy->setAttr("micro.hop",
+                IntegerAttr::get(IntegerType::get(f.context.get(), 64), 99));
+  llvm::Error e = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(e));
+  EXPECT_NE(llvm::toString(std::move(e)).find("invalid_mapping_metadata"),
+            std::string::npos);
+}
+
+// The destination node stamp must be the memory the resolved hop actually lands
+// in; a copy claiming some other destination is not the connection it names.
+TEST(PlanBinder, RejectsAMovementWhoseDestinationDoesNotMatchItsRoute) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  Operation *copy = materializedCopy(*b->module);
+  ASSERT_NE(copy, nullptr);
+  copy->setAttr("micro.dst_node", StringAttr::get(f.context.get(), "sram.9"));
+  llvm::Error e = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(e));
+  EXPECT_NE(llvm::toString(std::move(e)).find("invalid_mapping_metadata"),
+            std::string::npos);
+}
+
+// A movement hop carried by a transfer engine the machine does not declare is
+// not executable; the resolved route's engine set must be supported.
+TEST(PlanBinder, RejectsAMovementOnAnUnsupportedTransferEngine) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_NE(materializedCopy(*b->module), nullptr);
+  rewriteAllRouteEngines(b->kernel, *f.context, {"no_such_engine"});
+  llvm::Error e = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(e));
+  // The materialized-movement path resolves the route and rejects the
+  // unsupported engine before the route walk reaches it.
+  std::string text = llvm::toString(std::move(e));
+  EXPECT_NE(text.find("invalid_mapping_metadata"), std::string::npos) << text;
+  EXPECT_NE(text.find("no_such_engine"), std::string::npos) << text;
+}

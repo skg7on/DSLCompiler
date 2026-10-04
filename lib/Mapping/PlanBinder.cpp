@@ -32,6 +32,22 @@ constexpr llvm::StringLiteral kPlanAttr = "micro.plan";
 constexpr llvm::StringLiteral kMappingAttr = "micro.mapping";
 constexpr llvm::StringLiteral kRoutesAttr = "micro.routes";
 
+/// The binder's target-neutral bookkeeping on a materialized movement (design
+/// §12.4/§23.3). A copy belongs to a selected connection and to one hop of that
+/// connection's route; the performance model charges it by those ids, and the
+/// completeness verifier resolves the same stamps back to the route so that
+/// `micro.value` alone cannot exempt an arbitrary operation.
+constexpr llvm::StringLiteral kValueAttr = "micro.value";
+constexpr llvm::StringLiteral kDstNodeAttr = "micro.dst_node";
+constexpr llvm::StringLiteral kConnectionAttr = "micro.connection";
+constexpr llvm::StringLiteral kHopAttr = "micro.hop";
+
+/// The only Micro operation the binder emits to materialize a connection's
+/// movement. A completeness exemption is granted to exactly this operation, and
+/// only when its connection provenance resolves; no other op can claim it by
+/// carrying a movement stamp.
+constexpr llvm::StringLiteral kMaterializedMovementOp = "micro.async_copy";
+
 /// Stable, greppable reasons for a connection the binder cannot materialize
 /// (design §18.2). They are part of the report contract, so they are named
 /// constants rather than free-form prose.
@@ -110,8 +126,8 @@ WorkloadNode strippedWorkloadNode(const WorkloadNode &node) {
   bool stripped = false;
   for (mlir::NamedAttribute attribute : node.attributes) {
     llvm::StringRef name = attribute.getName().getValue();
-    if (name == kMappingAttr || name == "micro.value" ||
-        name == "micro.dst_node") {
+    if (name == kMappingAttr || name == kValueAttr || name == kDstNodeAttr ||
+        name == kConnectionAttr || name == kHopAttr) {
       stripped = true;
       continue;
     }
@@ -357,6 +373,311 @@ llvm::Expected<mlir::Operation *> findKernel(mlir::ModuleOp module) {
   return kernels.front();
 }
 
+/// Reads a required integer bookkeeping attribute from a materialized movement
+/// with a checked cast. The stamps are generic metadata and therefore untrusted
+/// (design §25.1): an absent field and a wrongly-typed one are stable
+/// diagnostics, not an unchecked cast that aborts the process.
+llvm::Expected<uint64_t> movementUintAttr(mlir::Operation *op,
+                                          llvm::StringRef name,
+                                          const std::string &where) {
+  std::string prefix =
+      where + ": op '" + op->getName().getStringRef().str() + "'";
+  mlir::Attribute raw = op->getAttr(name);
+  if (!raw)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       prefix + ": '" + name.str() + "' is missing");
+  auto integer = mlir::dyn_cast<mlir::IntegerAttr>(raw);
+  if (!integer)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       prefix + ": '" + name.str() + "' is not an integer");
+  return integer.getValue().getZExtValue();
+}
+
+/// The string member of a materialized movement's bookkeeping, read with a
+/// checked cast for the same reason.
+llvm::Expected<std::string> movementStringAttr(mlir::Operation *op,
+                                               llvm::StringRef name,
+                                               const std::string &where) {
+  std::string prefix =
+      where + ": op '" + op->getName().getStringRef().str() + "'";
+  mlir::Attribute raw = op->getAttr(name);
+  if (!raw)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       prefix + ": '" + name.str() + "' is missing");
+  auto text = mlir::dyn_cast<mlir::StringAttr>(raw);
+  if (!text)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       prefix + ": '" + name.str() + "' is not a string");
+  return text.getValue().str();
+}
+
+/// The `#micro.memory<kind>` attribute a machine memory kind names, or a null
+/// attribute when the kind is not a Micro memory space.
+mlir::Attribute memoryAttrFor(mlir::MLIRContext *context,
+                              llvm::StringRef kind) {
+  return mlir::parseAttribute(("#micro.memory<" + kind + ">").str(), context);
+}
+
+/// Validates that `op` is a binder-emitted materialized movement, so the
+/// completeness walk may exempt it from carrying its own `micro.mapping`.
+///
+/// The old exemption trusted any `micro.value`, which let an unmapped compute
+/// operation evade coverage by stamping movement bookkeeping onto itself (issue
+/// #67, stage A). Here the exemption requires *all* of:
+///
+///   - the canonical movement operation (`micro.async_copy`);
+///   - typed `micro.connection`/`micro.hop`/`micro.value`/`micro.dst_node`
+///     stamps;
+///   - a connection in the kernel's `micro.routes` the id resolves to, of a
+///     kind the binder materializes as copies;
+///   - a hop inside that connection's route whose source and destination the
+///     copy's declared memories and `micro.dst_node` agree with, carried by a
+///     link and transfer engine the machine declares;
+///   - a copy whose operand type matches its result and whose operand is
+///     kernel work (a mapped op, or another materialized hop of the chain);
+///   - a well-formed consumer set (it, too, is untrusted metadata).
+///
+/// Returns success only for a genuine materialized connection; every other op
+/// is an error, so an exempted op is always a verified connection.
+llvm::Error verifyMaterializedMovement(mlir::Operation *op,
+                                       mlir::Operation *kernel,
+                                       const MachineModel &machine,
+                                       const std::string &where) {
+  llvm::StringRef name = op->getName().getStringRef();
+  const bool claimsMovement =
+      op->hasAttr(kValueAttr) || op->hasAttr(kConnectionAttr) ||
+      op->hasAttr(kHopAttr) || op->hasAttr(kDstNodeAttr);
+  // Only the canonical movement op that actually claims materialization may be
+  // exempt. An ordinary unannotated workload op -- including an unannotated
+  // copy -- is still just an op that needed a rule, and an op of any other kind
+  // cannot become a materialized movement by carrying its stamps.
+  if (name != kMaterializedMovementOp || !claimsMovement)
+    return verifyError(DiagnosticCode::NoMatchingRule,
+                       where + ": op '" + name.str() +
+                           "' carries no micro.mapping");
+
+  auto metadataError = [&](llvm::Error error) {
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       llvm::toString(std::move(error)));
+  };
+
+  llvm::Expected<uint64_t> connectionId =
+      movementUintAttr(op, kConnectionAttr, where);
+  if (!connectionId)
+    return connectionId.takeError();
+  llvm::Expected<uint64_t> hop = movementUintAttr(op, kHopAttr, where);
+  if (!hop)
+    return hop.takeError();
+  llvm::Expected<uint64_t> value = movementUintAttr(op, kValueAttr, where);
+  if (!value)
+    return value.takeError();
+  llvm::Expected<std::string> dstNode =
+      movementStringAttr(op, kDstNodeAttr, where);
+  if (!dstNode)
+    return dstNode.takeError();
+
+  // Resolve the claimed connection. Without its route there is nothing the
+  // stamps can be checked against, so an unresolved claim is rejected rather
+  // than granted the exemption.
+  auto routes = kernel->getAttrOfType<mlir::ArrayAttr>(kRoutesAttr);
+  if (!routes)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": op '" + name.str() + "' names connection " +
+                           std::to_string(*connectionId) +
+                           ", but the kernel has no micro.routes");
+  mlir::DictionaryAttr route;
+  for (mlir::Attribute element : routes) {
+    auto entry = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+    if (!entry)
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": micro.routes entry is not a dictionary");
+    auto id = entry.getAs<mlir::IntegerAttr>("id");
+    if (id && id.getValue().getZExtValue() == *connectionId) {
+      route = entry;
+      break;
+    }
+  }
+  if (!route)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": op '" + name.str() + "' names connection " +
+                           std::to_string(*connectionId) +
+                           ", which micro.routes does not declare");
+
+  // Only a movement kind is materialized as copies; a `Direct` connection emits
+  // nothing, and a `Reduce`/transform-only one is not this op.
+  llvm::Expected<std::string> kind = requiredString(route, "kind", where);
+  if (!kind)
+    return metadataError(kind.takeError());
+  std::optional<ConnectionKind> symbolized = symbolizeConnectionKind(*kind);
+  if (!symbolized)
+    return metadataError(
+        bindError(where + ": unknown connection kind '" + *kind + "'"));
+  switch (*symbolized) {
+  case ConnectionKind::Transfer:
+  case ConnectionKind::TransferAndTransform:
+  case ConnectionKind::Replicate:
+    break;
+  case ConnectionKind::Direct:
+  case ConnectionKind::LayoutTransform:
+  case ConnectionKind::Reduce:
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": op '" + name.str() +
+                           "' resolves to connection " +
+                           std::to_string(*connectionId) +
+                           ", which is not materialized as a movement");
+  }
+
+  // The route's value must be the value the copy carries.
+  auto routeValue =
+      mlir::dyn_cast_or_null<mlir::IntegerAttr>(route.get("value"));
+  if (!routeValue)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": connection " + std::to_string(*connectionId) +
+                           " records no integer value");
+  if (routeValue.getValue().getZExtValue() != *value)
+    return verifyError(
+        DiagnosticCode::InvalidMappingMetadata,
+        where + ": op '" + name.str() + "' records value " +
+            std::to_string(*value) + ", but connection " +
+            std::to_string(*connectionId) + " carries value " +
+            std::to_string(routeValue.getValue().getZExtValue()));
+
+  mlir::Attribute rawRoute = route.get("route");
+  if (!rawRoute)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": connection " + std::to_string(*connectionId) +
+                           " has no 'route'");
+  llvm::Expected<llvm::SmallVector<std::string, 4>> nodes =
+      readStringArray(rawRoute, "route", where);
+  if (!nodes)
+    return metadataError(nodes.takeError());
+  if (*hop < 1 || *hop >= nodes->size())
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": op '" + name.str() + "' names hop " +
+                           std::to_string(*hop) +
+                           ", which is outside connection " +
+                           std::to_string(*connectionId) + "'s route");
+  const std::string &fromNode = (*nodes)[*hop - 1];
+  const std::string &toNode = (*nodes)[*hop];
+  if (toNode != *dstNode)
+    return verifyError(
+        DiagnosticCode::InvalidMappingMetadata,
+        where + ": op '" + name.str() + "' records micro.dst_node '" +
+            *dstNode + "', but connection " + std::to_string(*connectionId) +
+            " hop " + std::to_string(*hop) + " lands in '" + toNode + "'");
+
+  // Source/destination: the copy's declared memory spaces must be the memory
+  // kinds of the hop's two endpoints.
+  const machine::MemoryNode *fromMemory = machine.findMemory(fromNode);
+  const machine::MemoryNode *toMemory = machine.findMemory(toNode);
+  if (!fromMemory || !toMemory)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": connection " + std::to_string(*connectionId) +
+                           " hop " + std::to_string(*hop) +
+                           " names a memory the machine does not declare");
+  mlir::MLIRContext *context = op->getContext();
+  mlir::Attribute expectedSrc = memoryAttrFor(context, fromMemory->kind);
+  mlir::Attribute expectedDst = memoryAttrFor(context, toMemory->kind);
+  if (!expectedSrc || !expectedDst)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": connection " + std::to_string(*connectionId) +
+                           " hop " + std::to_string(*hop) +
+                           " names a memory kind Micro cannot represent");
+  if (op->getAttr("src_memory") != expectedSrc ||
+      op->getAttr("dst_memory") != expectedDst)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": op '" + name.str() +
+                           "' declares memories that do not match "
+                           "connection " +
+                           std::to_string(*connectionId) + " hop " +
+                           std::to_string(*hop) + " ('" + fromNode + "' -> '" +
+                           toNode + "')");
+
+  // Engine/link: the hop must be a link the machine declares, and the route
+  // must name a transfer engine that link actually offers.
+  const machine::LinkEdge *link = nullptr;
+  for (const machine::LinkEdge &edge : machine.links)
+    if (edge.source == fromNode && edge.destination == toNode) {
+      link = &edge;
+      break;
+    }
+  if (!link)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": op '" + name.str() + "' hop '" + fromNode +
+                           "' -> '" + toNode + "' has no link");
+  llvm::SmallVector<std::string, 4> engines;
+  if (mlir::Attribute rawEngines = route.get("engines")) {
+    llvm::Expected<llvm::SmallVector<std::string, 4>> read =
+        readStringArray(rawEngines, "engines", where);
+    if (!read)
+      return metadataError(read.takeError());
+    engines = std::move(*read);
+  }
+  if (!link->transferEngines.empty()) {
+    if (engines.empty())
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": op '" + name.str() + "' hop '" + fromNode +
+                             "' -> '" + toNode +
+                             "' names no transfer engine, but its link "
+                             "requires one");
+    bool served = false;
+    for (const std::string &engine : engines) {
+      if (!machine.findTransferEngine(engine))
+        return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                           where + ": op '" + name.str() +
+                               "' route names unsupported transfer engine '" +
+                               engine + "'");
+      if (llvm::is_contained(link->transferEngines, engine))
+        served = true;
+    }
+    if (!served)
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": op '" + name.str() + "' hop '" + fromNode +
+                             "' -> '" + toNode +
+                             "' names no transfer engine its link offers");
+  }
+
+  // Type: a copy preserves the value's type. A movement that changes it is not
+  // the connection it claims.
+  if (op->getNumOperands() < 1 || op->getNumResults() < 1)
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": op '" + name.str() +
+                           "' is not a well-formed movement");
+  if (op->getOperand(0).getType() != op->getResult(0).getType())
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": op '" + name.str() +
+                           "' copies a value whose type differs from its "
+                           "result");
+  // Actual SSA provenance: the copy must read kernel work -- a mapped op, or
+  // another materialized hop of the same chain -- never an arbitrary value.
+  mlir::Operation *producer = op->getOperand(0).getDefiningOp();
+  if (!producer || enclosingKernel(producer) != kernel)
+    return verifyError(
+        DiagnosticCode::InvalidMappingMetadata,
+        where + ": op '" + name.str() +
+            "' reads a value no operation in its kernel defines");
+  if (!producer->getAttr(kMappingAttr) && !producer->hasAttr(kConnectionAttr))
+    return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                       where + ": op '" + name.str() +
+                           "' reads a value that no mapped or materialized "
+                           "operation produces");
+
+  // Selected consumers: the connection's consumer set is generic metadata too,
+  // so its shape is validated here with the same checked reads as every other
+  // container. (Whether each recorded consumer actually reads the movement is
+  // the connection's rewiring contract, not a completeness-exemption fact.)
+  if (mlir::Attribute rawConsumers = route.get("consumers")) {
+    auto consumers = mlir::dyn_cast<mlir::ArrayAttr>(rawConsumers);
+    if (!consumers)
+      return metadataError(bindError(where + ": 'consumers' is not an array"));
+    for (mlir::Attribute consumer : consumers)
+      if (!mlir::isa<mlir::IntegerAttr>(consumer))
+        return metadataError(
+            bindError(where + ": 'consumers' has a non-integer entry"));
+  }
+  return llvm::Error::success();
+}
+
 } // namespace
 
 llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
@@ -444,6 +765,12 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
   llvm::SmallVector<mlir::Attribute> routes;
   for (const PlanConnection &connection : plan.connectionPlans) {
     llvm::SmallVector<mlir::NamedAttribute> attributes;
+    // The connection's own id, so a materialized copy's `micro.connection`
+    // stamp resolves to the route it was emitted for. Without it the route
+    // entries are only "a movement of value N", and two connections carrying
+    // one value are indistinguishable.
+    attributes.emplace_back(mlir::StringAttr::get(context, "id"),
+                            u64Attr(context, connection.id));
     attributes.emplace_back(mlir::StringAttr::get(context, "value"),
                             u64Attr(context, connection.value));
     attributes.emplace_back(
@@ -735,10 +1062,13 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       // §12.4/§23.3): which connection this hop belongs to, and the concrete
       // memory node it lands in. Without it a movement is indistinguishable
       // from the other movements that share its endpoint memory *kinds*, and
-      // is charged the wrong link.
-      copyState.addAttribute("micro.value", u64Attr(context, connection.value));
-      copyState.addAttribute("micro.dst_node",
+      // is charged the wrong link. The same stamps are what the completeness
+      // verifier resolves (A5): `micro.value` alone must not exempt an op.
+      copyState.addAttribute(kValueAttr, u64Attr(context, connection.value));
+      copyState.addAttribute(kDstNodeAttr,
                              mlir::StringAttr::get(context, to->id));
+      copyState.addAttribute(kConnectionAttr, u64Attr(context, connection.id));
+      copyState.addAttribute(kHopAttr, u64Attr(context, hop));
       mlir::Operation *copy = builder.create(copyState);
 
       mlir::OperationState waitState(producer->getLoc(), "micro.wait");
@@ -882,15 +1212,17 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         return;
       if (!isWorkloadNodeOp(op->getName()))
         return;
-      // A binder-emitted movement is a materialized connection, not a workload
-      // operation that needed a rule; it is identified by the connection
-      // bookkeeping the binder stamps on the copy.
-      if (op->hasAttr("micro.value"))
+      // A mapped workload op is checked by the per-operation walk below.
+      if (op->getAttr(kMappingAttr))
         return;
-      if (!op->getAttr(kMappingAttr))
-        fail(DiagnosticCode::NoMatchingRule,
-             where + ": op '" + op->getName().getStringRef().str() +
-                 "' carries no micro.mapping");
+      // An op with no mapping is only exempt when it is a binder-emitted
+      // movement whose connection provenance resolves to a selected route.
+      // `micro.value` alone is not evidence of a materialized connection
+      // (issue #67, stage A): a compute op that stamps movement bookkeeping
+      // onto itself is still a workload op that needed a rule.
+      if (llvm::Error error =
+              verifyMaterializedMovement(op, kernel, machine, where))
+        failure = std::move(error);
     });
   });
   if (failure)
@@ -1296,6 +1628,14 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         failMetadata(bindError(where + ": a route entry is not a dictionary"));
         return;
       }
+      // The connection id a materialized movement's `micro.connection` stamp
+      // resolves against. It is generic metadata like every other field, so a
+      // wrongly-typed value is a diagnostic rather than a cast.
+      if (mlir::Attribute rawId = route.get("id"))
+        if (!mlir::isa<mlir::IntegerAttr>(rawId)) {
+          failMetadata(bindError(where + ": route 'id' is not an integer"));
+          return;
+        }
       llvm::Expected<std::string> kind = requiredString(route, "kind", where);
       if (!kind) {
         failMetadata(kind.takeError());

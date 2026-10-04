@@ -65,6 +65,82 @@ module {
 
 // -----
 
+// A compute op that deleted its `micro.mapping` and stamped an arbitrary
+// `micro.value` movement attribute onto itself used to evade the completeness
+// check: the walk exempted any op carrying the stamp. The exemption now
+// requires a verified materialized connection, so the compute op is still
+// coverage.
+// expected-error @below {{no_matching_rule: kernel 'k': op 'micro.vector' carries no micro.mapping}}
+module {
+  micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.value = 0 : i64} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+}
+
+// -----
+
+// A movement stamped with `micro.value` but no connection provenance is not a
+// verified materialized connection, so the exemption is refused.
+// expected-error @below {{invalid_mapping_metadata: kernel 'k': op 'micro.async_copy': 'micro.connection' is missing}}
+module {
+  micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %0 {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>, micro.value = 0 : i64, micro.dst_node = "sram.0"} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  }
+}
+
+// -----
+
+// A movement naming a connection the kernel's `micro.routes` does not declare
+// cannot be resolved, so it is not the materialized connection it claims.
+// expected-error @below {{invalid_mapping_metadata: kernel 'k': op 'micro.async_copy' names connection 99, which micro.routes does not declare}}
+module {
+  micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}, micro.routes = [{id = 7 : i64, kind = "transfer", route = ["dram.0", "sram.0"], engines = ["dma.0"], value = 0 : i64}]} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %0 {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>, micro.value = 0 : i64, micro.dst_node = "sram.0", micro.connection = 99 : i64, micro.hop = 1 : i64} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  }
+}
+
+// -----
+
+// A resolved hop carried by a transfer engine the machine does not declare is
+// not executable: the movement's route must name an engine its link offers.
+// expected-error @below {{invalid_mapping_metadata: kernel 'k': op 'micro.async_copy' route names unsupported transfer engine 'no_such_engine'}}
+module {
+  micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}, micro.routes = [{id = 7 : i64, kind = "transfer", route = ["dram.0", "sram.0"], engines = ["no_such_engine"], value = 0 : i64}]} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %0 {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>, micro.value = 0 : i64, micro.dst_node = "sram.0", micro.connection = 7 : i64, micro.hop = 1 : i64} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  }
+}
+
+// -----
+
+// A movement whose destination stamp is not the memory the resolved hop lands
+// in is not the connection it names.
+// expected-error @below {{invalid_mapping_metadata: kernel 'k': op 'micro.async_copy' records micro.dst_node 'acc.0', but connection 7 hop 1 lands in 'sram.0'}}
+module {
+  micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}, micro.routes = [{id = 7 : i64, kind = "transfer", route = ["dram.0", "sram.0"], engines = ["dma.0"], value = 0 : i64}]} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %0 {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>, micro.value = 0 : i64, micro.dst_node = "acc.0", micro.connection = 7 : i64, micro.hop = 1 : i64} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  }
+}
+
+// -----
+
+// A movement whose declared source memory is not the resolved hop's source is
+// not the connection it names.
+// expected-error @below {{invalid_mapping_metadata: kernel 'k': op 'micro.async_copy' declares memories that do not match connection 7 hop 1 ('dram.0' -> 'sram.0')}}
+module {
+  micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}, micro.routes = [{id = 7 : i64, kind = "transfer", route = ["dram.0", "sram.0"], engines = ["dma.0"], value = 0 : i64}]} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %0 {src_memory = #micro.memory<l2>, dst_memory = #micro.memory<sram>, micro.value = 0 : i64, micro.dst_node = "sram.0", micro.connection = 7 : i64, micro.hop = 1 : i64} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  }
+}
+
+// -----
+
 // An unknown rule: the mapping records an id the target's rule file does not
 // declare.
 // expected-error @below {{no_matching_rule: mapped op 'micro.vector': unknown rule 'avx2.no_such_rule'}}
