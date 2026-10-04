@@ -98,6 +98,14 @@ struct LayoutRequirement {
   /// the layout class, so this resolution never changes a plan id.
   std::string elementType;
   int64_t rank = -1;
+  /// The workload value the named port carries, so the solved binding can later
+  /// be attributed to the edge that carries that value rather than to every
+  /// edge touching the instance. `-1` when the rule names no port, or names one
+  /// its node does not have -- in which case the binding is attributable to
+  /// nothing and a connection request leaves the endpoint's layout unset.
+  /// Excluded from the canonical string for the same reason as `elementType`:
+  /// it is a resolution fact, and the id already depends only on the class.
+  int64_t portValue = -1;
 };
 
 /// An abstract compute capability a placement must attach (design §15.1).
@@ -113,6 +121,14 @@ struct ResourceUsage {
 
 /// A layout conversion over a value, expressed as an affine relationship so
 /// equivalence and composition use MLIR's canonicalization.
+///
+/// Known asymmetry with ruling R4: `srcLayout`/`dstLayout` name layout
+/// *families*, and `map` is left null by `synthesizeConnections`, so a
+/// connection's transform is under-specified exactly where an instance's
+/// `SolvedLayout` is now concrete (`VW = 8`, with its map). The endpoints'
+/// solved parameterizations are reachable through the plan's placements, but a
+/// materializer that must emit the conversion needs them here -- filling this
+/// in is follow-up work, deliberately not guessed from the placements now.
 struct LayoutTransform {
   std::string srcLayout;
   std::string dstLayout;
@@ -134,6 +150,38 @@ struct MappingCandidate {
   Cost lowerBound;
 };
 
+/// One layout class's solved instantiation: the parameter values the solver
+/// chose and the affine map they substitute into. `layoutBindings` names the
+/// layout *family*; this is what makes the binding concrete, so a materializer
+/// (and a report) can state which parameterization was selected instead of
+/// implying "some legal one".
+///
+/// The parameter map is the identity-bearing field: it is rendered sorted and
+/// type-tagged by `canonicalSearchValueString`, and it participates in the
+/// instance and plan ids (ruling R4 -- two parameterizations of one layout id
+/// are different placements). The affine map is carried but deliberately *not*
+/// hashed: it is a pure function of the bound layout id and these values, so
+/// including its rendering would only add a dependency on MLIR's map printer.
+///
+/// Invariant: in the maps that key a `SolvedLayout` by layout class, the key is
+/// the resolved definition id, so it is string-identical to the same class's
+/// entry in `layoutBindings` (both are written together by
+/// `enumeratePlacements` from the requirement's `layoutClass`).
+struct SolvedLayout {
+  llvm::StringMap<SearchValue> parameters;
+  /// The logical-to-physical map with the integer parameters substituted; null
+  /// when the layout declaration carries no map clause.
+  mlir::AffineMap map;
+  /// The workload value this layout was solved for, copied from the
+  /// requirement's `portValue`; `-1` when the rule named no resolvable port.
+  /// This is what lets a connection request ask for "the layout bound for
+  /// *this* edge's value" instead of taking whatever one layout the instance
+  /// happens to hold -- a rule that names an input port must not have its
+  /// layout attributed to the edge carrying the result. Like `parameters`, it
+  /// is a resolution fact, not content, so it is not hashed either.
+  int64_t portValue = -1;
+};
+
 /// One mapping candidate placed on concrete resources.
 struct CandidateInstance {
   InstanceId id = 0;
@@ -145,6 +193,9 @@ struct CandidateInstance {
   llvm::StringMap<MemoryNodeId> memoryBindings;
   llvm::StringMap<std::string> computeBindings;
   llvm::StringMap<LayoutId> layoutBindings;
+  /// The solved instantiation of each bound layout class, keyed exactly as
+  /// `layoutBindings` is. Empty when the candidate requires no layout.
+  llvm::StringMap<SolvedLayout> layoutSolutions;
   ResourceUsage resourceUsage;
   Cost localCost;
 };
@@ -198,6 +249,9 @@ struct PlanPlacement {
   ExecutorId executor;
   llvm::StringMap<MemoryNodeId> memories;
   llvm::StringMap<LayoutId> layouts;
+  /// The solved instantiation of each layout in `layouts`, so the selected
+  /// plan states the parameterization it chose, not just the family name.
+  llvm::StringMap<SolvedLayout> layoutSolutions;
 };
 
 /// One selected connection, with the route it takes.

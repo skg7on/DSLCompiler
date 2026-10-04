@@ -76,6 +76,28 @@ std::string transformString(const LayoutTransform &transform) {
   return out;
 }
 
+/// The solved layout assignments of an instance or placement: one
+/// `class{params}` group per layout class, sorted so map iteration order never
+/// leaks into an id. The parameters render through `canonicalSearchValueString`
+/// (sorted and type-tagged, so `8` and `"8"` differ). The affine map is
+/// deliberately omitted -- see `SolvedLayout`: it is a function of the class id
+/// and the values rendered here, so hashing its printed form would add a
+/// dependency on MLIR's printer for no distinguishing power.
+std::string
+solvedLayoutsString(const llvm::StringMap<SolvedLayout> &solutions) {
+  std::vector<std::string> groups;
+  groups.reserve(solutions.size());
+  for (const auto &entry : solutions) {
+    std::string text = entry.first().str();
+    text += '{';
+    text += canonicalSearchValueString(entry.second.parameters);
+    text += '}';
+    groups.push_back(std::move(text));
+  }
+  llvm::sort(groups);
+  return joinStrings(groups, ";");
+}
+
 /// One bundle parameter as `key:type:value`. The type tag keeps a string `8`
 /// and an integer `8` from colliding, so two typed parameters that differ only
 /// in type still get different ids.
@@ -240,6 +262,8 @@ std::string canonicalInstanceString(const CandidateInstance &instance) {
   out += joinStrings(sortedEntries(instance.memoryBindings), ",");
   out += "|layout=";
   out += joinStrings(sortedEntries(instance.layoutBindings), ",");
+  out += "|solvedlayout=";
+  out += solvedLayoutsString(instance.layoutSolutions);
   out += "|compute=";
   out += joinStrings(sortedEntries(instance.computeBindings), ",");
   out += "|slots=";
@@ -308,6 +332,8 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
     text += joinStrings(sortedEntries(placement.memories), ",");
     text += ":layout=";
     text += joinStrings(sortedEntries(placement.layouts), ",");
+    text += ":solvedlayout=";
+    text += solvedLayoutsString(placement.layoutSolutions);
     placements.push_back(std::move(text));
   }
   llvm::sort(placements);

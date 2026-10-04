@@ -291,6 +291,7 @@ target_compile_options(LLKMachine PRIVATE -fno-rtti -fno-exceptions)
 add_library(LLKMapping STATIC
     lib/Mapping/StableHash.cpp
     lib/Mapping/Diagnostics.cpp
+    lib/Mapping/TileFacts.cpp
     lib/Mapping/CostModel.cpp
     lib/Mapping/CostEvent.cpp
     lib/Mapping/LatencyProvider.cpp
@@ -805,6 +806,7 @@ add_llk_mapping_test(MappingStableHashTest test/Mapping/stable_hash.cpp)
 add_llk_mapping_test(MappingCostModelTest test/Mapping/cost_model.cpp)
 add_llk_mapping_test(MappingSearchBindingTest test/Mapping/search_binding.cpp)
 add_llk_mapping_test(MappingWorkloadGraphTest test/Mapping/workload_graph.cpp)
+add_llk_mapping_test(MappingTileFactsTest test/Mapping/tile_facts.cpp)
 add_llk_mapping_test(MappingPlanTest test/Mapping/mapping_plan.cpp)
 add_llk_mapping_test(MappingLayoutTest test/Mapping/layout_constraints.cpp)
 add_llk_mapping_test(MappingRulesTest test/Mapping/mapping_rules.cpp)

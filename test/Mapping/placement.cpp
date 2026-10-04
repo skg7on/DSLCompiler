@@ -3,10 +3,12 @@
 #include "LLK/Mapping/Placement.h"
 
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
 
 #include <string>
+#include <variant>
 #include <vector>
 
 using namespace mlir::llk::machine;
@@ -100,6 +102,53 @@ layout t.rank3(int N) {
   require rank == 3;
 }
 )llkmap";
+
+/// A parameterized layout whose only legal assignment is `VW = 8`. `VW`'s
+/// domain holds five values and a constraint narrows it to one, so the solved
+/// assignment is a real search result rather than the sole declared value.
+constexpr llvm::StringLiteral kParameterizedLayout = R"llkmap(
+layout t.blocked(int VW) {
+  param VW in [4..8];
+  require VW == 8;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap";
+
+/// A layout with two legal assignments: `VW = 4` and `VW = 8`. The solver
+/// enumerates the domain in declaration order, so which one placement records
+/// is observable -- and pinned.
+constexpr llvm::StringLiteral kTwoSolutionLayout = R"llkmap(
+layout t.choosy(int VW) {
+  param VW in [4..8];
+  require VW % 4 == 0;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap";
+
+/// An affine map's rendered text, for asserting a solved constant reached it.
+std::string printedMap(mlir::AffineMap map) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  map.print(stream);
+  stream.flush();
+  return text;
+}
+
+/// The solved integer `parameter` of `layoutClass`, or nullopt when the layout
+/// is unbound, the parameter is unset, or it did not solve to an integer.
+std::optional<int64_t> solvedInteger(const CandidateInstance &instance,
+                                     llvm::StringRef layoutClass,
+                                     llvm::StringRef parameter) {
+  auto layout = instance.layoutSolutions.find(layoutClass);
+  if (layout == instance.layoutSolutions.end())
+    return std::nullopt;
+  auto value = layout->second.parameters.find(parameter);
+  if (value == layout->second.parameters.end())
+    return std::nullopt;
+  if (const int64_t *integer = std::get_if<int64_t>(&value->second))
+    return *integer;
+  return std::nullopt;
+}
 
 std::unique_ptr<MappingTarget> targetFor(MachineModel machine,
                                          llvm::StringRef layouts = kLayouts) {
@@ -302,6 +351,92 @@ TEST(Placement, BindsTheSolvedLayoutForEveryEnumeratedAttachment) {
   }
 }
 
+// Phase-3 T4: the solve's concrete parameter assignment reaches the instance.
+// Before this, `layoutBindings` recorded only the layout *id*, so an instance
+// could not say *which* parameterization it selected -- which `VW`, and which
+// affine map that implies.
+TEST(Placement, RecordsTheSolvedLayoutParametersAndAffineMap) {
+  std::unique_ptr<MappingTarget> target =
+      targetFor(placementMachine(), kParameterizedLayout);
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withLayout = candidate();
+  LayoutRequirement requirement;
+  requirement.layoutClass = "t.blocked";
+  // A hand-built candidate points the requirement at a value directly (a rule
+  // bridge fills this from the port it names); the number is carried through
+  // unchanged so an edge can later ask for this value's layout.
+  requirement.portValue = 7;
+  withLayout.layoutRequirements.push_back(requirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withLayout, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  const CandidateInstance &instance = instances->front();
+
+  // The solved assignment is filed under the same key as the binding.
+  ASSERT_EQ(instance.layoutSolutions.size(), 1u);
+  ASSERT_EQ(instance.layoutBindings.size(), 1u);
+  EXPECT_EQ(solvedInteger(instance, "t.blocked", "VW"),
+            std::optional<int64_t>(8));
+
+  // And the affine map carries the solved constant, not the parameter name.
+  auto layout = instance.layoutSolutions.find("t.blocked");
+  ASSERT_NE(layout, instance.layoutSolutions.end());
+  ASSERT_TRUE(layout->second.map);
+  const std::string printed = printedMap(layout->second.map);
+  EXPECT_NE(printed.find("floordiv 8"), std::string::npos) << printed;
+
+  // The value the requirement was resolved for travels with the binding, so a
+  // connection request can attribute it to the right edge.
+  EXPECT_EQ(layout->second.portValue, 7);
+}
+
+// The solver enumerates the declared domain in declaration order, and placement
+// binds the first legal solution; with two legal assignments (4 and 8) the
+// recorded one is pinned so a solver reordering is a visible change.
+TEST(Placement, RecordsTheSolversFirstLegalAssignment) {
+  std::unique_ptr<MappingTarget> target =
+      targetFor(placementMachine(), kTwoSolutionLayout);
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withLayout = candidate();
+  LayoutRequirement requirement;
+  requirement.layoutClass = "t.choosy";
+  withLayout.layoutRequirements.push_back(requirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withLayout, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  // 4 and 8 both satisfy `VW % 4 == 0`; the first declared is recorded.
+  EXPECT_EQ(solvedInteger(instances->front(), "t.choosy", "VW"),
+            std::optional<int64_t>(4));
+  // A requirement that names no value records the unset sentinel, never a
+  // fabricated value: nothing may attribute this binding to an edge.
+  auto layout = instances->front().layoutSolutions.find("t.choosy");
+  ASSERT_NE(layout, instances->front().layoutSolutions.end());
+  EXPECT_EQ(layout->second.portValue, -1);
+}
+
+// A candidate that requires no layout records no solved layout: the field is
+// empty, never a fabricated default.
+TEST(Placement, RecordsNoSolvedLayoutWithoutALayoutRequirement) {
+  std::unique_ptr<MappingTarget> target = targetFor(placementMachine());
+  ASSERT_NE(target, nullptr);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(candidate(), *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  EXPECT_TRUE(instances->front().layoutSolutions.empty());
+}
+
 TEST(Placement, TheInstanceCapCapsEnumeratedAttachmentsAndReportsTruncation) {
   std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
   ASSERT_NE(target, nullptr);
@@ -364,8 +499,8 @@ TEST(Placement, RequiresTheLayoutToSolve) {
   // definition id the requirement resolved to, and it resolves in the target's
   // registry. A rule's `require layout p satisfies <id>` names that definition
   // id directly, so the bound value is string-identical to the requirement's
-  // declared id by construction; the solved parameters are not carried
-  // (`layoutBindings` is a `StringMap<LayoutId>`).
+  // declared id by construction. (The solved parameter assignment travels
+  // alongside in `layoutSolutions`.)
   const std::string bound = (*solvable)[0].layoutBindings.lookup("t.rank3");
   EXPECT_EQ(bound, "t.rank3");
   EXPECT_NE((*target).layouts().find(bound), nullptr);

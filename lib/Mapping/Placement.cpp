@@ -2,6 +2,8 @@
 
 #include "LLK/Mapping/Placement.h"
 
+#include "LLK/Mapping/TileFacts.h"
+
 #include "mlir/IR/BuiltinTypes.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -108,48 +110,24 @@ reduceSymmetric(const MachineModel &machine,
   return representatives;
 }
 
-/// The element type a port type exposes for §10.2 comparison, or nullopt when
-/// this target-independent core cannot read one. A modelled shaped type
-/// (`tensor`, `memref`, `vector`) states its element type; a bare float or
-/// integer type *is* an element type. A `!micro.tile` is opaque here -- the
-/// core never names the Micro dialect -- so it yields nullopt rather than a
-/// guessed element type.
-std::optional<mlir::Type> comparableElementType(mlir::Type type) {
-  if (!type)
-    return std::nullopt;
-  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
-    return shaped.getElementType();
-  if (mlir::isa<mlir::FloatType, mlir::IntegerType, mlir::IndexType>(type))
-    return type;
-  return std::nullopt;
-}
-
-/// The static logical shape a port type exposes, or nullopt for a dynamic,
-/// unranked, or opaque type.
-std::optional<llvm::SmallVector<int64_t, 4>> staticShape(mlir::Type type) {
-  if (!type)
-    return std::nullopt;
-  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
-    if (shaped.hasStaticShape())
-      return llvm::SmallVector<int64_t, 4>(shaped.getShape());
-  return std::nullopt;
-}
-
 /// §10.2: a changed element type or logical tile shape admits no alternative --
 /// neither a layout transform nor a transfer rewrites it -- so it rejects the
-/// pair outright. Only a fact both ends state is compared.
+/// pair outright. Only a fact both ends state is compared: an unstated end (a
+/// null type, or a type neither helper can read) yields no fact and can never
+/// reject. The reads go through `TileFacts`, the one place a `!micro.tile` is
+/// unwrapped to the tensor its head spells, so a tile-typed port is compared
+/// rather than silently skipped -- the same element type and shape that size
+/// the moving value are what §10.2 compares here.
 bool elementAndShapeCompatible(const ConnectionRequest &request) {
-  std::optional<mlir::Type> producer =
-      comparableElementType(request.elementType);
-  std::optional<mlir::Type> consumer =
-      comparableElementType(request.consumerType);
-  if (producer && consumer && *producer != *consumer)
+  mlir::Type producer = elementTypeOf(request.elementType);
+  mlir::Type consumer = elementTypeOf(request.consumerType);
+  if (producer && consumer && producer != consumer)
     return false;
 
   std::optional<llvm::SmallVector<int64_t, 4>> producerShape =
-      staticShape(request.elementType);
+      staticShapeOf(request.elementType);
   std::optional<llvm::SmallVector<int64_t, 4>> consumerShape =
-      staticShape(request.consumerType);
+      staticShapeOf(request.consumerType);
   if (producerShape && consumerShape && *producerShape != *consumerShape)
     return false;
   return true;
@@ -242,18 +220,26 @@ enumeratePlacements(const MappingCandidate &candidate,
   // backend drops in here without touching placement.
   //
   // Every requirement must solve before any executor is tried; the resolved
-  // definition is kept so an instance can bind it. `layoutBindings` is a
-  // `StringMap<LayoutId>`, so it carries the layout *definition* id only: that
-  // is the registry-resolved id of the definition the requirement names, and is
-  // therefore string-identical to `requirement.layoutClass` by construction. A
-  // solve's concrete parameter assignment and affine map are not surfaced --
-  // there is no field on `CandidateInstance` for them, and a solve may report
-  // several, none of which placement selects (selection is the tuner's job).
-  // Recording solved parameters would be a data-model change, not a binding
-  // tweak.
+  // definition is kept so an instance can bind it, and its first legal solution
+  // is kept so the instance can record the parameterization it uses.
+  // `layoutBindings` carries the layout *definition* id only: the
+  // registry-resolved id of the definition the requirement names, and therefore
+  // string-identical to `requirement.layoutClass` by construction. The concrete
+  // assignment travels separately in `layoutSolutions`, because an instance
+  // that says only "t.blocked" cannot tell a materializer whether it meant
+  // `VW = 4` or `VW = 8`.
+  //
+  // A solve may report several solutions and placement does not rank them
+  // (choosing between them by cost is the tuner's job). It binds the *first*
+  // solution the solver reports: the solver enumerates the declared domains in
+  // declaration order, so that pick is deterministic and a plan is
+  // reproducible. A tuner that wants another solution needs a selection surface
+  // here -- recording a different one silently would be the worse failure.
   std::unique_ptr<LayoutSolver> layoutSolver = makeBoundedLayoutSolver();
   std::vector<const LayoutDef *> solvedDefs;
+  std::vector<LayoutSolution> solvedSolutions;
   solvedDefs.reserve(candidate.layoutRequirements.size());
+  solvedSolutions.reserve(candidate.layoutRequirements.size());
   for (const LayoutRequirement &requirement : candidate.layoutRequirements) {
     const LayoutDef *def = target.layouts().find(requirement.layoutClass);
     if (!def)
@@ -286,6 +272,7 @@ enumeratePlacements(const MappingCandidate &candidate,
       return std::vector<CandidateInstance>{};
     }
     solvedDefs.push_back(def);
+    solvedSolutions.push_back(solved->solutions.front());
   }
 
   std::vector<const ExecutorNode *> executors;
@@ -393,9 +380,23 @@ enumeratePlacements(const MappingCandidate &candidate,
       for (size_t j = 0; j < memoryChoices.size(); ++j)
         instance.memoryBindings[candidate.memoryRequirements[j].kind] =
             memoryChoices[j][pick[computeChoices.size() + j]]->id;
-      for (size_t i = 0; i < solvedDefs.size(); ++i)
-        instance.layoutBindings[candidate.layoutRequirements[i].layoutClass] =
-            solvedDefs[i]->id;
+      for (size_t i = 0; i < solvedDefs.size(); ++i) {
+        const std::string &layoutClass =
+            candidate.layoutRequirements[i].layoutClass;
+        instance.layoutBindings[layoutClass] = solvedDefs[i]->id;
+        // The solved assignment and its affine map, so the instance states
+        // *which* parameterization of the bound layout it uses (`VW = 8`, not
+        // merely "some legal `VW`"). `LayoutValue` and `SearchValue` are the
+        // same variant, so the values carry over without conversion.
+        SolvedLayout solvedLayout;
+        for (const auto &value : solvedSolutions[i].values)
+          solvedLayout.parameters[value.first] = value.second;
+        solvedLayout.map = solvedSolutions[i].map;
+        // Which value the requirement was solved for, so an edge can ask for
+        // *its* layout rather than the instance's only one.
+        solvedLayout.portValue = candidate.layoutRequirements[i].portValue;
+        instance.layoutSolutions[layoutClass] = std::move(solvedLayout);
+      }
 
       instance.resourceUsage.executorSlots = 1;
       for (const MemoryRequirement &requirement : candidate.memoryRequirements)
@@ -544,9 +545,11 @@ synthesizeConnections(const ConnectionRequest &request,
   // filter. Threaded only when the producer states a layout.
   if (!transformRequired && request.producerLayout)
     route.layoutClass = *request.producerLayout;
-  // liveBytesOnIntermediate stays unset: this layer keeps no occupancy state,
-  // so it has no live-byte figure to supply rather than a zero that would
-  // silently assert the intermediates are empty.
+  // The caller's per-memory live bytes travel with the request: this layer
+  // keeps no occupancy state of its own, so it forwards exactly the figure it
+  // was given and asserts nothing otherwise. An empty map leaves every
+  // intermediate treated as empty, the documented default.
+  route.liveBytesByIntermediate = request.intermediateOccupancy;
   llvm::Expected<llvm::SmallVector<MemoryRoute>> routes =
       topology.enumerateRoutes(route, options.maxRoutesPerConnection,
                                truncated);

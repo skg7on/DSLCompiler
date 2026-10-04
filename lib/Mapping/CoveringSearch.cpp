@@ -26,6 +26,7 @@
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/Routing.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/TileFacts.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -33,6 +34,7 @@
 #include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
+#include <cassert>
 #include <optional>
 #include <string>
 #include <utility>
@@ -44,13 +46,14 @@ namespace {
 using machine::MachineModel;
 using machine::MemoryNode;
 
-/// Byte count assumed for a value crossing a connection. The real size comes
-/// from the value's type once the plan binder carries it (#50/D7); costing a
-/// route needs a number now, and every plan is costed the same way.
-constexpr uint64_t kAssumedValueBytes = 4096;
+/// Byte count and alignment assumed for a value whose tile size cannot be
+/// derived (a dynamic shape, or a type the core does not model). These are the
+/// pre-phase-3 constants, kept so an unmeasurable value is costed exactly as it
+/// was -- but the fallback is *reported*, naming the value, never taken
+/// silently (see `factsForValue`).
+constexpr uint64_t kUnknownValueBytes = 4096;
 
-/// Alignment every fixture memory supports.
-constexpr uint64_t kAssumedAlignment = 32;
+constexpr uint64_t kUnknownAlignment = 32;
 
 /// A legal placement and the rule that produced it, so a selected plan can
 /// name the rule and bundle it chose.
@@ -115,6 +118,15 @@ struct Partial {
   unsigned covered = 0;
   uint64_t executorSlots = 0;
   llvm::StringMap<uint64_t> memoryBytes;
+  /// Per-value live-range accounting: the memory charges a value currently
+  /// owes, as exact (memory, bytes) pairs so the release subtracts precisely
+  /// what the charge added. Populated when the value's producer is placed and
+  /// cleared when the value's *last* consumer is placed. A value the graph
+  /// never fully consumes keeps its charges for the whole plan (it is not in
+  /// `valueLinks`, so nothing ever releases it) -- the conservative direction.
+  llvm::DenseMap<WorkloadValueId,
+                 llvm::SmallVector<std::pair<MemoryNodeId, uint64_t>, 2>>
+      liveValueCharges;
 };
 
 MemoryNodeId primaryMemory(const MachineModel &machine,
@@ -130,6 +142,40 @@ MemoryNodeId primaryMemory(const MachineModel &machine,
     if (machine.isVisible(memory.id, executor))
       return memory.id;
   return MemoryNodeId();
+}
+
+/// The layout `instance` bound for the value `value`, or nullopt when it bound
+/// none for it.
+///
+/// The match is by *value*, not by "the instance's one layout": a rule's layout
+/// requirement names a port, and the solved binding is recorded against the
+/// workload value that port carries. The edge being connected carries that same
+/// value (a port's value *is* the edge's value), so a binding solved for
+/// another value -- or for no resolvable port at all -- does not match. That is
+/// what keeps a layout named on one port from being attributed to an edge
+/// carrying a different one: `avx2.mma_bf16` requires `lhs` to be
+/// `avx2.row_major`, and `lhs` is an *input*, so the edge carrying the mma's
+/// `result` must not inherit that layout. Both directions of error are avoided
+/// rather than traded: a mis-attributed layout could fabricate a transform (or,
+/// because differing layouts now suppress `Direct`, drop a connection that was
+/// valid), while no attribution at all only costs the transform alternative for
+/// that edge.
+///
+/// Two layout classes solved for the same value are ambiguous -- the edge
+/// cannot say which governs -- so that is treated as unattributable too.
+std::optional<LayoutId> boundLayoutForValue(const CandidateInstance &instance,
+                                            WorkloadValueId value) {
+  std::optional<LayoutId> found;
+  for (const auto &entry : instance.layoutSolutions) {
+    if (entry.second.portValue != static_cast<int64_t>(value))
+      continue;
+    if (found)
+      return std::nullopt;
+    // The key is the resolved definition id, string-identical to this class's
+    // `layoutBindings` entry (see `SolvedLayout`'s invariant).
+    found = entry.first().str();
+  }
+  return found;
 }
 
 /// Hashes the chosen instance ids, so a partial plan has a stable identity
@@ -256,6 +302,40 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     key += message;
     if (recordedDiagnostics.insert(key).second)
       result.frontier.diagnostics.push_back({code, std::move(message)});
+  };
+
+  // The size of the tile a value carries, derived from its type. A dynamic
+  // shape or a type the core does not model cannot be sized: fall back to the
+  // pre-phase-3 constants and *report* it, naming the value, so an assumed size
+  // is never silent again (phase-3 ruling R1).
+  auto factsForValue = [&](WorkloadValueId value) -> TileFacts {
+    const WorkloadValue *moved = workload_.findValue(value);
+    TileFacts facts = moved ? tileFactsFor(moved->type) : TileFacts{};
+    if (facts.known)
+      return facts;
+    report(DiagnosticCode::AssumedValueSize,
+           "value " + std::to_string(value) + " ('" +
+               (moved ? moved->name : std::string("<unknown>")) +
+               "'): tile size unknown; assuming " +
+               std::to_string(kUnknownValueBytes) + " bytes, " +
+               std::to_string(kUnknownAlignment) + "-byte alignment");
+    facts.bytes = kUnknownValueBytes;
+    facts.alignment = kUnknownAlignment;
+    return facts;
+  };
+
+  // The byte count for a node with no output to size: its first input's tile,
+  // or -- for a node with no port at all -- the reported fallback. A node that
+  // writes no output materializes nothing attributable, so such a charge is
+  // never expired.
+  auto portlessBytes = [&](const WorkloadNode &node) -> uint64_t {
+    if (!node.inputs.empty())
+      return factsForValue(node.inputs.front().value).bytes;
+    report(DiagnosticCode::AssumedValueSize,
+           "node " + std::to_string(node.id) +
+               " has no port to size; assuming " +
+               std::to_string(kUnknownValueBytes) + " bytes");
+    return kUnknownValueBytes;
   };
 
   // --- node tables -----------------------------------------------------
@@ -459,15 +539,51 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     partial.executorSlots += instance.resourceUsage.executorSlots;
     if (partial.linked.size() != valueLinks.size())
       partial.linked.assign(valueLinks.size(), 0);
-    // A bound memory holds the tile this instance materializes, plus anything
+    // A bound memory holds the tiles this instance materializes, plus anything
     // the rule declared explicitly. `memoryBytes` is keyed by memory *node*, so
-    // each byte can be charged to the node that actually holds it: the binding
+    // each byte is charged to the memory that actually holds it: the binding
     // map resolves a requirement kind to the node placement chose, while
-    // `resourceUsage` is keyed by that requirement kind. Bytes are accumulated
-    // for the duration of the partial plan -- an honest conservative live-range
-    // bound, since true expiry is not modelled.
-    for (const auto &binding : instance.memoryBindings)
-      partial.memoryBytes[binding.second] += kAssumedValueBytes;
+    // `resourceUsage` is keyed by that requirement kind.
+    //
+    // The materialized tiles are the node's *outputs*. One binding holds every
+    // output the node writes, so it is charged their total -- sizing it from
+    // the first output alone under-charges a multi-output node, the unsafe
+    // direction for a capacity check. When a node declares several bindings the
+    // graph fixes no output-to-binding pairing (a memory requirement names a
+    // requirement *kind*, never the port that goes there), so each binding
+    // keeps the first-output fallback, an admitted lower bound, rather than
+    // guessing a pairing.
+    //
+    // Each charged output is also recorded as a live range: the bytes are
+    // released once its last consumer is placed (below), so a sequential
+    // program is not charged as if every value were simultaneously live. Only
+    // size the tile when there is a binding to charge it to; a rule that
+    // declares no memory charges nothing and must not report an assumption for
+    // a size it never uses.
+    if (!instance.memoryBindings.empty()) {
+      const WorkloadNode &workload = *tables[nodeIndex].workload;
+      if (workload.outputs.empty()) {
+        // No output to attribute: charge the first-input fallback for the whole
+        // plan. A sink materializes nothing we can expire.
+        const uint64_t bytes = portlessBytes(workload);
+        for (const auto &binding : instance.memoryBindings)
+          partial.memoryBytes[binding.second] += bytes;
+      } else if (instance.memoryBindings.size() == 1) {
+        const MemoryNodeId memory = instance.memoryBindings.begin()->second;
+        for (const WorkloadPort &output : workload.outputs) {
+          const uint64_t bytes = factsForValue(output.value).bytes;
+          partial.memoryBytes[memory] += bytes;
+          partial.liveValueCharges[output.value].push_back({memory, bytes});
+        }
+      } else {
+        const WorkloadValueId first = workload.outputs.front().value;
+        const uint64_t bytes = factsForValue(first).bytes;
+        for (const auto &binding : instance.memoryBindings) {
+          partial.memoryBytes[binding.second] += bytes;
+          partial.liveValueCharges[first].push_back({binding.second, bytes});
+        }
+      }
+    }
     for (const auto &usage : instance.resourceUsage.memoryBytes) {
       MemoryNodeId node = instance.memoryBindings.lookup(usage.first());
       if (node.empty())
@@ -491,8 +607,16 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       request.value = value;
       request.producerMemory = primaryMemory(machine, producer);
       request.consumerMemory = primaryMemory(machine, consumer);
-      request.bytes = kAssumedValueBytes;
-      request.alignmentBytes = kAssumedAlignment;
+      // The layout each endpoint bound for *this* value, so differing layouts
+      // make the pair a transform rather than a direct connection (§15.2).
+      // Without them the search could only ever reach
+      // `synthesizeConnections`' direct path, and a transform alternative was
+      // unreachable from the search.
+      request.producerLayout = boundLayoutForValue(producer, value);
+      request.consumerLayout = boundLayoutForValue(consumer, value);
+      const TileFacts facts = factsForValue(value);
+      request.bytes = facts.bytes;
+      request.alignmentBytes = facts.alignment;
       if (const WorkloadValue *moved = workload_.findValue(value))
         request.elementType = moved->type;
       if (consumerPort)
@@ -507,6 +631,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (ExecutorId executor = consumer.executorBindings.lookup("executor");
           !executor.empty())
         request.consumerExecutor = executor;
+      // The partial plan's live bytes per memory, so a route that stages
+      // through an already-occupied intermediate is rejected (§12.2's
+      // intermediate capacity *and liveness*). The router only looks entries up
+      // by node id and never iterates the map, so it cannot perturb
+      // determinism. The pair's own memories are harmless to include: a route
+      // never re-enters its source, and its destination is exempt.
+      request.intermediateOccupancy = partial.memoryBytes;
       return request;
     };
     // The alternative the declared objective prefers. `min_element` keeps the
@@ -541,6 +672,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // they are charged. A plain single-consumer `Transfer` is deliberately not
     // charged here: its destination tile is the consumer instance's own tile,
     // already counted through that instance's memory binding.
+    //
+    // Unlike the materialized values above, these bytes do *not* expire with
+    // their value: the live range of a copy or gather intermediate is simply
+    // not modelled yet, so it is charged for the whole partial plan. That is
+    // the conservative direction -- an intermediate is assumed live from the
+    // moment its copy is staged until the plan ends.
     llvm::StringMap<uint64_t> stagedBytes; // memory -> replica/gather bytes
 
     // Synthesizes one plain-edge connection, staging the chosen alternative.
@@ -571,6 +708,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       return true;
     };
 
+    // Values whose last endpoint this placement completes. Their bytes are
+    // released only after the capacity check below, so a consumer and the value
+    // it reads stay charged together while it is placed.
+    std::vector<size_t> completedLinks;
+
     for (size_t index = 0; index < valueLinks.size(); ++index) {
       const ValueLink &link = valueLinks[index];
       if (partial.linked[index])
@@ -585,6 +727,20 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (!complete)
         continue;
       partial.linked[index] = 1;
+      completedLinks.push_back(index);
+
+      // The size of the value this link moves, derived once and shared by the
+      // requests, the replica staging, and the gather's intermediate tile.
+      const TileFacts linkFacts = factsForValue(link.value);
+
+      // A zero-element value (a static 0 dimension) moves no bytes: it needs no
+      // route, layout transform, or staging, and synthesizing a connection for
+      // it would only trip the "bytes must be positive" rule. Budget it as
+      // free, matching the zero capacity it is charged. The Micro tile verifier
+      // rejects a 0 dimension, so this is reachable only through a modelled
+      // tensor/memref/vector value type.
+      if (linkFacts.bytes == 0)
+        continue;
 
       if (link.producers.size() == 1) {
         const ValueEndpoint &producerEnd = link.producers[0];
@@ -632,10 +788,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           staged.push_back(plan);
           cost = addCost(cost, staged.back().cost);
           // A copy occupies every memory after its source: its destination and
-          // any staging hop it passes through.
-          if (staged.back().kind == ConnectionKind::Replicate)
+          // any staging hop it passes through. The copy is one replica of the
+          // moved value, so the value's own derived bytes size it.
+          if (staged.back().kind == ConnectionKind::Replicate) {
             for (size_t hop = 1; hop < staged.back().memoryRoute.size(); ++hop)
-              stagedBytes[staged.back().memoryRoute[hop]] += kAssumedValueBytes;
+              stagedBytes[staged.back().memoryRoute[hop]] += linkFacts.bytes;
+          }
         }
         continue;
       }
@@ -707,12 +865,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         }
         ConnectionPlan reduce =
             synthesizeFanIn(producerIds, consumerIds, link.value,
-                            consumerMemory, kAssumedValueBytes, feedCost);
+                            consumerMemory, linkFacts.bytes, feedCost);
         reduce.transferEngines.assign(engines.begin(), engines.end());
         staged.push_back(std::move(reduce));
         cost = addCost(cost, staged.back().cost);
         // The gather stages its reduced intermediate tile on the consumer.
-        stagedBytes[consumerMemory] += kAssumedValueBytes;
+        stagedBytes[consumerMemory] += linkFacts.bytes;
       }
     }
 
@@ -753,6 +911,32 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
              "plan byte total exceeds the global budget (" +
                  std::to_string(options_.memoryBudgetBytes) + " bytes)");
       return false;
+    }
+
+    // The branch fits, so the values whose last consumer this placement is have
+    // now run: release the bytes they were charged. Releasing *after* the
+    // capacity check keeps a consumer and the value it reads charged together
+    // for the placement -- an operation reads its inputs and writes its outputs
+    // in the same step, so they genuinely overlap. Where the graph fixes no
+    // order, staying conservative is the rule (ruling R2): only a value whose
+    // last consumer is placed expires, and its bytes are charged the whole time
+    // every endpoint is still live.
+    for (size_t index : completedLinks) {
+      auto charges = partial.liveValueCharges.find(valueLinks[index].value);
+      if (charges == partial.liveValueCharges.end())
+        continue;
+      for (const auto &charge : charges->second) {
+        uint64_t &held = partial.memoryBytes[charge.first];
+        // Subtract exactly what was charged. The charge can never exceed what
+        // the memory still holds -- every release is a charge made earlier and
+        // not yet released -- so `held >= charge.second` holds; `min` only
+        // keeps a future accounting bug from underflowing instead of failing
+        // loudly, and never masks drift by clamping a correct value.
+        assert(held >= charge.second &&
+               "live-value release exceeds the memory's charged bytes");
+        held -= charge.second;
+      }
+      partial.liveValueCharges.erase(charges);
     }
 
     // The branch is legal: publish its connections to the shared pool.
@@ -992,6 +1176,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       placement.executor = instance->executorBindings.lookup("executor");
       placement.memories = instance->memoryBindings;
       placement.layouts = instance->layoutBindings;
+      // The solved parameterization travels with the binding, so a selected
+      // plan says which one it chose rather than only naming the layout family.
+      placement.layoutSolutions = instance->layoutSolutions;
       plan.placements.push_back(std::move(placement));
     }
     llvm::sort(plan.placements, placementBefore);

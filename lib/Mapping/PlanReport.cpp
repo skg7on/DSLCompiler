@@ -19,6 +19,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -45,17 +46,36 @@ llvm::StringRef stringifySearchMode(SearchMode mode) {
 }
 
 /// True when `code` names a *rejection* -- something the search refused -- as
-/// opposed to a notice. §22.2 asks for "rejected counts", so `search_truncated`
-/// (a cap, not a rejection) and `latency_cache_miss` (a provider gap, not a
-/// rejection) are reported separately and never inflate the rejection tally.
+/// opposed to a notice. §22.2 asks for "rejected counts", so a notice never
+/// inflates the rejection tally.
+///
+/// Every code is classified explicitly and there is deliberately no `default`:
+/// a code added to the enum without a case here makes this switch incomplete
+/// (`-Wswitch`), rather than silently defaulting into the rejection bucket.
+/// `AssumedValueSize` is the case that motivated it -- its own documentation
+/// says it is not an error, so it must land under notices.
 bool isRejection(DiagnosticCode code) {
   switch (code) {
+  // Notices: a cap, a provider gap, or an advisory assumption. None is a
+  // refusal the search made.
   case DiagnosticCode::SearchTruncated:
   case DiagnosticCode::LatencyCacheMiss:
+  case DiagnosticCode::AssumedValueSize:
     return false;
-  default:
+  // Rejections: the search refused a rule, a placement, a pair, a layout, a
+  // global constraint, a bundle, or a plan.
+  case DiagnosticCode::NoMatchingRule:
+  case DiagnosticCode::NoLegalLayout:
+  case DiagnosticCode::NoLegalExecutor:
+  case DiagnosticCode::MemoryCapacityExceeded:
+  case DiagnosticCode::UnsupportedComputeFragment:
+  case DiagnosticCode::NoMemoryRoute:
+  case DiagnosticCode::NoLayoutTransform:
+  case DiagnosticCode::GlobalConstraintFailed:
+  case DiagnosticCode::TargetBundleInvalid:
     return true;
   }
+  llvm_unreachable("unclassified DiagnosticCode");
 }
 
 /// Fixed six-decimal rendering of a double, matching `canonicalCostString`, so
@@ -175,6 +195,15 @@ std::string writePlanReport(const MappingSearchResult &result,
       for (size_t rank = 0; rank < result.plans.size(); ++rank) {
         const CoveringPlan &plan = result.plans[rank];
         json.object([&] {
+          // The plan's content id. It is a snapshot for correlation, *not*
+          // something a reader can recompute from this document: the id folds
+          // content the summary below does not emit -- since phase-3 T4 the
+          // solved layout parameterization of every instance and placement
+          // (`CoveringPlan` -> `PlanPlacement::layoutSolutions`), as well as
+          // the placements' layouts -- so an id cannot be re-derived from the
+          // report's content. (Re-emitting the same search's report does carry
+          // every id through verbatim; it just cannot be recomputed from what
+          // the document shows.)
           json.attribute("id", hexId(plan.id));
           json.attribute("rank", static_cast<uint64_t>(rank));
           json.attribute("sourceBindingHash", hexId(plan.sourceBindingHash));
