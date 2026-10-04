@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -80,6 +81,35 @@ TEST(LayoutParse, BareParamDefaultsToInteger) {
 TEST(LayoutParse, SymbolicParamIsMarked) {
   EXPECT_TRUE(
       parses("layout t.one(sym policy) { param policy in {\"a\", \"b\"}; }"));
+}
+
+TEST(LayoutParse, ParsesRangesEndingAtInt64Max) {
+  auto registry = parse(R"llkmap(
+layout t.edge(singleton, pair) {
+  param singleton in [9223372036854775807..9223372036854775807];
+  param pair in [9223372036854775806..9223372036854775807];
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const auto *def = registry->find("t.edge");
+  ASSERT_NE(def, nullptr);
+  const auto &singleton = def->domains.at("singleton").values;
+  ASSERT_EQ(singleton.size(), 1u);
+  EXPECT_EQ(std::get<int64_t>(singleton[0]),
+            std::numeric_limits<int64_t>::max());
+  const auto &pair = def->domains.at("pair").values;
+  ASSERT_EQ(pair.size(), 2u);
+  EXPECT_EQ(std::get<int64_t>(pair[0]),
+            std::numeric_limits<int64_t>::max() - 1);
+  EXPECT_EQ(std::get<int64_t>(pair[1]), std::numeric_limits<int64_t>::max());
+}
+
+TEST(LayoutParse, TypeKeywordsRequireExplicitParameterNames) {
+  EXPECT_FALSE(parses("layout t.one(int) {}"));
+  EXPECT_FALSE(parses("layout t.one(sym) {}"));
+  EXPECT_TRUE(parses("layout t.one(int int, sym sym) {"
+                     "param int in {1}; param sym in {\"a\"}; }"));
 }
 
 TEST(LayoutParse, RejectsDuplicateLayoutId) {

@@ -1,5 +1,8 @@
 # LLKMap Layout Grammar
 
+For the formal merged-implementation grammar and validation rules, see
+[LLKMap formal syntax](llkmap-syntax.md) and [the EBNF](llkmap.ebnf).
+
 LLKMap is the small declarative language that describes target layout legality.
 Its layout subset — the part implemented today — lets a target declare the
 concrete layouts it supports and the constraints under which each is legal,
@@ -23,11 +26,12 @@ queries only, so a layout file never names a concrete executor.
 file       ::= layout*
 layout     ::= "layout" id "(" params ")" "{" stmt* "}"
 params     ::= [ param ("," param)* ]
-param      ::= [ "int" | "sym" ] ident          // a bare name means int
+param      ::= ( "int" | "sym" ) ident | untyped-name
+untyped-name ::= ident except "int" and "sym"   // a bare name means int
 stmt       ::= domain | require | map
 domain     ::= "param" ident "in" ( "[" int ".." int "]" | "{" literal ("," literal)* "}" ) ";"
 require    ::= "require" expr ";"
-map        ::= "map" "(" ident ("," ident)* ")" "->" "(" expr ("," expr)* ")" ";"
+map        ::= "map" "(" [ ident ("," ident)* ] ")" "->" "(" expr ("," expr)* ")" ";"
 expr       ::= or
 or         ::= and ("||" and)*
 and        ::= equality ("&&" equality)*
@@ -57,8 +61,8 @@ A `layout` names its integer and symbolic parameters, then states:
   without a domain is *unbound* and rejected when solved.
 - **constraints** — boolean `require` expressions, all of which must hold.
 - **map** — the affine logical-to-physical mapping. The `map` clause's
-  identifiers are the logical dimensions; referenced parameters become affine
-  symbols. Only affine operations are allowed (`+ - * floordiv ceildiv mod`,
+  identifiers are the logical dimensions; solved integer parameters become affine
+  constants. Only affine operations are allowed (`+ - * floordiv ceildiv mod`,
   constants, dims, symbols).
 
 ### Builtins
