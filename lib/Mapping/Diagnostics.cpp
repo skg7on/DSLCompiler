@@ -38,6 +38,8 @@ llvm::StringRef stringifyDiagnosticCode(DiagnosticCode code) {
     return "latency_cache_miss";
   case DiagnosticCode::TargetBundleInvalid:
     return "target_bundle_invalid";
+  case DiagnosticCode::AssumedValueSize:
+    return "assumed_value_size";
   }
   return "";
 }
@@ -56,6 +58,7 @@ std::optional<DiagnosticCode> symbolizeDiagnosticCode(llvm::StringRef name) {
       .Case("search_truncated", DiagnosticCode::SearchTruncated)
       .Case("latency_cache_miss", DiagnosticCode::LatencyCacheMiss)
       .Case("target_bundle_invalid", DiagnosticCode::TargetBundleInvalid)
+      .Case("assumed_value_size", DiagnosticCode::AssumedValueSize)
       .Default(std::nullopt);
 }
 

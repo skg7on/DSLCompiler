@@ -26,6 +26,7 @@
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/Routing.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/TileFacts.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -44,13 +45,14 @@ namespace {
 using machine::MachineModel;
 using machine::MemoryNode;
 
-/// Byte count assumed for a value crossing a connection. The real size comes
-/// from the value's type once the plan binder carries it (#50/D7); costing a
-/// route needs a number now, and every plan is costed the same way.
-constexpr uint64_t kAssumedValueBytes = 4096;
+/// Byte count and alignment assumed for a value whose tile size cannot be
+/// derived (a dynamic shape, or a type the core does not model). These are the
+/// pre-phase-3 constants, kept so an unmeasurable value is costed exactly as it
+/// was -- but the fallback is *reported*, naming the value, never taken
+/// silently (see `factsForValue`).
+constexpr uint64_t kUnknownValueBytes = 4096;
 
-/// Alignment every fixture memory supports.
-constexpr uint64_t kAssumedAlignment = 32;
+constexpr uint64_t kUnknownAlignment = 32;
 
 /// A legal placement and the rule that produced it, so a selected plan can
 /// name the rule and bundle it chose.
@@ -256,6 +258,41 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     key += message;
     if (recordedDiagnostics.insert(key).second)
       result.frontier.diagnostics.push_back({code, std::move(message)});
+  };
+
+  // The size of the tile a value carries, derived from its type. A dynamic
+  // shape or a type the core does not model cannot be sized: fall back to the
+  // pre-phase-3 constants and *report* it, naming the value, so an assumed size
+  // is never silent again (phase-3 ruling R1).
+  auto factsForValue = [&](WorkloadValueId value) -> TileFacts {
+    const WorkloadValue *moved = workload_.findValue(value);
+    TileFacts facts = moved ? tileFactsFor(moved->type) : TileFacts{};
+    if (facts.known)
+      return facts;
+    report(DiagnosticCode::AssumedValueSize,
+           "value " + std::to_string(value) + " ('" +
+               (moved ? moved->name : std::string("<unknown>")) +
+               "'): tile size unknown; assuming " +
+               std::to_string(kUnknownValueBytes) + " bytes, " +
+               std::to_string(kUnknownAlignment) + "-byte alignment");
+    facts.bytes = kUnknownValueBytes;
+    facts.alignment = kUnknownAlignment;
+    return facts;
+  };
+
+  // The bytes one instance materializes: its first output tile, or -- for a
+  // node the graph records no output for -- its first input. A node with no
+  // ports is sized by the reported fallback.
+  auto materializedBytes = [&](const WorkloadNode &node) -> uint64_t {
+    if (!node.outputs.empty())
+      return factsForValue(node.outputs.front().value).bytes;
+    if (!node.inputs.empty())
+      return factsForValue(node.inputs.front().value).bytes;
+    report(DiagnosticCode::AssumedValueSize,
+           "node " + std::to_string(node.id) +
+               " has no port to size; assuming " +
+               std::to_string(kUnknownValueBytes) + " bytes");
+    return kUnknownValueBytes;
   };
 
   // --- node tables -----------------------------------------------------
@@ -466,8 +503,15 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // `resourceUsage` is keyed by that requirement kind. Bytes are accumulated
     // for the duration of the partial plan -- an honest conservative live-range
     // bound, since true expiry is not modelled.
-    for (const auto &binding : instance.memoryBindings)
-      partial.memoryBytes[binding.second] += kAssumedValueBytes;
+    // Only size the tile when there is a binding to charge it to; a rule that
+    // declares no memory charges nothing and must not report an assumption for
+    // a size it never uses.
+    if (!instance.memoryBindings.empty()) {
+      const uint64_t instanceBytes =
+          materializedBytes(*tables[nodeIndex].workload);
+      for (const auto &binding : instance.memoryBindings)
+        partial.memoryBytes[binding.second] += instanceBytes;
+    }
     for (const auto &usage : instance.resourceUsage.memoryBytes) {
       MemoryNodeId node = instance.memoryBindings.lookup(usage.first());
       if (node.empty())
@@ -491,8 +535,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       request.value = value;
       request.producerMemory = primaryMemory(machine, producer);
       request.consumerMemory = primaryMemory(machine, consumer);
-      request.bytes = kAssumedValueBytes;
-      request.alignmentBytes = kAssumedAlignment;
+      const TileFacts facts = factsForValue(value);
+      request.bytes = facts.bytes;
+      request.alignmentBytes = facts.alignment;
       if (const WorkloadValue *moved = workload_.findValue(value))
         request.elementType = moved->type;
       if (consumerPort)
@@ -586,6 +631,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         continue;
       partial.linked[index] = 1;
 
+      // The size of the value this link moves, derived once and shared by the
+      // requests, the replica staging, and the gather's intermediate tile.
+      const TileFacts linkFacts = factsForValue(link.value);
+
       if (link.producers.size() == 1) {
         const ValueEndpoint &producerEnd = link.producers[0];
         const CandidateInstance &producer = *partial.chosen[producerEnd.node];
@@ -632,10 +681,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           staged.push_back(plan);
           cost = addCost(cost, staged.back().cost);
           // A copy occupies every memory after its source: its destination and
-          // any staging hop it passes through.
-          if (staged.back().kind == ConnectionKind::Replicate)
+          // any staging hop it passes through. The copy is one replica of the
+          // moved value, so the value's own derived bytes size it.
+          if (staged.back().kind == ConnectionKind::Replicate) {
             for (size_t hop = 1; hop < staged.back().memoryRoute.size(); ++hop)
-              stagedBytes[staged.back().memoryRoute[hop]] += kAssumedValueBytes;
+              stagedBytes[staged.back().memoryRoute[hop]] += linkFacts.bytes;
+          }
         }
         continue;
       }
@@ -707,12 +758,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         }
         ConnectionPlan reduce =
             synthesizeFanIn(producerIds, consumerIds, link.value,
-                            consumerMemory, kAssumedValueBytes, feedCost);
+                            consumerMemory, linkFacts.bytes, feedCost);
         reduce.transferEngines.assign(engines.begin(), engines.end());
         staged.push_back(std::move(reduce));
         cost = addCost(cost, staged.back().cost);
         // The gather stages its reduced intermediate tile on the consumer.
-        stagedBytes[consumerMemory] += kAssumedValueBytes;
+        stagedBytes[consumerMemory] += linkFacts.bytes;
       }
     }
 

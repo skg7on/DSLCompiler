@@ -4,6 +4,11 @@
 #include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/LatencyProvider.h"
 
+#include "LLK/Dialect/Micro/MicroDialect.h"
+
+#include "mlir/AsmParser/AsmParser.h"
+#include "mlir/IR/MLIRContext.h"
+
 #include "llvm/Support/Error.h"
 
 #include <gtest/gtest.h>
@@ -50,10 +55,11 @@ MachineModel twoWorkerMachine() {
   return model;
 }
 
-/// `searchMachine` with the sram node shrunk to 5000 bytes. The search charges
-/// 4096 bytes per bound instance (kAssumedValueBytes), so one instance fits the
-/// node while two do not -- and two still fit the default global byte budget,
-/// leaving the per-memory check as the only thing that can reject the pair.
+/// `searchMachine` with the sram node shrunk to 5000 bytes. The fixtures here
+/// carry untyped values, so the search falls back to 4096 bytes per bound
+/// instance; one instance fits the node while two do not -- and two still fit
+/// the default global byte budget, leaving the per-memory check as the only
+/// thing that can reject the pair.
 MachineModel smallMemoryMachine() {
   MachineModel model = searchMachine();
   for (MemoryNode &memory : model.memories)
@@ -96,6 +102,36 @@ WorkloadGraph twoNodeGraph(mlir::MLIRContext &context,
   consumer.attributes = vectorAttributes(context, consumerOp);
   consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
   consumer.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+/// `twoNodeGraph` with every value and port carrying `tile`, so the search
+/// derives real bytes for each materialized tile and each crossing instead of
+/// sizing everything with a constant.
+WorkloadGraph twoNodeTileGraph(mlir::MLIRContext &context, mlir::Type tile) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, tile, "in", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, tile, "mid", /*external=*/false});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, tile, "out", /*external=*/false});
+
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.attributes = vectorAttributes(context, "add");
+  producer.inputs.push_back(WorkloadPort{input, tile, std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, tile, std::nullopt});
+  graph.addNode(std::move(producer));
+
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.attributes = vectorAttributes(context, "add");
+  consumer.inputs.push_back(WorkloadPort{middle, tile, std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{output, tile, std::nullopt});
   graph.addNode(std::move(consumer));
 
   graph.finalize();
@@ -1156,6 +1192,83 @@ TEST(CoveringSearch, PerMemoryCapacityRejectsOverSubscription) {
   EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
 }
 
+// §9.3: the bytes a memory is charged are the value's own, not a constant. Two
+// `!micro.tile<8x32xf32>` tiles are 1024 bytes each, so 2048 fits the
+// 5000-byte sram node -- where the old 4096-byte-per-instance assumption
+// (8192) would have rejected the pair outright. The derived size is what makes
+// the plan legal.
+TEST(CoveringSearch, CapacityUsesTheRealValueSizeNotAConstant) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = twoNodeTileGraph(context, tile);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(smallMemoryMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  // The premise: two real 1024-byte tiles fit the node, two 4096-byte
+  // assumptions would not -- so the old constant could not have produced this
+  // legal plan.
+  const MemoryNode *sram = target->machine().findMemory("sram.0");
+  ASSERT_NE(sram, nullptr);
+  ASSERT_GE(sram->capacityBytes, 2u * 1024u);
+  ASSERT_LT(sram->capacityBytes, 2u * 4096u);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
+// Phase-3 ruling R1: a value whose size cannot be derived is still costed, but
+// the fallback is *reported*, naming the value -- an assumed size must never be
+// silent again.
+TEST(CoveringSearch, AnUnknownValueSizeIsReportedNotSilent) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context); // untyped values
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::AssumedValueSize));
+
+  bool namedTheValue = false;
+  for (const Diagnostic &diagnostic : result->frontier.diagnostics)
+    if (diagnostic.code == DiagnosticCode::AssumedValueSize &&
+        diagnostic.message.find("'mid'") != std::string::npos)
+      namedTheValue = true;
+  EXPECT_TRUE(namedTheValue);
+}
+
+// The complement: a value the graph types is sized exactly, so no assumption is
+// reported.
+TEST(CoveringSearch, AKnownValueSizeIsNotReported) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = twoNodeTileGraph(context, tile);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(smallMemoryMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_FALSE(hasDiagnostic(*result, DiagnosticCode::AssumedValueSize));
+}
+
 // A connection across two *different* memories must run producer -> consumer,
 // not the reverse. The #97 bug reversed the endpoints when the connection was
 // synthesized as the consumer instance completed the edge, and every fixture
@@ -1893,6 +2006,7 @@ TEST(MappingDiagnostics, EveryCodeRoundTripsThroughItsString) {
       DiagnosticCode::SearchTruncated,
       DiagnosticCode::LatencyCacheMiss,
       DiagnosticCode::TargetBundleInvalid,
+      DiagnosticCode::AssumedValueSize,
   };
   for (DiagnosticCode code : codes) {
     llvm::StringRef text = stringifyDiagnosticCode(code);

@@ -65,6 +65,11 @@ enum class DiagnosticCode {
   /// verified when a target is loaded (`verifyMappingTarget`), so the search
   /// never sees an invalid one and has no producer today.
   TargetBundleInvalid,
+  /// A value's tile size could not be derived (a dynamic shape or an
+  /// unmodelled type), so the search sized it with the fallback constant. The
+  /// message names the value. This is not an error: the fallback keeps the
+  /// plan searchable, but an assumed size must not be silent.
+  AssumedValueSize,
 };
 
 /// The stable string for `code` (for example `no_matching_rule`). Never empty.
