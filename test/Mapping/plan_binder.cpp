@@ -448,6 +448,42 @@ TEST(PlanBinder, ReportsALayoutTransformConnectionItCannotMaterialize) {
             "value 7: layout_transform_requires_dialect_op");
 }
 
+// The executable contract refuses exactly the plan the partial contract
+// reports: a caller that will hand the result to a backend must not receive IR
+// that silently omits a selected decision, while analysis/reporting keeps the
+// partial plan.
+TEST(PlanBinder, ExecutableContractRefusesAPlanThatOmitsADecision) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+
+  CoveringPlan plan;
+  plan.id = 42;
+  PlanConnection connection;
+  connection.id = 1;
+  connection.value = 7;
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route.push_back("sram.0");
+  plan.connectionPlans.push_back(connection);
+
+  // The partial contract binds it and reports the omission.
+  llvm::Expected<BoundPlan> partial =
+      bindPlan(*fixture.module, plan, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(partial))
+      << llvm::toString(partial.takeError());
+  EXPECT_FALSE(partial->unmaterialized.empty());
+
+  // The executable contract refuses it, naming the decision.
+  llvm::Expected<BoundPlan> executable = bindPlan(
+      *fixture.module, plan, *fixture.target, BindContract::Executable);
+  ASSERT_FALSE(static_cast<bool>(executable));
+  std::string error = llvm::toString(executable.takeError());
+  EXPECT_NE(error.find("not fully executable"), std::string::npos) << error;
+  EXPECT_NE(error.find("layout_transform_requires_dialect_op"),
+            std::string::npos)
+      << error;
+}
+
 TEST(PlanBinder, ReportsOtherConnectionKindsItCannotMaterialize) {
   // `Replicate` and `Reduce` are not plain movements, so the binder emits
   // nothing for them today. They must still be reported rather than dropped.

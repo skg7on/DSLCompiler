@@ -232,7 +232,8 @@ llvm::Expected<mlir::Operation *> findKernel(mlir::ModuleOp module) {
 
 llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
                                    const CoveringPlan &plan,
-                                   const MappingTarget &target) {
+                                   const MappingTarget &target,
+                                   BindContract contract) {
   mlir::OwningOpRef<mlir::ModuleOp> module(
       mlir::cast<mlir::ModuleOp>(source->clone()));
   llvm::Expected<mlir::Operation *> resolvedKernel = findKernel(*module);
@@ -541,6 +542,20 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
         uses.push_back(&use);
     for (mlir::OpOperand *use : uses)
       use->set(lastCopy->getResult(0));
+  }
+
+  // An executable contract refuses a plan it could not fully materialize: the
+  // caller asked for code a backend may run, and a partial binding would omit
+  // part of the selected plan without saying so in a form the backend checks.
+  // The partial contract keeps the report, which is the analysis contract.
+  if (contract == BindContract::Executable && !bound.unmaterialized.empty()) {
+    std::string message =
+        "bindPlan: the plan is not fully executable; " +
+        std::to_string(bound.unmaterialized.size()) +
+        " execution-affecting decision(s) could not be materialized:";
+    for (const std::string &reason : bound.unmaterialized)
+      message += "\n  " + reason;
+    return bindError(message);
   }
 
   bound.planId = plan.id;

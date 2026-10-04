@@ -40,6 +40,23 @@ struct BoundPlan {
   std::vector<std::string> unmaterialized;
 };
 
+/// How strict binding is about execution-affecting decisions the binder cannot
+/// yet materialize (design §18.2). The distinction is the difference between a
+/// useful *analysis* artifact and something a backend may execute: a partial
+/// plan is honest about what it left out, but must not be mistaken for
+/// executable code.
+enum class BindContract {
+  /// Bind every decision that can be materialized and report the rest in
+  /// `BoundPlan::unmaterialized`. The result is a partial plan, for analysis,
+  /// reporting, and the report-only workflow. This is the default.
+  Partial,
+  /// Refuse a plan that is not fully executable: any unresolved
+  /// execution-affecting decision is an error naming the decisions, so a caller
+  /// that will hand the result to a backend cannot silently receive IR that
+  /// omits part of the selected plan.
+  Executable,
+};
+
 /// Clones `source`, extracts its workload graph, and writes the plan's
 /// selections onto the clone: a `micro.plan` dictionary on the kernel (plan
 /// id, binding hash, truncation) and `micro.mapping` on each covered
@@ -67,9 +84,17 @@ struct BoundPlan {
 /// token (a `LayoutTransform` connection is reported as
 /// `layout_transform_requires_dialect_op`), while a movement that fails reports
 /// its own specific cause.
-llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
-                                   const CoveringPlan &plan,
-                                   const MappingTarget &target);
+///
+/// `contract` decides what an unresolved decision means. Under
+/// `BindContract::Partial` (the default) the plan is bound with those
+/// connections reported, which is the analysis/reporting contract; under
+/// `BindContract::Executable` the same situation is an error naming every
+/// unresolved decision, so a caller that will hand the result to a backend
+/// cannot receive IR that omits part of the selected plan.
+llvm::Expected<BoundPlan>
+bindPlan(mlir::ModuleOp source, const CoveringPlan &plan,
+         const MappingTarget &target,
+         BindContract contract = BindContract::Partial);
 
 /// Layered verification of mapped Micro-IR (design §18.3), in order:
 ///

@@ -81,6 +81,12 @@ struct MicroMapOptions {
   /// the binding's hash, so a binding-derived id is only reproducible by a
   /// search at the same candidate (ruling S8).
   std::string candidate;
+  /// When set, binding requires the plan be fully executable: an
+  /// execution-affecting decision the binder cannot materialize fails the pass
+  /// instead of being warned about and left in a partial plan (design §18.2).
+  /// The default (off) keeps the partial/analysis contract. `report-only`
+  /// ignores it -- a report-only run never binds.
+  bool requireExecutable = false;
 };
 
 /// `micro-bind-plan` runs the same search and binds the one plan whose id the

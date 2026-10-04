@@ -462,11 +462,12 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
 /// report is surfaced as a warning and the pass still succeeds. The reports are
 /// captured before `takeBody`, because taking the body is what lets the
 /// `BoundPlan` fall out of scope.
-inline llvm::Error bindPlanOntoModule(ModuleOp module,
-                                      const mapping::CoveringPlan &plan,
-                                      const mapping::MappingTarget &target) {
+inline llvm::Error bindPlanOntoModule(
+    ModuleOp module, const mapping::CoveringPlan &plan,
+    const mapping::MappingTarget &target,
+    mapping::BindContract contract = mapping::BindContract::Partial) {
   llvm::Expected<mapping::BoundPlan> bound =
-      mapping::bindPlan(module, plan, target);
+      mapping::bindPlan(module, plan, target, contract);
   if (!bound)
     return bound.takeError();
   for (const std::string &unmaterialized : bound->unmaterialized)
