@@ -672,6 +672,75 @@ rule r.consume_b {
 }
 )llkmap";
 
+/// One producer rule and one consumer rule over the `twoDestinationHopMachine`
+/// topology, plus a third rule that parks an instance on the staging sram. The
+/// `a_`/`m_`/`z_` operation-name prefixes sort the content-keyed node order to
+/// hold -> produce -> consume, so `a_hold`'s live tile is charged to the
+/// staging memory before the producer -> consumer connection is synthesized.
+constexpr llvm::StringLiteral kOccupiedStagingRules = R"llkmap(
+rule r.hold {
+  match micro.vector(op = "a_hold");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.hold";
+  emit "e1";
+  cost 1;
+}
+rule r.produce {
+  match micro.vector(op = "m_produce");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "z_consume");
+  require executor kind worker;
+  require memory kind acc;
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// `a_hold -> {hold_out}`, `m_produce -> mid -> z_consume`, over `tile`.
+/// `a_hold` binds the staging sram and its output tile stays live there (no
+/// consumer ever releases it); `m_produce` binds dram and `z_consume` binds
+/// acc, so the one crossing value `mid` can only reach its consumer by staging
+/// through the memory `a_hold` already occupies.
+WorkloadGraph occupiedStagingGraph(mlir::MLIRContext &context,
+                                   mlir::Type tile) {
+  WorkloadGraph graph;
+  WorkloadValueId holdIn =
+      graph.addValue(WorkloadValue{0, tile, "hold_in", /*external=*/true});
+  WorkloadValueId holdOut =
+      graph.addValue(WorkloadValue{0, tile, "hold_out", /*external=*/false});
+  WorkloadValueId in =
+      graph.addValue(WorkloadValue{0, tile, "in", /*external=*/true});
+  WorkloadValueId mid =
+      graph.addValue(WorkloadValue{0, tile, "mid", /*external=*/false});
+  WorkloadValueId out =
+      graph.addValue(WorkloadValue{0, tile, "out", /*external=*/false});
+
+  auto node = [&](unsigned ordinal, llvm::StringRef op, WorkloadValueId input,
+                  WorkloadValueId output) {
+    WorkloadNode n;
+    n.opName = "micro.vector";
+    n.sourceOrdinal = ordinal;
+    n.attributes = vectorAttributes(context, op);
+    n.inputs.push_back(WorkloadPort{input, tile, std::nullopt});
+    n.outputs.push_back(WorkloadPort{output, tile, std::nullopt});
+    graph.addNode(std::move(n));
+  };
+  node(0, "a_hold", holdIn, holdOut);
+  node(1, "m_produce", in, mid);
+  node(2, "z_consume", mid, out);
+
+  graph.finalize();
+  return graph;
+}
+
 std::unique_ptr<MappingTarget> targetWith(MachineModel machine,
                                           llvm::StringRef rules) {
   llvm::Expected<RuleRegistry> registry = parseRuleText(rules, "<test>");
@@ -1674,6 +1743,76 @@ TEST(CoveringSearch, ReplicateIntermediateHopsCountAgainstCapacity) {
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   EXPECT_TRUE(result->plans.empty());
   EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// Phase-3 T3: a connection whose only route stages through a memory that
+// already holds another instance's live tile is illegal. `a_hold` writes its
+// 1024-byte tile to the staging sram and nothing ever releases it, so when
+// `z_consume` completes the `m_produce -> z_consume` crossing the router must
+// charge that live tile against the staging memory: 1500 - 1024 < 1024, so the
+// staging hop is rejected. The occupancy is the partial plan's real live bytes,
+// derived from the tile type, not a constant. With the occupancy left unset
+// (the pre-fix behaviour) the route fits and a plan is found.
+TEST(CoveringSearch, OccupiedStagingMemoryRejectsTheConnection) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  const uint64_t tileBytes = tileFactsFor(tile).bytes;
+  ASSERT_EQ(tileBytes, 1024u); // 8 * 32 * 4, so no magic constant
+
+  WorkloadGraph graph = occupiedStagingGraph(context, tile);
+  MachineModel machine = twoDestinationHopMachine();
+  for (MemoryNode &memory : machine.memories)
+    if (memory.kind == "sram")
+      memory.capacityBytes = 1500;
+  // Premise: one staging tile fits, the live tile plus the staged value do not.
+  const MemoryNode *stage = machine.findMemory("stage.0");
+  ASSERT_NE(stage, nullptr);
+  ASSERT_GE(stage->capacityBytes, tileBytes);
+  ASSERT_LT(stage->capacityBytes, 2u * tileBytes);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kOccupiedStagingRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+}
+
+// Control for the test above: the same graph and topology with a staging memory
+// large enough to hold the live tile *and* the staged value yields a legal
+// plan. The rejection above is therefore the occupancy, not the route's shape.
+TEST(CoveringSearch, StagingMemoryWithRoomAdmitsTheConnection) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  const uint64_t tileBytes = tileFactsFor(tile).bytes;
+
+  WorkloadGraph graph = occupiedStagingGraph(context, tile);
+  MachineModel machine = twoDestinationHopMachine();
+  for (MemoryNode &memory : machine.memories)
+    if (memory.kind == "sram")
+      memory.capacityBytes = 4u * tileBytes;
+  const MemoryNode *stage = machine.findMemory("stage.0");
+  ASSERT_NE(stage, nullptr);
+  ASSERT_GE(stage->capacityBytes, 2u * tileBytes);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kOccupiedStagingRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
 }
 
 // A gather's intermediate tile is charged to the consumer's memory too: the

@@ -31,6 +31,7 @@
 #include "LLK/Mapping/MappingPlan.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
@@ -50,9 +51,10 @@ namespace mlir::llk::mapping {
 /// and that liveness be satisfied. Transaction size is checked against every
 /// hop link unconditionally. The layout and liveness facts are opt-in:
 /// `layoutClass` names the layout the value is stored in and must be listed in
-/// every memory's `supportedLayouts`; `liveBytesOnIntermediate` is the caller's
-/// occupancy of an intermediate staging memory. Leaving either unset means the
-/// caller carries no such fact, and its check is skipped rather than guessed.
+/// every memory's `supportedLayouts`; `liveBytesOnIntermediate` and
+/// `liveBytesByIntermediate` are the caller's occupancy of intermediate staging
+/// memories. Leaving either unset means the caller carries no such fact, and
+/// its check is skipped rather than guessed.
 /// A memory supports a declared layout when it names it in `supportedLayouts`;
 /// a memory that declares none supports none. The router relies on this to
 /// legalize a hop and connection synthesis relies on it to legalize a
@@ -78,14 +80,22 @@ struct RouteRequest {
   /// Live bytes charged against *every* intermediate memory a route stages
   /// through -- one scalar, not a per-node occupancy figure. A hop into an
   /// intermediate is legal only when
-  /// `capacityBytes - min(liveBytesOnIntermediate, capacityBytes) >= bytes`.
-  /// The single scalar is deliberate: the routing layer evaluates one
-  /// connection at a time and keeps no node-occupancy vector, so it cannot
-  /// distinguish the intermediates' occupancies; a caller that needs per-node
-  /// precision must supply the tightest figure. 0 means the caller models no
-  /// live data. The destination already holds the value, so it is exempt, as
-  /// it is from the plain capacity check.
+  /// `capacityBytes - min(live, capacityBytes) >= bytes`. The single scalar is
+  /// deliberate: the routing layer evaluates one connection at a time and keeps
+  /// no node-occupancy vector, so it cannot distinguish the intermediates'
+  /// occupancies; a caller that needs per-node precision fills
+  /// `liveBytesByIntermediate` below. 0 means the caller models no live data.
+  /// The destination already holds the value, so it is exempt, as it is from
+  /// the plain capacity check.
   uint64_t liveBytesOnIntermediate = 0;
+
+  /// Live bytes for a *named* intermediate memory, overriding the scalar above
+  /// for the node it names. A hop into `m` uses
+  /// `liveBytesByIntermediate[m]` when the map has an entry for `m`, and
+  /// `liveBytesOnIntermediate` otherwise. The map is consulted by node id only
+  /// -- it is never iterated -- so it carries no ordering and cannot affect
+  /// route determinism.
+  llvm::StringMap<uint64_t> liveBytesByIntermediate;
 };
 
 /// One legal way to move a value, cheapest-first within an enumeration.

@@ -27,6 +27,7 @@
 #include "mlir/IR/Types.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
@@ -124,6 +125,13 @@ struct ConnectionRequest {
   std::optional<mlir::AffineMap> consumerMap;
   uint64_t bytes = 0;
   uint64_t alignmentBytes = 1;
+  /// Live bytes already charged to each memory in the caller's partial plan,
+  /// keyed by memory node. A transfer route stages through an intermediate only
+  /// when that memory can hold the value on top of this figure (§12.2's
+  /// *intermediate capacity and liveness*). Empty means the caller models no
+  /// live data, and every intermediate is treated as empty -- the same default
+  /// `RouteRequest::liveBytesOnIntermediate` takes.
+  llvm::StringMap<uint64_t> intermediateOccupancy;
 };
 
 /// True when the two ports can connect directly -- no transfer, no layout

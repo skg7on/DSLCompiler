@@ -73,10 +73,14 @@ std::optional<ExecutorId> legalHop(const MachineModel &model,
     return std::nullopt;
   // Intermediate storage must hold the value on top of whatever is already
   // live there; the destination already holds the value, so it is exempt from
-  // both the capacity and the liveness test.
+  // both the capacity and the liveness test. A per-node figure for this memory
+  // overrides the request's single scalar.
   if (next.id != destination) {
-    uint64_t live =
-        std::min(request.liveBytesOnIntermediate, next.capacityBytes);
+    auto named = request.liveBytesByIntermediate.find(next.id);
+    uint64_t live = named != request.liveBytesByIntermediate.end()
+                        ? named->second
+                        : request.liveBytesOnIntermediate;
+    live = std::min(live, next.capacityBytes);
     if (next.capacityBytes - live < request.bytes)
       return std::nullopt;
   }

@@ -590,6 +590,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (ExecutorId executor = consumer.executorBindings.lookup("executor");
           !executor.empty())
         request.consumerExecutor = executor;
+      // The partial plan's live bytes per memory, so a route that stages
+      // through an already-occupied intermediate is rejected (§12.2's
+      // intermediate capacity *and liveness*). The router only looks entries up
+      // by node id and never iterates the map, so it cannot perturb
+      // determinism. The pair's own memories are harmless to include: a route
+      // never re-enters its source, and its destination is exempt.
+      request.intermediateOccupancy = partial.memoryBytes;
       return request;
     };
     // The alternative the declared objective prefers. `min_element` keeps the

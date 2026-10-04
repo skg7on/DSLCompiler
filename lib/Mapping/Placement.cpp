@@ -544,9 +544,11 @@ synthesizeConnections(const ConnectionRequest &request,
   // filter. Threaded only when the producer states a layout.
   if (!transformRequired && request.producerLayout)
     route.layoutClass = *request.producerLayout;
-  // liveBytesOnIntermediate stays unset: this layer keeps no occupancy state,
-  // so it has no live-byte figure to supply rather than a zero that would
-  // silently assert the intermediates are empty.
+  // The caller's per-memory live bytes travel with the request: this layer
+  // keeps no occupancy state of its own, so it forwards exactly the figure it
+  // was given and asserts nothing otherwise. An empty map leaves every
+  // intermediate treated as empty, the documented default.
+  route.liveBytesByIntermediate = request.intermediateOccupancy;
   llvm::Expected<llvm::SmallVector<MemoryRoute>> routes =
       topology.enumerateRoutes(route, options.maxRoutesPerConnection,
                                truncated);
