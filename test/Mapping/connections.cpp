@@ -288,6 +288,80 @@ TEST(Connections, DirectWhenSolvedParametersAgree) {
   EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
 }
 
+// The endpoint occurrences a request names must reach the synthesized plan: two
+// uses of one value are distinguished by their ports, so the connection has to
+// carry the port it serves, not only the value.
+TEST(Connections, CarriesEndpointPortsIntoTheDirectPlan) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory; // nothing to move
+  request.producerPort = PortRef{1, PortDirection::Output, 0};
+  request.consumerPort = PortRef{2, PortDirection::Input, 1};
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+  ASSERT_TRUE((*plans)[0].producerPort.has_value());
+  EXPECT_EQ(*(*plans)[0].producerPort, (PortRef{1, PortDirection::Output, 0}));
+  ASSERT_EQ((*plans)[0].consumerPorts.size(), 1u);
+  EXPECT_EQ((*plans)[0].consumerPorts[0],
+            (PortRef{2, PortDirection::Input, 1}));
+}
+
+// The same-family/different-parameterization transform (the `VW = 4` vs
+// `VW = 8` case) must also carry the endpoints, so a materializer can rebind
+// the right use rather than every reader of the value.
+TEST(Connections, CarriesEndpointPortsOnASameFamilyParameterTransform) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.consumerLayout = "t.a";
+  request.producerLayoutParameters["VW"] = int64_t(4);
+  request.consumerLayoutParameters["VW"] = int64_t(8);
+  request.producerPort = PortRef{1, PortDirection::Output, 0};
+  request.consumerPort = PortRef{2, PortDirection::Input, 0};
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::LayoutTransform);
+  ASSERT_TRUE((*plans)[0].producerPort.has_value());
+  EXPECT_EQ(*(*plans)[0].producerPort, (PortRef{1, PortDirection::Output, 0}));
+  ASSERT_EQ((*plans)[0].consumerPorts.size(), 1u);
+  EXPECT_EQ((*plans)[0].consumerPorts[0],
+            (PortRef{2, PortDirection::Input, 0}));
+}
+
+// The same-family/equal-parameterization control: the pair stays direct and
+// still carries both endpoints, so the parameter comparison and the endpoint
+// propagation do not fight each other.
+TEST(Connections, CarriesEndpointPortsOnASameFamilyParameterDirect) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.consumerLayout = "t.a";
+  request.producerLayoutParameters["VW"] = int64_t(8);
+  request.consumerLayoutParameters["VW"] = int64_t(8);
+  request.producerPort = PortRef{1, PortDirection::Output, 0};
+  request.consumerPort = PortRef{2, PortDirection::Input, 2};
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+  ASSERT_TRUE((*plans)[0].producerPort.has_value());
+  ASSERT_EQ((*plans)[0].consumerPorts.size(), 1u);
+  EXPECT_EQ((*plans)[0].consumerPorts[0],
+            (PortRef{2, PortDirection::Input, 2}));
+}
+
 TEST(Connections, DirectReadAndTransferRoutesWhenOnlyMemoryDiffers) {
   // §10.2 defines direct compatibility by memory *visibility*, not by the two
   // memories being the same node: a consumer that can address the producer's
@@ -797,6 +871,38 @@ TEST(Connections, FanOutSharesAReadWhenEveryConsumerReadsTheProducersMemory) {
   ASSERT_EQ((*plans)[0].consumers.size(), 2u);
   EXPECT_EQ((*plans)[0].consumers[0], 11u);
   EXPECT_EQ((*plans)[0].consumers[1], 12u);
+}
+
+// A shared fan-out read carries every consumer *use* it serves. Two operand
+// ports of one consumer are two uses even though the instance id repeats, so
+// the plan's port list, not its compatibility instance list, is what names
+// them.
+TEST(Connections, FanOutCarriesEveryConsumerPortItServes) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+
+  ConnectionRequest base = baseRequest();
+  base.producerPort = PortRef{1, PortDirection::Output, 0};
+  std::vector<ConnectionRequest> consumers = {
+      consumerRequest(base, 11, base.producerMemory),
+      consumerRequest(base, 11, base.producerMemory)};
+  consumers[0].consumerPort = PortRef{11, PortDirection::Input, 0};
+  consumers[1].consumerPort = PortRef{11, PortDirection::Input, 1};
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeFanOut(base, consumers, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+  // The instance projection collapses the repeated use ...
+  ASSERT_EQ((*plans)[0].consumers.size(), 1u);
+  EXPECT_EQ((*plans)[0].consumers[0], 11u);
+  // ... while the endpoint list keeps both.
+  ASSERT_EQ((*plans)[0].consumerPorts.size(), 2u);
+  EXPECT_EQ((*plans)[0].consumerPorts[0],
+            (PortRef{11, PortDirection::Input, 0}));
+  EXPECT_EQ((*plans)[0].consumerPorts[1],
+            (PortRef{11, PortDirection::Input, 1}));
 }
 
 // §15.3(a): "all consumers can **legally access** one placement" is a

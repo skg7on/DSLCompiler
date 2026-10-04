@@ -104,6 +104,13 @@ struct ConnectionRequest {
   InstanceId producer = 0;
   InstanceId consumer = 0;
   WorkloadValueId value = 0;
+  /// The producer-side result occurrence this movement reads, and the single
+  /// consumer operand occurrence it serves. They name the *use*, not the SSA
+  /// value: a value consumed through two operand ports is two requests, each
+  /// with its own consumer port. Unset when the caller knows no endpoint, in
+  /// which case the synthesized plan carries none either.
+  std::optional<PortRef> producerPort;
+  std::optional<PortRef> consumerPort;
   MemoryNodeId producerMemory;
   MemoryNodeId consumerMemory;
   std::optional<LayoutId> producerLayout;
@@ -214,7 +221,8 @@ ConnectionPlan synthesizeFanIn(llvm::ArrayRef<InstanceId> producers,
                                llvm::ArrayRef<InstanceId> consumers,
                                WorkloadValueId value,
                                MemoryNodeId consumerMemory, uint64_t bytes,
-                               const Cost &feedCost = {});
+                               const Cost &feedCost = {},
+                               llvm::ArrayRef<PortRef> consumerPorts = {});
 
 } // namespace mlir::llk::mapping
 

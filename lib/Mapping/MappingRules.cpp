@@ -1325,11 +1325,21 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     spec.name = port.name;
     spec.isInput = port.isInput;
     if (port.isInput) {
-      if (inputIndex < node.inputs.size())
-        spec.value = node.inputs[inputIndex++].value;
+      if (inputIndex < node.inputs.size()) {
+        spec.value = node.inputs[inputIndex].value;
+        // The operand occurrence, so two uses of one value stay distinct ports
+        // rather than collapsing into one spec.
+        spec.port = PortRef{node.id, PortDirection::Input,
+                            static_cast<uint32_t>(inputIndex)};
+      }
+      ++inputIndex;
     } else {
-      if (outputIndex < node.outputs.size())
-        spec.value = node.outputs[outputIndex++].value;
+      if (outputIndex < node.outputs.size()) {
+        spec.value = node.outputs[outputIndex].value;
+        spec.port = PortRef{node.id, PortDirection::Output,
+                            static_cast<uint32_t>(outputIndex)};
+      }
+      ++outputIndex;
     }
     candidate.ports.push_back(std::move(spec));
   }
@@ -1387,11 +1397,16 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     size_t layoutOutputIndex = 0;
     for (const RulePort &port : rule.ports) {
       const WorkloadPort *nodePort = nullptr;
+      PortDirection direction = PortDirection::Input;
+      uint32_t position = 0;
       if (port.isInput) {
+        position = static_cast<uint32_t>(layoutInputIndex);
         if (layoutInputIndex < node.inputs.size())
           nodePort = &node.inputs[layoutInputIndex];
         ++layoutInputIndex;
       } else {
+        direction = PortDirection::Output;
+        position = static_cast<uint32_t>(layoutOutputIndex);
         if (layoutOutputIndex < node.outputs.size())
           nodePort = &node.outputs[layoutOutputIndex];
         ++layoutOutputIndex;
@@ -1407,6 +1422,9 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
       // the edge that carries it. A rule that names only an input port
       // therefore does *not* claim a layout for the value its node produces.
       resolved.portValue = static_cast<int64_t>(nodePort->value);
+      // The operand occurrence itself, so two uses of one value resolve their
+      // own layout instead of a value-wide lookup that would give up.
+      resolved.port = PortRef{node.id, direction, position};
     }
     candidate.layoutRequirements.push_back(std::move(resolved));
   }

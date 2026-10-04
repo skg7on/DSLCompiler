@@ -664,6 +664,168 @@ rule r.consume {
 }
 )llkmap";
 
+/// One producer whose result feeds *both* operand ports of one consumer, over
+/// the value `mid`. The two operand uses are distinct obligations even though
+/// they carry one SSA value.
+WorkloadGraph repeatedOperandGraph(mlir::MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.attributes = vectorAttributes(context, "produce");
+  producer.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(producer));
+
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.attributes = vectorAttributes(context, "consume");
+  consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+/// The producer's result is plain; the same value feeds both consumer ports,
+/// `operand0` requiring plain and `operand1` requiring blocked. The two uses
+/// are incompatible representations, so each must get its own connection.
+constexpr llvm::StringLiteral kRepeatedConflictRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind sram;
+  require layout result satisfies t.plain;
+  input "operand0";
+  output "result";
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  require layout operand1 satisfies t.blocked;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The same-family control: both uses require `t.blocked` (one family,
+/// one solved parameterization) and the producer's result is blocked too, so
+/// the two uses share one direct connection.
+constexpr llvm::StringLiteral kRepeatedSameLayoutRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind sram;
+  require layout result satisfies t.blocked;
+  input "operand0";
+  output "result";
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.blocked;
+  require layout operand1 satisfies t.blocked;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Two *different* values (`v0`, `v1`) feeding the two operand ports of one
+/// consumer, each requiring the same family `t.plain`. Each edge resolves its
+/// own layout independently.
+WorkloadGraph twoValueSameLayoutGraph(mlir::MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId in0 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in0", /*external=*/true});
+  WorkloadValueId in1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in1", /*external=*/true});
+  WorkloadValueId v0 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "v0", /*external=*/false});
+  WorkloadValueId v1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "v1", /*external=*/false});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+
+  auto producer = [&](unsigned ordinal, WorkloadValueId input,
+                      WorkloadValueId result) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.attributes = vectorAttributes(context, "produce");
+    node.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
+    node.outputs.push_back(WorkloadPort{result, mlir::Type(), std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  producer(0, in0, v0);
+  producer(1, in1, v1);
+
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.sourceOrdinal = 2;
+  consumer.attributes = vectorAttributes(context, "consume");
+  consumer.inputs.push_back(WorkloadPort{v0, mlir::Type(), std::nullopt});
+  consumer.inputs.push_back(WorkloadPort{v1, mlir::Type(), std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+/// Two producers, each plain, feeding one consumer whose two operands both want
+/// `t.plain`: one family, two independent edges.
+constexpr llvm::StringLiteral kTwoValuePlainRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind sram;
+  require layout result satisfies t.plain;
+  input "operand0";
+  output "result";
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  require layout operand1 satisfies t.plain;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
 /// The search cost of one producer -> consumer transfer over `fanMachine`:
 /// the link latency (10) plus 4096 assumed bytes at 32 bytes/cycle.
 constexpr double kFanTransferCycles = 10.0 + 4096.0 / 32.0;
@@ -989,7 +1151,11 @@ values(std::initializer_list<std::pair<llvm::StringRef, SearchValue>> entries) {
 /// moves, not only those of plans that bind a layout. This fixture binds none,
 /// which is exactly why it is still the right pin for "the form changed and
 /// nothing else did".
-constexpr PlanId kNoBindingPlanId = 1637566088902498879ULL;
+// Pinned with endpoint occurrences in the identity: a candidate's ports and a
+// connection's producer/consumer ports now join their content keys, so two uses
+// of one value are distinct. The plan id changed once when those were resolved
+// (task A2); from then on it is content-stable.
+constexpr PlanId kNoBindingPlanId = 16999786886447551871ULL;
 
 //===----------------------------------------------------------------------===//
 // Search bound fixtures
@@ -1867,6 +2033,101 @@ TEST(CoveringSearch, ALayoutOnAnotherPortIsNotAttributedToTheEdge) {
             static_cast<int64_t>(producerNode->inputs[0].value));
   EXPECT_NE(solved->second.portValue,
             static_cast<int64_t>(producerNode->outputs[0].value));
+}
+
+// P1 regression: one value feeding two operand ports of the same consumer is
+// *two* uses, not one. Here the producer's result is plain, `operand0` requires
+// plain and `operand1` requires blocked. Resolving a layout by SSA value made
+// the two solved classes ambiguous ("nothing governs it"), so the pair became
+// one unattributed direct connection -- silently dropping operand1's blocked
+// obligation. Each use must get its own connection under its own layout.
+TEST(CoveringSearch, DistinctOperandUsesOfOneValueKeepTheirOwnLayouts) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = repeatedOperandGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWithLayouts(
+      transformMachine(), kRepeatedConflictRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans.front();
+
+  // Two connections, one per operand use -- not one collapsed direct read.
+  ASSERT_EQ(plan.connectionPlans.size(), 2u);
+
+  // The plain use (operand0) connects directly; the blocked use (operand1)
+  // needs a conversion into `t.blocked`. The transform's destination layout
+  // identifies which connection serves `operand1`, so no plan-level port field
+  // is needed to tell them apart.
+  const PlanConnection *direct = nullptr;
+  const PlanConnection *toBlocked = nullptr;
+  for (const PlanConnection &connection : plan.connectionPlans) {
+    if (connection.kind == ConnectionKind::Direct)
+      direct = &connection;
+    if (connection.transform && connection.transform->dstLayout == "t.blocked")
+      toBlocked = &connection;
+  }
+  ASSERT_NE(direct, nullptr);
+  ASSERT_NE(toBlocked, nullptr);
+  EXPECT_EQ(toBlocked->kind, ConnectionKind::LayoutTransform);
+  ASSERT_TRUE(toBlocked->transform.has_value());
+  EXPECT_EQ(toBlocked->transform->srcLayout, "t.plain");
+  EXPECT_EQ(toBlocked->transform->dstLayout, "t.blocked");
+  EXPECT_TRUE(direct->transform == std::nullopt);
+  // Both movements serve the same consumer instance; the compatibility
+  // projection cannot tell the two uses apart, which is why the endpoint
+  // occurrence is the rewiring authority.
+  EXPECT_EQ(direct->consumers, toBlocked->consumers);
+}
+
+// The same-family, equal-parameterization control: both operand uses require
+// `t.blocked` and so does the producer, so the two uses share one legal direct
+// connection. Equal layouts must stay shareable -- the fix must not turn every
+// repeated operand into a transform.
+TEST(CoveringSearch, EqualLayoutsOnRepeatedOperandUsesShareOneConnection) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = repeatedOperandGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWithLayouts(
+      transformMachine(), kRepeatedSameLayoutRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans.front();
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  EXPECT_EQ(plan.connectionPlans.front().kind, ConnectionKind::Direct);
+  EXPECT_FALSE(plan.connectionPlans.front().transform.has_value());
+}
+
+// Two *different* values feeding the two operands, both requiring one family
+// `t.plain`: each edge resolves its own solved layout independently and stays
+// direct. This is the legal control for the by-occurrence lookup; resolving by
+// value must not conflate the two edges.
+TEST(CoveringSearch, DistinctValuesNeedingOneFamilyStayIndependent) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoValueSameLayoutGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kTwoValuePlainRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans.front();
+  ASSERT_EQ(plan.connectionPlans.size(), 2u);
+  for (const PlanConnection &connection : plan.connectionPlans)
+    EXPECT_EQ(connection.kind, ConnectionKind::Direct);
 }
 
 //===----------------------------------------------------------------------===//

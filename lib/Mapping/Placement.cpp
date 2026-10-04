@@ -439,6 +439,10 @@ enumeratePlacements(const MappingCandidate &candidate,
         // Which value the requirement was solved for, so an edge can ask for
         // *its* layout rather than the instance's only one.
         solvedLayout.portValue = requirement.portValue;
+        // The occurrence the requirement named, so a connection request can ask
+        // for *this* use's layout rather than a value-wide one that two uses
+        // would have to share.
+        solvedLayout.port = requirement.port;
         instance.layoutSolutions[solutionKey] = std::move(solvedLayout);
       }
 
@@ -532,6 +536,17 @@ synthesizeConnections(const ConnectionRequest &request,
   // `plans` is that attempt order.
   std::vector<ConnectionPlan> plans;
 
+  // Copies the request's endpoint occurrences onto every synthesized plan, so
+  // the connection names the *use* it serves -- not just the SSA value two uses
+  // share -- and folds them into its canonical id. A request with no endpoints
+  // leaves the plan's endpoint fields empty and its id as it was before the
+  // migration.
+  auto assignEndpoints = [&](ConnectionPlan &plan) {
+    plan.producerPort = request.producerPort;
+    if (request.consumerPort)
+      plan.consumerPorts.push_back(*request.consumerPort);
+  };
+
   // Alternative 1: a direct connection -- nothing is moved and nothing is
   // transformed. §10.2 defines direct compatibility by element type, logical
   // tile shape, memory *visibility*, and affine index relation, so the two
@@ -547,6 +562,7 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.kind = ConnectionKind::Direct;
     plan.memoryRoute.push_back(request.producerMemory);
     plan.cost.localBytes = request.bytes;
+    assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
   }
@@ -573,6 +589,7 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.memoryRoute.push_back(request.producerMemory);
     plan.transform = transformOf();
     plan.cost.localBytes = request.bytes;
+    assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
   }
@@ -649,6 +666,7 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.transferEngines = memoryRoute.transferEngines;
     plan.transform = transformOf();
     plan.cost = memoryRoute.cost;
+    assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
   };
@@ -682,9 +700,15 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
     ConnectionPlan plan;
     plan.producer = base.producer;
     plan.value = base.value;
-    for (const ConnectionRequest &consumer : consumers)
+    plan.producerPort = base.producerPort;
+    for (const ConnectionRequest &consumer : consumers) {
       plan.consumers.push_back(consumer.consumer);
-    llvm::sort(plan.consumers);
+      // Every consumer *use* this shared read serves, so two ports of one
+      // consumer both appear even though their instance id repeats.
+      if (consumer.consumerPort)
+        plan.consumerPorts.push_back(*consumer.consumerPort);
+    }
+    sortUnique(plan.consumers);
     plan.kind = ConnectionKind::Direct;
     plan.memoryRoute.push_back(base.producerMemory);
     plan.cost.localBytes = base.bytes;
@@ -744,9 +768,13 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
       ConnectionPlan plan;
       plan.producer = base.producer;
       plan.value = base.value;
-      for (size_t index : group)
+      plan.producerPort = base.producerPort;
+      for (size_t index : group) {
         plan.consumers.push_back(consumers[index].consumer);
-      llvm::sort(plan.consumers);
+        if (consumers[index].consumerPort)
+          plan.consumerPorts.push_back(*consumers[index].consumerPort);
+      }
+      sortUnique(plan.consumers);
       plan.kind = ConnectionKind::Direct;
       plan.memoryRoute.push_back(base.producerMemory);
       plan.cost.localBytes = base.bytes;
@@ -809,9 +837,14 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
     });
     ConnectionPlan chosen = *best;
     chosen.consumers.clear();
-    for (size_t index : group)
+    chosen.consumerPorts.clear();
+    chosen.producerPort = base.producerPort;
+    for (size_t index : group) {
       chosen.consumers.push_back(consumers[index].consumer);
-    llvm::sort(chosen.consumers);
+      if (consumers[index].consumerPort)
+        chosen.consumerPorts.push_back(*consumers[index].consumerPort);
+    }
+    sortUnique(chosen.consumers);
     chosen.id = computeConnectionId(chosen);
     plans.push_back(std::move(chosen));
   }
@@ -822,11 +855,13 @@ ConnectionPlan synthesizeFanIn(llvm::ArrayRef<InstanceId> producers,
                                llvm::ArrayRef<InstanceId> consumers,
                                WorkloadValueId value,
                                MemoryNodeId consumerMemory, uint64_t bytes,
-                               const Cost &feedCost) {
+                               const Cost &feedCost,
+                               llvm::ArrayRef<PortRef> consumerPorts) {
   ConnectionPlan plan;
   plan.kind = ConnectionKind::Reduce;
   plan.consumers.assign(consumers.begin(), consumers.end());
   plan.producers.assign(producers.begin(), producers.end());
+  plan.consumerPorts.assign(consumerPorts.begin(), consumerPorts.end());
   plan.value = value;
   plan.memoryRoute.push_back(std::move(consumerMemory));
   // A gather sums what its feeds cost. The gathered tile's `bytes` are charged

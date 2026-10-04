@@ -73,10 +73,13 @@ struct NodeTable {
 };
 
 /// One end of a dataflow value: the node table index that produces or consumes
-/// it and the port it crosses, so a connection can state the element type,
-/// logical shape, and affine relation §10.2 compares.
+/// it, the position of the port within that side, and the port it crosses, so a
+/// connection can state the element type, logical shape, and affine relation
+/// §10.2 compares. The index is what tells two operand uses of one value apart;
+/// the node alone would collapse them.
 struct ValueEndpoint {
   size_t node = 0;
+  uint32_t index = 0;
   const WorkloadPort *port = nullptr;
 };
 
@@ -145,44 +148,53 @@ MemoryNodeId primaryMemory(const MachineModel &machine,
   return MemoryNodeId();
 }
 
-/// The layout `instance` bound for the value `value`, or nullopt when it bound
-/// none for it.
+/// The layout `instance` solved for the endpoint occurrence `port`, or nullopt
+/// when it solved none for it.
 ///
-/// The match is by *value*, not by "the instance's one layout": a rule's layout
-/// requirement names a port, and the solved binding is recorded against the
-/// workload value that port carries. The edge being connected carries that same
-/// value (a port's value *is* the edge's value), so a binding solved for
-/// another value -- or for no resolvable port at all -- does not match. That is
-/// what keeps a layout named on one port from being attributed to an edge
-/// carrying a different one: `avx2.mma_bf16` requires `lhs` to be
+/// The match is by *occurrence*, not by the SSA value the occurrence carries: a
+/// rule's layout requirement names a port, and two operand uses of one value
+/// can require different layouts. Matching by value would make those two
+/// solutions ambiguous ("nothing governs it") and drop both, collapsing the
+/// two uses into one unattributed request. Matching by the endpoint keeps each
+/// use's obligation: the edge carrying a different occurrence -- or a
+/// requirement that named no resolvable port, whose solution carries no
+/// endpoint -- does not match. `avx2.mma_bf16` requires `lhs` to be
 /// `avx2.row_major`, and `lhs` is an *input*, so the edge carrying the mma's
-/// `result` must not inherit that layout. Both directions of error are avoided
-/// rather than traded: a mis-attributed layout could fabricate a transform (or,
-/// because differing layouts now suppress `Direct`, drop a connection that was
-/// valid), while no attribution at all only costs the transform alternative for
-/// that edge.
+/// `result` must not inherit that layout.
 ///
-/// Two layout classes solved for the same value are ambiguous -- the edge
-/// cannot say which governs -- so that is treated as unattributable too.
-const SolvedLayout *boundSolvedLayoutForValue(const CandidateInstance &instance,
-                                              WorkloadValueId value) {
+/// Several solutions for one occurrence that *agree* (same class and
+/// parameters) are one representation and resolve to it. Several that disagree
+/// are a rule's alternative offers for one use (`require layout operand0
+/// satisfies t.plain` and `... satisfies t.blocked` with no binding to choose
+/// between them): no single layout governs the use, so the lookup reports none
+/// -- exactly as it did by value -- rather than picking one by iteration order
+/// or rejecting the whole candidate. This is a different fact from two
+/// *occurrences* requiring different layouts, which each resolve on their own.
+const SolvedLayout *boundSolvedLayoutForPort(const CandidateInstance &instance,
+                                             const PortRef &port) {
   const SolvedLayout *found = nullptr;
   for (const auto &entry : instance.layoutSolutions) {
-    if (entry.second.portValue != static_cast<int64_t>(value))
+    if (!entry.second.port || !(*entry.second.port == port))
       continue;
-    if (found)
-      return nullptr; // two classes for one value: nothing governs it
-    found = &entry.second;
+    if (!found) {
+      found = &entry.second;
+      continue;
+    }
+    if (found->layoutClass != entry.second.layoutClass ||
+        canonicalSearchValueString(found->parameters) !=
+            canonicalSearchValueString(entry.second.parameters))
+      return nullptr; // disagreeing alternatives for one use: nothing governs
+                      // it
   }
   return found;
 }
 
-/// The layout *family* `instance` bound for `value`. Taken from the solved
+/// The layout *family* `instance` bound for `port`. Taken from the solved
 /// layout's own class rather than its containing map's key, which is
 /// index-disambiguated when one class is required by several ports.
-std::optional<LayoutId> boundLayoutForValue(const CandidateInstance &instance,
-                                            WorkloadValueId value) {
-  const SolvedLayout *solved = boundSolvedLayoutForValue(instance, value);
+std::optional<LayoutId> boundLayoutForPort(const CandidateInstance &instance,
+                                           const PortRef &port) {
+  const SolvedLayout *solved = boundSolvedLayoutForPort(instance, port);
   if (!solved)
     return std::nullopt;
   return solved->layoutClass;
@@ -568,20 +580,31 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return allLinks.size() - 1;
   };
   for (size_t index = 0; index < tables.size(); ++index) {
-    for (const WorkloadPort &port : tables[index].workload->outputs)
-      allLinks[linkIndexFor(port.value)].producers.push_back({index, &port});
-    for (const WorkloadPort &port : tables[index].workload->inputs)
-      allLinks[linkIndexFor(port.value)].consumers.push_back({index, &port});
+    for (uint32_t portIndex = 0;
+         portIndex < tables[index].workload->outputs.size(); ++portIndex)
+      allLinks[linkIndexFor(tables[index].workload->outputs[portIndex].value)]
+          .producers.push_back(
+              {index, portIndex, &tables[index].workload->outputs[portIndex]});
+    for (uint32_t portIndex = 0;
+         portIndex < tables[index].workload->inputs.size(); ++portIndex)
+      allLinks[linkIndexFor(tables[index].workload->inputs[portIndex].value)]
+          .consumers.push_back(
+              {index, portIndex, &tables[index].workload->inputs[portIndex]});
   }
+  // One endpoint per *occurrence*. Deduplicating by node alone collapsed two
+  // operand uses of one value into a single endpoint, so the second use lost
+  // its layout obligation and only one connection was ever synthesized.
   auto canonicalEndpoints = [](std::vector<ValueEndpoint> &endpoints) {
     llvm::sort(endpoints,
                [](const ValueEndpoint &lhs, const ValueEndpoint &rhs) {
-                 return lhs.node < rhs.node;
+                 if (lhs.node != rhs.node)
+                   return lhs.node < rhs.node;
+                 return lhs.index < rhs.index;
                });
     endpoints.erase(
         std::unique(endpoints.begin(), endpoints.end(),
                     [](const ValueEndpoint &lhs, const ValueEndpoint &rhs) {
-                      return lhs.node == rhs.node;
+                      return lhs.node == rhs.node && lhs.index == rhs.index;
                     }),
         endpoints.end());
   };
@@ -707,8 +730,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // pair's ports.
     auto makeRequest = [&](const CandidateInstance &producer,
                            const CandidateInstance &consumer,
-                           const WorkloadPort *producerPort,
-                           const WorkloadPort *consumerPort,
+                           const ValueEndpoint *producerEnd,
+                           const ValueEndpoint *consumerEnd,
                            WorkloadValueId value) {
       ConnectionRequest request;
       request.producer = producer.id;
@@ -716,26 +739,50 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       request.value = value;
       request.producerMemory = primaryMemory(machine, producer);
       request.consumerMemory = primaryMemory(machine, consumer);
-      // The layout each endpoint bound for *this* value, so differing layouts
-      // make the pair a transform rather than a direct connection (§15.2).
-      // Without them the search could only ever reach
-      // `synthesizeConnections`' direct path, and a transform alternative was
-      // unreachable from the search.
-      request.producerLayout = boundLayoutForValue(producer, value);
-      request.consumerLayout = boundLayoutForValue(consumer, value);
+      const WorkloadPort *producerPort =
+          producerEnd ? producerEnd->port : nullptr;
+      const WorkloadPort *consumerPort =
+          consumerEnd ? consumerEnd->port : nullptr;
+      // The endpoint occurrences, validated against the finalized graph so only
+      // real ports reach the connection's identity.
+      auto refFor = [&](const ValueEndpoint *endpoint,
+                        PortDirection direction) -> std::optional<PortRef> {
+        if (!endpoint)
+          return std::nullopt;
+        PortRef ref{tables[endpoint->node].node, direction, endpoint->index};
+        if (!lookupPort(workload_, ref))
+          return std::nullopt;
+        return ref;
+      };
+      request.producerPort = refFor(producerEnd, PortDirection::Output);
+      request.consumerPort = refFor(consumerEnd, PortDirection::Input);
+      // The layout each endpoint solved for *its own occurrence*, so two
+      // operand uses of one value keep their distinct obligations and a pair
+      // that differs becomes a transform rather than an unattributed direct
+      // connection (§15.2). Without the occurrence the lookup would give up on
+      // a value with two solved classes and the transform would be
+      // unreachable.
+      if (request.producerPort)
+        request.producerLayout =
+            boundLayoutForPort(producer, *request.producerPort);
+      if (request.consumerPort)
+        request.consumerLayout =
+            boundLayoutForPort(consumer, *request.consumerPort);
       // The concrete parameterization each endpoint solved, so a pair that
       // agrees on the class but not on its parameters is a transform rather
       // than a direct connection.
-      if (const SolvedLayout *solved =
-              boundSolvedLayoutForValue(producer, value)) {
-        request.producerLayoutParameters = solved->parameters;
-        request.producerLayoutMap = solved->map;
-      }
-      if (const SolvedLayout *solved =
-              boundSolvedLayoutForValue(consumer, value)) {
-        request.consumerLayoutParameters = solved->parameters;
-        request.consumerLayoutMap = solved->map;
-      }
+      if (request.producerPort)
+        if (const SolvedLayout *solved =
+                boundSolvedLayoutForPort(producer, *request.producerPort)) {
+          request.producerLayoutParameters = solved->parameters;
+          request.producerLayoutMap = solved->map;
+        }
+      if (request.consumerPort)
+        if (const SolvedLayout *solved =
+                boundSolvedLayoutForPort(consumer, *request.consumerPort)) {
+          request.consumerLayoutParameters = solved->parameters;
+          request.consumerLayoutMap = solved->map;
+        }
       const TileFacts facts = factsForValue(value);
       request.bytes = facts.bytes;
       request.alignmentBytes = facts.alignment;
@@ -802,8 +849,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // moment its copy is staged until the plan ends.
     llvm::StringMap<uint64_t> stagedBytes; // memory -> replica/gather bytes
 
-    // Synthesizes one plain-edge connection, staging the chosen alternative.
-    auto connect = [&](const ConnectionRequest &request) -> bool {
+    // Synthesizes one connection, staging the chosen alternative. When
+    // `consumerPorts` is given the chosen plan serves every one of those
+    // occurrences -- a single instance using the value through several equal
+    // operand ports shares one connection, whose endpoint list names them all.
+    auto connect = [&](const ConnectionRequest &request,
+                       llvm::ArrayRef<PortRef> consumerPorts = {}) -> bool {
       bool connectionTruncated = false;
       llvm::Expected<std::vector<ConnectionPlan>> alternatives =
           synthesizeConnections(request, machine, topology, placementOptions,
@@ -841,6 +892,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                    " alternatives without branching over them");
       }
       staged.push_back(*pickBest(*alternatives));
+      if (!consumerPorts.empty()) {
+        staged.back().consumerPorts.assign(consumerPorts.begin(),
+                                           consumerPorts.end());
+        // `consumerPorts` is part of the canonical string, so the id is
+        // recomputed for the shared plan.
+        staged.back().id = computeConnectionId(staged.back());
+      }
       cost = addCost(cost, staged.back().cost);
       // §9.3: a plain movement fills a destination buffer in the consumer's
       // memory -- the consumer's *input*, not its output tile (which the
@@ -900,16 +958,102 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (linkFacts.bytes == 0)
         continue;
 
+      // What makes two consumer *uses* interchangeable: same destination
+      // memory, same solved representation (family and parameters), same
+      // executor, and the same port type and affine relation (§10.2). Two
+      // occurrences that agree on all of these can be served by one
+      // connection; a difference in any is a different obligation. The key is
+      // exactly what `makeRequest` reads from a use, so every member of a group
+      // is equivalent to its representative by construction.
+      struct ConsumerUseKey {
+        MemoryNodeId memory;
+        std::optional<LayoutId> layout;
+        std::string layoutParameters;
+        ExecutorId executor;
+        mlir::Type portType;
+        std::optional<mlir::AffineMap> portMap;
+        bool operator==(const ConsumerUseKey &other) const {
+          return memory == other.memory && layout == other.layout &&
+                 layoutParameters == other.layoutParameters &&
+                 executor == other.executor && portType == other.portType &&
+                 portMap == other.portMap;
+        }
+      };
+      auto useKeyFor = [&](const ValueEndpoint &consumerEnd) {
+        ConsumerUseKey key;
+        const CandidateInstance &consumer = *partial.chosen[consumerEnd.node];
+        key.memory = primaryMemory(machine, consumer);
+        PortRef ref{tables[consumerEnd.node].node, PortDirection::Input,
+                    consumerEnd.index};
+        if (lookupPort(workload_, ref)) {
+          key.layout = boundLayoutForPort(consumer, ref);
+          if (const SolvedLayout *solved =
+                  boundSolvedLayoutForPort(consumer, ref))
+            key.layoutParameters =
+                canonicalSearchValueString(solved->parameters);
+        }
+        key.executor = consumer.executorBindings.lookup("executor");
+        if (consumerEnd.port) {
+          key.portType = consumerEnd.port->type;
+          key.portMap = consumerEnd.port->accessMap;
+        }
+        return key;
+      };
+      // The occurrences of one group's value, in the order they were seen.
+      auto addToUseGroup =
+          [&](std::vector<std::vector<const ValueEndpoint *>> &groups,
+              std::vector<ConsumerUseKey> &keys,
+              const ValueEndpoint &consumerEnd) {
+            ConsumerUseKey key = useKeyFor(consumerEnd);
+            size_t group = 0;
+            for (; group < keys.size(); ++group)
+              if (keys[group] == key)
+                break;
+            if (group == keys.size()) {
+              keys.push_back(std::move(key));
+              groups.emplace_back();
+            }
+            groups[group].push_back(&consumerEnd);
+          };
+
       if (link.producers.size() == 1) {
         const ValueEndpoint &producerEnd = link.producers[0];
         const CandidateInstance &producer = *partial.chosen[producerEnd.node];
-        if (link.consumers.size() == 1) {
-          // A plain edge.
-          const ValueEndpoint &consumerEnd = link.consumers[0];
-          if (!connect(makeRequest(producer, *partial.chosen[consumerEnd.node],
-                                   producerEnd.port, consumerEnd.port,
-                                   link.value)))
-            return false;
+
+        // One consumer *node* using the value through several operand ports is
+        // not a fan-out: the uses belong to one instance. Group them by the
+        // representation they need and synthesize one connection per group --
+        // equal uses share it, incompatible uses (a plain and a blocked
+        // operand, say) get their own. This is the path that keeps per-use
+        // layout obligations; without it the two uses collapsed into one
+        // request.
+        bool distinctConsumerNodes = false;
+        for (size_t i = 1; i < link.consumers.size(); ++i)
+          if (link.consumers[i].node != link.consumers[0].node) {
+            distinctConsumerNodes = true;
+            break;
+          }
+        if (!distinctConsumerNodes) {
+          std::vector<ConsumerUseKey> useKeys;
+          std::vector<std::vector<const ValueEndpoint *>> useGroups;
+          for (const ValueEndpoint &consumerEnd : link.consumers)
+            addToUseGroup(useGroups, useKeys, consumerEnd);
+          for (const std::vector<const ValueEndpoint *> &group : useGroups) {
+            const ValueEndpoint &consumerEnd = *group.front();
+            const CandidateInstance &consumer =
+                *partial.chosen[consumerEnd.node];
+            ConnectionRequest request = makeRequest(
+                producer, consumer, &producerEnd, &consumerEnd, link.value);
+            llvm::SmallVector<PortRef> consumerPorts;
+            for (const ValueEndpoint *endpoint : group) {
+              PortRef ref{tables[endpoint->node].node, PortDirection::Input,
+                          endpoint->index};
+              if (lookupPort(workload_, ref))
+                consumerPorts.push_back(ref);
+            }
+            if (!connect(request, consumerPorts))
+              return false;
+          }
           continue;
         }
 
@@ -920,7 +1064,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         for (const ValueEndpoint &consumerEnd : link.consumers)
           consumerRequests.push_back(
               makeRequest(producer, *partial.chosen[consumerEnd.node],
-                          producerEnd.port, consumerEnd.port, link.value));
+                          &producerEnd, &consumerEnd, link.value));
         bool fanOutTruncated = false;
         bool fanOutChoseAmongAlternatives = false;
         llvm::Expected<std::vector<ConnectionPlan>> alternatives =
@@ -973,58 +1117,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // memory alone validated the feeds against one representative and then
       // attached every consumer to the result, so a second consumer with a
       // different element type, affine relation, layout or executor was never
-      // checked. The key is exactly what `makeRequest` reads from the consumer,
-      // so every member of a group is equivalent to its representative by
+      // checked. `ConsumerUseKey` names exactly what `makeRequest` reads, so
+      // every member of a group is equivalent to its representative by
       // construction.
-      struct GatherKey {
-        MemoryNodeId memory;
-        std::optional<LayoutId> layout;
-        /// The solved parameterization of `layout` the consumer bound, rendered
-        /// canonically. Two consumers that name the same layout family but
-        /// solved different parameters (VW = 4 versus VW = 8) hold different
-        /// representations, so one gathered tile cannot serve both -- the same
-        /// reason the class id is part of the key.
-        std::string layoutParameters;
-        ExecutorId executor;
-        mlir::Type portType;
-        std::optional<mlir::AffineMap> portMap;
-        bool operator==(const GatherKey &other) const {
-          return memory == other.memory && layout == other.layout &&
-                 layoutParameters == other.layoutParameters &&
-                 executor == other.executor && portType == other.portType &&
-                 portMap == other.portMap;
-        }
-      };
       std::vector<InstanceId> producerIds;
       for (const ValueEndpoint &producerEnd : link.producers)
         producerIds.push_back(partial.chosen[producerEnd.node]->id);
       llvm::sort(producerIds);
 
-      std::vector<GatherKey> gatherKeys;
+      std::vector<ConsumerUseKey> gatherKeys;
       std::vector<std::vector<const ValueEndpoint *>> gatherGroups;
-      for (const ValueEndpoint &consumerEnd : link.consumers) {
-        const CandidateInstance &consumer = *partial.chosen[consumerEnd.node];
-        GatherKey key;
-        key.memory = primaryMemory(machine, consumer);
-        key.layout = boundLayoutForValue(consumer, link.value);
-        if (const SolvedLayout *solved =
-                boundSolvedLayoutForValue(consumer, link.value))
-          key.layoutParameters = canonicalSearchValueString(solved->parameters);
-        key.executor = consumer.executorBindings.lookup("executor");
-        if (consumerEnd.port) {
-          key.portType = consumerEnd.port->type;
-          key.portMap = consumerEnd.port->accessMap;
-        }
-        size_t group = 0;
-        for (; group < gatherKeys.size(); ++group)
-          if (gatherKeys[group] == key)
-            break;
-        if (group == gatherKeys.size()) {
-          gatherKeys.push_back(std::move(key));
-          gatherGroups.emplace_back();
-        }
-        gatherGroups[group].push_back(&consumerEnd);
-      }
+      for (const ValueEndpoint &consumerEnd : link.consumers)
+        addToUseGroup(gatherGroups, gatherKeys, consumerEnd);
 
       for (size_t group = 0; group < gatherGroups.size(); ++group) {
         MemoryNodeId consumerMemory = gatherKeys[group].memory;
@@ -1034,8 +1138,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         const CandidateInstance &consumer =
             *partial.chosen[representative.node];
         std::vector<InstanceId> consumerIds;
-        for (const ValueEndpoint *endpoint : groupEndpoints)
+        llvm::SmallVector<PortRef> consumerPorts;
+        for (const ValueEndpoint *endpoint : groupEndpoints) {
           consumerIds.push_back(partial.chosen[endpoint->node]->id);
+          PortRef ref{tables[endpoint->node].node, PortDirection::Input,
+                      endpoint->index};
+          if (lookupPort(workload_, ref))
+            consumerPorts.push_back(ref);
+        }
         llvm::sort(consumerIds);
 
         Cost feedCost;
@@ -1043,7 +1153,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         for (const ValueEndpoint &producerEnd : link.producers) {
           ConnectionRequest request =
               makeRequest(*partial.chosen[producerEnd.node], consumer,
-                          producerEnd.port, representative.port, link.value);
+                          &producerEnd, &representative, link.value);
           bool feedTruncated = false;
           llvm::Expected<std::vector<ConnectionPlan>> alternatives =
               synthesizeConnections(request, machine, topology,
@@ -1066,9 +1176,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             if (!llvm::is_contained(engines, engine))
               engines.push_back(engine);
         }
-        ConnectionPlan reduce =
-            synthesizeFanIn(producerIds, consumerIds, link.value,
-                            consumerMemory, linkFacts.bytes, feedCost);
+        ConnectionPlan reduce = synthesizeFanIn(
+            producerIds, consumerIds, link.value, consumerMemory,
+            linkFacts.bytes, feedCost, consumerPorts);
         reduce.transferEngines.assign(engines.begin(), engines.end());
         staged.push_back(std::move(reduce));
         cost = addCost(cost, staged.back().cost);
