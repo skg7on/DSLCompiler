@@ -141,10 +141,22 @@ bool boundIsDead(const Cost &cost);
 
 /// True when bound `lhs` is more promising than bound `rhs` under `order`.
 /// Direction-aware: a minimizing objective ranks the smaller bound ahead, a
-/// maximizing objective the larger -- a componentwise-min bound would be
-/// inadmissible for a maximize objective, since pruning keeps the largest and
-/// an under-estimate would discard exactly what maximize wants. An exact tie
-/// returns false in both directions.
+/// maximizing objective the larger, because pruning must always favour the
+/// branch it bounds.
+///
+/// **The bound's admissibility is asymmetric.** A bound built by `boundCost`
+/// omits connection costs -- a connection is synthesized only once both
+/// endpoints are chosen, so its cost is unknown while nodes remain uncovered --
+/// and that term is non-negative. For a *minimize* objective the omission is
+/// safe: a non-negative term can only raise a completion, so the bound stays at
+/// or below it and pruning on the bound is sound. For a *maximize* objective
+/// the same omission makes the bound *too small*, so a branch whose real
+/// completion would be largest can look poor; the bound is then inadmissible
+/// and must not prune. A maximize search must rely on the search caps (`topK`,
+/// instance, candidate, and route caps), not on the bound, for soundness --
+/// `CoveringSearch` disables its exact prune when `order.minimize == false`.
+///
+/// An exact tie returns false in both directions.
 bool boundIsBetterThan(const Cost &lhs, const Cost &rhs,
                        const ObjectiveOrder &order);
 

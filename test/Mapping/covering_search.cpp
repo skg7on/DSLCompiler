@@ -703,6 +703,91 @@ rule r.c_sram {
 }
 )llkmap";
 
+/// Two producer destinations feeding one consumer memory over links of very
+/// different latency (11 vs 101 cycles for the 4096-byte value). The consumer
+/// on `e1` sees neither producer memory, so every plan moves the value. A
+/// plan's connection cost is what can make it largest, and that cost is unknown
+/// while any node is still uncovered.
+MachineModel maximizeMachine() {
+  MachineModel model;
+  model.target = "maximize";
+  model.executors = {{"e0", "a", std::nullopt, {}, 1, {}},
+                     {"e1", "b", std::nullopt, {}, 1, {}}};
+  MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "e0";
+  dram.capacityBytes = 1u << 30;
+  dram.alignmentBytes = 64;
+  MemoryNode acc;
+  acc.id = "acc.0";
+  acc.kind = "acc";
+  acc.visibleFrom = "e0";
+  acc.capacityBytes = 1u << 30;
+  acc.alignmentBytes = 64;
+  MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "e1";
+  sram.capacityBytes = 1u << 20;
+  sram.alignmentBytes = 64;
+  model.memories = {dram, acc, sram};
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+  LinkEdge fastEdge;
+  fastEdge.id = "dram_to_sram.0";
+  fastEdge.source = "dram.0";
+  fastEdge.destination = "sram.0";
+  fastEdge.bandwidthBytesPerCycle = 4096;
+  fastEdge.latencyCycles = 10;
+  fastEdge.transactionBytes = 4096;
+  fastEdge.transferEngines = {"dma.0"};
+  LinkEdge slowEdge;
+  slowEdge.id = "acc_to_sram.0";
+  slowEdge.source = "acc.0";
+  slowEdge.destination = "sram.0";
+  slowEdge.bandwidthBytesPerCycle = 4096;
+  slowEdge.latencyCycles = 100;
+  slowEdge.transactionBytes = 4096;
+  slowEdge.transferEngines = {"dma.0"};
+  model.links = {fastEdge, slowEdge};
+  return model;
+}
+
+/// `r.p_fast` reaches the consumer in 11 cycles, `r.p_slow` in 101; both
+/// declare the same 1-cycle instance cost, so only the connection distinguishes
+/// them. The operation names sort the producer to node 0, pinning the
+/// depth-first order the exact search follows.
+constexpr llvm::StringLiteral kMaximizeRules = R"llkmap(
+rule r.p_fast {
+  match micro.vector(op = "a_produce");
+  require executor kind a;
+  require memory kind dram;
+  bundle "b.pf";
+  emit "e1";
+  cost 1;
+}
+rule r.p_slow {
+  match micro.vector(op = "a_produce");
+  require executor kind a;
+  require memory kind acc;
+  bundle "b.ps";
+  emit "e1";
+  cost 1;
+}
+rule r.c_dest {
+  match micro.vector(op = "z_consume");
+  require executor kind b;
+  require memory kind sram;
+  bundle "b.c";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
 } // namespace
 
 TEST(CoveringSearch, DeterministicReturnsTheFirstCompletePlan) {
@@ -1475,6 +1560,35 @@ TEST(CoveringSearch, TheBoundFollowsTheObjectiveDirection) {
   ASSERT_FALSE(result->plans[0].placements.empty());
   EXPECT_EQ(result->plans[0].placements[0].rule, "r.expensive");
   EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 20.0);
+}
+
+// The bound omits connection costs, so it is only admissible for a minimize
+// objective. Plan B is largest (103 cycles) only *after* its 101-cycle route is
+// added; while the consumer is still uncovered the bound sees 1 + 1 = 2. A
+// maximize objective must not prune on that bound: exact mode explores fully
+// and returns B, rather than reporting the 13-cycle plan as exact.
+TEST(CoveringSearch, ExactMaximizeDoesNotPruneOnAnInadmissibleBound) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, "a_produce", "z_consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(maximizeMachine(), kMaximizeRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  options.objective =
+      ObjectiveOrder{CostMetric::LatencyCycles, {}, /*minimize=*/false};
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // Producer on acc.0: 1 + 1 + (100 + 4096 / 4096) = 103 cycles.
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 103.0);
+  bool usesSlow = false;
+  for (const PlanPlacement &placement : result->plans[0].placements)
+    usesSlow |= placement.rule == "r.p_slow";
+  EXPECT_TRUE(usesSlow);
 }
 
 //===----------------------------------------------------------------------===//

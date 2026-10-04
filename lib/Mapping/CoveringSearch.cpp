@@ -10,11 +10,14 @@
 // immediately tests every edge whose other end is already chosen, so a branch
 // dies at the first pair that cannot be connected rather than at completion.
 //
-// The bound used for ordering and pruning is admissible: accumulated cost plus,
-// for each uncovered node, the componentwise best still reachable -- the
-// measured-or-static `entry.cost`, never the stale static estimate -- added
-// onto the accumulated cost. Its direction follows the declared objective, and
-// connection costs are non-negative, so it never overestimates.
+// The bound used for ordering and pruning is accumulated cost plus, for each
+// uncovered node, the componentwise best still reachable -- the
+// measured-or-static `entry.cost`, never the stale static estimate -- and its
+// direction follows the declared objective. It omits connection costs, whose
+// sign is non-negative; that omission keeps it admissible (never above a
+// completion) for a minimize objective, while for maximize it makes the bound
+// too small to prune on, so maximize explores fully and relies on the caps
+// instead.
 //
 //===----------------------------------------------------------------------===//
 
@@ -764,12 +767,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   // Optimistic completion cost: accumulated cost plus, for every uncovered
   // node, the componentwise best still reachable. "Best" is direction-aware --
   // a minimize objective wants the smallest reachable value, a maximize
-  // objective the largest, or the bound stops favouring the branch it bounds
-  // and pruning becomes inadmissible. The per-instance value is `entry.cost`
-  // (measured-or-static), never `instance.localCost`: a calibrated-down
-  // instance must lower the bound, not be pruned by a stale static estimate.
-  // A node with no reachable instance makes the bound infinite, which
-  // `boundIsBetterThan` always loses whichever direction is declared.
+  // objective the largest, so the bound favours the branch it bounds. The
+  // per-instance value is `entry.cost` (measured-or-static), never
+  // `instance.localCost`: a calibrated-down instance must lower the bound, not
+  // be pruned by a stale static estimate. A node with no reachable instance
+  // makes the bound infinite, which `boundIsBetterThan` always loses whichever
+  // direction is declared.
+  //
+  // The bound omits connection costs, which are unknown until both endpoints of
+  // a connection are chosen and are non-negative. That keeps it admissible for
+  // minimize (omitted terms can only raise a completion); for maximize the
+  // omission makes it too small, so the exact prune below is disabled unless
+  // the objective minimizes.
   auto boundCost = [&](const Partial &partial) -> Cost {
     Cost total = partial.cost;
     for (size_t index = 0; index < tables.size(); ++index) {
@@ -814,9 +823,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           }
         }
       }
-      // Task 2 replaces this comparator; `boundIsBetterThan` is the exposed,
-      // direction-aware swap point. An exact tie falls back to the deeper (more
-      // covered) plan, then the stable partial id.
+      // Bound order: the more promising bound first, direction-aware. An exact
+      // tie falls back to the deeper (more covered) plan, then the stable
+      // partial id. The beam is a bounded heuristic that always reports
+      // truncation, so it may sort on a bound the exact prune would reject.
       llvm::sort(next, [&](const Partial &lhs, const Partial &rhs) {
         if (boundIsBetterThan(lhs.lowerBound, rhs.lowerBound,
                               options_.objective))
@@ -870,12 +880,17 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         Partial branch = partial;
         if (!extend(branch, *node, entry))
           continue;
-        if (exact) {
+        // Bound-based pruning is sound only for a minimize objective. The bound
+        // omits connection costs (a connection is synthesized only once both
+        // endpoints are chosen), and that term is non-negative: for minimize an
+        // omitted term can only raise a completion, so the bound stays at or
+        // below it; for maximize the same omission makes the bound too small,
+        // and a branch whose real completion would be largest can look poor.
+        // Maximize therefore explores fully -- the caps (topK, instance,
+        // candidate, and route caps) still bound the run and report
+        // `searchTruncated`, so it never silently returns a non-best plan.
+        if (exact && options_.objective.minimize) {
           branch.lowerBound = boundCost(branch);
-          // Task 2 replaces this prune; `boundIsBetterThan` is the exposed,
-          // direction-aware swap point. A bound that cannot beat the worst
-          // kept plan is pruned -- `>=` under a minimize objective, `<=`
-          // under a maximize one, and a dead bound always loses.
           if (bestCosts.size() >= options_.topK &&
               !boundIsBetterThan(branch.lowerBound, bestCosts.back(),
                                  options_.objective)) {

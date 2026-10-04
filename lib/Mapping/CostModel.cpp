@@ -174,7 +174,19 @@ Cost infiniteCost() {
   return cost;
 }
 
-bool boundIsDead(const Cost &cost) { return std::isinf(cost.latencyCycles); }
+bool boundIsDead(const Cost &cost) {
+  // The `infiniteCost()` sentinel saturates *every* dimension. Keying only on
+  // `latencyCycles` would be fragile: under a maximize objective an infinite
+  // latency is the *best* value, so a single-dimension test could mistake a
+  // live bound for a dead one. Requiring all six dimensions to be saturated
+  // cannot collide with a real completion, whose costs are finite.
+  return std::isinf(cost.latencyCycles) &&
+         std::isinf(cost.computeUtilization) &&
+         std::isinf(cost.transferUtilization) &&
+         cost.dramBytes == std::numeric_limits<uint64_t>::max() &&
+         cost.localBytes == std::numeric_limits<uint64_t>::max() &&
+         cost.spillBytes == std::numeric_limits<uint64_t>::max();
+}
 
 bool boundIsBetterThan(const Cost &lhs, const Cost &rhs,
                        const ObjectiveOrder &order) {
