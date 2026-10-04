@@ -1,6 +1,7 @@
-(* LLKMap merged profile: main 31fd9eb. Token-level EBNF.
+(* LLKMap profile: main 31fd9eb plus INT64_MAX range parsing fix.
+   Token-level EBNF.
    Quoted text is a terminal; [] optional; {} repetition; | alternative.
-   IDENT, UINT, STRING, VERSION and EOF are defined in llkmap-syntax.md.
+   IDENT, UNTYPED_PARAM, UINT, STRING, VERSION and EOF are defined in llkmap-syntax.md.
    VERSION is an IDENT constrained to v followed by decimal digits.
    Lexical rules and semantic restrictions are part of the specification. *)
 layout_file = { layout }, EOF ;
@@ -8,7 +9,7 @@ rule_file = { rule }, EOF ;
 
 layout = "layout", IDENT, "(", [ layout_param, { ",", layout_param } ],
          ")", "{", { layout_stmt }, "}" ;
-layout_param = [ "int" | "sym" ], IDENT ;
+layout_param = ( "int" | "sym" ), IDENT | UNTYPED_PARAM ;
 layout_stmt = domain_stmt | expr_requirement | map_stmt ;
 domain_stmt = "param", IDENT, "in", domain, ";" ;
 domain = "[", UINT, "..", UINT, "]"
