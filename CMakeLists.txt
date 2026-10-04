@@ -437,12 +437,18 @@ add_library(LLKMicroMapping STATIC
     lib/Conversion/MicroMapping/MicroMapPass.cpp
     lib/Conversion/MicroMapping/MicroBindPlanPass.cpp
     lib/Conversion/MicroMapping/MicroVerifyMappingPass.cpp
+    lib/Conversion/MicroMapping/SearchBindingLoader.cpp
 )
 target_include_directories(LLKMicroMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
 )
-target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine)
+# The SearchBinding loader reads a space's parameters through
+# llk::perf::loadSearchSpace rather than re-parsing micro.param, so this library
+# needs LLKPerf. That direction is legal: LLKPerf already depends on LLKMapping,
+# and LLKMapping must never depend on LLKPerf, so the pass library -- above both
+# -- is the only layer that may link them together.
+target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine LLKPerf)
 # LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
 # not inherit those. Match the toolchain, exactly as LLKMapping does.
 target_compile_options(LLKMicroMapping PRIVATE -fno-rtti -fno-exceptions)
@@ -821,6 +827,20 @@ add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
 add_llk_mapping_test(MappingPropertiesTest test/Mapping/properties.cpp)
 
+# SearchBinding loader (phase-4 task 1): micro.candidate -> mapping::SearchBinding.
+# The loader lives in the pass library, not LLKMapping, because it reuses
+# llk::perf::loadSearchSpace to read the parameters -- and LLKPerf depends on
+# LLKMapping, so the loader cannot live in the reverse direction. The test reads
+# the checked-in fixture by path, so the same file the FileCheck round-trip
+# covers is the one the loader is driven against.
+add_llvm_executable(SearchBindingLoaderTest
+    test/Conversion/MicroMapping/search_binding_loader.cpp)
+target_link_libraries(SearchBindingLoaderTest PRIVATE
+    LLKMicroMapping LLKPerf MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(SearchBindingLoaderTest PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME SearchBindingLoaderTest COMMAND SearchBindingLoaderTest)
+
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
 # every configure so changing LLVM_PROJECT_BUILD_DIR cannot retain FileCheck
@@ -855,6 +875,7 @@ if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
   add_llk_filecheck_test(MicroDialectSearchSpace test/Dialect/Micro/search_space.mlir)
+  add_llk_filecheck_test(MicroMappingSearchBinding test/Conversion/MicroMapping/search_binding.mlir)
 
   # MicroMappingMap: the --micro-map pass runs the mapping chain (extract ->
   # search -> bind) and writes the selected plan's metadata onto the kernel.
