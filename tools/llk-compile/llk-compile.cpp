@@ -60,7 +60,8 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
-#include "mlir/Target/LLVMIR/Dialect/All.h"
+#include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Config/llvm-config.h"
@@ -327,12 +328,13 @@ int main(int argc, char **argv) {
   mlir::linalg::registerValueBoundsOpInterfaceExternalModels(registry);
   mlir::scf::registerValueBoundsOpInterfaceExternalModels(registry);
 
-  // Register the LLVM IR translations for every dialect. The legacy LLK ->
-  // Linalg pipeline never produced e.g. `ub.poison`, so its translation was
-  // never needed; a frontier reached by lowering a `micro.kernel` --
-  // uninitialized allocations, vector ops, CF -- does, and without this the
-  // JIT step fails with "missing LLVMTranslationDialectInterface".
-  mlir::registerAllToLLVMIRTranslations(registry);
+  // Register the LLVM IR translations the pipeline can actually reach:
+  // builtin (modules and unreachable) and the LLVM dialect. Not the full
+  // `registerAllToLLVMIRTranslations`, whose ARM/GPU/SPIRV/... entries this
+  // tool does not link -- naming them would turn a complete-looking
+  // registration into a link error.
+  mlir::registerBuiltinDialectTranslation(registry);
+  mlir::registerLLVMDialectTranslation(registry);
 
   mlir::MLIRContext ctx(registry);
   ctx.loadAllAvailableDialects();
