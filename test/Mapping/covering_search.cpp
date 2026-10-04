@@ -138,6 +138,71 @@ WorkloadGraph twoNodeTileGraph(mlir::MLIRContext &context, mlir::Type tile) {
   return graph;
 }
 
+/// A three-node chain `in -> n0 -> v0 -> n1 -> v1 -> n2 -> out`, every node a
+/// `micro.vector(op = "add")` over untyped values. Each node binds one memory
+/// and materializes the 4096-byte fallback tile.
+WorkloadGraph threeNodeChainGraph(mlir::MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
+  WorkloadValueId v0 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "v0", /*external=*/false});
+  WorkloadValueId v1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "v1", /*external=*/false});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+
+  auto node = [&](unsigned ordinal, WorkloadValueId in, WorkloadValueId out) {
+    WorkloadNode n;
+    n.opName = "micro.vector";
+    n.sourceOrdinal = ordinal;
+    n.attributes = vectorAttributes(context, "add");
+    n.inputs.push_back(WorkloadPort{in, mlir::Type(), std::nullopt});
+    n.outputs.push_back(WorkloadPort{out, mlir::Type(), std::nullopt});
+    graph.addNode(std::move(n));
+  };
+  node(0, input, v0);
+  node(1, v0, v1);
+  node(2, v1, output);
+
+  graph.finalize();
+  return graph;
+}
+
+/// One `micro.vector` node with two output tiles of different sizes. The node
+/// binds a single memory, which holds both outputs.
+WorkloadGraph twoOutputTileGraph(mlir::MLIRContext &context, mlir::Type first,
+                                 mlir::Type second) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, first, "in", /*external=*/true});
+  WorkloadValueId out0 =
+      graph.addValue(WorkloadValue{0, first, "out0", /*external=*/false});
+  WorkloadValueId out1 =
+      graph.addValue(WorkloadValue{0, second, "out1", /*external=*/false});
+
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context, "add");
+  node.inputs.push_back(WorkloadPort{input, first, std::nullopt});
+  node.outputs.push_back(WorkloadPort{out0, first, std::nullopt});
+  node.outputs.push_back(WorkloadPort{out1, second, std::nullopt});
+  graph.addNode(std::move(node));
+
+  graph.finalize();
+  return graph;
+}
+
+/// `searchMachine` with the sram node's capacity set to `bytes`, so a capacity
+/// test can pin the exact live total it admits.
+MachineModel sramCapacityMachine(uint64_t bytes) {
+  MachineModel model = searchMachine();
+  for (MemoryNode &memory : model.memories)
+    if (memory.kind == "sram")
+      memory.capacityBytes = bytes;
+  return model;
+}
+
 /// Two executors whose ids sort opposite to their kinds, so ordering placements
 /// by node and by the executor binding tuple give different answers.
 MachineModel oppositeOrderMachine() {
@@ -1221,6 +1286,90 @@ TEST(CoveringSearch, CapacityUsesTheRealValueSizeNotAConstant) {
   llvm::Expected<MappingSearchResult> result = search.search();
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   EXPECT_FALSE(result->plans.empty());
+}
+
+// Phase-3 T2: a value's bytes are released once its last consumer is placed.
+// Three 4096-byte tiles chained n0 -> n1 -> n2 each fit sram.0 *sequentially*,
+// but never all three at once: the live peak is two tiles (the one a consumer
+// reads plus the one it writes). Monotonic accumulation charged all three and
+// rejected the chain; live-range expiry makes it legal.
+TEST(CoveringSearch, ExpiresAValueWhenItsLastConsumerIsPlaced) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = threeNodeChainGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sramCapacityMachine(2u * 4096u), kSharedReadRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+  EXPECT_EQ(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// Expiry must not become unsound: a value stays charged until its *last*
+// consumer is placed. A fan-out's value and both consumers' own output tiles
+// are live together, so three 4096-byte tiles exceed a two-tile memory at the
+// moment the second consumer is placed. Releasing on the first consumer would
+// wrongly admit it -- both consumers genuinely overlap the shared value.
+TEST(CoveringSearch, AnOverlappingValueStaysChargedUntilEveryConsumerIsPlaced) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanOutGraph(context, /*producerOp=*/"add",
+                                    /*consumerOp=*/"add");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sramCapacityMachine(2u * 4096u), kSharedReadRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// Carried from T1: a node's single memory binding holds *every* output tile it
+// writes, not just the first. A 1024-byte and a 2048-byte output are 3072
+// together; sizing the binding from the first output alone (1024) under-charged
+// and admitted a 2500-byte sram. 2500 must reject the pair, 4096 must admit it.
+TEST(CoveringSearch, ANodeChargesItsMemoryForEveryMaterializedOutput) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type small = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  mlir::Type large = mlir::parseType("!micro.tile<16x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(small));
+  ASSERT_TRUE(static_cast<bool>(large));
+  WorkloadGraph graph = twoOutputTileGraph(context, small, large);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  {
+    std::unique_ptr<MappingTarget> target =
+        targetWith(sramCapacityMachine(2500), kRulesWithMemory);
+    ASSERT_NE(target, nullptr);
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_TRUE(result->plans.empty());
+    EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+  }
+  {
+    // The complement: 4096 admits the derived 3072, so the rejection above was
+    // the summed output bytes and not some unrelated failure.
+    std::unique_ptr<MappingTarget> target =
+        targetWith(sramCapacityMachine(4096), kRulesWithMemory);
+    ASSERT_NE(target, nullptr);
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_FALSE(result->plans.empty());
+  }
 }
 
 // Phase-3 ruling R1: a value whose size cannot be derived is still costed, but

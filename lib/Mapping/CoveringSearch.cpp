@@ -117,6 +117,15 @@ struct Partial {
   unsigned covered = 0;
   uint64_t executorSlots = 0;
   llvm::StringMap<uint64_t> memoryBytes;
+  /// Per-value live-range accounting: the memory charges a value currently
+  /// owes, as exact (memory, bytes) pairs so the release subtracts precisely
+  /// what the charge added. Populated when the value's producer is placed and
+  /// cleared when the value's *last* consumer is placed. A value the graph
+  /// never fully consumes keeps its charges for the whole plan (it is not in
+  /// `valueLinks`, so nothing ever releases it) -- the conservative direction.
+  llvm::DenseMap<WorkloadValueId,
+                 llvm::SmallVector<std::pair<MemoryNodeId, uint64_t>, 2>>
+      liveValueCharges;
 };
 
 MemoryNodeId primaryMemory(const MachineModel &machine,
@@ -280,18 +289,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return facts;
   };
 
-  // The bytes one instance materializes: its first output tile, or -- for a
-  // node the graph records no output for -- its first input. A node with no
-  // ports is sized by the reported fallback.
-  //
-  // Direction matters: a multi-output node sizes every memory binding from this
-  // one tile, so the charge is a *lower bound* on what the node holds and can
-  // under-charge (the unsafe direction for a capacity check). This preserves
-  // the old one-charge-per-binding count; mapping each binding to the output it
-  // actually holds is task-2 work.
-  auto materializedBytes = [&](const WorkloadNode &node) -> uint64_t {
-    if (!node.outputs.empty())
-      return factsForValue(node.outputs.front().value).bytes;
+  // The byte count for a node with no output to size: its first input's tile,
+  // or -- for a node with no port at all -- the reported fallback. A node that
+  // writes no output materializes nothing attributable, so such a charge is
+  // never expired.
+  auto portlessBytes = [&](const WorkloadNode &node) -> uint64_t {
     if (!node.inputs.empty())
       return factsForValue(node.inputs.front().value).bytes;
     report(DiagnosticCode::AssumedValueSize,
@@ -502,21 +504,50 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     partial.executorSlots += instance.resourceUsage.executorSlots;
     if (partial.linked.size() != valueLinks.size())
       partial.linked.assign(valueLinks.size(), 0);
-    // A bound memory holds the tile this instance materializes, plus anything
+    // A bound memory holds the tiles this instance materializes, plus anything
     // the rule declared explicitly. `memoryBytes` is keyed by memory *node*, so
-    // each byte can be charged to the node that actually holds it: the binding
+    // each byte is charged to the memory that actually holds it: the binding
     // map resolves a requirement kind to the node placement chose, while
-    // `resourceUsage` is keyed by that requirement kind. Bytes are accumulated
-    // for the duration of the partial plan -- an honest conservative live-range
-    // bound, since true expiry is not modelled.
-    // Only size the tile when there is a binding to charge it to; a rule that
+    // `resourceUsage` is keyed by that requirement kind.
+    //
+    // The materialized tiles are the node's *outputs*. One binding holds every
+    // output the node writes, so it is charged their total -- sizing it from
+    // the first output alone under-charges a multi-output node, the unsafe
+    // direction for a capacity check. When a node declares several bindings the
+    // graph fixes no output-to-binding pairing (a memory requirement names a
+    // requirement *kind*, never the port that goes there), so each binding
+    // keeps the first-output fallback, an admitted lower bound, rather than
+    // guessing a pairing.
+    //
+    // Each charged output is also recorded as a live range: the bytes are
+    // released once its last consumer is placed (below), so a sequential
+    // program is not charged as if every value were simultaneously live. Only
+    // size the tile when there is a binding to charge it to; a rule that
     // declares no memory charges nothing and must not report an assumption for
     // a size it never uses.
     if (!instance.memoryBindings.empty()) {
-      const uint64_t instanceBytes =
-          materializedBytes(*tables[nodeIndex].workload);
-      for (const auto &binding : instance.memoryBindings)
-        partial.memoryBytes[binding.second] += instanceBytes;
+      const WorkloadNode &workload = *tables[nodeIndex].workload;
+      if (workload.outputs.empty()) {
+        // No output to attribute: charge the first-input fallback for the whole
+        // plan. A sink materializes nothing we can expire.
+        const uint64_t bytes = portlessBytes(workload);
+        for (const auto &binding : instance.memoryBindings)
+          partial.memoryBytes[binding.second] += bytes;
+      } else if (instance.memoryBindings.size() == 1) {
+        const MemoryNodeId memory = instance.memoryBindings.begin()->second;
+        for (const WorkloadPort &output : workload.outputs) {
+          const uint64_t bytes = factsForValue(output.value).bytes;
+          partial.memoryBytes[memory] += bytes;
+          partial.liveValueCharges[output.value].push_back({memory, bytes});
+        }
+      } else {
+        const WorkloadValueId first = workload.outputs.front().value;
+        const uint64_t bytes = factsForValue(first).bytes;
+        for (const auto &binding : instance.memoryBindings) {
+          partial.memoryBytes[binding.second] += bytes;
+          partial.liveValueCharges[first].push_back({binding.second, bytes});
+        }
+      }
     }
     for (const auto &usage : instance.resourceUsage.memoryBytes) {
       MemoryNodeId node = instance.memoryBindings.lookup(usage.first());
@@ -622,6 +653,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       return true;
     };
 
+    // Values whose last endpoint this placement completes. Their bytes are
+    // released only after the capacity check below, so a consumer and the value
+    // it reads stay charged together while it is placed.
+    std::vector<size_t> completedLinks;
+
     for (size_t index = 0; index < valueLinks.size(); ++index) {
       const ValueLink &link = valueLinks[index];
       if (partial.linked[index])
@@ -636,6 +672,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (!complete)
         continue;
       partial.linked[index] = 1;
+      completedLinks.push_back(index);
 
       // The size of the value this link moves, derived once and shared by the
       // requests, the replica staging, and the gather's intermediate tile.
@@ -819,6 +856,25 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
              "plan byte total exceeds the global budget (" +
                  std::to_string(options_.memoryBudgetBytes) + " bytes)");
       return false;
+    }
+
+    // The branch fits, so the values whose last consumer this placement is have
+    // now run: release the bytes they were charged. Releasing *after* the
+    // capacity check keeps a consumer and the value it reads charged together
+    // for the placement -- an operation reads its inputs and writes its outputs
+    // in the same step, so they genuinely overlap. Where the graph fixes no
+    // order, staying conservative is the rule (ruling R2): only a value whose
+    // last consumer is placed expires, and its bytes are charged the whole time
+    // every endpoint is still live.
+    for (size_t index : completedLinks) {
+      auto charges = partial.liveValueCharges.find(valueLinks[index].value);
+      if (charges == partial.liveValueCharges.end())
+        continue;
+      for (const auto &charge : charges->second) {
+        uint64_t &held = partial.memoryBytes[charge.first];
+        held -= std::min(held, charge.second);
+      }
+      partial.liveValueCharges.erase(charges);
     }
 
     // The branch is legal: publish its connections to the shared pool.
