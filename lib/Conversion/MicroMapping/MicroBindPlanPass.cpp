@@ -16,6 +16,7 @@
 #include "llvm/Support/Error.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace mlir {
@@ -77,27 +78,27 @@ struct MicroBindPlanPass
     ModuleOp module = getOperation();
 
     // A plan id is content-derived, so parse it before doing any work: a bad id
-    // is a usage error, not a failed search. The binder prints an id as a
-    // signed i64, so accept both the signed spelling it emits and the unsigned
-    // decimal form; both denote the same 64-bit hash.
-    uint64_t requestedId = 0;
+    // is a usage error, not a failed search. `parsePlanId` accepts the hex
+    // spelling `PlanReport` prints, `0x`-hex, and decimal signed or unsigned --
+    // all spellings of the same 64-bit hash (see the rule in
+    // MicroMappingCommon.h).
     if (planId.getValue().empty()) {
       module.emitError() << "micro-bind-plan: missing required key 'plan-id'";
       signalPassFailure();
       return;
     }
-    llvm::StringRef idText(planId.getValue());
-    if (idText.getAsInteger(10, requestedId)) {
-      int64_t signedId = 0;
-      if (idText.getAsInteger(10, signedId)) {
-        module.emitError() << "micro-bind-plan: 'plan-id' must be a 64-bit "
-                              "integer, got '"
-                           << planId.getValue() << "'";
-        signalPassFailure();
-        return;
-      }
-      requestedId = static_cast<uint64_t>(signedId);
+    std::optional<uint64_t> parsedId =
+        micro_mapping_detail::parsePlanId(planId.getValue());
+    if (!parsedId) {
+      module.emitError()
+          << "micro-bind-plan: 'plan-id' must be a 64-bit plan id in bare hex "
+             "(the report's spelling, e.g. 0081ef1286442d39), 0x-prefixed hex, "
+             "or decimal, got '"
+          << planId.getValue() << "'";
+      signalPassFailure();
+      return;
     }
+    uint64_t requestedId = *parsedId;
 
     llvm::Expected<micro_mapping_detail::MappingRun> run =
         micro_mapping_detail::runMappingSearch(module, "micro-bind-plan",

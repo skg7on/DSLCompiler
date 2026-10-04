@@ -881,6 +881,17 @@ if(LLK_BUILD_TOOLS)
           ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingReport
   )
 
+  # MicroMappingBindPlanId: `--micro-bind-plan` accepts the id the report prints
+  # (bare hex), plus 0x-hex and signed/unsigned decimal, and rejects anything
+  # else. End-to-end because the id is obtained by running `--micro-map report=`
+  # first -- the documented report -> bind workflow. A script because the id is
+  # read out of a file and fed back into a second invocation.
+  add_test(NAME MicroMappingBindPlanId
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_bind_plan_id.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBindPlanId
+  )
+
   # LLKToMicro lowering tests. The schedule database is pointed at a path that
   # does not exist on purpose: the export then uses its built-in conservative
   # schedule, so the expected tile sizes do not depend on the working directory

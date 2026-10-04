@@ -26,7 +26,9 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
@@ -77,6 +79,55 @@ parseSearchMode(llvm::StringRef text) {
       .Case("beam", mapping::SearchMode::Beam)
       .Case("exact", mapping::SearchMode::Exact)
       .Default(std::nullopt);
+}
+
+/// Parses a 64-bit plan id in every spelling the project emits or accepts.
+///
+/// A plan id is an unsigned 64-bit content hash. `PlanReport` prints it as bare
+/// lowercase hex (16 digits, from `hexId`), so that spelling -- the one the
+/// documented report -> bind workflow copies -- must be accepted verbatim. The
+/// other accepted spellings denote the same hash: `0x`/`0X`-prefixed hex, and
+/// decimal read as either unsigned or signed (a hash with the high bit set is
+/// negative when read as a signed i64, and both spellings must round-trip).
+///
+/// Spelling rule, deterministic and tested: a `0x`/`0X` prefix forces hex;
+/// otherwise a string made only of hex digits that contains at least one hex
+/// letter (`a`-`f`, either case) is hex; everything else is decimal. So the
+/// digit-only `12345` is decimal 12345 and not 0x12345, while `12ab` is hex
+/// 4779. Numbers too large for the chosen base, or containing any other
+/// character, are rejected. Returns nullopt on rejection.
+inline std::optional<uint64_t> parsePlanId(llvm::StringRef text) {
+  llvm::StringRef body = text;
+  if (body.consume_front("0x") || body.consume_front("0X")) {
+    uint64_t hex = 0;
+    if (body.empty() || body.getAsInteger(16, hex))
+      return std::nullopt;
+    return hex;
+  }
+
+  if (body.empty())
+    return std::nullopt;
+
+  // Hex-letter detection is what separates the two ambiguous spellings: a
+  // digit-only run is decimal, a run with a hex letter is hex.
+  bool allHexDigits =
+      llvm::all_of(body, [](char c) { return llvm::isHexDigit(c); });
+  bool hasHexLetter = llvm::any_of(
+      body, [](char c) { return llvm::isHexDigit(c) && !llvm::isDigit(c); });
+  if (allHexDigits && hasHexLetter) {
+    uint64_t hex = 0;
+    if (body.getAsInteger(16, hex))
+      return std::nullopt;
+    return hex;
+  }
+
+  uint64_t unsignedValue = 0;
+  if (!body.getAsInteger(10, unsignedValue))
+    return unsignedValue;
+  int64_t signedValue = 0;
+  if (!body.getAsInteger(10, signedValue))
+    return static_cast<uint64_t>(signedValue);
+  return std::nullopt;
 }
 
 /// Splits the comma-separated emitter keys, dropping empty entries so a stray
