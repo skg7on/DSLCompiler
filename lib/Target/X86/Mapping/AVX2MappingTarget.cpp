@@ -8,8 +8,9 @@
 namespace mlir::llk::target::avx2 {
 
 llvm::ArrayRef<llvm::StringLiteral> emitterKeys() {
-  static const llvm::StringLiteral kKeys[] = {"avx2_vector_add", "avx2_mma",
-                                              "avx2_reduce", "avx2_copy"};
+  static const llvm::StringLiteral kKeys[] = {
+      "avx2_vector_add", "avx2_mma",       "avx2_reduce",
+      "avx2_copy",       "avx2_tile_copy", "avx2_tile_store"};
   return kKeys;
 }
 

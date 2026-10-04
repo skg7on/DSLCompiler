@@ -165,6 +165,23 @@ TEST(Avx2Target, MatchesItsOwnRuleForTheVectorOperation) {
   EXPECT_EQ(matches[0]->id, "avx2.vector_add");
 }
 
+TEST(Avx2Target, CoversTheTileMovementOpsTheLoweringEmits) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  // `llk-to-micro` emits these two tile-level movement ops, so a rule must
+  // cover each one; without them a compiler-generated tile program fails with
+  // `no_matching_rule`. Each rule's `emit` key must be one the target declares.
+  for (llvm::StringRef op : {"micro.tile_async_copy", "micro.tile_store"}) {
+    WorkloadNode node;
+    node.opName = op.str();
+    std::vector<const RuleDef *> matches = matchRules(node, (*target)->rules());
+    ASSERT_FALSE(matches.empty()) << "no rule matches " << op.str();
+    for (const RuleDef *rule : matches)
+      EXPECT_TRUE((*target)->isKnownEmitter(rule->emitter)) << rule->id;
+  }
+}
+
 TEST(Avx2Target, MapsAVectorNodeEndToEnd) {
   llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
   ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());

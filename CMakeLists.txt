@@ -858,7 +858,7 @@ if(LLK_BUILD_TOOLS)
   # The pass options are quoted so sh hands llk-opt one argv token; the whole
   # option string is the user-facing contract from design §21.
   add_llk_filecheck_test(MicroMappingMap test/Conversion/MicroMapping/micro_map.mlir
-      "\"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_mma,avx2_reduce,avx2_copy mode=deterministic\"")
+      "\"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=deterministic\"")
 
   # MicroMappingUnmaterialized: a plan whose edge is an unmaterializable
   # movement (see the fixture's rules file). The binder reports such a
