@@ -71,3 +71,20 @@ TEST(TileFacts, AnUnrecognisedTypeIsReportedNotGuessed) {
                                 mlir::Float32Type::get(&context)))
                    .known);
 }
+
+TEST(TileFacts, HandlesUnitAndRankZeroShapes) {
+  mlir::MLIRContext context;
+  // A single-element tile is 1 * 1 * 4 bytes.
+  TileFacts unit = tileFactsFor(tileType(context, "1x1xf32"));
+  EXPECT_TRUE(unit.known);
+  EXPECT_EQ(unit.bytes, 4u);
+  EXPECT_EQ(unit.alignment, 4u);
+  // A unit extent in only one dimension.
+  EXPECT_EQ(tileFactsFor(tileType(context, "1x32xf32")).bytes, 128u);
+  // A rank-0 (scalar) shaped value holds exactly one element.
+  TileFacts scalar = tileFactsFor(
+      mlir::RankedTensorType::get({}, mlir::Float32Type::get(&context)));
+  EXPECT_TRUE(scalar.known);
+  EXPECT_EQ(scalar.bytes, 4u);
+  EXPECT_EQ(scalar.alignment, 4u);
+}

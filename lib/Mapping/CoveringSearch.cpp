@@ -283,6 +283,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   // The bytes one instance materializes: its first output tile, or -- for a
   // node the graph records no output for -- its first input. A node with no
   // ports is sized by the reported fallback.
+  //
+  // Direction matters: a multi-output node sizes every memory binding from this
+  // one tile, so the charge is a *lower bound* on what the node holds and can
+  // under-charge (the unsafe direction for a capacity check). This preserves
+  // the old one-charge-per-binding count; mapping each binding to the output it
+  // actually holds is task-2 work.
   auto materializedBytes = [&](const WorkloadNode &node) -> uint64_t {
     if (!node.outputs.empty())
       return factsForValue(node.outputs.front().value).bytes;
@@ -634,6 +640,15 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // The size of the value this link moves, derived once and shared by the
       // requests, the replica staging, and the gather's intermediate tile.
       const TileFacts linkFacts = factsForValue(link.value);
+
+      // A zero-element value (a static 0 dimension) moves no bytes: it needs no
+      // route, layout transform, or staging, and synthesizing a connection for
+      // it would only trip the "bytes must be positive" rule. Budget it as
+      // free, matching the zero capacity it is charged. The Micro tile verifier
+      // rejects a 0 dimension, so this is reachable only through a modelled
+      // tensor/memref/vector value type.
+      if (linkFacts.bytes == 0)
+        continue;
 
       if (link.producers.size() == 1) {
         const ValueEndpoint &producerEnd = link.producers[0];

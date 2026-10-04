@@ -1269,6 +1269,29 @@ TEST(CoveringSearch, AKnownValueSizeIsNotReported) {
   EXPECT_FALSE(hasDiagnostic(*result, DiagnosticCode::AssumedValueSize));
 }
 
+// A zero-element value (a static 0 dimension -- reachable only through a
+// modelled tensor, since the Micro tile verifier rejects 0) moves no bytes, so
+// it takes no connection rather than tripping the "bytes must be positive"
+// route rule. The plan still exists, charged zero for the tile.
+TEST(CoveringSearch, AZeroElementValueTakesNoConnection) {
+  mlir::MLIRContext context;
+  mlir::Type empty =
+      mlir::RankedTensorType::get({0, 32}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = twoNodeTileGraph(context, empty);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_TRUE(result->plans[0].connections.empty());
+  EXPECT_FALSE(hasDiagnostic(*result, DiagnosticCode::AssumedValueSize));
+}
+
 // A connection across two *different* memories must run producer -> consumer,
 // not the reverse. The #97 bug reversed the endpoints when the connection was
 // synthesized as the consumer instance completed the edge, and every fixture

@@ -19,6 +19,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -45,17 +46,36 @@ llvm::StringRef stringifySearchMode(SearchMode mode) {
 }
 
 /// True when `code` names a *rejection* -- something the search refused -- as
-/// opposed to a notice. §22.2 asks for "rejected counts", so `search_truncated`
-/// (a cap, not a rejection) and `latency_cache_miss` (a provider gap, not a
-/// rejection) are reported separately and never inflate the rejection tally.
+/// opposed to a notice. §22.2 asks for "rejected counts", so a notice never
+/// inflates the rejection tally.
+///
+/// Every code is classified explicitly and there is deliberately no `default`:
+/// a code added to the enum without a case here makes this switch incomplete
+/// (`-Wswitch`), rather than silently defaulting into the rejection bucket.
+/// `AssumedValueSize` is the case that motivated it -- its own documentation
+/// says it is not an error, so it must land under notices.
 bool isRejection(DiagnosticCode code) {
   switch (code) {
+  // Notices: a cap, a provider gap, or an advisory assumption. None is a
+  // refusal the search made.
   case DiagnosticCode::SearchTruncated:
   case DiagnosticCode::LatencyCacheMiss:
+  case DiagnosticCode::AssumedValueSize:
     return false;
-  default:
+  // Rejections: the search refused a rule, a placement, a pair, a layout, a
+  // global constraint, a bundle, or a plan.
+  case DiagnosticCode::NoMatchingRule:
+  case DiagnosticCode::NoLegalLayout:
+  case DiagnosticCode::NoLegalExecutor:
+  case DiagnosticCode::MemoryCapacityExceeded:
+  case DiagnosticCode::UnsupportedComputeFragment:
+  case DiagnosticCode::NoMemoryRoute:
+  case DiagnosticCode::NoLayoutTransform:
+  case DiagnosticCode::GlobalConstraintFailed:
+  case DiagnosticCode::TargetBundleInvalid:
     return true;
   }
+  llvm_unreachable("unclassified DiagnosticCode");
 }
 
 /// Fixed six-decimal rendering of a double, matching `canonicalCostString`, so
