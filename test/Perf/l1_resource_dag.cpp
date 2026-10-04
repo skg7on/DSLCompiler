@@ -692,4 +692,91 @@ TEST(L1ResourceDag, EveryEventCarriesItsSharedCostCategory) {
   EXPECT_EQ(dag->events[0].costKind, mapping::CostEventKind::TransferHop);
 }
 
+namespace {
+/// Two workers, each with its own vector engine, so a mapped op's executor
+/// decides which engine the cost model charges.
+constexpr llvm::StringLiteral kTwoEngineMachine = R"yaml(
+schema: llk.machine.v2
+target: two-engine
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.0
+    kind: cluster
+  - id: worker.0
+    kind: worker
+    parent: cluster.0
+  - id: cluster.1
+    kind: cluster
+  - id: worker.1
+    kind: worker
+    parent: cluster.1
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+compute:
+  - id: vpu.a
+    kind: vector_engine
+    attached_to: worker.0
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+    issue_cycles: 1
+    latency_cycles: 1
+    supported_layouts: [row_major]
+  - id: vpu.b
+    kind: vector_engine
+    attached_to: worker.1
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+    issue_cycles: 1
+    latency_cycles: 1
+    supported_layouts: [row_major]
+)yaml";
+
+/// One vector add whose `micro.mapping` names the executor the plan selected.
+std::string mappedVectorKernel(llvm::StringRef executor) {
+  return std::string(
+             "module {\n  micro.kernel @mapped {\n"
+             "    %t = micro.tile_alloc : !micro.tile<8xf32, memory = "
+             "#micro.memory<sram>>\n"
+             "    %r = micro.vector \"add\" %t, %t {micro.mapping = {executor "
+             "= \"") +
+         executor.str() +
+         "\"}} : !micro.tile<8xf32, memory = #micro.memory<sram>>, "
+         "!micro.tile<8xf32, memory = #micro.memory<sram>> -> "
+         "!micro.tile<8xf32, memory = #micro.memory<sram>>\n"
+         "    micro.yield\n  }\n}\n";
+}
+} // namespace
+
+// §17.2: the mapped executor is a modelled decision, so a vector op is charged
+// on the engine attached to the executor the plan selected -- not on the
+// machine's declaration-order first engine. Two kernels differing only in the
+// selected executor therefore charge two different engines.
+TEST(L1ResourceDag, AMappedOpChargesTheEngineItsExecutorOwns) {
+  machine::MachineModel model = parseMachine(kTwoEngineMachine);
+
+  auto first = parseKernel(mappedVectorKernel("worker.0"));
+  ASSERT_TRUE(first);
+  auto dagA = buildMicroDAG(first->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dagA)) << llvm::toString(dagA.takeError());
+  ASSERT_EQ(dagA->events.size(), 1u);
+  EXPECT_EQ(dagA->events[0].resourceName, "vpu.a");
+
+  auto second = parseKernel(mappedVectorKernel("worker.1"));
+  ASSERT_TRUE(second);
+  auto dagB = buildMicroDAG(second->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dagB)) << llvm::toString(dagB.takeError());
+  ASSERT_EQ(dagB->events.size(), 1u);
+  EXPECT_EQ(dagB->events[0].resourceName, "vpu.b");
+}
+
 } // namespace mlir::llk::perf
