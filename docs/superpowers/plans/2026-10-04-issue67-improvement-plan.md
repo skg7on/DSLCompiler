@@ -35,7 +35,9 @@ The following requirements apply to every task and companion plan:
 
 ## Baseline and scope
 
-Planning baseline: PR #111 head `249aa17670ff617bde1f37540075aa2c7f0d3929`, including PR #112. Review evidence: fresh build, 126 CTests, 124 passed, two CPU-specific skips. Earlier LLVM 22 linking failure was addressed by `249aa17`; new remote CI must still be checked by the implementer.
+Planning baseline: merged main `c8f74a91114de362658cff9a5ed36fa662fd5281` after PR #111, whose final head is `249aa17670ff617bde1f37540075aa2c7f0d3929` and includes PR #112. The merge adds only the earlier post-#108 review document relative to that head; implementation and tests are identical. After merge, configure/build, all 126 CTests (124 passed, two CPU-specific skips, zero failures), verifier/constraint/perf/lowering probes and rebuilt planner probes were rerun. All seven findings persist, so all 27 tasks remain applicable.
+
+The LLVM 22 linking failure is resolved: [final PR-head CI](https://github.com/skg7on/DSLCompiler/actions/runs/37200831517) and [merged-main CI](https://github.com/skg7on/DSLCompiler/actions/runs/37204042190) both pass build and tests. These are baseline checks; every implementation delivery still needs fresh checks at its own revision.
 
 This is a proposed implementation plan, not a claim that its interfaces already exist. The normative design is retained; the concrete interfaces below are the recommended implementation decisions. Before executing, rebase the selected worktree onto the then-current intended base and retire any task already fixed with equivalent evidence.
 
