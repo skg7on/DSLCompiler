@@ -196,6 +196,7 @@ micro.tile_copy
 micro.tile_async_copy
 micro.prefetch
 micro.tile_prefetch
+micro.transform
 ```
 
 Memory ops must carry enough information to compute:
@@ -210,6 +211,8 @@ Memory ops must carry enough information to compute:
 - overlap potential
 
 Logical tile ops such as `micro.tile_view`, `micro.tile_slice`, and `micro.tile_partition` are zero-cost until materialized. Materialization occurs through allocation, load, copy, async copy, store, layout transform, or compute consumption.
+
+`micro.transform` is the layout transform: it re-represents a shaped value from one layout to another, naming each side by its *logical-to-physical affine map* (`src_map`, `dst_map`) rather than by a target-owned layout id, so the operation stays target-neutral (target ids are not `#micro.layout` enumerants). Either map may be absent when that layout declares no map clause, leaving the index relation to the target. A mapping plan's `LayoutTransform` connection becomes one of these in place; a `TransferAndTransform` connection emits its movement copies followed by one.
 
 ### 3.3 Compute
 
@@ -564,6 +567,7 @@ Concrete `micro.kernel` verifier:
 - memory spaces are known
 - transfer source and destination spaces are legal
 - `micro.wait` operands reference async operations
+- `micro.transform` has shaped or tile operands and result, the result type equals the operand type (a re-representation, not a conversion), and `src_map`/`dst_map`, when both present, have the same logical rank (numDims); their physical ranks may differ
 - `micro.mma` dtypes and tile shape are supported by the selected machine when a machine is provided
 - tile layouts are compatible with their memory space and compute owner
 - owner mappings are valid and nested scopes are compatible

@@ -1774,3 +1774,45 @@ rule r {
   ASSERT_TRUE(map.accessMap.has_value());
   EXPECT_EQ(map.accessMap->dims.size(), 2u);
 }
+
+// A binding that names the port a layout governs obliges only that port: the
+// strategy can constrain `operand0` and `operand1` differently, which a single
+// role-less layout value cannot express.
+TEST(RuleMatch, APerRoleBindingObligesOnlyItsOwnPort) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.two_ports {
+  match micro.vector(input[0].element_type = f32);
+  input "operand0";
+  input "operand1";
+  output "result";
+  require layout operand0 satisfies t.plain;
+  require layout operand1 satisfies t.blocked;
+  bundle "b";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.two_ports");
+  ASSERT_NE(rule, nullptr);
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+
+  auto matches = [&](llvm::StringMap<std::string> bound) {
+    return toMappingCandidate(*rule, typedVectorNode(f32, f32), MachineModel{},
+                              LayoutContext{}, nullptr, nullptr, nullptr,
+                              &bound)
+        .has_value();
+  };
+
+  // Each port bound to what the rule offers there: a match.
+  EXPECT_TRUE(matches({{"operand0", "t.plain"}, {"operand1", "t.blocked"}}));
+  // `operand0` bound to the value `operand1` requires: no match.
+  EXPECT_FALSE(matches({{"operand0", "t.blocked"}}));
+  // A role the rule does not mention carries no obligation, so a rule that
+  // never mentions a port is not vetoed by a binding for it.
+  EXPECT_TRUE(matches({{"operand2", "t.blocked"}}));
+  // A value bound with no role governs the axis as a whole: the rule offers it
+  // somewhere, so it matches.
+  EXPECT_TRUE(matches({{"", "t.blocked"}}));
+}

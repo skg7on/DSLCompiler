@@ -187,3 +187,30 @@ func.func @reduce_bad_axis(%scores : !micro.tile<32x64xf32>) {
   %m = micro.reduce "max" %scores {axis = 5 : i64} : !micro.tile<32x64xf32> -> !micro.tile<32xf32>
   return
 }
+
+// -----
+
+// micro.transform re-represents a value: it must not change its shape.
+func.func @transform_shape_changed(%x : !micro.tile<32x64xf32>) {
+  // expected-error @+1 {{source and result must have the same shape and element type}}
+  %r = micro.transform %x : !micro.tile<32x64xf32> -> !micro.tile<16x64xf32>
+  return
+}
+
+// -----
+
+// micro.transform maps describe the same value, so their logical ranks agree.
+func.func @transform_rank_mismatch(%x : !micro.tile<32x64xf32>) {
+  // expected-error @+1 {{src_map and dst_map must have the same number of dimensions}}
+  %r = micro.transform %x {src_map = affine_map<(d0, d1) -> (d0, d1)>, dst_map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>} : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  return
+}
+
+// -----
+
+// micro.transform needs a shaped or tile value: an index has no layout.
+func.func @transform_unshaped(%i : index) {
+  // expected-error @+1 {{source and result must be shaped or tile types}}
+  %r = micro.transform %i : index -> index
+  return
+}

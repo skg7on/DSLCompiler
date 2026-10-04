@@ -30,6 +30,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -236,6 +237,64 @@ sortedKeys(const llvm::StringMap<ValueT> &map) {
   return keys;
 }
 
+/// A type's printed form, or "" for a null type.
+std::string renderedType(mlir::Type type) {
+  if (!type)
+    return {};
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  type.print(stream);
+  return stream.str();
+}
+
+/// A node's port types, space-joined in declaration order.
+std::string renderedPortTypes(llvm::ArrayRef<WorkloadPort> ports) {
+  std::vector<std::string> texts;
+  texts.reserve(ports.size());
+  for (const WorkloadPort &port : ports)
+    texts.push_back(renderedType(port.type));
+  return llvm::join(texts, " ");
+}
+
+/// An attribute's printed form, or "" for a null attribute.
+std::string renderedAttribute(mlir::Attribute attribute) {
+  if (!attribute)
+    return {};
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  attribute.print(stream);
+  return stream.str();
+}
+
+/// The instance's complete layout identity: for each bound requirement its
+/// layout family and the parameters solved for it, canonically rendered and
+/// sorted. Two placements that chose different parameterizations of one family
+/// (`VW = 4` versus `VW = 8`) are different work and must not share a key.
+std::string layoutIdentity(const CandidateInstance &instance) {
+  std::vector<std::string> entries;
+  entries.reserve(instance.layoutSolutions.size());
+  for (const auto &entry : instance.layoutSolutions) {
+    std::string text = entry.second.layoutClass;
+    text += "(";
+    text += canonicalSearchValueString(entry.second.parameters);
+    text += ")";
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return llvm::join(entries, ",");
+}
+
+/// The instance's concrete placement identity: the executor it bound and its
+/// sorted memory bindings. Two placements of one rule on different executors or
+/// memories are different work.
+std::string placementIdentity(const CandidateInstance &instance) {
+  std::string text = "executor=";
+  text += instance.executorBindings.lookup("executor");
+  text += ",memories=";
+  text += llvm::join(sortedBindings(instance.memoryBindings), ",");
+  return text;
+}
+
 /// Canonical placement order (design §22.1): the executor id, then the sorted
 /// memory bindings, then the sorted layout bindings. Node and instance ids
 /// break a tie so the order over a complete plan is total.
@@ -287,10 +346,10 @@ CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
                                const LayoutContext &layoutContext,
                                const MappingSearchOptions &options,
                                std::optional<SearchBinding> binding,
-                               std::optional<std::string> boundLayout)
+                               llvm::StringMap<std::string> boundLayouts)
     : workload_(workload), target_(target), context_(context),
       layoutContext_(layoutContext), options_(options),
-      binding_(std::move(binding)), boundLayout_(std::move(boundLayout)) {}
+      binding_(std::move(binding)), boundLayouts_(std::move(boundLayouts)) {}
 
 llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   const MachineModel &machine = target_.machine();
@@ -393,16 +452,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // exactly the pre-binding enumeration.
     const llvm::StringMap<SearchValue> *pinned =
         binding_ ? &binding_->values : nullptr;
-    // The layout the binding resolves to, resolved from its `layout`-kind
-    // parameter by the caller. A null pointer when no binding, or a binding
-    // with no layout-kind parameter, leaves layout selection unchanged.
-    const std::string *boundLayout = boundLayout_ ? &*boundLayout_ : nullptr;
+    // The layouts the binding resolves to, one per role, resolved from the
+    // space's `layout`-kind parameters by the caller. An empty map -- no
+    // binding, or a binding with no layout-kind parameter -- leaves layout
+    // selection unchanged.
+    const llvm::StringMap<std::string> *boundLayouts =
+        boundLayouts_.empty() ? nullptr : &boundLayouts_;
     for (const RuleDef *rule : matches) {
       std::string reason;
       bool truncated = false;
       std::optional<MappingCandidate> candidate =
           toMappingCandidate(*rule, *node, machine, layoutContext_, &reason,
-                             &truncated, pinned, boundLayout);
+                             &truncated, pinned, boundLayouts);
       if (!candidate) {
         if (truncated) {
           result.searchTruncated = true;
@@ -446,19 +507,26 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           if (const LatencyProvider *provider = target_.latencyProvider()) {
             OperationSignature signature;
             signature.operation = node->opName;
+            // The operation's own types and attributes: two workloads on one
+            // rule that differ in dtype, shape, or a predicate-relevant
+            // attribute are different work at different costs.
+            signature.operandTypes = renderedPortTypes(node->inputs);
+            signature.resultTypes = renderedPortTypes(node->outputs);
+            signature.attributes = renderedAttribute(node->attributes);
             signature.rule = rule->id;
             signature.ruleVersion = rule->version;
-            signature.bundle = rule->bundle;
-            if (!entry.instance.layoutBindings.empty()) {
-              std::vector<std::string> layouts;
-              for (const auto &binding : entry.instance.layoutBindings)
-                layouts.push_back(binding.second);
-              llvm::sort(layouts);
-              signature.layout = layouts.front();
-            }
+            signature.bundle = entry.instance.bundle.name.empty()
+                                   ? rule->bundle
+                                   : entry.instance.bundle.name;
+            signature.bundleParameters =
+                renderedAttribute(entry.instance.bundle.parameters);
+            // Every bound requirement's family *and* solved parameters, not
+            // merely the first family id.
+            signature.layout = layoutIdentity(entry.instance);
             if (const machine::ExecutorNode *executor = machine.findExecutor(
                     entry.instance.executorBindings.lookup("executor")))
               signature.placementClass = executor->kind;
+            signature.placement = placementIdentity(entry.instance);
             TargetContext context{target_.name().str(),
                                   hexId(machine.contentHash)};
             if (std::optional<double> measured =
@@ -659,11 +727,15 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // agrees on the class but not on its parameters is a transform rather
       // than a direct connection.
       if (const SolvedLayout *solved =
-              boundSolvedLayoutForValue(producer, value))
+              boundSolvedLayoutForValue(producer, value)) {
         request.producerLayoutParameters = solved->parameters;
+        request.producerLayoutMap = solved->map;
+      }
       if (const SolvedLayout *solved =
-              boundSolvedLayoutForValue(consumer, value))
+              boundSolvedLayoutForValue(consumer, value)) {
         request.consumerLayoutParameters = solved->parameters;
+        request.consumerLayoutMap = solved->map;
+      }
       const TileFacts facts = factsForValue(value);
       request.bytes = facts.bytes;
       request.alignmentBytes = facts.alignment;
@@ -1323,6 +1395,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       detail.route = connection.memoryRoute;
       detail.engines = connection.transferEngines;
       detail.transform = connection.transform;
+      detail.consumers.assign(connection.consumers.begin(),
+                              connection.consumers.end());
+      llvm::sort(detail.consumers);
       plan.connectionPlans.push_back(std::move(detail));
     }
     llvm::sort(plan.connectionPlans,

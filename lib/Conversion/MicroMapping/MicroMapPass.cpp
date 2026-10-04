@@ -71,6 +71,13 @@ struct MicroMapPass
                      "different id -- it never selects a target layout id, and "
                      "a rule with no layout requirement matches unchanged "
                      "(ruling S7). Absent leaves the search binding-free")};
+  Option<bool> requireExecutable{
+      *this, "require-executable",
+      llvm::cl::desc("Fail rather than bind a plan that omits an "
+                     "execution-affecting decision the binder cannot "
+                     "materialize (design §18.2). Off, such a decision is "
+                     "reported as a warning and the partial plan is bound"),
+      llvm::cl::init(false)};
 
   StringRef getArgument() const override { return "micro-map"; }
 
@@ -102,6 +109,7 @@ struct MicroMapPass
     options.reportPath = report.getValue();
     options.reportOnly = reportOnly.getValue();
     options.candidate = candidate.getValue();
+    options.requireExecutable = requireExecutable.getValue();
     return options;
   }
 
@@ -144,7 +152,9 @@ struct MicroMapPass
     if (options.reportOnly)
       return;
     if (llvm::Error error = micro_mapping_detail::bindPlanOntoModule(
-            module, run->result.plans.front(), *run->target)) {
+            module, run->result.plans.front(), *run->target,
+            options.requireExecutable ? mapping::BindContract::Executable
+                                      : mapping::BindContract::Partial)) {
       module.emitError() << llvm::toString(std::move(error));
       signalPassFailure();
       return;
@@ -177,6 +187,7 @@ std::unique_ptr<Pass> createMicroMapPass(const MicroMapOptions &options) {
   pass->report = options.reportPath;
   pass->reportOnly = options.reportOnly;
   pass->candidate = options.candidate;
+  pass->requireExecutable = options.requireExecutable;
   return pass;
 }
 

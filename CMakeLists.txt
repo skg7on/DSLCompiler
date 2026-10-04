@@ -348,6 +348,19 @@ mlir_target_link_libraries(LLKToMicro PUBLIC
     MLIRArithDialect MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
+# Library: micro -> Linalg bridge. `micro` was a sink: nothing lowered it to
+# something a backend consumes, so a mapped or exported micro.kernel could not
+# reach the LLVM/JIT pipeline. This is that bridge.
+add_mlir_library(LLKMicroToLinalg
+    lib/Conversion/MicroToLinalg/MicroToLinalg.cpp
+    DEPENDS MicroDialect
+    LINK_LIBS PUBLIC MicroDialect
+)
+mlir_target_link_libraries(LLKMicroToLinalg PUBLIC
+    MLIRArithDialect MLIRFuncDialect MLIRLinalgDialect MLIRMemRefDialect
+    MLIRSCFDialect MLIRTensorDialect MLIRPass MLIRTransforms
+)
+
 # Library: JIT cache runtime + weight packing
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
@@ -630,7 +643,7 @@ endif()
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection LLKToMicro LLKMicroMapping TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection LLKToMicro LLKMicroToLinalg LLKMicroMapping TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -679,6 +692,16 @@ add_test(NAME TritonSwigluStaged COMMAND TritonSwigluStaged)
 add_llvm_executable(SwiGLUVector test/Execution/swiglu_vector_avx2.cpp)
 target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
+
+# MicroKernelExecution: the acceptance chain for the micro->Linalg bridge. A
+# `micro.kernel` is lowered, buffered, JIT-compiled and *called*, and its result
+# checked -- which is also what pins the kernel ABI (entry tensors become
+# parameters, the stored value becomes the bufferized out-parameter).
+add_llvm_executable(MicroKernelExecution test/Execution/micro_kernel_execution.cpp)
+target_link_libraries(MicroKernelExecution PRIVATE
+    LLKMicroToLinalg LLKTransforms LLKRuntime GTest::gtest_main
+    ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME MicroKernelExecution COMMAND MicroKernelExecution)
 
 add_llvm_executable(SwiGLUFusedMemory test/Execution/swiglu_fused_memory.cpp)
 target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
@@ -919,6 +942,14 @@ if(LLK_BUILD_TOOLS)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/probe_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=WARN ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir"
   )
 
+  # MicroMappingRequireExecutable: the executable binding contract refuses the
+  # very plan MicroMappingUnmaterialized warns about and binds. A backend-facing
+  # run must fail rather than receive IR that omits a selected decision, so the
+  # pass exits non-zero and names the unresolved decision.
+  add_test(NAME MicroMappingRequireExecutable
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/probe_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | grep -q 'not fully executable'"
+  )
+
   # MicroMappingReport: the `report=<path>` option's contract -- the report file
   # is produced, the mapped IR is byte-identical with and without it (the report
   # is metadata), and two separate llk-opt runs produce identical reports. A
@@ -1050,6 +1081,26 @@ if(LLK_BUILD_TOOLS)
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
+  )
+
+  # MicroToLinalg: the bridge from canonical Micro-IR to the backend pipeline.
+  # A `micro.kernel` becomes a `func.func` over memrefs and Linalg, which is
+  # what lets a mapped or exported kernel reach LLVM and the JIT.
+  add_test(NAME MicroToLinalg
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --micro-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg.mlir"
+  )
+  # MicroToLinalgInvalid: an op with no lowering must fail the conversion
+  # loudly rather than being silently left in the module.
+  add_test(NAME MicroToLinalgInvalid
+      COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --micro-to-linalg
+              ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg_invalid.mlir
+  )
+  # MicroToLinalgJit: the lowered kernel reaches the JIT. This is the check that
+  # the bridge produces IR the backend pipeline can finish -- which is why the
+  # lowering stays in tensor land: an already-bufferized module leaves an
+  # unrealized vector cast that LLVM translation rejects.
+  add_test(NAME MicroToLinalgJit
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --micro-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg_jit.mlir | $<TARGET_FILE:llk-compile> - | grep -q 'Compilation successful'"
   )
   # math_mode=triton_fast on the SiLU path: the sigmoid's exp must take the
   # bounded-fast (math.exp2) path, like bounded_fast and unsafe_fast do.

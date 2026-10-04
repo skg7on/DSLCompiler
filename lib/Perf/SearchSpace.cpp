@@ -171,6 +171,8 @@ llvm::Expected<SearchParam> loadParam(micro::SearchSpaceOp op,
   SearchParam loaded;
   loaded.name = param.getName().str();
   loaded.kind = param.getKind().str();
+  if (auto role = param.getRole())
+    loaded.role = role->str();
 
   if (param.getChoices().empty())
     return invalid(op, "parameter '" + param.getName() + "' has no choices");

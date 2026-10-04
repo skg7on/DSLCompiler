@@ -71,6 +71,13 @@ struct MicroBindPlanPass
       llvm::cl::desc("Symbol (without @) of the micro.candidate the id was "
                      "produced at; must match the --micro-map run that "
                      "produced the id. Absent searches binding-free")};
+  Option<bool> requireExecutable{
+      *this, "require-executable",
+      llvm::cl::desc("Fail rather than bind a plan that omits an "
+                     "execution-affecting decision the binder cannot "
+                     "materialize (design §18.2). Off, such a decision is "
+                     "reported as a warning and the partial plan is bound"),
+      llvm::cl::init(false)};
 
   StringRef getArgument() const override { return "micro-bind-plan"; }
 
@@ -102,6 +109,7 @@ struct MicroBindPlanPass
     options.topK = topK.getValue();
     options.beamWidth = beamWidth.getValue();
     options.candidate = candidate.getValue();
+    options.requireExecutable = requireExecutable.getValue();
     return options;
   }
 
@@ -157,7 +165,10 @@ struct MicroBindPlanPass
     }
 
     if (llvm::Error error = micro_mapping_detail::bindPlanOntoModule(
-            module, *selected, *run->target)) {
+            module, *selected, *run->target,
+            currentOptions().requireExecutable
+                ? mapping::BindContract::Executable
+                : mapping::BindContract::Partial)) {
       module.emitError() << llvm::toString(std::move(error));
       signalPassFailure();
       return;
@@ -192,6 +203,7 @@ createMicroBindPlanPass(const MicroBindPlanOptions &options) {
   // the binding's hash into its id, so dropping `candidate` here would turn a
   // reproducible id into one no search can find (ruling S8).
   pass->candidate = options.search.candidate;
+  pass->requireExecutable = options.search.requireExecutable;
   pass->planId = std::to_string(options.planId);
   return pass;
 }

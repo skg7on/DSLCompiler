@@ -47,6 +47,7 @@ private:
   bool parseDomain(LayoutDef &out);
   bool parseRequire(LayoutDef &out);
   bool parseMapClause(LayoutDef &out);
+  bool parseImplements(LayoutDef &out);
 };
 
 llvm::Expected<LayoutRegistry> Parser::parseFile() {
@@ -125,7 +126,22 @@ bool Parser::parseStatement(LayoutDef &out) {
     return parseRequire(out);
   if (current().text == "map")
     return parseMapClause(out);
+  if (current().text == "implements")
+    return parseImplements(out);
   return failAt(current(), "unknown statement '" + current().text + "'");
+}
+
+bool Parser::parseImplements(LayoutDef &out) {
+  if (!out.implementsKind.empty())
+    return failAt(current(), "duplicate implements clause");
+  advance(); // 'implements'
+  std::string kind;
+  if (!expectIdentifier("a layout kind", kind))
+    return false;
+  if (!expectPunct(";"))
+    return false;
+  out.implementsKind = std::move(kind);
+  return true;
 }
 
 bool Parser::parseDomain(LayoutDef &out) {
@@ -328,6 +344,8 @@ std::string printLayout(const LayoutDef &def) {
     out += "  param " + param.name + " in " + printParamDomain(domain->second) +
            ";\n";
   }
+  if (!def.implementsKind.empty())
+    out += "  implements " + def.implementsKind + ";\n";
   for (const ExprPtr &constraint : def.constraints) {
     out += "  require ";
     out += constraint ? printExpr(*constraint) : "<null>";
@@ -369,6 +387,8 @@ std::string canonicalLayoutDefString(const LayoutDef &def) {
   for (const ExprPtr &constraint : def.constraints)
     field("constraint",
           constraint ? canonicalExprString(*constraint) : "<null>");
+  if (!def.implementsKind.empty())
+    field("implements", def.implementsKind);
   if (def.map)
     field("map", canonicalAffineMapSpecString(*def.map));
   return out;
@@ -408,6 +428,17 @@ const LayoutDef *LayoutRegistry::find(llvm::StringRef id) const {
     if (def.id == id)
       return &def;
   return nullptr;
+}
+
+std::vector<const LayoutDef *>
+LayoutRegistry::implementing(llvm::StringRef kind) const {
+  std::vector<const LayoutDef *> found;
+  if (kind.empty())
+    return found;
+  for (const LayoutDef &def : defs_)
+    if (def.implementsKind == kind)
+      found.push_back(&def);
+  return found;
 }
 
 llvm::Expected<LayoutRegistry> parseLayoutText(llvm::StringRef text,

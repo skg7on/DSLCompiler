@@ -513,6 +513,11 @@ synthesizeConnections(const ConnectionRequest &request,
     LayoutTransform transform;
     transform.srcLayout = *request.producerLayout;
     transform.dstLayout = *request.consumerLayout;
+    // The endpoints' solved maps, so the bound plan can materialize the
+    // conversion as a target-neutral `micro.transform` rather than only naming
+    // the two families.
+    transform.srcMap = request.producerLayoutMap;
+    transform.dstMap = request.consumerLayoutMap;
     return transform;
   };
   const MemoryNode *producerMemory = machine.findMemory(request.producerMemory);

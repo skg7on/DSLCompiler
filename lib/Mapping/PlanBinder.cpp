@@ -33,37 +33,54 @@ constexpr llvm::StringLiteral kRoutesAttr = "micro.routes";
 /// Stable, greppable reasons for a connection the binder cannot materialize
 /// (design §18.2). They are part of the report contract, so they are named
 /// constants rather than free-form prose.
-constexpr llvm::StringLiteral kLayoutTransformReason =
-    "layout_transform_requires_dialect_op";
-constexpr llvm::StringLiteral kTransferAndTransformReason =
-    "transfer_and_transform_layout_not_applied";
-constexpr llvm::StringLiteral kReplicateReason = "replicate_not_materialized";
 constexpr llvm::StringLiteral kReduceReason = "reduce_not_materialized";
 constexpr llvm::StringLiteral kHoplessRouteReason =
     "route_has_no_hop_to_materialize";
-constexpr llvm::StringLiteral kDuplicateRouteReason =
-    "duplicate_route_for_value";
 
-/// The reason a non-movement connection cannot be materialized. `Direct` and
-/// the movements are handled inline and must never reach here.
+/// The reason a connection with no Micro operation form cannot be
+/// materialized. Every kind the binder emits inline -- `Direct`, the
+/// movements, replication, and the layout transform -- must never reach here.
 llvm::StringRef unmaterializedReason(ConnectionKind kind) {
   switch (kind) {
-  case ConnectionKind::LayoutTransform:
-    return kLayoutTransformReason;
-  case ConnectionKind::Replicate:
-    return kReplicateReason;
   case ConnectionKind::Reduce:
     return kReduceReason;
   case ConnectionKind::Direct:
   case ConnectionKind::Transfer:
   case ConnectionKind::TransferAndTransform:
-    llvm_unreachable("a direct or movement connection is materialized inline");
+  case ConnectionKind::Replicate:
+  case ConnectionKind::LayoutTransform:
+    llvm_unreachable("this connection kind is materialized inline");
   }
   llvm_unreachable("all connection kinds handled");
 }
 
 llvm::Error bindError(const std::string &message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+}
+
+/// The identity of a connection's layout transform: the two families and the
+/// two solved maps. Two connections that move one value to one memory under
+/// *different* transforms are different work, so they must not share a copy
+/// chain -- the chain key includes this.
+std::string transformIdentity(const PlanConnection &connection) {
+  if (!connection.transform)
+    return {};
+  auto mapText = [](mlir::AffineMap map) {
+    if (!map)
+      return std::string("<null>");
+    std::string printed;
+    llvm::raw_string_ostream stream(printed);
+    map.print(stream);
+    return stream.str();
+  };
+  std::string text = connection.transform->srcLayout;
+  text += "->";
+  text += connection.transform->dstLayout;
+  text += ":src=";
+  text += mapText(connection.transform->srcMap);
+  text += ":dst=";
+  text += mapText(connection.transform->dstMap);
+  return text;
 }
 
 /// A phase-2 (machine-aware) verification failure carrying its stable §22.3
@@ -232,7 +249,8 @@ llvm::Expected<mlir::Operation *> findKernel(mlir::ModuleOp module) {
 
 llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
                                    const CoveringPlan &plan,
-                                   const MappingTarget &target) {
+                                   const MappingTarget &target,
+                                   BindContract contract) {
   mlir::OwningOpRef<mlir::ModuleOp> module(
       mlir::cast<mlir::ModuleOp>(source->clone()));
   llvm::Expected<mlir::Operation *> resolvedKernel = findKernel(*module);
@@ -330,6 +348,15 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       engines.push_back(engine);
     attributes.emplace_back(mlir::StringAttr::get(context, "engines"),
                             stringArrayAttr(context, engines));
+    // Which placed instances this connection serves. A reader of the route
+    // metadata can then see whose dataflow the connection carries, rather than
+    // having to re-derive it from the placements: without it the connection is
+    // "a movement of value N", not "the movement value N's consumer C reads".
+    llvm::SmallVector<mlir::Attribute> consumers;
+    for (InstanceId consumer : connection.consumers)
+      consumers.push_back(u64Attr(context, consumer));
+    attributes.emplace_back(mlir::StringAttr::get(context, "consumers"),
+                            mlir::ArrayAttr::get(context, consumers));
     if (connection.transform) {
       llvm::SmallVector<mlir::NamedAttribute> transform;
       transform.emplace_back(
@@ -352,20 +379,69 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
 
   // --- materialize the movement (design §18.2) -------------------------
   //
-  // One copy chain per moved value: the value is produced in one memory and
-  // read in another, so the copies are placed right after the producer and
-  // every other use is rewired to the last of them. Emitting one chain per
-  // *connection* would duplicate it when a value fans out.
+  // One copy chain per (value, route). A value that fans out along one route is
+  // served by a single chain; a value whose consumers need *different* routes
+  // gets one chain per route, because one chain cannot land the value in two
+  // memories. Each chain rewires only the consumers its connection selected, so
+  // a copy that lands in one memory never redirects a reader the plan placed
+  // elsewhere.
   //
-  // A value reached by several connections (a producer feeding several
-  // consumers) is handled once. When every such connection takes the same
-  // route, one chain serves them all, so a duplicate is merged silently. When
-  // a duplicate takes a *different* route, that single chain cannot serve it --
-  // the second consumer would silently read the first route's memory -- and the
-  // binder cannot yet emit a second chain and rewire only that consumer, so the
-  // duplicate is reported instead of dropped.
-  llvm::DenseMap<WorkloadValueId, llvm::SmallVector<MemoryNodeId>> movedRoutes;
+  // Chains are recorded as they are emitted and rewired in a second pass: a
+  // later connection that shares a chain's route can still add its consumers to
+  // it, and the rewire must see the final set.
   mlir::OpBuilder builder(context);
+
+  // Which operation each placed instance is, so a connection's consumer
+  // instances resolve to the operations that must read its result.
+  llvm::DenseMap<InstanceId, mlir::Operation *> instanceOps;
+  for (const PlanPlacement &placement : plan.placements)
+    if (mlir::Operation *op = binding.opFor(placement.node))
+      instanceOps[placement.instance] = op;
+
+  struct MaterializedChain {
+    WorkloadValueId value = 0;
+    llvm::SmallVector<MemoryNodeId> route;
+    /// The chain's layout transform identity, so two connections moving one
+    /// value to one memory under *different* transforms do not share a chain.
+    /// Empty for a connection with no transform.
+    std::string transform;
+    /// What a consumer of this chain reads: the last copy's result, or the
+    /// transform's result when the connection carries one.
+    mlir::Value result;
+    llvm::SmallVector<mlir::Operation *, 4> consumers;
+  };
+  std::vector<MaterializedChain> chains;
+
+  // The covered node that writes `value`, or null. A transform-only connection
+  // needs it just as a movement does.
+  auto producerOperationFor = [&](WorkloadValueId value) -> mlir::Operation * {
+    for (const WorkloadNode &node : graph->getNodes()) {
+      bool writes = llvm::any_of(node.outputs, [&](const WorkloadPort &port) {
+        return port.value == value;
+      });
+      if (writes)
+        return binding.opFor(node.id);
+    }
+    return nullptr;
+  };
+
+  // Emits the target-neutral representation change: the value read through
+  // `transform.srcMap` is written through `transform.dstMap`. The operation
+  // names the layouts by their index relation, never by a target-owned id, so
+  // it stays generic (design §13.4).
+  auto emitTransform = [&](mlir::Operation *anchor, mlir::Value input,
+                           const LayoutTransform &transform) -> mlir::Value {
+    builder.setInsertionPointAfter(anchor);
+    mlir::OperationState state(anchor->getLoc(), "micro.transform");
+    state.addOperands(input);
+    state.addTypes({input.getType()});
+    if (transform.srcMap)
+      state.addAttribute("src_map", mlir::AffineMapAttr::get(transform.srcMap));
+    if (transform.dstMap)
+      state.addAttribute("dst_map", mlir::AffineMapAttr::get(transform.dstMap));
+    return builder.create(state)->getResult(0);
+  };
+
   for (const PlanConnection &connection : plan.connectionPlans) {
     // A `Direct` connection is materialized by construction: the producer wrote
     // the value to the memory the consumer reads, in a layout the consumer
@@ -373,50 +449,99 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     if (connection.kind == ConnectionKind::Direct)
       continue;
 
-    // Anything else that is not a plain movement cannot be emitted as Micro ops
-    // today. Report it with a stable reason rather than dropping it (design
-    // §18.2).
+    // The kinds a Micro operation can express: the movements and replication (a
+    // fan-out copy, served by the same copy chain), plus a layout conversion,
+    // which becomes a target-neutral `micro.transform`. `Reduce` still has no
+    // Micro operation form, so it is reported rather than dropped (§18.2).
     if (connection.kind != ConnectionKind::Transfer &&
-        connection.kind != ConnectionKind::TransferAndTransform) {
+        connection.kind != ConnectionKind::TransferAndTransform &&
+        connection.kind != ConnectionKind::Replicate &&
+        connection.kind != ConnectionKind::LayoutTransform) {
       bound.unmaterialized.push_back(
           "value " + std::to_string(connection.value) + ": " +
           unmaterializedReason(connection.kind).str());
       continue;
     }
 
+    // The operations this connection serves. Empty for a plan built without
+    // consumer associations: nothing is rewired, but the chain is emitted.
+    llvm::SmallVector<mlir::Operation *, 4> consumers;
+    for (InstanceId id : connection.consumers)
+      if (mlir::Operation *op = instanceOps.lookup(id))
+        if (!llvm::is_contained(consumers, op))
+          consumers.push_back(op);
+
+    const std::string transform = transformIdentity(connection);
+
+    // An already-emitted chain for this (value, route, transform) serves this
+    // connection too -- it lands the value in the same memory under the same
+    // layout, so the same result is read.
+    auto existing = llvm::find_if(chains, [&](const MaterializedChain &chain) {
+      return chain.value == connection.value &&
+             chain.route == connection.route && chain.transform == transform;
+    });
+    if (existing != chains.end()) {
+      for (mlir::Operation *op : consumers)
+        if (!llvm::is_contained(existing->consumers, op))
+          existing->consumers.push_back(op);
+      continue;
+    }
+
+    // A transform-only connection moves nothing: it converts the value in
+    // place, where the producer already wrote it, so there is no route to walk
+    // and no memory to check. It is materialized as one `micro.transform`.
+    if (connection.kind == ConnectionKind::LayoutTransform) {
+      if (!connection.transform) {
+        bound.unmaterialized.push_back(
+            "value " + std::to_string(connection.value) +
+            ": layout transform carries no maps to emit");
+        continue;
+      }
+      mlir::Value input = binding.valueFor(connection.value);
+      mlir::Operation *producer = producerOperationFor(connection.value);
+      if (!producer || !input) {
+        bound.unmaterialized.push_back(
+            "value " + std::to_string(connection.value) +
+            ": no producing operation in the kernel");
+        continue;
+      }
+      if (!mlir::isa<mlir::ShapedType>(input.getType())) {
+        bound.unmaterialized.push_back(
+            "value " + std::to_string(connection.value) +
+            ": 'micro.transform' needs a shaped or tile type, which the binder "
+            "cannot construct generically for this value");
+        continue;
+      }
+      MaterializedChain chain;
+      chain.value = connection.value;
+      chain.route = connection.route;
+      chain.transform = transform;
+      chain.result = emitTransform(producer, input, *connection.transform);
+      chain.consumers = std::move(consumers);
+      chains.push_back(std::move(chain));
+      continue;
+    }
+
     // A movement needs at least one hop between two memories; a shorter route
     // has nothing to emit. This is unreachable for the current placement code,
-    // but a selected connection must never vanish silently.
-    if (connection.route.size() < 2) {
+    // but a selected connection must never vanish silently. A transform-only
+    // connection moves nothing -- its route is a single memory -- so the check
+    // does not apply to it.
+    const bool moves =
+        connection.kind == ConnectionKind::Transfer ||
+        connection.kind == ConnectionKind::TransferAndTransform ||
+        connection.kind == ConnectionKind::Replicate;
+    if (moves && connection.route.size() < 2) {
       bound.unmaterialized.push_back("value " +
                                      std::to_string(connection.value) + ": " +
                                      kHoplessRouteReason.str());
       continue;
     }
-    auto handled = movedRoutes.find(connection.value);
-    if (handled != movedRoutes.end()) {
-      if (handled->second == connection.route)
-        continue; // the same movement: one chain serves both connections
-      bound.unmaterialized.push_back("value " +
-                                     std::to_string(connection.value) + ": " +
-                                     kDuplicateRouteReason.str());
-      continue;
-    }
-    movedRoutes.try_emplace(connection.value, connection.route);
 
     // The producer is the covered node that writes this value; the consumer is
     // any covered node that reads it.
     mlir::Value value = binding.valueFor(connection.value);
-    mlir::Operation *producer = nullptr;
-    for (const WorkloadNode &node : graph->getNodes()) {
-      bool writes = llvm::any_of(node.outputs, [&](const WorkloadPort &port) {
-        return port.value == connection.value;
-      });
-      if (writes) {
-        producer = binding.opFor(node.id);
-        break;
-      }
-    }
+    mlir::Operation *producer = producerOperationFor(connection.value);
     if (!producer || !value) {
       bound.unmaterialized.push_back("value " +
                                      std::to_string(connection.value) +
@@ -468,7 +593,6 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     // memory, so there is no separate buffer to allocate for it.
     builder.setInsertionPointAfter(producer);
     mlir::Value current = value;
-    mlir::Operation *firstCopy = nullptr;
     mlir::Operation *lastCopy = nullptr;
     bool materialized = true;
     for (size_t hop = 1; hop < connection.route.size(); ++hop) {
@@ -509,8 +633,6 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       waitState.addOperands(copy->getResult(1));
       builder.create(waitState);
 
-      if (!firstCopy)
-        firstCopy = copy;
       lastCopy = copy;
       current = copy->getResult(0);
     }
@@ -522,25 +644,56 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       continue;
     }
 
-    // A transfer-and-transform moved the value, but the selected layout
-    // transform itself has no Micro operation form (design §13.4). The
-    // movement is real, so the connection is not dropped -- but the transform
-    // must still be reported, or it vanishes without a trace. The token differs
-    // from the transform-only case so "nothing materialized" stays
-    // distinguishable from "movement done, transform dropped".
-    if (connection.kind == ConnectionKind::TransferAndTransform)
-      bound.unmaterialized.push_back("value " +
-                                     std::to_string(connection.value) + ": " +
-                                     kTransferAndTransformReason.str());
+    // A transfer-and-transform moved the value; the conversion itself is the
+    // same target-neutral `micro.transform`, emitted after the movement so the
+    // consumer reads the layout it requires.
+    mlir::Value produced = lastCopy->getResult(0);
+    if (connection.kind == ConnectionKind::TransferAndTransform) {
+      if (!connection.transform) {
+        bound.unmaterialized.push_back(
+            "value " + std::to_string(connection.value) +
+            ": transfer-and-transform carries no maps to emit");
+        continue;
+      }
+      produced = emitTransform(lastCopy, produced, *connection.transform);
+    }
 
-    // Rewire every other reader to the last hop's value; the copies themselves
-    // already read the previous one.
-    llvm::SmallVector<mlir::OpOperand *> uses;
-    for (mlir::OpOperand &use : value.getUses())
-      if (use.getOwner() != firstCopy)
-        uses.push_back(&use);
-    for (mlir::OpOperand *use : uses)
-      use->set(lastCopy->getResult(0));
+    // Record the chain; its consumers are rewired once every chain is emitted,
+    // so a later connection sharing its route can still be added to it.
+    MaterializedChain chain;
+    chain.value = connection.value;
+    chain.route = connection.route;
+    chain.transform = transform;
+    chain.result = produced;
+    chain.consumers = std::move(consumers);
+    chains.push_back(std::move(chain));
+  }
+
+  // Rewire each chain's own consumers to what it produced. Only these
+  // operations are touched: a reader the plan placed on another route keeps
+  // reading what that route produced.
+  for (const MaterializedChain &chain : chains) {
+    mlir::Value original = binding.valueFor(chain.value);
+    if (!original || !chain.result)
+      continue;
+    for (mlir::Operation *consumer : chain.consumers)
+      for (mlir::OpOperand &use : consumer->getOpOperands())
+        if (use.get() == original)
+          use.set(chain.result);
+  }
+
+  // An executable contract refuses a plan it could not fully materialize: the
+  // caller asked for code a backend may run, and a partial binding would omit
+  // part of the selected plan without saying so in a form the backend checks.
+  // The partial contract keeps the report, which is the analysis contract.
+  if (contract == BindContract::Executable && !bound.unmaterialized.empty()) {
+    std::string message =
+        "bindPlan: the plan is not fully executable; " +
+        std::to_string(bound.unmaterialized.size()) +
+        " execution-affecting decision(s) could not be materialized:";
+    for (const std::string &reason : bound.unmaterialized)
+      message += "\n  " + reason;
+    return bindError(message);
   }
 
   bound.planId = plan.id;
@@ -930,6 +1083,21 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
             return;
           }
         }
+      }
+      // The consumer association is generic metadata too: an array of instance
+      // ids, validated with checked casts like every other container.
+      if (mlir::Attribute rawConsumers = route.get("consumers")) {
+        auto consumers = mlir::dyn_cast<mlir::ArrayAttr>(rawConsumers);
+        if (!consumers) {
+          failMetadata(bindError(where + ": 'consumers' is not an array"));
+          return;
+        }
+        for (mlir::Attribute consumer : consumers)
+          if (!mlir::isa<mlir::IntegerAttr>(consumer)) {
+            failMetadata(
+                bindError(where + ": 'consumers' has a non-integer entry"));
+            return;
+          }
       }
     }
   });

@@ -28,10 +28,11 @@ layout     ::= "layout" id "(" params ")" "{" stmt* "}"
 params     ::= [ param ("," param)* ]
 param      ::= ( "int" | "sym" ) ident | untyped-name
 untyped-name ::= ident except "int" and "sym"   // a bare name means int
-stmt       ::= domain | require | map
+stmt       ::= domain | require | map | implements
 domain     ::= "param" ident "in" ( "[" int ".." int "]" | "{" literal ("," literal)* "}" ) ";"
 require    ::= "require" expr ";"
 map        ::= "map" "(" [ ident ("," ident)* ] ")" "->" "(" expr ("," expr)* ")" ";"
+implements ::= "implements" ident ";"   // the Micro layout kind this layout realizes
 expr       ::= or
 or         ::= and ("||" and)*
 and        ::= equality ("&&" equality)*
@@ -64,6 +65,16 @@ A `layout` names its integer and symbolic parameters, then states:
   identifiers are the logical dimensions; solved integer parameters become affine
   constants. Only affine operations are allowed (`+ - * floordiv ceildiv mod`,
   constants, dims, symbols).
+- **implements** (optional, at most once) — the Micro layout *kind* this layout
+  realizes (`blocked`, `row_major`, ...). A search-space binding names a Micro
+  kind, while a rule names a target-owned layout id; the two namespaces are
+  unrelated strings, so a binding that named only a kind could never select a
+  target layout. This clause is the bridge: a pass resolves a bound kind to the
+  target layout declaring it implements that kind, then compares the resolved
+  *id* as before. The bridge is well-defined only when exactly one layout
+  implements a kind; several is rejected as ambiguous, none leaves the bound
+  value as the bare kind (a rule that happens to spell its id like the kind
+  still matches). The kind is never read as target semantics by generic code.
 
 ### Builtins
 
@@ -156,6 +167,7 @@ layout avx2.blocked_2d(int M, int N, int VW) {
 The parser rejects, with a file/line/column diagnostic:
 
 - duplicate layout ids and duplicate parameter names;
+- a duplicate `implements` clause, or an `implements` without a kind or `;`;
 - a `param ... in` clause for an undeclared parameter, or a duplicate domain;
 - an identifier in a `require`/`map` that is neither a declared parameter, a
   map dimension, nor a builtin;

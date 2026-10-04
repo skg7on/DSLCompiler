@@ -43,6 +43,7 @@
 #ifndef LLK_CONVERSION_MICROMAPPING_SEARCHBINDINGLOADER_H
 #define LLK_CONVERSION_MICROMAPPING_SEARCHBINDINGLOADER_H
 
+#include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/SearchBinding.h"
 
 #include "llvm/ADT/StringRef.h"
@@ -53,6 +54,7 @@
 
 namespace mlir {
 class ModuleOp;
+class Operation;
 } // namespace mlir
 
 namespace mlir::llk::mapping {
@@ -70,10 +72,16 @@ namespace mlir::llk::mapping {
 llvm::Expected<SearchBinding>
 loadSearchBinding(mlir::ModuleOp module, llvm::StringRef candidateSymbol = "");
 
-/// The layout the binding selects, when the space it came from declares a
-/// `layout`-kind parameter: that parameter's bound value, as a string. This is
-/// the bridge from the search space's layout *choice* to the mapping engine's
-/// bound layout (phase-4 task 4, carried item A).
+/// The layouts the binding selects, one entry per `layout`-kind parameter,
+/// keyed by the role that parameter governs -- a rule's port name such as
+/// `operand0`, or the empty string for a parameter that governs the axis as a
+/// whole. Empty when the space declares no layout-kind parameter. This is the
+/// bridge from the search space's layout *choices* to the mapping engine's
+/// bound layouts (phase-4 task 4, carried item A).
+///
+/// A space that binds several layouts must say which role each one governs:
+/// with roles, one binding can constrain `operand0` and `lhs` differently, and
+/// two parameters claiming the same role is an error rather than a silent pick.
 ///
 /// The parameter is found by its declared `kind`, never by its name, because a
 /// space may call it anything (`tile_layout` is the conventional spelling; the
@@ -85,33 +93,48 @@ loadSearchBinding(mlir::ModuleOp module, llvm::StringRef candidateSymbol = "");
 /// compared, exactly, against the layout ids the rules declare, and those ids
 /// are target-owned. Nothing in this layer maps a layout kind to a target id.
 ///
-/// KNOWN LIMITATION -- the axis is veto-only against any target whose ids are
-/// namespaced. `micro.param` (kind `layout`) choices are Micro `LayoutKind`s
-/// (`row_major`, `col_major`, `blocked`, `vectorized`, `swizzled`), while a
-/// rule's `require layout ... satisfies <id>` names a *target* id, so the two
-/// strings are equal only when the target happens to spell its id like the
-/// kind (see `binding_layouts.llkmap`). Against a target like the shipped AVX2
-/// one (`avx2.blocked_2d`) the bound layout can only make rules non-matching --
-/// it can never *select* among them. The correct fix is for a target to declare
-/// which Micro kind each of its layout ids implements, e.g.
-/// `layout avx2.blocked_2d(...) implements blocked;`, so the pass can resolve
-/// the bound kind to the target id through that declaration; generic code still
-/// only string-compares, and the shipped target becomes usable. That is a
-/// tracked follow-up, not implemented here.
+/// A value bound this way is a Micro `LayoutKind` (`row_major`, `col_major`,
+/// `blocked`, ...) while a rule's `require layout ... satisfies <id>` names a
+/// *target* id, so the two strings meet only after the target declares which
+/// kind each of its ids implements (`layout avx2.blocked_2d(...) implements
+/// blocked;`). That bridge lives in the pass layer, which can see the target;
+/// nothing here maps a kind to an id.
 ///
 /// Fails when `binding.candidateId` names no candidate in `module`, when the
-/// candidate is not nested in a `micro.search_space`, when the space declares
-/// more than one layout-kind parameter (which one selects the plan's layout is
-/// not expressible yet -- per-role layout bindings are the follow-up, and
-/// returning `nullopt` would silently ignore a value the caller bound), or when
-/// a bound layout-kind parameter does not hold a string.
+/// candidate is not nested in a `micro.search_space`, when two layout-kind
+/// parameters govern the *same* role (which one selects that role's layout is
+/// then not expressible, and returning an empty map would silently ignore a
+/// value the caller bound), or when a bound layout-kind parameter does not hold
+/// a string.
 ///
 /// Note: the candidate is looked up by a second walk of the module (`run`-time
 /// callers already walked it to load the binding); the walk is O(ops) and this
 /// is a load-time path, so it is left un-memoized rather than threading the op
 /// through the binding -- a `SearchBinding` is deliberately IR-free.
-llvm::Expected<std::optional<std::string>>
-loadBoundLayout(mlir::ModuleOp module, const SearchBinding &binding);
+llvm::Expected<llvm::StringMap<std::string>>
+loadBoundLayouts(mlir::ModuleOp module, const SearchBinding &binding);
+
+/// Evaluates the selected search space's `micro.constraint`s against the
+/// binding, using the machine model and a workload shape derived from `kernel`.
+///
+/// A `micro.constraint` is the space's *persistent global legality rule*, and a
+/// binding that violates one is not a legal point -- so the mapping path must
+/// reject it rather than let the search select a plan the space forbids. The
+/// rules live in the perf legality layer (`lib/Perf/Legality.cpp`), so this is
+/// where the two meet: the pass library links both, generic mapping does not.
+///
+/// The shape comes from the kernel's first `micro.mma` (its declared M/N/K and
+/// dtypes). A space that declares constraints but a kernel that offers no such
+/// shape cannot be evaluated, and is an error rather than a silent pass: an
+/// unenforced constraint must not look like an enforced one. A space with no
+/// constraints is always legal and costs nothing.
+///
+/// Returns the first violated constraint's stable reason, and fails only when
+/// the space or candidate cannot be resolved.
+llvm::Error verifyBindingLegality(mlir::ModuleOp module,
+                                  const SearchBinding &binding,
+                                  mlir::Operation *kernel,
+                                  const machine::MachineModel &machine);
 
 } // namespace mlir::llk::mapping
 
