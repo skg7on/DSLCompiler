@@ -63,6 +63,21 @@ struct WorkloadPort {
   std::optional<AffineMap> accessMap;
 };
 
+/// Which side of a node a port sits on.
+enum class PortDirection { Input, Output };
+
+/// One operand or result occurrence on a node: the node it belongs to, the side
+/// it sits on, and its position within that side. A `PortRef` names the
+/// occurrence, not the SSA value it carries -- a single value used through two
+/// operand ports is two refs -- so it is what tells repeated uses apart. Refs
+/// name finalized node ids, so resolve them only after `finalize()`.
+struct PortRef {
+  WorkloadNodeId node = 0;
+  PortDirection direction = PortDirection::Input;
+  uint32_t index = 0;
+  bool operator==(const PortRef &) const = default;
+};
+
 /// One unit of work to implement. `coveredNodes` in a mapping candidate names
 /// these ids.
 ///
@@ -112,6 +127,14 @@ private:
   llvm::SmallVector<WorkloadNode> nodes;
   llvm::SmallVector<WorkloadValue> values;
 };
+
+/// The port a reference names on a finalized graph, or null when the node does
+/// not exist or `index` is out of range for that direction.
+const WorkloadPort *lookupPort(const WorkloadGraph &graph, const PortRef &ref);
+
+/// Deterministic rendering of a port reference (`node=7,input=0`). Used as the
+/// endpoint identity in candidate and connection content keys.
+std::string canonicalPortRefString(const PortRef &p);
 
 /// True for ops that become workload nodes: concrete execution and movement
 /// ops that a target must implement.

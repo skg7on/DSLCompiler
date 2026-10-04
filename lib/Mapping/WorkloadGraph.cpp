@@ -201,6 +201,31 @@ const WorkloadValue *WorkloadGraph::findValue(WorkloadValueId id) const {
   return &values[id];
 }
 
+const WorkloadPort *lookupPort(const WorkloadGraph &graph, const PortRef &ref) {
+  const WorkloadNode *node = graph.findNode(ref.node);
+  if (!node)
+    return nullptr;
+  switch (ref.direction) {
+  case PortDirection::Input:
+    if (ref.index >= node->inputs.size())
+      return nullptr;
+    return &node->inputs[ref.index];
+  case PortDirection::Output:
+    if (ref.index >= node->outputs.size())
+      return nullptr;
+    return &node->outputs[ref.index];
+  }
+  // Reached only for a direction value that is not one of the two ranks; a
+  // reference it renders is not a port.
+  return nullptr;
+}
+
+std::string canonicalPortRefString(const PortRef &p) {
+  return "node=" + std::to_string(p.node) +
+         (p.direction == PortDirection::Input ? ",input=" : ",output=") +
+         std::to_string(p.index);
+}
+
 void WorkloadGraph::finalize(
     llvm::DenseMap<WorkloadValueId, WorkloadValueId> *valueRemapOut) {
   llvm::SmallVector<std::string> nodeKeys;

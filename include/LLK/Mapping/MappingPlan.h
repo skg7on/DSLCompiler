@@ -72,6 +72,11 @@ struct PortSpec {
   std::string name;
   WorkloadValueId value = 0;
   bool isInput = false;
+  /// The operand or result occurrence this spec names, once resolved against a
+  /// finalized graph. Unset while endpoint resolution is still migrating;
+  /// when set it joins the candidate's canonical identity, so two uses of one
+  /// value are not the same port.
+  std::optional<PortRef> port;
 };
 
 /// An abstract capability a placement must satisfy. `capability` is a target
@@ -106,6 +111,10 @@ struct LayoutRequirement {
   /// Excluded from the canonical string for the same reason as `elementType`:
   /// it is a resolution fact, and the id already depends only on the class.
   int64_t portValue = -1;
+  /// The occurrence `portValue` was read from, once resolved against a
+  /// finalized graph. Unset while endpoint resolution is still migrating; like
+  /// `portValue`, it is a resolution fact and stays out of the canonical id.
+  std::optional<PortRef> port;
 };
 
 /// An abstract compute capability a placement must attach (design §15.1).
@@ -190,6 +199,10 @@ struct SolvedLayout {
   /// layout attributed to the edge carrying the result. Like `parameters`, it
   /// is a resolution fact, not content, so it is not hashed either.
   int64_t portValue = -1;
+  /// The occurrence this solution was solved for, copied from the
+  /// requirement's `port`; unset while endpoint resolution is still migrating.
+  /// Also a resolution fact, so it is likewise not hashed.
+  std::optional<PortRef> port;
 };
 
 /// One mapping candidate placed on concrete resources.
@@ -228,6 +241,15 @@ struct ConnectionPlan {
   ConnectionId id = 0;
   InstanceId producer = 0;
   llvm::SmallVector<InstanceId> consumers;
+  /// The producer-side result occurrence this connection reads. Unset while
+  /// endpoint resolution is still migrating; once set it joins the connection's
+  /// canonical identity, so two connections that read the same value through
+  /// different endpoints are distinct. The instance list above remains a
+  /// compatibility projection, not the rewiring authority.
+  std::optional<PortRef> producerPort;
+  /// The consumer-side operand occurrences this connection serves. Rendered
+  /// sorted into the canonical string; empty while resolution migrates.
+  llvm::SmallVector<PortRef> consumerPorts;
   /// The several producers a `Reduce` gathers; empty for every other kind,
   /// where `producer` is the single source.
   llvm::SmallVector<InstanceId> producers;

@@ -189,6 +189,14 @@ std::string canonicalCandidateString(const MappingCandidate &candidate) {
     text += ':';
     text += std::to_string(port.value);
     text += port.isInput ? ":in" : ":out";
+    // The occurrence, when resolved, is part of the port's identity: two
+    // operand uses of one value must not collapse into one spec. Braces keep
+    // the reference's commas from reading as the port-list separator.
+    if (port.port) {
+      text += ":{";
+      text += canonicalPortRefString(*port.port);
+      text += '}';
+    }
     ports.push_back(std::move(text));
   }
   llvm::sort(ports);
@@ -298,6 +306,27 @@ std::string canonicalConnectionString(const ConnectionPlan &connection) {
   out += std::to_string(connection.value);
   out += "|kind=";
   out += stringifyConnectionKind(connection.kind).str();
+  // Endpoint occurrences join the identity once resolved. They are omitted
+  // entirely while unset, so a connection built without endpoints keeps the id
+  // it had before endpoint resolution migrated in.
+  if (connection.producerPort) {
+    out += "|producerPort={";
+    out += canonicalPortRefString(*connection.producerPort);
+    out += '}';
+  }
+  if (!connection.consumerPorts.empty()) {
+    std::vector<std::string> consumerPorts;
+    consumerPorts.reserve(connection.consumerPorts.size());
+    for (const PortRef &port : connection.consumerPorts) {
+      std::string text = "{";
+      text += canonicalPortRefString(port);
+      text += '}';
+      consumerPorts.push_back(std::move(text));
+    }
+    llvm::sort(consumerPorts);
+    out += "|consumerPorts=";
+    out += joinStrings(consumerPorts, ",");
+  }
   out += "|route=";
   llvm::sort(route);
   out += joinStrings(std::vector<std::string>(route.begin(), route.end()), ",");
