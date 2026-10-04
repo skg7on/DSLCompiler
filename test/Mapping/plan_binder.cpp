@@ -1138,3 +1138,39 @@ TEST(PlanBinder, RejectsAComputeRequirementTheExecutorCannotSupply) {
   EXPECT_NE(llvm::toString(std::move(e)).find("unsupported_compute_fragment"),
             std::string::npos);
 }
+
+// A `micro.mapping` must name an operation the workload graph classifies as a
+// node: without the original endpoints the recorded rule cannot be re-checked,
+// so pointing the metadata at a transparent op (here a `micro.tile_view`) is
+// rejected rather than silently downgraded to the match-operation backstop.
+TEST(PlanBinder, RejectsAMappedOperationThatIsNotAWorkloadNode) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  llvm::Expected<BoundPlan> bound =
+      bindPlan(*fixture.module, *plan, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  bool stamped = false;
+  bound->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.tile_view")
+      return;
+    mlir::MLIRContext *context = fixture.context.get();
+    op->setAttr(
+        "micro.mapping",
+        DictionaryAttr::get(
+            context,
+            {NamedAttribute(StringAttr::get(context, "rule"),
+                            StringAttr::get(context, "avx2.vector_add"))}));
+    stamped = true;
+  });
+  ASSERT_TRUE(stamped);
+
+  llvm::Error e = verifyMappedMicroIR(*bound->module, *fixture.target);
+  ASSERT_TRUE(bool(e));
+  EXPECT_NE(llvm::toString(std::move(e)).find("invalid_mapping_metadata"),
+            std::string::npos);
+}

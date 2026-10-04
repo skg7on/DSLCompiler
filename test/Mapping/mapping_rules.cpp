@@ -1983,9 +1983,13 @@ TEST(RuleVerify, RejectsARecordedParameterOutsideItsDomain) {
   RecordedRuleSelection recorded = recordedOn("worker.0");
   recorded.parameters["VW"] = int64_t(3); // outside [4..8]
   recorded.parameters["U"] = int64_t(1);
-  std::string error = verifyText(*rule, typedVectorNode(f32, f32),
+  std::string error = verifyText(*rule, typedAddNode(context, f32, f32),
                                  verificationMachine(), recorded);
   EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+  // The domain check must be what rejects, not the `op = "add"` predicate.
+  EXPECT_NE(error.find("outside its declared domain"), std::string::npos)
+      << error;
+  EXPECT_EQ(error.find("predicate"), std::string::npos) << error;
 }
 
 TEST(RuleVerify, RejectsARecordedValueTheConstraintsDoNotAccept) {
@@ -1996,9 +2000,13 @@ TEST(RuleVerify, RejectsARecordedValueTheConstraintsDoNotAccept) {
   RecordedRuleSelection recorded = recordedOn("worker.0");
   recorded.parameters["VW"] = int64_t(6); // machine models 8 lanes
   recorded.parameters["U"] = int64_t(1);
-  std::string error = verifyText(*rule, typedVectorNode(f32, f32),
+  std::string error = verifyText(*rule, typedAddNode(context, f32, f32),
                                  verificationMachine(), recorded);
   EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+  // The constraint evaluation must be what rejects, not the predicate.
+  EXPECT_NE(error.find("require constraints reject"), std::string::npos)
+      << error;
+  EXPECT_EQ(error.find("predicate"), std::string::npos) << error;
 }
 
 TEST(RuleVerify, RejectsAnUnknownRecordedParameter) {
@@ -2010,9 +2018,13 @@ TEST(RuleVerify, RejectsAnUnknownRecordedParameter) {
   recorded.parameters["VW"] = int64_t(8);
   recorded.parameters["U"] = int64_t(1);
   recorded.parameters["XX"] = int64_t(2);
-  std::string error = verifyText(*rule, typedVectorNode(f32, f32),
+  std::string error = verifyText(*rule, typedAddNode(context, f32, f32),
                                  verificationMachine(), recorded);
   EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+  // The undeclared name must be what rejects, not the predicate.
+  EXPECT_NE(error.find("which it does not declare"), std::string::npos)
+      << error;
+  EXPECT_EQ(error.find("predicate"), std::string::npos) << error;
 }
 
 TEST(RuleVerify, RejectsAMissingDerivedParameter) {
@@ -2022,9 +2034,14 @@ TEST(RuleVerify, RejectsAMissingDerivedParameter) {
   mlir::Type f32 = mlir::Float32Type::get(&context);
   RecordedRuleSelection recorded = recordedOn("worker.0");
   recorded.parameters["U"] = int64_t(1); // VW omitted
-  std::string error = verifyText(*rule, typedVectorNode(f32, f32),
+  std::string error = verifyText(*rule, typedAddNode(context, f32, f32),
                                  verificationMachine(), recorded);
   EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+  // The missing derived name must be what rejects, not the predicate.
+  EXPECT_NE(error.find("does not record the derived parameter 'VW'"),
+            std::string::npos)
+      << error;
+  EXPECT_EQ(error.find("predicate"), std::string::npos) << error;
 }
 
 TEST(RuleVerify, RejectsWhenNoAssignmentSatisfiesTheRule) {

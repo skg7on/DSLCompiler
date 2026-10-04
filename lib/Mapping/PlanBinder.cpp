@@ -829,28 +829,38 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     WorkloadGraph graph;
     llvm::DenseMap<mlir::Operation *, const WorkloadNode *> byOp;
   };
+  /// The node a mapped operation resolves to, or why it could not be resolved.
+  /// A mapped op must be locatable: without its original endpoints there is
+  /// nothing to re-check the recorded rule against.
+  struct NodeLookup {
+    const WorkloadNode *node = nullptr;
+    std::string error;
+  };
   llvm::DenseMap<mlir::Operation *, std::unique_ptr<KernelWorkload>> workloads;
-  auto workloadNodeFor = [&](mlir::Operation *op) -> const WorkloadNode * {
+  auto workloadNodeFor = [&](mlir::Operation *op) -> NodeLookup {
     mlir::Operation *kernel = enclosingKernel(op);
     if (!kernel)
-      return nullptr;
+      return {nullptr, "it is not inside a micro.kernel"};
     auto entry = workloads.find(kernel);
     if (entry == workloads.end()) {
       WorkloadGraphBinding binding;
       llvm::Expected<WorkloadGraph> graph =
           extractWorkloadGraph(kernel, &binding);
+      if (!graph)
+        return {nullptr,
+                "its kernel's workload graph could not be extracted: " +
+                    llvm::toString(graph.takeError())};
       auto fresh = std::make_unique<KernelWorkload>();
-      if (graph) {
-        fresh->graph = std::move(*graph);
-        for (const auto &pair : binding.nodeOps)
-          fresh->byOp[pair.second] = fresh->graph.findNode(pair.first);
-      } else {
-        llvm::consumeError(graph.takeError());
-      }
+      fresh->graph = std::move(*graph);
+      for (const auto &pair : binding.nodeOps)
+        fresh->byOp[pair.second] = fresh->graph.findNode(pair.first);
       entry = workloads.insert({kernel, std::move(fresh)}).first;
     }
     auto found = entry->second->byOp.find(op);
-    return found == entry->second->byOp.end() ? nullptr : found->second;
+    if (found == entry->second->byOp.end())
+      return {nullptr,
+              "it is not a workload node in its kernel's workload graph"};
+    return {found->second, {}};
   };
 
   module->walk([&](mlir::Operation *op) {
@@ -876,6 +886,17 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     if (!rule) {
       fail(DiagnosticCode::NoMatchingRule,
            where + ": unknown rule '" + *ruleId + "'");
+      return;
+    }
+    // A mapped operation must be locatable in its kernel's workload graph:
+    // without the original endpoints nothing can re-check the recorded rule, so
+    // an op the graph does not classify as a workload node is rejected rather
+    // than silently downgraded to the match-operation backstop below.
+    NodeLookup lookup = workloadNodeFor(op);
+    if (!lookup.node) {
+      fail(DiagnosticCode::InvalidMappingMetadata,
+           where + ": cannot verify the recorded rule '" + *ruleId +
+               "': " + lookup.error);
       return;
     }
     // The recorded rule must implement *this* operation, not merely exist: a
@@ -941,21 +962,19 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     // matching mnemonic and existing ids are not enough. The node is the
     // original workload endpoint, with the binder's bookkeeping attributes
     // removed, so a predicate reads the operation rather than the metadata.
-    if (const WorkloadNode *node = workloadNodeFor(op)) {
-      WorkloadNode endpoint = strippedWorkloadNode(*node);
-      RecordedRuleSelection selection;
-      selection.executor = *executor;
-      for (const auto &entry : memories)
-        selection.memories[entry.first()] = entry.second;
-      // Resolved rule parameters are not persisted on this schema yet, so the
-      // selection carries none and verification falls back to the same
-      // existential requirement check generation applied. Schema v2 records
-      // them and this call validates the recorded assignment exactly.
-      if (llvm::Error error =
-              verifyRuleSelection(*rule, endpoint, machine, selection, where)) {
-        failure = std::move(error);
-        return;
-      }
+    WorkloadNode endpoint = strippedWorkloadNode(*lookup.node);
+    RecordedRuleSelection selection;
+    selection.executor = *executor;
+    for (const auto &entry : memories)
+      selection.memories[entry.first()] = entry.second;
+    // Resolved rule parameters are not persisted on this schema yet, so the
+    // selection carries none and verification falls back to the same
+    // existential requirement check generation applied. Schema v2 records them
+    // and this call validates the recorded assignment exactly.
+    if (llvm::Error error =
+            verifyRuleSelection(*rule, endpoint, machine, selection, where)) {
+      failure = std::move(error);
+      return;
     }
 
     // Layout role bindings: every bound id must resolve, and a rule that
