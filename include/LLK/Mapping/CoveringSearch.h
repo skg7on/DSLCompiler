@@ -150,6 +150,11 @@ private:
   /// accepts makes the rule a non-match). Every emitted plan also records the
   /// binding's hash and parameters (design §8.3/§9.5); a search with no binding
   /// leaves all of that at its default, so its plan ids are unchanged.
+  ///
+  /// Placement and routing stay binding-independent *by design* (ruling S3): a
+  /// binding names search choices, not machine resources -- the machine model
+  /// owns placement -- so it never constrains where a node runs or how a
+  /// connection routes. This is a finished boundary, not a half-built bridge.
   std::optional<SearchBinding> binding_;
   /// The layout the binding selects, resolved from its `layout`-kind parameter
   /// by the caller -- the pass layer, which alone can see the search space, so

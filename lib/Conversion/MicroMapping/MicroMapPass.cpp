@@ -67,8 +67,10 @@ struct MicroMapPass
       *this, "candidate",
       llvm::cl::desc("Symbol (without @) of the micro.candidate to search at; "
                      "its values pin rule parameters and its layout-kind "
-                     "parameter selects the bound layout. Absent leaves the "
-                     "search binding-free")};
+                     "parameter vetoes rules whose `require layout` names a "
+                     "different id -- it never selects a target layout id, and "
+                     "a rule with no layout requirement matches unchanged "
+                     "(ruling S7). Absent leaves the search binding-free")};
 
   StringRef getArgument() const override { return "micro-map"; }
 

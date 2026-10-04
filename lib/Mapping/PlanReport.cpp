@@ -114,9 +114,16 @@ std::string writePlanReport(const MappingSearchResult &result,
     json.attribute("inputModuleHash", hexId(moduleHash));
     json.attribute("sourceBindingHash",
                    hexId(selected ? selected->sourceBindingHash : 0));
-    // The source search binding itself, when the search was given one: its
-    // sorted, type-tagged parameter values. Empty for a binding-free search,
+    // The `micro.candidate` symbol the binding was loaded from, so a consumer
+    // holding only this report can name the exact `candidate=` a replay must
+    // pass: the hash above covers the values alone, so it cannot distinguish
+    // two candidates that bind identically. Empty for a binding-free search,
     // where the hash is zero too.
+    json.attribute("sourceBindingCandidate",
+                   selected ? selected->sourceBindingCandidate : std::string());
+    // The source search binding's sorted, type-tagged parameter values -- the
+    // point the candidate symbol names, rendered so it is readable without the
+    // module. Empty for a binding-free search.
     json.attribute("sourceBinding", selected ? canonicalSearchValueString(
                                                    selected->globalParameters)
                                              : std::string());

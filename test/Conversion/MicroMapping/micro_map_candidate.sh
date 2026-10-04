@@ -11,8 +11,9 @@
 #
 #   1. the bound plan records the candidate's hash -- the IR's `binding_hash`
 #      equals the report's `sourceBindingHash` (the binding's `stableHash`) and
-#      the report's `sourceBinding` is the candidate's values, so the plan is
-#      traceable to the `micro.candidate` it came from;
+#      the report names the candidate (`sourceBindingCandidate`) with its values
+#      (`sourceBinding`), so the plan is traceable to the `micro.candidate` it
+#      came from and replayable from the report alone;
 #   2. the layout parameter is named `block_shape`, not `layout`/`tile_layout`,
 #      and the feature still works -- the pass reads the parameter's `kind`;
 #   3. `candidate=` absent is byte-for-byte today's behaviour: a plan binds with
@@ -98,6 +99,11 @@ grep -q "binding_hash = $HASH : i64" "$WORK/bound.mlir" ||
 grep -q '"sourceBinding": "VW=i:8;block_shape=s:blocked"' "$WORK/bound.json" ||
   fail "the report's sourceBinding is not candidate_17's values"
 
+# ...and it names the candidate itself, so a consumer holding only the report
+# can replay the search at the same `candidate=` (ruling S8).
+grep -q '"sourceBindingCandidate": "candidate_17"' "$WORK/bound.json" ||
+  fail "the report did not name the source candidate"
+
 # --- 3. No candidate is today's behaviour. -----------------------------------
 "$LLK_OPT" "--micro-map=$PROBE mode=deterministic report=$WORK/unbound.json" \
     "$FIXTURE" > "$WORK/unbound.mlir"
@@ -107,6 +113,8 @@ grep -q 'binding_hash = 0 : i64' "$WORK/unbound.mlir" ||
   fail "a binding-free mapping recorded a non-zero binding_hash"
 grep -q '"sourceBinding": ""' "$WORK/unbound.json" ||
   fail "a binding-free search recorded a sourceBinding"
+grep -q '"sourceBindingCandidate": ""' "$WORK/unbound.json" ||
+  fail "a binding-free search recorded a source candidate"
 
 # --- 4. A candidate no rule can satisfy is a search failure. -----------------
 # A pinned parameter that contradicts a `require`: VW=4, but the machine's f32

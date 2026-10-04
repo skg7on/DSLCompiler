@@ -65,10 +65,16 @@ struct MicroMapOptions {
   /// The `micro.candidate` symbol to search at, or empty for a binding-free
   /// search. The candidate is loaded from the module (phase-4 task 1): its
   /// values pin the rule parameters of the same name, and its `layout`-kind
-  /// parameter -- resolved by `kind`, never by name -- becomes the layout every
-  /// rule must offer. A binding changes which plans are *legal*, so a candidate
-  /// no rule can satisfy is a search failure carrying the frontier's
-  /// diagnostics, never a silently different plan (design §8.3/§9.5).
+  /// parameter -- resolved by `kind`, never by name -- is a *veto* on the
+  /// layout axis, not a selector. A rule whose `require layout` names a
+  /// different id stops matching, while a rule with no layout requirement
+  /// matches unchanged (ruling S7). It can never pick a target layout id: the
+  /// choice's value is a Micro layout kind (`blocked`, `row_major`, ...) while
+  /// a rule names a target-owned id (`avx2.blocked_2d`), and the two are equal
+  /// only when a target spells its ids as kinds (see `SearchBindingLoader.h`).
+  /// A binding changes which plans are *legal*, so a candidate no rule can
+  /// satisfy is a search failure carrying the frontier's diagnostics, never a
+  /// silently different plan (design §8.3/§9.5).
   ///
   /// Both `--micro-map` and `--micro-bind-plan` honour it, and both must be
   /// given the *same* value to speak about the same plan: a plan id folds in

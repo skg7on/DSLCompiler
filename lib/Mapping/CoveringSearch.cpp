@@ -1217,6 +1217,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // folded, so two plans differing only by their binding do not collide.
     if (binding_) {
       plan.sourceBindingHash = binding_->stableHash;
+      plan.sourceBindingCandidate = binding_->candidateId;
       plan.globalParameters = binding_->values;
     }
     plan.id = computePlanId(plan);

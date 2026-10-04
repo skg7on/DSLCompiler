@@ -7,12 +7,16 @@
 // is inside its parameter's declared domain. A candidate outside its domain is
 // a startup diagnostic, not a late search failure, so the loader rejects it.
 //
-// The positive cases read the checked-in fixture. The rejection cases cannot
-// come from a source string: the parser verifies a module's invariants after
-// building it, so the dialect's own candidate checks would fire first. They
-// instead parse a valid space and then *mutate* a candidate's `bindings`, which
-// is the state the loader must survive when no verifier has blessed the IR --
-// exactly the startup path ruling S2 is about.
+// The positive cases read the checked-in fixture. Some rejection cases come
+// straight from source strings, because the structures they exploit are legal
+// IR the dialect verifier does not reject: a candidate name shared across two
+// spaces (symbols are unique only within one space) and a candidate with no
+// enclosing search space. Other rejection cases cannot come from a source
+// string: the parser verifies a module's invariants after building it, so the
+// dialect's own candidate checks would fire first. Those parse a valid space
+// and then *mutate* a candidate's `bindings`, which is the state the loader
+// must survive when no verifier has blessed the IR -- exactly the startup path
+// ruling S2 is about.
 //
 //===----------------------------------------------------------------------===//
 
