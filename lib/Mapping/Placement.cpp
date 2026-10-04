@@ -654,12 +654,11 @@ synthesizeConnections(const ConnectionRequest &request,
   return plans;
 }
 
-llvm::Expected<std::vector<ConnectionPlan>>
-synthesizeFanOut(const ConnectionRequest &base,
-                 llvm::ArrayRef<ConnectionRequest> consumers,
-                 const MachineModel &machine, const TopologyService &topology,
-                 const PlacementOptions &options, bool *truncated,
-                 const ObjectiveOrder &objective) {
+llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
+    const ConnectionRequest &base, llvm::ArrayRef<ConnectionRequest> consumers,
+    const MachineModel &machine, const TopologyService &topology,
+    const PlacementOptions &options, bool *truncated,
+    const ObjectiveOrder &objective, bool *choseAmongAlternatives) {
   if (consumers.empty())
     return std::vector<ConnectionPlan>{};
 
@@ -792,6 +791,10 @@ synthesizeFanOut(const ConnectionRequest &base,
     }
     if (alternatives.empty())
       return std::vector<ConnectionPlan>{};
+    // More than one way to serve this group, but only the cheapest is taken:
+    // the caller can no longer claim an exhaustive joint search, so it is told.
+    if (alternatives.size() > 1 && choseAmongAlternatives)
+      *choseAmongAlternatives = true;
     // §17.1: the copies are ranked by the declared objective, not by a
     // hard-coded dimension. `min_element` keeps the first alternative on an
     // exact tie, the same stable tie-break `CoveringSearch::pickBest` uses.

@@ -76,6 +76,15 @@ enum class DiagnosticCode {
   /// invalid metadata is a diagnostic rather than an unchecked cast that aborts
   /// the process (design §25.1).
   InvalidMappingMetadata,
+  /// The search chose each connection's locally cheapest alternative rather
+  /// than branching over the alternatives the topology offered. The connection
+  /// choice is therefore not part of an exhaustive joint placement/route
+  /// search: a covering rejected here may still be feasible through a more
+  /// expensive route combination. Distinct from `SearchTruncated`, which
+  /// reports a *cap*; this reports an algorithmic restriction that holds even
+  /// with every cap lifted. Admissible only for a *notice*, as `isRejection`
+  /// classifies it.
+  ConnectionChoiceUnexplored,
 };
 
 /// The stable string for `code` (for example `no_matching_rule`). Never empty.

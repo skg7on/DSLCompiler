@@ -753,6 +753,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                      request.consumerMemory + ": no legal route");
         return false;
       }
+      // Several legal ways to connect this pair, but only the locally cheapest
+      // is taken. In exact mode -- which otherwise implies an exhaustive joint
+      // search -- that is a restriction, not a cap: two individually cheapest
+      // routes through a shared intermediate can jointly exceed its capacity
+      // while more expensive direct routes would fit, so a feasible covering
+      // can be missed with no `searchTruncated` to explain it. Report it
+      // explicitly rather than implying exhaustiveness.
+      if (alternatives->size() > 1 && options_.mode == SearchMode::Exact) {
+        result.connectionChoicesUnexplored = true;
+        report(DiagnosticCode::ConnectionChoiceUnexplored,
+               "connection " + request.producerMemory + " -> " +
+                   request.consumerMemory + ": chose the cheapest of " +
+                   std::to_string(alternatives->size()) +
+                   " alternatives without branching over them");
+      }
       staged.push_back(*pickBest(*alternatives));
       cost = addCost(cost, staged.back().cost);
       // §9.3: a plain movement fills a destination buffer in the consumer's
@@ -835,10 +850,20 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
               makeRequest(producer, *partial.chosen[consumerEnd.node],
                           producerEnd.port, consumerEnd.port, link.value));
         bool fanOutTruncated = false;
+        bool fanOutChoseAmongAlternatives = false;
         llvm::Expected<std::vector<ConnectionPlan>> alternatives =
             synthesizeFanOut(consumerRequests.front(), consumerRequests,
                              machine, topology, placementOptions,
-                             &fanOutTruncated, options_.objective);
+                             &fanOutTruncated, options_.objective,
+                             &fanOutChoseAmongAlternatives);
+        if (fanOutChoseAmongAlternatives &&
+            options_.mode == SearchMode::Exact) {
+          result.connectionChoicesUnexplored = true;
+          report(DiagnosticCode::ConnectionChoiceUnexplored,
+                 "fan-out from " + consumerRequests.front().producerMemory +
+                     ": chose the cheapest alternative per destination group "
+                     "without branching over them");
+        }
         if (alternatives)
           result.routeCount += alternatives->size();
         reportTruncation(fanOutTruncated);

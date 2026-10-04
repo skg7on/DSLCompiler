@@ -196,7 +196,8 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
     const ConnectionRequest &base, llvm::ArrayRef<ConnectionRequest> consumers,
     const machine::MachineModel &machine, const TopologyService &topology,
     const PlacementOptions &options = {}, bool *truncated = nullptr,
-    const ObjectiveOrder &objective = {});
+    const ObjectiveOrder &objective = {},
+    bool *choseAmongAlternatives = nullptr);
 
 /// Fan-in (design §15.3): one gather plan collecting several producers into one
 /// or more consumers that share a destination memory. `feedCost` is the summed

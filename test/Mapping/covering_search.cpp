@@ -2105,6 +2105,82 @@ TEST(CoveringSearch, StagingMemoryWithRoomAdmitsTheConnection) {
   EXPECT_FALSE(result->plans.empty());
 }
 
+// Issue #109 defect 3: exact mode implies an exhaustive joint search, but each
+// connection's alternative is chosen locally -- only the cheapest is taken.
+// When more than one alternative exists the search now *says so*, rather than
+// letting exact mode's name imply a completeness it does not have. Two routes
+// (a direct hop and a staged one) make the choice observable.
+TEST(CoveringSearch, ExactModeReportsUnexploredConnectionChoices) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = occupiedStagingGraph(context, tile);
+
+  MachineModel machine = twoDestinationHopMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1u << 20; // every alternative fits
+  // A second route from dram.0 to acc.0: the direct hop, alongside the staged
+  // one through stage.0 the topology already offers.
+  LinkEdge direct;
+  direct.id = "dram_to_acc.0";
+  direct.source = "dram.0";
+  direct.destination = "acc.0";
+  direct.bandwidthBytesPerCycle = 32;
+  direct.latencyCycles = 10;
+  direct.transactionBytes = 64;
+  direct.transferEngines = {"dma.0"};
+  machine.links.push_back(direct);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kOccupiedStagingRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_TRUE(result->connectionChoicesUnexplored);
+  EXPECT_TRUE(
+      hasDiagnostic(*result, DiagnosticCode::ConnectionChoiceUnexplored));
+}
+
+// Control: the beam and deterministic modes are heuristic by contract, so they
+// make no exhaustiveness claim and leave the flag clear.
+TEST(CoveringSearch, DeterministicModeDoesNotReportUnexploredChoices) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = occupiedStagingGraph(context, tile);
+
+  MachineModel machine = twoDestinationHopMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1u << 20;
+  LinkEdge direct;
+  direct.id = "dram_to_acc.0";
+  direct.source = "dram.0";
+  direct.destination = "acc.0";
+  direct.bandwidthBytesPerCycle = 32;
+  direct.latencyCycles = 10;
+  direct.transactionBytes = 64;
+  direct.transferEngines = {"dma.0"};
+  machine.links.push_back(direct);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kOccupiedStagingRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->connectionChoicesUnexplored);
+}
+
 // A gather's intermediate tile is charged to the consumer's memory too: the
 // consumer instance fits acc.0, but the gathered tile it produces does not.
 TEST(CoveringSearch, GatherIntermediateCountsAgainstCapacity) {
@@ -3276,6 +3352,7 @@ TEST(MappingDiagnostics, EveryCodeRoundTripsThroughItsString) {
       DiagnosticCode::TargetBundleInvalid,
       DiagnosticCode::AssumedValueSize,
       DiagnosticCode::InvalidMappingMetadata,
+      DiagnosticCode::ConnectionChoiceUnexplored,
   };
   for (DiagnosticCode code : codes) {
     llvm::StringRef text = stringifyDiagnosticCode(code);

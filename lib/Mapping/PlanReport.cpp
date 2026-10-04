@@ -61,6 +61,7 @@ bool isRejection(DiagnosticCode code) {
   case DiagnosticCode::SearchTruncated:
   case DiagnosticCode::LatencyCacheMiss:
   case DiagnosticCode::AssumedValueSize:
+  case DiagnosticCode::ConnectionChoiceUnexplored:
     return false;
   // Rejections: the search refused a rule, a placement, a pair, a layout, a
   // global constraint, a bundle, or a plan.

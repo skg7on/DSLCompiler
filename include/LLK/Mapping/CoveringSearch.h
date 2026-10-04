@@ -109,6 +109,15 @@ struct MappingSearchResult {
   std::vector<CoveringPlan> plans;
   /// True when any cap ended the search early.
   bool searchTruncated = false;
+  /// True when the search picked each connection's locally cheapest alternative
+  /// instead of branching over the alternatives the topology offered (set in
+  /// exact mode; the beam and deterministic modes are heuristic by contract).
+  /// The result is then not an exhaustive joint placement/route search: a
+  /// covering rejected here may still be feasible through a more expensive
+  /// route combination. Distinct from `searchTruncated` -- this holds with
+  /// every cap lifted -- and reported with
+  /// `DiagnosticCode::ConnectionChoiceUnexplored`.
+  bool connectionChoicesUnexplored = false;
   FailureFrontier frontier;
   /// Partial plans the search expanded, for diagnostics.
   uint64_t expandedStates = 0;
