@@ -1254,15 +1254,20 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     return std::nullopt;
   }
 
-  // A bound layout selects which of the rule's declared layouts may apply. The
-  // value was resolved by `kind == "layout"` at the pass layer (lib/Mapping
-  // does not see the search space, and must not depend on LLKPerf); here it is
-  // only string-compared against the rule's declared layout ids, which stay
-  // target-owned. A rule that offers none of them -- including a rule that
-  // declares no layout requirement at all -- cannot honour the binding, so it
-  // is a non-match (ruling S1), never an error: a sibling rule that does offer
-  // the layout may still match.
-  if (boundLayout) {
+  // A bound layout constrains the rule only where the rule takes on a layout
+  // obligation. The value was resolved by `kind == "layout"` at the pass layer
+  // (lib/Mapping does not see the search space, and must not depend on
+  // LLKPerf); here it is only string-compared against the rule's declared
+  // layout ids, which stay target-owned. A rule that declares layout
+  // requirements but offers none of them contradicts the binding, so it is a
+  // non-match (ruling S1), never an error: a sibling rule that does offer the
+  // layout may still match. A rule that declares *no* layout requirement takes
+  // on no layout obligation, so it neither offers nor contradicts the bound
+  // value and matches unchanged (ruling S7) -- the layout-axis analogue of T2's
+  // "a binding name the rule does not declare is ignored". Vetoing such a rule
+  // would make every movement/reduce rule (which the shipped rule files leave
+  // layout-agnostic) unmappable under any bound layout.
+  if (boundLayout && !rule.layoutRequirements.empty()) {
     bool offered = false;
     for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)
       offered |= requirement.layoutId == *boundLayout;
@@ -1323,6 +1328,13 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     // declared layouts applies, so a rule that offered several selects the one
     // the search-space point named. Without a bound layout every requirement is
     // kept exactly as before.
+    //
+    // Known conflation: this treats "two ids on one port" (alternatives) and
+    // "ids on two ports" (distinct obligations) alike, so a future multi-port
+    // rule would silently drop an obligation -- under-constraint, the opposite
+    // direction to the empty-list veto S7 fixed. Every shipped rule declares at
+    // most one `require layout`, so the cases do not yet diverge; a per-port
+    // selection surface is the place to split them if one appears.
     if (boundLayout && requirement.layoutId != *boundLayout)
       continue;
     LayoutRequirement resolved;

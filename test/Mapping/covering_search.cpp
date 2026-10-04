@@ -2853,11 +2853,14 @@ TEST(CoveringSearch, ABoundLayoutARuleDoesNotOfferIsANonMatch) {
   }
 }
 
-// The literal edge: a rule that declares no layout requirement at all offers
-// nothing for the binding to select, so a bound layout leaves every node
-// without a rule -- a search failure with the frontier's diagnostics, not an
-// error.
-TEST(CoveringSearch, ABoundLayoutNoRuleOffersLeavesTheNodeWithoutARule) {
+// Ruling S7: a bound layout is a contradiction test, not a requirement test. A
+// rule that declares *no* layout requirement takes on no layout obligation, so
+// it matches unchanged under any bound layout -- the layout-axis analogue of
+// T2's "a name the rule does not declare is ignored". This is the shipped-AVX2
+// regression in miniature: its `reduce_sum_f32`/`async_copy`/`tile_async_copy`/
+// `tile_store` rules carry no `require layout`, and vetoing them would make a
+// movement-and-reduce kernel unmappable the moment a candidate binds a layout.
+TEST(CoveringSearch, ABoundLayoutLeavesLayoutAgnosticRulesUnchanged) {
   mlir::MLIRContext context;
   WorkloadGraph graph = twoNodeGraph(context);
   std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
@@ -2865,31 +2868,33 @@ TEST(CoveringSearch, ABoundLayoutNoRuleOffersLeavesTheNodeWithoutARule) {
 
   MappingSearchOptions options;
   options.mode = SearchMode::Deterministic;
+  SearchBinding binding = makeSearchBinding(
+      "candidate_blocked", values({{"tile_layout", std::string("t.blocked")}}));
 
-  // No bound layout: the rules match and plans are found.
-  {
-    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
-    llvm::Expected<MappingSearchResult> result = search.search();
-    ASSERT_TRUE(static_cast<bool>(result))
-        << llvm::toString(result.takeError());
-    EXPECT_FALSE(result->plans.empty());
-  }
+  // No bound layout: the layout-agnostic rules match and plans are found.
+  CoveringSearch plain(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> plainResult = plain.search();
+  ASSERT_TRUE(static_cast<bool>(plainResult))
+      << llvm::toString(plainResult.takeError());
+  ASSERT_FALSE(plainResult->plans.empty());
 
-  // Bound: no rule offers `t.blocked`, so no node has a rule in effect.
-  {
-    SearchBinding binding =
-        makeSearchBinding("candidate_blocked",
-                          values({{"tile_layout", std::string("t.blocked")}}));
-    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
-                          binding, std::string("t.blocked"));
-    llvm::Expected<MappingSearchResult> result = search.search();
-    ASSERT_TRUE(static_cast<bool>(result))
-        << llvm::toString(result.takeError());
-    EXPECT_TRUE(result->plans.empty());
-    EXPECT_FALSE(result->searchTruncated);
-    EXPECT_EQ(result->frontier.nodesWithoutRules, 2u);
-    EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
-  }
+  // The same rules under a bound layout still match, selecting the same rules:
+  // nothing about them contradicts `t.blocked`. (The plan *id* legitimately
+  // differs -- the binding's provenance is folded into it -- so compare the
+  // selections, not the id.)
+  CoveringSearch boundSearch(graph, *target, context, LayoutContext{}, options,
+                             binding, std::string("t.blocked"));
+  llvm::Expected<MappingSearchResult> boundResult = boundSearch.search();
+  ASSERT_TRUE(static_cast<bool>(boundResult))
+      << llvm::toString(boundResult.takeError());
+  ASSERT_FALSE(boundResult->plans.empty());
+  EXPECT_EQ(boundResult->frontier.nodesWithoutRules, 0u);
+  EXPECT_FALSE(hasDiagnostic(*boundResult, DiagnosticCode::NoMatchingRule));
+  ASSERT_EQ(boundResult->plans[0].placements.size(),
+            plainResult->plans[0].placements.size());
+  for (size_t i = 0; i < boundResult->plans[0].placements.size(); ++i)
+    EXPECT_EQ(boundResult->plans[0].placements[i].rule,
+              plainResult->plans[0].placements[i].rule);
 }
 
 //===----------------------------------------------------------------------===//
