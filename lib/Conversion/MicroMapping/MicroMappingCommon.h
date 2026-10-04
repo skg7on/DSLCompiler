@@ -426,6 +426,44 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     if (!layout)
       return layout.takeError();
     boundLayout = std::move(*layout);
+
+    // Bridge the bound Micro layout *kind* to the target layout the rules name
+    // through the target's own declaration (`layout <id> implements <kind>;`).
+    // The two namespaces are otherwise unrelated strings, so without the bridge
+    // a binding can only veto rules that name a different id -- it can never
+    // select the target layout it means. Generic code still only
+    // string-compares the resolved id (ruling S7); the kind is never read as
+    // target semantics.
+    if (boundLayout && !boundLayout->empty()) {
+      std::vector<const mapping::LayoutDef *> implementing =
+          run.target->layouts().implementing(*boundLayout);
+      if (implementing.size() == 1) {
+        boundLayout = implementing.front()->id;
+      } else if (implementing.size() > 1) {
+        // Several target layouts implement the bound kind, so the bridge does
+        // not land on one id. Rejected as ambiguous rather than guessing: the
+        // target must disambiguate (name a different kind, or one layout per
+        // kind) before a binding can select among them.
+        std::string names;
+        for (const mapping::LayoutDef *def : implementing) {
+          if (!names.empty())
+            names += ", ";
+          names += "'" + def->id + "'";
+        }
+        return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                       (passName + ": the bound layout kind '" +
+                                        *boundLayout + "' is implemented by " +
+                                        std::to_string(implementing.size()) +
+                                        " target layouts (" + names +
+                                        "); the kind-to-layout bridge is "
+                                        "ambiguous")
+                                           .str());
+      }
+      // Zero: no target layout claims the kind. The bound value is left as the
+      // bare kind, so a rule that happens to spell its id like the kind still
+      // matches (the pre-bridge behaviour) and any other rule keeps the veto
+      // semantics a binding has always had.
+    }
   }
 
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),

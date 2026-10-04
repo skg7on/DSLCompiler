@@ -83,6 +83,45 @@ TEST(LayoutParse, SymbolicParamIsMarked) {
       parses("layout t.one(sym policy) { param policy in {\"a\", \"b\"}; }"));
 }
 
+TEST(LayoutParse, ParsesImplementsClause) {
+  auto registry = parse(R"llkmap(
+layout t.blocked(int VW) {
+  param VW in [4..8];
+  implements blocked;
+  require VW == 8;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const LayoutDef *def = registry->find("t.blocked");
+  ASSERT_NE(def, nullptr);
+  EXPECT_EQ(def->implementsKind, "blocked");
+  // The bridge that matters: the kind lands on exactly one layout.
+  ASSERT_EQ(registry->implementing("blocked").size(), 1u);
+  EXPECT_EQ(registry->implementing("blocked").front()->id, "t.blocked");
+}
+
+TEST(LayoutParse, ImplementsIsAbsentByDefault) {
+  auto registry = parse("layout t.plain(N) { param N in [1..2]; }");
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("t.plain");
+  ASSERT_NE(def, nullptr);
+  EXPECT_TRUE(def->implementsKind.empty());
+  EXPECT_TRUE(registry->implementing("blocked").empty());
+  // An empty kind never matches: it is "no kind", not "any kind".
+  EXPECT_TRUE(registry->implementing("").empty());
+}
+
+TEST(LayoutParse, RejectsADuplicateImplementsClause) {
+  EXPECT_FALSE(
+      parses("layout t.two(N) { implements blocked; implements row_major; }"));
+}
+
+TEST(LayoutParse, RejectsImplementsWithoutASemicolon) {
+  EXPECT_FALSE(parses("layout t.bad(N) { implements blocked }"));
+}
+
 TEST(LayoutParse, ParsesRangesEndingAtInt64Max) {
   auto registry = parse(R"llkmap(
 layout t.edge(singleton, pair) {
@@ -463,6 +502,27 @@ TEST(LayoutShipped, LoadsTheAvx2LayoutFile) {
       << llvm::toString(registry.takeError());
   EXPECT_NE(registry->find("avx2.blocked_2d"), nullptr);
   EXPECT_NE(registry->find("avx2.row_major"), nullptr);
+}
+
+// The shipped AVX2 layouts declare which Micro kind each implements, so a
+// bound search-space kind resolves to a target id. Each kind lands on exactly
+// one layout, which is what makes the bridge well-defined.
+TEST(LayoutShipped, Avx2LayoutsDeclareTheKindTheyImplement) {
+  llvm::Expected<LayoutRegistry> registry = loadLayoutFile(kShippedLayouts);
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const LayoutDef *blocked = registry->find("avx2.blocked_2d");
+  ASSERT_NE(blocked, nullptr);
+  EXPECT_EQ(blocked->implementsKind, "blocked");
+  const LayoutDef *rowMajor = registry->find("avx2.row_major");
+  ASSERT_NE(rowMajor, nullptr);
+  EXPECT_EQ(rowMajor->implementsKind, "row_major");
+
+  ASSERT_EQ(registry->implementing("blocked").size(), 1u);
+  EXPECT_EQ(registry->implementing("blocked").front()->id, "avx2.blocked_2d");
+  ASSERT_EQ(registry->implementing("row_major").size(), 1u);
+  EXPECT_EQ(registry->implementing("row_major").front()->id, "avx2.row_major");
+  EXPECT_TRUE(registry->implementing("col_major").empty());
 }
 
 TEST(LayoutShipped, Blocked2dSolvesForF32) {
