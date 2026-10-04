@@ -262,10 +262,11 @@ llk-compile --emit=micro-search input.mlir
 # Search a mapping space, bind the best plan, and write a plan report
 llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml \
   layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap \
-  emitters=avx2_vector_add report=plan.json" input.mlir
+  emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store report=plan.json" input.mlir
 
-# Bind a specific plan by its stable id (same target keys as --micro-map)
-llk-opt --micro-bind-plan="plan-id=<id> target=x86-avx2 machine=... layouts=... rules=... emitters=..." input.mlir
+# Bind a specific plan by its stable id (reproduce the search: same target keys
+# AND search options as the --micro-map run that reported the id)
+llk-opt --micro-bind-plan="plan-id=<id> target=x86-avx2 machine=... layouts=... rules=... emitters=... mode=beam beam-width=64 top-k=8" input.mlir
 
 # Evaluate concrete Micro-IR against a machine profile
 micro-perf --machine machines/x86-avx2-v2.yaml --level l1 input.micro.mlir
@@ -274,7 +275,7 @@ micro-perf --machine machines/x86-avx2-v2.yaml --level l1 input.micro.mlir
 llk-tune --search-space swiglu.micro.mlir --machine machines/x86-avx2-v2.yaml
 ```
 
-`--micro-map` and `--micro-bind-plan` emit a versioned JSON plan report (input/machine/layout-library/rule-library hashes, search options and truncation flags, rejection counts by stable reason code, top-K plans with component costs, selected plan id, compiler and cost-model version).
+`--micro-map` writes a versioned JSON plan report when given `report=<path>` -- including in `report-only` mode, where it reports the selected plan without binding it onto the IR. The report carries input/machine/layout-library/rule-library hashes, search options and truncation flags, rejection counts by stable reason code, top-K plans with component costs, selected plan id, and compiler and cost-model version. `--micro-bind-plan` does not write a report: it re-runs the search to bind a plan by its id.
 
 ## Tech Stack
 

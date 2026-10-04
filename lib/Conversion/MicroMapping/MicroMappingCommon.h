@@ -26,7 +26,9 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/Twine.h"
@@ -77,6 +79,69 @@ parseSearchMode(llvm::StringRef text) {
       .Case("beam", mapping::SearchMode::Beam)
       .Case("exact", mapping::SearchMode::Exact)
       .Default(std::nullopt);
+}
+
+/// Parses a 64-bit plan id in every spelling the project emits or accepts.
+///
+/// A plan id is an unsigned 64-bit content hash. `PlanReport` prints it as bare
+/// lowercase hex (16 digits, from `hexId`), so that spelling -- the one the
+/// documented report -> bind workflow copies -- must be accepted verbatim. The
+/// other accepted spellings denote the same hash: `0x`/`0X`-prefixed hex, and
+/// decimal read as either unsigned or signed (a hash with the high bit set is
+/// negative when read as a signed i64, and both spellings must round-trip).
+///
+/// Spelling rule, deterministic and tested. In order:
+///   1. a `0x`/`0X` prefix forces hex;
+///   2. otherwise exactly 16 characters, all hex digits, is hex -- this is
+///      `hexId`'s `%016llx` output, so the report's token round-trips even when
+///      all 16 digits happen to be decimal;
+///   3. otherwise a string made only of hex digits that contains at least one
+///      hex letter (`a`-`f`, either case) is hex;
+///   4. everything else is decimal, read as unsigned then (for a leading `-`)
+///      signed.
+/// So the digit-only `12345` is decimal 12345 and not 0x12345, while `12ab` is
+/// hex 4779. Numbers too large for the chosen base, or containing any other
+/// character, are rejected. Returns nullopt on rejection.
+///
+/// Trade-off, stated plainly: at exactly 16 bare hex digits the parser prefers
+/// hex, so a 16-digit *decimal* value cannot be written bare -- it would be
+/// read as hex. Write it in `0x` hex instead, or in any other form that is not
+/// 16 bare hex digits. The round-trip of the report's token is the primary
+/// contract, and it is exactly this width, so it wins at this width.
+inline std::optional<uint64_t> parsePlanId(llvm::StringRef text) {
+  llvm::StringRef body = text;
+  if (body.consume_front("0x") || body.consume_front("0X")) {
+    uint64_t hex = 0;
+    if (body.empty() || body.getAsInteger(16, hex))
+      return std::nullopt;
+    return hex;
+  }
+
+  if (body.empty())
+    return std::nullopt;
+
+  // The report always prints 16 hex digits; at that exact width hex wins, so an
+  // id like 0x1234567890123456 (all-decimal digits) round-trips. Off that
+  // width, a hex letter is what separates the two ambiguous spellings.
+  bool allHexDigits =
+      llvm::all_of(body, [](char c) { return llvm::isHexDigit(c); });
+  bool reportWidth = body.size() == 16;
+  bool hasHexLetter = llvm::any_of(
+      body, [](char c) { return llvm::isHexDigit(c) && !llvm::isDigit(c); });
+  if (allHexDigits && (reportWidth || hasHexLetter)) {
+    uint64_t hex = 0;
+    if (body.getAsInteger(16, hex))
+      return std::nullopt;
+    return hex;
+  }
+
+  uint64_t unsignedValue = 0;
+  if (!body.getAsInteger(10, unsignedValue))
+    return unsignedValue;
+  int64_t signedValue = 0;
+  if (!body.getAsInteger(10, signedValue))
+    return static_cast<uint64_t>(signedValue);
+  return std::nullopt;
 }
 
 /// Splits the comma-separated emitter keys, dropping empty entries so a stray
@@ -149,9 +214,9 @@ objectiveOrderFromModule(ModuleOp module) {
 struct MappingRun {
   std::unique_ptr<mapping::MappingTarget> target;
   Operation *kernel = nullptr;
-  /// The options the search actually ran with -- including a forced
-  /// deterministic mode and the module's declared objective -- so a report can
-  /// state them without reconstructing them from the CLI.
+  /// The options the search actually ran with -- the requested mode and the
+  /// module's declared objective included -- so a report can state them without
+  /// reconstructing them from the CLI.
   mapping::MappingSearchOptions searchOptions;
   mapping::MappingSearchResult result;
 };
@@ -178,13 +243,29 @@ inline llvm::Error requireKey(llvm::StringRef passName, llvm::StringRef key,
       (passName + ": missing required key '" + key + "'").str());
 }
 
+/// `report-only` fixes what the pass does with a search result, not how it
+/// searches, so it is only meaningful together with a report path. A
+/// report-only run with nothing to report into would search and then throw the
+/// result away -- a success that produced nothing and could be mistaken for a
+/// successful mapping -- so the pair is required rather than defaulted.
+inline llvm::Error requireReportPathForReportOnly(llvm::StringRef passName,
+                                                  bool reportOnly,
+                                                  llvm::StringRef reportPath) {
+  if (!reportOnly || !reportPath.empty())
+    return llvm::Error::success();
+  return llvm::createStringError(
+      llvm::inconvertibleErrorCode(),
+      (passName + ": report-only requires report=<path>").str());
+}
+
 /// The whole chain up to (but not including) plan selection: load the target,
-/// find the kernel, extract its workload graph, and search it. `mode` is forced
-/// to `deterministic` when `forceDeterministic` is set, which is what makes a
-/// content-derived plan id reproducible.
+/// find the kernel, extract its workload graph, and search it in the mode
+/// `options.mode` names. Both entry points share this so a plan id is
+/// reproducible from either: re-running with the same options replays the same
+/// search and so exposes the same content-derived ids.
 inline llvm::Expected<MappingRun>
 runMappingSearch(ModuleOp module, llvm::StringRef passName,
-                 const MicroMapOptions &options, bool forceDeterministic) {
+                 const MicroMapOptions &options) {
   if (llvm::Error error = requireKey(passName, "target", options.target))
     return std::move(error);
   if (llvm::Error error = requireKey(passName, "machine", options.machinePath))
@@ -198,17 +279,14 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
         llvm::inconvertibleErrorCode(),
         (passName + ": missing required key 'emitters'").str());
 
-  mapping::SearchMode mode = mapping::SearchMode::Beam;
-  if (!forceDeterministic) {
-    std::optional<mapping::SearchMode> parsed = parseSearchMode(options.mode);
-    if (!parsed)
-      return llvm::createStringError(
-          llvm::inconvertibleErrorCode(),
-          (passName + ": unknown mode '" + options.mode +
-           "' (expected deterministic, beam, or exact)")
-              .str());
-    mode = *parsed;
-  }
+  std::optional<mapping::SearchMode> parsed = parseSearchMode(options.mode);
+  if (!parsed)
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        (passName + ": unknown mode '" + options.mode +
+         "' (expected deterministic, beam, or exact)")
+            .str());
+  mapping::SearchMode mode = *parsed;
 
   MappingRun run;
   llvm::Expected<std::unique_ptr<mapping::MappingTarget>> target =

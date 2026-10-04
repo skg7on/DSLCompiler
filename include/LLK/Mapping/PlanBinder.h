@@ -80,7 +80,10 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
 ///   3. target -- every selected rule's emitter is one the target declares.
 ///
 /// Returns the first violation, walking operations in order so diagnostics are
-/// deterministic.
+/// deterministic. A violation that a §22.3 code covers is reported as
+/// `<code>: <detail>` (for example `no_matching_rule: mapped op ...: unknown
+/// rule '...'`), so the code is the stable interface and the detail is prose;
+/// the structural failure has no §22.3 code of its own and is reported plainly.
 llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                                 const MappingTarget &target);
 

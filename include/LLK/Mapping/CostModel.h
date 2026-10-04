@@ -120,6 +120,54 @@ bool costLess(const Cost &lhs, const Cost &rhs, const ObjectiveOrder &order);
 bool ranksBefore(const Cost &lhs, uint64_t lhsId, const Cost &rhs,
                  uint64_t rhsId, const ObjectiveOrder &order);
 
+/// Component-wise best of two costs under `order`'s direction: each metric
+/// takes the smaller value when `order.minimize`, the larger otherwise. This is
+/// the optimistic combination a search bound folds in -- the value the
+/// objective would most prefer to see in every dimension.
+///
+/// **That optimism is admissible only for a minimize objective.** The bound
+/// also omits connection costs, a non-negative term (a connection exists only
+/// once both endpoints are chosen). Omitting it can only raise a completion, so
+/// for a *minimize* objective the bound stays at or below every completion and
+/// is never worse than one that exists. For a *maximize* objective the same
+/// omission makes the bound *too small* -- not the value the objective most
+/// prefers -- so it is inadmissible and cannot license pruning; a maximize
+/// search relies on its caps for soundness instead (see `boundIsBetterThan`).
+Cost bestCostForObjective(const Cost &lhs, const Cost &rhs,
+                          const ObjectiveOrder &order);
+
+/// A bound no completion can improve on: every metric at its worst
+/// representable value. Returned when an uncovered node has no reachable
+/// instance, so the branch can never complete and must be pruned.
+Cost infiniteCost();
+
+/// True when `cost` is the `infiniteCost()` sentinel. A dead bound is never
+/// "better" than a live one, whichever direction the objective prefers: a
+/// branch that cannot complete must not win a maximize objective on the
+/// strength of an infinitely large optimistic value.
+bool boundIsDead(const Cost &cost);
+
+/// True when bound `lhs` is more promising than bound `rhs` under `order`.
+/// Direction-aware: a minimizing objective ranks the smaller bound ahead, a
+/// maximizing objective the larger, because pruning must always favour the
+/// branch it bounds.
+///
+/// **The bound's admissibility is asymmetric.** A bound built by `boundCost`
+/// omits connection costs -- a connection is synthesized only once both
+/// endpoints are chosen, so its cost is unknown while nodes remain uncovered --
+/// and that term is non-negative. For a *minimize* objective the omission is
+/// safe: a non-negative term can only raise a completion, so the bound stays at
+/// or below it and pruning on the bound is sound. For a *maximize* objective
+/// the same omission makes the bound *too small*, so a branch whose real
+/// completion would be largest can look poor; the bound is then inadmissible
+/// and must not prune. A maximize search must rely on the search caps (`topK`,
+/// instance, candidate, and route caps), not on the bound, for soundness --
+/// `CoveringSearch` disables its exact prune when `order.minimize == false`.
+///
+/// An exact tie returns false in both directions.
+bool boundIsBetterThan(const Cost &lhs, const Cost &rhs,
+                       const ObjectiveOrder &order);
+
 /// Builds the comparison order a `micro.objective` declares from its metric
 /// spelling, direction (`minimize == false` means maximize), and optional
 /// secondary metrics, which are kept in the declared order as tie-breakers

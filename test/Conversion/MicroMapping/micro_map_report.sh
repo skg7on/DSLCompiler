@@ -23,7 +23,7 @@ mkdir -p "$WORK"
 
 # The five required target keys plus a deterministic mode, so the selected plan
 # is reproducible. `report=` is appended to the same option string.
-OPTIONS="target=x86-avx2 machine=$SRC/machines/x86-avx2-v2.yaml layouts=$SRC/mapping/x86-avx2/layouts.llkmap rules=$SRC/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_mma,avx2_reduce,avx2_copy mode=deterministic"
+OPTIONS="target=x86-avx2 machine=$SRC/machines/x86-avx2-v2.yaml layouts=$SRC/mapping/x86-avx2/layouts.llkmap rules=$SRC/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=deterministic"
 KERNEL="$SRC/test/Conversion/MicroMapping/micro_map.mlir"
 
 "$LLK_OPT" "--micro-map=$OPTIONS report=$WORK/report_a.json" "$KERNEL" > "$WORK/with_report.mlir"

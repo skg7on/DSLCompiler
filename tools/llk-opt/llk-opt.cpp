@@ -85,6 +85,11 @@ int main(int argc, char **argv) {
     return mlir::llk::createMicroBindPlanPass();
   });
 
+  // Register the mapping-verification pass (design §18.3 phase 2).
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createMicroVerifyMappingPass();
+  });
+
   // Register the TileAndVectorize pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createTileAndVectorizePass();

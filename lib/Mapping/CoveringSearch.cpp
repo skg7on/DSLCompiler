@@ -10,9 +10,14 @@
 // immediately tests every edge whose other end is already chosen, so a branch
 // dies at the first pair that cannot be connected rather than at completion.
 //
-// The bound used for ordering and pruning is admissible: accumulated cost plus,
-// for each uncovered node, the cheapest instance available for it. Connection
-// costs are non-negative, so it never overestimates.
+// The bound used for ordering and pruning is accumulated cost plus, for each
+// uncovered node, the componentwise best still reachable -- the
+// measured-or-static `entry.cost`, never the stale static estimate -- and its
+// direction follows the declared objective. It omits connection costs, whose
+// sign is non-negative; that omission keeps it admissible (never above a
+// completion) for a minimize objective, while for maximize it makes the bound
+// too small to prune on, so maximize explores fully and relies on the caps
+// instead.
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,6 +26,7 @@
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/Routing.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/TileFacts.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -28,7 +34,7 @@
 #include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
-#include <limits>
+#include <cassert>
 #include <optional>
 #include <string>
 #include <utility>
@@ -40,13 +46,14 @@ namespace {
 using machine::MachineModel;
 using machine::MemoryNode;
 
-/// Byte count assumed for a value crossing a connection. The real size comes
-/// from the value's type once the plan binder carries it (#50/D7); costing a
-/// route needs a number now, and every plan is costed the same way.
-constexpr uint64_t kAssumedValueBytes = 4096;
+/// Byte count and alignment assumed for a value whose tile size cannot be
+/// derived (a dynamic shape, or a type the core does not model). These are the
+/// pre-phase-3 constants, kept so an unmeasurable value is costed exactly as it
+/// was -- but the fallback is *reported*, naming the value, never taken
+/// silently (see `factsForValue`).
+constexpr uint64_t kUnknownValueBytes = 4096;
 
-/// Alignment every fixture memory supports.
-constexpr uint64_t kAssumedAlignment = 32;
+constexpr uint64_t kUnknownAlignment = 32;
 
 /// A legal placement and the rule that produced it, so a selected plan can
 /// name the rule and bundle it chose.
@@ -100,11 +107,26 @@ struct Partial {
   /// (when every endpoint is chosen), so a fan-out is built exactly once.
   std::vector<char> linked;
   Cost cost;
-  double lowerBound = std::numeric_limits<double>::infinity();
+  /// Optimistic completion cost, direction-aware and measured (`boundCost`).
+  /// Multi-dimensional: the beam order always compares it through
+  /// `boundIsBetterThan`, never as a bare latency. The exact prune compares it
+  /// through the same predicate -- but only under a minimize objective, the
+  /// only direction the bound is admissible for; an exact maximize run skips
+  /// the prune block entirely.
+  Cost lowerBound = infiniteCost();
   uint64_t id = 0;
   unsigned covered = 0;
   uint64_t executorSlots = 0;
   llvm::StringMap<uint64_t> memoryBytes;
+  /// Per-value live-range accounting: the memory charges a value currently
+  /// owes, as exact (memory, bytes) pairs so the release subtracts precisely
+  /// what the charge added. Populated when the value's producer is placed and
+  /// cleared when the value's *last* consumer is placed. A value the graph
+  /// never fully consumes keeps its charges for the whole plan (it is not in
+  /// `valueLinks`, so nothing ever releases it) -- the conservative direction.
+  llvm::DenseMap<WorkloadValueId,
+                 llvm::SmallVector<std::pair<MemoryNodeId, uint64_t>, 2>>
+      liveValueCharges;
 };
 
 MemoryNodeId primaryMemory(const MachineModel &machine,
@@ -120,6 +142,40 @@ MemoryNodeId primaryMemory(const MachineModel &machine,
     if (machine.isVisible(memory.id, executor))
       return memory.id;
   return MemoryNodeId();
+}
+
+/// The layout `instance` bound for the value `value`, or nullopt when it bound
+/// none for it.
+///
+/// The match is by *value*, not by "the instance's one layout": a rule's layout
+/// requirement names a port, and the solved binding is recorded against the
+/// workload value that port carries. The edge being connected carries that same
+/// value (a port's value *is* the edge's value), so a binding solved for
+/// another value -- or for no resolvable port at all -- does not match. That is
+/// what keeps a layout named on one port from being attributed to an edge
+/// carrying a different one: `avx2.mma_bf16` requires `lhs` to be
+/// `avx2.row_major`, and `lhs` is an *input*, so the edge carrying the mma's
+/// `result` must not inherit that layout. Both directions of error are avoided
+/// rather than traded: a mis-attributed layout could fabricate a transform (or,
+/// because differing layouts now suppress `Direct`, drop a connection that was
+/// valid), while no attribution at all only costs the transform alternative for
+/// that edge.
+///
+/// Two layout classes solved for the same value are ambiguous -- the edge
+/// cannot say which governs -- so that is treated as unattributable too.
+std::optional<LayoutId> boundLayoutForValue(const CandidateInstance &instance,
+                                            WorkloadValueId value) {
+  std::optional<LayoutId> found;
+  for (const auto &entry : instance.layoutSolutions) {
+    if (entry.second.portValue != static_cast<int64_t>(value))
+      continue;
+    if (found)
+      return std::nullopt;
+    // The key is the resolved definition id, string-identical to this class's
+    // `layoutBindings` entry (see `SolvedLayout`'s invariant).
+    found = entry.first().str();
+  }
+  return found;
 }
 
 /// Hashes the chosen instance ids, so a partial plan has a stable identity
@@ -246,6 +302,40 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     key += message;
     if (recordedDiagnostics.insert(key).second)
       result.frontier.diagnostics.push_back({code, std::move(message)});
+  };
+
+  // The size of the tile a value carries, derived from its type. A dynamic
+  // shape or a type the core does not model cannot be sized: fall back to the
+  // pre-phase-3 constants and *report* it, naming the value, so an assumed size
+  // is never silent again (phase-3 ruling R1).
+  auto factsForValue = [&](WorkloadValueId value) -> TileFacts {
+    const WorkloadValue *moved = workload_.findValue(value);
+    TileFacts facts = moved ? tileFactsFor(moved->type) : TileFacts{};
+    if (facts.known)
+      return facts;
+    report(DiagnosticCode::AssumedValueSize,
+           "value " + std::to_string(value) + " ('" +
+               (moved ? moved->name : std::string("<unknown>")) +
+               "'): tile size unknown; assuming " +
+               std::to_string(kUnknownValueBytes) + " bytes, " +
+               std::to_string(kUnknownAlignment) + "-byte alignment");
+    facts.bytes = kUnknownValueBytes;
+    facts.alignment = kUnknownAlignment;
+    return facts;
+  };
+
+  // The byte count for a node with no output to size: its first input's tile,
+  // or -- for a node with no port at all -- the reported fallback. A node that
+  // writes no output materializes nothing attributable, so such a charge is
+  // never expired.
+  auto portlessBytes = [&](const WorkloadNode &node) -> uint64_t {
+    if (!node.inputs.empty())
+      return factsForValue(node.inputs.front().value).bytes;
+    report(DiagnosticCode::AssumedValueSize,
+           "node " + std::to_string(node.id) +
+               " has no port to size; assuming " +
+               std::to_string(kUnknownValueBytes) + " bytes");
+    return kUnknownValueBytes;
   };
 
   // --- node tables -----------------------------------------------------
@@ -449,15 +539,51 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     partial.executorSlots += instance.resourceUsage.executorSlots;
     if (partial.linked.size() != valueLinks.size())
       partial.linked.assign(valueLinks.size(), 0);
-    // A bound memory holds the tile this instance materializes, plus anything
+    // A bound memory holds the tiles this instance materializes, plus anything
     // the rule declared explicitly. `memoryBytes` is keyed by memory *node*, so
-    // each byte can be charged to the node that actually holds it: the binding
+    // each byte is charged to the memory that actually holds it: the binding
     // map resolves a requirement kind to the node placement chose, while
-    // `resourceUsage` is keyed by that requirement kind. Bytes are accumulated
-    // for the duration of the partial plan -- an honest conservative live-range
-    // bound, since true expiry is not modelled.
-    for (const auto &binding : instance.memoryBindings)
-      partial.memoryBytes[binding.second] += kAssumedValueBytes;
+    // `resourceUsage` is keyed by that requirement kind.
+    //
+    // The materialized tiles are the node's *outputs*. One binding holds every
+    // output the node writes, so it is charged their total -- sizing it from
+    // the first output alone under-charges a multi-output node, the unsafe
+    // direction for a capacity check. When a node declares several bindings the
+    // graph fixes no output-to-binding pairing (a memory requirement names a
+    // requirement *kind*, never the port that goes there), so each binding
+    // keeps the first-output fallback, an admitted lower bound, rather than
+    // guessing a pairing.
+    //
+    // Each charged output is also recorded as a live range: the bytes are
+    // released once its last consumer is placed (below), so a sequential
+    // program is not charged as if every value were simultaneously live. Only
+    // size the tile when there is a binding to charge it to; a rule that
+    // declares no memory charges nothing and must not report an assumption for
+    // a size it never uses.
+    if (!instance.memoryBindings.empty()) {
+      const WorkloadNode &workload = *tables[nodeIndex].workload;
+      if (workload.outputs.empty()) {
+        // No output to attribute: charge the first-input fallback for the whole
+        // plan. A sink materializes nothing we can expire.
+        const uint64_t bytes = portlessBytes(workload);
+        for (const auto &binding : instance.memoryBindings)
+          partial.memoryBytes[binding.second] += bytes;
+      } else if (instance.memoryBindings.size() == 1) {
+        const MemoryNodeId memory = instance.memoryBindings.begin()->second;
+        for (const WorkloadPort &output : workload.outputs) {
+          const uint64_t bytes = factsForValue(output.value).bytes;
+          partial.memoryBytes[memory] += bytes;
+          partial.liveValueCharges[output.value].push_back({memory, bytes});
+        }
+      } else {
+        const WorkloadValueId first = workload.outputs.front().value;
+        const uint64_t bytes = factsForValue(first).bytes;
+        for (const auto &binding : instance.memoryBindings) {
+          partial.memoryBytes[binding.second] += bytes;
+          partial.liveValueCharges[first].push_back({binding.second, bytes});
+        }
+      }
+    }
     for (const auto &usage : instance.resourceUsage.memoryBytes) {
       MemoryNodeId node = instance.memoryBindings.lookup(usage.first());
       if (node.empty())
@@ -481,8 +607,16 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       request.value = value;
       request.producerMemory = primaryMemory(machine, producer);
       request.consumerMemory = primaryMemory(machine, consumer);
-      request.bytes = kAssumedValueBytes;
-      request.alignmentBytes = kAssumedAlignment;
+      // The layout each endpoint bound for *this* value, so differing layouts
+      // make the pair a transform rather than a direct connection (§15.2).
+      // Without them the search could only ever reach
+      // `synthesizeConnections`' direct path, and a transform alternative was
+      // unreachable from the search.
+      request.producerLayout = boundLayoutForValue(producer, value);
+      request.consumerLayout = boundLayoutForValue(consumer, value);
+      const TileFacts facts = factsForValue(value);
+      request.bytes = facts.bytes;
+      request.alignmentBytes = facts.alignment;
       if (const WorkloadValue *moved = workload_.findValue(value))
         request.elementType = moved->type;
       if (consumerPort)
@@ -497,6 +631,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (ExecutorId executor = consumer.executorBindings.lookup("executor");
           !executor.empty())
         request.consumerExecutor = executor;
+      // The partial plan's live bytes per memory, so a route that stages
+      // through an already-occupied intermediate is rejected (§12.2's
+      // intermediate capacity *and liveness*). The router only looks entries up
+      // by node id and never iterates the map, so it cannot perturb
+      // determinism. The pair's own memories are harmless to include: a route
+      // never re-enters its source, and its destination is exempt.
+      request.intermediateOccupancy = partial.memoryBytes;
       return request;
     };
     // The alternative the declared objective prefers. `min_element` keeps the
@@ -531,6 +672,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // they are charged. A plain single-consumer `Transfer` is deliberately not
     // charged here: its destination tile is the consumer instance's own tile,
     // already counted through that instance's memory binding.
+    //
+    // Unlike the materialized values above, these bytes do *not* expire with
+    // their value: the live range of a copy or gather intermediate is simply
+    // not modelled yet, so it is charged for the whole partial plan. That is
+    // the conservative direction -- an intermediate is assumed live from the
+    // moment its copy is staged until the plan ends.
     llvm::StringMap<uint64_t> stagedBytes; // memory -> replica/gather bytes
 
     // Synthesizes one plain-edge connection, staging the chosen alternative.
@@ -561,6 +708,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       return true;
     };
 
+    // Values whose last endpoint this placement completes. Their bytes are
+    // released only after the capacity check below, so a consumer and the value
+    // it reads stay charged together while it is placed.
+    std::vector<size_t> completedLinks;
+
     for (size_t index = 0; index < valueLinks.size(); ++index) {
       const ValueLink &link = valueLinks[index];
       if (partial.linked[index])
@@ -575,6 +727,20 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (!complete)
         continue;
       partial.linked[index] = 1;
+      completedLinks.push_back(index);
+
+      // The size of the value this link moves, derived once and shared by the
+      // requests, the replica staging, and the gather's intermediate tile.
+      const TileFacts linkFacts = factsForValue(link.value);
+
+      // A zero-element value (a static 0 dimension) moves no bytes: it needs no
+      // route, layout transform, or staging, and synthesizing a connection for
+      // it would only trip the "bytes must be positive" rule. Budget it as
+      // free, matching the zero capacity it is charged. The Micro tile verifier
+      // rejects a 0 dimension, so this is reachable only through a modelled
+      // tensor/memref/vector value type.
+      if (linkFacts.bytes == 0)
+        continue;
 
       if (link.producers.size() == 1) {
         const ValueEndpoint &producerEnd = link.producers[0];
@@ -622,10 +788,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           staged.push_back(plan);
           cost = addCost(cost, staged.back().cost);
           // A copy occupies every memory after its source: its destination and
-          // any staging hop it passes through.
-          if (staged.back().kind == ConnectionKind::Replicate)
+          // any staging hop it passes through. The copy is one replica of the
+          // moved value, so the value's own derived bytes size it.
+          if (staged.back().kind == ConnectionKind::Replicate) {
             for (size_t hop = 1; hop < staged.back().memoryRoute.size(); ++hop)
-              stagedBytes[staged.back().memoryRoute[hop]] += kAssumedValueBytes;
+              stagedBytes[staged.back().memoryRoute[hop]] += linkFacts.bytes;
+          }
         }
         continue;
       }
@@ -697,12 +865,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         }
         ConnectionPlan reduce =
             synthesizeFanIn(producerIds, consumerIds, link.value,
-                            consumerMemory, kAssumedValueBytes, feedCost);
+                            consumerMemory, linkFacts.bytes, feedCost);
         reduce.transferEngines.assign(engines.begin(), engines.end());
         staged.push_back(std::move(reduce));
         cost = addCost(cost, staged.back().cost);
         // The gather stages its reduced intermediate tile on the consumer.
-        stagedBytes[consumerMemory] += kAssumedValueBytes;
+        stagedBytes[consumerMemory] += linkFacts.bytes;
       }
     }
 
@@ -745,6 +913,32 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       return false;
     }
 
+    // The branch fits, so the values whose last consumer this placement is have
+    // now run: release the bytes they were charged. Releasing *after* the
+    // capacity check keeps a consumer and the value it reads charged together
+    // for the placement -- an operation reads its inputs and writes its outputs
+    // in the same step, so they genuinely overlap. Where the graph fixes no
+    // order, staying conservative is the rule (ruling R2): only a value whose
+    // last consumer is placed expires, and its bytes are charged the whole time
+    // every endpoint is still live.
+    for (size_t index : completedLinks) {
+      auto charges = partial.liveValueCharges.find(valueLinks[index].value);
+      if (charges == partial.liveValueCharges.end())
+        continue;
+      for (const auto &charge : charges->second) {
+        uint64_t &held = partial.memoryBytes[charge.first];
+        // Subtract exactly what was charged. The charge can never exceed what
+        // the memory still holds -- every release is a charge made earlier and
+        // not yet released -- so `held >= charge.second` holds; `min` only
+        // keeps a future accounting bug from underflowing instead of failing
+        // loudly, and never masks drift by clamping a correct value.
+        assert(held >= charge.second &&
+               "live-value release exceeds the memory's charged bytes");
+        held -= charge.second;
+      }
+      partial.liveValueCharges.erase(charges);
+    }
+
     // The branch is legal: publish its connections to the shared pool.
     for (ConnectionPlan &plan : staged) {
       pool.push_back(std::move(plan));
@@ -757,19 +951,34 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return true;
   };
 
-  // Admissible bound: accumulated cost plus the cheapest instance still
-  // available for every uncovered node.
-  auto bound = [&](const Partial &partial) -> double {
-    double total = partial.cost.latencyCycles;
+  // Optimistic completion cost: accumulated cost plus, for every uncovered
+  // node, the componentwise best still reachable. "Best" is direction-aware --
+  // a minimize objective wants the smallest reachable value, a maximize
+  // objective the largest, so the bound favours the branch it bounds. The
+  // per-instance value is `entry.cost` (measured-or-static), never
+  // `instance.localCost`: a calibrated-down instance must lower the bound, not
+  // be pruned by a stale static estimate. A node with no reachable instance
+  // makes the bound infinite, which `boundIsBetterThan` always loses whichever
+  // direction is declared.
+  //
+  // The bound omits connection costs, which are unknown until both endpoints of
+  // a connection are chosen and are non-negative. That keeps it admissible for
+  // minimize (omitted terms can only raise a completion); for maximize the
+  // omission makes it too small, so the exact prune below is disabled unless
+  // the objective minimizes.
+  auto boundCost = [&](const Partial &partial) -> Cost {
+    Cost total = partial.cost;
     for (size_t index = 0; index < tables.size(); ++index) {
       if (partial.chosen[index])
         continue;
-      double cheapest = std::numeric_limits<double>::infinity();
+      std::optional<Cost> best;
       for (const InstanceEntry &entry : tables[index].instances)
-        cheapest = std::min(cheapest, entry.instance.localCost.latencyCycles);
-      if (!std::isfinite(cheapest))
-        return std::numeric_limits<double>::infinity();
-      total += cheapest;
+        best = best
+                   ? bestCostForObjective(*best, entry.cost, options_.objective)
+                   : entry.cost;
+      if (!best)
+        return infiniteCost();
+      total = addCost(total, *best);
     }
     return total;
   };
@@ -796,14 +1005,23 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         for (const InstanceEntry &entry : tables[*node].instances) {
           Partial branch = partial;
           if (extend(branch, *node, entry)) {
-            branch.lowerBound = bound(branch);
+            branch.lowerBound = boundCost(branch);
             next.push_back(std::move(branch));
           }
         }
       }
-      llvm::sort(next, [](const Partial &lhs, const Partial &rhs) {
-        if (lhs.lowerBound != rhs.lowerBound)
-          return lhs.lowerBound < rhs.lowerBound;
+      // Bound order: the more promising bound first, direction-aware. An exact
+      // tie falls back to the deeper (more covered) plan, then the stable
+      // partial id. The beam is a bounded heuristic that may sort on a bound
+      // the exact prune would reject; it flags truncation only when a level
+      // exceeds `beamWidth` and is cut below, not unconditionally.
+      llvm::sort(next, [&](const Partial &lhs, const Partial &rhs) {
+        if (boundIsBetterThan(lhs.lowerBound, rhs.lowerBound,
+                              options_.objective))
+          return true;
+        if (boundIsBetterThan(rhs.lowerBound, lhs.lowerBound,
+                              options_.objective))
+          return false;
         if (lhs.covered != rhs.covered)
           return lhs.covered > rhs.covered;
         return lhs.id < rhs.id;
@@ -826,7 +1044,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // Deterministic and exact share a depth-first walk; they differ in when
     // they stop and in whether the bound prunes.
     bool exact = options_.mode == SearchMode::Exact;
-    std::vector<double> bestCosts; // best complete costs, ascending
+    // Best complete costs for the exact-minimize prune, ranked by the declared
+    // objective (best first, so the worst kept plan is `back()`). Only the
+    // prune reads it, and only a minimize objective arms that prune, so a
+    // maximize or deterministic run skips this bookkeeping along with the
+    // prune block below.
+    std::vector<Cost> bestCosts;
     std::function<void(Partial &, bool &)> visit = [&](Partial &partial,
                                                        bool &stop) {
       if (stop)
@@ -834,10 +1057,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       std::optional<size_t> node = lowestUncovered(partial);
       if (!node) {
         complete.push_back(partial);
-        bestCosts.push_back(partial.cost.latencyCycles);
-        llvm::sort(bestCosts);
-        if (bestCosts.size() > options_.topK)
-          bestCosts.resize(options_.topK);
+        if (exact && options_.objective.minimize) {
+          bestCosts.push_back(partial.cost);
+          llvm::sort(bestCosts, [&](const Cost &lhs, const Cost &rhs) {
+            return costLess(lhs, rhs, options_.objective);
+          });
+          if (bestCosts.size() > options_.topK)
+            bestCosts.resize(options_.topK);
+        }
         return;
       }
       for (const InstanceEntry &entry : tables[*node].instances) {
@@ -846,13 +1073,28 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         Partial branch = partial;
         if (!extend(branch, *node, entry))
           continue;
-        if (exact) {
-          branch.lowerBound = bound(branch);
+        // Bound-based pruning is sound only for a minimize objective. The bound
+        // omits connection costs (a connection is synthesized only once both
+        // endpoints are chosen), and that term is non-negative: for minimize an
+        // omitted term can only raise a completion, so the bound stays at or
+        // below it; for maximize the same omission makes the bound too small,
+        // and a branch whose real completion would be largest can look poor.
+        // Maximize therefore explores fully -- the caps (topK, instance,
+        // candidate, and route caps) still bound the run and report
+        // `searchTruncated`, so it never silently returns a non-best plan.
+        if (exact && options_.objective.minimize) {
+          branch.lowerBound = boundCost(branch);
           if (bestCosts.size() >= options_.topK &&
-              branch.lowerBound >= bestCosts.back()) {
-            // A full top-K list makes this prune exact -- it cannot drop a
-            // plan we would keep -- but the space was not exhausted, and the
-            // caller is told so.
+              !boundIsBetterThan(branch.lowerBound, bestCosts.back(),
+                                 options_.objective)) {
+            // A full top-K list makes this prune exact for a *strictly better*
+            // cost: it cannot drop a completion strictly cheaper than the worst
+            // kept plan. On an exact cost *tie* it is not exact -- the bound
+            // compares against `bestCosts.back()`, which is cost-only, while
+            // the final top-K trim keys on `(cost, plan.id)`, so a tie can
+            // prune a plan whose smaller id the trim would have kept. Either
+            // way the space was not exhausted, and the caller is told so
+            // (`searchTruncated`).
             result.searchTruncated = true;
             report(DiagnosticCode::SearchTruncated,
                    "exact search pruned by the top-K bound (topK=" +
@@ -879,20 +1121,26 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return std::move(pendingError);
 
   // --- finalize --------------------------------------------------------
-  // The declared objective ranks complete plans; the stable id breaks an exact
-  // tie so the order is deterministic (design §17.1).
-  llvm::sort(complete, [&](const Partial &lhs, const Partial &rhs) {
-    return ranksBefore(lhs.cost, lhs.id, rhs.cost, rhs.id, options_.objective);
-  });
   // Tally complete plans before the top-K cap drops the tail (design §22.2).
   result.planCount = complete.size();
+  // The top-K cap, when it bites, is a search truncation like any other. Fold
+  // it into the flag *before* any plan's content id is computed, because the
+  // flag is part of that content (see `canonicalPlanString`); this keeps every
+  // plan's id identical whether the cap was recorded before or after it was
+  // built.
   if (complete.size() > options_.topK) {
-    complete.resize(options_.topK);
     result.searchTruncated = true;
     report(DiagnosticCode::SearchTruncated,
            "top-K cap reached (topK=" + std::to_string(options_.topK) + ")");
   }
 
+  // Build every complete plan before trimming, so each one's *exposed* content
+  // id exists. The internal `Partial::id` is a search heuristic over partial
+  // plans; the documented tie-break is the exposed plan id (design §22.1), so
+  // the trim below must see the latter -- trimming on the partial hash would
+  // keep whichever K the search happened to order first.
+  std::vector<CoveringPlan> plans;
+  plans.reserve(complete.size());
   for (const Partial &partial : complete) {
     CoveringPlan plan;
     std::vector<InstanceId> instances;
@@ -928,6 +1176,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       placement.executor = instance->executorBindings.lookup("executor");
       placement.memories = instance->memoryBindings;
       placement.layouts = instance->layoutBindings;
+      // The solved parameterization travels with the binding, so a selected
+      // plan says which one it chose rather than only naming the layout family.
+      placement.layoutSolutions = instance->layoutSolutions;
       plan.placements.push_back(std::move(placement));
     }
     llvm::sort(plan.placements, placementBefore);
@@ -957,20 +1208,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       plan.globalParameters = binding_->values;
     }
     plan.id = computePlanId(plan);
-    result.plans.push_back(std::move(plan));
+    plans.push_back(std::move(plan));
   }
 
-  // §22.1: the emitted list is ordered by the declared objective and then the
-  // *exposed* plan id. The beam's `partialId` order chosen above is a search
-  // heuristic over partial plans; it must not leak into the reported order, so
-  // re-sort here, where each plan's content id exists. An exact cost tie now
-  // breaks on `plan.id`, making the emitted order reproducible from
-  // `(totalCost, plan.id)` alone.
-  llvm::sort(result.plans,
-             [&](const CoveringPlan &lhs, const CoveringPlan &rhs) {
-               return ranksBefore(lhs.totalCost, lhs.id, rhs.totalCost, rhs.id,
-                                  options_.objective);
-             });
+  // §22.1: order and retain by the declared objective and then the *exposed*
+  // plan id -- the documented key. The beam's `partialId` ordering stays where
+  // it belongs, inside the beam's frontier heuristic; it never decides which K
+  // survive a cap nor the emitted order. An exact cost tie breaks on `plan.id`,
+  // so both are reproducible from `(totalCost, plan.id)` alone.
+  llvm::sort(plans, [&](const CoveringPlan &lhs, const CoveringPlan &rhs) {
+    return ranksBefore(lhs.totalCost, lhs.id, rhs.totalCost, rhs.id,
+                       options_.objective);
+  });
+  if (plans.size() > options_.topK)
+    plans.resize(options_.topK);
+  result.plans = std::move(plans);
 
   // §22.1/§22.3: the frontier's codes are the stable interface, so their order
   // must not depend on the order branches happened to be explored.

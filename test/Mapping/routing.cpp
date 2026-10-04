@@ -396,6 +396,28 @@ TEST(Routing, AcceptsIntermediateWithLiveBytesButRoomToSpare) {
   EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
+TEST(Routing, RejectsRouteThroughAnOccupiedNamedIntermediate) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  // The only intermediate is sram; 512 bytes are live there but the value needs
+  // 1024, so the staging hop is illegal. The per-node figure, not the scalar,
+  // is what decides this intermediate.
+  request.liveBytesByIntermediate["sram"] = 32768 - 512;
+  EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, AcceptsRouteThroughAnEmptyNamedIntermediate) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  // The scalar would reject every intermediate, but the named entry for sram
+  // overrides it: an empty intermediate stays legal.
+  request.liveBytesOnIntermediate = 32768 - 512;
+  request.liveBytesByIntermediate["sram"] = 0;
+  EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
 TEST(Routing, RejectsHopWithoutEngine) {
   MachineModel model = chain(32768);
   for (LinkEdge &edge : model.links)

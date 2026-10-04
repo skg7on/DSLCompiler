@@ -260,6 +260,52 @@ TEST(MappingPlanReportTest, RejectionCountsAreGroupedByCode) {
   EXPECT_TRUE(sawTruncated);
 }
 
+// Each stable code belongs to exactly one bucket, and that membership is a
+// property of the code, not of the search that produced it -- so it is pinned
+// per code here. In particular `assumed_value_size` is advice (the search
+// sized a value it could not derive), never a refusal, so it must not inflate
+// §22.2's rejection tally even on a run that reaches a plan.
+TEST(MappingPlanReportTest, AssumedValueSizeIsANoticeNotARejection) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchResult result;
+  result.frontier.codeCounts[DiagnosticCode::AssumedValueSize] = 3;
+  result.frontier.codeCounts[DiagnosticCode::MemoryCapacityExceeded] = 1;
+  result.frontier.codeCounts[DiagnosticCode::SearchTruncated] = 2;
+  result.frontier.codeCounts[DiagnosticCode::LatencyCacheMiss] = 4;
+
+  MappingSearchOptions options;
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash("assumed"));
+  llvm::Expected<llvm::json::Value> json = llvm::json::parse(report);
+  ASSERT_TRUE(static_cast<bool>(json)) << llvm::toString(json.takeError());
+  const llvm::json::Object *root = json->getAsObject();
+  ASSERT_TRUE(root);
+
+  auto codesIn = [](const llvm::json::Array *array) {
+    llvm::StringSet<> codes;
+    for (const llvm::json::Value &entry : *array)
+      if (const llvm::json::Object *object = entry.getAsObject())
+        if (std::optional<llvm::StringRef> code = object->getString("code"))
+          codes.insert(*code);
+    return codes;
+  };
+  const llvm::json::Array *rejections = root->getArray("rejections");
+  const llvm::json::Array *notices = root->getArray("notices");
+  ASSERT_TRUE(rejections);
+  ASSERT_TRUE(notices);
+  llvm::StringSet<> rejected = codesIn(rejections);
+  llvm::StringSet<> noticed = codesIn(notices);
+
+  EXPECT_EQ(rejected.find("assumed_value_size"), rejected.end());
+  EXPECT_NE(noticed.find("assumed_value_size"), noticed.end());
+  EXPECT_NE(rejected.find("memory_capacity_exceeded"), rejected.end());
+  EXPECT_NE(noticed.find("search_truncated"), noticed.end());
+  EXPECT_NE(noticed.find("latency_cache_miss"), noticed.end());
+}
+
 // The library hashes are content-derived and stable, and differ between the
 // two registries (a layout library is not a rule library).
 TEST(MappingPlanReportTest, RegistryHashesAreContentDerivedAndStable) {

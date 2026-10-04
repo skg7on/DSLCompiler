@@ -3,8 +3,11 @@
 // Binds one specific plan, named by its stable content-derived id, onto the
 // module's kernel. A plan id is a hash of the plan's content, so the only way
 // to reproduce it is to re-run the search -- plans are never persisted between
-// passes. The search runs deterministically, which is what makes an id from a
-// deterministic `--micro-map` reproducible here.
+// passes. Reproduction therefore requires the same search options the id was
+// produced with: the mode, beam-width, and top-k, as well as the same target
+// files (machine, rules, layouts, emitters). A different search can order or
+// cap the plans differently and so fail to contain the id, which is reported
+// rather than silently binding a different plan.
 //
 //===----------------------------------------------------------------------===//
 
@@ -16,6 +19,7 @@
 #include "llvm/Support/Error.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace mlir {
@@ -45,20 +49,36 @@ struct MicroBindPlanPass
   Option<std::string> emitters{
       *this, "emitters",
       llvm::cl::desc("Comma-separated emitter keys the target understands")};
+  Option<std::string> mode{
+      *this, "mode",
+      llvm::cl::desc("Search mode: deterministic, beam, or exact (must match "
+                     "the mode that produced the plan id)"),
+      llvm::cl::init("beam")};
   Option<unsigned> topK{
       *this, "top-k",
-      llvm::cl::desc("Maximum number of complete plans to keep"),
+      llvm::cl::desc("Maximum number of complete plans to keep (must match the "
+                     "cap that produced the plan id)"),
       llvm::cl::init(8)};
+  Option<unsigned> beamWidth{*this, "beam-width",
+                             llvm::cl::desc("Beam mode's frontier width (must "
+                                            "match the width that produced the "
+                                            "plan id)"),
+                             llvm::cl::init(64)};
 
   StringRef getArgument() const override { return "micro-bind-plan"; }
 
   StringRef getDescription() const override {
     return "Bind the covering plan with the requested stable id onto a "
-           "micro.kernel, e.g. --micro-bind-plan=\"plan-id=12345 "
+           "micro.kernel. The id is the spelling --micro-map report= prints "
+           "(bare 16-digit hex), 0x-prefixed hex, or decimal. Reproducing a "
+           "content-hash id needs the same search options (mode, beam-width, "
+           "top-k) and target files (machine, rules, layouts, emitters) "
+           "--micro-map ran with, e.g. "
+           "--micro-bind-plan=\"plan-id=0081ef1286442d39 "
            "target=x86-avx2 machine=machines/x86-avx2-v2.yaml "
            "layouts=mapping/x86-avx2/layouts.llkmap "
            "rules=mapping/x86-avx2/rules.llkmap "
-           "emitters=avx2_vector_add\"";
+           "emitters=avx2_vector_add mode=beam beam-width=64 top-k=8\"";
   }
 
   MicroMapOptions currentOptions() const {
@@ -69,7 +89,9 @@ struct MicroBindPlanPass
     options.rulePath = rules.getValue();
     options.emitterKeys =
         micro_mapping_detail::parseEmitterKeys(emitters.getValue());
+    options.mode = mode.getValue();
     options.topK = topK.getValue();
+    options.beamWidth = beamWidth.getValue();
     return options;
   }
 
@@ -77,32 +99,31 @@ struct MicroBindPlanPass
     ModuleOp module = getOperation();
 
     // A plan id is content-derived, so parse it before doing any work: a bad id
-    // is a usage error, not a failed search. The binder prints an id as a
-    // signed i64, so accept both the signed spelling it emits and the unsigned
-    // decimal form; both denote the same 64-bit hash.
-    uint64_t requestedId = 0;
+    // is a usage error, not a failed search. `parsePlanId` accepts the hex
+    // spelling `PlanReport` prints, `0x`-hex, and decimal signed or unsigned --
+    // all spellings of the same 64-bit hash (see the rule in
+    // MicroMappingCommon.h).
     if (planId.getValue().empty()) {
       module.emitError() << "micro-bind-plan: missing required key 'plan-id'";
       signalPassFailure();
       return;
     }
-    llvm::StringRef idText(planId.getValue());
-    if (idText.getAsInteger(10, requestedId)) {
-      int64_t signedId = 0;
-      if (idText.getAsInteger(10, signedId)) {
-        module.emitError() << "micro-bind-plan: 'plan-id' must be a 64-bit "
-                              "integer, got '"
-                           << planId.getValue() << "'";
-        signalPassFailure();
-        return;
-      }
-      requestedId = static_cast<uint64_t>(signedId);
+    std::optional<uint64_t> parsedId =
+        micro_mapping_detail::parsePlanId(planId.getValue());
+    if (!parsedId) {
+      module.emitError()
+          << "micro-bind-plan: 'plan-id' must be a 64-bit plan id in bare hex "
+             "(the report's spelling, e.g. 0081ef1286442d39), 0x-prefixed hex, "
+             "or decimal, got '"
+          << planId.getValue() << "'";
+      signalPassFailure();
+      return;
     }
+    uint64_t requestedId = *parsedId;
 
     llvm::Expected<micro_mapping_detail::MappingRun> run =
         micro_mapping_detail::runMappingSearch(module, "micro-bind-plan",
-                                               currentOptions(),
-                                               /*forceDeterministic=*/true);
+                                               currentOptions());
     if (!run) {
       module.emitError() << llvm::toString(run.takeError());
       signalPassFailure();
@@ -117,10 +138,10 @@ struct MicroBindPlanPass
       }
     }
     if (!selected) {
-      module.emitError()
-          << "micro-bind-plan: no plan in the deterministic search has id "
-          << requestedId << " (the search produced " << run->result.plans.size()
-          << " plan(s))";
+      module.emitError() << "micro-bind-plan: no plan in the "
+                         << mode.getValue() << " search has id " << requestedId
+                         << " (the search produced " << run->result.plans.size()
+                         << " plan(s))";
       signalPassFailure();
       return;
     }
@@ -154,7 +175,9 @@ createMicroBindPlanPass(const MicroBindPlanOptions &options) {
     emitters += key;
   }
   pass->emitters = emitters;
+  pass->mode = options.search.mode;
   pass->topK = options.search.topK;
+  pass->beamWidth = options.search.beamWidth;
   pass->planId = std::to_string(options.planId);
   return pass;
 }

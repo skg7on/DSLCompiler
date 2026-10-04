@@ -27,6 +27,7 @@
 #include "mlir/IR/Types.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
@@ -109,8 +110,9 @@ struct ConnectionRequest {
   std::optional<LayoutId> consumerLayout;
   /// The moved value's type, as far as it is known. A modelled shaped type
   /// (`tensor`, `memref`, `vector`) states both its element type and its
-  /// logical shape; a `!micro.tile` is opaque to this target-independent core,
-  /// so a tile here contributes no comparable fact.
+  /// logical shape; a `!micro.tile` is read through `TileFacts`, which unwraps
+  /// its printed head to the tensor it spells, so a tile here contributes the
+  /// same element type and static shape an equivalent tensor would.
   mlir::Type elementType;
   /// The consumer port's expected type. When both it and `elementType` expose
   /// an element type or a static shape, they must agree.
@@ -124,6 +126,13 @@ struct ConnectionRequest {
   std::optional<mlir::AffineMap> consumerMap;
   uint64_t bytes = 0;
   uint64_t alignmentBytes = 1;
+  /// Live bytes already charged to each memory in the caller's partial plan,
+  /// keyed by memory node. A transfer route stages through an intermediate only
+  /// when that memory can hold the value on top of this figure (§12.2's
+  /// *intermediate capacity and liveness*). Empty means the caller models no
+  /// live data, and every intermediate is treated as empty -- the same default
+  /// `RouteRequest::liveBytesOnIntermediate` takes.
+  llvm::StringMap<uint64_t> intermediateOccupancy;
 };
 
 /// True when the two ports can connect directly -- no transfer, no layout

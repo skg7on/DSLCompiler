@@ -2,6 +2,7 @@
 
 #include "LLK/Mapping/PlanBinder.h"
 
+#include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/AsmParser/AsmParser.h"
@@ -63,6 +64,16 @@ llvm::StringRef unmaterializedReason(ConnectionKind kind) {
 
 llvm::Error bindError(const std::string &message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+}
+
+/// A phase-2 (machine-aware) verification failure carrying its stable §22.3
+/// code. The code is the interface a caller may group or switch on; the message
+/// is human detail that may change between releases (see Diagnostics.h), so the
+/// two are joined as the code's stable string, a colon, and the message. Which
+/// code fits a violation is decided where the violation is detected -- the
+/// strings themselves come from `stringifyDiagnosticCode`.
+llvm::Error verifyError(DiagnosticCode code, const std::string &message) {
+  return bindError((stringifyDiagnosticCode(code) + ": " + message).str());
 }
 
 mlir::IntegerAttr u64Attr(mlir::MLIRContext *context, uint64_t value) {
@@ -435,13 +446,15 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     std::string ruleId = stringValue("rule");
     const RuleDef *rule = target.rules().find(ruleId);
     if (!rule) {
-      failure = bindError(where + ": unknown rule '" + ruleId + "'");
+      failure = verifyError(DiagnosticCode::NoMatchingRule,
+                            where + ": unknown rule '" + ruleId + "'");
       return;
     }
 
     std::string executor = stringValue("executor");
     if (!machine.findExecutor(executor)) {
-      failure = bindError(where + ": unknown executor '" + executor + "'");
+      failure = verifyError(DiagnosticCode::NoLegalExecutor,
+                            where + ": unknown executor '" + executor + "'");
       return;
     }
 
@@ -451,12 +464,14 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
             mlir::cast<mlir::StringAttr>(entry.getValue()).getValue().str();
         const machine::MemoryNode *memory = machine.findMemory(memoryId);
         if (!memory) {
-          failure = bindError(where + ": unknown memory '" + memoryId + "'");
+          failure = verifyError(DiagnosticCode::NoMemoryRoute,
+                                where + ": unknown memory '" + memoryId + "'");
           return;
         }
         if (!machine.isVisible(memoryId, executor)) {
-          failure = bindError(where + ": executor '" + executor +
-                              "' cannot see memory '" + memoryId + "'");
+          failure = verifyError(DiagnosticCode::NoMemoryRoute,
+                                where + ": executor '" + executor +
+                                    "' cannot see memory '" + memoryId + "'");
           return;
         }
       }
@@ -467,7 +482,8 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         std::string layoutId =
             mlir::cast<mlir::StringAttr>(entry.getValue()).getValue().str();
         if (!target.layouts().find(layoutId)) {
-          failure = bindError(where + ": unknown layout '" + layoutId + "'");
+          failure = verifyError(DiagnosticCode::NoLegalLayout,
+                                where + ": unknown layout '" + layoutId + "'");
           return;
         }
       }
@@ -476,7 +492,8 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     // 3. target: the emitter the rule selected must be one the target declares.
     std::string emitter = stringValue("emitter");
     if (!target.isKnownEmitter(emitter)) {
-      failure = bindError(where + ": unknown emitter '" + emitter + "'");
+      failure = verifyError(DiagnosticCode::TargetBundleInvalid,
+                            where + ": unknown emitter '" + emitter + "'");
       return;
     }
   });
@@ -499,7 +516,8 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       for (mlir::Attribute node : nodes) {
         std::string id = mlir::cast<mlir::StringAttr>(node).getValue().str();
         if (!machine.findMemory(id)) {
-          routeFailure = bindError("route names unknown memory '" + id + "'");
+          routeFailure = verifyError(DiagnosticCode::NoMemoryRoute,
+                                     "route names unknown memory '" + id + "'");
           return;
         }
       }
@@ -513,8 +531,9 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
               return l.source == from && l.destination == to;
             });
         if (!linked) {
-          routeFailure =
-              bindError("route hop '" + from + "' -> '" + to + "' has no link");
+          routeFailure = verifyError(DiagnosticCode::NoMemoryRoute,
+                                     "route hop '" + from + "' -> '" + to +
+                                         "' has no link");
           return;
         }
       }

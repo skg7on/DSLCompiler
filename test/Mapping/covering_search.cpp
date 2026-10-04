@@ -3,6 +3,12 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/LatencyProvider.h"
+#include "LLK/Mapping/TileFacts.h"
+
+#include "LLK/Dialect/Micro/MicroDialect.h"
+
+#include "mlir/AsmParser/AsmParser.h"
+#include "mlir/IR/MLIRContext.h"
 
 #include "llvm/Support/Error.h"
 
@@ -50,10 +56,11 @@ MachineModel twoWorkerMachine() {
   return model;
 }
 
-/// `searchMachine` with the sram node shrunk to 5000 bytes. The search charges
-/// 4096 bytes per bound instance (kAssumedValueBytes), so one instance fits the
-/// node while two do not -- and two still fit the default global byte budget,
-/// leaving the per-memory check as the only thing that can reject the pair.
+/// `searchMachine` with the sram node shrunk to 5000 bytes. The fixtures here
+/// carry untyped values, so the search falls back to 4096 bytes per bound
+/// instance; one instance fits the node while two do not -- and two still fit
+/// the default global byte budget, leaving the per-memory check as the only
+/// thing that can reject the pair.
 MachineModel smallMemoryMachine() {
   MachineModel model = searchMachine();
   for (MemoryNode &memory : model.memories)
@@ -100,6 +107,101 @@ WorkloadGraph twoNodeGraph(mlir::MLIRContext &context,
 
   graph.finalize();
   return graph;
+}
+
+/// `twoNodeGraph` with every value and port carrying `tile`, so the search
+/// derives real bytes for each materialized tile and each crossing instead of
+/// sizing everything with a constant.
+WorkloadGraph twoNodeTileGraph(mlir::MLIRContext &context, mlir::Type tile) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, tile, "in", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, tile, "mid", /*external=*/false});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, tile, "out", /*external=*/false});
+
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.attributes = vectorAttributes(context, "add");
+  producer.inputs.push_back(WorkloadPort{input, tile, std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, tile, std::nullopt});
+  graph.addNode(std::move(producer));
+
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.attributes = vectorAttributes(context, "add");
+  consumer.inputs.push_back(WorkloadPort{middle, tile, std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{output, tile, std::nullopt});
+  graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+/// A three-node chain `in -> n0 -> v0 -> n1 -> v1 -> n2 -> out`, every node a
+/// `micro.vector(op = "add")` over `tile`-typed values. Each node binds one
+/// memory and materializes the derived tile size.
+WorkloadGraph threeNodeChainGraph(mlir::MLIRContext &context, mlir::Type tile) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, tile, "in", /*external=*/true});
+  WorkloadValueId v0 =
+      graph.addValue(WorkloadValue{0, tile, "v0", /*external=*/false});
+  WorkloadValueId v1 =
+      graph.addValue(WorkloadValue{0, tile, "v1", /*external=*/false});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, tile, "out", /*external=*/false});
+
+  auto node = [&](unsigned ordinal, WorkloadValueId in, WorkloadValueId out) {
+    WorkloadNode n;
+    n.opName = "micro.vector";
+    n.sourceOrdinal = ordinal;
+    n.attributes = vectorAttributes(context, "add");
+    n.inputs.push_back(WorkloadPort{in, tile, std::nullopt});
+    n.outputs.push_back(WorkloadPort{out, tile, std::nullopt});
+    graph.addNode(std::move(n));
+  };
+  node(0, input, v0);
+  node(1, v0, v1);
+  node(2, v1, output);
+
+  graph.finalize();
+  return graph;
+}
+
+/// One `micro.vector` node with two output tiles of different sizes. The node
+/// binds a single memory, which holds both outputs.
+WorkloadGraph twoOutputTileGraph(mlir::MLIRContext &context, mlir::Type first,
+                                 mlir::Type second) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, first, "in", /*external=*/true});
+  WorkloadValueId out0 =
+      graph.addValue(WorkloadValue{0, first, "out0", /*external=*/false});
+  WorkloadValueId out1 =
+      graph.addValue(WorkloadValue{0, second, "out1", /*external=*/false});
+
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context, "add");
+  node.inputs.push_back(WorkloadPort{input, first, std::nullopt});
+  node.outputs.push_back(WorkloadPort{out0, first, std::nullopt});
+  node.outputs.push_back(WorkloadPort{out1, second, std::nullopt});
+  graph.addNode(std::move(node));
+
+  graph.finalize();
+  return graph;
+}
+
+/// `searchMachine` with the sram node's capacity set to `bytes`, so a capacity
+/// test can pin the exact live total it admits.
+MachineModel sramCapacityMachine(uint64_t bytes) {
+  MachineModel model = searchMachine();
+  for (MemoryNode &memory : model.memories)
+    if (memory.kind == "sram")
+      memory.capacityBytes = bytes;
+  return model;
 }
 
 /// Two executors whose ids sort opposite to their kinds, so ordering placements
@@ -176,6 +278,56 @@ rule r.expensive {
   bundle "b.expensive";
   emit "e1";
   cost 10;
+}
+)llkmap";
+
+/// Six interchangeable rules for one node, every one the same 1-cycle cost and
+/// an interchangeable placement. Kept under a five-candidate cap,
+/// cross-producing them over a two-node graph yields a large set of *cost-tied*
+/// complete plans, so which K survive a top-K cap is decided purely by the
+/// tie-break key rather than by cost.
+constexpr llvm::StringLiteral kDenseTieRules = R"llkmap(
+rule r.0 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.0";
+  emit "e1";
+  cost 1;
+}
+rule r.1 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.1";
+  emit "e1";
+  cost 1;
+}
+rule r.2 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.2";
+  emit "e1";
+  cost 1;
+}
+rule r.3 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.3";
+  emit "e1";
+  cost 1;
+}
+rule r.4 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.4";
+  emit "e1";
+  cost 1;
+}
+rule r.5 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.5";
+  emit "e1";
+  cost 1;
 }
 )llkmap";
 
@@ -356,6 +508,125 @@ rule r.sram {
 }
 )llkmap";
 
+//===----------------------------------------------------------------------===//
+// Layout transforms driven by the bound layouts (phase-3 T4)
+//===----------------------------------------------------------------------===//
+
+/// Two layouts that solve under the search's default (rank-0) context, and are
+/// genuinely different: `t.plain` writes the logical indices unchanged while
+/// `t.blocked` blocks the second dimension by the solved `VW`.
+constexpr llvm::StringLiteral kTwoLayouts = R"llkmap(
+layout t.plain(int N) {
+  param N in [1..4];
+  require N == 1;
+  map (m, n) -> (m, n);
+}
+layout t.blocked(int VW) {
+  param VW in [4..8];
+  require VW == 8;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap";
+
+/// `searchMachine` with the sram node declaring both layouts, so a transform
+/// between them is legal in the memory both instances bind -- and so the pair's
+/// layouts are the only reason a transform is needed at all.
+MachineModel transformMachine() {
+  MachineModel model = searchMachine();
+  for (MemoryNode &memory : model.memories)
+    if (memory.kind == "sram")
+      memory.supportedLayouts = {"t.plain", "t.blocked"};
+  return model;
+}
+
+/// Producer and consumer bind *different* layouts for the value they exchange.
+/// The producer names the port that carries the crossing value (`result`, its
+/// only output) and the consumer names its input, so both bindings are
+/// attributable to the edge. Both rules declare their ports: a layout
+/// requirement is attributed to the value its named port carries, and a rule
+/// that names no port attributes nothing.
+constexpr llvm::StringLiteral kTransformRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind sram;
+  require layout result satisfies t.plain;
+  input "operand0";
+  output "result";
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.blocked;
+  input "operand0";
+  output "result";
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The control: the same two rules, both requiring `t.plain` for the crossing
+/// value, so the endpoints agree and the pair must stay a direct connection.
+constexpr llvm::StringLiteral kSameLayoutRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind sram;
+  require layout result satisfies t.plain;
+  input "operand0";
+  output "result";
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  input "operand0";
+  output "result";
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The `avx2.mma_bf16` shape: the producer's layout requirement names an
+/// *input* port (`lhs`), while the value crossing the edge is its `result`. The
+/// producer therefore says nothing about the result's layout, and the edge must
+/// inherit nothing from it -- even though the consumer asks for a different
+/// layout.
+constexpr llvm::StringLiteral kMmaShapedRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind sram;
+  require layout lhs satisfies t.plain;
+  input "lhs";
+  output "result";
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.blocked;
+  input "operand0";
+  output "result";
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
 /// The search cost of one producer -> consumer transfer over `fanMachine`:
 /// the link latency (10) plus 4096 assumed bytes at 32 bytes/cycle.
 constexpr double kFanTransferCycles = 10.0 + 4096.0 / 32.0;
@@ -520,6 +791,75 @@ rule r.consume_b {
 }
 )llkmap";
 
+/// One producer rule and one consumer rule over the `twoDestinationHopMachine`
+/// topology, plus a third rule that parks an instance on the staging sram. The
+/// `a_`/`m_`/`z_` operation-name prefixes sort the content-keyed node order to
+/// hold -> produce -> consume, so `a_hold`'s live tile is charged to the
+/// staging memory before the producer -> consumer connection is synthesized.
+constexpr llvm::StringLiteral kOccupiedStagingRules = R"llkmap(
+rule r.hold {
+  match micro.vector(op = "a_hold");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.hold";
+  emit "e1";
+  cost 1;
+}
+rule r.produce {
+  match micro.vector(op = "m_produce");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "z_consume");
+  require executor kind worker;
+  require memory kind acc;
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// `a_hold -> {hold_out}`, `m_produce -> mid -> z_consume`, over `tile`.
+/// `a_hold` binds the staging sram and its output tile stays live there (no
+/// consumer ever releases it); `m_produce` binds dram and `z_consume` binds
+/// acc, so the one crossing value `mid` can only reach its consumer by staging
+/// through the memory `a_hold` already occupies.
+WorkloadGraph occupiedStagingGraph(mlir::MLIRContext &context,
+                                   mlir::Type tile) {
+  WorkloadGraph graph;
+  WorkloadValueId holdIn =
+      graph.addValue(WorkloadValue{0, tile, "hold_in", /*external=*/true});
+  WorkloadValueId holdOut =
+      graph.addValue(WorkloadValue{0, tile, "hold_out", /*external=*/false});
+  WorkloadValueId in =
+      graph.addValue(WorkloadValue{0, tile, "in", /*external=*/true});
+  WorkloadValueId mid =
+      graph.addValue(WorkloadValue{0, tile, "mid", /*external=*/false});
+  WorkloadValueId out =
+      graph.addValue(WorkloadValue{0, tile, "out", /*external=*/false});
+
+  auto node = [&](unsigned ordinal, llvm::StringRef op, WorkloadValueId input,
+                  WorkloadValueId output) {
+    WorkloadNode n;
+    n.opName = "micro.vector";
+    n.sourceOrdinal = ordinal;
+    n.attributes = vectorAttributes(context, op);
+    n.inputs.push_back(WorkloadPort{input, tile, std::nullopt});
+    n.outputs.push_back(WorkloadPort{output, tile, std::nullopt});
+    graph.addNode(std::move(n));
+  };
+  node(0, "a_hold", holdIn, holdOut);
+  node(1, "m_produce", in, mid);
+  node(2, "z_consume", mid, out);
+
+  graph.finalize();
+  return graph;
+}
+
 std::unique_ptr<MappingTarget> targetWith(MachineModel machine,
                                           llvm::StringRef rules) {
   llvm::Expected<RuleRegistry> registry = parseRuleText(rules, "<test>");
@@ -604,7 +944,231 @@ values(std::initializer_list<std::pair<llvm::StringRef, SearchValue>> entries) {
 /// The plan id the deterministic two-node fixture produces when a zero binding
 /// hash and no parameters are folded in. Pinned so the no-binding path cannot
 /// drift silently; it changes only when the canonical plan form does.
-constexpr PlanId kNoBindingPlanId = 13971994565763734923ULL;
+///
+/// Re-baselined for phase-3 T4 (ruling R4): the canonical instance and plan
+/// forms each gained a `solvedlayout=` field carrying the solved layout
+/// parameter assignment. The field is present for *every* instance and
+/// placement -- empty when the rule requires no layout -- so every plan id
+/// moves, not only those of plans that bind a layout. This fixture binds none,
+/// which is exactly why it is still the right pin for "the form changed and
+/// nothing else did".
+constexpr PlanId kNoBindingPlanId = 1637566088902498879ULL;
+
+//===----------------------------------------------------------------------===//
+// Search bound fixtures
+//===----------------------------------------------------------------------===//
+
+/// Both rules declare the *same* static 100-cycle cost, so a bound that reads
+/// the static estimate cannot tell them apart -- only the measured cost can.
+/// `r.a_static` sorts first, which pins the depth-first instance order.
+constexpr llvm::StringLiteral kMeasuredBoundRules = R"llkmap(
+rule r.a_static {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.a";
+  emit "e1";
+  cost 100;
+}
+rule r.b_measured {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.b";
+  emit "e1";
+  cost 100;
+}
+)llkmap";
+
+/// Two workers under a shared `root` scope, joined by a near-free
+/// `dram.0 -> sram.0` link. Both workers can address `sram.0`, but only `e0`
+/// can address `dram.0`, so a consumer on `e1` must *move* a DRAM value rather
+/// than read it in place. The route latency stays small, so latency and DRAM
+/// pull in opposite directions.
+MachineModel objectiveMachine() {
+  MachineModel model;
+  model.target = "objective";
+  model.executors = {{"root", "cluster", std::nullopt, {}, 1, {}},
+                     {"e0", "a", std::string("root"), {}, 1, {}},
+                     {"e1", "b", std::string("root"), {}, 1, {}}};
+  MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "root";
+  sram.capacityBytes = 1u << 20;
+  sram.alignmentBytes = 64;
+  MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "e0";
+  dram.capacityBytes = 1u << 30;
+  dram.alignmentBytes = 64;
+  model.memories = {sram, dram};
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+  LinkEdge edge;
+  edge.id = "dram_to_sram.0";
+  edge.source = "dram.0";
+  edge.destination = "sram.0";
+  edge.bandwidthBytesPerCycle = 4096;
+  edge.latencyCycles = 0;
+  edge.transactionBytes = 4096;
+  edge.transferEngines = {"dma.0"};
+  model.links = {edge};
+  return model;
+}
+
+/// The consumer is pinned to a 1-cycle SRAM placement on `e1`. The producer
+/// chooses between a 1-cycle DRAM placement (which the consumer cannot read in
+/// place, so 4096 bytes cross DRAM) and a 50-cycle SRAM placement (read in
+/// place, 0 DRAM bytes). Minimizing latency picks the DRAM plan, minimizing
+/// DRAM the SRAM one -- opposite answers, so the bound must follow the metric.
+constexpr llvm::StringLiteral kObjectiveRules = R"llkmap(
+rule r.p_dram {
+  match micro.vector(op = "produce");
+  require executor kind a;
+  require memory kind dram;
+  bundle "b.pd";
+  emit "e1";
+  cost 1;
+}
+rule r.p_sram {
+  match micro.vector(op = "produce");
+  require executor kind a;
+  require memory kind sram;
+  bundle "b.ps";
+  emit "e1";
+  cost 50;
+}
+rule r.c_sram {
+  match micro.vector(op = "consume");
+  require executor kind b;
+  require memory kind sram;
+  bundle "b.c";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Both producer placements reach the consumer in 51 cycles, but on different
+/// metrics: `r.p_dram` pays 49 in place plus a 1-cycle 4096-byte move across
+/// `dram.0 -> sram.0`, `r.p_sram` pays 50 and the consumer reads it in place.
+/// The two plans tie on latency and differ only on `dram_bytes` (4096 vs 0), so
+/// a primary-only comparison cannot tell them apart -- the declared secondary
+/// metric must. `r.p_dram` is declared first (and sorts first), so its plan
+/// completes first and becomes the plan a tie-breaking prune would defend.
+constexpr llvm::StringLiteral kTieRules = R"llkmap(
+rule r.p_dram {
+  match micro.vector(op = "produce");
+  require executor kind a;
+  require memory kind dram;
+  bundle "b.pd";
+  emit "e1";
+  cost 49;
+}
+rule r.p_sram {
+  match micro.vector(op = "produce");
+  require executor kind a;
+  require memory kind sram;
+  bundle "b.ps";
+  emit "e1";
+  cost 50;
+}
+rule r.c_sram {
+  match micro.vector(op = "consume");
+  require executor kind b;
+  require memory kind sram;
+  bundle "b.c";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Two producer destinations feeding one consumer memory over links of very
+/// different latency (11 vs 101 cycles for the 4096-byte value). The consumer
+/// on `e1` sees neither producer memory, so every plan moves the value. A
+/// plan's connection cost is what can make it largest, and that cost is unknown
+/// while any node is still uncovered.
+MachineModel maximizeMachine() {
+  MachineModel model;
+  model.target = "maximize";
+  model.executors = {{"e0", "a", std::nullopt, {}, 1, {}},
+                     {"e1", "b", std::nullopt, {}, 1, {}}};
+  MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "e0";
+  dram.capacityBytes = 1u << 30;
+  dram.alignmentBytes = 64;
+  MemoryNode acc;
+  acc.id = "acc.0";
+  acc.kind = "acc";
+  acc.visibleFrom = "e0";
+  acc.capacityBytes = 1u << 30;
+  acc.alignmentBytes = 64;
+  MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "e1";
+  sram.capacityBytes = 1u << 20;
+  sram.alignmentBytes = 64;
+  model.memories = {dram, acc, sram};
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+  LinkEdge fastEdge;
+  fastEdge.id = "dram_to_sram.0";
+  fastEdge.source = "dram.0";
+  fastEdge.destination = "sram.0";
+  fastEdge.bandwidthBytesPerCycle = 4096;
+  fastEdge.latencyCycles = 10;
+  fastEdge.transactionBytes = 4096;
+  fastEdge.transferEngines = {"dma.0"};
+  LinkEdge slowEdge;
+  slowEdge.id = "acc_to_sram.0";
+  slowEdge.source = "acc.0";
+  slowEdge.destination = "sram.0";
+  slowEdge.bandwidthBytesPerCycle = 4096;
+  slowEdge.latencyCycles = 100;
+  slowEdge.transactionBytes = 4096;
+  slowEdge.transferEngines = {"dma.0"};
+  model.links = {fastEdge, slowEdge};
+  return model;
+}
+
+/// `r.p_fast` reaches the consumer in 11 cycles, `r.p_slow` in 101; both
+/// declare the same 1-cycle instance cost, so only the connection distinguishes
+/// them. The operation names sort the producer to node 0, pinning the
+/// depth-first order the exact search follows.
+constexpr llvm::StringLiteral kMaximizeRules = R"llkmap(
+rule r.p_fast {
+  match micro.vector(op = "a_produce");
+  require executor kind a;
+  require memory kind dram;
+  bundle "b.pf";
+  emit "e1";
+  cost 1;
+}
+rule r.p_slow {
+  match micro.vector(op = "a_produce");
+  require executor kind a;
+  require memory kind acc;
+  bundle "b.ps";
+  emit "e1";
+  cost 1;
+}
+rule r.c_dest {
+  match micro.vector(op = "z_consume");
+  require executor kind b;
+  require memory kind sram;
+  bundle "b.c";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
 
 } // namespace
 
@@ -758,6 +1322,57 @@ TEST(CoveringSearch, EveryPlanIsRankedAndCappedAtTopK) {
   EXPECT_TRUE(result->searchTruncated);
 }
 
+// §22.1: the retained top-K is chosen by the documented (objective, plan id)
+// key. The beam's frontier order over *partial* plans is a search heuristic and
+// must not decide which K survive: with many cost-tied plans the two orders
+// disagree, so trimming before the exposed id exists keeps the wrong K.
+TEST(CoveringSearch, TopKRetainsThePlanIdSmallestAmongCostTies) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kDenseTieRules);
+  ASSERT_NE(target, nullptr);
+
+  // Six rules match but the candidate cap keeps five, so the search is already
+  // truncated before the top-K decision -- both runs below fold the same
+  // `truncated` bit into every plan id, which is what makes their ids directly
+  // comparable.
+  MappingSearchOptions wideOptions;
+  wideOptions.mode = SearchMode::Beam;
+  wideOptions.beamWidth = 64;
+  wideOptions.topK = 64;
+  wideOptions.maxCandidatesPerNode = 5;
+  CoveringSearch wide(graph, *target, context, LayoutContext{}, wideOptions);
+  llvm::Expected<MappingSearchResult> wideResult = wide.search();
+  ASSERT_TRUE(static_cast<bool>(wideResult))
+      << llvm::toString(wideResult.takeError());
+  ASSERT_TRUE(wideResult->searchTruncated);
+  // Five interchangeable instances per node over two nodes: twenty-five
+  // complete plans, every one tied at the same cost.
+  ASSERT_EQ(wideResult->plans.size(), 25u);
+  ASSERT_EQ(wideResult->planCount, 25u);
+  // With every cost equal, the emitted order is exactly the plan-id order.
+  for (size_t i = 1; i < wideResult->plans.size(); ++i)
+    EXPECT_LT(wideResult->plans[i - 1].id, wideResult->plans[i].id);
+
+  // A capped run over the same complete set must retain the plan-id-smallest K.
+  const unsigned k = 2;
+  MappingSearchOptions cappedOptions = wideOptions;
+  cappedOptions.topK = k;
+  CoveringSearch capped(graph, *target, context, LayoutContext{},
+                        cappedOptions);
+  llvm::Expected<MappingSearchResult> cappedResult = capped.search();
+  ASSERT_TRUE(static_cast<bool>(cappedResult))
+      << llvm::toString(cappedResult.takeError());
+  ASSERT_EQ(cappedResult->plans.size(), k);
+  // The tally still counts every complete plan before the cap (design §22.2).
+  EXPECT_EQ(cappedResult->planCount, 25u);
+  EXPECT_TRUE(cappedResult->searchTruncated);
+  EXPECT_TRUE(hasDiagnostic(*cappedResult, DiagnosticCode::SearchTruncated));
+  for (unsigned i = 0; i < k; ++i)
+    EXPECT_EQ(cappedResult->plans[i].id, wideResult->plans[i].id);
+}
+
 TEST(CoveringSearch, NarrowBeamDisclosesTruncationAndExactDoesNot) {
   mlir::MLIRContext context;
   WorkloadGraph graph = twoNodeGraph(context);
@@ -839,6 +1454,208 @@ TEST(CoveringSearch, PerMemoryCapacityRejectsOverSubscription) {
   EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
 }
 
+// §9.3: the bytes a memory is charged are the value's own, not a constant. Two
+// `!micro.tile<8x32xf32>` tiles are 1024 bytes each, so 2048 fits the
+// 5000-byte sram node -- where the old 4096-byte-per-instance assumption
+// (8192) would have rejected the pair outright. The derived size is what makes
+// the plan legal.
+TEST(CoveringSearch, CapacityUsesTheRealValueSizeNotAConstant) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = twoNodeTileGraph(context, tile);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(smallMemoryMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  // The premise: two real 1024-byte tiles fit the node, two 4096-byte
+  // assumptions would not -- so the old constant could not have produced this
+  // legal plan.
+  const MemoryNode *sram = target->machine().findMemory("sram.0");
+  ASSERT_NE(sram, nullptr);
+  ASSERT_GE(sram->capacityBytes, 2u * 1024u);
+  ASSERT_LT(sram->capacityBytes, 2u * 4096u);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
+// Phase-3 T2: a value's bytes are released once its last consumer is placed.
+// Three 1024-byte tiles chained n0 -> n1 -> n2 each fit sram.0 *sequentially*,
+// but never all three at once: the live peak is two tiles (the one a consumer
+// reads plus the one it writes). Monotonic accumulation charged all three and
+// rejected the chain; live-range expiry makes it legal. The tiles are typed and
+// the capacity is tied to their derived size, so the test cannot keep passing
+// after a derivation change that would make three tiles fit.
+TEST(CoveringSearch, ExpiresAValueWhenItsLastConsumerIsPlaced) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = threeNodeChainGraph(context, tile);
+
+  // Task 1's derivation, not the fallback: the test exercises the real-size
+  // path the rest of the stack uses.
+  const uint64_t tileBytes = tileFactsFor(tile).bytes;
+  ASSERT_EQ(tileBytes, 1024u); // 8 * 32 * 4
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sramCapacityMachine(2u * 1024u), kSharedReadRules);
+  ASSERT_NE(target, nullptr);
+  // Premise: two tiles fit, three do not. Only then is monotonic accumulation
+  // guaranteed to reject while the live peak of two is admitted; if the derived
+  // tile ever shrank, this fails loudly rather than letting the test pass
+  // without detecting the regression.
+  const MemoryNode *sram = target->machine().findMemory("sram.0");
+  ASSERT_NE(sram, nullptr);
+  ASSERT_GE(sram->capacityBytes, 2u * tileBytes);
+  ASSERT_LT(sram->capacityBytes, 3u * tileBytes);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+  EXPECT_EQ(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// Expiry must not become unsound: a value stays charged until its *last*
+// consumer is placed. A fan-out's value and both consumers' own output tiles
+// are live together, so three 4096-byte tiles exceed a two-tile memory at the
+// moment the second consumer is placed. Releasing on the first consumer would
+// wrongly admit it -- both consumers genuinely overlap the shared value.
+TEST(CoveringSearch, AnOverlappingValueStaysChargedUntilEveryConsumerIsPlaced) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanOutGraph(context, /*producerOp=*/"add",
+                                    /*consumerOp=*/"add");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sramCapacityMachine(2u * 4096u), kSharedReadRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// Carried from T1: a node's single memory binding holds *every* output tile it
+// writes, not just the first. A 1024-byte and a 2048-byte output are 3072
+// together; sizing the binding from the first output alone (1024) under-charged
+// and admitted a 2500-byte sram. 2500 must reject the pair, 4096 must admit it.
+TEST(CoveringSearch, ANodeChargesItsMemoryForEveryMaterializedOutput) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type small = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  mlir::Type large = mlir::parseType("!micro.tile<16x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(small));
+  ASSERT_TRUE(static_cast<bool>(large));
+  WorkloadGraph graph = twoOutputTileGraph(context, small, large);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  {
+    std::unique_ptr<MappingTarget> target =
+        targetWith(sramCapacityMachine(2500), kRulesWithMemory);
+    ASSERT_NE(target, nullptr);
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_TRUE(result->plans.empty());
+    EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+  }
+  {
+    // The complement: 4096 admits the derived 3072, so the rejection above was
+    // the summed output bytes and not some unrelated failure.
+    std::unique_ptr<MappingTarget> target =
+        targetWith(sramCapacityMachine(4096), kRulesWithMemory);
+    ASSERT_NE(target, nullptr);
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_FALSE(result->plans.empty());
+  }
+}
+
+// Phase-3 ruling R1: a value whose size cannot be derived is still costed, but
+// the fallback is *reported*, naming the value -- an assumed size must never be
+// silent again.
+TEST(CoveringSearch, AnUnknownValueSizeIsReportedNotSilent) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context); // untyped values
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::AssumedValueSize));
+
+  bool namedTheValue = false;
+  for (const Diagnostic &diagnostic : result->frontier.diagnostics)
+    if (diagnostic.code == DiagnosticCode::AssumedValueSize &&
+        diagnostic.message.find("'mid'") != std::string::npos)
+      namedTheValue = true;
+  EXPECT_TRUE(namedTheValue);
+}
+
+// The complement: a value the graph types is sized exactly, so no assumption is
+// reported.
+TEST(CoveringSearch, AKnownValueSizeIsNotReported) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = twoNodeTileGraph(context, tile);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(smallMemoryMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_FALSE(hasDiagnostic(*result, DiagnosticCode::AssumedValueSize));
+}
+
+// A zero-element value (a static 0 dimension -- reachable only through a
+// modelled tensor, since the Micro tile verifier rejects 0) moves no bytes, so
+// it takes no connection rather than tripping the "bytes must be positive"
+// route rule. The plan still exists, charged zero for the tile.
+TEST(CoveringSearch, AZeroElementValueTakesNoConnection) {
+  mlir::MLIRContext context;
+  mlir::Type empty =
+      mlir::RankedTensorType::get({0, 32}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = twoNodeTileGraph(context, empty);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_TRUE(result->plans[0].connections.empty());
+  EXPECT_FALSE(hasDiagnostic(*result, DiagnosticCode::AssumedValueSize));
+}
+
 // A connection across two *different* memories must run producer -> consumer,
 // not the reverse. The #97 bug reversed the endpoints when the connection was
 // synthesized as the consumer instance completed the edge, and every fixture
@@ -887,6 +1704,132 @@ TEST(CoveringSearch, CrossMemoryConnectionRunsFromProducerToConsumer) {
   ASSERT_FALSE(connection.route.empty());
   EXPECT_EQ(connection.route.front(), producerMemory);
   EXPECT_EQ(connection.route.back(), consumerMemory);
+}
+
+// Phase-3 T4: the search hands each connection request the layouts its
+// endpoints *bound*, so a pair placed under different layouts selects the
+// transform alternative inside the search. Before this, `makeRequest` left both
+// endpoints' layouts unset, so `synthesizeConnections` could only ever take its
+// direct path from the search -- the transform path existed but was unreachable
+// from it.
+TEST(CoveringSearch, DifferingBoundLayoutsSelectTheTransformFromTheSearch) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, /*producerOp=*/"produce",
+                                     /*consumerOp=*/"consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kTransformRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connections.size(), 1u);
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  const PlanConnection &connection = plan.connectionPlans[0];
+  // Both endpoints sit in sram.0, which supports both layouts, so the transform
+  // runs in place: no transfer, one layout conversion, producer's layout first.
+  EXPECT_EQ(connection.kind, ConnectionKind::LayoutTransform);
+  EXPECT_EQ(connection.route, (llvm::SmallVector<MemoryNodeId>{"sram.0"}));
+  ASSERT_TRUE(connection.transform.has_value());
+  EXPECT_EQ(connection.transform->srcLayout, "t.plain");
+  EXPECT_EQ(connection.transform->dstLayout, "t.blocked");
+
+  // The placements carry the solved assignment each endpoint bound -- the
+  // parameters the transform's two layouts were instantiated with.
+  const PlanPlacement *producer = nullptr;
+  const PlanPlacement *consumer = nullptr;
+  for (const PlanPlacement &placement : plan.placements) {
+    if (placement.rule == "r.produce")
+      producer = &placement;
+    else if (placement.rule == "r.consume")
+      consumer = &placement;
+  }
+  ASSERT_NE(producer, nullptr);
+  ASSERT_NE(consumer, nullptr);
+  auto producerLayout = producer->layoutSolutions.find("t.plain");
+  ASSERT_NE(producerLayout, producer->layoutSolutions.end());
+  auto consumerLayout = consumer->layoutSolutions.find("t.blocked");
+  ASSERT_NE(consumerLayout, consumer->layoutSolutions.end());
+  ASSERT_EQ(consumerLayout->second.parameters.size(), 1u);
+  const int64_t *vw = std::get_if<int64_t>(
+      &consumerLayout->second.parameters.find("VW")->second);
+  ASSERT_NE(vw, nullptr);
+  EXPECT_EQ(*vw, 8);
+}
+
+// The control for the test above: the same graph and topology with both rules
+// requiring the *same* layout stays a direct connection, so the transform above
+// was the differing endpoint layouts and not the fixture.
+TEST(CoveringSearch, MatchingBoundLayoutsStayDirect) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, /*producerOp=*/"produce",
+                                     /*consumerOp=*/"consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kSameLayoutRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  EXPECT_EQ(plan.connectionPlans[0].kind, ConnectionKind::Direct);
+  EXPECT_FALSE(plan.connectionPlans[0].transform.has_value());
+}
+
+// The other direction of the same attribution rule, and the reason it is by
+// value rather than by "the instance's one layout": a layout named on a port
+// that does *not* carry the crossing value must not be inherited by the edge.
+// This is the shipped `avx2.mma_bf16` shape -- `require layout lhs satisfies
+// avx2.row_major` names an input, while the edge carries the mma's `result`.
+// Attributing `lhs`'s layout to the result would fabricate a transform (and,
+// because differing layouts suppress `Direct`, could drop a valid connection).
+TEST(CoveringSearch, ALayoutOnAnotherPortIsNotAttributedToTheEdge) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, /*producerOp=*/"produce",
+                                     /*consumerOp=*/"consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kMmaShapedRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  // The producer bound `t.plain`, but for its *input*; the edge carries its
+  // result, whose layout it never named. So the edge is not a transform: the
+  // producer's layout is unknown, not `t.plain`.
+  EXPECT_EQ(plan.connectionPlans[0].kind, ConnectionKind::Direct);
+  EXPECT_FALSE(plan.connectionPlans[0].transform.has_value());
+
+  // The premise: the producer really did bind `t.plain` (for its input), so
+  // this is an attribution decision and not a missing solve.
+  const PlanPlacement *producer = nullptr;
+  for (const PlanPlacement &placement : plan.placements)
+    if (placement.rule == "r.produce")
+      producer = &placement;
+  ASSERT_NE(producer, nullptr);
+  auto solved = producer->layoutSolutions.find("t.plain");
+  ASSERT_NE(solved, producer->layoutSolutions.end());
+  const WorkloadNode *producerNode = graph.findNode(producer->node);
+  ASSERT_NE(producerNode, nullptr);
+  ASSERT_EQ(producerNode->inputs.size(), 1u);
+  ASSERT_EQ(producerNode->outputs.size(), 1u);
+  EXPECT_EQ(solved->second.portValue,
+            static_cast<int64_t>(producerNode->inputs[0].value));
+  EXPECT_NE(solved->second.portValue,
+            static_cast<int64_t>(producerNode->outputs[0].value));
 }
 
 //===----------------------------------------------------------------------===//
@@ -1053,6 +1996,76 @@ TEST(CoveringSearch, ReplicateIntermediateHopsCountAgainstCapacity) {
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   EXPECT_TRUE(result->plans.empty());
   EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// Phase-3 T3: a connection whose only route stages through a memory that
+// already holds another instance's live tile is illegal. `a_hold` writes its
+// 1024-byte tile to the staging sram and nothing ever releases it, so when
+// `z_consume` completes the `m_produce -> z_consume` crossing the router must
+// charge that live tile against the staging memory: 1500 - 1024 < 1024, so the
+// staging hop is rejected. The occupancy is the partial plan's real live bytes,
+// derived from the tile type, not a constant. With the occupancy left unset
+// (the pre-fix behaviour) the route fits and a plan is found.
+TEST(CoveringSearch, OccupiedStagingMemoryRejectsTheConnection) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  const uint64_t tileBytes = tileFactsFor(tile).bytes;
+  ASSERT_EQ(tileBytes, 1024u); // 8 * 32 * 4, so no magic constant
+
+  WorkloadGraph graph = occupiedStagingGraph(context, tile);
+  MachineModel machine = twoDestinationHopMachine();
+  for (MemoryNode &memory : machine.memories)
+    if (memory.kind == "sram")
+      memory.capacityBytes = 1500;
+  // Premise: one staging tile fits, the live tile plus the staged value do not.
+  const MemoryNode *stage = machine.findMemory("stage.0");
+  ASSERT_NE(stage, nullptr);
+  ASSERT_GE(stage->capacityBytes, tileBytes);
+  ASSERT_LT(stage->capacityBytes, 2u * tileBytes);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kOccupiedStagingRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+}
+
+// Control for the test above: the same graph and topology with a staging memory
+// large enough to hold the live tile *and* the staged value yields a legal
+// plan. The rejection above is therefore the occupancy, not the route's shape.
+TEST(CoveringSearch, StagingMemoryWithRoomAdmitsTheConnection) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  const uint64_t tileBytes = tileFactsFor(tile).bytes;
+
+  WorkloadGraph graph = occupiedStagingGraph(context, tile);
+  MachineModel machine = twoDestinationHopMachine();
+  for (MemoryNode &memory : machine.memories)
+    if (memory.kind == "sram")
+      memory.capacityBytes = 4u * tileBytes;
+  const MemoryNode *stage = machine.findMemory("stage.0");
+  ASSERT_NE(stage, nullptr);
+  ASSERT_GE(stage->capacityBytes, 2u * tileBytes);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kOccupiedStagingRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
 }
 
 // A gather's intermediate tile is charged to the consumer's memory too: the
@@ -1299,6 +2312,176 @@ TEST(CoveringSearch, DramObjectiveRanksBeforeLatency) {
 }
 
 //===----------------------------------------------------------------------===//
+// The search bound: multi-dimensional, measured, direction-aware
+//===----------------------------------------------------------------------===//
+
+// The bound must follow the *measured* cost. Both rules declare a static
+// 100-cycle cost; a provider measures `r.b_measured` down to 1. The genuinely
+// cheapest plan therefore places `r.b_measured` on both nodes -- and the bound
+// must not over-estimate it from the static 100 and prune it.
+TEST(CoveringSearch, TheBoundUsesTheMeasuredCostNotTheStaticOne) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  FixedLatencyProvider provider;
+  provider.byRule["r.b_measured"] = 1.0; // `r.a_static` keeps the static 100
+  std::unique_ptr<MappingTarget> target =
+      targetWithProvider(searchMachine(), kMeasuredBoundRules, &provider);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1; // a full top-K list is what arms the prune
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // 1 + 1 measured cycles; a static-only bound prunes this branch at 101.
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 2.0);
+  ASSERT_FALSE(result->plans[0].placements.empty());
+  EXPECT_EQ(result->plans[0].placements[0].rule, "r.b_measured");
+}
+
+// The bound must answer to the *declared* metric. The latency-cheaper plan
+// moves 4096 bytes through DRAM; the plan that minimizes DRAM is 50 cycles
+// slower in place. A latency-only bound prunes the DRAM-cheap plan; a bound
+// that reads the DramBytes dimension keeps it, and it ranks first.
+TEST(CoveringSearch, TheBoundIsObjectiveAware) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, "produce", "consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(objectiveMachine(), kObjectiveRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  options.objective = ObjectiveOrder{CostMetric::DramBytes, {}, true};
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // The SRAM producer reads in place: no DRAM traffic, 51 cycles rather than
+  // the DRAM plan's 3. A latency-only bound prunes it and reports the 4096-byte
+  // plan instead.
+  EXPECT_EQ(result->plans[0].totalCost.dramBytes, 0u);
+  bool usesDramCheap = false;
+  for (const PlanPlacement &placement : result->plans[0].placements)
+    usesDramCheap |= placement.rule == "r.p_sram";
+  EXPECT_TRUE(usesDramCheap);
+}
+
+// §17.1: the objective's secondary metrics are tie-breakers, not decoration.
+// Two complete plans here tie at 51 cycles on the primary metric and differ
+// only on `dram_bytes`; the DRAM-free plan must rank first even though the
+// primary sees a tie. With `topK = 1` the exact prune is armed, so a prune that
+// compared only the primary -- treating an exact primary tie as "not better" --
+// would drop the DRAM-free branch. It must survive on the secondary metric.
+TEST(CoveringSearch, SecondaryMetricBreaksAPrimaryTie) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, "produce", "consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(objectiveMachine(), kTieRules);
+  ASSERT_NE(target, nullptr);
+
+  ObjectiveOrder order{CostMetric::LatencyCycles,
+                       {CostMetric::DramBytes},
+                       /*minimize=*/true};
+
+  // A wide top-K keeps both plans, so the tie and the tie-break are both
+  // observable rather than inferred from which plan survived a prune.
+  {
+    MappingSearchOptions options;
+    options.mode = SearchMode::Exact;
+    options.topK = 2;
+    options.objective = order;
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_EQ(result->plans.size(), 2u);
+    EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 51.0);
+    EXPECT_DOUBLE_EQ(result->plans[1].totalCost.latencyCycles, 51.0);
+    // ...and the only difference is the secondary metric, which ranks the
+    // DRAM-free plan first.
+    EXPECT_EQ(result->plans[0].totalCost.dramBytes, 0u);
+    EXPECT_EQ(result->plans[1].totalCost.dramBytes, 4096u);
+  }
+
+  // A full top-K list arms the exact prune. The DRAM plan completes first, so
+  // the DRAM-free branch's bound ties it on latency; only the secondary metric
+  // can keep that branch alive.
+  {
+    MappingSearchOptions options;
+    options.mode = SearchMode::Exact;
+    options.topK = 1;
+    options.objective = order;
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_EQ(result->plans.size(), 1u);
+    EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 51.0);
+    EXPECT_EQ(result->plans[0].totalCost.dramBytes, 0u);
+    bool usesDramFree = false;
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      usesDramFree |= placement.rule == "r.p_sram";
+    EXPECT_TRUE(usesDramFree);
+  }
+}
+
+// The bound must be direction-aware. Maximizing latency keeps the *largest*
+// reachable completion; a componentwise-min bound (the minimize rule) would
+// keep the 1-cycle branch and prune the 10-cycle plan the objective asks for.
+TEST(CoveringSearch, TheBoundFollowsTheObjectiveDirection) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Beam;
+  options.beamWidth = 1; // the sort, not the final rank, decides what survives
+  options.objective =
+      ObjectiveOrder{CostMetric::LatencyCycles, {}, /*minimize=*/false};
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_FALSE(result->plans[0].placements.empty());
+  EXPECT_EQ(result->plans[0].placements[0].rule, "r.expensive");
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 20.0);
+}
+
+// The bound omits connection costs, so it is only admissible for a minimize
+// objective. Plan B is largest (103 cycles) only *after* its 101-cycle route is
+// added; while the consumer is still uncovered the bound sees 1 + 1 = 2. A
+// maximize objective must not prune on that bound: exact mode explores fully
+// and returns B, rather than reporting the 13-cycle plan as exact.
+TEST(CoveringSearch, ExactMaximizeDoesNotPruneOnAnInadmissibleBound) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, "a_produce", "z_consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(maximizeMachine(), kMaximizeRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  options.objective =
+      ObjectiveOrder{CostMetric::LatencyCycles, {}, /*minimize=*/false};
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // Producer on acc.0: 1 + 1 + (100 + 4096 / 4096) = 103 cycles.
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 103.0);
+  bool usesSlow = false;
+  for (const PlanPlacement &placement : result->plans[0].placements)
+    usesSlow |= placement.rule == "r.p_slow";
+  EXPECT_TRUE(usesSlow);
+}
+
+//===----------------------------------------------------------------------===//
 // Source binding provenance
 //===----------------------------------------------------------------------===//
 
@@ -1406,6 +2589,7 @@ TEST(MappingDiagnostics, EveryCodeRoundTripsThroughItsString) {
       DiagnosticCode::SearchTruncated,
       DiagnosticCode::LatencyCacheMiss,
       DiagnosticCode::TargetBundleInvalid,
+      DiagnosticCode::AssumedValueSize,
   };
   for (DiagnosticCode code : codes) {
     llvm::StringRef text = stringifyDiagnosticCode(code);

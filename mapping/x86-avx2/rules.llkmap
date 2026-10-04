@@ -26,6 +26,55 @@ rule avx2.vector_add v1 {
   cost 4;
 }
 
+// `micro.vector` is one op with an `op` attribute, so each variant the lowering
+// emits is matched on that attribute. `--llk-to-micro` emits exactly three --
+// `convert` (the accumulator narrowing), `silu` (the gate activation), and
+// `mul` (the gating multiply) -- so three rules cover them. There is
+// deliberately no catch-all: an op value with no rule stays `no_matching_rule`
+// rather than being bound to an implementation that does not exist.
+//
+// Each requires its f32 operand (the accumulator tile) in avx2.blocked_2d.
+// The requirement is solved against that operand's own element type -- f32,
+// lanes 8 -- not the graph's first value, so it holds even inside a bf16 tile
+// program where the accumulator is the only f32 value.
+
+rule avx2.vector_convert v1 {
+  match micro.vector(op = "convert");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies avx2.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "avx2.vector.convert.f32";
+  emit "avx2_vector_convert";
+  cost 2;
+}
+
+rule avx2.vector_silu v1 {
+  match micro.vector(op = "silu");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies avx2.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "avx2.vector.silu.f32";
+  emit "avx2_vector_silu";
+  cost 4;
+}
+
+rule avx2.vector_mul v1 {
+  match micro.vector(op = "mul");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies avx2.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "avx2.vector.mul.f32";
+  emit "avx2_vector_mul";
+  cost 4;
+}
+
 rule avx2.mma_bf16 v1 {
   match micro.mma(input[0].element_type = bf16);
   require executor kind worker;
@@ -56,5 +105,24 @@ rule avx2.async_copy v1 {
   require executor kind worker;
   bundle "avx2.copy";
   emit "avx2_copy";
+  cost 2;
+}
+
+rule avx2.tile_async_copy v1 {
+  match micro.tile_async_copy();
+  require executor kind worker;
+  input "source";
+  output "result";
+  bundle "avx2.tile.copy";
+  emit "avx2_tile_copy";
+  cost 2;
+}
+
+rule avx2.tile_store v1 {
+  match micro.tile_store();
+  require executor kind worker;
+  input "source";
+  bundle "avx2.tile.store";
+  emit "avx2_tile_store";
   cost 2;
 }

@@ -57,12 +57,20 @@ struct MicroMapPass
       *this, "report",
       llvm::cl::desc("Write the versioned JSON plan report (design §22.2) to "
                      "this path; the report never changes the IR")};
+  Option<bool> reportOnly{
+      *this, "report-only",
+      llvm::cl::desc("Search and write the report (requires report=<path>) but "
+                     "leave the module unmodified: the selected plan is not "
+                     "bound onto it (design §21)"),
+      llvm::cl::init(false)};
 
   StringRef getArgument() const override { return "micro-map"; }
 
   StringRef getDescription() const override {
     return "Search a micro.kernel for a covering plan and bind the best one to "
-           "it (e.g. --micro-map=\"target=x86-avx2 "
+           "it; with report-only=1 (and report=<path>) the plan is reported "
+           "but not bound, so the input IR is left unmodified (e.g. "
+           "--micro-map=\"target=x86-avx2 "
            "machine=machines/x86-avx2-v2.yaml "
            "layouts=mapping/x86-avx2/layouts.llkmap "
            "rules=mapping/x86-avx2/rules.llkmap "
@@ -81,15 +89,22 @@ struct MicroMapPass
     options.topK = topK.getValue();
     options.beamWidth = beamWidth.getValue();
     options.reportPath = report.getValue();
+    options.reportOnly = reportOnly.getValue();
     return options;
   }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
     MicroMapOptions options = currentOptions();
+    if (llvm::Error error =
+            micro_mapping_detail::requireReportPathForReportOnly(
+                "micro-map", options.reportOnly, options.reportPath)) {
+      module.emitError() << llvm::toString(std::move(error));
+      signalPassFailure();
+      return;
+    }
     llvm::Expected<micro_mapping_detail::MappingRun> run =
-        micro_mapping_detail::runMappingSearch(module, "micro-map", options,
-                                               /*forceDeterministic=*/false);
+        micro_mapping_detail::runMappingSearch(module, "micro-map", options);
     if (!run) {
       module.emitError() << llvm::toString(run.takeError());
       signalPassFailure();
@@ -109,6 +124,13 @@ struct MicroMapPass
         return;
       }
     }
+    // The report is written (above) and, in report-only mode, that is all: the
+    // selection is reported and then dropped, so the module is left exactly as
+    // it was read. Everything before this point -- the target load, the search,
+    // and the report -- is the same work the binding run does, so the report is
+    // the one a binding run would write (design §21).
+    if (options.reportOnly)
+      return;
     if (llvm::Error error = micro_mapping_detail::bindPlanOntoModule(
             module, run->result.plans.front(), *run->target)) {
       module.emitError() << llvm::toString(std::move(error));
@@ -141,6 +163,7 @@ std::unique_ptr<Pass> createMicroMapPass(const MicroMapOptions &options) {
   pass->topK = options.topK;
   pass->beamWidth = options.beamWidth;
   pass->report = options.reportPath;
+  pass->reportOnly = options.reportOnly;
   return pass;
 }
 

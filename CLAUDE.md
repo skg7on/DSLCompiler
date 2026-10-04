@@ -22,7 +22,7 @@ ctest --output-on-failure        # Same suite, without building first
 ctest -R MicroDialectTileOps     # Run a single FileCheck test
 ./llk-opt input.mlir             # Parse + print IR
 ./llk-opt --llk-to-linalg input.mlir  # Run a specific pass
-./llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add" input.mlir  # Search, bind best plan
+./llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store" input.mlir  # Search, bind best plan
 ./<TestName>                     # Run a single GTest
 ```
 

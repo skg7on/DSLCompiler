@@ -3,6 +3,9 @@
 #include "LLK/Mapping/Placement.h"
 #include "LLK/Mapping/Routing.h"
 
+#include "LLK/Dialect/Micro/MicroDialect.h"
+
+#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
@@ -18,6 +21,14 @@ using namespace mlir::llk::machine;
 using namespace mlir::llk::mapping;
 
 namespace {
+
+/// A `!micro.tile<inner>` type, parsed through the loaded Micro dialect so the
+/// test exercises the printed form real workloads carry.
+mlir::Type tileType(mlir::MLIRContext &context, llvm::StringRef inner) {
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  std::string text = "!micro.tile<" + inner.str() + ">";
+  return mlir::parseType(text, &context);
+}
 
 MemoryNode memory(llvm::StringRef id, llvm::StringRef kind) {
   MemoryNode node;
@@ -558,6 +569,58 @@ TEST(Connections, DirectWhenElementTypesAndShapesAgree) {
       mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
   request.consumerType =
       mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+}
+
+// The Micro dialect's primary value is `!micro.tile`, and a real workload's
+// value type *is* one. §10.2's element-type and logical-shape check must read
+// it through the same `TileFacts` unwrapping that sizes the value, or the
+// check is a no-op for the very type it exists to compare.
+TEST(Connections, RejectsTileElementTypeMismatch) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.elementType = tileType(context, "8x8xf32");
+  request.consumerType = tileType(context, "8x8xbf16");
+  ASSERT_TRUE(static_cast<bool>(request.elementType));
+  ASSERT_TRUE(static_cast<bool>(request.consumerType));
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_TRUE(plans->empty());
+}
+
+TEST(Connections, RejectsTileLogicalShapeMismatch) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.elementType = tileType(context, "8x8xf32");
+  request.consumerType = tileType(context, "4x4xf32");
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  EXPECT_TRUE(plans->empty());
+}
+
+TEST(Connections, DirectWhenTileTypesAgree) {
+  mlir::MLIRContext context;
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.elementType = tileType(context, "8x8xf32");
+  request.consumerType = tileType(context, "8x8xf32");
 
   llvm::Expected<std::vector<ConnectionPlan>> plans =
       synthesizeConnections(request, machine, topology);

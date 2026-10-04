@@ -15,9 +15,9 @@
 #include "LLK/Mapping/MappingRules.h"
 
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/TileFacts.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
-#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinTypes.h"
 
@@ -799,55 +799,9 @@ std::string printedType(mlir::Type type) {
   return stream.str();
 }
 
-/// A `!micro.tile<shape x element, ...>` read through its printed form. This
-/// core deliberately does not link the Micro dialect (see WorkloadGraph.h), so
-/// the tile is re-parsed as the `tensor<shape x element>` its head spells. Any
-/// other type yields a null type.
-mlir::Type tileAsTensor(mlir::Type type) {
-  if (!type)
-    return {};
-  std::string printed = printedType(type);
-  llvm::StringRef text(printed);
-  if (!text.consume_front("!micro.tile<"))
-    return {};
-  size_t end = text.find_first_of(",>");
-  if (end == llvm::StringRef::npos)
-    return {};
-  std::string wrapped = ("tensor<" + text.take_front(end) + ">").str();
-  return mlir::parseType(wrapped, type.getContext());
-}
-
-/// The element type a port type exposes, or a null type when this core cannot
-/// read one. A modelled shaped type and a bare float, integer, or index type
-/// state theirs; a `!micro.tile` is unwrapped through its printed form.
-mlir::Type elementTypeOf(mlir::Type type) {
-  if (!type)
-    return {};
-  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
-    return shaped.getElementType();
-  if (mlir::isa<mlir::FloatType, mlir::IntegerType, mlir::IndexType>(type))
-    return type;
-  if (mlir::Type tile = tileAsTensor(type))
-    if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(tile))
-      return shaped.getElementType();
-  return {};
-}
-
-/// The static shape a port type exposes, or nullopt for a dynamic, unranked, or
-/// opaque type. A `!micro.tile` is unwrapped through its printed form.
-std::optional<llvm::SmallVector<int64_t, 4>> shapeOf(mlir::Type type) {
-  if (!type)
-    return std::nullopt;
-  mlir::Type candidate = type;
-  if (!mlir::isa<mlir::ShapedType>(candidate))
-    candidate = tileAsTensor(type);
-  if (!candidate)
-    return std::nullopt;
-  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(candidate))
-    if (shaped.hasStaticShape())
-      return llvm::SmallVector<int64_t, 4>(shaped.getShape());
-  return std::nullopt;
-}
+// The `!micro.tile` printed-form unwrapping, and the element-type and static
+// shape it exposes, live in TileFacts: the same read is what sizes a moving
+// value, so it has one implementation rather than one per caller.
 
 /// The ports a predicate reads: exactly the one it names, or -- for an
 /// unqualified predicate -- every port in the property's default direction.
@@ -917,7 +871,8 @@ bool predicateMatches(const RulePredicate &predicate,
       return false;
     bool exposed = false;
     for (const WorkloadPort *port : subjectPorts(predicate, node)) {
-      std::optional<llvm::SmallVector<int64_t, 4>> shape = shapeOf(port->type);
+      std::optional<llvm::SmallVector<int64_t, 4>> shape =
+          staticShapeOf(port->type);
       if (!shape || predicate.dimension < 0 ||
           static_cast<size_t>(predicate.dimension) >= shape->size())
         continue;
@@ -1013,7 +968,7 @@ LayoutContext ruleLayoutContext(const WorkloadNode &node,
   bool haveRank = false;
   for (const WorkloadPort &port : node.outputs) {
     if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
-            shapeOf(port.type)) {
+            staticShapeOf(port.type)) {
       context.rank = static_cast<int64_t>(shape->size());
       haveRank = true;
       break;
@@ -1022,7 +977,7 @@ LayoutContext ruleLayoutContext(const WorkloadNode &node,
   if (!haveRank)
     for (const WorkloadPort &port : node.inputs) {
       if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
-              shapeOf(port.type)) {
+              staticShapeOf(port.type)) {
         context.rank = static_cast<int64_t>(shape->size());
         break;
       }
@@ -1319,6 +1274,36 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   for (const RuleLayoutRequirement &requirement : rule.layoutRequirements) {
     LayoutRequirement resolved;
     resolved.layoutClass = requirement.layoutId;
+    // A layout applies to the operand the requirement names, so resolve that
+    // operand to its own element type and rank: the layout is then solved
+    // against the value it constrains rather than the graph's first value,
+    // which for a mixed-dtype kernel is a different dtype. Left unset when the
+    // port exposes neither, so placement falls back to the caller's context.
+    size_t layoutInputIndex = 0;
+    size_t layoutOutputIndex = 0;
+    for (const RulePort &port : rule.ports) {
+      const WorkloadPort *nodePort = nullptr;
+      if (port.isInput) {
+        if (layoutInputIndex < node.inputs.size())
+          nodePort = &node.inputs[layoutInputIndex];
+        ++layoutInputIndex;
+      } else {
+        if (layoutOutputIndex < node.outputs.size())
+          nodePort = &node.outputs[layoutOutputIndex];
+        ++layoutOutputIndex;
+      }
+      if (port.name != requirement.port || !nodePort)
+        continue;
+      if (mlir::Type element = elementTypeOf(nodePort->type))
+        resolved.elementType = printedType(element);
+      if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
+              staticShapeOf(nodePort->type))
+        resolved.rank = static_cast<int64_t>(shape->size());
+      // The value this port carries, so the solved binding can be attributed to
+      // the edge that carries it. A rule that names only an input port
+      // therefore does *not* claim a layout for the value its node produces.
+      resolved.portValue = static_cast<int64_t>(nodePort->value);
+    }
     candidate.layoutRequirements.push_back(std::move(resolved));
   }
 
