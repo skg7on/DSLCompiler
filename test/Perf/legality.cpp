@@ -40,12 +40,14 @@ namespace {
 using llvm::StringRef;
 
 SearchParam integerParam(std::string name, std::vector<SearchChoice> choices) {
-  return SearchParam{std::move(name), "integer", std::move(choices)};
+  return SearchParam{std::move(name), "integer", std::move(choices),
+                     std::string{}};
 }
 
 SearchParam symbolicParam(std::string name, std::string kind,
                           std::vector<SearchChoice> choices) {
-  return SearchParam{std::move(name), std::move(kind), std::move(choices)};
+  return SearchParam{std::move(name), std::move(kind), std::move(choices),
+                     std::string{}};
 }
 
 /// A symbolic parameter that names the role (port) it governs. Two such

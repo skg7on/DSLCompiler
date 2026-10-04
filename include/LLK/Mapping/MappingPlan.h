@@ -313,6 +313,10 @@ struct PlanConnection {
   /// (see `canonicalConnectionString`), so they are deliberately not rendered
   /// again into `canonicalPlanString` -- that would only change every plan id
   /// without adding identity.
+  ///
+  /// The search populates these fields and plan identity covers them; their
+  /// *consumption* -- rewiring by endpoint rather than by instance -- begins in
+  /// the later B1/B4 work. Until then they are recorded, not acted on.
   std::optional<PortRef> producerPort;
   llvm::SmallVector<PortRef> consumerPorts;
 };

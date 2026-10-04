@@ -145,6 +145,7 @@ TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
   ASSERT_TRUE(root);
 
   EXPECT_TRUE(root->getInteger("version").has_value());
+  EXPECT_EQ(*root->getInteger("version"), 2);
   EXPECT_TRUE(root->getString("compilerVersion").has_value());
   EXPECT_NE(*root->getString("compilerVersion"), "llk-compiler");
   EXPECT_TRUE(root->getInteger("costModelVersion").has_value());
