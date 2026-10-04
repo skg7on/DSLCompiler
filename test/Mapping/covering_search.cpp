@@ -508,6 +508,82 @@ rule r.sram {
 }
 )llkmap";
 
+//===----------------------------------------------------------------------===//
+// Layout transforms driven by the bound layouts (phase-3 T4)
+//===----------------------------------------------------------------------===//
+
+/// Two layouts that solve under the search's default (rank-0) context, and are
+/// genuinely different: `t.plain` writes the logical indices unchanged while
+/// `t.blocked` blocks the second dimension by the solved `VW`.
+constexpr llvm::StringLiteral kTwoLayouts = R"llkmap(
+layout t.plain(int N) {
+  param N in [1..4];
+  require N == 1;
+  map (m, n) -> (m, n);
+}
+layout t.blocked(int VW) {
+  param VW in [4..8];
+  require VW == 8;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap";
+
+/// `searchMachine` with the sram node declaring both layouts, so a transform
+/// between them is legal in the memory both instances bind -- and so the pair's
+/// layouts are the only reason a transform is needed at all.
+MachineModel transformMachine() {
+  MachineModel model = searchMachine();
+  for (MemoryNode &memory : model.memories)
+    if (memory.kind == "sram")
+      memory.supportedLayouts = {"t.plain", "t.blocked"};
+  return model;
+}
+
+/// Producer and consumer bind *different* layouts for the value they exchange.
+constexpr llvm::StringLiteral kTransformRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.blocked;
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The control: the same two rules, both requiring `t.plain`, so the endpoints
+/// agree and the pair must stay a direct connection.
+constexpr llvm::StringLiteral kSameLayoutRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
 /// The search cost of one producer -> consumer transfer over `fanMachine`:
 /// the link latency (10) plus 4096 assumed bytes at 32 bytes/cycle.
 constexpr double kFanTransferCycles = 10.0 + 4096.0 / 32.0;
@@ -825,7 +901,15 @@ values(std::initializer_list<std::pair<llvm::StringRef, SearchValue>> entries) {
 /// The plan id the deterministic two-node fixture produces when a zero binding
 /// hash and no parameters are folded in. Pinned so the no-binding path cannot
 /// drift silently; it changes only when the canonical plan form does.
-constexpr PlanId kNoBindingPlanId = 13971994565763734923ULL;
+///
+/// Re-baselined for phase-3 T4 (ruling R4): the canonical instance and plan
+/// forms each gained a `solvedlayout=` field carrying the solved layout
+/// parameter assignment. The field is present for *every* instance and
+/// placement -- empty when the rule requires no layout -- so every plan id
+/// moves, not only those of plans that bind a layout. This fixture binds none,
+/// which is exactly why it is still the right pin for "the form changed and
+/// nothing else did".
+constexpr PlanId kNoBindingPlanId = 1637566088902498879ULL;
 
 //===----------------------------------------------------------------------===//
 // Search bound fixtures
@@ -1577,6 +1661,84 @@ TEST(CoveringSearch, CrossMemoryConnectionRunsFromProducerToConsumer) {
   ASSERT_FALSE(connection.route.empty());
   EXPECT_EQ(connection.route.front(), producerMemory);
   EXPECT_EQ(connection.route.back(), consumerMemory);
+}
+
+// Phase-3 T4: the search hands each connection request the layouts its
+// endpoints *bound*, so a pair placed under different layouts selects the
+// transform alternative inside the search. Before this, `makeRequest` left both
+// endpoints' layouts unset, so `synthesizeConnections` could only ever take its
+// direct path from the search -- the transform path existed but was unreachable
+// from it.
+TEST(CoveringSearch, DifferingBoundLayoutsSelectTheTransformFromTheSearch) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, /*producerOp=*/"produce",
+                                     /*consumerOp=*/"consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kTransformRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connections.size(), 1u);
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  const PlanConnection &connection = plan.connectionPlans[0];
+  // Both endpoints sit in sram.0, which supports both layouts, so the transform
+  // runs in place: no transfer, one layout conversion, producer's layout first.
+  EXPECT_EQ(connection.kind, ConnectionKind::LayoutTransform);
+  EXPECT_EQ(connection.route, (llvm::SmallVector<MemoryNodeId>{"sram.0"}));
+  ASSERT_TRUE(connection.transform.has_value());
+  EXPECT_EQ(connection.transform->srcLayout, "t.plain");
+  EXPECT_EQ(connection.transform->dstLayout, "t.blocked");
+
+  // The placements carry the solved assignment each endpoint bound -- the
+  // parameters the transform's two layouts were instantiated with.
+  const PlanPlacement *producer = nullptr;
+  const PlanPlacement *consumer = nullptr;
+  for (const PlanPlacement &placement : plan.placements) {
+    if (placement.rule == "r.produce")
+      producer = &placement;
+    else if (placement.rule == "r.consume")
+      consumer = &placement;
+  }
+  ASSERT_NE(producer, nullptr);
+  ASSERT_NE(consumer, nullptr);
+  auto producerLayout = producer->layoutSolutions.find("t.plain");
+  ASSERT_NE(producerLayout, producer->layoutSolutions.end());
+  auto consumerLayout = consumer->layoutSolutions.find("t.blocked");
+  ASSERT_NE(consumerLayout, consumer->layoutSolutions.end());
+  ASSERT_EQ(consumerLayout->second.parameters.size(), 1u);
+  const int64_t *vw = std::get_if<int64_t>(
+      &consumerLayout->second.parameters.find("VW")->second);
+  ASSERT_NE(vw, nullptr);
+  EXPECT_EQ(*vw, 8);
+}
+
+// The control for the test above: the same graph and topology with both rules
+// requiring the *same* layout stays a direct connection, so the transform above
+// was the differing endpoint layouts and not the fixture.
+TEST(CoveringSearch, MatchingBoundLayoutsStayDirect) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, /*producerOp=*/"produce",
+                                     /*consumerOp=*/"consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kSameLayoutRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  EXPECT_EQ(plan.connectionPlans[0].kind, ConnectionKind::Direct);
+  EXPECT_FALSE(plan.connectionPlans[0].transform.has_value());
 }
 
 //===----------------------------------------------------------------------===//

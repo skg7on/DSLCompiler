@@ -144,6 +144,19 @@ MemoryNodeId primaryMemory(const MachineModel &machine,
   return MemoryNodeId();
 }
 
+/// The one layout an instance binds, when it binds exactly one; nullopt
+/// otherwise. `layoutBindings` is keyed by layout *class*, not by port, so an
+/// instance holding two classes cannot say which one applies to a given edge.
+/// That fact is genuinely unknown here, and a connection request leaves an
+/// unknown fact unset rather than guessing: a guessed-wrong layout would
+/// fabricate a transform for an edge whose ends actually agree, while a missed
+/// one only costs the transform alternative for a multi-layout instance.
+std::optional<LayoutId> soleBoundLayout(const CandidateInstance &instance) {
+  if (instance.layoutBindings.size() != 1)
+    return std::nullopt;
+  return instance.layoutBindings.begin()->second;
+}
+
 /// Hashes the chosen instance ids, so a partial plan has a stable identity
 /// independent of how it was reached.
 uint64_t partialId(const std::vector<const CandidateInstance *> &chosen) {
@@ -573,6 +586,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       request.value = value;
       request.producerMemory = primaryMemory(machine, producer);
       request.consumerMemory = primaryMemory(machine, consumer);
+      // The layouts each endpoint *bound*, so differing layouts make this pair
+      // a transform rather than a direct connection (§15.2). Without them the
+      // search could only ever reach `synthesizeConnections`' direct path, and
+      // a transform alternative was unreachable from the search.
+      request.producerLayout = soleBoundLayout(producer);
+      request.consumerLayout = soleBoundLayout(consumer);
       const TileFacts facts = factsForValue(value);
       request.bytes = facts.bytes;
       request.alignmentBytes = facts.alignment;
@@ -1135,6 +1154,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       placement.executor = instance->executorBindings.lookup("executor");
       placement.memories = instance->memoryBindings;
       placement.layouts = instance->layoutBindings;
+      // The solved parameterization travels with the binding, so a selected
+      // plan says which one it chose rather than only naming the layout family.
+      placement.layoutSolutions = instance->layoutSolutions;
       plan.placements.push_back(std::move(placement));
     }
     llvm::sort(plan.placements, placementBefore);

@@ -242,18 +242,26 @@ enumeratePlacements(const MappingCandidate &candidate,
   // backend drops in here without touching placement.
   //
   // Every requirement must solve before any executor is tried; the resolved
-  // definition is kept so an instance can bind it. `layoutBindings` is a
-  // `StringMap<LayoutId>`, so it carries the layout *definition* id only: that
-  // is the registry-resolved id of the definition the requirement names, and is
-  // therefore string-identical to `requirement.layoutClass` by construction. A
-  // solve's concrete parameter assignment and affine map are not surfaced --
-  // there is no field on `CandidateInstance` for them, and a solve may report
-  // several, none of which placement selects (selection is the tuner's job).
-  // Recording solved parameters would be a data-model change, not a binding
-  // tweak.
+  // definition is kept so an instance can bind it, and its first legal solution
+  // is kept so the instance can record the parameterization it uses.
+  // `layoutBindings` carries the layout *definition* id only: the
+  // registry-resolved id of the definition the requirement names, and therefore
+  // string-identical to `requirement.layoutClass` by construction. The concrete
+  // assignment travels separately in `layoutSolutions`, because an instance
+  // that says only "t.blocked" cannot tell a materializer whether it meant
+  // `VW = 4` or `VW = 8`.
+  //
+  // A solve may report several solutions and placement does not rank them
+  // (choosing between them by cost is the tuner's job). It binds the *first*
+  // solution the solver reports: the solver enumerates the declared domains in
+  // declaration order, so that pick is deterministic and a plan is
+  // reproducible. A tuner that wants another solution needs a selection surface
+  // here -- recording a different one silently would be the worse failure.
   std::unique_ptr<LayoutSolver> layoutSolver = makeBoundedLayoutSolver();
   std::vector<const LayoutDef *> solvedDefs;
+  std::vector<LayoutSolution> solvedSolutions;
   solvedDefs.reserve(candidate.layoutRequirements.size());
+  solvedSolutions.reserve(candidate.layoutRequirements.size());
   for (const LayoutRequirement &requirement : candidate.layoutRequirements) {
     const LayoutDef *def = target.layouts().find(requirement.layoutClass);
     if (!def)
@@ -286,6 +294,7 @@ enumeratePlacements(const MappingCandidate &candidate,
       return std::vector<CandidateInstance>{};
     }
     solvedDefs.push_back(def);
+    solvedSolutions.push_back(solved->solutions.front());
   }
 
   std::vector<const ExecutorNode *> executors;
@@ -393,9 +402,20 @@ enumeratePlacements(const MappingCandidate &candidate,
       for (size_t j = 0; j < memoryChoices.size(); ++j)
         instance.memoryBindings[candidate.memoryRequirements[j].kind] =
             memoryChoices[j][pick[computeChoices.size() + j]]->id;
-      for (size_t i = 0; i < solvedDefs.size(); ++i)
-        instance.layoutBindings[candidate.layoutRequirements[i].layoutClass] =
-            solvedDefs[i]->id;
+      for (size_t i = 0; i < solvedDefs.size(); ++i) {
+        const std::string &layoutClass =
+            candidate.layoutRequirements[i].layoutClass;
+        instance.layoutBindings[layoutClass] = solvedDefs[i]->id;
+        // The solved assignment and its affine map, so the instance states
+        // *which* parameterization of the bound layout it uses (`VW = 8`, not
+        // merely "some legal `VW`"). `LayoutValue` and `SearchValue` are the
+        // same variant, so the values carry over without conversion.
+        SolvedLayout solvedLayout;
+        for (const auto &value : solvedSolutions[i].values)
+          solvedLayout.parameters[value.first] = value.second;
+        solvedLayout.map = solvedSolutions[i].map;
+        instance.layoutSolutions[layoutClass] = std::move(solvedLayout);
+      }
 
       instance.resourceUsage.executorSlots = 1;
       for (const MemoryRequirement &requirement : candidate.memoryRequirements)

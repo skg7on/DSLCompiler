@@ -134,6 +134,25 @@ struct MappingCandidate {
   Cost lowerBound;
 };
 
+/// One layout class's solved instantiation: the parameter values the solver
+/// chose and the affine map they substitute into. `layoutBindings` names the
+/// layout *family*; this is what makes the binding concrete, so a materializer
+/// (and a report) can state which parameterization was selected instead of
+/// implying "some legal one".
+///
+/// The parameter map is the identity-bearing field: it is rendered sorted and
+/// type-tagged by `canonicalSearchValueString`, and it participates in the
+/// instance and plan ids (ruling R4 -- two parameterizations of one layout id
+/// are different placements). The affine map is carried but deliberately *not*
+/// hashed: it is a pure function of the bound layout id and these values, so
+/// including its rendering would only add a dependency on MLIR's map printer.
+struct SolvedLayout {
+  llvm::StringMap<SearchValue> parameters;
+  /// The logical-to-physical map with the integer parameters substituted; null
+  /// when the layout declaration carries no map clause.
+  mlir::AffineMap map;
+};
+
 /// One mapping candidate placed on concrete resources.
 struct CandidateInstance {
   InstanceId id = 0;
@@ -145,6 +164,9 @@ struct CandidateInstance {
   llvm::StringMap<MemoryNodeId> memoryBindings;
   llvm::StringMap<std::string> computeBindings;
   llvm::StringMap<LayoutId> layoutBindings;
+  /// The solved instantiation of each bound layout class, keyed exactly as
+  /// `layoutBindings` is. Empty when the candidate requires no layout.
+  llvm::StringMap<SolvedLayout> layoutSolutions;
   ResourceUsage resourceUsage;
   Cost localCost;
 };
@@ -198,6 +220,9 @@ struct PlanPlacement {
   ExecutorId executor;
   llvm::StringMap<MemoryNodeId> memories;
   llvm::StringMap<LayoutId> layouts;
+  /// The solved instantiation of each layout in `layouts`, so the selected
+  /// plan states the parameterization it chose, not just the family name.
+  llvm::StringMap<SolvedLayout> layoutSolutions;
 };
 
 /// One selected connection, with the route it takes.

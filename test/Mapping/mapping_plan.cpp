@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 using namespace mlir::llk::mapping;
@@ -195,6 +196,95 @@ TEST(MappingPlan, InstanceIdIgnoresBindingInsertionOrder) {
   b.executorBindings["w1"] = "core.1";
   b.executorBindings["w0"] = "core.0";
   EXPECT_EQ(computeInstanceId(a), computeInstanceId(b));
+}
+
+//===----------------------------------------------------------------------===//
+// Solved layout assignments and identity (phase-3 T4, ruling R4)
+//===----------------------------------------------------------------------===//
+
+// R4: the solved parameter assignment IS part of the canonical instance and
+// plan identity, deliberately. The bound layout *id* names the layout family;
+// the solved assignment is what makes it concrete (`VW = 8` blocks differently
+// from `VW = 4`, occupies different bytes, and materializes different code), so
+// two instances that differ only in it are different placements and must not
+// collide on one id. It is not a derived view of already-hashed content either:
+// the solve also depends on the machine model and the solver limits, neither of
+// which the candidate's content covers.
+namespace {
+
+/// An instance binding one layout class, solved with `vw`.
+CandidateInstance solvedInstance(int64_t vw) {
+  CandidateInstance instance;
+  instance.candidate = 7;
+  instance.layoutBindings["t.blocked"] = "t.blocked";
+  instance.layoutSolutions["t.blocked"].parameters["VW"] = SearchValue(vw);
+  return instance;
+}
+
+/// A plan with one placement, binding one layout class solved with `vw`.
+CoveringPlan solvedPlan(int64_t vw) {
+  CoveringPlan plan;
+  PlanPlacement placement;
+  placement.node = 0;
+  placement.instance = 1;
+  placement.rule = "r.blocked";
+  placement.layouts["t.blocked"] = "t.blocked";
+  placement.layoutSolutions["t.blocked"].parameters["VW"] = SearchValue(vw);
+  plan.placements.push_back(std::move(placement));
+  return plan;
+}
+
+} // namespace
+
+TEST(MappingPlan, SolvedLayoutParametersArePartOfTheInstanceId) {
+  EXPECT_NE(computeInstanceId(solvedInstance(8)),
+            computeInstanceId(solvedInstance(4)));
+}
+
+TEST(MappingPlan, SolvedLayoutParametersArePartOfThePlanId) {
+  EXPECT_NE(computePlanId(solvedPlan(8)), computePlanId(solvedPlan(4)));
+}
+
+// The rendering is sorted and type-tagged (the same canonical helper the search
+// binding uses), so insertion order cannot leak into an id and an integer `8`
+// never hashes like the string `"8"`.
+TEST(MappingPlan, SolvedLayoutParameterOrderDoesNotChangeTheId) {
+  // The same two parameters, filled in opposite orders.
+  CandidateInstance ascending = solvedInstance(8);
+  ascending.layoutSolutions["t.blocked"].parameters["N"] =
+      SearchValue(int64_t{16});
+  CandidateInstance descending;
+  descending.candidate = 7;
+  descending.layoutBindings["t.blocked"] = "t.blocked";
+  descending.layoutSolutions["t.blocked"].parameters["N"] =
+      SearchValue(int64_t{16});
+  descending.layoutSolutions["t.blocked"].parameters["VW"] =
+      SearchValue(int64_t{8});
+  EXPECT_EQ(computeInstanceId(ascending), computeInstanceId(descending));
+}
+
+TEST(MappingPlan, SolvedLayoutParameterTypeIsPartOfTheId) {
+  CandidateInstance integer = solvedInstance(8);
+  CandidateInstance text;
+  text.candidate = 7;
+  text.layoutBindings["t.blocked"] = "t.blocked";
+  text.layoutSolutions["t.blocked"].parameters["VW"] =
+      SearchValue(std::string("8"));
+  EXPECT_NE(computeInstanceId(integer), computeInstanceId(text));
+}
+
+// The affine map is carried (a materializer needs it) but is deliberately NOT
+// part of the id: it is a pure function of the layout id and the solved
+// assignment, both of which the canonical string already contains, so including
+// its rendering would add a dependency on MLIR's map printer for no extra
+// distinguishing power.
+TEST(MappingPlan, TheSolvedAffineMapIsExcludedFromTheId) {
+  mlir::MLIRContext context;
+  CandidateInstance withoutMap = solvedInstance(8);
+  CandidateInstance withMap = solvedInstance(8);
+  withMap.layoutSolutions["t.blocked"].map =
+      mlir::AffineMap::getMultiDimIdentityMap(2, &context);
+  EXPECT_EQ(computeInstanceId(withoutMap), computeInstanceId(withMap));
 }
 
 TEST(MappingPlan, PlanIdChangesWithBindingHash) {
