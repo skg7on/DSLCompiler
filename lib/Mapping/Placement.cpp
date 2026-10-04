@@ -259,8 +259,19 @@ enumeratePlacements(const MappingCandidate &candidate,
     if (!def)
       return placementError("placement: unknown layout '" +
                             requirement.layoutClass + "'");
+    // Solve against the operand's own element type and rank when the candidate
+    // resolved them; fall back to the caller's context otherwise (a hand-built
+    // candidate leaves them unset). Solving every requirement against one
+    // graph-wide context would reject a legal per-operand layout whenever the
+    // graph's first value has a different dtype than the operand -- e.g. an
+    // f32 vector op in a bf16 tile program.
+    LayoutContext requirementContext = layoutContext;
+    if (!requirement.elementType.empty())
+      requirementContext.elementType = requirement.elementType;
+    if (requirement.rank >= 0)
+      requirementContext.rank = requirement.rank;
     llvm::Expected<LayoutSolveResult> solved =
-        layoutSolver->solve(*def, machine, context, layoutContext);
+        layoutSolver->solve(*def, machine, context, requirementContext);
     if (!solved)
       return solved.takeError();
     if (solved->undecided || solved->solutions.empty()) {

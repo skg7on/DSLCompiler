@@ -1319,6 +1319,32 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   for (const RuleLayoutRequirement &requirement : rule.layoutRequirements) {
     LayoutRequirement resolved;
     resolved.layoutClass = requirement.layoutId;
+    // A layout applies to the operand the requirement names, so resolve that
+    // operand to its own element type and rank: the layout is then solved
+    // against the value it constrains rather than the graph's first value,
+    // which for a mixed-dtype kernel is a different dtype. Left unset when the
+    // port exposes neither, so placement falls back to the caller's context.
+    size_t layoutInputIndex = 0;
+    size_t layoutOutputIndex = 0;
+    for (const RulePort &port : rule.ports) {
+      const WorkloadPort *nodePort = nullptr;
+      if (port.isInput) {
+        if (layoutInputIndex < node.inputs.size())
+          nodePort = &node.inputs[layoutInputIndex];
+        ++layoutInputIndex;
+      } else {
+        if (layoutOutputIndex < node.outputs.size())
+          nodePort = &node.outputs[layoutOutputIndex];
+        ++layoutOutputIndex;
+      }
+      if (port.name != requirement.port || !nodePort)
+        continue;
+      if (mlir::Type element = elementTypeOf(nodePort->type))
+        resolved.elementType = printedType(element);
+      if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
+              shapeOf(nodePort->type))
+        resolved.rank = static_cast<int64_t>(shape->size());
+    }
     candidate.layoutRequirements.push_back(std::move(resolved));
   }
 

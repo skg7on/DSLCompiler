@@ -224,11 +224,15 @@ TEST(Avx2Target, CoversTheTileMovementOpsTheLoweringEmits) {
 
 TEST(Avx2Target, BindsTheTileMovementOpsTheLoweringEmits) {
   // Carried acceptance from the rules that cover `micro.tile_async_copy` and
-  // `micro.tile_store`: a match is not a binding. This carries those rules
-  // through extraction, search, and the binder, so a rule that matches but
-  // declares a wrong port split -- which
-  // `CoversTheTileMovementOpsTheLoweringEmits` cannot see -- fails here instead
-  // of slipping through.
+  // `micro.tile_store`. Two claims, checked separately because different
+  // defects falsify them:
+  //
+  //   * the plan binds and stamps `micro.mapping` on both nodes -- the binder
+  //     reads placement identities and value links, never a rule's ports, so
+  //     this proves materialization but cannot see a port split;
+  //   * each rule's declared port split mirrors the node's own ports and bound
+  //     value ids -- the split feeds only the candidate (and its id), so a
+  //     wrong split must be caught at the candidate, not at bind time.
   mlir::MLIRContext context;
   context.getOrLoadDialect<mlir::micro::MicroDialect>();
   context.getOrLoadDialect<mlir::tensor::TensorDialect>();
@@ -251,6 +255,49 @@ TEST(Avx2Target, BindsTheTileMovementOpsTheLoweringEmits) {
   LayoutContext layoutContext;
   layoutContext.rank = 2;
   layoutContext.elementType = "bf16";
+
+  // The declared split, against the node the lowering produces. The ports are
+  // positional: one input per input port, then one output per output port.
+  struct SplitCase {
+    llvm::StringLiteral op;
+    llvm::StringLiteral rule;
+    size_t inputs;
+    size_t outputs;
+  };
+  for (const SplitCase &test :
+       {SplitCase{"micro.tile_async_copy", "avx2.tile_async_copy", 1, 1},
+        SplitCase{"micro.tile_store", "avx2.tile_store", 1, 0}}) {
+    const WorkloadNode *node = nullptr;
+    for (const WorkloadNode &candidate : graph->getNodes())
+      if (candidate.opName == test.op) {
+        node = &candidate;
+        break;
+      }
+    ASSERT_NE(node, nullptr) << test.op.str();
+    ASSERT_EQ(node->inputs.size(), test.inputs) << test.op.str();
+    ASSERT_EQ(node->outputs.size(), test.outputs) << test.op.str();
+
+    const RuleDef *rule = (*target)->rules().find(test.rule);
+    ASSERT_NE(rule, nullptr) << test.rule.str();
+    std::string reason;
+    std::optional<MappingCandidate> candidate = toMappingCandidate(
+        *rule, *node, (*target)->machine(), layoutContext, &reason);
+    ASSERT_TRUE(candidate) << test.rule.str() << ": " << reason;
+    ASSERT_EQ(candidate->ports.size(), test.inputs + test.outputs)
+        << test.rule.str();
+    for (size_t i = 0; i < test.inputs; ++i) {
+      EXPECT_TRUE(candidate->ports[i].isInput) << test.rule.str();
+      EXPECT_EQ(candidate->ports[i].value, node->inputs[i].value)
+          << test.rule.str();
+    }
+    for (size_t i = 0; i < test.outputs; ++i) {
+      EXPECT_FALSE(candidate->ports[test.inputs + i].isInput)
+          << test.rule.str();
+      EXPECT_EQ(candidate->ports[test.inputs + i].value, node->outputs[i].value)
+          << test.rule.str();
+    }
+  }
+
   MappingSearchOptions options;
   options.mode = SearchMode::Deterministic;
   CoveringSearch search(*graph, **target, context, layoutContext, options);
@@ -268,16 +315,14 @@ TEST(Avx2Target, BindsTheTileMovementOpsTheLoweringEmits) {
   bound->module->print(stream);
   llvm::StringRef mapped(stream.str());
 
-  // Each movement op is stamped with its own rule and emitter, and the store's
-  // operand is the copy's result -- the port split the two rules declare.
+  // Materialization: each movement op is stamped with its own rule and emitter,
+  // and exactly one placement per node.
   EXPECT_NE(mapped.find("rule = \"avx2.tile_async_copy\""),
             llvm::StringRef::npos);
   EXPECT_NE(mapped.find("emitter = \"avx2_tile_copy\""), llvm::StringRef::npos);
   EXPECT_NE(mapped.find("rule = \"avx2.tile_store\""), llvm::StringRef::npos);
   EXPECT_NE(mapped.find("emitter = \"avx2_tile_store\""),
             llvm::StringRef::npos);
-  EXPECT_NE(mapped.find("micro.tile_store %result"), llvm::StringRef::npos);
-  // Exactly one placement per node: the copy and the store.
   EXPECT_EQ(mapped.count("micro.mapping"), 2u);
 }
 

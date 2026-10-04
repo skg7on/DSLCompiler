@@ -38,19 +38,19 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // CHECK-LABEL: micro.kernel @matmul_M16_N64_K64 attributes {
 // CHECK-SAME: micro.plan
 
-// Staged copies carry their placement.
+// Staged copies carry their placement, bound by their own rule.
 // CHECK: micro.tile_async_copy
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.tile_async_copy"
 
 // The GEMM core binds to the matrix engine.
 // CHECK: micro.mma
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.mma_bf16"
 
 // The narrowing epilogue -- `micro.vector "convert"` -- is the op that had no
 // rule before this task.
 // CHECK: micro.vector "convert"
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.vector_convert"
 
 // The write back carries a placement too.
 // CHECK: micro.tile_store
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.tile_store"

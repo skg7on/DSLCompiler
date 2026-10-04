@@ -839,6 +839,45 @@ TEST(RuleMatch, BuildsAMappingCandidate) {
   EXPECT_DOUBLE_EQ(candidate.lowerBound.latencyCycles, 9.0);
 }
 
+TEST(RuleMatch, ResolvesALayoutRequirementAgainstItsOperandType) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(kMatchingRules);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const RuleDef *rule = registry->find("r.add");
+  ASSERT_NE(rule, nullptr);
+
+  // `kMatchingRules` requires `layout operand0 satisfies avx2.blocked_2d`. Give
+  // the operand an f32 type while the fallback context names a different value
+  // (bf16): the requirement is on operand0, so it must be solved against the
+  // operand's f32, not the fallback. Solving every requirement against the
+  // graph's first value is what made an f32 vector op unplaceable in a bf16
+  // tile program.
+  WorkloadNode node;
+  node.id = 7;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context, "add");
+  WorkloadPort inPort;
+  inPort.value = 1;
+  inPort.type =
+      mlir::RankedTensorType::get({8, 32}, mlir::Float32Type::get(&context));
+  WorkloadPort outPort;
+  outPort.value = 2;
+  outPort.type =
+      mlir::RankedTensorType::get({8, 32}, mlir::BFloat16Type::get(&context));
+  node.inputs.push_back(inPort);
+  node.outputs.push_back(outPort);
+
+  LayoutContext fallback;
+  fallback.rank = 2;
+  fallback.elementType = "bf16";
+  std::optional<MappingCandidate> resolved =
+      toMappingCandidate(*rule, node, MachineModel{}, fallback);
+  ASSERT_TRUE(resolved.has_value());
+  ASSERT_EQ(resolved->layoutRequirements.size(), 1u);
+  EXPECT_EQ(resolved->layoutRequirements[0].elementType, "f32");
+  EXPECT_EQ(resolved->layoutRequirements[0].rank, 2);
+}
+
 //===----------------------------------------------------------------------===//
 // Typed target bundles (design §14.3)
 //===----------------------------------------------------------------------===//

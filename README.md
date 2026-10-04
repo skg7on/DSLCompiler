@@ -262,7 +262,7 @@ llk-compile --emit=micro-search input.mlir
 # Search a mapping space, bind the best plan, and write a plan report
 llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml \
   layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap \
-  emitters=avx2_vector_add report=plan.json" input.mlir
+  emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store report=plan.json" input.mlir
 
 # Bind a specific plan by its stable id (reproduce the search: same target keys
 # AND search options as the --micro-map run that reported the id)

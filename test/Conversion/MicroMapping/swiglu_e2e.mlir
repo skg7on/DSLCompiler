@@ -40,25 +40,27 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK-LABEL: micro.kernel @fused_swiglu_M16_N64_K64 attributes {
 // CHECK-SAME: micro.plan
 
-// Staged copies carry their placement.
+// Staged copies carry their placement, bound by their own rule.
 // CHECK: micro.tile_async_copy
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.tile_async_copy"
 
 // Both projections bind to the matrix engine.
 // CHECK: micro.mma
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.mma_bf16"
 // CHECK: micro.mma
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.mma_bf16"
 
 // The gating epilogue is three vector variants -- SiLU, the multiply, and the
-// narrowing conversion -- none of which had a rule before this task.
+// narrowing conversion -- none of which had a rule before this task. Each is
+// pinned to its own rule so a wrong variant cannot pass on `micro.mapping`
+// alone.
 // CHECK: micro.vector "silu"
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.vector_silu"
 // CHECK: micro.vector "mul"
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.vector_mul"
 // CHECK: micro.vector "convert"
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.vector_convert"
 
 // The write back carries a placement too.
 // CHECK: micro.tile_store
-// CHECK-SAME: micro.mapping
+// CHECK-SAME: rule = "avx2.tile_store"

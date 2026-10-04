@@ -88,6 +88,16 @@ struct MemoryRequirement {
 
 struct LayoutRequirement {
   std::string layoutClass;
+  /// The element type and rank the requirement is solved against, taken from
+  /// the operand the rule names. A layout applies to that operand, so its
+  /// legality must be decided against the operand's own type -- not a single
+  /// graph-wide context, which for a mixed-dtype kernel names a different
+  /// value. Unset (empty element type, negative rank) means the caller's
+  /// `LayoutContext` is used, which is what a hand-built candidate expects.
+  /// Not part of the candidate's canonical string: the id still depends only on
+  /// the layout class, so this resolution never changes a plan id.
+  std::string elementType;
+  int64_t rank = -1;
 };
 
 /// An abstract compute capability a placement must attach (design §15.1).

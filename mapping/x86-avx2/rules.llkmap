@@ -33,20 +33,16 @@ rule avx2.vector_add v1 {
 // deliberately no catch-all: an op value with no rule stays `no_matching_rule`
 // rather than being bound to an implementation that does not exist.
 //
-// Unlike avx2.vector_add these three carry no `require layout ...` clause. The
-// layout stage solves a rule's layout requirement against one graph-wide
-// context whose element type is the first statically shaped value's, which for
-// a bf16 tile program is bf16, not the f32 accumulator these epilogue ops run
-// on. `avx2.blocked_2d` binds its vector width to that context, so a blocked
-// requirement on a per-tile f32 operand would be solved at 16 lanes (bf16) and
-// be unsatisfiable -- placement would reject an otherwise legal fragment
-// (`no_legal_layout`). The epilogue's real placement facts are the executor and
-// the vector engine, which the `require kind` clauses below already state.
+// Each requires its f32 operand (the accumulator tile) in avx2.blocked_2d.
+// The requirement is solved against that operand's own element type -- f32,
+// lanes 8 -- not the graph's first value, so it holds even inside a bf16 tile
+// program where the accumulator is the only f32 value.
 
 rule avx2.vector_convert v1 {
   match micro.vector(op = "convert");
   require executor kind worker;
   require compute kind vector_engine;
+  require layout operand0 satisfies avx2.blocked_2d;
   input "operand0";
   output "result";
   bundle "avx2.vector.convert.f32";
@@ -58,6 +54,7 @@ rule avx2.vector_silu v1 {
   match micro.vector(op = "silu");
   require executor kind worker;
   require compute kind vector_engine;
+  require layout operand0 satisfies avx2.blocked_2d;
   input "operand0";
   output "result";
   bundle "avx2.vector.silu.f32";
@@ -69,6 +66,7 @@ rule avx2.vector_mul v1 {
   match micro.vector(op = "mul");
   require executor kind worker;
   require compute kind vector_engine;
+  require layout operand0 satisfies avx2.blocked_2d;
   input "operand0";
   input "operand1";
   output "result";
