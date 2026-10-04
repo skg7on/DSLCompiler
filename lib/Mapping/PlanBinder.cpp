@@ -144,6 +144,50 @@ readStringArray(mlir::Attribute raw, llvm::StringRef name,
   return values;
 }
 
+/// One search value -- an integer or a string -- as a typed attribute, so a
+/// persisted parameter round-trips as its own type rather than being flattened
+/// to text.
+mlir::Attribute searchValueAttr(mlir::MLIRContext *context,
+                                const SearchValue &value) {
+  if (const int64_t *integer = std::get_if<int64_t>(&value))
+    return mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
+                                  *integer);
+  return mlir::StringAttr::get(context, std::get<std::string>(value));
+}
+
+/// The solved parameterization of each layout requirement, keyed exactly as the
+/// plan's `layoutSolutions` are (the layout class, index-disambiguated when one
+/// class is required by several ports). Each value is a dictionary of parameter
+/// name -> typed value, so the bound IR states the concrete instantiation the
+/// plan chose (`VW = 8`), not merely the layout family. Keys and parameter
+/// names are sorted, so the persisted form is deterministic.
+mlir::DictionaryAttr
+layoutParametersAttr(mlir::MLIRContext *context,
+                     const llvm::StringMap<SolvedLayout> &solutions) {
+  std::vector<std::string> keys;
+  keys.reserve(solutions.size());
+  for (const auto &entry : solutions)
+    keys.push_back(entry.first().str());
+  llvm::sort(keys);
+  llvm::SmallVector<mlir::NamedAttribute> attributes;
+  for (const std::string &key : keys) {
+    const SolvedLayout &solution = solutions.lookup(key);
+    std::vector<std::string> names;
+    names.reserve(solution.parameters.size());
+    for (const auto &entry : solution.parameters)
+      names.push_back(entry.first().str());
+    llvm::sort(names);
+    llvm::SmallVector<mlir::NamedAttribute> parameters;
+    for (const std::string &name : names)
+      parameters.emplace_back(
+          mlir::StringAttr::get(context, name),
+          searchValueAttr(context, solution.parameters.lookup(name)));
+    attributes.emplace_back(mlir::StringAttr::get(context, key),
+                            mlir::DictionaryAttr::get(context, parameters));
+  }
+  return mlir::DictionaryAttr::get(context, attributes);
+}
+
 mlir::DictionaryAttr
 stringMapAttr(mlir::MLIRContext *context,
               const llvm::StringMap<std::string> &entries) {
@@ -249,6 +293,20 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
                             stringMapAttr(context, memories));
     attributes.emplace_back(mlir::StringAttr::get(context, "layouts"),
                             stringMapAttr(context, layouts));
+    // The opaque bundle's typed parameters, carried unchanged so a target
+    // emitter sees the resolved bundle the plan selected rather than only its
+    // name. Absent when the rule declares none (a null attribute has no impl to
+    // walk, so it is not written).
+    if (placement.bundle.parameters)
+      attributes.emplace_back(
+          mlir::StringAttr::get(context, "bundle_parameters"),
+          placement.bundle.parameters);
+    // The solved parameterization of each layout requirement, so a materializer
+    // (or a report reader) can state the concrete instantiation the plan chose.
+    if (!placement.layoutSolutions.empty())
+      attributes.emplace_back(
+          mlir::StringAttr::get(context, "layout_parameters"),
+          layoutParametersAttr(context, placement.layoutSolutions));
     op->setAttr(kMappingAttr, mlir::DictionaryAttr::get(context, attributes));
   }
 
@@ -722,14 +780,67 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                "'");
       return;
     }
+    // The persisted bundle parameters and solved layout parameters are generic
+    // metadata too, so their shape is validated with checked casts before they
+    // are handed to the plugin or a reader.
+    if (mlir::Attribute rawBundleParameters =
+            mapping.get("bundle_parameters")) {
+      auto parameters =
+          mlir::dyn_cast<mlir::DictionaryAttr>(rawBundleParameters);
+      if (!parameters) {
+        failMetadata(
+            bindError(where + ": 'bundle_parameters' is not a dictionary"));
+        return;
+      }
+      for (const mlir::NamedAttribute &entry : parameters)
+        if (!mlir::isa<mlir::IntegerAttr>(entry.getValue()) &&
+            !mlir::isa<mlir::StringAttr>(entry.getValue())) {
+          failMetadata(bindError(where + ": 'bundle_parameters' entry '" +
+                                 entry.getName().str() +
+                                 "' is not an integer or string"));
+          return;
+        }
+    }
+    if (mlir::Attribute rawLayoutParameters =
+            mapping.get("layout_parameters")) {
+      auto byClass = mlir::dyn_cast<mlir::DictionaryAttr>(rawLayoutParameters);
+      if (!byClass) {
+        failMetadata(
+            bindError(where + ": 'layout_parameters' is not a dictionary"));
+        return;
+      }
+      for (const mlir::NamedAttribute &entry : byClass) {
+        auto parameters =
+            mlir::dyn_cast<mlir::DictionaryAttr>(entry.getValue());
+        if (!parameters) {
+          failMetadata(bindError(where + ": 'layout_parameters' entry '" +
+                                 entry.getName().str() +
+                                 "' is not a dictionary"));
+          return;
+        }
+        for (const mlir::NamedAttribute &parameter : parameters)
+          if (!mlir::isa<mlir::IntegerAttr>(parameter.getValue()) &&
+              !mlir::isa<mlir::StringAttr>(parameter.getValue())) {
+            failMetadata(bindError(where + ": 'layout_parameters' entry '" +
+                                   entry.getName().str() + "' parameter '" +
+                                   parameter.getName().str() +
+                                   "' is not an integer or string"));
+            return;
+          }
+      }
+    }
+
     if (std::unique_ptr<TargetEmitter> emitter =
             target.createEmitter(*emitterKey)) {
       TargetBundle bundle;
       bundle.name = *bundleName;
       bundle.emitterKey = *emitterKey;
-      // Bundle parameters are not persisted by the binder yet (design §18.1
-      // open item); the plugin's shape check therefore sees the name and key
-      // only.
+      if (mlir::Attribute rawBundleParameters =
+              mapping.get("bundle_parameters"))
+        bundle.parameters =
+            mlir::cast<mlir::DictionaryAttr>(rawBundleParameters);
+      // The target's own emitter decides whether the resolved bundle is
+      // complete enough to lower (design §18.3, phase 3).
       if (llvm::Error error = emitter->verify(bundle)) {
         fail(DiagnosticCode::TargetBundleInvalid,
              where + ": " + llvm::toString(std::move(error)));

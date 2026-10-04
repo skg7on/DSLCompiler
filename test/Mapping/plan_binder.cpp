@@ -179,6 +179,46 @@ TEST(PlanBinder, MappedIrVerifiesAndRoundTripsWithoutATargetPlugin) {
       static_cast<bool>(verifyMappedMicroIR(*reparsed, *fixture.target)));
 }
 
+// The bound IR must state the *concrete* layout instantiation the plan chose,
+// not merely the family: `avx2.blocked_2d` alone cannot tell a materializer
+// whether the plan meant `VW = 4` or `VW = 8`. The parameters are persisted as
+// typed attributes under `layout_parameters`, alongside the family ids.
+TEST(PlanBinder, PersistsTheSolvedLayoutParameters) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  llvm::Expected<BoundPlan> bound =
+      bindPlan(*fixture.module, *plan, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  bool sawSolvedWidth = false;
+  bound->kernel->walk([&](Operation *op) {
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping)
+      return;
+    auto layoutParameters = mapping.getAs<DictionaryAttr>("layout_parameters");
+    if (!layoutParameters)
+      return;
+    for (const NamedAttribute &entry : layoutParameters) {
+      auto parameters = dyn_cast<DictionaryAttr>(entry.getValue());
+      ASSERT_TRUE(parameters) << "layout_parameters entry is not a dictionary";
+      // The AVX2 blocked layout is parameterized by M, N, and VW; a solved
+      // integer VW is what says which instantiation was selected.
+      if (auto vw = parameters.getAs<IntegerAttr>("VW"))
+        sawSolvedWidth = true;
+    }
+  });
+  EXPECT_TRUE(sawSolvedWidth);
+
+  // The persisted parameters are ordinary metadata, so phase-2 verification
+  // still accepts the module.
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, *fixture.target)));
+}
+
 TEST(PlanBinder, MachineAwareVerificationRejectsAnUnknownExecutor) {
   Fixture fixture = makeFixture();
   ASSERT_TRUE(fixture.module);
