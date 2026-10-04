@@ -10,9 +10,14 @@
 // immediately tests every edge whose other end is already chosen, so a branch
 // dies at the first pair that cannot be connected rather than at completion.
 //
-// The bound used for ordering and pruning is admissible: accumulated cost plus,
-// for each uncovered node, the cheapest instance available for it. Connection
-// costs are non-negative, so it never overestimates.
+// The bound used for ordering and pruning is accumulated cost plus, for each
+// uncovered node, the componentwise best still reachable -- the
+// measured-or-static `entry.cost`, never the stale static estimate -- and its
+// direction follows the declared objective. It omits connection costs, whose
+// sign is non-negative; that omission keeps it admissible (never above a
+// completion) for a minimize objective, while for maximize it makes the bound
+// too small to prune on, so maximize explores fully and relies on the caps
+// instead.
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,13 +26,15 @@
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/Routing.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/TileFacts.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
-#include <limits>
+#include <cassert>
 #include <optional>
 #include <string>
 #include <utility>
@@ -39,13 +46,14 @@ namespace {
 using machine::MachineModel;
 using machine::MemoryNode;
 
-/// Byte count assumed for a value crossing a connection. The real size comes
-/// from the value's type once the plan binder carries it (#50/D7); costing a
-/// route needs a number now, and every plan is costed the same way.
-constexpr uint64_t kAssumedValueBytes = 4096;
+/// Byte count and alignment assumed for a value whose tile size cannot be
+/// derived (a dynamic shape, or a type the core does not model). These are the
+/// pre-phase-3 constants, kept so an unmeasurable value is costed exactly as it
+/// was -- but the fallback is *reported*, naming the value, never taken
+/// silently (see `factsForValue`).
+constexpr uint64_t kUnknownValueBytes = 4096;
 
-/// Alignment every fixture memory supports.
-constexpr uint64_t kAssumedAlignment = 32;
+constexpr uint64_t kUnknownAlignment = 32;
 
 /// A legal placement and the rule that produced it, so a selected plan can
 /// name the rule and bundle it chose.
@@ -63,23 +71,62 @@ struct NodeTable {
   std::vector<InstanceEntry> instances;
 };
 
-struct Edge {
-  size_t producer = 0; // index into the node table
-  size_t consumer = 0;
-  /// The value the edge carries, so a connection names what it moves.
-  WorkloadValueId value = 0;
+/// One end of a dataflow value: the node table index that produces or consumes
+/// it and the port it crosses, so a connection can state the element type,
+/// logical shape, and affine relation §10.2 compares.
+struct ValueEndpoint {
+  size_t node = 0;
+  const WorkloadPort *port = nullptr;
 };
+
+/// A logical value and every place it crosses. One producer and one consumer is
+/// a plain edge; several consumers call for fan-out, and several producers call
+/// for a gather (design §15.3).
+struct ValueLink {
+  WorkloadValueId value = 0;
+  std::vector<ValueEndpoint> producers;
+  std::vector<ValueEndpoint> consumers;
+};
+
+/// True when `node` is one of the value's ends.
+bool valueInvolves(const ValueLink &link, size_t node) {
+  for (const ValueEndpoint &endpoint : link.producers)
+    if (endpoint.node == node)
+      return true;
+  for (const ValueEndpoint &endpoint : link.consumers)
+    if (endpoint.node == node)
+      return true;
+  return false;
+}
 
 /// A partial cover: one instance chosen per covered node.
 struct Partial {
   std::vector<const CandidateInstance *> chosen; // null while uncovered
   std::vector<size_t> connections;               // indices into the plan pool
+  /// One flag per value link: set once the value's connections are synthesized
+  /// (when every endpoint is chosen), so a fan-out is built exactly once.
+  std::vector<char> linked;
   Cost cost;
-  double lowerBound = std::numeric_limits<double>::infinity();
+  /// Optimistic completion cost, direction-aware and measured (`boundCost`).
+  /// Multi-dimensional: the beam order always compares it through
+  /// `boundIsBetterThan`, never as a bare latency. The exact prune compares it
+  /// through the same predicate -- but only under a minimize objective, the
+  /// only direction the bound is admissible for; an exact maximize run skips
+  /// the prune block entirely.
+  Cost lowerBound = infiniteCost();
   uint64_t id = 0;
   unsigned covered = 0;
   uint64_t executorSlots = 0;
   llvm::StringMap<uint64_t> memoryBytes;
+  /// Per-value live-range accounting: the memory charges a value currently
+  /// owes, as exact (memory, bytes) pairs so the release subtracts precisely
+  /// what the charge added. Populated when the value's producer is placed and
+  /// cleared when the value's *last* consumer is placed. A value the graph
+  /// never fully consumes keeps its charges for the whole plan (it is not in
+  /// `valueLinks`, so nothing ever releases it) -- the conservative direction.
+  llvm::DenseMap<WorkloadValueId,
+                 llvm::SmallVector<std::pair<MemoryNodeId, uint64_t>, 2>>
+      liveValueCharges;
 };
 
 MemoryNodeId primaryMemory(const MachineModel &machine,
@@ -95,6 +142,40 @@ MemoryNodeId primaryMemory(const MachineModel &machine,
     if (machine.isVisible(memory.id, executor))
       return memory.id;
   return MemoryNodeId();
+}
+
+/// The layout `instance` bound for the value `value`, or nullopt when it bound
+/// none for it.
+///
+/// The match is by *value*, not by "the instance's one layout": a rule's layout
+/// requirement names a port, and the solved binding is recorded against the
+/// workload value that port carries. The edge being connected carries that same
+/// value (a port's value *is* the edge's value), so a binding solved for
+/// another value -- or for no resolvable port at all -- does not match. That is
+/// what keeps a layout named on one port from being attributed to an edge
+/// carrying a different one: `avx2.mma_bf16` requires `lhs` to be
+/// `avx2.row_major`, and `lhs` is an *input*, so the edge carrying the mma's
+/// `result` must not inherit that layout. Both directions of error are avoided
+/// rather than traded: a mis-attributed layout could fabricate a transform (or,
+/// because differing layouts now suppress `Direct`, drop a connection that was
+/// valid), while no attribution at all only costs the transform alternative for
+/// that edge.
+///
+/// Two layout classes solved for the same value are ambiguous -- the edge
+/// cannot say which governs -- so that is treated as unattributable too.
+std::optional<LayoutId> boundLayoutForValue(const CandidateInstance &instance,
+                                            WorkloadValueId value) {
+  std::optional<LayoutId> found;
+  for (const auto &entry : instance.layoutSolutions) {
+    if (entry.second.portValue != static_cast<int64_t>(value))
+      continue;
+    if (found)
+      return std::nullopt;
+    // The key is the resolved definition id, string-identical to this class's
+    // `layoutBindings` entry (see `SolvedLayout`'s invariant).
+    found = entry.first().str();
+  }
+  return found;
 }
 
 /// Hashes the chosen instance ids, so a partial plan has a stable identity
@@ -115,19 +196,148 @@ uint64_t partialId(const std::vector<const CandidateInstance *> &chosen) {
   return hash;
 }
 
+/// A binding map's `name=value` entries, sorted. A placement's memory and
+/// layout binding tuples compare through this, never through `StringMap`
+/// iteration order (design §22.1).
+template <typename ValueT>
+std::vector<std::string>
+sortedBindings(const llvm::StringMap<ValueT> &bindings) {
+  std::vector<std::string> entries;
+  entries.reserve(bindings.size());
+  for (const auto &entry : bindings) {
+    std::string text = entry.first().str();
+    text += '=';
+    text += entry.second;
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return entries;
+}
+
+/// A map's keys in sorted order, so an unordered container is never walked as
+/// output order (design §22.1).
+template <typename ValueT>
+llvm::SmallVector<llvm::StringRef, 8>
+sortedKeys(const llvm::StringMap<ValueT> &map) {
+  llvm::SmallVector<llvm::StringRef, 8> keys;
+  keys.reserve(map.size());
+  for (const auto &entry : map)
+    keys.push_back(entry.first());
+  llvm::sort(keys);
+  return keys;
+}
+
+/// Canonical placement order (design §22.1): the executor id, then the sorted
+/// memory bindings, then the sorted layout bindings. Node and instance ids
+/// break a tie so the order over a complete plan is total.
+bool placementBefore(const PlanPlacement &lhs, const PlanPlacement &rhs) {
+  if (lhs.executor != rhs.executor)
+    return lhs.executor < rhs.executor;
+  std::vector<std::string> lhsMemories = sortedBindings(lhs.memories);
+  std::vector<std::string> rhsMemories = sortedBindings(rhs.memories);
+  if (lhsMemories != rhsMemories)
+    return lhsMemories < rhsMemories;
+  std::vector<std::string> lhsLayouts = sortedBindings(lhs.layouts);
+  std::vector<std::string> rhsLayouts = sortedBindings(rhs.layouts);
+  if (lhsLayouts != rhsLayouts)
+    return lhsLayouts < rhsLayouts;
+  if (lhs.node != rhs.node)
+    return lhs.node < rhs.node;
+  return lhs.instance < rhs.instance;
+}
+
+/// The §22.3 code naming a placement failure. `NoLegalMemory` has no dedicated
+/// code in the minimum set: the executor that matched cannot supply a memory
+/// the rule requires, so the executor is what is not legal.
+DiagnosticCode placementFailureCode(PlacementFailure failure) {
+  switch (failure) {
+  case PlacementFailure::NoLegalLayout:
+    return DiagnosticCode::NoLegalLayout;
+  case PlacementFailure::UnsupportedComputeFragment:
+    return DiagnosticCode::UnsupportedComputeFragment;
+  case PlacementFailure::NoLegalExecutor:
+  case PlacementFailure::NoLegalMemory:
+  case PlacementFailure::None:
+    return DiagnosticCode::NoLegalExecutor;
+  }
+  return DiagnosticCode::NoLegalExecutor;
+}
+
 } // namespace
+
+bool FailureFrontier::has(DiagnosticCode code) const {
+  for (const Diagnostic &diagnostic : diagnostics)
+    if (diagnostic.code == code)
+      return true;
+  return false;
+}
 
 CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
                                const MappingTarget &target,
                                mlir::MLIRContext &context,
                                const LayoutContext &layoutContext,
-                               const MappingSearchOptions &options)
+                               const MappingSearchOptions &options,
+                               std::optional<SearchBinding> binding,
+                               std::optional<std::string> boundLayout)
     : workload_(workload), target_(target), context_(context),
-      layoutContext_(layoutContext), options_(options) {}
+      layoutContext_(layoutContext), options_(options),
+      binding_(std::move(binding)), boundLayout_(std::move(boundLayout)) {}
 
 llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   const MachineModel &machine = target_.machine();
   MappingSearchResult result;
+
+  // Records a stable-coded failure once per (code, message) pair. A cause that
+  // recurs on every branch -- a memory overflow, a provider that never caches a
+  // rule, a cap hit -- stays a single frontier entry; the category counts carry
+  // the tally. Order here is deterministic, and the final sort makes it so even
+  // if a future caller reaches these in a different order.
+  llvm::StringSet<> recordedDiagnostics;
+  auto report = [&](DiagnosticCode code, std::string message) {
+    // Count every occurrence (design §22.2), even when the distinct
+    // (code, message) pair is already recorded, so a recurring cause is
+    // visible as a tally.
+    ++result.frontier.codeCounts[code];
+    std::string key = stringifyDiagnosticCode(code).str();
+    key += '\x1f';
+    key += message;
+    if (recordedDiagnostics.insert(key).second)
+      result.frontier.diagnostics.push_back({code, std::move(message)});
+  };
+
+  // The size of the tile a value carries, derived from its type. A dynamic
+  // shape or a type the core does not model cannot be sized: fall back to the
+  // pre-phase-3 constants and *report* it, naming the value, so an assumed size
+  // is never silent again (phase-3 ruling R1).
+  auto factsForValue = [&](WorkloadValueId value) -> TileFacts {
+    const WorkloadValue *moved = workload_.findValue(value);
+    TileFacts facts = moved ? tileFactsFor(moved->type) : TileFacts{};
+    if (facts.known)
+      return facts;
+    report(DiagnosticCode::AssumedValueSize,
+           "value " + std::to_string(value) + " ('" +
+               (moved ? moved->name : std::string("<unknown>")) +
+               "'): tile size unknown; assuming " +
+               std::to_string(kUnknownValueBytes) + " bytes, " +
+               std::to_string(kUnknownAlignment) + "-byte alignment");
+    facts.bytes = kUnknownValueBytes;
+    facts.alignment = kUnknownAlignment;
+    return facts;
+  };
+
+  // The byte count for a node with no output to size: its first input's tile,
+  // or -- for a node with no port at all -- the reported fallback. A node that
+  // writes no output materializes nothing attributable, so such a charge is
+  // never expired.
+  auto portlessBytes = [&](const WorkloadNode &node) -> uint64_t {
+    if (!node.inputs.empty())
+      return factsForValue(node.inputs.front().value).bytes;
+    report(DiagnosticCode::AssumedValueSize,
+           "node " + std::to_string(node.id) +
+               " has no port to size; assuming " +
+               std::to_string(kUnknownValueBytes) + " bytes");
+    return kUnknownValueBytes;
+  };
 
   // --- node tables -----------------------------------------------------
   std::vector<const WorkloadNode *> ordered;
@@ -152,69 +362,176 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     if (matches.size() > options_.maxCandidatesPerNode) {
       matches.resize(options_.maxCandidatesPerNode);
       result.searchTruncated = true;
+      report(DiagnosticCode::SearchTruncated,
+             "candidate cap reached (maxCandidatesPerNode=" +
+                 std::to_string(options_.maxCandidatesPerNode) + ")");
     }
     if (matches.empty()) {
       ++result.frontier.nodesWithoutRules;
-      result.frontier.messages.push_back("node " + std::to_string(node->id) +
-                                         " ('" + node->opName +
-                                         "'): no matching rule");
+      report(DiagnosticCode::NoMatchingRule,
+             "node " + std::to_string(node->id) + " ('" + node->opName +
+                 "'): no matching rule");
     }
+    // A rule whose `require` constraints no assignment satisfies produces no
+    // candidate: that is a non-match, so a node with only such rules has no
+    // rule in effect and is counted under `nodesWithoutRules` once, below. If
+    // the constraint search hit its cap the match was not proven false, so the
+    // result is reported as truncated rather than silently treated as absent.
+    bool producedCandidate = false;
+    // A binding is authoritative for the rule parameters it names: each rule
+    // resolves at that search-space point, so its pinned parameters take only
+    // the bound value. With no binding the pointer is null and resolution is
+    // exactly the pre-binding enumeration.
+    const llvm::StringMap<SearchValue> *pinned =
+        binding_ ? &binding_->values : nullptr;
+    // The layout the binding resolves to, resolved from its `layout`-kind
+    // parameter by the caller. A null pointer when no binding, or a binding
+    // with no layout-kind parameter, leaves layout selection unchanged.
+    const std::string *boundLayout = boundLayout_ ? &*boundLayout_ : nullptr;
     for (const RuleDef *rule : matches) {
-      MappingCandidate candidate = toMappingCandidate(*rule, *node);
+      std::string reason;
+      bool truncated = false;
+      std::optional<MappingCandidate> candidate =
+          toMappingCandidate(*rule, *node, machine, layoutContext_, &reason,
+                             &truncated, pinned, boundLayout);
+      if (!candidate) {
+        if (truncated) {
+          result.searchTruncated = true;
+          report(DiagnosticCode::SearchTruncated,
+                 "constraint assignment cap reached while matching rule '" +
+                     rule->id + "'");
+        }
+        report(DiagnosticCode::NoMatchingRule,
+               "node " + std::to_string(node->id) + ": rule '" + rule->id +
+                   "' not applicable: " + reason);
+        continue;
+      }
+      producedCandidate = true;
+      ++result.candidateCount;
+      PlacementFailure placementFailure = PlacementFailure::None;
+      bool placementTruncated = false;
       llvm::Expected<std::vector<CandidateInstance>> instances =
-          enumeratePlacements(candidate, target_, context_, layoutContext_,
-                              placementOptions);
+          enumeratePlacements(*candidate, target_, context_, layoutContext_,
+                              placementOptions, &placementTruncated,
+                              &placementFailure);
       if (!instances)
         return instances.takeError();
+      result.instanceCount += instances->size();
+      if (placementTruncated) {
+        result.searchTruncated = true;
+        report(DiagnosticCode::SearchTruncated,
+               "instance cap reached (maxInstancesPerCandidate=" +
+                   std::to_string(options_.maxInstancesPerCandidate) + ")");
+      }
       if (instances->empty()) {
         ++result.frontier.candidatesWithoutPlacement;
-        result.frontier.messages.push_back("node " + std::to_string(node->id) +
-                                           ": rule '" + rule->id +
-                                           "' has no legal placement");
+        DiagnosticCode code = placementFailureCode(placementFailure);
+        report(code, "node " + std::to_string(node->id) + ": rule '" +
+                         rule->id + "' has no legal placement (" +
+                         stringifyDiagnosticCode(code).str() + ")");
       }
       for (CandidateInstance &instance : *instances) {
         InstanceEntry entry{std::move(instance), rule, {}};
         entry.cost = entry.instance.localCost;
-        if (const LatencyProvider *provider = target_.latencyProvider()) {
-          OperationSignature signature;
-          signature.operation = node->opName;
-          signature.rule = rule->id;
-          signature.ruleVersion = rule->version;
-          signature.bundle = rule->bundle;
-          if (!entry.instance.layoutBindings.empty()) {
-            std::vector<std::string> layouts;
-            for (const auto &binding : entry.instance.layoutBindings)
-              layouts.push_back(binding.second);
-            llvm::sort(layouts);
-            signature.layout = layouts.front();
+        if (options_.enableLatencyCache) {
+          if (const LatencyProvider *provider = target_.latencyProvider()) {
+            OperationSignature signature;
+            signature.operation = node->opName;
+            signature.rule = rule->id;
+            signature.ruleVersion = rule->version;
+            signature.bundle = rule->bundle;
+            if (!entry.instance.layoutBindings.empty()) {
+              std::vector<std::string> layouts;
+              for (const auto &binding : entry.instance.layoutBindings)
+                layouts.push_back(binding.second);
+              llvm::sort(layouts);
+              signature.layout = layouts.front();
+            }
+            if (const machine::ExecutorNode *executor = machine.findExecutor(
+                    entry.instance.executorBindings.lookup("executor")))
+              signature.placementClass = executor->kind;
+            TargetContext context{target_.name().str(),
+                                  hexId(machine.contentHash)};
+            if (std::optional<double> measured =
+                    provider->lookupCycles(signature, context))
+              entry.cost.latencyCycles = *measured;
+            else
+              report(DiagnosticCode::LatencyCacheMiss,
+                     "rule '" + rule->id + "' (op '" + node->opName +
+                         "'): no cached latency; static estimate retained");
           }
-          if (const machine::ExecutorNode *executor = machine.findExecutor(
-                  entry.instance.executorBindings.lookup("executor")))
-            signature.placementClass = executor->kind;
-          TargetContext context{target_.name().str(),
-                                hexId(machine.contentHash)};
-          if (std::optional<double> measured =
-                  provider->lookupCycles(signature, context))
-            entry.cost.latencyCycles = *measured;
         }
         table.instances.push_back(std::move(entry));
       }
     }
+    if (!producedCandidate && !matches.empty()) {
+      ++result.frontier.nodesWithoutRules;
+      report(DiagnosticCode::NoMatchingRule,
+             "node " + std::to_string(node->id) + " ('" + node->opName +
+                 "'): no rule satisfies its constraints");
+    }
     tables.push_back(std::move(table));
   }
 
-  // --- dataflow edges --------------------------------------------------
-  llvm::DenseMap<WorkloadValueId, size_t> producerOf;
-  for (size_t index = 0; index < tables.size(); ++index)
+  // --- dataflow values -------------------------------------------------
+  // Each value and every place it crosses. A value crossed once is a plain
+  // edge; several consumers make it a fan-out, and several producers make it a
+  // gather (design §15.3). Endpoints are canonicalized so a repeated port is
+  // still one link.
+  llvm::DenseMap<WorkloadValueId, size_t> valueIndex;
+  std::vector<ValueLink> allLinks;
+  auto linkIndexFor = [&](WorkloadValueId value) -> size_t {
+    auto it = valueIndex.find(value);
+    if (it != valueIndex.end())
+      return it->second;
+    valueIndex[value] = allLinks.size();
+    ValueLink link;
+    link.value = value;
+    allLinks.push_back(std::move(link));
+    return allLinks.size() - 1;
+  };
+  for (size_t index = 0; index < tables.size(); ++index) {
     for (const WorkloadPort &port : tables[index].workload->outputs)
-      producerOf[port.value] = index;
-  std::vector<Edge> edges;
-  for (size_t index = 0; index < tables.size(); ++index)
-    for (const WorkloadPort &port : tables[index].workload->inputs) {
-      auto producer = producerOf.find(port.value);
-      if (producer != producerOf.end() && producer->second != index)
-        edges.push_back({producer->second, index, port.value});
+      allLinks[linkIndexFor(port.value)].producers.push_back({index, &port});
+    for (const WorkloadPort &port : tables[index].workload->inputs)
+      allLinks[linkIndexFor(port.value)].consumers.push_back({index, &port});
+  }
+  auto canonicalEndpoints = [](std::vector<ValueEndpoint> &endpoints) {
+    llvm::sort(endpoints,
+               [](const ValueEndpoint &lhs, const ValueEndpoint &rhs) {
+                 return lhs.node < rhs.node;
+               });
+    endpoints.erase(
+        std::unique(endpoints.begin(), endpoints.end(),
+                    [](const ValueEndpoint &lhs, const ValueEndpoint &rhs) {
+                      return lhs.node == rhs.node;
+                    }),
+        endpoints.end());
+  };
+  std::vector<ValueLink> valueLinks;
+  for (ValueLink &link : allLinks) {
+    canonicalEndpoints(link.producers);
+    canonicalEndpoints(link.consumers);
+    // Nothing crosses when one side is empty, and a node feeding itself is not
+    // a connection.
+    if (link.producers.empty() || link.consumers.empty())
+      continue;
+    if (link.producers.size() == 1) {
+      size_t self = link.producers[0].node;
+      link.consumers.erase(std::remove_if(link.consumers.begin(),
+                                          link.consumers.end(),
+                                          [&](const ValueEndpoint &endpoint) {
+                                            return endpoint.node == self;
+                                          }),
+                           link.consumers.end());
+      if (link.consumers.empty())
+        continue;
     }
+    valueLinks.push_back(std::move(link));
+  }
+  llvm::sort(valueLinks, [](const ValueLink &lhs, const ValueLink &rhs) {
+    return lhs.value < rhs.value;
+  });
 
   TopologyService topology(machine,
                            RouteOptions{options_.maxRoutesPerConnection, 4});
@@ -223,84 +540,421 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   // here and surfaced once the search returns.
   llvm::Error pendingError = llvm::Error::success();
 
-  // Extends `partial` with `instance` for `nodeIndex`, synthesizing every
-  // connection whose other endpoint is already chosen. Returns false when the
-  // branch is illegal or over budget.
+  // Extends `partial` with `instance` for `nodeIndex`, synthesizing every value
+  // whose endpoints are all chosen now. Returns false when the branch is
+  // illegal or over budget.
   auto extend = [&](Partial &partial, size_t nodeIndex,
                     const InstanceEntry &entry) -> bool {
     const CandidateInstance &instance = entry.instance;
     partial.chosen[nodeIndex] = &instance;
     ++partial.covered;
     partial.executorSlots += instance.resourceUsage.executorSlots;
-    // A bound memory holds the tile this instance materializes, plus anything
-    // the rule declared explicitly.
-    for (const auto &entry : instance.memoryBindings)
-      partial.memoryBytes[entry.second] += kAssumedValueBytes;
-    uint64_t totalBytes = 0;
-    for (const auto &entry : instance.resourceUsage.memoryBytes)
-      partial.memoryBytes[entry.first()] += entry.second;
-    for (const auto &entry : partial.memoryBytes)
-      totalBytes += entry.second;
-    if (totalBytes > options_.memoryBudgetBytes) {
-      ++result.frontier.plansRejectedByCapacity;
-      return false;
+    if (partial.linked.size() != valueLinks.size())
+      partial.linked.assign(valueLinks.size(), 0);
+    // A bound memory holds the tiles this instance materializes, plus anything
+    // the rule declared explicitly. `memoryBytes` is keyed by memory *node*, so
+    // each byte is charged to the memory that actually holds it: the binding
+    // map resolves a requirement kind to the node placement chose, while
+    // `resourceUsage` is keyed by that requirement kind.
+    //
+    // The materialized tiles are the node's *outputs*. One binding holds every
+    // output the node writes, so it is charged their total -- sizing it from
+    // the first output alone under-charges a multi-output node, the unsafe
+    // direction for a capacity check. When a node declares several bindings the
+    // graph fixes no output-to-binding pairing (a memory requirement names a
+    // requirement *kind*, never the port that goes there), so each binding
+    // keeps the first-output fallback, an admitted lower bound, rather than
+    // guessing a pairing.
+    //
+    // Each charged output is also recorded as a live range: the bytes are
+    // released once its last consumer is placed (below), so a sequential
+    // program is not charged as if every value were simultaneously live. Only
+    // size the tile when there is a binding to charge it to; a rule that
+    // declares no memory charges nothing and must not report an assumption for
+    // a size it never uses.
+    if (!instance.memoryBindings.empty()) {
+      const WorkloadNode &workload = *tables[nodeIndex].workload;
+      if (workload.outputs.empty()) {
+        // No output to attribute: charge the first-input fallback for the whole
+        // plan. A sink materializes nothing we can expire.
+        const uint64_t bytes = portlessBytes(workload);
+        for (const auto &binding : instance.memoryBindings)
+          partial.memoryBytes[binding.second] += bytes;
+      } else if (instance.memoryBindings.size() == 1) {
+        const MemoryNodeId memory = instance.memoryBindings.begin()->second;
+        for (const WorkloadPort &output : workload.outputs) {
+          const uint64_t bytes = factsForValue(output.value).bytes;
+          partial.memoryBytes[memory] += bytes;
+          partial.liveValueCharges[output.value].push_back({memory, bytes});
+        }
+      } else {
+        const WorkloadValueId first = workload.outputs.front().value;
+        const uint64_t bytes = factsForValue(first).bytes;
+        for (const auto &binding : instance.memoryBindings) {
+          partial.memoryBytes[binding.second] += bytes;
+          partial.liveValueCharges[first].push_back({binding.second, bytes});
+        }
+      }
+    }
+    for (const auto &usage : instance.resourceUsage.memoryBytes) {
+      MemoryNodeId node = instance.memoryBindings.lookup(usage.first());
+      if (node.empty())
+        node = usage.first().str(); // no binding recorded: charge the raw key
+      partial.memoryBytes[node] += usage.second;
     }
 
     Cost cost = partial.cost;
     cost = addCost(cost, entry.cost);
 
-    for (const Edge &edge : edges) {
-      const CandidateInstance *other = nullptr;
-      const CandidateInstance *producer = nullptr;
-      const CandidateInstance *consumer = nullptr;
-      if (edge.consumer == nodeIndex) {
-        // The instance being added reads the edge, so the *other* end produces.
-        other = partial.chosen[edge.producer];
-        producer = other;
-        consumer = &instance;
-      } else if (edge.producer == nodeIndex) {
-        other = partial.chosen[edge.consumer];
-        producer = &instance;
-        consumer = other;
-      } else {
-        continue;
-      }
-      if (!other)
-        continue;
-
+    // The connection facts §10.2 compares, gathered from one producer/consumer
+    // pair's ports.
+    auto makeRequest = [&](const CandidateInstance &producer,
+                           const CandidateInstance &consumer,
+                           const WorkloadPort *producerPort,
+                           const WorkloadPort *consumerPort,
+                           WorkloadValueId value) {
       ConnectionRequest request;
-      request.producer = producer->id;
-      request.consumer = consumer->id;
-      request.value = edge.value;
-      request.producerMemory = primaryMemory(machine, *producer);
-      request.consumerMemory = primaryMemory(machine, *consumer);
-      request.bytes = kAssumedValueBytes;
-      request.alignmentBytes = kAssumedAlignment;
+      request.producer = producer.id;
+      request.consumer = consumer.id;
+      request.value = value;
+      request.producerMemory = primaryMemory(machine, producer);
+      request.consumerMemory = primaryMemory(machine, consumer);
+      // The layout each endpoint bound for *this* value, so differing layouts
+      // make the pair a transform rather than a direct connection (§15.2).
+      // Without them the search could only ever reach
+      // `synthesizeConnections`' direct path, and a transform alternative was
+      // unreachable from the search.
+      request.producerLayout = boundLayoutForValue(producer, value);
+      request.consumerLayout = boundLayoutForValue(consumer, value);
+      const TileFacts facts = factsForValue(value);
+      request.bytes = facts.bytes;
+      request.alignmentBytes = facts.alignment;
+      if (const WorkloadValue *moved = workload_.findValue(value))
+        request.elementType = moved->type;
+      if (consumerPort)
+        request.consumerType = consumerPort->type;
+      if (producerPort)
+        request.producerMap = producerPort->accessMap;
+      if (consumerPort)
+        request.consumerMap = consumerPort->accessMap;
+      if (ExecutorId executor = producer.executorBindings.lookup("executor");
+          !executor.empty())
+        request.producerExecutor = executor;
+      if (ExecutorId executor = consumer.executorBindings.lookup("executor");
+          !executor.empty())
+        request.consumerExecutor = executor;
+      // The partial plan's live bytes per memory, so a route that stages
+      // through an already-occupied intermediate is rejected (§12.2's
+      // intermediate capacity *and liveness*). The router only looks entries up
+      // by node id and never iterates the map, so it cannot perturb
+      // determinism. The pair's own memories are harmless to include: a route
+      // never re-enters its source, and its destination is exempt.
+      request.intermediateOccupancy = partial.memoryBytes;
+      return request;
+    };
+    // The alternative the declared objective prefers. `min_element` keeps the
+    // first on an exact tie, the stable deterministic tie-break.
+    auto pickBest = [&](llvm::ArrayRef<ConnectionPlan> alternatives)
+        -> const ConnectionPlan * {
+      if (alternatives.empty())
+        return nullptr;
+      return &*llvm::min_element(alternatives, [&](const ConnectionPlan &lhs,
+                                                   const ConnectionPlan &rhs) {
+        return costLess(lhs.cost, rhs.cost, options_.objective);
+      });
+    };
+    auto reportTruncation = [&](bool truncated) {
+      if (!truncated)
+        return;
+      result.searchTruncated = true;
+      report(DiagnosticCode::SearchTruncated,
+             "route cap reached (maxRoutesPerConnection=" +
+                 std::to_string(options_.maxRoutesPerConnection) + ")");
+    };
+    auto incompatible = [&](const std::string &message) {
+      ++result.frontier.incompatibleInstancePairs;
+      report(DiagnosticCode::NoMemoryRoute, message);
+    };
+
+    // Connections are staged locally and committed to the pool only after the
+    // capacity check, so a rejected branch leaves no partial state behind.
+    std::vector<ConnectionPlan> staged;
+    // Bytes a connection adds beyond the instances' own tiles: a replicated
+    // copy and a gather's intermediate tile are extra objects in memory, so
+    // they are charged. A plain single-consumer `Transfer` is deliberately not
+    // charged here: its destination tile is the consumer instance's own tile,
+    // already counted through that instance's memory binding.
+    //
+    // Unlike the materialized values above, these bytes do *not* expire with
+    // their value: the live range of a copy or gather intermediate is simply
+    // not modelled yet, so it is charged for the whole partial plan. That is
+    // the conservative direction -- an intermediate is assumed live from the
+    // moment its copy is staged until the plan ends.
+    llvm::StringMap<uint64_t> stagedBytes; // memory -> replica/gather bytes
+
+    // Synthesizes one plain-edge connection, staging the chosen alternative.
+    auto connect = [&](const ConnectionRequest &request) -> bool {
+      bool connectionTruncated = false;
       llvm::Expected<std::vector<ConnectionPlan>> alternatives =
-          synthesizeConnections(request, machine, topology, placementOptions);
+          synthesizeConnections(request, machine, topology, placementOptions,
+                                &connectionTruncated);
+      if (alternatives)
+        result.routeCount += alternatives->size();
+      reportTruncation(connectionTruncated);
       if (!alternatives) {
-        result.frontier.messages.push_back(
-            "connection " + request.producerMemory + " -> " +
-            request.consumerMemory + ": " +
-            llvm::toString(alternatives.takeError()));
+        // A malformed connection request: it fails this branch, and the closest
+        // §22.3 code is the one that names a connection that cannot be built.
+        report(DiagnosticCode::NoMemoryRoute,
+               "connection " + request.producerMemory + " -> " +
+                   request.consumerMemory + ": " +
+                   llvm::toString(alternatives.takeError()));
         return false;
       }
       if (alternatives->empty()) {
-        ++result.frontier.incompatibleInstancePairs;
-        result.frontier.messages.push_back(
-            "connection " + request.producerMemory + " -> " +
-            request.consumerMemory + ": no legal route");
+        incompatible("connection " + request.producerMemory + " -> " +
+                     request.consumerMemory + ": no legal route");
         return false;
       }
-      // The cheapest alternative is the one a plan would use.
-      auto best =
-          llvm::min_element(*alternatives, [](const ConnectionPlan &lhs,
-                                              const ConnectionPlan &rhs) {
-            return lhs.cost.latencyCycles < rhs.cost.latencyCycles;
-          });
-      pool.push_back(*best);
+      staged.push_back(*pickBest(*alternatives));
+      cost = addCost(cost, staged.back().cost);
+      return true;
+    };
+
+    // Values whose last endpoint this placement completes. Their bytes are
+    // released only after the capacity check below, so a consumer and the value
+    // it reads stay charged together while it is placed.
+    std::vector<size_t> completedLinks;
+
+    for (size_t index = 0; index < valueLinks.size(); ++index) {
+      const ValueLink &link = valueLinks[index];
+      if (partial.linked[index])
+        continue;
+      if (!valueInvolves(link, nodeIndex))
+        continue;
+      bool complete = true;
+      for (const ValueEndpoint &producer : link.producers)
+        complete &= partial.chosen[producer.node] != nullptr;
+      for (const ValueEndpoint &consumer : link.consumers)
+        complete &= partial.chosen[consumer.node] != nullptr;
+      if (!complete)
+        continue;
+      partial.linked[index] = 1;
+      completedLinks.push_back(index);
+
+      // The size of the value this link moves, derived once and shared by the
+      // requests, the replica staging, and the gather's intermediate tile.
+      const TileFacts linkFacts = factsForValue(link.value);
+
+      // A zero-element value (a static 0 dimension) moves no bytes: it needs no
+      // route, layout transform, or staging, and synthesizing a connection for
+      // it would only trip the "bytes must be positive" rule. Budget it as
+      // free, matching the zero capacity it is charged. The Micro tile verifier
+      // rejects a 0 dimension, so this is reachable only through a modelled
+      // tensor/memref/vector value type.
+      if (linkFacts.bytes == 0)
+        continue;
+
+      if (link.producers.size() == 1) {
+        const ValueEndpoint &producerEnd = link.producers[0];
+        const CandidateInstance &producer = *partial.chosen[producerEnd.node];
+        if (link.consumers.size() == 1) {
+          // A plain edge.
+          const ValueEndpoint &consumerEnd = link.consumers[0];
+          if (!connect(makeRequest(producer, *partial.chosen[consumerEnd.node],
+                                   producerEnd.port, consumerEnd.port,
+                                   link.value)))
+            return false;
+          continue;
+        }
+
+        // Fan-out (design §15.3). Each consumer is described by its own
+        // request, so the shared-read decision and every §10.2 check see that
+        // consumer's real element type, affine relation, and executor.
+        std::vector<ConnectionRequest> consumerRequests;
+        for (const ValueEndpoint &consumerEnd : link.consumers)
+          consumerRequests.push_back(
+              makeRequest(producer, *partial.chosen[consumerEnd.node],
+                          producerEnd.port, consumerEnd.port, link.value));
+        bool fanOutTruncated = false;
+        llvm::Expected<std::vector<ConnectionPlan>> alternatives =
+            synthesizeFanOut(consumerRequests.front(), consumerRequests,
+                             machine, topology, placementOptions,
+                             &fanOutTruncated, options_.objective);
+        if (alternatives)
+          result.routeCount += alternatives->size();
+        reportTruncation(fanOutTruncated);
+        if (!alternatives) {
+          report(DiagnosticCode::NoMemoryRoute,
+                 "fan-out " + consumerRequests.front().producerMemory + ": " +
+                     llvm::toString(alternatives.takeError()));
+          return false;
+        }
+        if (alternatives->empty()) {
+          incompatible("fan-out " + consumerRequests.front().producerMemory +
+                       ": no legal route");
+          return false;
+        }
+        // `synthesizeFanOut` has already selected the shapes: one shared read,
+        // or one copy per destination memory (plus any in-place group reads).
+        for (const ConnectionPlan &plan : *alternatives) {
+          staged.push_back(plan);
+          cost = addCost(cost, staged.back().cost);
+          // A copy occupies every memory after its source: its destination and
+          // any staging hop it passes through. The copy is one replica of the
+          // moved value, so the value's own derived bytes size it.
+          if (staged.back().kind == ConnectionKind::Replicate) {
+            for (size_t hop = 1; hop < staged.back().memoryRoute.size(); ++hop)
+              stagedBytes[staged.back().memoryRoute[hop]] += linkFacts.bytes;
+          }
+        }
+        continue;
+      }
+
+      // Fan-in (design §15.3): several producers feed one value. Consumers
+      // sharing a destination memory are served by one gather, so the feeds and
+      // the intermediate tile are counted once per memory, not once per
+      // consumer.
+      std::vector<InstanceId> producerIds;
+      for (const ValueEndpoint &producerEnd : link.producers)
+        producerIds.push_back(partial.chosen[producerEnd.node]->id);
+      llvm::sort(producerIds);
+
+      std::vector<MemoryNodeId> gatherMemories;
+      std::vector<std::vector<const ValueEndpoint *>> gatherGroups;
+      for (const ValueEndpoint &consumerEnd : link.consumers) {
+        MemoryNodeId memory =
+            primaryMemory(machine, *partial.chosen[consumerEnd.node]);
+        size_t group = 0;
+        for (; group < gatherMemories.size(); ++group)
+          if (gatherMemories[group] == memory)
+            break;
+        if (group == gatherMemories.size()) {
+          gatherMemories.push_back(memory);
+          gatherGroups.emplace_back();
+        }
+        gatherGroups[group].push_back(&consumerEnd);
+      }
+
+      for (size_t group = 0; group < gatherGroups.size(); ++group) {
+        MemoryNodeId consumerMemory = gatherMemories[group];
+        const std::vector<const ValueEndpoint *> &groupEndpoints =
+            gatherGroups[group];
+        const ValueEndpoint &representative = *groupEndpoints.front();
+        const CandidateInstance &consumer =
+            *partial.chosen[representative.node];
+        std::vector<InstanceId> consumerIds;
+        for (const ValueEndpoint *endpoint : groupEndpoints)
+          consumerIds.push_back(partial.chosen[endpoint->node]->id);
+        llvm::sort(consumerIds);
+
+        Cost feedCost;
+        std::vector<ExecutorId> engines;
+        for (const ValueEndpoint &producerEnd : link.producers) {
+          ConnectionRequest request =
+              makeRequest(*partial.chosen[producerEnd.node], consumer,
+                          producerEnd.port, representative.port, link.value);
+          bool feedTruncated = false;
+          llvm::Expected<std::vector<ConnectionPlan>> alternatives =
+              synthesizeConnections(request, machine, topology,
+                                    placementOptions, &feedTruncated);
+          if (alternatives)
+            result.routeCount += alternatives->size();
+          reportTruncation(feedTruncated);
+          if (!alternatives) {
+            report(DiagnosticCode::NoMemoryRoute,
+                   "gather: " + llvm::toString(alternatives.takeError()));
+            return false;
+          }
+          if (alternatives->empty()) {
+            incompatible("gather: a producer has no legal route");
+            return false;
+          }
+          const ConnectionPlan *best = pickBest(*alternatives);
+          feedCost = addCost(feedCost, best->cost);
+          for (const ExecutorId &engine : best->transferEngines)
+            if (!llvm::is_contained(engines, engine))
+              engines.push_back(engine);
+        }
+        ConnectionPlan reduce =
+            synthesizeFanIn(producerIds, consumerIds, link.value,
+                            consumerMemory, linkFacts.bytes, feedCost);
+        reduce.transferEngines.assign(engines.begin(), engines.end());
+        staged.push_back(std::move(reduce));
+        cost = addCost(cost, staged.back().cost);
+        // The gather stages its reduced intermediate tile on the consumer.
+        stagedBytes[consumerMemory] += linkFacts.bytes;
+      }
+    }
+
+    // §9.3: no memory's own capacity may be exceeded (per-node), on top of the
+    // global byte ceiling (whole plan). Replicated copies and gathered
+    // intermediate tiles are charged to the memory that holds them alongside
+    // the instances' own bytes. Keys are walked sorted: which memory is
+    // inspected first decides whether an unknown binding is reported as an
+    // error or an over-capacity one merely rejects the branch, so `StringMap`
+    // iteration order must not reach that decision (design §22.1).
+    for (const auto &entry : stagedBytes)
+      partial.memoryBytes[entry.first()] += entry.second;
+    uint64_t totalBytes = 0;
+    for (llvm::StringRef key : sortedKeys(partial.memoryBytes)) {
+      uint64_t bytes = partial.memoryBytes.lookup(key);
+      totalBytes += bytes;
+      const MemoryNode *memory = machine.findMemory(key);
+      if (!memory) {
+        // Defensive: an id no machine node names cannot be checked. Surface it
+        // as an error rather than silently treating it as unlimited.
+        if (!pendingError)
+          pendingError = llvm::createStringError(
+              llvm::inconvertibleErrorCode(),
+              "covering search: plan binds unknown memory '" + key.str() + "'");
+        return false;
+      }
+      if (bytes > memory->capacityBytes) {
+        ++result.frontier.plansRejectedByCapacity;
+        report(DiagnosticCode::MemoryCapacityExceeded,
+               "memory '" + key.str() + "' over capacity (" +
+                   std::to_string(memory->capacityBytes) + " bytes)");
+        return false;
+      }
+    }
+    if (totalBytes > options_.memoryBudgetBytes) {
+      ++result.frontier.plansRejectedByCapacity;
+      report(DiagnosticCode::MemoryCapacityExceeded,
+             "plan byte total exceeds the global budget (" +
+                 std::to_string(options_.memoryBudgetBytes) + " bytes)");
+      return false;
+    }
+
+    // The branch fits, so the values whose last consumer this placement is have
+    // now run: release the bytes they were charged. Releasing *after* the
+    // capacity check keeps a consumer and the value it reads charged together
+    // for the placement -- an operation reads its inputs and writes its outputs
+    // in the same step, so they genuinely overlap. Where the graph fixes no
+    // order, staying conservative is the rule (ruling R2): only a value whose
+    // last consumer is placed expires, and its bytes are charged the whole time
+    // every endpoint is still live.
+    for (size_t index : completedLinks) {
+      auto charges = partial.liveValueCharges.find(valueLinks[index].value);
+      if (charges == partial.liveValueCharges.end())
+        continue;
+      for (const auto &charge : charges->second) {
+        uint64_t &held = partial.memoryBytes[charge.first];
+        // Subtract exactly what was charged. The charge can never exceed what
+        // the memory still holds -- every release is a charge made earlier and
+        // not yet released -- so `held >= charge.second` holds; `min` only
+        // keeps a future accounting bug from underflowing instead of failing
+        // loudly, and never masks drift by clamping a correct value.
+        assert(held >= charge.second &&
+               "live-value release exceeds the memory's charged bytes");
+        held -= charge.second;
+      }
+      partial.liveValueCharges.erase(charges);
+    }
+
+    // The branch is legal: publish its connections to the shared pool.
+    for (ConnectionPlan &plan : staged) {
+      pool.push_back(std::move(plan));
       partial.connections.push_back(pool.size() - 1);
-      cost = addCost(cost, best->cost);
     }
 
     partial.cost = cost;
@@ -309,19 +963,34 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return true;
   };
 
-  // Admissible bound: accumulated cost plus the cheapest instance still
-  // available for every uncovered node.
-  auto bound = [&](const Partial &partial) -> double {
-    double total = partial.cost.latencyCycles;
+  // Optimistic completion cost: accumulated cost plus, for every uncovered
+  // node, the componentwise best still reachable. "Best" is direction-aware --
+  // a minimize objective wants the smallest reachable value, a maximize
+  // objective the largest, so the bound favours the branch it bounds. The
+  // per-instance value is `entry.cost` (measured-or-static), never
+  // `instance.localCost`: a calibrated-down instance must lower the bound, not
+  // be pruned by a stale static estimate. A node with no reachable instance
+  // makes the bound infinite, which `boundIsBetterThan` always loses whichever
+  // direction is declared.
+  //
+  // The bound omits connection costs, which are unknown until both endpoints of
+  // a connection are chosen and are non-negative. That keeps it admissible for
+  // minimize (omitted terms can only raise a completion); for maximize the
+  // omission makes it too small, so the exact prune below is disabled unless
+  // the objective minimizes.
+  auto boundCost = [&](const Partial &partial) -> Cost {
+    Cost total = partial.cost;
     for (size_t index = 0; index < tables.size(); ++index) {
       if (partial.chosen[index])
         continue;
-      double cheapest = std::numeric_limits<double>::infinity();
+      std::optional<Cost> best;
       for (const InstanceEntry &entry : tables[index].instances)
-        cheapest = std::min(cheapest, entry.instance.localCost.latencyCycles);
-      if (!std::isfinite(cheapest))
-        return std::numeric_limits<double>::infinity();
-      total += cheapest;
+        best = best
+                   ? bestCostForObjective(*best, entry.cost, options_.objective)
+                   : entry.cost;
+      if (!best)
+        return infiniteCost();
+      total = addCost(total, *best);
     }
     return total;
   };
@@ -348,14 +1017,23 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         for (const InstanceEntry &entry : tables[*node].instances) {
           Partial branch = partial;
           if (extend(branch, *node, entry)) {
-            branch.lowerBound = bound(branch);
+            branch.lowerBound = boundCost(branch);
             next.push_back(std::move(branch));
           }
         }
       }
-      llvm::sort(next, [](const Partial &lhs, const Partial &rhs) {
-        if (lhs.lowerBound != rhs.lowerBound)
-          return lhs.lowerBound < rhs.lowerBound;
+      // Bound order: the more promising bound first, direction-aware. An exact
+      // tie falls back to the deeper (more covered) plan, then the stable
+      // partial id. The beam is a bounded heuristic that may sort on a bound
+      // the exact prune would reject; it flags truncation only when a level
+      // exceeds `beamWidth` and is cut below, not unconditionally.
+      llvm::sort(next, [&](const Partial &lhs, const Partial &rhs) {
+        if (boundIsBetterThan(lhs.lowerBound, rhs.lowerBound,
+                              options_.objective))
+          return true;
+        if (boundIsBetterThan(rhs.lowerBound, lhs.lowerBound,
+                              options_.objective))
+          return false;
         if (lhs.covered != rhs.covered)
           return lhs.covered > rhs.covered;
         return lhs.id < rhs.id;
@@ -363,6 +1041,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (next.size() > options_.beamWidth) {
         next.resize(options_.beamWidth);
         result.searchTruncated = true;
+        report(DiagnosticCode::SearchTruncated,
+               "beam width reached (beamWidth=" +
+                   std::to_string(options_.beamWidth) + ")");
       }
       beam = std::move(next);
       if (beam.empty())
@@ -375,7 +1056,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // Deterministic and exact share a depth-first walk; they differ in when
     // they stop and in whether the bound prunes.
     bool exact = options_.mode == SearchMode::Exact;
-    std::vector<double> bestCosts; // best complete costs, ascending
+    // Best complete costs for the exact-minimize prune, ranked by the declared
+    // objective (best first, so the worst kept plan is `back()`). Only the
+    // prune reads it, and only a minimize objective arms that prune, so a
+    // maximize or deterministic run skips this bookkeeping along with the
+    // prune block below.
+    std::vector<Cost> bestCosts;
     std::function<void(Partial &, bool &)> visit = [&](Partial &partial,
                                                        bool &stop) {
       if (stop)
@@ -383,10 +1069,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       std::optional<size_t> node = lowestUncovered(partial);
       if (!node) {
         complete.push_back(partial);
-        bestCosts.push_back(partial.cost.latencyCycles);
-        llvm::sort(bestCosts);
-        if (bestCosts.size() > options_.topK)
-          bestCosts.resize(options_.topK);
+        if (exact && options_.objective.minimize) {
+          bestCosts.push_back(partial.cost);
+          llvm::sort(bestCosts, [&](const Cost &lhs, const Cost &rhs) {
+            return costLess(lhs, rhs, options_.objective);
+          });
+          if (bestCosts.size() > options_.topK)
+            bestCosts.resize(options_.topK);
+        }
         return;
       }
       for (const InstanceEntry &entry : tables[*node].instances) {
@@ -395,14 +1085,32 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         Partial branch = partial;
         if (!extend(branch, *node, entry))
           continue;
-        if (exact) {
-          branch.lowerBound = bound(branch);
+        // Bound-based pruning is sound only for a minimize objective. The bound
+        // omits connection costs (a connection is synthesized only once both
+        // endpoints are chosen), and that term is non-negative: for minimize an
+        // omitted term can only raise a completion, so the bound stays at or
+        // below it; for maximize the same omission makes the bound too small,
+        // and a branch whose real completion would be largest can look poor.
+        // Maximize therefore explores fully -- the caps (topK, instance,
+        // candidate, and route caps) still bound the run and report
+        // `searchTruncated`, so it never silently returns a non-best plan.
+        if (exact && options_.objective.minimize) {
+          branch.lowerBound = boundCost(branch);
           if (bestCosts.size() >= options_.topK &&
-              branch.lowerBound >= bestCosts.back()) {
-            // A full top-K list makes this prune exact -- it cannot drop a
-            // plan we would keep -- but the space was not exhausted, and the
-            // caller is told so.
+              !boundIsBetterThan(branch.lowerBound, bestCosts.back(),
+                                 options_.objective)) {
+            // A full top-K list makes this prune exact for a *strictly better*
+            // cost: it cannot drop a completion strictly cheaper than the worst
+            // kept plan. On an exact cost *tie* it is not exact -- the bound
+            // compares against `bestCosts.back()`, which is cost-only, while
+            // the final top-K trim keys on `(cost, plan.id)`, so a tie can
+            // prune a plan whose smaller id the trim would have kept. Either
+            // way the space was not exhausted, and the caller is told so
+            // (`searchTruncated`).
             result.searchTruncated = true;
+            report(DiagnosticCode::SearchTruncated,
+                   "exact search pruned by the top-K bound (topK=" +
+                       std::to_string(options_.topK) + ")");
             continue;
           }
         }
@@ -425,16 +1133,26 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return std::move(pendingError);
 
   // --- finalize --------------------------------------------------------
-  llvm::sort(complete, [](const Partial &lhs, const Partial &rhs) {
-    if (lhs.cost.latencyCycles != rhs.cost.latencyCycles)
-      return lhs.cost.latencyCycles < rhs.cost.latencyCycles;
-    return lhs.id < rhs.id;
-  });
+  // Tally complete plans before the top-K cap drops the tail (design §22.2).
+  result.planCount = complete.size();
+  // The top-K cap, when it bites, is a search truncation like any other. Fold
+  // it into the flag *before* any plan's content id is computed, because the
+  // flag is part of that content (see `canonicalPlanString`); this keeps every
+  // plan's id identical whether the cap was recorded before or after it was
+  // built.
   if (complete.size() > options_.topK) {
-    complete.resize(options_.topK);
     result.searchTruncated = true;
+    report(DiagnosticCode::SearchTruncated,
+           "top-K cap reached (topK=" + std::to_string(options_.topK) + ")");
   }
 
+  // Build every complete plan before trimming, so each one's *exposed* content
+  // id exists. The internal `Partial::id` is a search heuristic over partial
+  // plans; the documented tie-break is the exposed plan id (design §22.1), so
+  // the trim below must see the latter -- trimming on the partial hash would
+  // keep whichever K the search happened to order first.
+  std::vector<CoveringPlan> plans;
+  plans.reserve(complete.size());
   for (const Partial &partial : complete) {
     CoveringPlan plan;
     std::vector<InstanceId> instances;
@@ -458,22 +1176,24 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       PlanPlacement placement;
       placement.node = tables[index].node;
       placement.instance = instance->id;
+      // The bundle travels on the placed instance, so it reaches the plan
+      // unchanged and generic code never re-reads the rule for it.
+      placement.bundle = instance->bundle;
       for (const InstanceEntry &entry : tables[index].instances) {
         if (&entry.instance == instance) {
           placement.rule = entry.rule->id;
-          placement.bundle = entry.rule->bundle;
           break;
         }
       }
       placement.executor = instance->executorBindings.lookup("executor");
       placement.memories = instance->memoryBindings;
       placement.layouts = instance->layoutBindings;
+      // The solved parameterization travels with the binding, so a selected
+      // plan says which one it chose rather than only naming the layout family.
+      placement.layoutSolutions = instance->layoutSolutions;
       plan.placements.push_back(std::move(placement));
     }
-    llvm::sort(plan.placements,
-               [](const PlanPlacement &lhs, const PlanPlacement &rhs) {
-                 return lhs.node < rhs.node;
-               });
+    llvm::sort(plan.placements, placementBefore);
 
     for (size_t index : partial.connections) {
       const ConnectionPlan &connection = pool[index];
@@ -493,9 +1213,33 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
 
     plan.totalCost = partial.cost;
     plan.diagnostics.searchTruncated = result.searchTruncated;
+    // Record the search point this plan came from before its content id is
+    // folded, so two plans differing only by their binding do not collide.
+    if (binding_) {
+      plan.sourceBindingHash = binding_->stableHash;
+      plan.sourceBindingCandidate = binding_->candidateId;
+      plan.globalParameters = binding_->values;
+    }
     plan.id = computePlanId(plan);
-    result.plans.push_back(std::move(plan));
+    plans.push_back(std::move(plan));
   }
+
+  // §22.1: order and retain by the declared objective and then the *exposed*
+  // plan id -- the documented key. The beam's `partialId` ordering stays where
+  // it belongs, inside the beam's frontier heuristic; it never decides which K
+  // survive a cap nor the emitted order. An exact cost tie breaks on `plan.id`,
+  // so both are reproducible from `(totalCost, plan.id)` alone.
+  llvm::sort(plans, [&](const CoveringPlan &lhs, const CoveringPlan &rhs) {
+    return ranksBefore(lhs.totalCost, lhs.id, rhs.totalCost, rhs.id,
+                       options_.objective);
+  });
+  if (plans.size() > options_.topK)
+    plans.resize(options_.topK);
+  result.plans = std::move(plans);
+
+  // §22.1/§22.3: the frontier's codes are the stable interface, so their order
+  // must not depend on the order branches happened to be explored.
+  llvm::sort(result.frontier.diagnostics, diagnosticLess);
   return result;
 }
 

@@ -22,6 +22,7 @@ ctest --output-on-failure        # Same suite, without building first
 ctest -R MicroDialectTileOps     # Run a single FileCheck test
 ./llk-opt input.mlir             # Parse + print IR
 ./llk-opt --llk-to-linalg input.mlir  # Run a specific pass
+./llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store" input.mlir  # Search, bind best plan
 ./<TestName>                     # Run a single GTest
 ```
 
@@ -55,9 +56,15 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 9. Use external GEMM as baseline, not necessarily final implementation
 10. Keep first target narrow: one op, one dtype, one layout, one ISA
 
-**Custom dialects:** `llk` is small — only retains domain info unavailable in generic MLIR (`llk.fused_swiglu`, `llk.rope`, `llk.attention`); never recreate tensor/linalg/vector/memref. `micro` (`include/LLK/Dialect/Micro/`) is the tile-centric execution IR. Implemented: `!micro.tile`, `#micro.layout`, `#micro.owner`, `#micro.memory`; ops `micro.kernel`, `micro.{tile_view,tile_alloc,tile_partition,tile_async_copy,tile_store}`, `micro.{mma,vector,reduce}`, `micro.{for,spatial_for,pipeline,alloc,async_copy,wait,store}`. Search-space ops (`micro.search_space`, `micro.param`, `micro.constraint`, `micro.objective`, `micro.candidate`) are M9 remaining work (issue #44).
+**Custom dialects:** `llk` is small — only retains domain info unavailable in generic MLIR (`llk.fused_swiglu`, `llk.rope`, `llk.attention`); never recreate tensor/linalg/vector/memref. `micro` (`include/LLK/Dialect/Micro/`) is the tile-centric execution IR. Implemented: `!micro.tile`, `#micro.layout`, `#micro.owner`, `#micro.memory`; ops `micro.kernel`, `micro.{tile_view,tile_alloc,tile_partition,tile_async_copy,tile_store}`, `micro.{mma,vector,reduce}`, `micro.{for,spatial_for,pipeline,alloc,async_copy,wait,store}`. Search-space ops (`micro.search_space`, `micro.param`, `micro.constraint`, `micro.objective`, `micro.candidate`) are implemented (#44). A bound plan adds target-neutral metadata attributes to the kernel: `micro.plan`, `micro.mapping`, `micro.routes`, plus `micro.value`/`micro.dst_node` on each emitted copy.
 
-**Gotcha — `MicroEnums.h` is hand-written:** the CMake tablegen config does not run `-gen-enum-decls/-gen-enum-defs`. Adding an enum in `MicroDialect.td` requires a matching hand-written `stringify*`/`symbolize*` entry in `include/LLK/Dialect/Micro/MicroEnums.h`.
+**Mapping subsystem (epic #67):** target policy is declarative and consumed by generic code. Libraries: `LLKMachine` (`include/LLK/Machine/` — v2 topology: executor/memory/compute/transfer nodes with `contains`/`dominates`/`attached_to`/`link` edges) and `LLKMapping` (`include/LLK/Mapping/` — workload graph, candidate/instance/connection/covering, routing, LLKMap, placement, covering search, plan binder, cost/latency/diagnostics/report). Target packages live in `lib/Target/<Target>/Mapping/` (`LLKTargetMapping`) with policy in `mapping/<target>/{layouts,rules}.llkmap`; machines are `machines/*-v2.yaml`. Generic `lib/Mapping`/`lib/Machine` code must never branch on a target name — policy belongs in the `.llkmap`/`.yaml` files.
+
+**Gotcha — `MicroEnums.h` is hand-written:** the CMake tablegen config does not run `-gen-enum-decls/-gen-enum-defs`. Adding an enum in `MicroDialect.td` requires a matching hand-written `stringify*`/`symbolize*` entry in `include/LLK/Dialect/Micro/MicroEnums.h`. The mapping diagnostics enum (`include/LLK/Mapping/Diagnostics.h`) follows the same hand-written pattern, as do the MachineModel v2 kind/direction stringifiers.
+
+**Gotcha — adding a MachineModel field:** give it a default member initializer (e.g. `std::vector<std::string> equivalentTo{};`) or every aggregate test literal emits `-Wmissing-field-initializers`. The loader preserves the minor version (`MachineModel::schemaMinor`) and tolerates *unknown keys only when the file declares a minor greater than `kSupportedSchemaMinor`*; missing required keys, wrong node types, malformed values, and unknown kinds are always rejected. `schemaMinor` is excluded from the content hash.
+
+**Gotcha — compiler version is generated:** `CMakeLists.txt` does `configure_file(include/LLK/Version.h.in → ${CMAKE_BINARY_DIR}/include/LLK/Version.h)` producing `LLK_COMPILER_VERSION` from the project version plus `git describe`. The plan report prints it; there is no hand-written version constant.
 
 **Schedules are data:** Transform dialect `.mlir` files or `schedule_db.json`. Keyed by `(operation, M_bucket, N, K, dtype, ISA, math_mode)`. 5 M-buckets: {1}, [2,4], [5,16], [17,64], ≥65.
 
@@ -68,11 +75,16 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 - Error handling: MLIR `emitError()` for verifier failures, `llvm::Expected<T>` for JIT ops
 - ABI: C structs (`Tensor2D`, `KernelContext`) — not MLIR memref descriptors
 - TDD: every task starts with a failing test, then minimal code; commit per task
-- FileCheck tests are plain `add_test` entries in the root `CMakeLists.txt` — there is no lit runner, and `// RUN:` lines are comments only. Register new `.mlir` tests by hand with `add_llk_filecheck_test(Name test/Dialect/Micro/foo.mlir)`, or use a raw `add_test` with `--verify-diagnostics --split-input-file` for invalid-IR tests
+- FileCheck tests are plain `add_test` entries in the root `CMakeLists.txt` — there is no lit runner, and `// RUN:` lines are comments only. Register new `.mlir` tests by hand with `add_llk_filecheck_test(Name test/Dialect/Micro/foo.mlir)` (an optional trailing argument is passed through to the tool, e.g. pass options), or use a raw `add_test` with `--verify-diagnostics --split-input-file` for invalid-IR tests
+- Mapping/target boundary: generic `lib/Mapping` + `lib/Machine` stay target-neutral; target policy is data (`mapping/*.llkmap`, `machines/*.yaml`). `LLKMapping` takes `-fno-rtti -fno-exceptions` and links only `LLVMSupport`/`LLKMachine` (+ `MLIRIR`/`MLIRAsmParser` via `mlir_target_link_libraries`)
 
 ## Milestone Sequence
 
-M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, specialization/tuning, RoPE + Attention). **Current work is the M9+ Micro-IR roadmap** (tracker: issue #41): M9 dialect infra + concrete execution ops ✅, search-space ops (open) → M10 MachineModel YAML + AVX2 perf simulator → M11 LLKToMicro lowering + search-space export → M12 tuning core + candidate ranking → M13 measurement loop + calibration. Python frontend (M7) deferred.
+M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, specialization/tuning, RoPE + Attention). M7 (Python frontend) deferred.
+
+**M9–M12 complete.** Search-space IR (#44), LLKToMicro + search export (#47/#48), MachineModel + `micro-perf` (#45/#46), tuning core + candidate binding/ranking (#49/#50), and the **epic #67 topology-aware mapping subsystem**: MachineModel v2 topology, deterministic routing, declarative LLKMap layouts and rules, placement and connection synthesis, deterministic/beam/exact covering search, AVX2 + generic-accelerator target packages, plan binding and emission, §22.3 diagnostics, §22.2 versioned plan report, and an optional `LatencyProvider`.
+
+**Remaining: M13 — measurement loop and calibration (#51/#52).** Blocked on a way to *execute* micro-IR, which does not exist; that is the deferred Micro emulator (#54), so it is a milestone, not a slice. Tracker: issue #41; epic #67.
 
 ## Key Files
 
@@ -83,6 +95,15 @@ M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, sp
 | `docs/design/m9-canonical-micro-ir-architecture.md` | Micro-IR project-level redesign, layer responsibilities |
 | `docs/design/m9-micro-ir-core-concepts.md` | `micro` dialect semantics: tile model, op families, attrs, verifier rules |
 | `docs/superpowers/specs/2026-08-13-micro-ir-tile-programming-model-spec.md` | Detailed tile programming model |
+| `docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md` | Epic #67 design: mapping engine, MachineModel v2, routing, LLKMap, covering search, plan binding (§-numbered throughout the code) |
+| `docs/design/micro-ir-mapping-workflow.md` | Contributor workflow: extract → match → place → connect → cover → bind → verify |
+| `docs/design/llkmap-layout-grammar.md`, `docs/design/llkmap-rule-grammar.md` | LLKMap declarative grammar: layouts, rules, target bundles |
+| `include/LLK/Machine/` + `lib/Machine/` | `MachineModel` v2 topology, loader, content hash |
+| `include/LLK/Mapping/` + `lib/Mapping/` | Mapping core: workload graph, routing, LLKMap, rules, placement, covering search, plan binder, cost/latency/diagnostics/report |
+| `include/LLK/Target/*/Mapping/` + `lib/Target/*/Mapping/` | AVX2 and generic-accelerator mapping targets (`LLKTargetMapping`) |
+| `mapping/<target>/{layouts,rules}.llkmap` | Declarative target policy (layouts + mapping rules + bundles) |
+| `machines/*-v2.yaml` | MachineModel v2 topology profiles |
+| `docs/superpowers/plans/2026-10-03-micro-ir-gap-closure.md` | Gap-closure plan (31 TDD tasks) |
 | `include/LLK/Dialect/Micro/` + `lib/Dialect/Micro/` | `micro` dialect implementation |
 | `docs/superpowers/plans/m[1-6]-*.md` | Implementation plans with TDD tasks + complete code |
 | `docs/superpowers/plans/2026-07-14-llk-compiler-implementation.md` | Plan index + file map |

@@ -1,14 +1,26 @@
 //===- avx2_target.cpp - AVX2 mapping target (D7) ------------------------===//
 
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/PlanBinder.h"
+#include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
+#include "LLK/Dialect/Micro/MicroDialect.h"
+
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/Parser/Parser.h"
+
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
 
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace mlir::llk::mapping;
 
@@ -49,6 +61,36 @@ llvm::Expected<std::unique_ptr<MappingTarget>> loadTarget() {
   return avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
 }
 
+/// A kernel in the shape `llk-to-micro` emits for a tile program: a logical
+/// view of an external tensor, an async staging copy into SRAM, and a store
+/// back to DRAM. Used to carry the tile-movement rules past matching and
+/// through the binder, where a wrong port split would show.
+constexpr llvm::StringLiteral kTileMovementKernel = R"mlir(
+module {
+  micro.kernel @tiles {
+    %ext = tensor.empty() : tensor<8x32xbf16>
+    %v = micro.tile_view %ext {shape = array<i64: 8, 32>} : tensor<8x32xbf16> -> !micro.tile<8x32xbf16, memory = #micro.memory<dram>>
+    %t, %tok = micro.tile_async_copy %v {dst_memory = #micro.memory<sram>, owner = #micro.owner<worker>} : !micro.tile<8x32xbf16, memory = #micro.memory<dram>> -> !micro.tile<8x32xbf16, memory = #micro.memory<sram>, owner = #micro.owner<worker>>, !micro.async_token
+    micro.tile_store %t {dst_memory = #micro.memory<dram>} : !micro.tile<8x32xbf16, memory = #micro.memory<sram>, owner = #micro.owner<worker>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// A bundle naming `emitterKey` with one well-typed integer parameter.
+TargetBundle makeBundle(llvm::StringRef emitterKey,
+                        mlir::MLIRContext &context) {
+  TargetBundle bundle;
+  bundle.name = "avx2.vector_add";
+  bundle.emitterKey = emitterKey.str();
+  bundle.parameters = mlir::DictionaryAttr::get(
+      &context,
+      {mlir::NamedAttribute(
+          mlir::StringAttr::get(&context, "rows"),
+          mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), 4))});
+  return bundle;
+}
+
 } // namespace
 
 TEST(Avx2Target, LoadsAndVerifiesItsConfiguration) {
@@ -69,6 +111,73 @@ TEST(Avx2Target, EveryRuleEmitterIsDeclared) {
   EXPECT_FALSE(avx2_mapping::emitterKeys().empty());
 }
 
+TEST(Avx2Target, ExposesAnEmitterForEachDeclaredKey) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  // The design §19 factory creates a target-owned emitter; its key is one the
+  // target declares, so generic code can hand it a bundle without knowing the
+  // AVX2 vocabulary.
+  std::unique_ptr<TargetEmitter> primary = (*target)->createEmitter();
+  ASSERT_NE(primary, nullptr);
+  EXPECT_TRUE((*target)->isKnownEmitter(primary->key()));
+
+  for (llvm::StringLiteral key : avx2_mapping::emitterKeys()) {
+    std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter(key);
+    ASSERT_NE(emitter, nullptr) << key.data();
+    EXPECT_EQ(emitter->key(), key);
+  }
+  // An undeclared key has no emitter rather than a fabricated one.
+  EXPECT_EQ((*target)->createEmitter("avx2_missing"), nullptr);
+}
+
+TEST(Avx2Target, EmitterVerifiesBundleCompleteness) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter();
+  ASSERT_NE(emitter, nullptr);
+  mlir::MLIRContext context;
+
+  // A bundle for the emitter's own key with well-typed parameters is complete.
+  EXPECT_FALSE(
+      static_cast<bool>(emitter->verify(makeBundle(emitter->key(), context))));
+
+  // A rule with no bundle parameters produces a bundle whose `parameters` is a
+  // null DictionaryAttr; that is the most common shape and must be accepted,
+  // not dereferenced.
+  TargetBundle parameterless = makeBundle(emitter->key(), context);
+  parameterless.parameters = {};
+  EXPECT_FALSE(static_cast<bool>(emitter->verify(parameterless)));
+
+  // A bundle naming an emitter the target does not declare is rejected.
+  llvm::Error unknown = emitter->verify(makeBundle("avx2_missing", context));
+  ASSERT_TRUE(static_cast<bool>(unknown));
+  EXPECT_NE(llvm::toString(std::move(unknown)).find("avx2_missing"),
+            std::string::npos);
+
+  // A bundle naming a *different but declared* emitter key is rejected too:
+  // an emitter handles exactly one key.
+  llvm::ArrayRef<llvm::StringLiteral> keys = avx2_mapping::emitterKeys();
+  ASSERT_GE(keys.size(), 2u);
+  std::unique_ptr<TargetEmitter> first = (*target)->createEmitter(keys[0]);
+  ASSERT_NE(first, nullptr);
+  llvm::Error otherKey = first->verify(makeBundle(keys[1], context));
+  ASSERT_TRUE(static_cast<bool>(otherKey));
+  EXPECT_NE(llvm::toString(std::move(otherKey)).find("handles"),
+            std::string::npos);
+
+  // A parameter whose value is not the integer/string shape the plugin
+  // contract permits is rejected.
+  TargetBundle malformed = makeBundle(emitter->key(), context);
+  malformed.parameters = mlir::DictionaryAttr::get(
+      &context, {mlir::NamedAttribute(mlir::StringAttr::get(&context, "rows"),
+                                      mlir::UnitAttr::get(&context))});
+  llvm::Error badParameters = emitter->verify(malformed);
+  ASSERT_TRUE(static_cast<bool>(badParameters));
+  EXPECT_NE(llvm::toString(std::move(badParameters)).find("rows"),
+            std::string::npos);
+}
+
 TEST(Avx2Target, MatchesItsOwnRuleForTheVectorOperation) {
   llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
   ASSERT_TRUE(static_cast<bool>(target));
@@ -80,6 +189,141 @@ TEST(Avx2Target, MatchesItsOwnRuleForTheVectorOperation) {
   std::vector<const RuleDef *> matches = matchRules(node, (*target)->rules());
   ASSERT_EQ(matches.size(), 1u);
   EXPECT_EQ(matches[0]->id, "avx2.vector_add");
+}
+
+TEST(Avx2Target, LeavesUnruledVectorVariantsUnmatched) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target));
+  mlir::MLIRContext context;
+
+  // Matching is per `op` value, not per op name: a variant the target has no
+  // implementation for must stay uncovered rather than fall back to a
+  // catch-all. `exp` is a `micro.vector` op the AVX2 target does not implement.
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context, "exp");
+  EXPECT_TRUE(matchRules(node, (*target)->rules()).empty());
+}
+
+TEST(Avx2Target, CoversTheTileMovementOpsTheLoweringEmits) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  // `llk-to-micro` emits these two tile-level movement ops, so a rule must
+  // cover each one; without them a compiler-generated tile program fails with
+  // `no_matching_rule`. Each rule's `emit` key must be one the target declares.
+  for (llvm::StringRef op : {"micro.tile_async_copy", "micro.tile_store"}) {
+    WorkloadNode node;
+    node.opName = op.str();
+    std::vector<const RuleDef *> matches = matchRules(node, (*target)->rules());
+    ASSERT_FALSE(matches.empty()) << "no rule matches " << op.str();
+    for (const RuleDef *rule : matches)
+      EXPECT_TRUE((*target)->isKnownEmitter(rule->emitter)) << rule->id;
+  }
+}
+
+TEST(Avx2Target, BindsTheTileMovementOpsTheLoweringEmits) {
+  // Carried acceptance from the rules that cover `micro.tile_async_copy` and
+  // `micro.tile_store`. Two claims, checked separately because different
+  // defects falsify them:
+  //
+  //   * the plan binds and stamps `micro.mapping` on both nodes -- the binder
+  //     reads placement identities and value links, never a rule's ports, so
+  //     this proves materialization but cannot see a port split;
+  //   * each rule's declared port split mirrors the node's own ports and bound
+  //     value ids -- the split feeds only the candidate (and its id), so a
+  //     wrong split must be caught at the candidate, not at bind time.
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  context.getOrLoadDialect<mlir::tensor::TensorDialect>();
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kTileMovementKernel, &context);
+  ASSERT_TRUE(module);
+  mlir::Operation *kernel = nullptr;
+  module->walk([&](mlir::Operation *op) {
+    if (!kernel && op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+  });
+  ASSERT_NE(kernel, nullptr);
+
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "bf16";
+
+  // The declared split, against the node the lowering produces. The ports are
+  // positional: one input per input port, then one output per output port.
+  struct SplitCase {
+    llvm::StringLiteral op;
+    llvm::StringLiteral rule;
+    size_t inputs;
+    size_t outputs;
+  };
+  for (const SplitCase &test :
+       {SplitCase{"micro.tile_async_copy", "avx2.tile_async_copy", 1, 1},
+        SplitCase{"micro.tile_store", "avx2.tile_store", 1, 0}}) {
+    const WorkloadNode *node = nullptr;
+    for (const WorkloadNode &candidate : graph->getNodes())
+      if (candidate.opName == test.op) {
+        node = &candidate;
+        break;
+      }
+    ASSERT_NE(node, nullptr) << test.op.str();
+    ASSERT_EQ(node->inputs.size(), test.inputs) << test.op.str();
+    ASSERT_EQ(node->outputs.size(), test.outputs) << test.op.str();
+
+    const RuleDef *rule = (*target)->rules().find(test.rule);
+    ASSERT_NE(rule, nullptr) << test.rule.str();
+    std::string reason;
+    std::optional<MappingCandidate> candidate = toMappingCandidate(
+        *rule, *node, (*target)->machine(), layoutContext, &reason);
+    ASSERT_TRUE(candidate) << test.rule.str() << ": " << reason;
+    ASSERT_EQ(candidate->ports.size(), test.inputs + test.outputs)
+        << test.rule.str();
+    for (size_t i = 0; i < test.inputs; ++i) {
+      EXPECT_TRUE(candidate->ports[i].isInput) << test.rule.str();
+      EXPECT_EQ(candidate->ports[i].value, node->inputs[i].value)
+          << test.rule.str();
+    }
+    for (size_t i = 0; i < test.outputs; ++i) {
+      EXPECT_FALSE(candidate->ports[test.inputs + i].isInput)
+          << test.rule.str();
+      EXPECT_EQ(candidate->ports[test.inputs + i].value, node->outputs[i].value)
+          << test.rule.str();
+    }
+  }
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(*graph, **target, context, layoutContext, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 1u);
+
+  llvm::Expected<BoundPlan> bound =
+      bindPlan(*module, result->plans.front(), **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  EXPECT_TRUE(bound->unmaterialized.empty());
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  bound->module->print(stream);
+  llvm::StringRef mapped(stream.str());
+
+  // Materialization: each movement op is stamped with its own rule and emitter,
+  // and exactly one placement per node.
+  EXPECT_NE(mapped.find("rule = \"avx2.tile_async_copy\""),
+            llvm::StringRef::npos);
+  EXPECT_NE(mapped.find("emitter = \"avx2_tile_copy\""), llvm::StringRef::npos);
+  EXPECT_NE(mapped.find("rule = \"avx2.tile_store\""), llvm::StringRef::npos);
+  EXPECT_NE(mapped.find("emitter = \"avx2_tile_store\""),
+            llvm::StringRef::npos);
+  EXPECT_EQ(mapped.count("micro.mapping"), 2u);
 }
 
 TEST(Avx2Target, MapsAVectorNodeEndToEnd) {

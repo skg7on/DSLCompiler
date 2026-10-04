@@ -6,9 +6,13 @@
 
 #include "LLK/Mapping/LayoutConstraints.h"
 
+#include "LLK/Mapping/StableHash.h"
+
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
@@ -17,6 +21,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -238,6 +243,139 @@ bool LayoutDef::isSymbolic(llvm::StringRef name) const {
   return param && param->symbolic;
 }
 
+std::string canonicalAffineMapSpecString(const AffineMapSpec &spec) {
+  std::string out;
+  for (size_t index = 0; index < spec.dims.size(); ++index) {
+    if (index)
+      out += ',';
+    out += spec.dims[index];
+  }
+  out += "->";
+  for (size_t index = 0; index < spec.results.size(); ++index) {
+    if (index)
+      out += ',';
+    out += spec.results[index] ? canonicalExprString(*spec.results[index])
+                               : "<null>";
+  }
+  return out;
+}
+
+//===----------------------------------------------------------------------===//
+// Source-faithful printing (design §25.3)
+//===----------------------------------------------------------------------===//
+
+std::string printAffineMapSpec(const AffineMapSpec &spec) {
+  std::string out = "(";
+  for (size_t index = 0; index < spec.dims.size(); ++index) {
+    if (index)
+      out += ", ";
+    out += spec.dims[index];
+  }
+  out += ") -> (";
+  for (size_t index = 0; index < spec.results.size(); ++index) {
+    if (index)
+      out += ", ";
+    out += spec.results[index] ? printExpr(*spec.results[index]) : "<null>";
+  }
+  out += ")";
+  return out;
+}
+
+std::string printParamDomain(const ParamDomain &domain) {
+  // A non-empty contiguous ascending integer run prints as a range; every other
+  // domain (symbolic, sparse, or unordered) prints as an enum. Both re-parse to
+  // the identical value list.
+  bool isRun = !domain.values.empty();
+  const int64_t *previous = nullptr;
+  for (const LayoutValue &value : domain.values) {
+    const int64_t *integer = std::get_if<int64_t>(&value);
+    if (!integer || (previous && *integer != *previous + 1)) {
+      isRun = false;
+      break;
+    }
+    previous = integer;
+  }
+  if (isRun)
+    return "[" + std::to_string(std::get<int64_t>(domain.values.front())) +
+           ".." + std::to_string(std::get<int64_t>(domain.values.back())) + "]";
+
+  std::string out = "{";
+  for (size_t index = 0; index < domain.values.size(); ++index) {
+    if (index)
+      out += ", ";
+    out += printValue(domain.values[index]);
+  }
+  out += "}";
+  return out;
+}
+
+std::string printLayout(const LayoutDef &def) {
+  std::string out = "layout " + def.id + "(";
+  for (size_t index = 0; index < def.params.size(); ++index) {
+    if (index)
+      out += ", ";
+    out += def.params[index].symbolic ? "sym " : "int ";
+    out += def.params[index].name;
+  }
+  out += ") {\n";
+  // Domains follow parameter declaration order so `params` round-trips
+  // order-for-order (the domain map is canonical by name, so its own order is
+  // not semantic). A parameter with no domain is still declared by the header.
+  for (const LayoutParam &param : def.params) {
+    auto domain = def.domains.find(param.name);
+    if (domain == def.domains.end())
+      continue;
+    out += "  param " + param.name + " in " + printParamDomain(domain->second) +
+           ";\n";
+  }
+  for (const ExprPtr &constraint : def.constraints) {
+    out += "  require ";
+    out += constraint ? printExpr(*constraint) : "<null>";
+    out += ";\n";
+  }
+  if (def.map)
+    out += "  map " + printAffineMapSpec(*def.map) + ";\n";
+  out += "}\n";
+  return out;
+}
+
+namespace {
+
+/// Canonical rendering of one layout declaration: every field that shapes the
+/// declaration, with a length-prefixed line per field so no field's bytes can
+/// be read as another's.
+std::string canonicalLayoutDefString(const LayoutDef &def) {
+  std::string out;
+  auto field = [&](llvm::StringRef key, llvm::StringRef value) {
+    out += key.str();
+    out += ':';
+    out += std::to_string(value.size());
+    out += ':';
+    out += value.str();
+    out += '\n';
+  };
+  field("id", def.id);
+  for (const LayoutParam &param : def.params)
+    field("param", param.name + (param.symbolic ? ":symbolic" : ":integer"));
+  for (const auto &entry : def.domains) {
+    std::string values;
+    for (const LayoutValue &value : entry.second.values) {
+      if (!values.empty())
+        values += ',';
+      values += canonicalValueString(value);
+    }
+    field("domain", entry.first + "=" + values);
+  }
+  for (const ExprPtr &constraint : def.constraints)
+    field("constraint",
+          constraint ? canonicalExprString(*constraint) : "<null>");
+  if (def.map)
+    field("map", canonicalAffineMapSpecString(*def.map));
+  return out;
+}
+
+} // namespace
+
 bool LayoutRegistry::add(LayoutDef def, std::string &error) {
   if (find(def.id)) {
     error = "duplicate layout id '" + def.id + "'";
@@ -245,6 +383,24 @@ bool LayoutRegistry::add(LayoutDef def, std::string &error) {
   }
   defs_.push_back(std::move(def));
   return true;
+}
+
+uint64_t LayoutRegistry::computeContentHash() const {
+  // `defs_` is insertion order (`all()` reports it as-is), and declaration
+  // order is not part of a layout library's identity, so sort by id before
+  // folding.
+  std::vector<const LayoutDef *> sorted;
+  sorted.reserve(defs_.size());
+  for (const LayoutDef &def : defs_)
+    sorted.push_back(&def);
+  llvm::sort(sorted, [](const LayoutDef *lhs, const LayoutDef *rhs) {
+    return lhs->id < rhs->id;
+  });
+
+  std::string canonical;
+  for (const LayoutDef *def : sorted)
+    canonical += canonicalLayoutDefString(*def);
+  return stableHash(canonical);
 }
 
 const LayoutDef *LayoutRegistry::find(llvm::StringRef id) const {
@@ -377,20 +533,21 @@ llvm::Expected<mlir::AffineExpr> AffineBuilder::convert(const Expr &expr) {
   }
   case ExprKind::StringLit:
   case ExprKind::MemberCall:
+  case ExprKind::Quantifier:
     return evalError("non-affine expression in map");
   }
   return evalError("unhandled map expression");
 }
 
-llvm::Expected<mlir::AffineMap> buildAffineMap(const AffineMapSpec &spec,
-                                               const LayoutSolution &solution,
-                                               mlir::MLIRContext &context) {
-  AffineBuilder builder{context, {}, {}};
+} // namespace
+
+llvm::Expected<mlir::AffineMap>
+buildAffineMap(const AffineMapSpec &spec,
+               const llvm::StringMap<int64_t> &constants,
+               mlir::MLIRContext &context) {
+  AffineBuilder builder{context, {}, constants};
   for (unsigned index = 0; index < spec.dims.size(); ++index)
     builder.dims[spec.dims[index]] = index;
-  for (const auto &entry : solution.values)
-    if (const auto *value = std::get_if<int64_t>(&entry.second))
-      builder.constants[entry.first] = *value;
 
   llvm::SmallVector<mlir::AffineExpr, 4> results;
   for (const ExprPtr &result : spec.results) {
@@ -403,12 +560,15 @@ llvm::Expected<mlir::AffineMap> buildAffineMap(const AffineMapSpec &spec,
                               &context);
 }
 
-} // namespace
+namespace {
 
+/// The bounded-enumeration implementation body: deterministic, over the
+/// declared finite domains, in declaration order. Design §13.3's first
+/// implementation; `BoundedLayoutSolver` wraps it behind the interface.
 llvm::Expected<LayoutSolveResult>
-solveLayout(const LayoutDef &def, const MachineModel &machine,
-            mlir::MLIRContext &context, const LayoutContext &layoutContext,
-            const SolverLimits &limits) {
+solveBounded(const LayoutDef &def, const MachineModel &machine,
+             mlir::MLIRContext &context, const LayoutContext &layoutContext,
+             const SolverLimits &limits) {
   // Every declared parameter must have a finite domain to enumerate.
   llvm::SmallVector<const LayoutParam *, 4> enumerable;
   uint64_t total = 1;
@@ -433,6 +593,24 @@ solveLayout(const LayoutDef &def, const MachineModel &machine,
     return def.domains.find(param.name)->second;
   };
 
+  // One quantifier budget for the whole solve, and a resolver that lets a
+  // `domain(<param>)` quantifier read the declared domains (§13.3). The
+  // resolver is a named lvalue: `function_ref` does not own its callable, so it
+  // must outlive every `evaluateExpr` that borrows it.
+  QuantifierBudget budget;
+  budget.limit = limits.maxQuantifierIterations;
+  auto resolveDomain =
+      [&def](
+          llvm::StringRef name) -> std::optional<llvm::ArrayRef<LayoutValue>> {
+    auto it = def.domains.find(name.str());
+    if (it == def.domains.end())
+      return std::nullopt;
+    return llvm::ArrayRef<LayoutValue>(it->second.values);
+  };
+  EvalOptions evalOptions;
+  evalOptions.budget = &budget;
+  evalOptions.domainResolver = resolveDomain;
+
   LayoutSolveResult result;
   llvm::SmallVector<size_t, 4> index(enumerable.size(), 0);
   uint64_t assignments = 0;
@@ -448,8 +626,8 @@ solveLayout(const LayoutDef &def, const MachineModel &machine,
 
     bool satisfied = true;
     for (const ExprPtr &constraint : def.constraints) {
-      llvm::Expected<EvalValue> value =
-          evaluateExpr(*constraint, bindings, machine, layoutContext);
+      llvm::Expected<EvalValue> value = evaluateExpr(
+          *constraint, bindings, machine, layoutContext, evalOptions);
       if (!value)
         return value.takeError();
       if (value->kind != EvalValue::Kind::Int || value->intValue == 0) {
@@ -463,8 +641,12 @@ solveLayout(const LayoutDef &def, const MachineModel &machine,
       for (const auto &entry : bindings)
         solution.values[entry.first().str()] = entry.second;
       if (def.map) {
+        llvm::StringMap<int64_t> constants;
+        for (const auto &entry : bindings)
+          if (const auto *value = std::get_if<int64_t>(&entry.second))
+            constants[entry.first()] = *value;
         llvm::Expected<mlir::AffineMap> map =
-            buildAffineMap(*def.map, solution, context);
+            buildAffineMap(*def.map, constants, context);
         if (!map)
           return map.takeError();
         solution.map = *map;
@@ -485,8 +667,42 @@ solveLayout(const LayoutDef &def, const MachineModel &machine,
     }
   }
 
-  result.truncated = assignments < total;
+  // The search is incomplete both when the assignment space was not exhausted
+  // and when a quantifier ran out of budget (design §13.3). Exhausting the
+  // quantifier budget is stronger: it leaves a constraint *undecided*, so the
+  // solutions may not be legal and are withheld -- a consumer must never read
+  // an undecided solve as "these layouts are legal, there may be more".
+  result.undecided = budget.exhausted;
+  if (result.undecided)
+    result.solutions.clear();
+  result.truncated = assignments < total || budget.exhausted;
   return result;
+}
+
+/// The interface wrapper around `solveBounded`.
+class BoundedLayoutSolver final : public LayoutSolver {
+public:
+  llvm::Expected<LayoutSolveResult>
+  solve(const LayoutDef &def, const MachineModel &machine,
+        mlir::MLIRContext &context, const LayoutContext &layoutContext,
+        const SolverLimits &limits) const override {
+    return solveBounded(def, machine, context, layoutContext, limits);
+  }
+};
+
+} // namespace
+
+std::unique_ptr<LayoutSolver> makeBoundedLayoutSolver() {
+  return std::make_unique<BoundedLayoutSolver>();
+}
+
+llvm::Expected<LayoutSolveResult>
+solveLayout(const LayoutDef &def, const MachineModel &machine,
+            mlir::MLIRContext &context, const LayoutContext &layoutContext,
+            const SolverLimits &limits) {
+  // Preserved as a thin wrapper; new clients take the `LayoutSolver` interface.
+  return makeBoundedLayoutSolver()->solve(def, machine, context, layoutContext,
+                                          limits);
 }
 
 } // namespace mlir::llk::mapping

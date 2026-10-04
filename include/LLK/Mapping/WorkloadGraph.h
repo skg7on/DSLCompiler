@@ -53,8 +53,10 @@ struct WorkloadValue {
 };
 
 /// A value as seen from one node. `accessMap` is the affine relationship
-/// between the node's iteration space and this value, when known; extraction
-/// leaves it empty and rule/layout stages refine it.
+/// between the node's iteration space and this value, when known. Extraction
+/// populates it for *input* ports whose operand chain states one; output ports
+/// and chains that state none are left empty, to be refined by later
+/// rule/layout stages.
 struct WorkloadPort {
   WorkloadValueId value = 0;
   Type type;

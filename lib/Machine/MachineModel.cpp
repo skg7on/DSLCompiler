@@ -9,8 +9,46 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/ErrorHandling.h"
 
 namespace mlir::llk::machine {
+
+llvm::StringRef stringifySchedulingClass(SchedulingClass value) {
+  switch (value) {
+  case SchedulingClass::InOrder:
+    return "in_order";
+  case SchedulingClass::OutOfOrder:
+    return "out_of_order";
+  }
+  llvm_unreachable("unhandled SchedulingClass");
+}
+
+std::optional<SchedulingClass> symbolizeSchedulingClass(llvm::StringRef text) {
+  if (text == "in_order")
+    return SchedulingClass::InOrder;
+  if (text == "out_of_order")
+    return SchedulingClass::OutOfOrder;
+  return std::nullopt;
+}
+
+llvm::StringRef stringifyLinkDirectionality(LinkDirectionality value) {
+  switch (value) {
+  case LinkDirectionality::Unidirectional:
+    return "unidirectional";
+  case LinkDirectionality::Bidirectional:
+    return "bidirectional";
+  }
+  llvm_unreachable("unhandled LinkDirectionality");
+}
+
+std::optional<LinkDirectionality>
+symbolizeLinkDirectionality(llvm::StringRef text) {
+  if (text == "unidirectional")
+    return LinkDirectionality::Unidirectional;
+  if (text == "bidirectional")
+    return LinkDirectionality::Bidirectional;
+  return std::nullopt;
+}
 
 namespace {
 
@@ -54,7 +92,9 @@ std::string optionalNumber(const std::optional<T> &value) {
 
 std::string renderExecutor(const ExecutorNode &node) {
   std::vector<std::string> refines(node.refines);
+  std::vector<std::string> equivalents(node.equivalentTo);
   llvm::sort(refines);
+  llvm::sort(equivalents);
   std::string out = "executor|id=";
   out += node.id;
   out += "|kind=";
@@ -67,6 +107,12 @@ std::string renderExecutor(const ExecutorNode &node) {
   out += std::to_string(node.concurrency);
   out += "|refines=";
   out += joinStrings(refines, ",");
+  out += "|scheduling=";
+  out += stringifySchedulingClass(node.schedulingClass);
+  // A declared equivalence changes which placements the symmetry reducer
+  // keeps, so it is behaviour-bearing and enters the content hash.
+  out += "|equivalent_to=";
+  out += joinStrings(equivalents, ",");
   return out;
 }
 
@@ -91,6 +137,8 @@ std::string renderMemory(const MemoryNode &node) {
   out += formatDouble(node.bandwidthBytesPerCycle);
   out += "|latency=";
   out += std::to_string(node.latencyCycles);
+  out += "|access_granularity=";
+  out += optionalNumber(node.accessGranularityBytes);
   return out;
 }
 
@@ -136,6 +184,8 @@ std::string renderCompute(const ComputeNode &node) {
   std::vector<std::string> accumulators(node.accumulatorDTypes);
   llvm::sort(accumulators);
   out += joinStrings(accumulators, ",");
+  out += "|occupancy=";
+  out += optionalNumber(node.occupancyLimit);
   return out;
 }
 
@@ -174,6 +224,8 @@ std::string renderLink(const LinkEdge &node) {
   out += joinStrings(engines, ",");
   out += "|concurrency=";
   out += std::to_string(node.concurrency);
+  out += "|directionality=";
+  out += stringifyLinkDirectionality(node.directionality);
   return out;
 }
 
@@ -377,13 +429,27 @@ bool isKnownMemoryKind(llvm::StringRef kind) {
   return micro::symbolizeMemorySpace(kind).has_value();
 }
 
-/// Compute capabilities the dialect models today. A rule that wants another
-/// capability adds it here and in the profile that declares it.
-bool isKnownComputeKind(llvm::StringRef kind) {
-  return kind == "matrix_engine" || kind == "vector_engine";
+/// Compute capabilities and transfer resources are `micro::Owner` vocabulary
+/// (design §11.5): a kernel maps onto a `matrix_engine` or `vector_engine`
+/// owner, and a `dma` owner moves its data. The subset a machine may declare is
+/// written with the enum's own enumerators, so a rename in MicroEnums.h breaks
+/// this code at compile time instead of letting a string list drift. Execution
+/// scopes such as `core` are also owners, but they are not capabilities a
+/// machine attaches, so they are excluded here.
+bool isComputeOwner(micro::Owner owner) {
+  return owner == micro::Owner::matrix_engine ||
+         owner == micro::Owner::vector_engine;
 }
 
-bool isKnownTransferKind(llvm::StringRef kind) { return kind == "dma"; }
+bool isKnownComputeKind(llvm::StringRef kind) {
+  std::optional<micro::Owner> owner = micro::symbolizeOwner(kind);
+  return owner && isComputeOwner(*owner);
+}
+
+bool isKnownTransferKind(llvm::StringRef kind) {
+  std::optional<micro::Owner> owner = micro::symbolizeOwner(kind);
+  return owner && *owner == micro::Owner::dma;
+}
 
 } // namespace
 
@@ -447,6 +513,28 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
     if (executor.parent && !model.findExecutor(*executor.parent))
       return invalid(path + ".parent: unknown executor '" + *executor.parent +
                      "'");
+    // A declared equivalence is a target assertion that two executors can be
+    // canonicalized. It is only sound when it names a real executor, is
+    // mutual, and joins executors of one kind -- a cross-kind collapse would
+    // make a placement bind the wrong executor class. Checked in declaration
+    // order, so the first bad entry decides.
+    for (const std::string &equivalent : executor.equivalentTo) {
+      if (equivalent == executor.id)
+        return invalid(path + ".equivalent_to: executor '" + executor.id +
+                       "' cannot declare itself equivalent");
+      const ExecutorNode *other = model.findExecutor(equivalent);
+      if (!other)
+        return invalid(path + ".equivalent_to: unknown executor '" +
+                       equivalent + "'");
+      if (other->kind != executor.kind)
+        return invalid(path + ".equivalent_to: '" + equivalent +
+                       "' has kind '" + other->kind + "', expected '" +
+                       executor.kind + "'");
+      if (!llvm::is_contained(other->equivalentTo, executor.id))
+        return invalid(path + ".equivalent_to: '" + equivalent +
+                       "' does not declare '" + executor.id +
+                       "' equivalent (the declaration must be mutual)");
+    }
   }
 
   // Containment must be acyclic: walk each executor's parent chain.
@@ -475,6 +563,11 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
       return invalid(path + ".capacity_bytes: must be positive");
     if (memory.alignmentBytes == 0)
       return invalid(path + ".alignment_bytes: must be positive");
+    // A zero access granule can never move anything; absent is fine, and means
+    // the profile does not model one (fall back to alignment).
+    if (memory.accessGranularityBytes && *memory.accessGranularityBytes == 0)
+      return invalid(
+          path + ".access_granularity_bytes: must be positive when declared");
   }
 
   for (size_t i = 0; i < model.computes.size(); ++i) {
@@ -488,6 +581,10 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
                      compute.attachedTo + "'");
     if (compute.concurrency == 0)
       return invalid(path + ".concurrency: must be positive");
+    // An occupancy limit of zero would forbid all resident work; absent is
+    // fine, and means the capability is bounded only by its slots.
+    if (compute.occupancyLimit && *compute.occupancyLimit == 0)
+      return invalid(path + ".occupancy_limit: must be positive when declared");
     if (compute.shapes.empty())
       return invalid(path + ".shapes: must not be empty");
     for (const std::vector<int64_t> &shape : compute.shapes) {

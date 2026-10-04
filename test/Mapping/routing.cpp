@@ -105,12 +105,28 @@ std::vector<std::string> linkIds(const MemoryRoute &route) {
   return std::vector<std::string>(route.links.begin(), route.links.end());
 }
 
+/// Builds a request by field so adding a field to `RouteRequest` never leaves a
+/// partially-initialized aggregate in these tests.
+RouteRequest routeRequest(llvm::StringRef source, llvm::StringRef destination,
+                          uint64_t bytes, uint64_t alignment,
+                          std::optional<ExecutorId> producer = std::nullopt,
+                          std::optional<ExecutorId> consumer = std::nullopt) {
+  RouteRequest request;
+  request.source = source.str();
+  request.destination = destination.str();
+  request.bytes = bytes;
+  request.alignmentBytes = alignment;
+  request.producerExecutor = std::move(producer);
+  request.consumerExecutor = std::move(consumer);
+  return request;
+}
+
 } // namespace
 
 TEST(Routing, PrefersCheaperMultiHopOverExpensiveDirect) {
   MachineModel model = diamond();
   TopologyService service(model);
-  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
   auto result = service.enumerateRoutes(request, 8);
   ASSERT_TRUE(static_cast<bool>(result));
   ASSERT_GE(result->size(), 2u);
@@ -125,7 +141,7 @@ TEST(Routing, PrefersCheaperMultiHopOverExpensiveDirect) {
 TEST(Routing, RoutesAreCycleFree) {
   MachineModel model = diamond();
   TopologyService service(model);
-  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
   auto result = service.enumerateRoutes(request, 16);
   ASSERT_TRUE(static_cast<bool>(result));
   for (const MemoryRoute &route : *result) {
@@ -138,7 +154,7 @@ TEST(Routing, RoutesAreCycleFree) {
 TEST(Routing, RespectsTheLimit) {
   MachineModel model = diamond();
   TopologyService service(model);
-  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
   auto result = service.enumerateRoutes(request, 1);
   ASSERT_TRUE(static_cast<bool>(result));
   ASSERT_EQ(result->size(), 1u);
@@ -147,10 +163,92 @@ TEST(Routing, RespectsTheLimit) {
       (std::vector<std::string>{"dram_to_l2", "l2_to_sram", "sram_to_acc"}));
 }
 
+TEST(Routing, ReportsTruncationWhenTheRouteCapIsHit) {
+  MachineModel model = diamond();
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  // diamond() has more than one route dram -> acc; asking for one reaches the
+  // cap and must say so rather than implying the space was exhausted.
+  bool truncated = false;
+  auto result = service.enumerateRoutes(request, 1, &truncated);
+  ASSERT_TRUE(static_cast<bool>(result));
+  ASSERT_EQ(result->size(), 1u);
+  EXPECT_TRUE(truncated);
+}
+
+TEST(Routing, ReportsNoTruncationWhenEveryRouteFits) {
+  MachineModel model = diamond();
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  bool truncated = false;
+  auto result = service.enumerateRoutes(request, 8, &truncated);
+  ASSERT_TRUE(static_cast<bool>(result));
+  EXPECT_LT(result->size(), 8u); // the whole space fit under the cap
+  EXPECT_FALSE(truncated);
+}
+
+TEST(Routing, ReportsTruncationWhenTheHopCapPrunesALegalPath) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  // dram -> acc needs two hops; a one-hop cap cuts the path at sram, which
+  // still has a legal link to acc. The caller must hear that the search was
+  // bounded, even though no route was found.
+  TopologyService service(model, RouteOptions{/*maxRoutes=*/8, /*maxHops=*/1});
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  bool truncated = false;
+  auto result = service.enumerateRoutes(request, 8, &truncated);
+  EXPECT_FALSE(static_cast<bool>(result));
+  EXPECT_TRUE(truncated);
+}
+
+TEST(Routing, DoesNotReportTruncationWhenTheFrontierEmpties) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  model.links.clear(); // nowhere to go at all
+  TopologyService service(model, RouteOptions{/*maxRoutes=*/8, /*maxHops=*/1});
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  bool truncated = false;
+  auto result = service.enumerateRoutes(request, 8, &truncated);
+  EXPECT_FALSE(static_cast<bool>(result));
+  EXPECT_FALSE(truncated); // no legal hop was ever cut, so no truncation
+}
+
+TEST(Routing, DoesNotReportTruncationWhenTheHopCapHasNoLegalExtension) {
+  // A two-node loop with an unreachable destination: the cap lands on sram,
+  // whose only outgoing link returns to a memory already on the path. The cap
+  // was reached, but nothing legal was pruned, so this is not a truncation.
+  MachineModel model;
+  model.target = "loop";
+  model.executors = {executor("package.0", "worker"),
+                     executor("core.0", "core", std::string("package.0"))};
+  model.memories = {memory("dram", "package.0", 1u << 30),
+                    memory("sram", "core.0", 32768),
+                    memory("acc", "core.0", 4096, 32)};
+  model.transferEngines = {dma("core.0")};
+  model.links = {link("dram_to_sram", "dram", "sram", 32, 100),
+                 link("sram_to_dram", "sram", "dram", 32, 100)};
+  TopologyService service(model, RouteOptions{/*maxRoutes=*/8, /*maxHops=*/1});
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  bool truncated = false;
+  auto result = service.enumerateRoutes(request, 8, &truncated);
+  EXPECT_FALSE(static_cast<bool>(result));
+  EXPECT_FALSE(truncated);
+}
+
+TEST(Routing, DoesNotReportTruncationWhenARouteIsFoundWithinTheHopCap) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  // The two-hop route fits under a four-hop cap and no path reaches it.
+  TopologyService service(model, RouteOptions{/*maxRoutes=*/8, /*maxHops=*/4});
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  bool truncated = false;
+  auto result = service.enumerateRoutes(request, 8, &truncated);
+  ASSERT_TRUE(static_cast<bool>(result));
+  EXPECT_EQ(result->front().hopCount(), 2u);
+  EXPECT_FALSE(truncated);
+}
+
 TEST(Routing, SameMemoryIsATrivialRoute) {
   MachineModel model = diamond();
   TopologyService service(model);
-  RouteRequest request{"dram", "dram", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "dram", 1024, 32);
   auto result = service.enumerateRoutes(request, 8);
   ASSERT_TRUE(static_cast<bool>(result));
   ASSERT_EQ(result->size(), 1u);
@@ -162,22 +260,22 @@ TEST(Routing, ReportsNoRoute) {
   MachineModel model = diamond();
   model.links.clear(); // no edges at all
   TopologyService service(model);
-  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
   EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
 TEST(Routing, RejectsUnknownEndpoint) {
   MachineModel model = diamond();
   TopologyService service(model);
-  RouteRequest request{"dram", "nowhere", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "nowhere", 1024, 32);
   EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
 TEST(Routing, RejectsInvisibleEndpoint) {
   MachineModel model = diamond();
   TopologyService service(model);
-  RouteRequest request{"dram",      "acc", 1024, 32, std::string("other.0"),
-                       std::nullopt};
+  RouteRequest request =
+      routeRequest("dram", "acc", 1024, 32, std::string("other.0"));
   // other.0 is not within dram's visibility scope (package.0).
   EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
@@ -185,22 +283,138 @@ TEST(Routing, RejectsInvisibleEndpoint) {
 TEST(Routing, AcceptsVisibleEndpoint) {
   MachineModel model = diamond();
   TopologyService service(model);
-  RouteRequest request{
-      "dram", "acc", 1024, 32, std::string("core.0"), std::string("core.0")};
+  RouteRequest request = routeRequest(
+      "dram", "acc", 1024, 32, std::string("core.0"), std::string("core.0"));
   EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
 TEST(Routing, RejectsTooSmallIntermediate) {
   MachineModel model = chain(/*sramCapacity=*/512);
   TopologyService service(model);
-  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
   EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
 TEST(Routing, AcceptsFittingIntermediate) {
   MachineModel model = chain(/*sramCapacity=*/32768);
   TopologyService service(model);
-  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, RejectsLayoutTheStagingMemoryDoesNotSupport) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  // The endpoints can hold the value, but the sram the route must stage
+  // through cannot: it only holds a tiled layout, not the row-major the value
+  // declares.
+  model.memories[0].supportedLayouts = {"row_major"}; // dram
+  model.memories[1].supportedLayouts = {"tiled"};     // sram
+  model.memories[2].supportedLayouts = {"row_major"}; // acc
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  request.layoutClass = "row_major";
+  EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, AcceptsLayoutEveryHopSupports) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  for (MemoryNode &node : model.memories)
+    node.supportedLayouts = {"row_major"};
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  request.layoutClass = "row_major";
+  EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, RejectsLayoutNoMemoryDeclares) {
+  // chain() declares no layouts; unknown is not unconstrained, so a request
+  // that names one is rejected rather than allowed through.
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  request.layoutClass = "row_major";
+  EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, ReportsTheEndpointLayoutDiagnostic) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  model.memories[0].supportedLayouts = {"row_major"}; // dram supports it
+  // acc declares tiled only, so the destination endpoint rejects the layout.
+  model.memories[2].supportedLayouts = {"tiled"};
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  request.layoutClass = "row_major";
+  auto result = service.enumerateRoutes(request, 8);
+  ASSERT_FALSE(static_cast<bool>(result));
+  std::string message = llvm::toString(result.takeError());
+  EXPECT_NE(message.find("does not support layout"), std::string::npos)
+      << message;
+}
+
+TEST(Routing, RejectsValueNotExpressibleInWholeTransactions) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  // The link moves 64-byte transactions; a 100-byte value is one full
+  // transaction plus a 36-byte remainder, so it is not transferable.
+  model.links[0].transactionBytes = 64;
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 100, 32);
+  EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, RejectsZeroTransactionGranularity) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  // A zero granularity admits no whole transaction (and would divide by zero).
+  model.links[0].transactionBytes = 0;
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, AcceptsValueThatTilesTheLinkGranularity) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  // 1 KiB is sixteen 64-byte transactions.
+  model.links[0].transactionBytes = 64;
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, RejectsIntermediateWithNoFreeSpace) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  // 512 bytes free in the staging sram, but the value needs 1024.
+  request.liveBytesOnIntermediate = 32768 - 512;
+  EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, AcceptsIntermediateWithLiveBytesButRoomToSpare) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  request.liveBytesOnIntermediate = 32768 - 2048;
+  EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, RejectsRouteThroughAnOccupiedNamedIntermediate) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  // The only intermediate is sram; 512 bytes are live there but the value needs
+  // 1024, so the staging hop is illegal. The per-node figure, not the scalar,
+  // is what decides this intermediate.
+  request.liveBytesByIntermediate["sram"] = 32768 - 512;
+  EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
+}
+
+TEST(Routing, AcceptsRouteThroughAnEmptyNamedIntermediate) {
+  MachineModel model = chain(/*sramCapacity=*/32768);
+  TopologyService service(model);
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
+  // The scalar would reject every intermediate, but the named entry for sram
+  // overrides it: an empty intermediate stays legal.
+  request.liveBytesOnIntermediate = 32768 - 512;
+  request.liveBytesByIntermediate["sram"] = 0;
   EXPECT_TRUE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
@@ -209,7 +423,7 @@ TEST(Routing, RejectsHopWithoutEngine) {
   for (LinkEdge &edge : model.links)
     edge.transferEngines.clear();
   TopologyService service(model);
-  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
   EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
@@ -217,14 +431,14 @@ TEST(Routing, RejectsUnsupportedAlignment) {
   MachineModel model = diamond();
   TopologyService service(model);
   // No memory in the fixture aligns to 128 bytes.
-  RouteRequest request{"dram", "acc", 1024, 128, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "acc", 1024, 128);
   EXPECT_FALSE(static_cast<bool>(service.enumerateRoutes(request, 8)));
 }
 
 TEST(Routing, IdenticalRequestsProduceIdenticalRoutes) {
   MachineModel model = diamond();
   TopologyService service(model);
-  RouteRequest request{"dram", "acc", 1024, 32, std::nullopt, std::nullopt};
+  RouteRequest request = routeRequest("dram", "acc", 1024, 32);
   auto first = service.enumerateRoutes(request, 8);
   auto second = service.enumerateRoutes(request, 8);
   ASSERT_TRUE(static_cast<bool>(first));

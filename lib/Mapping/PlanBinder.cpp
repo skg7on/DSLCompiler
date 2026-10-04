@@ -2,6 +2,7 @@
 
 #include "LLK/Mapping/PlanBinder.h"
 
+#include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/AsmParser/AsmParser.h"
@@ -10,7 +11,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 
-#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 
@@ -29,8 +30,50 @@ constexpr llvm::StringLiteral kPlanAttr = "micro.plan";
 constexpr llvm::StringLiteral kMappingAttr = "micro.mapping";
 constexpr llvm::StringLiteral kRoutesAttr = "micro.routes";
 
+/// Stable, greppable reasons for a connection the binder cannot materialize
+/// (design §18.2). They are part of the report contract, so they are named
+/// constants rather than free-form prose.
+constexpr llvm::StringLiteral kLayoutTransformReason =
+    "layout_transform_requires_dialect_op";
+constexpr llvm::StringLiteral kTransferAndTransformReason =
+    "transfer_and_transform_layout_not_applied";
+constexpr llvm::StringLiteral kReplicateReason = "replicate_not_materialized";
+constexpr llvm::StringLiteral kReduceReason = "reduce_not_materialized";
+constexpr llvm::StringLiteral kHoplessRouteReason =
+    "route_has_no_hop_to_materialize";
+constexpr llvm::StringLiteral kDuplicateRouteReason =
+    "duplicate_route_for_value";
+
+/// The reason a non-movement connection cannot be materialized. `Direct` and
+/// the movements are handled inline and must never reach here.
+llvm::StringRef unmaterializedReason(ConnectionKind kind) {
+  switch (kind) {
+  case ConnectionKind::LayoutTransform:
+    return kLayoutTransformReason;
+  case ConnectionKind::Replicate:
+    return kReplicateReason;
+  case ConnectionKind::Reduce:
+    return kReduceReason;
+  case ConnectionKind::Direct:
+  case ConnectionKind::Transfer:
+  case ConnectionKind::TransferAndTransform:
+    llvm_unreachable("a direct or movement connection is materialized inline");
+  }
+  llvm_unreachable("all connection kinds handled");
+}
+
 llvm::Error bindError(const std::string &message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+}
+
+/// A phase-2 (machine-aware) verification failure carrying its stable §22.3
+/// code. The code is the interface a caller may group or switch on; the message
+/// is human detail that may change between releases (see Diagnostics.h), so the
+/// two are joined as the code's stable string, a colon, and the message. Which
+/// code fits a violation is decided where the violation is detected -- the
+/// strings themselves come from `stringifyDiagnosticCode`.
+llvm::Error verifyError(DiagnosticCode code, const std::string &message) {
+  return bindError((stringifyDiagnosticCode(code) + ": " + message).str());
 }
 
 mlir::IntegerAttr u64Attr(mlir::MLIRContext *context, uint64_t value) {
@@ -121,10 +164,12 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     llvm::SmallVector<mlir::NamedAttribute> attributes;
     attributes.emplace_back(mlir::StringAttr::get(context, "rule"),
                             mlir::StringAttr::get(context, placement.rule));
-    attributes.emplace_back(mlir::StringAttr::get(context, "bundle"),
-                            mlir::StringAttr::get(context, placement.bundle));
-    attributes.emplace_back(mlir::StringAttr::get(context, "emitter"),
-                            mlir::StringAttr::get(context, rule->emitter));
+    attributes.emplace_back(
+        mlir::StringAttr::get(context, "bundle"),
+        mlir::StringAttr::get(context, placement.bundle.name));
+    attributes.emplace_back(
+        mlir::StringAttr::get(context, "emitter"),
+        mlir::StringAttr::get(context, placement.bundle.emitterKey));
     attributes.emplace_back(mlir::StringAttr::get(context, "executor"),
                             mlir::StringAttr::get(context, placement.executor));
     attributes.emplace_back(mlir::StringAttr::get(context, "memories"),
@@ -180,16 +225,53 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
   // read in another, so the copies are placed right after the producer and
   // every other use is rewired to the last of them. Emitting one chain per
   // *connection* would duplicate it when a value fans out.
-  llvm::DenseSet<WorkloadValueId> moved;
+  //
+  // A value reached by several connections (a producer feeding several
+  // consumers) is handled once. When every such connection takes the same
+  // route, one chain serves them all, so a duplicate is merged silently. When
+  // a duplicate takes a *different* route, that single chain cannot serve it --
+  // the second consumer would silently read the first route's memory -- and the
+  // binder cannot yet emit a second chain and rewire only that consumer, so the
+  // duplicate is reported instead of dropped.
+  llvm::DenseMap<WorkloadValueId, llvm::SmallVector<MemoryNodeId>> movedRoutes;
   mlir::OpBuilder builder(context);
   for (const PlanConnection &connection : plan.connectionPlans) {
+    // A `Direct` connection is materialized by construction: the producer wrote
+    // the value to the memory the consumer reads, in a layout the consumer
+    // addresses, so there is nothing to emit and nothing to report.
+    if (connection.kind == ConnectionKind::Direct)
+      continue;
+
+    // Anything else that is not a plain movement cannot be emitted as Micro ops
+    // today. Report it with a stable reason rather than dropping it (design
+    // §18.2).
     if (connection.kind != ConnectionKind::Transfer &&
-        connection.kind != ConnectionKind::TransferAndTransform)
+        connection.kind != ConnectionKind::TransferAndTransform) {
+      bound.unmaterialized.push_back(
+          "value " + std::to_string(connection.value) + ": " +
+          unmaterializedReason(connection.kind).str());
       continue;
-    if (connection.route.size() < 2)
+    }
+
+    // A movement needs at least one hop between two memories; a shorter route
+    // has nothing to emit. This is unreachable for the current placement code,
+    // but a selected connection must never vanish silently.
+    if (connection.route.size() < 2) {
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) + ": " +
+                                     kHoplessRouteReason.str());
       continue;
-    if (!moved.insert(connection.value).second)
+    }
+    auto handled = movedRoutes.find(connection.value);
+    if (handled != movedRoutes.end()) {
+      if (handled->second == connection.route)
+        continue; // the same movement: one chain serves both connections
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) + ": " +
+                                     kDuplicateRouteReason.str());
       continue;
+    }
+    movedRoutes.try_emplace(connection.value, connection.route);
 
     // The producer is the covered node that writes this value; the consumer is
     // any covered node that reads it.
@@ -242,7 +324,9 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     }
     mlir::Type tokenType = mlir::parseType("!micro.async_token", context);
     if (!tokenType) {
-      bound.unmaterialized.push_back("async token type is not registered");
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) +
+                                     ": async token type is not registered");
       continue;
     }
 
@@ -280,6 +364,14 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       copyState.addTypes(copyResultTypes);
       copyState.addAttribute("src_memory", hopSrc);
       copyState.addAttribute("dst_memory", hopDst);
+      // Target-neutral identity for the performance model (design
+      // §12.4/§23.3): which connection this hop belongs to, and the concrete
+      // memory node it lands in. Without it a movement is indistinguishable
+      // from the other movements that share its endpoint memory *kinds*, and
+      // is charged the wrong link.
+      copyState.addAttribute("micro.value", u64Attr(context, connection.value));
+      copyState.addAttribute("micro.dst_node",
+                             mlir::StringAttr::get(context, to->id));
       mlir::Operation *copy = builder.create(copyState);
 
       mlir::OperationState waitState(producer->getLoc(), "micro.wait");
@@ -298,6 +390,17 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
           ": a route hop names memories the machine cannot carry data between");
       continue;
     }
+
+    // A transfer-and-transform moved the value, but the selected layout
+    // transform itself has no Micro operation form (design §13.4). The
+    // movement is real, so the connection is not dropped -- but the transform
+    // must still be reported, or it vanishes without a trace. The token differs
+    // from the transform-only case so "nothing materialized" stays
+    // distinguishable from "movement done, transform dropped".
+    if (connection.kind == ConnectionKind::TransferAndTransform)
+      bound.unmaterialized.push_back("value " +
+                                     std::to_string(connection.value) + ": " +
+                                     kTransferAndTransformReason.str());
 
     // Rewire every other reader to the last hop's value; the copies themselves
     // already read the previous one.
@@ -343,13 +446,15 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     std::string ruleId = stringValue("rule");
     const RuleDef *rule = target.rules().find(ruleId);
     if (!rule) {
-      failure = bindError(where + ": unknown rule '" + ruleId + "'");
+      failure = verifyError(DiagnosticCode::NoMatchingRule,
+                            where + ": unknown rule '" + ruleId + "'");
       return;
     }
 
     std::string executor = stringValue("executor");
     if (!machine.findExecutor(executor)) {
-      failure = bindError(where + ": unknown executor '" + executor + "'");
+      failure = verifyError(DiagnosticCode::NoLegalExecutor,
+                            where + ": unknown executor '" + executor + "'");
       return;
     }
 
@@ -359,12 +464,14 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
             mlir::cast<mlir::StringAttr>(entry.getValue()).getValue().str();
         const machine::MemoryNode *memory = machine.findMemory(memoryId);
         if (!memory) {
-          failure = bindError(where + ": unknown memory '" + memoryId + "'");
+          failure = verifyError(DiagnosticCode::NoMemoryRoute,
+                                where + ": unknown memory '" + memoryId + "'");
           return;
         }
         if (!machine.isVisible(memoryId, executor)) {
-          failure = bindError(where + ": executor '" + executor +
-                              "' cannot see memory '" + memoryId + "'");
+          failure = verifyError(DiagnosticCode::NoMemoryRoute,
+                                where + ": executor '" + executor +
+                                    "' cannot see memory '" + memoryId + "'");
           return;
         }
       }
@@ -375,7 +482,8 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         std::string layoutId =
             mlir::cast<mlir::StringAttr>(entry.getValue()).getValue().str();
         if (!target.layouts().find(layoutId)) {
-          failure = bindError(where + ": unknown layout '" + layoutId + "'");
+          failure = verifyError(DiagnosticCode::NoLegalLayout,
+                                where + ": unknown layout '" + layoutId + "'");
           return;
         }
       }
@@ -384,7 +492,8 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     // 3. target: the emitter the rule selected must be one the target declares.
     std::string emitter = stringValue("emitter");
     if (!target.isKnownEmitter(emitter)) {
-      failure = bindError(where + ": unknown emitter '" + emitter + "'");
+      failure = verifyError(DiagnosticCode::TargetBundleInvalid,
+                            where + ": unknown emitter '" + emitter + "'");
       return;
     }
   });
@@ -407,7 +516,8 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       for (mlir::Attribute node : nodes) {
         std::string id = mlir::cast<mlir::StringAttr>(node).getValue().str();
         if (!machine.findMemory(id)) {
-          routeFailure = bindError("route names unknown memory '" + id + "'");
+          routeFailure = verifyError(DiagnosticCode::NoMemoryRoute,
+                                     "route names unknown memory '" + id + "'");
           return;
         }
       }
@@ -421,8 +531,9 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
               return l.source == from && l.destination == to;
             });
         if (!linked) {
-          routeFailure =
-              bindError("route hop '" + from + "' -> '" + to + "' has no link");
+          routeFailure = verifyError(DiagnosticCode::NoMemoryRoute,
+                                     "route hop '" + from + "' -> '" + to +
+                                         "' has no link");
           return;
         }
       }

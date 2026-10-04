@@ -16,6 +16,8 @@
 
 #include "LLK/Machine/MachineModel.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -24,6 +26,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -41,7 +44,9 @@ enum class ExprKind {
   Call,       ///< `floordiv(a, b)`, `machine.compute("vector_engine")`
   MemberCall, ///< `receiver.lanes(dtype)`, `receiver.count`
   Unary,      ///< `!a`, `-a`
-  Binary      ///< `a + b`, `a % b`, `a == b`, `a && b`
+  Binary,     ///< `a + b`, `a % b`, `a == b`, `a && b`
+  Quantifier  ///< `forall x in domain(N) : p`, `exists e in executors("dma") :
+              ///< q`
 };
 
 struct Expr;
@@ -65,6 +70,31 @@ struct LayoutContext {
   std::string elementType;
 };
 
+/// Canonical, fully-tagged rendering of `expr`: every node carries its kind and
+/// its operands follow in order, so two structurally different expressions
+/// never render alike. This is a hash input, not a source-faithful printer --
+/// its exact spelling may change between releases, but never within one, and
+/// it is dependency-free and platform-stable (design §22.1).
+std::string canonicalExprString(const Expr &expr);
+
+/// Canonical, type-tagged rendering of a value: integer `8` and string `"8"`
+/// render differently, so a declaration that only changes a value's kind still
+/// changes its content hash.
+std::string canonicalValueString(const LayoutValue &value);
+
+/// Source-faithful rendering of `expr` as LLKMap text: the inverse of the
+/// expression grammar above, so `parseExpr(printExpr(e))` is structurally `e`.
+/// Compound nodes (unary, binary, quantifier) are parenthesized, which keeps
+/// the tree exactly and stops a quantifier's greedy body from swallowing a
+/// following operator. Deterministic and dependency-free.
+std::string printExpr(const Expr &expr);
+
+/// Source-faithful rendering of a value: integers bare, strings quoted, so the
+/// result re-parses to the same value wherever a literal is accepted (a
+/// predicate value, a domain member, a bundle parameter). The kind survives the
+/// round trip, unlike `canonicalValueString`'s type tags.
+std::string printValue(const LayoutValue &value);
+
 /// The result of evaluating an expression. `Handle` is the intermediate value
 /// a `machine.compute(...)` / `machine.memory(...)` query produces before a
 /// member query is applied; it never escapes as a solution value.
@@ -75,13 +105,84 @@ struct EvalValue {
   std::string text;
 };
 
+/// The single default bound on quantified evaluation, shared by
+/// `QuantifierBudget::limit` and `SolverLimits::maxQuantifierIterations` so the
+/// two can never drift apart.
+inline constexpr uint64_t kDefaultQuantifierIterations = 100000;
+
+/// A shared, bounded budget for quantified evaluation. Each candidate element a
+/// quantifier examines consumes one unit. When the budget is spent before a
+/// quantifier has decided, `exhausted` is set and the quantifier yields 0 --
+/// *undecided*, never a definite false -- so a caller must surface `exhausted`
+/// instead of reading the value as a final answer. The cap is never silently
+/// ignored.
+struct QuantifierBudget {
+  /// Total domain elements one evaluation may examine. The solver sets this
+  /// from its `SolverLimits`; a direct evaluator call uses the default.
+  uint64_t limit = kDefaultQuantifierIterations;
+  uint64_t used = 0;
+  bool exhausted = false;
+
+  /// Consumes one unit of the budget. Returns false once it is spent (setting
+  /// `exhausted`), so a quantifier stops rather than running unbounded.
+  bool step() {
+    if (used >= limit) {
+      exhausted = true;
+      return false;
+    }
+    ++used;
+    return true;
+  }
+};
+
+/// Resolves a `domain(<name>)` quantifier to the finite set a declared
+/// parameter ranges over, in declaration order. The evaluator carries no
+/// declaration of its own, so the enclosing solver supplies one. A name with no
+/// declared domain returns `std::nullopt`, which evaluation reports as an
+/// error -- never a silently empty set.
+using DomainResolver =
+    llvm::function_ref<std::optional<llvm::ArrayRef<LayoutValue>>(
+        llvm::StringRef name)>;
+
+/// Extra inputs a quantified expression needs. The four-argument
+/// `evaluateExpr` call -- everything without a quantifier -- leaves these
+/// defaulted.
+struct EvalOptions {
+  /// Resolves `domain(<name>)` quantifiers, or empty when the caller has no
+  /// declaration to resolve against (in which case such a quantifier errors).
+  DomainResolver domainResolver;
+  /// Budget shared across one evaluation, or null to use a private default
+  /// budget -- in which case exceeding it is an error rather than a value.
+  QuantifierBudget *budget = nullptr;
+};
+
 /// Evaluates a parsed expression. Booleans are integers (0 and 1). Fails on an
 /// unknown identifier, an unknown machine fact, a type mismatch between an
-/// integer and a string, or division by zero.
+/// integer and a string, division by zero, or -- when `options` carries no
+/// budget -- a quantifier that exhausts the private default budget.
 llvm::Expected<EvalValue>
 evaluateExpr(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
-             const machine::MachineModel &machine,
-             const LayoutContext &context);
+             const machine::MachineModel &machine, const LayoutContext &context,
+             const EvalOptions &options = {});
+
+/// Resolves the literal subject of a `machine.<callee>("<subject>")` query
+/// against a machine. Returns `std::nullopt` when the subject is known, or the
+/// diagnostic describing why it is not (an unknown compute kind, memory, ...).
+///
+/// A declaration file has no machine while it is parsed, so the check is
+/// deferred: `validateExpr` accepts the query structurally, and the target
+/// loader resolves the subjects against its machine once one exists (design
+/// §14.4 -- an unknown capability query is a load-time failure, never a late
+/// search failure).
+using MachineQueryResolver = llvm::function_ref<std::optional<std::string>(
+    llvm::StringRef callee, llvm::StringRef subject)>;
+
+/// Walks `expr`, asking `resolver` about every literal `machine.compute` /
+/// `machine.memory` query subject. Returns the first diagnostic, in expression
+/// order, or an empty string when every subject resolves. A query whose subject
+/// is not a string literal is left to evaluation, which cannot know it either.
+std::string resolveMachineQueries(const Expr &expr,
+                                  MachineQueryResolver resolver);
 
 //===----------------------------------------------------------------------===//
 // Tokens
@@ -148,7 +249,10 @@ public:
   ExprPtr parseExpression();
 
   /// Validates every identifier, call, and member against the vocabulary the
-  /// current declaration allows.
+  /// current declaration allows. A declaration has no machine while it is
+  /// parsed, so a `machine.<query>("<subject>")` is accepted structurally here;
+  /// its subject is resolved later, against the target's machine, by
+  /// `resolveMachineQueries` (design §14.4).
   bool validateExpr(const ExprPtr &expr, const llvm::StringSet<> &allowed);
 
 protected:
@@ -161,6 +265,7 @@ protected:
   ExprPtr parseUnary();
   ExprPtr parsePostfix();
   ExprPtr parsePrimary();
+  ExprPtr parseQuantifier();
   bool parseCallArgs(std::vector<ExprPtr> &out);
 
   std::vector<LlkMapToken> tokens_;

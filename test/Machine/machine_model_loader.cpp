@@ -83,6 +83,7 @@ TEST(MachineModelLoader, ParsesAValidDocument) {
   ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
   EXPECT_EQ(model->target, "test-avx2");
   EXPECT_EQ(model->schemaMajor, 2u);
+  EXPECT_EQ(model->schemaMinor, 0u);
   ASSERT_EQ(model->executors.size(), 2u);
   ASSERT_EQ(model->memories.size(), 2u);
   ASSERT_EQ(model->computes.size(), 1u);
@@ -107,11 +108,99 @@ TEST(MachineModelLoader, RejectsUnsupportedMajor) {
 }
 
 TEST(MachineModelLoader, AcceptsMinorVersionSuffix) {
-  // A minor bump stays readable by this major (design §11.6).
+  // A minor bump stays readable by this major, and the declared minor is
+  // preserved on the model rather than discarded (design §11.6).
   std::string text = kValid.str();
   text.replace(text.find("llk.machine.v2"),
                std::string("llk.machine.v2").size(), "llk.machine.v2.1");
+  llvm::Expected<MachineModel> model = parse(text);
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  EXPECT_EQ(model->schemaMajor, 2u);
+  EXPECT_EQ(model->schemaMinor, 1u);
+}
+
+TEST(MachineModelLoader, RejectsMalformedMinorVersion) {
+  // A "." with no minor digits is not a version.
+  EXPECT_FALSE(loads("schema: llk.machine.v2.\ntarget: t\n"));
+  EXPECT_FALSE(loads("schema: llk.machine.v2.x\ntarget: t\n"));
+}
+
+TEST(MachineModelLoader, ToleratesUnknownKeysUnderANewerMinor) {
+  // Design §11.6: a minor addition must be optional/defaulted, so a file at a
+  // newer minor may carry keys this build does not know. Ignoring them keeps
+  // the file loadable instead of forcing a loader edit per minor bump.
+  std::string text = kValid.str();
+  text.replace(text.find("llk.machine.v2"),
+               std::string("llk.machine.v2").size(), "llk.machine.v2.1");
+  text += "\nfuture_section: 7\n";
   EXPECT_TRUE(loads(text));
+
+  // The same tolerance applies inside a node section.
+  std::string nested = kValid.str();
+  nested.replace(nested.find("llk.machine.v2"),
+                 std::string("llk.machine.v2").size(), "llk.machine.v2.1");
+  nested.replace(nested.find("kind: worker"),
+                 std::string("kind: worker").size(),
+                 "kind: worker\n    future_flag: 1");
+  EXPECT_TRUE(loads(nested));
+}
+
+TEST(MachineModelLoader, RejectsUnknownKeysAtTheCurrentMinor) {
+  // At the current minor an unknown key is a typo, not a forward-compatible
+  // addition, so it stays an error -- this is the diagnostic §11.6 relies on.
+  std::string text = kValid.str();
+  text += "\nfuture_section: 7\n";
+  EXPECT_FALSE(loads(text));
+
+  std::string nested = kValid.str();
+  nested.replace(nested.find("kind: worker"),
+                 std::string("kind: worker").size(),
+                 "kind: worker\n    future_flag: 1");
+  EXPECT_FALSE(loads(nested));
+}
+
+TEST(MachineModelLoader, ANewerMinorStillRejectsMissingRequiredKeys) {
+  // Tolerance covers *unknown* keys only: a newer minor may add optional keys,
+  // but the required structure is unchanged, so a missing `target` still fails.
+  // Non-vacuous: it would load if tolerantMinor_ also suppressed requireKey.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2.1
+executors:
+  - {id: e0, kind: worker}
+)yaml"));
+}
+
+TEST(MachineModelLoader, ANewerMinorStillRejectsWrongNodeTypes) {
+  // `executors` must be a sequence; a newer minor does not relax that.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2.1
+target: t
+executors:
+  id: e0
+  kind: worker
+)yaml"));
+}
+
+TEST(MachineModelLoader, ANewerMinorStillRejectsMalformedKnownValues) {
+  // A *known* key with a bad value is a type error, not an unknown key.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2.1
+target: t
+clock_hz: not-a-number
+)yaml"));
+}
+
+TEST(MachineModelLoader, ANewerMinorStillRejectsUnknownKinds) {
+  // Kind validation is vocabulary, not an unknown key: a newer minor cannot
+  // smuggle in a capability this build does not model.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2.1
+target: t
+executors:
+  - {id: e0, kind: worker}
+compute:
+  - {id: c0, kind: tensor_core, attached_to: e0, element_types: [f32], shapes: [[8]]}
+)yaml"));
 }
 
 TEST(MachineModelLoader, RejectsUnknownRootKey) {
@@ -169,6 +258,85 @@ executors:
   - {id: e0, kind: worker}
 compute:
   - {id: c0, kind: vector_engine, attached_to: nope, element_types: [f32], shapes: [[8]]}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsUnknownComputeKindAtLoad) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+compute:
+  - {id: c0, kind: tensor_core, attached_to: e0, element_types: [f32], shapes: [[8]]}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsUnknownTransferKindAtLoad) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+transfer_engines:
+  - {id: t0, kind: pcie, attached_to: e0}
+)yaml"));
+}
+
+TEST(MachineModelLoader, ParsesDeclaredEquivalence) {
+  llvm::Expected<MachineModel> model = parse(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [e1]}
+  - {id: e1, kind: worker, equivalent_to: [e0]}
+)yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  ASSERT_NE(model->findExecutor("e0"), nullptr);
+  ASSERT_NE(model->findExecutor("e1"), nullptr);
+  EXPECT_EQ(model->findExecutor("e0")->equivalentTo,
+            (std::vector<std::string>{"e1"}));
+  EXPECT_EQ(model->findExecutor("e1")->equivalentTo,
+            (std::vector<std::string>{"e0"}));
+}
+
+TEST(MachineModelLoader, RejectsEquivalenceWithUnknownExecutor) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [nope]}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsAsymmetricEquivalence) {
+  // e0 declares e1 equivalent, but e1 declares nothing: the assertion is not
+  // mutual, so it is not a sound canonicalization and is rejected.
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [e1]}
+  - {id: e1, kind: worker}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsEquivalenceAcrossKinds) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [e1]}
+  - {id: e1, kind: core, equivalent_to: [e0]}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsSelfEquivalence) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, equivalent_to: [e0]}
 )yaml"));
 }
 
@@ -337,4 +505,136 @@ TEST(MachineModelLoader, ShippedProfilesDeclareTheirPerfFacts) {
     EXPECT_TRUE(model->clockHz.has_value()) << name;
     EXPECT_GT(model->workerThreads, 0u) << name;
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Design 11.3 properties added after the v2 model shipped
+//===----------------------------------------------------------------------===//
+
+TEST(MachineModelLoader, AppliesDocumentedDefaultsForTheAddedProperties) {
+  llvm::Expected<MachineModel> model = parse(kValid);
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  for (const ExecutorNode &executor : model->executors)
+    EXPECT_EQ(executor.schedulingClass, SchedulingClass::InOrder);
+  for (const MemoryNode &memory : model->memories)
+    EXPECT_FALSE(memory.accessGranularityBytes.has_value());
+  for (const ComputeNode &compute : model->computes)
+    EXPECT_FALSE(compute.occupancyLimit.has_value());
+  for (const LinkEdge &link : model->links)
+    EXPECT_EQ(link.directionality, LinkDirectionality::Unidirectional);
+}
+
+TEST(MachineModelLoader,
+     ParsesSchedulingGranularityOccupancyAndDirectionality) {
+  llvm::Expected<MachineModel> model = parse(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - id: e0
+    kind: worker
+    scheduling_class: out_of_order
+memories:
+  - id: m0
+    kind: sram
+    visible_from: e0
+    capacity_bytes: 32768
+    access_granularity_bytes: 32
+compute:
+  - id: c0
+    kind: vector_engine
+    attached_to: e0
+    element_types: [f32]
+    shapes: [[8]]
+    occupancy_limit: 4
+links:
+  - id: l0
+    source: m0
+    destination: m0
+    bandwidth_bytes_per_cycle: 64
+    directionality: bidirectional
+)yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  ASSERT_EQ(model->executors.size(), 1u);
+  EXPECT_EQ(model->executors[0].schedulingClass, SchedulingClass::OutOfOrder);
+  ASSERT_EQ(model->memories.size(), 1u);
+  ASSERT_TRUE(model->memories[0].accessGranularityBytes.has_value());
+  EXPECT_EQ(*model->memories[0].accessGranularityBytes, 32u);
+  ASSERT_EQ(model->computes.size(), 1u);
+  ASSERT_TRUE(model->computes[0].occupancyLimit.has_value());
+  EXPECT_EQ(*model->computes[0].occupancyLimit, 4u);
+  ASSERT_EQ(model->links.size(), 1u);
+  EXPECT_EQ(model->links[0].directionality, LinkDirectionality::Bidirectional);
+}
+
+TEST(MachineModelLoader, RejectsUnknownSchedulingClass) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker, scheduling_class: warp_ordered}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsUnknownLinkDirectionality) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+memories:
+  - {id: m0, kind: sram, visible_from: e0, capacity_bytes: 32768}
+links:
+  - {id: l0, source: m0, destination: m0, bandwidth_bytes_per_cycle: 64, directionality: omni}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsZeroMemoryAccessGranularity) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+memories:
+  - {id: m0, kind: sram, visible_from: e0, capacity_bytes: 32768, access_granularity_bytes: 0}
+)yaml"));
+}
+
+TEST(MachineModelLoader, RejectsZeroOccupancyLimit) {
+  EXPECT_FALSE(loads(R"yaml(
+schema: llk.machine.v2
+target: t
+executors:
+  - {id: e0, kind: worker}
+compute:
+  - id: c0
+    kind: vector_engine
+    attached_to: e0
+    element_types: [f32]
+    shapes: [[8]]
+    occupancy_limit: 0
+)yaml"));
+}
+
+TEST(MachineModelLoader, AddedPropertiesChangeTheContentHash) {
+  llvm::Expected<MachineModel> base = parse(kValid);
+  ASSERT_TRUE(static_cast<bool>(base)) << llvm::toString(base.takeError());
+
+  // Rewrite the worker executor entry in place instead of appending.
+  std::string scheduling = kValid.str();
+  scheduling.replace(scheduling.find("    kind: worker\n"),
+                     std::string("    kind: worker\n").size(),
+                     "    kind: worker\n    scheduling_class: out_of_order\n");
+  llvm::Expected<MachineModel> scheduled = parse(scheduling);
+  ASSERT_TRUE(static_cast<bool>(scheduled))
+      << llvm::toString(scheduled.takeError());
+  EXPECT_NE(base->contentHash, scheduled->contentHash);
+
+  std::string withOccupancy = kValid.str();
+  withOccupancy.replace(withOccupancy.find("    shapes: [[8]]\n"),
+                        std::string("    shapes: [[8]]\n").size(),
+                        "    shapes: [[8]]\n    occupancy_limit: 4\n");
+  llvm::Expected<MachineModel> occupied = parse(withOccupancy);
+  ASSERT_TRUE(static_cast<bool>(occupied))
+      << llvm::toString(occupied.takeError());
+  EXPECT_NE(base->contentHash, occupied->contentHash);
 }

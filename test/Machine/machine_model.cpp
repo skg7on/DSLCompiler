@@ -136,6 +136,32 @@ TEST(MachineModel, VerifyRejectsUnknownExecutorKind) {
   EXPECT_FALSE(verifies(model));
 }
 
+TEST(MachineModel, VerifyRejectsUnknownComputeKind) {
+  MachineModel model = twoCoreMachine();
+  model.computes[0].kind = "tensor_core"; // not Micro owner vocabulary
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsUnknownTransferKind) {
+  MachineModel model = twoCoreMachine();
+  model.transferEngines[0].kind = "pcie";
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyAcceptsMatrixEngineComputeKind) {
+  MachineModel model = twoCoreMachine();
+  model.computes[0].kind = "matrix_engine"; // a Micro owner capability
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsExecutorOwnerAsComputeKind) {
+  MachineModel model = twoCoreMachine();
+  // `core` is valid Micro owner vocabulary, but it is an execution scope, not
+  // a compute capability a machine may attach.
+  model.computes[0].kind = "core";
+  EXPECT_FALSE(verifies(model));
+}
+
 TEST(MachineModel, VerifyRejectsMissingParent) {
   MachineModel model = twoCoreMachine();
   model.executors[1].parent = "nope.0";
@@ -267,4 +293,145 @@ TEST(MachineModel, ContentHashCoversMemoryAccessCost) {
   MachineModel c = twoCoreMachine();
   c.memories[0].latencyCycles = 7;
   EXPECT_NE(computeContentHash(a), computeContentHash(c));
+}
+
+//===----------------------------------------------------------------------===//
+// Design 11.3 properties added after the v2 model shipped
+//===----------------------------------------------------------------------===//
+
+TEST(MachineModel, SchedulingClassDefaultsToInOrder) {
+  MachineModel model = twoCoreMachine();
+  for (const ExecutorNode &executor : model.executors)
+    EXPECT_EQ(executor.schedulingClass, SchedulingClass::InOrder);
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyAcceptsOutOfOrderExecutor) {
+  MachineModel model = twoCoreMachine();
+  model.executors[0].schedulingClass = SchedulingClass::OutOfOrder;
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, ContentHashCoversSchedulingClass) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.executors[0].schedulingClass = SchedulingClass::OutOfOrder;
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+}
+
+TEST(MachineModel, DeclaredEquivalenceDefaultsToEmpty) {
+  MachineModel model = twoCoreMachine();
+  for (const ExecutorNode &executor : model.executors)
+    EXPECT_TRUE(executor.equivalentTo.empty());
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyAcceptsMutualSameKindEquivalence) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].equivalentTo = {"core.1"};
+  model.executors[2].equivalentTo = {"core.0"};
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsUnknownEquivalentExecutor) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].equivalentTo = {"nope.0"};
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsAsymmetricEquivalence) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].equivalentTo = {"core.1"};
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsCrossKindEquivalence) {
+  MachineModel model = twoCoreMachine();
+  model.executors[0].equivalentTo = {"core.0"};
+  model.executors[1].equivalentTo = {"package.0"};
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsSelfEquivalence) {
+  MachineModel model = twoCoreMachine();
+  model.executors[1].equivalentTo = {"core.0"};
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, ContentHashCoversDeclaredEquivalence) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.executors[1].equivalentTo = {"core.1"};
+  b.executors[2].equivalentTo = {"core.0"};
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+}
+
+TEST(MachineModel, MemoryAccessGranularityIsUnmodelledByDefault) {
+  MachineModel model = twoCoreMachine();
+  EXPECT_FALSE(model.memories[0].accessGranularityBytes.has_value());
+  model.memories[0].accessGranularityBytes = 32;
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsZeroMemoryAccessGranularity) {
+  MachineModel model = twoCoreMachine();
+  model.memories[0].accessGranularityBytes = 0;
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, ContentHashCoversMemoryAccessGranularity) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.memories[0].accessGranularityBytes = 32;
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+}
+
+TEST(MachineModel, ComputeOccupancyIsUnconstrainedByDefault) {
+  MachineModel model = twoCoreMachine();
+  EXPECT_FALSE(model.computes[0].occupancyLimit.has_value());
+  model.computes[0].occupancyLimit = 4;
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, VerifyRejectsZeroComputeOccupancy) {
+  MachineModel model = twoCoreMachine();
+  model.computes[0].occupancyLimit = 0;
+  EXPECT_FALSE(verifies(model));
+}
+
+TEST(MachineModel, ContentHashCoversComputeOccupancy) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.computes[0].occupancyLimit = 4;
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+}
+
+TEST(MachineModel, LinkDirectionalityDefaultsToUnidirectional) {
+  MachineModel model = twoCoreMachine();
+  EXPECT_EQ(model.links[0].directionality, LinkDirectionality::Unidirectional);
+  EXPECT_TRUE(verifies(model));
+}
+
+TEST(MachineModel, ContentHashCoversLinkDirectionality) {
+  MachineModel a = twoCoreMachine();
+  MachineModel b = twoCoreMachine();
+  b.links[0].directionality = LinkDirectionality::Bidirectional;
+  EXPECT_NE(computeContentHash(a), computeContentHash(b));
+}
+
+TEST(MachineModel, SchedulingAndDirectionalitySymbolizeRoundTrip) {
+  EXPECT_EQ(symbolizeSchedulingClass("in_order"), SchedulingClass::InOrder);
+  EXPECT_EQ(symbolizeSchedulingClass("out_of_order"),
+            SchedulingClass::OutOfOrder);
+  EXPECT_FALSE(symbolizeSchedulingClass("turbo").has_value());
+  EXPECT_EQ(stringifySchedulingClass(SchedulingClass::OutOfOrder),
+            "out_of_order");
+
+  EXPECT_EQ(symbolizeLinkDirectionality("unidirectional"),
+            LinkDirectionality::Unidirectional);
+  EXPECT_EQ(symbolizeLinkDirectionality("bidirectional"),
+            LinkDirectionality::Bidirectional);
+  EXPECT_FALSE(symbolizeLinkDirectionality("omni").has_value());
+  EXPECT_EQ(stringifyLinkDirectionality(LinkDirectionality::Bidirectional),
+            "bidirectional");
 }

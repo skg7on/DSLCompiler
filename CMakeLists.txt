@@ -75,10 +75,32 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
   endif()
 endif()
 
-project(llk-compiler LANGUAGES CXX C)
+project(llk-compiler VERSION 0.1.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# The compiler version the plan report (§22.2) records. It is the project
+# version plus a `git describe` suffix when the checkout is a git tree, so two
+# compiler revisions never print the same string. A git failure leaves the
+# bare project version, which is still a real version rather than a name.
+set(LLK_COMPILER_VERSION "${PROJECT_VERSION}")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE LLK_GIT_DESCRIBE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE LLK_GIT_RESULT)
+  if(LLK_GIT_RESULT EQUAL 0 AND LLK_GIT_DESCRIBE)
+    set(LLK_COMPILER_VERSION "${PROJECT_VERSION}+${LLK_GIT_DESCRIBE}")
+  endif()
+endif()
+configure_file(include/LLK/Version.h.in
+    "${CMAKE_BINARY_DIR}/include/LLK/Version.h" @ONLY)
+message(STATUS "LLK compiler version: ${LLK_COMPILER_VERSION}")
 
 # Emit compile_commands.json for clangd and other editors. Honoured by the Ninja
 # and Makefile generators; other generators ignore it.
@@ -268,6 +290,8 @@ target_compile_options(LLKMachine PRIVATE -fno-rtti -fno-exceptions)
 # LLKMachine's topology.
 add_library(LLKMapping STATIC
     lib/Mapping/StableHash.cpp
+    lib/Mapping/Diagnostics.cpp
+    lib/Mapping/TileFacts.cpp
     lib/Mapping/CostModel.cpp
     lib/Mapping/CostEvent.cpp
     lib/Mapping/LatencyProvider.cpp
@@ -282,6 +306,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/CoveringSearch.cpp
     lib/Mapping/PlanBinder.cpp
     lib/Mapping/Routing.cpp
+    lib/Mapping/PlanReport.cpp
 )
 target_include_directories(LLKMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -402,6 +427,35 @@ target_include_directories(LLKTargetMapping PUBLIC
 )
 target_link_libraries(LLKTargetMapping PUBLIC LLKMapping LLKMachine)
 target_compile_options(LLKTargetMapping PRIVATE -fno-rtti -fno-exceptions)
+
+# Library: mapping passes (design §21). The `--micro-map` and
+# `--micro-bind-plan` passes are the compiler front door to the mapping engine.
+# They are strictly target-neutral: a target is loaded from files on disk, so
+# the library depends on the mapping core and the target packages, never the
+# reverse.
+add_library(LLKMicroMapping STATIC
+    lib/Conversion/MicroMapping/MicroMapPass.cpp
+    lib/Conversion/MicroMapping/MicroBindPlanPass.cpp
+    lib/Conversion/MicroMapping/MicroVerifyMappingPass.cpp
+    lib/Conversion/MicroMapping/SearchBindingLoader.cpp
+)
+target_include_directories(LLKMicroMapping PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+# The SearchBinding loader reads a space's parameters through
+# llk::perf::loadSearchSpace rather than re-parsing micro.param, so this library
+# needs LLKPerf. That direction is legal: LLKPerf already depends on LLKMapping,
+# and LLKMapping must never depend on LLKPerf, so the pass library -- above both
+# -- is the only layer that may link them together.
+target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine LLKPerf)
+# LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
+# not inherit those. Match the toolchain, exactly as LLKMapping does.
+target_compile_options(LLKMicroMapping PRIVATE -fno-rtti -fno-exceptions)
+# PassWrapper/OperationPass come from MLIRPass; ShapedType and Operation from
+# MLIRIR. Named through mlir_target_link_libraries() so the dylib/archive split
+# stays correct.
+mlir_target_link_libraries(LLKMicroMapping PRIVATE MLIRIR MLIRParser MLIRPass)
 
 # Library: AArch64 target feature detection (SVE/SVE2/NEON)
 add_library(LLKTargetAArch64 STATIC
@@ -576,7 +630,7 @@ endif()
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection LLKToMicro TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection LLKToMicro LLKMicroMapping TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -704,6 +758,11 @@ endfunction()
 add_llk_perf_test(L0StaticBoundTest test/Perf/l0_static_bound.cpp)
 add_llk_perf_test(L1ResourceDAGTest test/Perf/l1_resource_dag.cpp)
 
+# Binder -> perf route identity: builds a real plan, binds it, and charges the
+# bound kernel. Crosses the mapping/perf boundary, so it links LLKMapping too.
+add_llk_perf_test(RouteIdentityTest test/Perf/route_identity.cpp)
+target_link_libraries(RouteIdentityTest PRIVATE LLKMapping)
+
 # Tuning-core tests (issue #49): the search-space loader, candidate
 # generation, and machine-aware legality. The loader test parses micro IR;
 # the other two build typed spaces directly, so a failure points at one layer.
@@ -753,6 +812,7 @@ add_llk_mapping_test(MappingStableHashTest test/Mapping/stable_hash.cpp)
 add_llk_mapping_test(MappingCostModelTest test/Mapping/cost_model.cpp)
 add_llk_mapping_test(MappingSearchBindingTest test/Mapping/search_binding.cpp)
 add_llk_mapping_test(MappingWorkloadGraphTest test/Mapping/workload_graph.cpp)
+add_llk_mapping_test(MappingTileFactsTest test/Mapping/tile_facts.cpp)
 add_llk_mapping_test(MappingPlanTest test/Mapping/mapping_plan.cpp)
 add_llk_mapping_test(MappingLayoutTest test/Mapping/layout_constraints.cpp)
 add_llk_mapping_test(MappingRulesTest test/Mapping/mapping_rules.cpp)
@@ -764,6 +824,22 @@ add_llk_mapping_test(MappingGenericAcceleratorTargetTest test/Mapping/generic_ac
 add_llk_mapping_test(MappingPlanBinderTest test/Mapping/plan_binder.cpp)
 add_llk_mapping_test(MappingE2EWorkflowTest test/Mapping/e2e_workflow.cpp)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
+add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
+add_llk_mapping_test(MappingPropertiesTest test/Mapping/properties.cpp)
+
+# SearchBinding loader (phase-4 task 1): micro.candidate -> mapping::SearchBinding.
+# The loader lives in the pass library, not LLKMapping, because it reuses
+# llk::perf::loadSearchSpace to read the parameters -- and LLKPerf depends on
+# LLKMapping, so the loader cannot live in the reverse direction. The test reads
+# the checked-in fixture by path, so the same file the FileCheck round-trip
+# covers is the one the loader is driven against.
+add_llvm_executable(SearchBindingLoaderTest
+    test/Conversion/MicroMapping/search_binding_loader.cpp)
+target_link_libraries(SearchBindingLoaderTest PRIVATE
+    LLKMicroMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(SearchBindingLoaderTest PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME SearchBindingLoaderTest COMMAND SearchBindingLoaderTest)
 
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
@@ -787,8 +863,11 @@ if(LLK_BUILD_TOOLS)
       # COMMAND mode does not support < redirection natively).
       # Execute the RUN line: llk-opt %s | llk-opt | FileCheck %s
       # This round-trips the IR through llk-opt twice to verify parse+print stability.
+      # Arguments after the input file are placed on the first llk-opt
+      # invocation only, so a test can select a pass; the second invocation
+      # stays the bare parse/print round-trip.
       add_test(NAME ${test_name}
-          COMMAND sh -c "$<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
+          COMMAND sh -c "$<TARGET_FILE:llk-opt> ${ARGN} ${CMAKE_SOURCE_DIR}/${input_file} | $<TARGET_FILE:llk-opt> | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/${input_file}"
       )
   endfunction()
 
@@ -796,6 +875,144 @@ if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
   add_llk_filecheck_test(MicroDialectSearchSpace test/Dialect/Micro/search_space.mlir)
+  add_llk_filecheck_test(MicroMappingSearchBinding test/Conversion/MicroMapping/search_binding.mlir)
+
+  # MicroMappingMap: the --micro-map pass runs the mapping chain (extract ->
+  # search -> bind) and writes the selected plan's metadata onto the kernel.
+  # The pass options are quoted so sh hands llk-opt one argv token; the whole
+  # option string is the user-facing contract from design §21.
+  add_llk_filecheck_test(MicroMappingMap test/Conversion/MicroMapping/micro_map.mlir
+      "\"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=deterministic\"")
+
+  # MicroMappingVerify: phase 2 of the layered verification (design §18.3).
+  # The pipeline chains `--micro-map` (which binds a plan and records its ids)
+  # into `--micro-verify-mapping` (which loads the same target and resolves every
+  # recorded id). A successful verify leaves the IR byte-identical, so the
+  # FileCheck assertions are the plan/mapping metadata MicroMappingMap checks --
+  # a verifier that mutated would have to break them. Raw add_test (rather than
+  # add_llk_filecheck_test) because two passes are chained with their own option
+  # strings; the helper's ARGN list would hand sh a command separator.
+  add_test(NAME MicroMappingVerify
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=deterministic\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/verify_mapping.mlir | $<TARGET_FILE:llk-opt> \"--micro-verify-mapping=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store\" | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/verify_mapping.mlir"
+  )
+
+  # MicroMappingVerifyInvalid: the negative half of phase 2. Each chunk of the
+  # fixture is mapped IR with one recorded id that does not resolve (or a module
+  # with no kernel at all), and `--verify-diagnostics` asserts the stable §22.3
+  # code *and* the specific detail on the diagnostic. The same test also pins
+  # that a fully resolved chunk produces no diagnostic.
+  add_test(NAME MicroMappingVerifyInvalid
+      COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+              "--micro-verify-mapping=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store"
+              ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/verify_mapping_invalid.mlir
+  )
+
+  # MicroMappingUnmaterialized: a plan whose edge is an unmaterializable
+  # movement (see the fixture's rules file). The binder reports such a
+  # connection rather than dropping it silently; the pass must surface that
+  # report as a warning, so this pins the diagnostic. stderr is merged because
+  # the warning goes there while FileCheck reads stdout. Raw add_test because
+  # add_llk_filecheck_test() pipes stdout only and cannot set --check-prefix.
+  add_test(NAME MicroMappingUnmaterialized
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/probe_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=WARN ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir"
+  )
+
+  # MicroMappingReport: the `report=<path>` option's contract -- the report file
+  # is produced, the mapped IR is byte-identical with and without it (the report
+  # is metadata), and two separate llk-opt runs produce identical reports. A
+  # script because FileCheck only speaks about one stdout stream, while this
+  # compares two IR outputs and two report files.
+  add_test(NAME MicroMappingReport
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_report.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingReport
+  )
+
+  # MicroMappingReportOnly: `report-only=1` runs the search and writes the
+  # report but leaves the module untouched (design §21: "emitting a plan report
+  # without modifying input IR"). A script because the assertions span two
+  # files -- the report and the printed IR -- and one of them is a diff of the
+  # output against the input kernel itself, byte for byte.
+  add_test(NAME MicroMappingReportOnly
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_report_only.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingReportOnly
+  )
+
+  # MicroMappingCandidate: `candidate=<sym>` drives `--micro-map` (and, for the
+  # replay half, `--micro-bind-plan`) from a persistent `micro.candidate`
+  # (phase-4 task 4). The candidate's values pin rule parameters and its
+  # `layout`-kind parameter -- resolved by kind, not by name -- selects the
+  # bound layout, so the plan the pass binds is traceable to the search-space
+  # point it came from. Because the plan id folds in the binding's hash, the
+  # round trip needs the same `candidate=` on both runs (ruling S8); this test
+  # proves it, and that the id is genuinely absent from a binding-free replay.
+  # A script because the binding's hash is read back out of the report file and
+  # compared against the bound IR, and because the rejection and namespace cases
+  # are separate invocations whose diagnostics are asserted.
+  add_test(NAME MicroMappingCandidate
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_candidate.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingCandidate
+  )
+
+  # MicroMappingBindPlanId: `--micro-bind-plan` accepts the id the report prints
+  # (bare hex), plus 0x-hex and signed/unsigned decimal, and rejects anything
+  # else. End-to-end because the id is obtained by running `--micro-map report=`
+  # first -- the documented report -> bind workflow. A script because the id is
+  # read out of a file and fed back into a second invocation.
+  add_test(NAME MicroMappingBindPlanId
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_bind_plan_id.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBindPlanId
+  )
+
+  # MicroMappingBindPlanMode: a plan id is a content hash, so reproducing one
+  # means replaying the search -- same mode, beam-width, and top-k. This pins
+  # that `--micro-bind-plan` takes those options and honours them: a beam id
+  # round-trips in beam mode, and a deterministic id is absent from a beam
+  # search with the same cap (the diagnostic names the mode it searched).
+  add_test(NAME MicroMappingBindPlanMode
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_bind_plan_mode.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBindPlanMode
+  )
+
+  # MicroMappingBindPlanRoundtrip: the strongest form of the report -> bind
+  # contract -- binding the reported id reproduces the *same* plan, not merely
+  # *a* plan, so the bound IR is byte-identical to the `--micro-map report=`
+  # output. The id-parsing and mode tests above prove the id is accepted and the
+  # search is replayed; this one proves the replayed search selects the plan the
+  # report named. Three cases: deterministic and beam over the hand-authored
+  # kernel, and exact over IR that `--llk-to-micro` produced, so the round-trip
+  # is covered on compiler-generated IR too. A script because it compares two
+  # IR streams the way FileCheck cannot.
+  #
+  # The ids here are all binding-free, so the replay passes no `candidate=`. A
+  # plan id folds the search point in, so a binding-derived id needs the same
+  # `candidate=` on both runs; MicroMappingCandidate covers that round trip
+  # (ruling S8).
+  add_test(NAME MicroMappingBindPlanRoundtrip
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_bind_plan_roundtrip.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBindPlanRoundtrip
+  )
+
+  # MicroMappingMatmulE2E / MicroMappingSwiGLUE2E: the gap-#3 acceptance. Each
+  # runs the two-pass pipeline `--llk-to-micro | --micro-map mode=exact` over
+  # the LLK source, so the kernel being mapped is genuinely compiler-generated
+  # (the input is the same LLK program as the matching LLKToMicro fixture), and
+  # asserts the shipped AVX2 target binds a complete plan onto it: a
+  # `micro.plan` on the kernel and a `micro.mapping` on every covered node,
+  # including the `micro.vector` op variants the lowering emits and the
+  # `micro.tile_async_copy`/`micro.tile_store` movement ops.
+  add_test(NAME MicroMappingMatmulE2E
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | $<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=exact\" | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir"
+  )
+  add_test(NAME MicroMappingSwiGLUE2E
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/swiglu_e2e.mlir | $<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=exact\" | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/swiglu_e2e.mlir"
+  )
+
   # LLKToMicro lowering tests. The schedule database is pointed at a path that
   # does not exist on purpose: the export then uses its built-in conservative
   # schedule, so the expected tile sizes do not depend on the working directory

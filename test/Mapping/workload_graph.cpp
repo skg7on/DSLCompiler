@@ -4,6 +4,7 @@
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -31,6 +32,7 @@ Parsed parseKernel(llvm::StringRef text) {
   parsed.context = std::make_unique<MLIRContext>();
   parsed.context->getOrLoadDialect<micro::MicroDialect>();
   parsed.context->getOrLoadDialect<tensor::TensorDialect>();
+  parsed.context->getOrLoadDialect<arith::ArithDialect>();
   parsed.module = parseSourceString<ModuleOp>(text, parsed.context.get());
   if (parsed.module)
     parsed.module->walk([&](Operation *op) {
@@ -82,6 +84,49 @@ const WorkloadNode *findNodeByOp(const WorkloadGraph &graph,
   return nullptr;
 }
 
+/// A view with constant offsets: the consumer's index space is the source's,
+/// shifted by (1, 2).
+constexpr llvm::StringRef kShiftedView = R"mlir(
+module {
+  micro.kernel @shift {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %v = micro.tile_view %t[%c1, %c2] {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %v, %v : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// A non-constant view offset: no affine map can be extracted from it alone.
+constexpr llvm::StringRef kSymbolicView = R"mlir(
+module {
+  micro.kernel @symbolic {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    %c3 = arith.constant 3 : index
+    %offset = arith.addi %c3, %c3 : index
+    %v = micro.tile_view %t[%offset, %offset] {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %v, %v : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// A partition names a fragment, not an index relationship to its parent.
+constexpr llvm::StringRef kPartitioned = R"mlir(
+module {
+  micro.kernel @partition {
+    %t = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %p = micro.tile_partition %t {shape = array<i64: 4, 4>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<4x4xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %p, %p : !micro.tile<4x4xf32, memory = #micro.memory<sram>>, !micro.tile<4x4xf32, memory = #micro.memory<sram>> -> !micro.tile<4x4xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
 } // namespace
 
 TEST(WorkloadGraph, KeepsOnlyExecutionOpsAsNodes) {
@@ -112,6 +157,70 @@ TEST(WorkloadGraph, TileViewIsTransparent) {
   // Both operands resolve through the logical view to the copy's output.
   EXPECT_EQ(vector->inputs[0].value, copy->outputs[0].value);
   EXPECT_EQ(vector->inputs[1].value, copy->outputs[0].value);
+}
+
+TEST(WorkloadGraph, WholeSourceViewGivesAnIdentityAccessMap) {
+  Parsed parsed = parseKernel(kVector);
+  ASSERT_TRUE(parsed.module);
+  auto graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph));
+
+  const WorkloadNode *vector = findNodeByOp(*graph, "micro.vector");
+  ASSERT_NE(vector, nullptr);
+  ASSERT_EQ(vector->inputs.size(), 2u);
+  ASSERT_TRUE(vector->inputs[0].accessMap.has_value());
+  // A view of the whole source is the identity relation.
+  EXPECT_EQ(*vector->inputs[0].accessMap,
+            AffineMap::getMultiDimIdentityMap(2, parsed.context.get()));
+  EXPECT_EQ(*vector->inputs[1].accessMap,
+            AffineMap::getMultiDimIdentityMap(2, parsed.context.get()));
+}
+
+TEST(WorkloadGraph, ConstantOffsetViewGivesAShiftedAccessMap) {
+  Parsed parsed = parseKernel(kShiftedView);
+  ASSERT_TRUE(parsed.module) << "fixture must parse";
+  auto graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph));
+
+  MLIRContext &context = *parsed.context;
+  const WorkloadNode *vector = findNodeByOp(*graph, "micro.vector");
+  ASSERT_NE(vector, nullptr);
+  ASSERT_EQ(vector->inputs.size(), 2u);
+  ASSERT_TRUE(vector->inputs[0].accessMap.has_value());
+  AffineMap expected = AffineMap::get(
+      2, 0,
+      {getAffineDimExpr(0, &context) + getAffineConstantExpr(1, &context),
+       getAffineDimExpr(1, &context) + getAffineConstantExpr(2, &context)},
+      &context);
+  EXPECT_EQ(*vector->inputs[0].accessMap, expected);
+}
+
+TEST(WorkloadGraph, NonConstantViewOffsetHasNoAccessMap) {
+  Parsed parsed = parseKernel(kSymbolicView);
+  ASSERT_TRUE(parsed.module) << "fixture must parse";
+  auto graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph));
+
+  const WorkloadNode *vector = findNodeByOp(*graph, "micro.vector");
+  ASSERT_NE(vector, nullptr);
+  ASSERT_FALSE(vector->inputs.empty());
+  // The offset is not a constant this layer can turn into an affine map, so
+  // none is invented.
+  EXPECT_FALSE(vector->inputs[0].accessMap.has_value());
+}
+
+TEST(WorkloadGraph, PartitionHasNoAccessMap) {
+  Parsed parsed = parseKernel(kPartitioned);
+  ASSERT_TRUE(parsed.module) << "fixture must parse";
+  auto graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph));
+
+  const WorkloadNode *vector = findNodeByOp(*graph, "micro.vector");
+  ASSERT_NE(vector, nullptr);
+  ASSERT_FALSE(vector->inputs.empty());
+  // A fragment's position within its parent is not an index relation the op
+  // alone states, so no map is invented.
+  EXPECT_FALSE(vector->inputs[0].accessMap.has_value());
 }
 
 TEST(WorkloadGraph, ExternalInputsAreMarked) {

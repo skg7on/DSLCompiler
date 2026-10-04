@@ -20,9 +20,8 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
+#include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingRules.h"
-
-#include "mlir/IR/BuiltinAttributes.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -33,12 +32,28 @@
 
 namespace mlir::llk::mapping {
 
-/// An opaque target-owned implementation name plus typed parameters. Only the
-/// target's emitter interprets `name` and `parameters`.
-struct TargetBundle {
-  std::string name;
-  mlir::DictionaryAttr parameters;
-  std::string emitterKey;
+/// A target plugin's code emitter. It is opaque to the mapping core: generic
+/// code selects a bundle and hands it to the plugin emitter, which decides
+/// whether the bundle is complete enough to lower (design §18.3, phase 3). The
+/// interface deliberately stops at that boundary -- it exposes no lowering or
+/// LIR API, because emission to machine code is a plugin concern.
+///
+/// An emitter instance handles exactly one emitter key, the one it was created
+/// for. `verify` is pure and may be called repeatedly.
+class TargetEmitter {
+public:
+  virtual ~TargetEmitter() = default;
+
+  /// The emitter key this emitter handles. Always one the owning target
+  /// declares (`MappingTarget::isKnownEmitter`).
+  virtual llvm::StringRef key() const = 0;
+
+  /// Verifies `bundle` is complete for this emitter before lowering. Returns
+  /// an error when the bundle names an emitter this target does not declare,
+  /// when the bundle targets a different emitter key than the one this emitter
+  /// handles, or when a bundle parameter is not the integer/string shape the
+  /// plugin contract permits.
+  virtual llvm::Error verify(const TargetBundle &bundle) const = 0;
 };
 
 /// The interface target-independent mapping code uses.
@@ -51,6 +66,25 @@ public:
   virtual const LayoutRegistry &layouts() const = 0;
   virtual const RuleRegistry &rules() const = 0;
   virtual bool isKnownEmitter(llvm::StringRef key) const = 0;
+
+  /// The emitter for `key`, or null when the target does not declare that key.
+  /// A target that declares several emitter keys exposes each one here; the
+  /// caller passes the key a bundle's `emitterKey` names. This is the one
+  /// factory a target must implement.
+  virtual std::unique_ptr<TargetEmitter>
+  createEmitter(llvm::StringRef key) const = 0;
+
+  /// A target's single default emitter, if it has one (design §19). The base
+  /// returns null: a target that declares several keys has no single default,
+  /// so callers reach each key through `createEmitter(key)` and a target opts
+  /// in to a default only when it genuinely has a principal emitter. Because
+  /// this is non-pure, an out-of-tree target need implement only the keyed
+  /// factory. The default `FileMappingTarget` supplies is declaration-order
+  /// dependent (its first declared key), so it is meaningful for a
+  /// single-key target and a convenience otherwise -- prefer the keyed form.
+  virtual std::unique_ptr<TargetEmitter> createEmitter() const {
+    return nullptr;
+  }
 
   /// Optional measured or calibrated latencies. Null means the target has
   /// none -- and a provider with no entry for a signature is the same as null
@@ -77,6 +111,9 @@ public:
   const LayoutRegistry &layouts() const override { return layouts_; }
   const RuleRegistry &rules() const override { return rules_; }
   bool isKnownEmitter(llvm::StringRef key) const override;
+  std::unique_ptr<TargetEmitter>
+  createEmitter(llvm::StringRef key) const override;
+  std::unique_ptr<TargetEmitter> createEmitter() const override;
   const LatencyProvider *latencyProvider() const override { return provider_; }
 
 private:

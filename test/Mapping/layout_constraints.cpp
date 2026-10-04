@@ -2,11 +2,15 @@
 
 #include "LLK/Mapping/LayoutConstraints.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <memory>
+#include <optional>
 #include <string>
 
 using namespace mlir::llk::mapping;
@@ -447,6 +451,8 @@ TEST(LayoutSolve, RespectsMaxSolutionsAndDisclosesIt) {
 namespace {
 constexpr llvm::StringLiteral kShippedLayouts =
     LLK_MAPPING_DIR "/x86-avx2/layouts.llkmap";
+constexpr llvm::StringLiteral kShippedGenericLayouts =
+    LLK_MAPPING_DIR "/generic-ai-accel/layouts.llkmap";
 constexpr llvm::StringLiteral kInvalidLayouts =
     LLK_MAPPING_DIR "/../test/Mapping/Inputs/invalid-layouts.llkmap";
 } // namespace
@@ -506,4 +512,340 @@ TEST(LayoutShipped, RejectsTheInvalidFixture) {
   EXPECT_FALSE(static_cast<bool>(registry));
   if (!registry)
     llvm::consumeError(registry.takeError());
+}
+
+//===----------------------------------------------------------------------===//
+// Printing and round-trip (design §25.3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Prints every declaration in `registry`, re-parses the text, and returns the
+/// re-parsed content hash -- or `std::nullopt` when the printed text does not
+/// parse. Comparing content hashes is the structural-equality check: the hash
+/// folds every field that shapes a declaration.
+std::optional<uint64_t> roundTripLayouts(const LayoutRegistry &registry) {
+  std::string text;
+  for (const LayoutDef &def : registry.all())
+    text += printLayout(def);
+  llvm::Expected<LayoutRegistry> reparsed =
+      parseLayoutText(text, "<round-trip>");
+  if (!reparsed) {
+    llvm::consumeError(reparsed.takeError());
+    return std::nullopt;
+  }
+  return reparsed->computeContentHash();
+}
+
+} // namespace
+
+TEST(LayoutPrint, RoundTripsEveryConstruct) {
+  // Integer and symbolic parameters, an integer range and a symbolic enum, a
+  // plain and a machine-query constraint, both quantifiers, and an affine map.
+  llvm::Expected<LayoutRegistry> registry = parse(R"llkmap(
+layout t.everything(int M, int N, sym policy) {
+  param M in [2..4];
+  param N in [1..3];
+  param policy in {"row", "col"};
+  require rank == 2;
+  require M == machine.compute("vector_engine").lanes(element_type);
+  require forall d in dimensions : d >= 0;
+  require exists v in domain(N) : v > 1;
+  map (m, n) -> (m, floordiv(n, N), mod(n, N));
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  std::optional<uint64_t> reparsed = roundTripLayouts(*registry);
+  ASSERT_TRUE(reparsed.has_value())
+      << "printed layout did not parse back:\n"
+      << printLayout(*registry->find("t.everything"));
+  EXPECT_EQ(*reparsed, registry->computeContentHash());
+}
+
+TEST(LayoutPrint, RoundTripsBareParameterDeclaration) {
+  llvm::Expected<LayoutRegistry> registry =
+      parse("layout t.bare(N) { param N in [1..2]; }");
+  ASSERT_TRUE(static_cast<bool>(registry));
+  std::optional<uint64_t> reparsed = roundTripLayouts(*registry);
+  ASSERT_TRUE(reparsed.has_value());
+  EXPECT_EQ(*reparsed, registry->computeContentHash());
+}
+
+TEST(LayoutPrint, RoundTripsADomainlessParameter) {
+  // A parameter declared in the header but never given a domain must survive:
+  // the header list, not a domain statement, is what declares it.
+  llvm::Expected<LayoutRegistry> registry =
+      parse("layout t.free(int M, sym tag) { require rank == 1; }");
+  ASSERT_TRUE(static_cast<bool>(registry));
+  std::optional<uint64_t> reparsed = roundTripLayouts(*registry);
+  ASSERT_TRUE(reparsed.has_value());
+  EXPECT_EQ(*reparsed, registry->computeContentHash());
+}
+
+TEST(LayoutPrint, RoundTripsShippedFiles) {
+  for (llvm::StringLiteral path : {kShippedLayouts, kShippedGenericLayouts}) {
+    llvm::Expected<LayoutRegistry> registry = loadLayoutFile(path);
+    ASSERT_TRUE(static_cast<bool>(registry))
+        << path.str() << ": " << llvm::toString(registry.takeError());
+    std::optional<uint64_t> reparsed = roundTripLayouts(*registry);
+    ASSERT_TRUE(reparsed.has_value()) << path.str();
+    EXPECT_EQ(*reparsed, registry->computeContentHash()) << path.str();
+  }
+}
+
+TEST(LayoutPrint, PrintingIsDeterministic) {
+  llvm::Expected<LayoutRegistry> registry = loadLayoutFile(kShippedLayouts);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  for (const LayoutDef &def : registry->all())
+    EXPECT_EQ(printLayout(def), printLayout(def)) << def.id;
+}
+
+//===----------------------------------------------------------------------===//
+// Finite quantification (design §13.3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Evaluates the first `require` of `id` in `text`, resolving a `domain(...)`
+/// quantifier against the layout's declared parameter domains.
+llvm::Expected<EvalValue>
+evalLayoutConstraint(llvm::StringRef text, llvm::StringRef id,
+                     const MachineModel &machine, LayoutContext context = {},
+                     const llvm::StringMap<LayoutValue> &bindings = {}) {
+  llvm::Expected<LayoutRegistry> registry = parseLayoutText(text, "<test>");
+  if (!registry)
+    return registry.takeError();
+  const LayoutDef *def = registry->find(id);
+  if (!def)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "missing layout '" + id + "'");
+  // Named lvalue: `function_ref` borrows, so it must outlive the call.
+  auto resolveDomain =
+      [def](
+          llvm::StringRef name) -> std::optional<llvm::ArrayRef<LayoutValue>> {
+    auto it = def->domains.find(name.str());
+    if (it == def->domains.end())
+      return std::nullopt;
+    return llvm::ArrayRef<LayoutValue>(it->second.values);
+  };
+  EvalOptions options;
+  options.domainResolver = resolveDomain;
+  return evaluateExpr(*def->constraints[0], bindings, machine, context,
+                      options);
+}
+
+int64_t evalLayoutInt(llvm::StringRef text, llvm::StringRef id,
+                      const MachineModel &machine, LayoutContext context = {},
+                      const llvm::StringMap<LayoutValue> &bindings = {}) {
+  llvm::Expected<EvalValue> value =
+      evalLayoutConstraint(text, id, machine, context, bindings);
+  if (!value || value->kind != EvalValue::Kind::Int)
+    return INT64_MIN;
+  return value->intValue;
+}
+
+} // namespace
+
+TEST(LayoutQuantifier, ForallOverAParamDomainHoldsAndFails) {
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral holds = R"llkmap(
+layout t.q(int N) {
+  param N in [2..6];
+  require forall v in domain(N) : v >= 2;
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(holds, "t.q", machine), 1);
+
+  llvm::StringLiteral fails = R"llkmap(
+layout t.q(int N) {
+  param N in [2..6];
+  require forall v in domain(N) : v >= 3;
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(fails, "t.q", machine), 0);
+}
+
+TEST(LayoutQuantifier, ExistsOverAParamDomainHoldsAndFails) {
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral holds = R"llkmap(
+layout t.q(int N) {
+  param N in [2..6];
+  require exists v in domain(N) : v == 6;
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(holds, "t.q", machine), 1);
+
+  llvm::StringLiteral fails = R"llkmap(
+layout t.q(int N) {
+  param N in [2..6];
+  require exists v in domain(N) : v == 9;
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(fails, "t.q", machine), 0);
+}
+
+TEST(LayoutQuantifier, QuantifiesOverMachineExecutors) {
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral everyWorker = R"llkmap(
+layout t.q() {
+  require forall e in executors("worker") : e != "nobody";
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(everyWorker, "t.q", machine), 1);
+
+  llvm::StringLiteral someWorker = R"llkmap(
+layout t.q() {
+  require exists e in executors("worker") : e == "e0";
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(someWorker, "t.q", machine), 1);
+
+  llvm::StringLiteral noWorker = R"llkmap(
+layout t.q() {
+  require exists e in executors("worker") : e == "e9";
+}
+)llkmap";
+  EXPECT_EQ(evalLayoutInt(noWorker, "t.q", machine), 0);
+}
+
+TEST(LayoutQuantifier, RejectsExecutorKindsWithNoExecutors) {
+  MachineModel machine = evalMachine();
+  // `wormer` is outside the owner vocabulary -- a typo.
+  llvm::StringLiteral unknown = R"llkmap(
+layout t.q() {
+  require forall e in executors("wormer") : e != "";
+}
+)llkmap";
+  llvm::Expected<EvalValue> unknownKind =
+      evalLayoutConstraint(unknown, "t.q", machine);
+  ASSERT_FALSE(static_cast<bool>(unknownKind));
+  EXPECT_NE(
+      llvm::toString(unknownKind.takeError()).find("unknown executor kind"),
+      std::string::npos);
+
+  // `dma` is a valid owner kind, just not populated by this machine.
+  llvm::StringLiteral empty = R"llkmap(
+layout t.q() {
+  require forall e in executors("dma") : e != "";
+}
+)llkmap";
+  llvm::Expected<EvalValue> noExecutors =
+      evalLayoutConstraint(empty, "t.q", machine);
+  ASSERT_FALSE(static_cast<bool>(noExecutors));
+  EXPECT_NE(llvm::toString(noExecutors.takeError())
+                .find("offers no executors of kind"),
+            std::string::npos);
+}
+
+TEST(LayoutQuantifier, OverDimensionsIsVacuouslyTrueWhenEmpty) {
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral everyDim = R"llkmap(
+layout t.q() {
+  require forall d in dimensions : d < rank;
+}
+)llkmap";
+  llvm::StringLiteral anyDim = R"llkmap(
+layout t.q() {
+  require exists d in dimensions : d >= 0;
+}
+)llkmap";
+  LayoutContext rank2;
+  rank2.rank = 2;
+  EXPECT_EQ(evalLayoutInt(everyDim, "t.q", machine, rank2), 1);
+  EXPECT_EQ(evalLayoutInt(anyDim, "t.q", machine, rank2), 1);
+
+  // A scalar has no dimensions: `forall` is vacuous, `exists` finds nothing.
+  LayoutContext rank0;
+  rank0.rank = 0;
+  EXPECT_EQ(evalLayoutInt(everyDim, "t.q", machine, rank0), 1);
+  EXPECT_EQ(evalLayoutInt(anyDim, "t.q", machine, rank0), 0);
+}
+
+TEST(LayoutQuantifier, ReportsTruncationWhenTheDomainExceedsTheBound) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::StringLiteral text = R"llkmap(
+layout t.q(int N) {
+  param N in [1..4];
+  require forall v in domain(N) : v >= 1;
+}
+)llkmap";
+
+  // With room for the whole quantified domain, every assignment solves.
+  SolverLimits roomy;
+  roomy.maxAssignments = 1000;
+  roomy.maxQuantifierIterations = 1000;
+  llvm::Expected<LayoutSolveResult> solved =
+      solveText(text, "t.q", machine, context, {}, roomy);
+  ASSERT_TRUE(static_cast<bool>(solved)) << llvm::toString(solved.takeError());
+  EXPECT_FALSE(solved->truncated);
+  EXPECT_EQ(solved->solutions.size(), 4u);
+
+  // A quantifier bound below the domain size stops the scan. The result is
+  // reported truncated, never read as a definite "no solution".
+  SolverLimits tight;
+  tight.maxAssignments = 1000;
+  tight.maxQuantifierIterations = 2;
+  llvm::Expected<LayoutSolveResult> clipped =
+      solveText(text, "t.q", machine, context, {}, tight);
+  ASSERT_TRUE(static_cast<bool>(clipped));
+  EXPECT_TRUE(clipped->solutions.empty());
+  EXPECT_TRUE(clipped->truncated);
+}
+
+TEST(LayoutQuantifier, ATruncatedQuantifierUnderNegationIsReportedNotAccepted) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  // The domain is larger than the default quantifier budget, so the `forall`
+  // is *undecided*; under `!` that reads as satisfied. The solve must flag the
+  // truncation -- the production consumer (Placement) fails closed on it -- so
+  // the undecided constraint is never presented as a clean success.
+  llvm::StringLiteral text = R"llkmap(
+layout t.trunc(int N) {
+  param N in [1..200000];
+  require !(forall v in domain(N) : v >= 1);
+}
+)llkmap";
+  llvm::Expected<LayoutSolveResult> result =
+      solveText(text, "t.trunc", machine, context);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->truncated);
+  EXPECT_TRUE(result->undecided);
+  // Solutions that rest on an undecided constraint are withheld, so no caller
+  // can accept the undecided-derived layout as legal.
+  EXPECT_TRUE(result->solutions.empty());
+}
+
+//===----------------------------------------------------------------------===//
+// LayoutSolver interface (design §13.3)
+//===----------------------------------------------------------------------===//
+
+TEST(LayoutSolverInterface, SolvesThroughTheInterface) {
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  llvm::Expected<LayoutRegistry> registry = parse(kSolvable);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("t.block");
+  ASSERT_NE(def, nullptr);
+
+  std::unique_ptr<LayoutSolver> solver = makeBoundedLayoutSolver();
+  ASSERT_NE(solver, nullptr);
+  SolverLimits limits;
+  limits.maxSolutions = 64;
+
+  llvm::Expected<LayoutSolveResult> throughInterface =
+      solver->solve(*def, machine, context, layoutContext, limits);
+  ASSERT_TRUE(static_cast<bool>(throughInterface))
+      << llvm::toString(throughInterface.takeError());
+  llvm::Expected<LayoutSolveResult> throughFree =
+      solveLayout(*def, machine, context, layoutContext, limits);
+  ASSERT_TRUE(static_cast<bool>(throughFree))
+      << llvm::toString(throughFree.takeError());
+
+  EXPECT_EQ(throughInterface->solutions.size(), throughFree->solutions.size());
+  EXPECT_EQ(throughInterface->solutions.size(), 12u);
+  EXPECT_FALSE(throughInterface->truncated);
 }

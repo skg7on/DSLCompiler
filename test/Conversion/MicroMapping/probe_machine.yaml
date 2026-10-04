@@ -1,0 +1,60 @@
+# A machine for micro_map_unmaterialized.mlir whose two memories live in
+# different visibility scopes, so the node reading DRAM cannot read the SRAM
+# the producer wrote: the edge between them is a real transfer, which is what
+# makes the binder try -- and fail -- to materialize it. The shipped AVX2
+# profile puts every memory in one cluster, where any worker can read any
+# memory, so under design §10.2 every cross-memory edge there is a Direct read
+# and nothing has to move.
+schema: llk.machine.v2
+target: probe
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.a
+    kind: cluster
+  - id: worker.a
+    kind: worker
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+  - id: worker.b
+    kind: worker
+    parent: cluster.b
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.a
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+  - id: dram.0
+    kind: dram
+    visible_from: cluster.b
+    capacity_bytes: 1073741824
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.a
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+transfer_engines:
+  - id: dma.a
+    kind: dma
+    attached_to: cluster.a
+    count: 1
+    max_outstanding: 1
+links:
+  - id: sram_to_dram.0
+    source: sram.0
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.a]

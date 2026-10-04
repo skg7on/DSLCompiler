@@ -41,7 +41,9 @@ additive   ::= multiplicative (("+" | "-") multiplicative)*
 multiplicative ::= unary (("*" | "/" | "%") unary)*
 unary      ::= ("!" | "-") unary | postfix
 postfix    ::= primary ("." ident [ "(" args ")" ])*
-primary    ::= int | string | ident | "(" expr ")" | call
+primary    ::= int | string | ident | "(" expr ")" | call | quantifier
+quantifier ::= ("forall" | "exists") ident "in" domain ":" expr
+domain     ::= "domain" "(" ident ")" | "executors" "(" expr ")" | "dimensions"
 call       ::= ident "(" args ")"
 id         ::= (letter | "_") (alnum | "_" | ".")*
 ```
@@ -79,6 +81,62 @@ A `layout` names its integer and symbolic parameters, then states:
 | `machine.memory(<id>).capacity_bytes` | memory capacity |
 | `machine.memory(<id>).alignment_bytes` | memory alignment |
 
+## Finite quantification
+
+Design §13.3 requires the evaluator to quantify over a declared finite domain,
+so a constraint like "every declared vector width is a multiple of two" or
+"every executor of this kind exists" is *declared* rather than written in
+target-specific C++.
+
+```text
+require forall v in domain(VW) : v % 2 == 0;
+require exists d in dimensions : d == 1;
+require forall e in executors("worker") : e != "";
+```
+
+`forall x in D : p` is 1 when the body `p` holds for every element of `D`, and
+`exists x in D : p` is 1 when it holds for at least one. Booleans are integers,
+so a quantifier is usable anywhere an expression is.
+
+### Domains
+
+| Domain | Elements (in declaration order) |
+|---|---|
+| `domain(<param>)` | the declared domain of `<param>` (`[lo..hi]` or `{...}`) |
+| `executors(<kind>)` | every executor whose kind is `<kind>` (or that refines it), binding its id |
+| `dimensions` | the integers `0 .. rank-1`, the value's logical dimensions |
+
+The bound variable shadows any outer name and is local to the body. The body
+extends as far right as possible, so a quantifier that must feed a larger
+expression needs parentheses: `(forall v in domain(VW) : p) && q`.
+
+`executors(<kind>)` reads the machine like the other capability queries: a
+`<kind>` with no matching executor is an unknown fact, reported as an error,
+never a silently empty set. The diagnostic distinguishes a kind outside the
+owner vocabulary (`unknown executor kind`) from a valid owner kind the profile
+simply does not populate (`the machine offers no executors of kind`).
+
+An empty domain is vacuous: `forall` over it is 1 and `exists` over it is 0.
+`dimensions` is the only domain that can be empty (a scalar has no dimensions).
+
+### Boundedness
+
+Quantification is bounded and deterministic. Every element a quantifier examines
+consumes one unit of a budget set from `SolverLimits::maxQuantifierIterations`
+(a rule's `require` uses its own assignment bound). When the budget runs out
+before a quantifier has decided, the quantifier yields **0** -- *undecided*,
+never a definite false -- and the declaration is never silently treated as
+satisfied or unsatisfied.
+
+For a layout, the solve reports two distinct flags: `truncated` (the search did
+not exhaust its space; the reported solutions are legal, there may be more) and
+`undecided` (a quantifier ran out of budget, so a solution could rest on an
+undecided constraint and must not be accepted). An `undecided` solve withholds
+its solutions and `Placement` refuses to place such a candidate. Rejecting a
+layout under an undecided constraint is the conservative direction: it is better
+to fail to place than to accept an illegal layout. For a rule, an undecided
+constraint is a non-match with the search reported truncated.
+
 ## Example
 
 ```text
@@ -101,6 +159,13 @@ The parser rejects, with a file/line/column diagnostic:
 - a `param ... in` clause for an undeclared parameter, or a duplicate domain;
 - an identifier in a `require`/`map` that is neither a declared parameter, a
   map dimension, nor a builtin;
+- a quantifier domain that is not `domain(...)`, `executors(...)`, or
+  `dimensions`, a `domain(...)` argument that is not a known identifier, or a
+  missing `in`/`:` in a quantifier. A `domain(<name>)` whose `<name>` is a known
+  identifier that is not a declared parameter -- a builtin such as `rank` or
+  `element_type` -- parses, because it cannot be told from a parameter until the
+  declaration is complete, and is reported as `unknown domain` when solved (a
+  builtin has no declared domain);
 - an unknown function (`floordiv`, `ceildiv`, `mod`, `min`, `max`,
   `machine.compute`, `machine.memory`) or member query (`lanes`, `count`,
   `capacity_bytes`, `alignment_bytes`);

@@ -1,0 +1,40 @@
+// Rules for the micro_map_unmaterialized.mlir fixture.
+//
+// They deliberately bind the vector and the store to different memories, so
+// the edge between them is a real movement (a `Transfer`) rather than a
+// same-memory `Direct` connection -- which is what makes the binder try, and
+// fail, to materialize it. The machine (probe_machine.yaml) puts those two
+// memories in different visibility scopes, so the store cannot read the
+// vector's memory and no `Direct` alternative hides the movement. The moved
+// value is a `!micro.tile`, and the binder can only build a
+// `micro.tile_async_copy` for a shaped (tensor) value, so it reports the
+// connection instead of writing a copy.
+//
+// `emit` is an opaque key here; the pass is given `emitters=e1`.
+
+rule t.copy {
+  match micro.async_copy();
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.copy";
+  emit "e1";
+  cost 1;
+}
+
+rule t.vector {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.vector";
+  emit "e1";
+  cost 1;
+}
+
+rule t.store {
+  match micro.tile_store();
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.store";
+  emit "e1";
+  cost 1;
+}

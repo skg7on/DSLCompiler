@@ -1,0 +1,200 @@
+//===- MicroBindPlanPass.cpp - `micro-bind-plan` (design §21) -------------===//
+//
+// Binds one specific plan, named by its stable content-derived id, onto the
+// module's kernel. A plan id is a hash of the plan's content, so the only way
+// to reproduce it is to re-run the search -- plans are never persisted between
+// passes. Reproduction therefore requires the same search options the id was
+// produced with: the mode, beam-width, and top-k, the same search point
+// (`candidate=`, when the id came from a bound search -- the id folds in the
+// binding's hash), and the same target files (machine, rules, layouts,
+// emitters). A different search can order, cap, or constrain the plans
+// differently and so fail to contain the id, which is reported rather than
+// silently binding a different plan.
+//
+//===----------------------------------------------------------------------===//
+
+#include "LLK/Conversion/MicroMapping/MicroMappingPasses.h"
+#include "MicroMappingCommon.h"
+
+#include "mlir/Pass/Pass.h"
+
+#include "llvm/Support/Error.h"
+
+#include <memory>
+#include <optional>
+#include <string>
+
+namespace mlir {
+namespace llk {
+
+namespace {
+
+struct MicroBindPlanPass
+    : public PassWrapper<MicroBindPlanPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MicroBindPlanPass)
+
+  MicroBindPlanPass() = default;
+  MicroBindPlanPass(const MicroBindPlanPass &other) : PassWrapper(other) {}
+
+  Option<std::string> planId{
+      *this, "plan-id",
+      llvm::cl::desc("Stable id of the plan to bind (required)")};
+  Option<std::string> target{
+      *this, "target",
+      llvm::cl::desc("Opaque target label recorded on the selected plan")};
+  Option<std::string> machine{*this, "machine",
+                              llvm::cl::desc("Machine profile YAML path")};
+  Option<std::string> layouts{
+      *this, "layouts", llvm::cl::desc("Layout declaration (.llkmap) path")};
+  Option<std::string> rules{*this, "rules",
+                            llvm::cl::desc("Rule declaration (.llkmap) path")};
+  Option<std::string> emitters{
+      *this, "emitters",
+      llvm::cl::desc("Comma-separated emitter keys the target understands")};
+  Option<std::string> mode{
+      *this, "mode",
+      llvm::cl::desc("Search mode: deterministic, beam, or exact (must match "
+                     "the mode that produced the plan id)"),
+      llvm::cl::init("beam")};
+  Option<unsigned> topK{
+      *this, "top-k",
+      llvm::cl::desc("Maximum number of complete plans to keep (must match the "
+                     "cap that produced the plan id)"),
+      llvm::cl::init(8)};
+  Option<unsigned> beamWidth{*this, "beam-width",
+                             llvm::cl::desc("Beam mode's frontier width (must "
+                                            "match the width that produced the "
+                                            "plan id)"),
+                             llvm::cl::init(64)};
+  Option<std::string> candidate{
+      *this, "candidate",
+      llvm::cl::desc("Symbol (without @) of the micro.candidate the id was "
+                     "produced at; must match the --micro-map run that "
+                     "produced the id. Absent searches binding-free")};
+
+  StringRef getArgument() const override { return "micro-bind-plan"; }
+
+  StringRef getDescription() const override {
+    return "Bind the covering plan with the requested stable id onto a "
+           "micro.kernel. The id is the spelling --micro-map report= prints "
+           "(bare 16-digit hex), 0x-prefixed hex, or decimal. Reproducing a "
+           "content-hash id needs the same search options (mode, beam-width, "
+           "top-k), the same search point (candidate=, when the id came from a "
+           "bound search -- the id folds in the binding's hash), and the same "
+           "target files (machine, rules, layouts, emitters) --micro-map ran "
+           "with, e.g. "
+           "--micro-bind-plan=\"plan-id=0081ef1286442d39 "
+           "target=x86-avx2 machine=machines/x86-avx2-v2.yaml "
+           "layouts=mapping/x86-avx2/layouts.llkmap "
+           "rules=mapping/x86-avx2/rules.llkmap "
+           "emitters=avx2_vector_add mode=beam beam-width=64 top-k=8\"";
+  }
+
+  MicroMapOptions currentOptions() const {
+    MicroMapOptions options;
+    options.target = target.getValue();
+    options.machinePath = machine.getValue();
+    options.layoutPath = layouts.getValue();
+    options.rulePath = rules.getValue();
+    options.emitterKeys =
+        micro_mapping_detail::parseEmitterKeys(emitters.getValue());
+    options.mode = mode.getValue();
+    options.topK = topK.getValue();
+    options.beamWidth = beamWidth.getValue();
+    options.candidate = candidate.getValue();
+    return options;
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+
+    // A plan id is content-derived, so parse it before doing any work: a bad id
+    // is a usage error, not a failed search. `parsePlanId` accepts the hex
+    // spelling `PlanReport` prints, `0x`-hex, and decimal signed or unsigned --
+    // all spellings of the same 64-bit hash (see the rule in
+    // MicroMappingCommon.h).
+    if (planId.getValue().empty()) {
+      module.emitError() << "micro-bind-plan: missing required key 'plan-id'";
+      signalPassFailure();
+      return;
+    }
+    std::optional<uint64_t> parsedId =
+        micro_mapping_detail::parsePlanId(planId.getValue());
+    if (!parsedId) {
+      module.emitError()
+          << "micro-bind-plan: 'plan-id' must be a 64-bit plan id in bare hex "
+             "(the report's spelling, e.g. 0081ef1286442d39), 0x-prefixed hex, "
+             "or decimal, got '"
+          << planId.getValue() << "'";
+      signalPassFailure();
+      return;
+    }
+    uint64_t requestedId = *parsedId;
+
+    llvm::Expected<micro_mapping_detail::MappingRun> run =
+        micro_mapping_detail::runMappingSearch(module, "micro-bind-plan",
+                                               currentOptions());
+    if (!run) {
+      module.emitError() << llvm::toString(run.takeError());
+      signalPassFailure();
+      return;
+    }
+
+    const mapping::CoveringPlan *selected = nullptr;
+    for (const mapping::CoveringPlan &plan : run->result.plans) {
+      if (plan.id == requestedId) {
+        selected = &plan;
+        break;
+      }
+    }
+    if (!selected) {
+      module.emitError() << "micro-bind-plan: no plan in the "
+                         << mode.getValue() << " search has id " << requestedId
+                         << " (the search produced " << run->result.plans.size()
+                         << " plan(s))";
+      signalPassFailure();
+      return;
+    }
+
+    if (llvm::Error error = micro_mapping_detail::bindPlanOntoModule(
+            module, *selected, *run->target)) {
+      module.emitError() << llvm::toString(std::move(error));
+      signalPassFailure();
+      return;
+    }
+  }
+};
+
+} // namespace
+
+std::unique_ptr<Pass> createMicroBindPlanPass() {
+  return std::make_unique<MicroBindPlanPass>();
+}
+
+std::unique_ptr<Pass>
+createMicroBindPlanPass(const MicroBindPlanOptions &options) {
+  auto pass = std::make_unique<MicroBindPlanPass>();
+  pass->target = options.search.target;
+  pass->machine = options.search.machinePath;
+  pass->layouts = options.search.layoutPath;
+  pass->rules = options.search.rulePath;
+  std::string emitters;
+  for (const std::string &key : options.search.emitterKeys) {
+    if (!emitters.empty())
+      emitters += ",";
+    emitters += key;
+  }
+  pass->emitters = emitters;
+  pass->mode = options.search.mode;
+  pass->topK = options.search.topK;
+  pass->beamWidth = options.search.beamWidth;
+  // The search point travels with the id: a plan produced at a candidate folds
+  // the binding's hash into its id, so dropping `candidate` here would turn a
+  // reproducible id into one no search can find (ruling S8).
+  pass->candidate = options.search.candidate;
+  pass->planId = std::to_string(options.planId);
+  return pass;
+}
+
+} // namespace llk
+} // namespace mlir

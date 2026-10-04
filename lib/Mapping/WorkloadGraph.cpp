@@ -59,6 +59,87 @@ std::string nameFor(Value value) {
   return name;
 }
 
+/// The integer a value carries, when it is a constant index. Anything else --
+/// an argument, a computed value -- cannot become an affine constant here.
+std::optional<int64_t> constantIndex(Value value) {
+  Operation *op = value.getDefiningOp();
+  if (!op || op->getName().getStringRef() != "arith.constant")
+    return std::nullopt;
+  if (auto attr = op->getAttrOfType<IntegerAttr>("value"))
+    return attr.getInt();
+  return std::nullopt;
+}
+
+/// The affine relationship a chain of logical ops states between an operand's
+/// local index space and the value it ultimately resolves to, or nullopt when
+/// the chain states none (design §10.1/§10.2).
+///
+/// A `micro.tile_view` with constant offsets is `d_i -> d_i + offset_i`, and a
+/// chain of views composes by summing their offsets. Everything else -- a
+/// non-constant offset, a `micro.tile_partition` (which names a fragment, not a
+/// position), a rank-changing chain, or an opaque source rank -- yields nullopt
+/// rather than an invented map.
+std::optional<AffineMap> accessMapFor(Value operand) {
+  Operation *defining = operand.getDefiningOp();
+  if (!defining || !isTransparentWorkloadOp(defining->getName()))
+    return std::nullopt;
+
+  MLIRContext *context = operand.getContext();
+  llvm::SmallVector<int64_t, 4> offsets;
+  bool ranked = false;
+  unsigned rank = 0;
+
+  Value current = operand;
+  while (Operation *op = current.getDefiningOp()) {
+    if (!isTransparentWorkloadOp(op->getName()))
+      break;
+    // A partition names which fragment, not where it sits, so the op alone
+    // does not state an index relationship.
+    if (op->getName().getStringRef() != "micro.tile_view")
+      return std::nullopt;
+    auto shape = op->getAttrOfType<DenseI64ArrayAttr>("shape");
+    if (!shape)
+      return std::nullopt;
+    unsigned viewRank = shape.size();
+    if (!ranked) {
+      rank = viewRank;
+      offsets.assign(rank, 0);
+      ranked = true;
+    } else if (rank != viewRank) {
+      return std::nullopt;
+    }
+    unsigned offsetCount = op->getNumOperands() - 1;
+    if (offsetCount != 0 && offsetCount != rank)
+      return std::nullopt;
+    for (unsigned i = 0; i < offsetCount; ++i) {
+      std::optional<int64_t> offset = constantIndex(op->getOperand(i + 1));
+      if (!offset)
+        return std::nullopt;
+      offsets[i] += *offset;
+    }
+    current = op->getOperand(0);
+  }
+
+  if (!ranked)
+    return std::nullopt;
+
+  // The resolved source must have the same rank, or this element-wise relation
+  // is not the chain's relationship.
+  auto source = dyn_cast<ShapedType>(current.getType());
+  if (!source || source.getRank() != rank)
+    return std::nullopt;
+
+  llvm::SmallVector<AffineExpr, 4> exprs;
+  exprs.reserve(rank);
+  for (unsigned i = 0; i < rank; ++i) {
+    AffineExpr dim = getAffineDimExpr(i, context);
+    exprs.push_back(offsets[i] == 0
+                        ? dim
+                        : dim + getAffineConstantExpr(offsets[i], context));
+  }
+  return AffineMap::get(rank, 0, exprs, context);
+}
+
 /// Content key used to order nodes canonically. Types and attributes are
 /// content; `sourceOrdinal` only breaks ties between otherwise identical
 /// nodes, so identical content never depends on insertion sequence.
@@ -296,8 +377,11 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
       for (Value operand : op->getOperands()) {
         if (isAsyncToken(operand.getType()))
           continue;
-        node.inputs.push_back(
-            WorkloadPort{resolve(operand), operand.getType(), std::nullopt});
+        // A logical view chains this operand to the value it really reads;
+        // record the index relationship when the chain states one, so §10.2
+        // can compare it against the producer's.
+        node.inputs.push_back(WorkloadPort{resolve(operand), operand.getType(),
+                                           accessMapFor(operand)});
       }
       for (Value result : op->getResults()) {
         if (isAsyncToken(result.getType()))

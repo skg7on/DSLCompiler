@@ -56,8 +56,9 @@ void captureDiagnostic(const SMDiagnostic &diagnostic, void *context) {
 }
 
 /// Accepts `llk.machine.v2` and `llk.machine.v2.<minor>`, rejecting any other
-/// major. Returns the major in `major` on success.
-bool parseSchema(StringRef text, uint32_t &major) {
+/// major or a malformed minor. Returns the major and minor on success; a bare
+/// version is minor 0.
+bool parseSchema(StringRef text, uint32_t &major, uint32_t &minor) {
   constexpr StringLiteral prefix = "llk.machine.v";
   if (!text.consume_front(prefix))
     return false;
@@ -70,7 +71,13 @@ bool parseSchema(StringRef text, uint32_t &major) {
   if (text.substr(0, digits).getAsInteger(10, major))
     return false;
   StringRef rest = text.substr(digits);
-  return rest.empty() || rest.starts_with(".");
+  if (rest.empty()) {
+    minor = 0;
+    return true;
+  }
+  if (!rest.consume_front(".") || rest.empty())
+    return false;
+  return !rest.getAsInteger(10, minor);
 }
 
 class Loader {
@@ -118,9 +125,25 @@ private:
 
   bool requireKey(bool present, const Twine &path, StringRef key);
 
+  /// Defers the verdict on an unrecognized key: it always returns true so the
+  /// walk can continue, and never means "accepted". Whether the key is a typo
+  /// or a forward-compatible addition depends on this file's schema minor,
+  /// which may be declared after the key, and a YAML mapping is a single-pass
+  /// stream, so resolveUnknownKeys() decides once the walk ends.
+  bool deferUnknownKey(const Node *node, const Twine &path, StringRef key);
+  bool resolveUnknownKeys();
+
   StringRef source_;
   StringRef text_;
   std::string error_;
+
+  /// True once the root `schema` entry declares a minor above the one this
+  /// build understands (design §11.6).
+  bool tolerantMinor_ = false;
+  /// The first unrecognized key seen, held until the schema minor is known.
+  const Node *firstUnknownNode_ = nullptr;
+  std::string firstUnknownPath_;
+  std::string firstUnknownKey_;
 };
 
 //===----------------------------------------------------------------------===//
@@ -322,6 +345,27 @@ bool Loader::requireKey(bool present, const Twine &path, StringRef key) {
   return fail(path + ": missing required key '" + key + "'");
 }
 
+bool Loader::deferUnknownKey(const Node *node, const Twine &path,
+                             StringRef key) {
+  // A file at a newer minor may carry keys added after this build; §11.6
+  // requires those additions to be optional or defaulted, so they are ignored.
+  if (tolerantMinor_)
+    return true;
+  if (!firstUnknownNode_) {
+    firstUnknownPath_ = path.str();
+    firstUnknownKey_ = key.str();
+    firstUnknownNode_ = node;
+  }
+  return true;
+}
+
+bool Loader::resolveUnknownKeys() {
+  if (tolerantMinor_ || !firstUnknownNode_)
+    return true;
+  return failAt(firstUnknownNode_,
+                firstUnknownPath_ + ": unknown key '" + firstUnknownKey_ + "'");
+}
+
 //===----------------------------------------------------------------------===//
 // Sections
 //===----------------------------------------------------------------------===//
@@ -356,7 +400,26 @@ bool Loader::parseExecutor(Node *node, size_t index, ExecutorNode &out) {
                                    out.concurrency);
                if (key == "refines")
                  return readStringList(value, path + ".refines", out.refines);
-               return failAt(keyNode, path + ": unknown key '" + key + "'");
+               if (key == "equivalent_to")
+                 return readStringList(value, path + ".equivalent_to",
+                                       out.equivalentTo);
+               if (key == "scheduling_class") {
+                 std::string name;
+                 if (!readText(value, path + ".scheduling_class", name))
+                   return false;
+                 std::optional<SchedulingClass> scheduling =
+                     symbolizeSchedulingClass(name);
+                 if (!scheduling)
+                   return failAt(value, path +
+                                            ".scheduling_class: unknown "
+                                            "class '" +
+                                            name +
+                                            "', expected in_order or "
+                                            "out_of_order");
+                 out.schedulingClass = *scheduling;
+                 return true;
+               }
+               return deferUnknownKey(keyNode, path, key);
              }) &&
          requireKey(sawId, path, "id") && requireKey(sawKind, path, "kind");
 }
@@ -402,7 +465,14 @@ bool Loader::parseMemory(Node *node, size_t index, MemoryNode &out) {
           out.banks = banks;
           return true;
         }
-        return failAt(keyNode, path + ": unknown key '" + key + "'");
+        if (key == "access_granularity_bytes") {
+          uint64_t granularity = 0;
+          if (!readUInt(value, path + ".access_granularity_bytes", granularity))
+            return false;
+          out.accessGranularityBytes = granularity;
+          return true;
+        }
+        return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&
          requireKey(sawKind, path, "kind") &&
@@ -458,7 +528,14 @@ bool Loader::parseCompute(Node *node, size_t index, ComputeNode &out) {
         }
         if (key == "concurrency")
           return readUInt32(value, path + ".concurrency", out.concurrency);
-        return failAt(keyNode, path + ": unknown key '" + key + "'");
+        if (key == "occupancy_limit") {
+          uint32_t occupancy = 0;
+          if (!readUInt32(value, path + ".occupancy_limit", occupancy))
+            return false;
+          out.occupancyLimit = occupancy;
+          return true;
+        }
+        return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&
          requireKey(sawKind, path, "kind") &&
@@ -493,7 +570,7 @@ bool Loader::parseTransferEngine(Node *node, size_t index,
                             out.maxOutstanding);
         if (key == "setup_cycles")
           return readUInt(value, path + ".setup_cycles", out.setupCycles);
-        return failAt(keyNode, path + ": unknown key '" + key + "'");
+        return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&
          requireKey(sawKind, path, "kind") &&
@@ -535,7 +612,20 @@ bool Loader::parseLink(Node *node, size_t index, LinkEdge &out) {
                                 out.transferEngines);
         if (key == "concurrency")
           return readUInt32(value, path + ".concurrency", out.concurrency);
-        return failAt(keyNode, path + ": unknown key '" + key + "'");
+        if (key == "directionality") {
+          std::string name;
+          if (!readText(value, path + ".directionality", name))
+            return false;
+          std::optional<LinkDirectionality> directionality =
+              symbolizeLinkDirectionality(name);
+          if (!directionality)
+            return failAt(value,
+                          path + ".directionality: unknown class '" + name +
+                              "', expected unidirectional or bidirectional");
+          out.directionality = *directionality;
+          return true;
+        }
+        return deferUnknownKey(keyNode, path, key);
       });
   return parsed && requireKey(sawId, path, "id") &&
          requireKey(sawSource, path, "source") &&
@@ -551,7 +641,7 @@ bool Loader::parseSync(Node *node, MachineModel &model) {
                           model.sync.barrierCycles);
         if (key == "wait_cycles")
           return readUInt(value, "sync.wait_cycles", model.sync.waitCycles);
-        return failAt(keyNode, "sync: unknown key '" + key + "'");
+        return deferUnknownKey(keyNode, "sync", key);
       });
 }
 
@@ -566,10 +656,16 @@ bool Loader::parseRoot(Node *root, MachineModel &model) {
           if (!readText(value, "schema", schema))
             return false;
           uint32_t major = 0;
-          if (!parseSchema(schema, major))
+          uint32_t minor = 0;
+          if (!parseSchema(schema, major, minor))
             return failAt(value, "schema: expected 'llk.machine.v2', got '" +
                                      schema + "'");
           model.schemaMajor = major;
+          model.schemaMinor = minor;
+          // A newer minor may add optional keys this build does not know
+          // (design §11.6); at or below the current minor any unknown key is
+          // an error.
+          tolerantMinor_ = minor > kSupportedSchemaMinor;
           return true;
         }
         if (key == "target") {
@@ -635,9 +731,9 @@ bool Loader::parseRoot(Node *root, MachineModel &model) {
                                   model.links.push_back(std::move(link));
                                   return true;
                                 });
-        return failAt(keyNode, "document: unknown key '" + key + "'");
+        return deferUnknownKey(keyNode, "document", key);
       });
-  return ok && requireKey(sawSchema, "", "schema") &&
+  return ok && resolveUnknownKeys() && requireKey(sawSchema, "", "schema") &&
          requireKey(sawTarget, "", "target");
 }
 

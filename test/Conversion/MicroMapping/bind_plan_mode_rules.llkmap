@@ -1,0 +1,39 @@
+// Rules for the micro_bind_plan_mode.sh fixture.
+//
+// They give the `micro.vector` node a genuine choice whose answer depends on
+// the search mode: `v.a_costly` sorts first and costs 10, `v.z_cheap` sorts
+// last and costs 1. Deterministic mode takes the first legal plan in canonical
+// order, so it selects the costly rule; beam mode takes the lowest-bound
+// frontier, so it selects the cheap rule. Mapping with one mode and binding
+// with the other therefore cannot reproduce the reported id -- which is what
+// makes the mode part of the reproduction contract.
+//
+// The `micro.async_copy` node has a single rule, so only the vector node's
+// choice varies. `emit` is an opaque key here; the pass is given `emitters=e1`.
+
+rule v.a_costly {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.costly";
+  emit "e1";
+  cost 10;
+}
+
+rule v.z_cheap {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.cheap";
+  emit "e1";
+  cost 1;
+}
+
+rule c.copy {
+  match micro.async_copy();
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.copy";
+  emit "e1";
+  cost 1;
+}

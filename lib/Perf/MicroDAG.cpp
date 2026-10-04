@@ -155,12 +155,32 @@ private:
   /// Reads `micro.routes` from a mapped kernel, so a routed movement is
   /// charged hop by hop instead of endpoint to endpoint.
   void loadRoutes(mlir::Operation *kernel);
-  std::vector<const machine::LinkEdge *>
-  routeHops(llvm::StringRef srcSpace, llvm::StringRef dstSpace) const;
+  /// The links a movement is charged, matched by the most specific identity
+  /// available: the destination node and connection value the binder stamps on
+  /// a per-hop copy, then the connection value alone, then the node pair the
+  /// endpoint spaces resolve to, and only when a space names several nodes the
+  /// plan's route order. Empty when the movement is unrouted; a whole-route
+  /// match claims its route so a second op cannot take it. The decision is
+  /// memoized per op, so a copy a loop unrolls keeps its route on every
+  /// iteration.
+  llvm::SmallVector<const machine::LinkEdge *, 4>
+  matchRoute(mlir::Operation &op, llvm::StringRef srcSpace,
+             llvm::StringRef dstSpace);
+  /// The single machine node of `kind`, or nullptr when the machine declares
+  /// none or more than one -- a kind that names several nodes cannot pin a
+  /// movement's endpoint on its own.
+  const machine::MemoryNode *soleMemoryOfKind(llvm::StringRef kind) const;
 
   const machine::MachineModel &machine;
   std::string kernelName;
   std::vector<PlannedRoute> routes;
+  std::vector<bool> routeClaimed;
+  /// The links each movement op resolved to, so unrolled iterations of the
+  /// same op do not each consume a fresh route (an empty result is a
+  /// legitimate "this op is unrouted" answer and is cached too).
+  llvm::DenseMap<mlir::Operation *,
+                 llvm::SmallVector<const machine::LinkEdge *, 4>>
+      routeOfOp;
   MicroDAG dag;
   llvm::DenseMap<mlir::Value, uint32_t> producers;
   llvm::SmallPtrSet<mlir::Operation *, 32> countedStorage;
@@ -254,6 +274,14 @@ void DAGBuilder::loadRoutes(mlir::Operation *kernel) {
       continue;
 
     PlannedRoute built;
+    if (auto value = route.getAs<mlir::IntegerAttr>("value"))
+      built.value = static_cast<uint64_t>(value.getInt());
+    // Only transfer connections become copies (design §18.2); a reduce or a
+    // pure layout transform is not a movement and must not be matched to one.
+    // A hand-written entry with no `kind` is taken as a movement route.
+    if (auto kind = route.getAs<mlir::StringAttr>("kind"))
+      built.moves = kind.getValue() == "transfer" ||
+                    kind.getValue() == "transfer_and_transform";
     bool complete = true;
     for (size_t i = 1; i < nodes.size(); ++i) {
       std::string from =
@@ -274,25 +302,125 @@ void DAGBuilder::loadRoutes(mlir::Operation *kernel) {
     if (!complete || built.hops.empty())
       continue;
 
-    const machine::MemoryNode *source =
-        machine.findMemory(built.hops.front()->source);
-    const machine::MemoryNode *destination =
-        machine.findMemory(built.hops.back()->destination);
+    // The endpoints are the route's first and last nodes, whatever the hops
+    // say: the route is identified by the pair it connects, not by the kinds a
+    // movement is spelled with.
+    built.srcNode = mlir::cast<mlir::StringAttr>(nodes[0]).getValue().str();
+    built.dstNode =
+        mlir::cast<mlir::StringAttr>(nodes[nodes.size() - 1]).getValue().str();
+    const machine::MemoryNode *source = machine.findMemory(built.srcNode);
+    const machine::MemoryNode *destination = machine.findMemory(built.dstNode);
     if (!source || !destination)
       continue;
     built.srcSpace = source->kind;
     built.dstSpace = destination->kind;
     routes.push_back(std::move(built));
   }
+  routeClaimed.assign(routes.size(), false);
 }
 
-std::vector<const machine::LinkEdge *>
-DAGBuilder::routeHops(llvm::StringRef srcSpace,
-                      llvm::StringRef dstSpace) const {
-  for (const PlannedRoute &route : routes)
-    if (route.srcSpace == srcSpace && route.dstSpace == dstSpace)
-      return route.hops;
-  return {};
+const machine::MemoryNode *
+DAGBuilder::soleMemoryOfKind(llvm::StringRef kind) const {
+  const machine::MemoryNode *found = nullptr;
+  for (const machine::MemoryNode &node : machine.memories)
+    if (node.kind == kind) {
+      if (found)
+        return nullptr; // several nodes of this kind: not an identity
+      found = &node;
+    }
+  return found;
+}
+
+llvm::SmallVector<const machine::LinkEdge *, 4>
+DAGBuilder::matchRoute(mlir::Operation &op, llvm::StringRef srcSpace,
+                       llvm::StringRef dstSpace) {
+  auto memo = routeOfOp.find(&op);
+  if (memo != routeOfOp.end())
+    return memo->second;
+
+  llvm::SmallVector<const machine::LinkEdge *, 4> charged;
+  auto stampNode = op.getAttrOfType<mlir::StringAttr>("micro.dst_node");
+  auto stampValue = op.getAttrOfType<mlir::IntegerAttr>("micro.value");
+  auto valueOf = [&](const PlannedRoute &route) {
+    return stampValue && route.value &&
+           *route.value == static_cast<uint64_t>(stampValue.getInt());
+  };
+
+  // Most specific: a per-hop copy the binder stamped. It names the memory node
+  // the hop lands in, so charge exactly that link -- the one hop of the route
+  // whose destination is the stamped node and whose source kind is this
+  // movement's, disambiguated by the connection value. This is what lets a
+  // multi-hop chain, materialized as one copy per hop, be charged hop by hop
+  // rather than falling through to the first link of the endpoint kind pair.
+  if (stampNode) {
+    for (const PlannedRoute &route : routes) {
+      if (!route.moves || (stampValue && !valueOf(route)))
+        continue;
+      for (const machine::LinkEdge *link : route.hops) {
+        if (link->destination != stampNode.getValue())
+          continue;
+        const machine::MemoryNode *from = machine.findMemory(link->source);
+        if (from && from->kind != srcSpace)
+          continue; // a different leg into the same node
+        charged.push_back(link);
+        break;
+      }
+      if (!charged.empty())
+        break;
+    }
+    if (!charged.empty()) {
+      routeOfOp[&op] = charged;
+      return charged;
+    }
+  }
+
+  llvm::SmallVector<size_t, 2> candidates;
+  for (size_t index = 0; index < routes.size(); ++index)
+    if (!routeClaimed[index] && routes[index].moves &&
+        routes[index].srcSpace == srcSpace &&
+        routes[index].dstSpace == dstSpace)
+      candidates.push_back(index);
+
+  if (!candidates.empty()) {
+    std::optional<size_t> chosen;
+
+    // The connection value on the movement, for a copy that carries the route
+    // as a whole rather than one stamped hop.
+    if (stampValue)
+      for (size_t index : candidates)
+        if (valueOf(routes[index])) {
+          chosen = index;
+          break;
+        }
+
+    // Endpoint spaces that each name exactly one machine node pin the route's
+    // node pair without ambiguity.
+    if (!chosen) {
+      const machine::MemoryNode *source = soleMemoryOfKind(srcSpace);
+      const machine::MemoryNode *destination = soleMemoryOfKind(dstSpace);
+      if (source && destination)
+        for (size_t index : candidates)
+          if (routes[index].srcNode == source->id &&
+              routes[index].dstNode == destination->id) {
+            chosen = index;
+            break;
+          }
+    }
+
+    // A space with several nodes (a machine that declares `sram.0`/`sram.1`)
+    // leaves an unstamped movement without a node identity of its own. The
+    // binder emits the plan's routes and their copies in the same
+    // `connectionPlans` order, so the movements consume the matching routes in
+    // that order.
+    if (!chosen)
+      chosen = candidates.front();
+
+    routeClaimed[*chosen] = true;
+    charged.append(routes[*chosen].hops.begin(), routes[*chosen].hops.end());
+  }
+
+  routeOfOp[&op] = charged;
+  return charged;
 }
 
 uint64_t DAGBuilder::copyCycles(llvm::StringRef src, llvm::StringRef dst,
@@ -872,8 +1000,11 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
 
   // A movement the selected plan routed is charged per hop: the mapper chose a
   // path through the hierarchy, and the simulator has to see every link on it
-  // rather than a single endpoint-to-endpoint transfer.
-  std::vector<const machine::LinkEdge *> hops = routeHops(srcMemory, dstMemory);
+  // rather than a single endpoint-to-endpoint transfer. The route and, for a
+  // stamped per-hop copy, the single link are matched by node identity, so two
+  // movements between same-kind endpoints still get their own links.
+  llvm::SmallVector<const machine::LinkEdge *, 4> hops =
+      matchRoute(op, srcMemory, dstMemory);
 
   auto describe = [&](const machine::LinkEdge &link, uint64_t cycles) {
     MicroEvent event;

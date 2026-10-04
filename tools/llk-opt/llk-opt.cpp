@@ -15,6 +15,7 @@
 // Include the LLK dialect public header to register it.
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
+#include "LLK/Conversion/MicroMapping/MicroMappingPasses.h"
 #include "LLK/Conversion/TritonToLLK/AtomicToLLRT.h"
 #include "LLK/Conversion/TritonToLLK/BlockPointerToVector.h"
 #include "LLK/Conversion/TritonToLLK/GridToForall.h"
@@ -73,6 +74,20 @@ int main(int argc, char **argv) {
   // Register the LLK-to-Micro search-space export pass.
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return mlir::llk::createLLKToMicroSearchSpacePass();
+  });
+
+  // Register the mapping passes (design §21).
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createMicroMapPass();
+  });
+
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createMicroBindPlanPass();
+  });
+
+  // Register the mapping-verification pass (design §18.3 phase 2).
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return mlir::llk::createMicroVerifyMappingPass();
   });
 
   // Register the TileAndVectorize pass.

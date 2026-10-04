@@ -133,18 +133,18 @@ Future targets should reuse the same Micro-IR contract with different MachineMod
 
 | Milestone | Status | Scope |
 |-----------|--------|-------|
-| M1: Scalar end-to-end pipeline | In progress | LLK dialect, LLKToLinalg, scalar JIT foundation |
-| M2: Explicit vector path | In progress | MLIR Vector lowering and AVX2 validation |
-| M3: Fused memory lowering | Design approved | Double-contraction fusion, packing, scratch analysis |
-| M4: Parallel execution | Design approved | Thread pool and tiled parallel dispatch |
-| M5: Specialization and tuning | Design approved | Shape buckets, JIT cache, schedule DB |
-| M6: Multi-kernel support | Design approved | RoPE, Attention, shared compiler infrastructure |
-| M7+: Python frontend | Future | Triton-like DSL and Python entry points |
-| M9: Canonical Micro-IR foundation | Planned | `micro` dialect, execution ops, search ops, verifiers |
-| M10: MachineModel and performance evaluation | Planned | YAML profiles, `micro-perf`, L0/L1 simulator |
-| M11: MLIR to Micro lowering | Planned | `llk-compile --emit=micro`, `--emit=micro-search` |
-| M12: Micro-based auto-optimization | Planned | Candidate generation, legality, binding, ranking |
-| M13: Feedback and calibration | Planned | Schedule YAML, predicted vs measured metrics |
+| M1: Scalar end-to-end pipeline | Complete | LLK dialect, LLKToLinalg, scalar JIT foundation |
+| M2: Explicit vector path | Complete | MLIR Vector lowering and AVX2 validation |
+| M3: Fused memory lowering | Complete | Double-contraction fusion, packing, scratch analysis |
+| M4: Parallel execution | Complete | Thread pool and tiled parallel dispatch |
+| M5: Specialization and tuning | Complete | Shape buckets, JIT cache, schedule DB |
+| M6: Multi-kernel support | Complete | RoPE, Attention, shared compiler infrastructure |
+| M7+: Python frontend | Deferred | Triton-like DSL and Python entry points |
+| M9: Canonical Micro-IR foundation | Complete | `micro` dialect, execution ops, search ops, verifiers |
+| M10: MachineModel and performance evaluation | Complete | YAML profiles, `micro-perf`, L0/L1 simulator |
+| M11: MLIR to Micro lowering | Complete | `llk-compile --emit=micro`, `--emit=micro-search` |
+| M12: Micro-based auto-optimization | Complete | Candidate generation, legality, binding, ranking, plus topology-aware mapping, LLKMap rules/layouts, covering search, and plan binding |
+| M13: Feedback and calibration | In progress | Measurement loop and calibration; blocked on a way to execute Micro-IR |
 
 ## Documentation
 
@@ -158,6 +158,8 @@ Future targets should reuse the same Micro-IR contract with different MachineMod
 | [docs/design/m5-specialization-tuning.md](docs/design/m5-specialization-tuning.md) | M5 design: M-bucketing, JIT cache, schedule DB, autotuning foundation |
 | [docs/design/m6-multi-kernel.md](docs/design/m6-multi-kernel.md) | M6 design: RoPE, Attention, online softmax, shared infrastructure |
 | [docs/design/micro-ir-mapping-workflow.md](docs/design/micro-ir-mapping-workflow.md) | **Start here to use the compiler**: the tile-centric workflow, the tools, MachineModel customization, and the target-independent mapping chain |
+| [docs/design/llkmap-layout-grammar.md](docs/design/llkmap-layout-grammar.md) | LLKMap declarative layout grammar |
+| [docs/design/llkmap-rule-grammar.md](docs/design/llkmap-rule-grammar.md) | LLKMap mapping-rule and target-bundle grammar |
 | [docs/design/m9-canonical-micro-ir-architecture.md](docs/design/m9-canonical-micro-ir-architecture.md) | M9+ architecture: canonical Micro-IR, MachineModel, performance evaluation, auto-search |
 | [docs/design/m9-micro-ir-core-concepts.md](docs/design/m9-micro-ir-core-concepts.md) | Core `micro` concepts: execution IR, search IR, attributes, verifier invariants |
 | [docs/superpowers/specs/2026-08-11-canonical-micro-ir-redesign.md](docs/superpowers/specs/2026-08-11-canonical-micro-ir-redesign.md) | Full canonical Micro-IR redesign spec and milestone contract |
@@ -166,6 +168,7 @@ Future targets should reuse the same Micro-IR contract with different MachineMod
 | [docs/superpowers/specs/2026-08-11-llk-to-micro-lowering-implementation-spec.md](docs/superpowers/specs/2026-08-11-llk-to-micro-lowering-implementation-spec.md) | Detailed implementation spec for LLK/Linalg to Micro lowering |
 | [docs/superpowers/specs/2026-08-11-micro-ir-autotuning-implementation-spec.md](docs/superpowers/specs/2026-08-11-micro-ir-autotuning-implementation-spec.md) | Detailed implementation spec for Micro-based auto-tuning and auto-optimization |
 | [docs/superpowers/specs/2026-08-11-micro-ir-avx2-simulator-implementation-spec.md](docs/superpowers/specs/2026-08-11-micro-ir-avx2-simulator-implementation-spec.md) | Detailed implementation spec for the AVX2 Micro performance simulator |
+| [docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md](docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md) | Epic #67 design: topology-aware mapping, MachineModel v2, LLKMap, routing, placement, covering search, plan binding |
 | [docs/superpowers/plans/](docs/superpowers/plans/) | Implementation plans and task breakdowns |
 
 ## Architecture Layers
@@ -213,23 +216,27 @@ The layer is split conceptually into:
 - `uMap`: memory placement, spatial ownership, pipeline structure, copy paths, and synchronization.
 - `uHW`: native execution fragments that match hardware granularity, such as MMA tiles, vector tiles, DMA transactions, barriers, and NoC transfers.
 
-### 4. MachineModel Layer
+### 4. Mapping and Target Selection Layer
 
-Machine profiles are YAML files under `machines/` and are loaded into typed C++ structures. A MachineModel describes:
+The mapping engine turns a concrete `micro.kernel` into a *placed, connected, covered* plan and binds the selected plan back into Micro-IR, keeping all target policy out of the generic dialect — the design's "target-independent core, declarative target policy" split:
 
-- compute engines and throughput
-- memory hierarchy, capacity, latency, and bandwidth
-- DMA/copy engines
-- synchronization costs
-- supported dtypes and tile shapes
-- target constraints used by legality checks
+- **Workload graph** — target-independent extraction of the compute/movement ops and the values between them.
+- **MachineModel v2 topology** — executors, memories, compute capabilities, and transfer engines as a graph with containment, visibility, attachment, and directed-link edges.
+- **LLKMap** — small declarative files (`mapping/<target>/layouts.llkmap`, `rules.llkmap`) describing target layouts and the rules that map Micro operations onto target implementation bundles; parsed, type-checked, and solved without target branches in generic code. Rules may declare typed target bundles, port/attribute/shape/dtype/affine predicates, and `require` expressions evaluated against the machine.
+- **Placement and connection synthesis** — enumerate legal executor/memory/layout bindings, then the ordered connection alternatives: direct, layout-only transform, transfer, transfer-plus-transform, and bounded multi-hop with the transform at a legal hop.
+- **Covering search** — deterministic, beam, and exact modes behind one interface, ranked by the declared `micro.objective`, with honest truncation reporting.
+- **Plan binding** — clones the kernel and applies the selected plan (placements, routes, copies, waits) plus generic metadata attributes; a versioned JSON plan report records the provenance (input/machine/rule/layout hashes, search options, rejection counts by stable diagnostic code, top-K plans, selected plan id).
 
-Initial profiles:
+### 5. MachineModel Layer
+
+Machine profiles are YAML files under `machines/` and are loaded into typed C++ structures. The current **v2 schema models an explicit topology**: executor, memory, compute, and transfer-engine nodes joined by containment, visibility, attachment, and directed-link edges, with per-node capabilities, capacities, latencies, bandwidths, and synchronization costs, plus per-executor refinement (`refines`) and a declared-equivalence relation used for symmetry reduction. Machine, layout, and rule files are content-hashed and versioned.
+
+Profiles:
 
 - `machines/x86-avx2-v2.yaml`
 - `machines/generic-ai-accel-v2.yaml`
 
-### 5. Evaluation and Optimization Layer
+### 6. Evaluation and Optimization Layer
 
 `micro-perf` and tuning tools consume concrete Micro-IR plus MachineModel YAML:
 
@@ -243,7 +250,7 @@ concrete micro.kernel + MachineModel
 
 The auto-optimization flow consumes `micro.search_space`, generates candidates, checks legality, binds candidates into concrete `micro.kernel`, ranks them, and persists selected schedules.
 
-## Planned Tool Surface
+## Tool Surface
 
 ```bash
 # Emit concrete Micro-IR without running the JIT path
@@ -252,6 +259,15 @@ llk-compile --emit=micro input.mlir
 # Emit a parametric Micro-IR search space for auto-scheduling
 llk-compile --emit=micro-search input.mlir
 
+# Search a mapping space, bind the best plan, and write a plan report
+llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml \
+  layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap \
+  emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store report=plan.json" input.mlir
+
+# Bind a specific plan by its stable id (reproduce the search: same target keys
+# AND search options as the --micro-map run that reported the id)
+llk-opt --micro-bind-plan="plan-id=<id> target=x86-avx2 machine=... layouts=... rules=... emitters=... mode=beam beam-width=64 top-k=8" input.mlir
+
 # Evaluate concrete Micro-IR against a machine profile
 micro-perf --machine machines/x86-avx2-v2.yaml --level l1 input.micro.mlir
 
@@ -259,7 +275,7 @@ micro-perf --machine machines/x86-avx2-v2.yaml --level l1 input.micro.mlir
 llk-tune --search-space swiglu.micro.mlir --machine machines/x86-avx2-v2.yaml
 ```
 
-These commands document the intended M9-M13 interface. They become available as the corresponding issues land.
+`--micro-map` writes a versioned JSON plan report when given `report=<path>` -- including in `report-only` mode, where it reports the selected plan without binding it onto the IR. The report carries input/machine/layout-library/rule-library hashes, search options and truncation flags, rejection counts by stable reason code, top-K plans with component costs, selected plan id, and compiler and cost-model version. `--micro-bind-plan` does not write a report: it re-runs the search to bind a plan by its id.
 
 ## Tech Stack
 

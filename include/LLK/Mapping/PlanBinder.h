@@ -61,7 +61,12 @@ struct BoundPlan {
 /// not a shaped (tensor) type has no generic copy form (`micro.tile_async_copy`
 /// needs a destination-memory-typed tile, which cannot be built without the
 /// dialect's type class), and a target layout id has no Micro operation form at
-/// all (design §13.4 keeps target layout ids out of `#micro.layout`).
+/// all (design §13.4 keeps target layout ids out of `#micro.layout`). Every
+/// reported entry names the connection's value id; when the binder cannot
+/// materialize a whole connection kind, the entry also carries a stable reason
+/// token (a `LayoutTransform` connection is reported as
+/// `layout_transform_requires_dialect_op`), while a movement that fails reports
+/// its own specific cause.
 llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
                                    const CoveringPlan &plan,
                                    const MappingTarget &target);
@@ -75,7 +80,10 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
 ///   3. target -- every selected rule's emitter is one the target declares.
 ///
 /// Returns the first violation, walking operations in order so diagnostics are
-/// deterministic.
+/// deterministic. A violation that a §22.3 code covers is reported as
+/// `<code>: <detail>` (for example `no_matching_rule: mapped op ...: unknown
+/// rule '...'`), so the code is the stable interface and the detail is prose;
+/// the structural failure has no §22.3 code of its own and is reported plainly.
 llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                                 const MappingTarget &target);
 

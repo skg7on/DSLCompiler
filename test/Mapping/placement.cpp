@@ -3,10 +3,12 @@
 #include "LLK/Mapping/Placement.h"
 
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
 
 #include <string>
+#include <variant>
 #include <vector>
 
 using namespace mlir::llk::machine;
@@ -52,6 +54,44 @@ MachineModel placementMachine() {
   return model;
 }
 
+/// One executor carrying two compute capabilities and two memories: every
+/// requirement has more than one compatible attachment, so placement must
+/// enumerate the combinations rather than pick the first.
+MachineModel attachmentMachine() {
+  MachineModel model;
+  model.target = "attachment";
+  model.executors = {{"core.0", "core", std::nullopt, {0}, 1, {}}};
+  model.computes = {compute("vec.a", "vector_engine", "core.0"),
+                    compute("vec.b", "vector_engine", "core.0"),
+                    compute("mxu.a", "matrix_engine", "core.0")};
+  model.memories = {memory("sram.a", "sram", "core.0"),
+                    memory("sram.b", "sram", "core.0")};
+  return model;
+}
+
+/// Two executors of the same kind that differ in coordinates and concurrency,
+/// so the structural heuristic would keep both; each declares the other
+/// `equivalentTo`, so the target's declaration is what makes them
+/// interchangeable.
+MachineModel declaredEquivalentMachine() {
+  MachineModel model;
+  model.target = "declared";
+  ExecutorNode lhs;
+  lhs.id = "c.0";
+  lhs.kind = "core";
+  lhs.coordinates = {0};
+  lhs.concurrency = 1;
+  lhs.equivalentTo = {"c.1"};
+  ExecutorNode rhs;
+  rhs.id = "c.1";
+  rhs.kind = "core";
+  rhs.coordinates = {3};
+  rhs.concurrency = 4;
+  rhs.equivalentTo = {"c.0"};
+  model.executors = {lhs, rhs};
+  return model;
+}
+
 constexpr llvm::StringLiteral kLayouts = R"llkmap(
 layout t.rank2(int N) {
   param N in [1..8];
@@ -62,6 +102,53 @@ layout t.rank3(int N) {
   require rank == 3;
 }
 )llkmap";
+
+/// A parameterized layout whose only legal assignment is `VW = 8`. `VW`'s
+/// domain holds five values and a constraint narrows it to one, so the solved
+/// assignment is a real search result rather than the sole declared value.
+constexpr llvm::StringLiteral kParameterizedLayout = R"llkmap(
+layout t.blocked(int VW) {
+  param VW in [4..8];
+  require VW == 8;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap";
+
+/// A layout with two legal assignments: `VW = 4` and `VW = 8`. The solver
+/// enumerates the domain in declaration order, so which one placement records
+/// is observable -- and pinned.
+constexpr llvm::StringLiteral kTwoSolutionLayout = R"llkmap(
+layout t.choosy(int VW) {
+  param VW in [4..8];
+  require VW % 4 == 0;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap";
+
+/// An affine map's rendered text, for asserting a solved constant reached it.
+std::string printedMap(mlir::AffineMap map) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  map.print(stream);
+  stream.flush();
+  return text;
+}
+
+/// The solved integer `parameter` of `layoutClass`, or nullopt when the layout
+/// is unbound, the parameter is unset, or it did not solve to an integer.
+std::optional<int64_t> solvedInteger(const CandidateInstance &instance,
+                                     llvm::StringRef layoutClass,
+                                     llvm::StringRef parameter) {
+  auto layout = instance.layoutSolutions.find(layoutClass);
+  if (layout == instance.layoutSolutions.end())
+    return std::nullopt;
+  auto value = layout->second.parameters.find(parameter);
+  if (value == layout->second.parameters.end())
+    return std::nullopt;
+  if (const int64_t *integer = std::get_if<int64_t>(&value->second))
+    return *integer;
+  return std::nullopt;
+}
 
 std::unique_ptr<MappingTarget> targetFor(MachineModel machine,
                                          llvm::StringRef layouts = kLayouts) {
@@ -89,6 +176,14 @@ boundExecutors(const std::vector<CandidateInstance> &instances) {
   for (const CandidateInstance &instance : instances)
     ids.push_back(instance.executorBindings.lookup("executor"));
   return ids;
+}
+
+/// A candidate that must run on `core`, so it matches the single-executor
+/// attachment machine.
+MappingCandidate coreCandidate() {
+  MappingCandidate result = candidate();
+  result.executorRequirements[0].capability = "core";
+  return result;
 }
 
 } // namespace
@@ -159,6 +254,225 @@ TEST(Placement, BindsAVisibleMemoryOfTheRequiredKind) {
   EXPECT_EQ((*instances)[1].memoryBindings.lookup("sram"), "sram.1");
 }
 
+TEST(Placement, EnumeratesEveryCompatibleComputeAttachment) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withCompute = coreCandidate();
+  ComputeRequirement requirement;
+  requirement.kind = "vector_engine";
+  withCompute.computeRequirements.push_back(requirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withCompute, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // core.0 carries two vector engines; both are compatible attachments, so the
+  // candidate places twice rather than collapsing to the first.
+  ASSERT_EQ(instances->size(), 2u);
+  EXPECT_EQ((*instances)[0].computeBindings.lookup("vector_engine"), "vec.a");
+  EXPECT_EQ((*instances)[1].computeBindings.lookup("vector_engine"), "vec.b");
+}
+
+TEST(Placement, EnumeratesEveryVisibleMemoryAttachment) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withMemory = coreCandidate();
+  MemoryRequirement requirement;
+  requirement.kind = "sram";
+  withMemory.memoryRequirements.push_back(requirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withMemory, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // core.0 sees two sram nodes; each is a legal attachment.
+  ASSERT_EQ(instances->size(), 2u);
+  EXPECT_EQ((*instances)[0].memoryBindings.lookup("sram"), "sram.a");
+  EXPECT_EQ((*instances)[1].memoryBindings.lookup("sram"), "sram.b");
+}
+
+TEST(Placement, EnumeratesComputeMemoryAttachmentCombinations) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withAll = coreCandidate();
+  ComputeRequirement computeRequirement;
+  computeRequirement.kind = "vector_engine";
+  withAll.computeRequirements.push_back(computeRequirement);
+  MemoryRequirement memoryRequirement;
+  memoryRequirement.kind = "sram";
+  withAll.memoryRequirements.push_back(memoryRequirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withAll, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // The two compute attachments and two memories cross to four instances, in
+  // machine-declaration order with the last requirement varying fastest.
+  ASSERT_EQ(instances->size(), 4u);
+  EXPECT_EQ((*instances)[0].computeBindings.lookup("vector_engine"), "vec.a");
+  EXPECT_EQ((*instances)[0].memoryBindings.lookup("sram"), "sram.a");
+  EXPECT_EQ((*instances)[1].computeBindings.lookup("vector_engine"), "vec.a");
+  EXPECT_EQ((*instances)[1].memoryBindings.lookup("sram"), "sram.b");
+  EXPECT_EQ((*instances)[2].computeBindings.lookup("vector_engine"), "vec.b");
+  EXPECT_EQ((*instances)[2].memoryBindings.lookup("sram"), "sram.a");
+  EXPECT_EQ((*instances)[3].computeBindings.lookup("vector_engine"), "vec.b");
+  EXPECT_EQ((*instances)[3].memoryBindings.lookup("sram"), "sram.b");
+}
+
+TEST(Placement, BindsTheSolvedLayoutForEveryEnumeratedAttachment) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withAll = coreCandidate();
+  ComputeRequirement computeRequirement;
+  computeRequirement.kind = "vector_engine";
+  withAll.computeRequirements.push_back(computeRequirement);
+  LayoutRequirement layoutRequirement;
+  layoutRequirement.layoutClass = "t.rank2";
+  withAll.layoutRequirements.push_back(layoutRequirement);
+  mlir::MLIRContext context;
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withAll, *target, context, layoutContext);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_EQ(instances->size(), 2u);
+  for (const CandidateInstance &instance : *instances) {
+    // Each enumerated attachment binds the solved layout: the registry-resolved
+    // definition id, identical to the requirement's declared id by
+    // construction.
+    const std::string bound = instance.layoutBindings.lookup("t.rank2");
+    EXPECT_EQ(bound, "t.rank2");
+    EXPECT_NE((*target).layouts().find(bound), nullptr);
+  }
+}
+
+// Phase-3 T4: the solve's concrete parameter assignment reaches the instance.
+// Before this, `layoutBindings` recorded only the layout *id*, so an instance
+// could not say *which* parameterization it selected -- which `VW`, and which
+// affine map that implies.
+TEST(Placement, RecordsTheSolvedLayoutParametersAndAffineMap) {
+  std::unique_ptr<MappingTarget> target =
+      targetFor(placementMachine(), kParameterizedLayout);
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withLayout = candidate();
+  LayoutRequirement requirement;
+  requirement.layoutClass = "t.blocked";
+  // A hand-built candidate points the requirement at a value directly (a rule
+  // bridge fills this from the port it names); the number is carried through
+  // unchanged so an edge can later ask for this value's layout.
+  requirement.portValue = 7;
+  withLayout.layoutRequirements.push_back(requirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withLayout, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  const CandidateInstance &instance = instances->front();
+
+  // The solved assignment is filed under the same key as the binding.
+  ASSERT_EQ(instance.layoutSolutions.size(), 1u);
+  ASSERT_EQ(instance.layoutBindings.size(), 1u);
+  EXPECT_EQ(solvedInteger(instance, "t.blocked", "VW"),
+            std::optional<int64_t>(8));
+
+  // And the affine map carries the solved constant, not the parameter name.
+  auto layout = instance.layoutSolutions.find("t.blocked");
+  ASSERT_NE(layout, instance.layoutSolutions.end());
+  ASSERT_TRUE(layout->second.map);
+  const std::string printed = printedMap(layout->second.map);
+  EXPECT_NE(printed.find("floordiv 8"), std::string::npos) << printed;
+
+  // The value the requirement was resolved for travels with the binding, so a
+  // connection request can attribute it to the right edge.
+  EXPECT_EQ(layout->second.portValue, 7);
+}
+
+// The solver enumerates the declared domain in declaration order, and placement
+// binds the first legal solution; with two legal assignments (4 and 8) the
+// recorded one is pinned so a solver reordering is a visible change.
+TEST(Placement, RecordsTheSolversFirstLegalAssignment) {
+  std::unique_ptr<MappingTarget> target =
+      targetFor(placementMachine(), kTwoSolutionLayout);
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withLayout = candidate();
+  LayoutRequirement requirement;
+  requirement.layoutClass = "t.choosy";
+  withLayout.layoutRequirements.push_back(requirement);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withLayout, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  // 4 and 8 both satisfy `VW % 4 == 0`; the first declared is recorded.
+  EXPECT_EQ(solvedInteger(instances->front(), "t.choosy", "VW"),
+            std::optional<int64_t>(4));
+  // A requirement that names no value records the unset sentinel, never a
+  // fabricated value: nothing may attribute this binding to an edge.
+  auto layout = instances->front().layoutSolutions.find("t.choosy");
+  ASSERT_NE(layout, instances->front().layoutSolutions.end());
+  EXPECT_EQ(layout->second.portValue, -1);
+}
+
+// A candidate that requires no layout records no solved layout: the field is
+// empty, never a fabricated default.
+TEST(Placement, RecordsNoSolvedLayoutWithoutALayoutRequirement) {
+  std::unique_ptr<MappingTarget> target = targetFor(placementMachine());
+  ASSERT_NE(target, nullptr);
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(candidate(), *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  EXPECT_TRUE(instances->front().layoutSolutions.empty());
+}
+
+TEST(Placement, TheInstanceCapCapsEnumeratedAttachmentsAndReportsTruncation) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withAll = coreCandidate();
+  ComputeRequirement computeRequirement;
+  computeRequirement.kind = "vector_engine";
+  withAll.computeRequirements.push_back(computeRequirement);
+  MemoryRequirement memoryRequirement;
+  memoryRequirement.kind = "sram";
+  withAll.memoryRequirements.push_back(memoryRequirement);
+  mlir::MLIRContext context;
+
+  // Four legal combinations, capped at three: the cap genuinely stops
+  // enumeration and must be reported.
+  PlacementOptions capped;
+  capped.maxInstances = 3;
+  bool truncated = false;
+  llvm::Expected<std::vector<CandidateInstance>> cappedInstances =
+      enumeratePlacements(withAll, *target, context, LayoutContext{}, capped,
+                          &truncated);
+  ASSERT_TRUE(static_cast<bool>(cappedInstances))
+      << llvm::toString(cappedInstances.takeError());
+  EXPECT_EQ(cappedInstances->size(), 3u);
+  EXPECT_TRUE(truncated);
+
+  // A cap that admits every combination reports no truncation.
+  PlacementOptions roomy;
+  roomy.maxInstances = 8;
+  bool notTruncated = false;
+  llvm::Expected<std::vector<CandidateInstance>> all = enumeratePlacements(
+      withAll, *target, context, LayoutContext{}, roomy, &notTruncated);
+  ASSERT_TRUE(static_cast<bool>(all));
+  EXPECT_EQ(all->size(), 4u);
+  EXPECT_FALSE(notTruncated);
+}
+
 TEST(Placement, RequiresTheLayoutToSolve) {
   std::unique_ptr<MappingTarget> target = targetFor(placementMachine());
   ASSERT_NE(target, nullptr);
@@ -181,7 +495,47 @@ TEST(Placement, RequiresTheLayoutToSolve) {
       enumeratePlacements(withLayout, *target, context, rank3);
   ASSERT_TRUE(static_cast<bool>(solvable));
   EXPECT_EQ(solvable->size(), 3u);
-  EXPECT_EQ((*solvable)[0].layoutBindings.lookup("t.rank3"), "t.rank3");
+  // Every placed instance carries the solved layout: the binding is the layout
+  // definition id the requirement resolved to, and it resolves in the target's
+  // registry. A rule's `require layout p satisfies <id>` names that definition
+  // id directly, so the bound value is string-identical to the requirement's
+  // declared id by construction. (The solved parameter assignment travels
+  // alongside in `layoutSolutions`.)
+  const std::string bound = (*solvable)[0].layoutBindings.lookup("t.rank3");
+  EXPECT_EQ(bound, "t.rank3");
+  EXPECT_NE((*target).layouts().find(bound), nullptr);
+}
+
+TEST(Placement, TreatsATruncatedLayoutSolveAsUnplaceable) {
+  // The domain is larger than the default quantifier budget, so the `forall`
+  // is undecided and `!undecided` reads as satisfied -- the solve is truncated.
+  // Placement must fail closed on the flag, not accept the undecided layout.
+  constexpr llvm::StringLiteral kTruncating = R"llkmap(
+layout t.truncating(int N) {
+  param N in [1..200000];
+  require !(forall v in domain(N) : v >= 1);
+}
+)llkmap";
+  std::unique_ptr<MappingTarget> target =
+      targetFor(placementMachine(), kTruncating);
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate withLayout = candidate();
+  LayoutRequirement requirement;
+  requirement.layoutClass = "t.truncating";
+  withLayout.layoutRequirements.push_back(requirement);
+
+  mlir::MLIRContext context;
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withLayout, *target, context, layoutContext);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // The undecided solve yielded no trustworthy layout, so the candidate does
+  // not place -- it is never accepted on the strength of `!undecided`.
+  EXPECT_TRUE(instances->empty());
 }
 
 TEST(Placement, SymmetryReductionKeepsOneRepresentative) {
@@ -211,6 +565,147 @@ TEST(Placement, SymmetryReductionKeepsOneRepresentative) {
   ASSERT_TRUE(static_cast<bool>(all));
   EXPECT_EQ(boundExecutors(*all),
             (std::vector<std::string>{"c.0", "c.1", "c.2"}));
+}
+
+TEST(Placement, DeclaredEquivalenceCollapsesExecutorsToRepresentative) {
+  // The target declares c.0 and c.1 equivalent even though their coordinates
+  // and concurrency differ, so symmetry reduction collapses them to one
+  // representative -- a declared group always keeps at least one member.
+  std::unique_ptr<MappingTarget> target =
+      targetFor(declaredEquivalentMachine());
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate core = candidate();
+  core.executorRequirements[0].capability = "core";
+  mlir::MLIRContext context;
+
+  PlacementOptions reduced; // reduceSymmetry defaults on
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(core, *target, context, LayoutContext{}, reduced);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances), (std::vector<std::string>{"c.0"}));
+}
+
+TEST(Placement, DeclaredEquivalenceRespectsTheSymmetrySwitch) {
+  // The same declared-equivalent machine with reduction disabled enumerates
+  // every representative, so the switch still governs the collapse.
+  std::unique_ptr<MappingTarget> target =
+      targetFor(declaredEquivalentMachine());
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate core = candidate();
+  core.executorRequirements[0].capability = "core";
+  mlir::MLIRContext context;
+
+  PlacementOptions full;
+  full.reduceSymmetry = false;
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(core, *target, context, LayoutContext{}, full);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances),
+            (std::vector<std::string>{"c.0", "c.1"}));
+}
+
+TEST(Placement, IgnoresCrossKindEquivalenceInAHandBuiltModel) {
+  // A hand-built model bypasses `verifyMachineModel`, so placement must not
+  // trust a cross-kind declaration: collapsing a `pe` onto a `worker` would
+  // bind the wrong executor class. Both executors match the `worker` owner
+  // (the `pe` refines it), but the kinds differ, so neither the declaration
+  // nor the structural heuristic collapses them.
+  MachineModel machine;
+  machine.target = "hand-built";
+  ExecutorNode worker;
+  worker.id = "e0";
+  worker.kind = "worker";
+  worker.equivalentTo = {"e1"};
+  ExecutorNode pe;
+  pe.id = "e1";
+  pe.kind = "pe";
+  pe.refines = {"worker"};
+  pe.equivalentTo = {"e0"};
+  machine.executors = {worker, pe};
+  std::unique_ptr<MappingTarget> target = targetFor(std::move(machine));
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate workerCandidate = candidate();
+  workerCandidate.executorRequirements[0].capability = "worker";
+  mlir::MLIRContext context;
+
+  PlacementOptions reduced; // reduceSymmetry defaults on
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(workerCandidate, *target, context, LayoutContext{},
+                          reduced);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances), (std::vector<std::string>{"e0", "e1"}));
+}
+
+TEST(Placement, DoesNotCollapseExecutorsThatDifferInConcurrencyOrCoordinates) {
+  // The structural heuristic must compare the facts that make two executors
+  // behave differently: logical coordinates, concurrency, and scheduling class.
+  // Executors that differ in any of them are not interchangeable, so collapsing
+  // them to one representative would hide a distinct-performance placement.
+  MachineModel machine;
+  machine.target = "distinct";
+  machine.executors = {
+      {"c.0", "core", std::nullopt, {0}, 1, {}},
+      {"c.1", "core", std::nullopt, {1}, 1, {}},
+      {"c.2", "core", std::nullopt, {0}, 4, {}},
+      {"c.3", "core", std::nullopt, {0}, 1, {}, SchedulingClass::OutOfOrder}};
+  std::unique_ptr<MappingTarget> target = targetFor(std::move(machine));
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate core = candidate();
+  core.executorRequirements[0].capability = "core";
+  mlir::MLIRContext context;
+
+  PlacementOptions reduced; // reduceSymmetry defaults on
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(core, *target, context, LayoutContext{}, reduced);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances),
+            (std::vector<std::string>{"c.0", "c.1", "c.2", "c.3"}));
+}
+
+TEST(Placement, ReportsTruncationWhenTheInstanceCapIsHit) {
+  // Three interchangeable executors and no reduction: a cap of one genuinely
+  // stops enumeration before the other two legal placements are considered.
+  MachineModel machine;
+  machine.target = "symmetric";
+  machine.executors = {{"c.0", "core", std::nullopt, {}, 1, {}},
+                       {"c.1", "core", std::nullopt, {}, 1, {}},
+                       {"c.2", "core", std::nullopt, {}, 1, {}}};
+  std::unique_ptr<MappingTarget> target = targetFor(std::move(machine));
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate core = candidate();
+  core.executorRequirements[0].capability = "core";
+  mlir::MLIRContext context;
+
+  PlacementOptions capped;
+  capped.reduceSymmetry = false;
+  capped.maxInstances = 1;
+  bool truncated = false;
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(core, *target, context, LayoutContext{}, capped,
+                          &truncated);
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  EXPECT_EQ(boundExecutors(*instances), (std::vector<std::string>{"c.0"}));
+  EXPECT_TRUE(truncated);
+
+  // A cap that admits every placement reports no truncation.
+  PlacementOptions roomy;
+  roomy.reduceSymmetry = false;
+  bool notTruncated = false;
+  llvm::Expected<std::vector<CandidateInstance>> all = enumeratePlacements(
+      core, *target, context, LayoutContext{}, roomy, &notTruncated);
+  ASSERT_TRUE(static_cast<bool>(all));
+  EXPECT_EQ(all->size(), 3u);
+  EXPECT_FALSE(notTruncated);
 }
 
 TEST(Placement, InstancesAreLegalAndStable) {
@@ -248,4 +743,52 @@ TEST(Placement, InstancesAreLegalAndStable) {
       EXPECT_NE((*target).machine().findCompute(binding.second), nullptr);
     EXPECT_EQ((*first)[i].id, (*second)[i].id);
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Cost dimensions (design §17.2)
+//===----------------------------------------------------------------------===//
+
+// Compute utilization is the candidate's rule-local compute cycles over the
+// cycles the executors had available in one machine sync period
+// (workerThreads x (barrier + wait) cycles).
+TEST(Placement, ComputeUtilizationUsesTheSyncWindow) {
+  MachineModel machine = placementMachine();
+  machine.workerThreads = 4;
+  // No clockHz: it cancels in the dimensionless cycle ratio (see
+  // utilizationEstimate), so the sync period is the only fact this needs.
+  machine.sync.barrierCycles = 200;
+  machine.sync.waitCycles = 50;
+  std::unique_ptr<MappingTarget> target = targetFor(machine);
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate withCompute = candidate();
+  withCompute.lowerBound.latencyCycles = 500.0;
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withCompute, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  // 500 compute cycles over 4 workers x 250 cycles-per-period = 0.5.
+  EXPECT_DOUBLE_EQ(instances->front().localCost.computeUtilization, 0.5);
+}
+
+// A machine without sync facts gives no denominator, so the dimension stays 0
+// rather than a fabricated constant.
+TEST(Placement, ComputeUtilizationStaysZeroWithoutSyncFacts) {
+  std::unique_ptr<MappingTarget> target = targetFor(placementMachine());
+  ASSERT_NE(target, nullptr);
+
+  MappingCandidate withCompute = candidate();
+  withCompute.lowerBound.latencyCycles = 500.0;
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withCompute, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  EXPECT_DOUBLE_EQ(instances->front().localCost.computeUtilization, 0.0);
 }
