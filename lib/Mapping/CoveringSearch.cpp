@@ -571,9 +571,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // the first output alone under-charges a multi-output node, the unsafe
     // direction for a capacity check. When a node declares several bindings the
     // graph fixes no output-to-binding pairing (a memory requirement names a
-    // requirement *kind*, never the port that goes there), so each binding
-    // keeps the first-output fallback, an admitted lower bound, rather than
-    // guessing a pairing.
+    // requirement *kind*, never the port that goes there). A single output can
+    // still be charged to each binding conservatively (that over-charges, the
+    // safe direction); several outputs with several bindings cannot be charged
+    // soundly at all, so that branch is rejected below rather than admitted on
+    // an unsafe lower bound.
     //
     // Each charged output is also recorded as a live range: the bytes are
     // released once its last consumer is placed (below), so a sequential
@@ -596,6 +598,24 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           partial.memoryBytes[memory] += bytes;
           partial.liveValueCharges[output.value].push_back({memory, bytes});
         }
+      } else if (workload.outputs.size() > 1) {
+        // Several outputs *and* several memory bindings. A memory requirement
+        // names a kind, never the port that writes into it, so the graph fixes
+        // no output-to-binding pairing: there is no sound way to charge these
+        // outputs. Sizing every binding from the first output alone is a lower
+        // bound that can admit an over-capacity plan -- a 4-byte first output
+        // hiding a 4096-byte second -- so the branch is rejected rather than
+        // admitted on an unsafe bound. A single binding has no such ambiguity
+        // (one binding holds every output, charged below), and a single output
+        // cannot be misattributed among bindings.
+        report(
+            DiagnosticCode::MemoryCapacityExceeded,
+            "node " + std::to_string(workload.id) + ": " +
+                std::to_string(workload.outputs.size()) + " outputs with " +
+                std::to_string(instance.memoryBindings.size()) +
+                " memory bindings have no output-to-memory association; "
+                "placement is ambiguous and cannot be proven within capacity");
+        return false;
       } else {
         const WorkloadValueId first = workload.outputs.front().value;
         const uint64_t bytes = factsForValue(first).bytes;

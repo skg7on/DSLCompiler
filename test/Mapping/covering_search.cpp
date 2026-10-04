@@ -2214,6 +2214,129 @@ TEST(CoveringSearch, ATransferWithinItsDestinationCapacityIsAdmitted) {
   EXPECT_FALSE(result->plans.empty());
 }
 
+/// One node writing two outputs and reading nothing: the simplest shape whose
+/// capacity accounting depends on how its outputs are attributed to memory.
+WorkloadGraph multiOutputGraph(mlir::MLIRContext &context, mlir::Type first,
+                               mlir::Type second) {
+  WorkloadGraph graph;
+  WorkloadValueId a =
+      graph.addValue(WorkloadValue{0, first, "a", /*external=*/false});
+  WorkloadValueId b =
+      graph.addValue(WorkloadValue{0, second, "b", /*external=*/false});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context);
+  node.outputs.push_back(WorkloadPort{a, first, std::nullopt});
+  node.outputs.push_back(WorkloadPort{b, second, std::nullopt});
+  graph.addNode(std::move(node));
+  graph.finalize();
+  return graph;
+}
+
+/// A rule binding two memory kinds, so a placed node carries two memory
+/// bindings and the graph fixes no output-to-binding association.
+constexpr llvm::StringLiteral kTwoMemoryRules = R"llkmap(
+rule r.two_memory {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  require memory kind dram;
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The same node with a single memory binding: no association is needed, so
+/// every output is charged to that one binding.
+constexpr llvm::StringLiteral kOneMemoryRules = R"llkmap(
+rule r.one_memory {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+// Issue #109 defect 1: a node with several outputs and several memory bindings
+// has no output-to-binding association, so its capacity cannot be established.
+// Charging only the *first* output to every binding is a lower bound, and a
+// 4-byte first output hid a 4096-byte second: the old search admitted the plan
+// into two 1024-byte memories. Ambiguous placement is now rejected rather than
+// admitted on that unsafe bound -- and here with capacity to spare, because the
+// ambiguity is structural, not a matter of size.
+TEST(CoveringSearch, AmbiguousMultiOutputMultiMemoryPlacementIsRejected) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  MachineModel machine = searchMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1u << 30; // plenty: rejection is not about size
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kTwoMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+// Control: one memory binding leaves nothing ambiguous -- the binding holds
+// every output -- so a two-output node whose outputs both fit is admitted.
+TEST(CoveringSearch, MultiOutputSingleMemoryIsAdmittedWhenTheTotalFits) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, small);
+
+  MachineModel machine = searchMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1024;
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kOneMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
+// Control: the same single-binding node is rejected once its *later* output is
+// large -- proving every output is charged, not only the first.
+TEST(CoveringSearch, MultiOutputSingleMemoryRejectsAnOversizedLaterOutput) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  MachineModel machine = searchMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1024;
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kOneMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
 /// Two independent producer -> consumer pairs over `fanMachine`, each moving a
 /// `value`-sized tile from dram.0 into acc.0 and writing a 4-byte result. The
 /// pairs share no value, so the only thing linking them is the destination
