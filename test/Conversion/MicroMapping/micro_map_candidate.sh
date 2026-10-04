@@ -82,11 +82,27 @@ grep -q 'micro\.mapping' "$WORK/bound.mlir" || fail "candidate_17 placed no node
 
 # The binding is recorded in the IR as the candidate's stable hash. The report
 # prints the hash as 16 hex digits; the IR prints the same 64-bit value as a
-# signed i64, so `$((0x...))` (signed 64-bit) is the spelling the IR uses.
+# signed i64. Shell arithmetic is only portable below 2^63, so a hash with its
+# top bit set is converted by two's complement on the *text* rather than by
+# `$((0x...))`, which saturates to INT64_MAX under some shells (dash) instead of
+# wrapping to the signed value. The complement's top nibble is below 8, so the
+# arithmetic below is exact everywhere.
 HEX=$(sed -n 's/.*"sourceBindingHash": "\([0-9a-f][0-9a-f]*\)".*/\1/p' \
         "$WORK/bound.json" | head -n 1)
 [ -n "$HEX" ] || fail "the report carried no sourceBindingHash"
-HASH=$((0x$HEX))
+[ ${#HEX} -eq 16 ] || fail "sourceBindingHash is not 16 hex digits: '$HEX'"
+top=$(printf '%s' "$HEX" | cut -c1)
+case $top in
+  8|9|a|b|c|d|e|f|A|B|C|D|E|F)
+    # signed(V) == -(2^64 - V) == -1 - not(V); not(V) fits in a signed 64-bit.
+    NOT=$(printf '%s' "$HEX" |
+            tr '0123456789abcdefABCDEF' 'fedcba9876543210FEDCBA9876543210')
+    HASH=$(( -1 - 0x$NOT ))
+    ;;
+  *)
+    HASH=$((0x$HEX))
+    ;;
+esac
 [ "$HASH" -ne 0 ] || fail "candidate_17's stableHash is zero"
 grep -q "binding_hash = $HASH : i64" "$WORK/bound.mlir" ||
   fail "the bound IR does not record the candidate's stableHash ($HASH)"
