@@ -351,6 +351,43 @@ rule r.pe_only {
 }
 )llkmap";
 
+/// Two rules over the same node, each satisfied only by one value of the shared
+/// parameter `VW`: a binding selects between them. Unpinned, both match (and
+/// the cheaper `r.wide` wins); pinned to 4 only `r.narrow` matches.
+constexpr llvm::StringLiteral kParameterRules = R"llkmap(
+rule r.wide {
+  match micro.vector(op = "add");
+  param VW in [4..8];
+  require VW == 8;
+  require executor kind worker;
+  bundle "b.wide";
+  emit "e1";
+  cost 1;
+}
+rule r.narrow {
+  match micro.vector(op = "add");
+  param VW in [4..8];
+  require VW == 4;
+  require executor kind worker;
+  bundle "b.narrow";
+  emit "e1";
+  cost 2;
+}
+)llkmap";
+
+/// One rule over a node, satisfied only by VW = 8, so a binding that pins any
+/// other value leaves the node with no rule in effect.
+constexpr llvm::StringLiteral kSingleParameterRule = R"llkmap(
+rule r.wide {
+  match micro.vector(op = "add");
+  param VW in [4..8];
+  require VW == 8;
+  require executor kind worker;
+  bundle "b.wide";
+  emit "e1";
+}
+)llkmap";
+
 /// One producer feeding two consumers across the value `mid`. `producerOp` and
 /// `consumerOp` are the node attributes the rules predicate on, so a fixture
 /// can gate producer and consumer rules apart.
@@ -2569,6 +2606,295 @@ TEST(CoveringSearch, NoBindingLeavesTheHashZeroAndThePlanIdUnchanged) {
   EXPECT_EQ(result->plans[0].sourceBindingHash, 0u);
   EXPECT_TRUE(result->plans[0].globalParameters.empty());
   EXPECT_EQ(result->plans[0].id, kNoBindingPlanId);
+}
+
+//===----------------------------------------------------------------------===//
+// A binding constrains rule parameter resolution (phase-4 T2)
+//===----------------------------------------------------------------------===//
+
+TEST(CoveringSearch, ABindingDecidesWhichRuleResolvesForANode) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kParameterRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  // With no binding both rules match -- the enumeration resolves VW = 8 for
+  // `r.wide` and VW = 4 for `r.narrow` -- and deterministic mode keeps the
+  // first in canonical (rule-id) order, `r.narrow`.
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.narrow");
+  }
+
+  // Pinned to 8, `r.narrow` (which needs VW = 4) is a non-match for every node,
+  // so `r.wide` is the only rule left: the binding, not canonical order,
+  // decides. This is the case that is red before the binding constrains
+  // resolution -- the search would pick `r.narrow` regardless.
+  {
+    SearchBinding wide =
+        makeSearchBinding("candidate_8", values({{"VW", int64_t{8}}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          wide);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    ASSERT_EQ(result->plans[0].placements.size(), 2u);
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.wide");
+    // The rule the binding pinned out of range is reported, not silently
+    // dropped.
+    EXPECT_GE(result->frontier.codeCounts[DiagnosticCode::NoMatchingRule], 1u);
+  }
+
+  // Pinned to 4, symmetric: `r.wide` is a non-match and `r.narrow` remains.
+  {
+    SearchBinding narrow =
+        makeSearchBinding("candidate_4", values({{"VW", int64_t{4}}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          narrow);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.narrow");
+    EXPECT_GE(result->frontier.codeCounts[DiagnosticCode::NoMatchingRule], 1u);
+  }
+}
+
+TEST(CoveringSearch, ABindingThatFailsEveryRuleLeavesTheNodeWithoutARule) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kSingleParameterRule);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  // Pinned to the value the rule rejects, no rule applies to either node: the
+  // nodes fall into the failure frontier, and the search is not truncated.
+  SearchBinding binding =
+      makeSearchBinding("candidate_4", values({{"VW", int64_t{4}}}));
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                        binding);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_FALSE(result->searchTruncated);
+  EXPECT_EQ(result->frontier.nodesWithoutRules, 2u);
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
+
+  // The same fixture with the satisfying value pinned does produce plans.
+  SearchBinding matching =
+      makeSearchBinding("candidate_8", values({{"VW", int64_t{8}}}));
+  CoveringSearch matchingSearch(graph, *target, context, LayoutContext{},
+                                options, matching);
+  llvm::Expected<MappingSearchResult> matchingResult = matchingSearch.search();
+  ASSERT_TRUE(static_cast<bool>(matchingResult))
+      << llvm::toString(matchingResult.takeError());
+  EXPECT_FALSE(matchingResult->plans.empty());
+}
+
+//===----------------------------------------------------------------------===//
+// A binding constrains layout selection (phase-4 T3)
+//===----------------------------------------------------------------------===//
+
+/// One rule that offers two layouts for the same port (`operand0`). With no
+/// binding both requirements are materialized, exactly as before; a bound
+/// layout selects the one it names and supersedes the other.
+constexpr llvm::StringLiteral kOneRuleTwoLayouts = R"llkmap(
+rule r.laid_out {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  require layout operand0 satisfies t.blocked;
+  input "operand0";
+  output "result";
+  bundle "b.laid_out";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Two sibling rules, each offering exactly one layout. `r.a_plain` sorts
+/// before `r.b_blocked`, so a binding that names `t.blocked` is observable: the
+/// canonical-first rule offers only `t.plain` and is a non-match, while the
+/// sibling still matches.
+constexpr llvm::StringLiteral kSiblingLayoutRules = R"llkmap(
+rule r.a_plain {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.plain;
+  input "operand0";
+  output "result";
+  bundle "b.plain";
+  emit "e1";
+  cost 1;
+}
+rule r.b_blocked {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.blocked;
+  input "operand0";
+  output "result";
+  bundle "b.blocked";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+// (a) + (c): a rule offers two layout ids; a binding that names one selects it,
+// and with no binding the choice is unchanged.
+TEST(CoveringSearch, ABoundLayoutSelectsAmongTheLayoutsARuleOffers) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kOneRuleTwoLayouts, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  // (c) No binding: both declared layouts are materialized, as before. The
+  // plan is still found (the two layouts for one value are unattributable to
+  // an edge, which only costs the transform alternative, not the plan).
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    ASSERT_FALSE(result->plans[0].placements.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements) {
+      EXPECT_EQ(placement.layouts.size(), 2u);
+      EXPECT_NE(placement.layouts.find("t.plain"), placement.layouts.end());
+      EXPECT_NE(placement.layouts.find("t.blocked"), placement.layouts.end());
+    }
+  }
+
+  // (a) The binding names `t.blocked`: that layout is selected and `t.plain`,
+  // which the rule also offered, is not. Red before the fix -- both remain.
+  {
+    SearchBinding binding =
+        makeSearchBinding("candidate_blocked",
+                          values({{"tile_layout", std::string("t.blocked")}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          binding, std::string("t.blocked"));
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    ASSERT_FALSE(result->plans[0].placements.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements) {
+      ASSERT_EQ(placement.layouts.size(), 1u);
+      EXPECT_NE(placement.layouts.find("t.blocked"), placement.layouts.end());
+      EXPECT_EQ(placement.layouts.find("t.plain"), placement.layouts.end());
+    }
+  }
+}
+
+// (b): a binding naming a layout the rule does not offer yields no candidate
+// for that node (a non-match, not an error), and a sibling rule that offers it
+// still matches.
+TEST(CoveringSearch, ABoundLayoutARuleDoesNotOfferIsANonMatch) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kSiblingLayoutRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  // No binding: both rules match; deterministic mode keeps the canonical
+  // first, `r.a_plain`.
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.a_plain");
+  }
+
+  // Bound to `t.blocked`: `r.a_plain` offers only `t.plain`, so it is a
+  // non-match for every node; `r.b_blocked` remains. Red before the fix --
+  // `r.a_plain` is picked regardless.
+  {
+    SearchBinding binding =
+        makeSearchBinding("candidate_blocked",
+                          values({{"tile_layout", std::string("t.blocked")}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          binding, std::string("t.blocked"));
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    ASSERT_FALSE(result->plans[0].placements.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.b_blocked");
+    // The rule the binding rejected is reported, not silently dropped.
+    EXPECT_GE(result->frontier.codeCounts[DiagnosticCode::NoMatchingRule], 1u);
+  }
+}
+
+// Ruling S7: a bound layout is a contradiction test, not a requirement test. A
+// rule that declares *no* layout requirement takes on no layout obligation, so
+// it matches unchanged under any bound layout -- the layout-axis analogue of
+// T2's "a name the rule does not declare is ignored". This is the shipped-AVX2
+// regression in miniature: its `reduce_sum_f32`/`async_copy`/`tile_async_copy`/
+// `tile_store` rules carry no `require layout`, and vetoing them would make a
+// movement-and-reduce kernel unmappable the moment a candidate binds a layout.
+TEST(CoveringSearch, ABoundLayoutLeavesLayoutAgnosticRulesUnchanged) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  SearchBinding binding = makeSearchBinding(
+      "candidate_blocked", values({{"tile_layout", std::string("t.blocked")}}));
+
+  // No bound layout: the layout-agnostic rules match and plans are found.
+  CoveringSearch plain(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> plainResult = plain.search();
+  ASSERT_TRUE(static_cast<bool>(plainResult))
+      << llvm::toString(plainResult.takeError());
+  ASSERT_FALSE(plainResult->plans.empty());
+
+  // The same rules under a bound layout still match, selecting the same rules:
+  // nothing about them contradicts `t.blocked`. (The plan *id* legitimately
+  // differs -- the binding's provenance is folded into it -- so compare the
+  // selections, not the id.)
+  CoveringSearch boundSearch(graph, *target, context, LayoutContext{}, options,
+                             binding, std::string("t.blocked"));
+  llvm::Expected<MappingSearchResult> boundResult = boundSearch.search();
+  ASSERT_TRUE(static_cast<bool>(boundResult))
+      << llvm::toString(boundResult.takeError());
+  ASSERT_FALSE(boundResult->plans.empty());
+  EXPECT_EQ(boundResult->frontier.nodesWithoutRules, 0u);
+  EXPECT_FALSE(hasDiagnostic(*boundResult, DiagnosticCode::NoMatchingRule));
+  ASSERT_EQ(boundResult->plans[0].placements.size(),
+            plainResult->plans[0].placements.size());
+  for (size_t i = 0; i < boundResult->plans[0].placements.size(); ++i)
+    EXPECT_EQ(boundResult->plans[0].placements[i].rule,
+              plainResult->plans[0].placements[i].rule);
 }
 
 //===----------------------------------------------------------------------===//

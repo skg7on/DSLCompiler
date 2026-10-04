@@ -37,7 +37,7 @@ namespace llk {
 /// are exposed on the command line as `--micro-map="target=<name>
 /// machine=<path> layouts=<path> rules=<path> emitters=<csv>
 /// mode=<deterministic|beam|exact> beam-width=<n> top-k=<n> report=<path>
-/// report-only=<bool>"`.
+/// report-only=<bool> candidate=<sym>"`.
 struct MicroMapOptions {
   /// Opaque target label, recorded on the selected plan; never interpreted by
   /// generic code.
@@ -62,14 +62,36 @@ struct MicroMapOptions {
   /// discard its own result. A search that finds no plan still fails the pass,
   /// report-only or not, so the mode cannot hide a real failure.
   bool reportOnly = false;
+  /// The `micro.candidate` symbol to search at, or empty for a binding-free
+  /// search. The candidate is loaded from the module (phase-4 task 1): its
+  /// values pin the rule parameters of the same name, and its `layout`-kind
+  /// parameter -- resolved by `kind`, never by name -- is a *veto* on the
+  /// layout axis, not a selector. A rule whose `require layout` names a
+  /// different id stops matching, while a rule with no layout requirement
+  /// matches unchanged (ruling S7). It can never pick a target layout id: the
+  /// choice's value is a Micro layout kind (`blocked`, `row_major`, ...) while
+  /// a rule names a target-owned id (`avx2.blocked_2d`), and the two are equal
+  /// only when a target spells its ids as kinds (see `SearchBindingLoader.h`).
+  /// A binding changes which plans are *legal*, so a candidate no rule can
+  /// satisfy is a search failure carrying the frontier's diagnostics, never a
+  /// silently different plan (design §8.3/§9.5).
+  ///
+  /// Both `--micro-map` and `--micro-bind-plan` honour it, and both must be
+  /// given the *same* value to speak about the same plan: a plan id folds in
+  /// the binding's hash, so a binding-derived id is only reproducible by a
+  /// search at the same candidate (ruling S8).
+  std::string candidate;
 };
 
 /// `micro-bind-plan` runs the same search and binds the one plan whose id the
 /// caller names, so it carries a whole `MicroMapOptions` plus that id. A plan
 /// id is a content hash, so the only way to reproduce it is to re-run the
 /// search -- plans are never persisted between passes. The search options
-/// (mode, beam-width, top-k) must be the ones the id was produced with, or the
-/// search can order or cap the plans differently and the id will not be found.
+/// (mode, beam-width, top-k) *and* the search point (`search.candidate`) must
+/// be the ones the id was produced with, or the search can order, cap, or
+/// constrain the plans differently and the id will not be found. A plan
+/// produced without a binding and one produced at a candidate are different
+/// points, so their ids are never interchangeable.
 struct MicroBindPlanOptions {
   MicroMapOptions search;
   uint64_t planId = 0;

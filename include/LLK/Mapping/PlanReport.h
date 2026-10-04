@@ -6,6 +6,10 @@
 // input: it names the exact inputs a search ran on -- the module hash, the
 // machine, the layout and rule libraries, and the source search binding -- the
 // options it used, how far it got, and the plans it retained with their costs.
+// The binding is reported self-containedly: its `micro.candidate` symbol, its
+// sorted parameter values, and its content hash, so a consumer holding only the
+// report can re-run the search at the same `candidate=` and reproduce the plan
+// ids (a binding-derived id is only reproducible at the same search point).
 // It does not replace `micro.search_space` or the bound Micro-IR.
 //
 // Determinism is the contract (design §29.12): two runs with identical inputs

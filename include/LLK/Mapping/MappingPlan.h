@@ -268,6 +268,14 @@ struct PlanConnection {
 struct CoveringPlan {
   PlanId id = 0;
   uint64_t sourceBindingHash = 0;
+  /// The `micro.candidate` symbol the source binding was loaded from, or empty
+  /// for a binding-free search. The hash above covers the binding's *values*
+  /// only, so this name is what lets a reader of the report name the exact
+  /// `candidate=` a replay must pass (the id itself is reproducible from the
+  /// same search point). It is provenance, not plan content:
+  /// `canonicalPlanString` deliberately does not fold it, so a plan id is
+  /// unchanged by it.
+  std::string sourceBindingCandidate;
   llvm::SmallVector<InstanceId> instances;
   llvm::SmallVector<ConnectionId> connections;
   /// The same selections, resolved: which node each instance covers and how

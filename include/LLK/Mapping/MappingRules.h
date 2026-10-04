@@ -23,11 +23,13 @@
 #include "LLK/Mapping/LayoutConstraints.h"
 #include "LLK/Mapping/LlkMap.h"
 #include "LLK/Mapping/MappingPlan.h"
+#include "LLK/Mapping/SearchBinding.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
@@ -202,11 +204,44 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
 /// bounded parameter enumeration hit its assignment cap -- a possibly
 /// satisfiable rule that was not fully explored -- so a caller can report the
 /// search as truncated rather than concluding no match.
+///
+/// `pinned` is the search-space point this match is evaluated at, when the
+/// caller has one (see `CoveringSearch`'s binding): a declared parameter named
+/// in it may take *only* the bound value, so the enumeration for that parameter
+/// is a singleton. A bound value the parameter's declared domain does not
+/// contain, or one that makes a `require` unsatisfiable, yields `std::nullopt`
+/// -- the same non-match, never an error, so another rule for the node may
+/// still apply. Names the rule does not declare are ignored; a parameter
+/// `pinned` does not name is enumerated over its whole domain exactly as
+/// before. A null `pinned` is byte-identical to the pre-binding behaviour.
+/// The map is the binding's `values` directly -- no filtered projection -- so
+/// the rule stays the single authority on which of its own parameters a name
+/// refers to.
+///
+/// `boundLayout` is the layout the binding selects, when the caller resolved a
+/// `layout`-kind search parameter to a concrete value. It is passed as a bare
+/// value rather than as the binding or the search space because lib/Mapping
+/// must not depend on LLKPerf (the `kind` lives on `perf::SearchParam`), and
+/// because the rule -- not generic code -- owns which layout ids it offers.
+/// A rule that declares at least one `require layout ... satisfies <id>` equal
+/// to the bound value matches, and only the requirements naming that value are
+/// materialized: the binding selects which of the rule's declared layouts
+/// applies. A rule that declares layout requirements none of which equals the
+/// bound value contradicts the binding and yields `std::nullopt` -- the same
+/// non-match as an unsatisfiable `require`, never an error, so a sibling rule
+/// that does offer the layout may still match. A rule that declares *no* layout
+/// requirement takes on no layout obligation, so it neither offers nor
+/// contradicts the bound value and matches unchanged: vetoing such a rule would
+/// make every movement/reduce rule -- which the shipped rule files leave
+/// layout-agnostic -- unmappable under any bound layout. A null `boundLayout`
+/// leaves layout selection byte-identical to the pre-binding behaviour.
 std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason = nullptr,
-                   bool *truncated = nullptr);
+                   bool *truncated = nullptr,
+                   const llvm::StringMap<SearchValue> *pinned = nullptr,
+                   const std::string *boundLayout = nullptr);
 
 } // namespace mlir::llk::mapping
 

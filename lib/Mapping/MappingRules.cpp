@@ -1030,20 +1030,32 @@ struct RuleResolution {
 /// assignment satisfies a constraint, or when a constraint cannot be evaluated
 /// from the facts the node and context supply.
 ///
+/// A parameter named in `pinned` -- the search-space point the match is
+/// evaluated at -- enumerates over the singleton bound value instead of its
+/// declared domain, so the binding, not the enumeration order, chooses it. A
+/// bound value the declared domain does not contain leaves no admissible
+/// assignment: the rule is a non-match, exactly as if a `require` rejected
+/// every value. Names not declared by the rule are ignored.
+///
 /// Only parameters a constraint references are recorded; a declared but
 /// unconstrained parameter is not derived, so it never lands in the result.
 /// Hitting the assignment cap sets `truncated`: a rule whose space was not
 /// exhausted was not proven unsatisfiable.
-RuleResolution resolveRuleConstraints(const RuleDef &rule,
-                                      const WorkloadNode &node,
-                                      const machine::MachineModel &machine,
-                                      const LayoutContext &context) {
+RuleResolution
+resolveRuleConstraints(const RuleDef &rule, const WorkloadNode &node,
+                       const machine::MachineModel &machine,
+                       const LayoutContext &context,
+                       const llvm::StringMap<SearchValue> *pinned) {
   RuleResolution result;
   if (rule.constraints.empty())
     return result;
 
   // Every declared parameter must have a finite, non-empty domain to enumerate.
+  // The domain is restricted to the bound value for a pinned parameter, in the
+  // rule's own declaration order, so pinned and unpinned runs enumerate
+  // deterministically.
   llvm::SmallVector<const LayoutParam *, 4> enumerable;
+  llvm::SmallVector<llvm::SmallVector<LayoutValue, 8>, 4> domains;
   for (const LayoutParam &param : rule.params) {
     auto domain = rule.domains.find(param.name);
     if (domain == rule.domains.end() || domain->second.values.empty()) {
@@ -1051,7 +1063,23 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
       result.reason = "parameter '" + param.name + "' has no declared domain";
       return result;
     }
+    llvm::SmallVector<LayoutValue, 8> values;
+    if (pinned) {
+      auto bound = pinned->find(param.name);
+      if (bound != pinned->end()) {
+        if (!llvm::is_contained(domain->second.values, bound->second)) {
+          result.matched = false;
+          result.reason = "binding pins parameter '" + param.name +
+                          "' to a value outside its declared domain";
+          return result;
+        }
+        values.push_back(bound->second);
+      }
+    }
+    if (values.empty())
+      values.assign(domain->second.values.begin(), domain->second.values.end());
     enumerable.push_back(&param);
+    domains.push_back(std::move(values));
   }
 
   // The parameters a constraint actually derives: only these are recorded.
@@ -1060,9 +1088,6 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
   for (const ExprPtr &constraint : rule.constraints)
     collectIdentifiers(*constraint, referenced, bound);
 
-  auto domainOf = [&](const LayoutParam &param) -> const ParamDomain & {
-    return rule.domains.find(param.name)->second;
-  };
   LayoutContext ruleContext = ruleLayoutContext(node, context);
 
   // A quantifier in a rule's `require` is bounded like the rule's own
@@ -1099,7 +1124,7 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
 
     llvm::StringMap<LayoutValue> bindings;
     for (size_t i = 0; i < enumerable.size(); ++i)
-      bindings[enumerable[i]->name] = domainOf(*enumerable[i]).values[index[i]];
+      bindings[enumerable[i]->name] = domains[i][index[i]];
     ++assignments;
 
     bool satisfied = true;
@@ -1140,7 +1165,7 @@ RuleResolution resolveRuleConstraints(const RuleDef &rule,
     // Advance the odometer: the last declared parameter varies fastest.
     exhausted = true;
     for (size_t i = enumerable.size(); i-- > 0;) {
-      if (++index[i] < domainOf(*enumerable[i]).values.size()) {
+      if (++index[i] < domains[i].size()) {
         exhausted = false;
         break;
       }
@@ -1215,9 +1240,10 @@ std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason,
-                   bool *truncated) {
+                   bool *truncated, const llvm::StringMap<SearchValue> *pinned,
+                   const std::string *boundLayout) {
   RuleResolution resolution =
-      resolveRuleConstraints(rule, node, machine, context);
+      resolveRuleConstraints(rule, node, machine, context, pinned);
   if (!resolution.matched) {
     if (reason)
       *reason = resolution.reason.empty()
@@ -1226,6 +1252,33 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     if (truncated)
       *truncated = resolution.truncated;
     return std::nullopt;
+  }
+
+  // A bound layout constrains the rule only where the rule takes on a layout
+  // obligation. The value was resolved by `kind == "layout"` at the pass layer
+  // (lib/Mapping does not see the search space, and must not depend on
+  // LLKPerf); here it is only string-compared against the rule's declared
+  // layout ids, which stay target-owned. A rule that declares layout
+  // requirements but offers none of them contradicts the binding, so it is a
+  // non-match, never an error: a sibling rule that does offer the layout may
+  // still match. A rule that declares *no* layout requirement takes on no
+  // layout obligation, so it neither offers nor contradicts the bound value and
+  // matches unchanged. Both halves are the same ruling (S7): the layout axis
+  // vetoes only a rule that takes on an obligation it cannot meet, which is the
+  // layout-axis analogue of T2's "a binding name the rule does not declare is
+  // ignored". Vetoing a rule with no obligation would make every
+  // movement/reduce rule (which the shipped rule files leave layout-agnostic)
+  // unmappable under any bound layout.
+  if (boundLayout && !rule.layoutRequirements.empty()) {
+    bool offered = false;
+    for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)
+      offered |= requirement.layoutId == *boundLayout;
+    if (!offered) {
+      if (reason)
+        *reason = "binding selects layout '" + *boundLayout +
+                  "', which the rule does not offer";
+      return std::nullopt;
+    }
   }
 
   MappingCandidate candidate;
@@ -1272,6 +1325,20 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   }
 
   for (const RuleLayoutRequirement &requirement : rule.layoutRequirements) {
+    // When a layout is bound, only the requirement(s) naming it are
+    // materialized: the binding, not the rule file, chooses which of the rule's
+    // declared layouts applies, so a rule that offered several selects the one
+    // the search-space point named. Without a bound layout every requirement is
+    // kept exactly as before.
+    //
+    // Known conflation: this treats "two ids on one port" (alternatives) and
+    // "ids on two ports" (distinct obligations) alike, so a future multi-port
+    // rule would silently drop an obligation -- under-constraint, the opposite
+    // direction to the empty-list veto S7 fixed. Every shipped rule declares at
+    // most one `require layout`, so the cases do not yet diverge; a per-port
+    // selection surface is the place to split them if one appears.
+    if (boundLayout && requirement.layoutId != *boundLayout)
+      continue;
     LayoutRequirement resolved;
     resolved.layoutClass = requirement.layoutId;
     // A layout applies to the operand the requirement names, so resolve that

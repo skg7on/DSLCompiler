@@ -150,6 +150,10 @@ TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
   EXPECT_TRUE(root->getInteger("costModelVersion").has_value());
   EXPECT_TRUE(root->getString("inputModuleHash").has_value());
   EXPECT_TRUE(root->getString("sourceBindingHash").has_value());
+  // The candidate symbol is emitted even for a binding-free search, where it is
+  // empty -- a fixed field set is part of the schema, not an omission.
+  EXPECT_TRUE(root->getString("sourceBindingCandidate").has_value());
+  EXPECT_EQ(*root->getString("sourceBindingCandidate"), "");
   EXPECT_TRUE(root->getString("sourceBinding").has_value());
   EXPECT_TRUE(root->getString("machineHash").has_value());
   EXPECT_TRUE(root->getString("layoutLibraryHash").has_value());

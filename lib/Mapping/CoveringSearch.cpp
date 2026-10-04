@@ -277,10 +277,11 @@ CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
                                mlir::MLIRContext &context,
                                const LayoutContext &layoutContext,
                                const MappingSearchOptions &options,
-                               std::optional<SearchBinding> binding)
+                               std::optional<SearchBinding> binding,
+                               std::optional<std::string> boundLayout)
     : workload_(workload), target_(target), context_(context),
       layoutContext_(layoutContext), options_(options),
-      binding_(std::move(binding)) {}
+      binding_(std::move(binding)), boundLayout_(std::move(boundLayout)) {}
 
 llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   const MachineModel &machine = target_.machine();
@@ -377,11 +378,22 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // the constraint search hit its cap the match was not proven false, so the
     // result is reported as truncated rather than silently treated as absent.
     bool producedCandidate = false;
+    // A binding is authoritative for the rule parameters it names: each rule
+    // resolves at that search-space point, so its pinned parameters take only
+    // the bound value. With no binding the pointer is null and resolution is
+    // exactly the pre-binding enumeration.
+    const llvm::StringMap<SearchValue> *pinned =
+        binding_ ? &binding_->values : nullptr;
+    // The layout the binding resolves to, resolved from its `layout`-kind
+    // parameter by the caller. A null pointer when no binding, or a binding
+    // with no layout-kind parameter, leaves layout selection unchanged.
+    const std::string *boundLayout = boundLayout_ ? &*boundLayout_ : nullptr;
     for (const RuleDef *rule : matches) {
       std::string reason;
       bool truncated = false;
-      std::optional<MappingCandidate> candidate = toMappingCandidate(
-          *rule, *node, machine, layoutContext_, &reason, &truncated);
+      std::optional<MappingCandidate> candidate =
+          toMappingCandidate(*rule, *node, machine, layoutContext_, &reason,
+                             &truncated, pinned, boundLayout);
       if (!candidate) {
         if (truncated) {
           result.searchTruncated = true;
@@ -1205,6 +1217,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // folded, so two plans differing only by their binding do not collide.
     if (binding_) {
       plan.sourceBindingHash = binding_->stableHash;
+      plan.sourceBindingCandidate = binding_->candidateId;
       plan.globalParameters = binding_->values;
     }
     plan.id = computePlanId(plan);

@@ -437,12 +437,18 @@ add_library(LLKMicroMapping STATIC
     lib/Conversion/MicroMapping/MicroMapPass.cpp
     lib/Conversion/MicroMapping/MicroBindPlanPass.cpp
     lib/Conversion/MicroMapping/MicroVerifyMappingPass.cpp
+    lib/Conversion/MicroMapping/SearchBindingLoader.cpp
 )
 target_include_directories(LLKMicroMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
 )
-target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine)
+# The SearchBinding loader reads a space's parameters through
+# llk::perf::loadSearchSpace rather than re-parsing micro.param, so this library
+# needs LLKPerf. That direction is legal: LLKPerf already depends on LLKMapping,
+# and LLKMapping must never depend on LLKPerf, so the pass library -- above both
+# -- is the only layer that may link them together.
+target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine LLKPerf)
 # LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
 # not inherit those. Match the toolchain, exactly as LLKMapping does.
 target_compile_options(LLKMicroMapping PRIVATE -fno-rtti -fno-exceptions)
@@ -821,6 +827,20 @@ add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
 add_llk_mapping_test(MappingPropertiesTest test/Mapping/properties.cpp)
 
+# SearchBinding loader (phase-4 task 1): micro.candidate -> mapping::SearchBinding.
+# The loader lives in the pass library, not LLKMapping, because it reuses
+# llk::perf::loadSearchSpace to read the parameters -- and LLKPerf depends on
+# LLKMapping, so the loader cannot live in the reverse direction. The test reads
+# the checked-in fixture by path, so the same file the FileCheck round-trip
+# covers is the one the loader is driven against.
+add_llvm_executable(SearchBindingLoaderTest
+    test/Conversion/MicroMapping/search_binding_loader.cpp)
+target_link_libraries(SearchBindingLoaderTest PRIVATE
+    LLKMicroMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(SearchBindingLoaderTest PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME SearchBindingLoaderTest COMMAND SearchBindingLoaderTest)
+
 # FileCheck tests require llk-opt and must use the FileCheck built alongside
 # the LLVM/MLIR packages consumed by this project. Clear the cached result on
 # every configure so changing LLVM_PROJECT_BUILD_DIR cannot retain FileCheck
@@ -855,6 +875,7 @@ if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
   add_llk_filecheck_test(MicroDialectSearchSpace test/Dialect/Micro/search_space.mlir)
+  add_llk_filecheck_test(MicroMappingSearchBinding test/Conversion/MicroMapping/search_binding.mlir)
 
   # MicroMappingMap: the --micro-map pass runs the mapping chain (extract ->
   # search -> bind) and writes the selected plan's metadata onto the kernel.
@@ -918,6 +939,23 @@ if(LLK_BUILD_TOOLS)
           ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingReportOnly
   )
 
+  # MicroMappingCandidate: `candidate=<sym>` drives `--micro-map` (and, for the
+  # replay half, `--micro-bind-plan`) from a persistent `micro.candidate`
+  # (phase-4 task 4). The candidate's values pin rule parameters and its
+  # `layout`-kind parameter -- resolved by kind, not by name -- selects the
+  # bound layout, so the plan the pass binds is traceable to the search-space
+  # point it came from. Because the plan id folds in the binding's hash, the
+  # round trip needs the same `candidate=` on both runs (ruling S8); this test
+  # proves it, and that the id is genuinely absent from a binding-free replay.
+  # A script because the binding's hash is read back out of the report file and
+  # compared against the bound IR, and because the rejection and namespace cases
+  # are separate invocations whose diagnostics are asserted.
+  add_test(NAME MicroMappingCandidate
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_candidate.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingCandidate
+  )
+
   # MicroMappingBindPlanId: `--micro-bind-plan` accepts the id the report prints
   # (bare hex), plus 0x-hex and signed/unsigned decimal, and rejects anything
   # else. End-to-end because the id is obtained by running `--micro-map report=`
@@ -949,6 +987,11 @@ if(LLK_BUILD_TOOLS)
   # kernel, and exact over IR that `--llk-to-micro` produced, so the round-trip
   # is covered on compiler-generated IR too. A script because it compares two
   # IR streams the way FileCheck cannot.
+  #
+  # The ids here are all binding-free, so the replay passes no `candidate=`. A
+  # plan id folds the search point in, so a binding-derived id needs the same
+  # `candidate=` on both runs; MicroMappingCandidate covers that round trip
+  # (ruling S8).
   add_test(NAME MicroMappingBindPlanRoundtrip
       COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_bind_plan_roundtrip.sh
           $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}

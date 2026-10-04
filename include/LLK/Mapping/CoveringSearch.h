@@ -132,7 +132,8 @@ public:
   CoveringSearch(const WorkloadGraph &workload, const MappingTarget &target,
                  mlir::MLIRContext &context, const LayoutContext &layoutContext,
                  const MappingSearchOptions &options = {},
-                 std::optional<SearchBinding> binding = std::nullopt);
+                 std::optional<SearchBinding> binding = std::nullopt,
+                 std::optional<std::string> boundLayout = std::nullopt);
 
   llvm::Expected<MappingSearchResult> search();
 
@@ -142,10 +143,30 @@ private:
   mlir::MLIRContext &context_;
   LayoutContext layoutContext_;
   MappingSearchOptions options_;
-  /// The search-space point this search evaluates, when known. Every emitted
-  /// plan records its hash and parameters (design §8.3/§9.5); a search with no
-  /// binding leaves both default so its plan ids are unchanged.
+  /// The search-space point this search evaluates, when known. Its values
+  /// constrain rule parameter resolution: a rule parameter the binding names
+  /// takes only the bound value, so a binding can select among rules that
+  /// differ only in a parameter choice (a pinned value that no `require`
+  /// accepts makes the rule a non-match). Every emitted plan also records the
+  /// binding's hash and parameters (design §8.3/§9.5); a search with no binding
+  /// leaves all of that at its default, so its plan ids are unchanged.
+  ///
+  /// Placement and routing stay binding-independent *by design* (ruling S3): a
+  /// binding names search choices, not machine resources -- the machine model
+  /// owns placement -- so it never constrains where a node runs or how a
+  /// connection routes. This is a finished boundary, not a half-built bridge.
   std::optional<SearchBinding> binding_;
+  /// The layout the binding selects, resolved from its `layout`-kind parameter
+  /// by the caller -- the pass layer, which alone can see the search space, so
+  /// lib/Mapping keeps no LLKPerf dependency. A rule that declares layout
+  /// requirements must offer it (`require layout ... satisfies <it>`) or it is
+  /// a non-match for the node; when it does, only that layout is materialized,
+  /// so the binding -- not the rule file -- decides which of the rule's
+  /// declared layouts applies. A rule that declares *no* layout requirement
+  /// matches unchanged: it takes on no layout obligation, so it neither offers
+  /// nor contradicts the bound value. Absent leaves layout selection exactly as
+  /// it was before bindings.
+  std::optional<std::string> boundLayout_;
 };
 
 } // namespace mlir::llk::mapping
