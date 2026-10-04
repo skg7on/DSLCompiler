@@ -881,6 +881,17 @@ if(LLK_BUILD_TOOLS)
           ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingReport
   )
 
+  # MicroMappingReportOnly: `report-only=1` runs the search and writes the
+  # report but leaves the module untouched (design §21: "emitting a plan report
+  # without modifying input IR"). A script because the assertions span two
+  # files -- the report and the printed IR -- and one of them is a diff of the
+  # output against the input kernel itself, byte for byte.
+  add_test(NAME MicroMappingReportOnly
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_report_only.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingReportOnly
+  )
+
   # MicroMappingBindPlanId: `--micro-bind-plan` accepts the id the report prints
   # (bare hex), plus 0x-hex and signed/unsigned decimal, and rejects anything
   # else. End-to-end because the id is obtained by running `--micro-map report=`

@@ -243,6 +243,21 @@ inline llvm::Error requireKey(llvm::StringRef passName, llvm::StringRef key,
       (passName + ": missing required key '" + key + "'").str());
 }
 
+/// `report-only` fixes what the pass does with a search result, not how it
+/// searches, so it is only meaningful together with a report path. A
+/// report-only run with nothing to report into would search and then throw the
+/// result away -- a success that produced nothing and could be mistaken for a
+/// successful mapping -- so the pair is required rather than defaulted.
+inline llvm::Error requireReportPathForReportOnly(llvm::StringRef passName,
+                                                  bool reportOnly,
+                                                  llvm::StringRef reportPath) {
+  if (!reportOnly || !reportPath.empty())
+    return llvm::Error::success();
+  return llvm::createStringError(
+      llvm::inconvertibleErrorCode(),
+      (passName + ": report-only requires report=<path>").str());
+}
+
 /// The whole chain up to (but not including) plan selection: load the target,
 /// find the kernel, extract its workload graph, and search it in the mode
 /// `options.mode` names. Both entry points share this so a plan id is

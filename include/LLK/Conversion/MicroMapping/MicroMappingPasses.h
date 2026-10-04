@@ -32,7 +32,8 @@ namespace llk {
 /// Everything `micro-map` needs to load a target and search it. The same fields
 /// are exposed on the command line as `--micro-map="target=<name>
 /// machine=<path> layouts=<path> rules=<path> emitters=<csv>
-/// mode=<deterministic|beam|exact> beam-width=<n> top-k=<n>"`.
+/// mode=<deterministic|beam|exact> beam-width=<n> top-k=<n> report=<path>
+/// report-only=<bool>"`.
 struct MicroMapOptions {
   /// Opaque target label, recorded on the selected plan; never interpreted by
   /// generic code.
@@ -50,6 +51,13 @@ struct MicroMapOptions {
   /// When non-empty, the pass writes the versioned JSON plan report (design
   /// §22.2) to this path. The report is metadata: it never changes the IR.
   std::string reportPath;
+  /// When set, the pass runs the same search and writes the same report but
+  /// does not bind the selected plan, leaving the module exactly as it was read
+  /// (design §21: "emitting a plan report without modifying input IR"). It
+  /// requires `reportPath`: a report-only run with nothing to report into would
+  /// discard its own result. A search that finds no plan still fails the pass,
+  /// report-only or not, so the mode cannot hide a real failure.
+  bool reportOnly = false;
 };
 
 /// `micro-bind-plan` runs the same search and binds the one plan whose id the
