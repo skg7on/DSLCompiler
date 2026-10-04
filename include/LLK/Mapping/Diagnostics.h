@@ -70,6 +70,12 @@ enum class DiagnosticCode {
   /// message names the value. This is not an error: the fallback keeps the
   /// plan searchable, but an assumed size must not be silent.
   AssumedValueSize,
+  /// Generic mapping metadata (`micro.plan`, `micro.mapping`, `micro.routes`)
+  /// is malformed: a container has the wrong attribute kind, or an entry has
+  /// the wrong type. Reported by phase-2 verification with a checked cast, so
+  /// invalid metadata is a diagnostic rather than an unchecked cast that aborts
+  /// the process (design §25.1).
+  InvalidMappingMetadata,
 };
 
 /// The stable string for `code` (for example `no_matching_rule`). Never empty.

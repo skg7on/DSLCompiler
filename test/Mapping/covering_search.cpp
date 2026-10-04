@@ -3152,6 +3152,7 @@ TEST(MappingDiagnostics, EveryCodeRoundTripsThroughItsString) {
       DiagnosticCode::LatencyCacheMiss,
       DiagnosticCode::TargetBundleInvalid,
       DiagnosticCode::AssumedValueSize,
+      DiagnosticCode::InvalidMappingMetadata,
   };
   for (DiagnosticCode code : codes) {
     llvm::StringRef text = stringifyDiagnosticCode(code);

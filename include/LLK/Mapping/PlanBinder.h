@@ -73,11 +73,20 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
 
 /// Layered verification of mapped Micro-IR (design §18.3), in order:
 ///
-///   1. structural -- the module passes the dialect verifier;
-///   2. machine-aware -- every rule, executor, memory, layout, route node, and
-///      link named by the metadata resolves in the target, and each memory is
-///      visible from the executor it is bound to;
-///   3. target -- every selected rule's emitter is one the target declares.
+///   1. structural -- the module passes the dialect verifier, and every generic
+///      metadata container (`micro.plan`, `micro.mapping`, `micro.routes`) has
+///      the shape it claims: a container of the wrong kind, or an entry of the
+///      wrong type, is a stable diagnostic rather than an unchecked cast that
+///      aborts the process (design §25.1);
+///   2. machine-aware -- every kernel is *mapped* (carries `micro.plan` and
+///      annotates each workload operation that needs a rule), and every rule,
+///      executor, memory, layout, route node, transfer engine, and link named
+///      by the metadata resolves in the target, with each memory visible from
+///      the executor it is bound to, the selected rule implementing the
+///      operation it is recorded on, and every role the rule requires bound;
+///   3. target -- the recorded bundle and emitter match the selected rule, the
+///      emitter is one the target declares, and the target's own emitter
+///      accepts the bundle before lowering.
 ///
 /// Returns the first violation, walking operations in order so diagnostics are
 /// deterministic. A violation that a §22.3 code covers is reported as

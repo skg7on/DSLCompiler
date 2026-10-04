@@ -81,6 +81,69 @@ mlir::IntegerAttr u64Attr(mlir::MLIRContext *context, uint64_t value) {
                                 static_cast<int64_t>(value));
 }
 
+/// A `micro.kernel`'s symbol name for diagnostics, or a placeholder when it has
+/// none.
+std::string kernelLabel(mlir::Operation *kernel) {
+  if (auto symbol = kernel->getAttrOfType<mlir::StringAttr>("sym_name"))
+    return ("'" + symbol.getValue() + "'").str();
+  return "<unnamed>";
+}
+
+/// Reads a required string field from a metadata dictionary with a checked
+/// cast. Generic mapping metadata is untrusted (design §25.1): an absent field
+/// and a wrongly-typed one are distinct, stable diagnostics rather than a cast
+/// that aborts the process.
+llvm::Expected<std::string> requiredString(mlir::DictionaryAttr dict,
+                                           llvm::StringRef name,
+                                           llvm::StringRef where) {
+  mlir::Attribute raw = dict.get(name);
+  if (!raw)
+    return bindError((where + ": missing '" + name + "'").str());
+  auto text = mlir::dyn_cast<mlir::StringAttr>(raw);
+  if (!text)
+    return bindError((where + ": '" + name + "' is not a string").str());
+  return text.getValue().str();
+}
+
+/// Reads a `key = "value"` string-map attribute (`memories` or `layouts`),
+/// type-checking the container and every entry.
+llvm::Expected<llvm::StringMap<std::string>>
+readStringMap(mlir::Attribute raw, llvm::StringRef name,
+              llvm::StringRef where) {
+  auto entries = mlir::dyn_cast<mlir::DictionaryAttr>(raw);
+  if (!entries)
+    return bindError((where + ": '" + name + "' is not a dictionary").str());
+  llvm::StringMap<std::string> values;
+  for (const mlir::NamedAttribute &entry : entries) {
+    auto value = mlir::dyn_cast<mlir::StringAttr>(entry.getValue());
+    if (!value)
+      return bindError((where + ": '" + name + "' entry '" +
+                        entry.getName().str() + "' is not a string")
+                           .str());
+    values[entry.getName()] = value.getValue().str();
+  }
+  return values;
+}
+
+/// Reads an array-of-strings attribute, type-checking the container and every
+/// element.
+llvm::Expected<llvm::SmallVector<std::string, 4>>
+readStringArray(mlir::Attribute raw, llvm::StringRef name,
+                llvm::StringRef where) {
+  llvm::SmallVector<std::string, 4> values;
+  auto array = mlir::dyn_cast<mlir::ArrayAttr>(raw);
+  if (!array)
+    return bindError((where + ": '" + name + "' is not an array").str());
+  for (mlir::Attribute element : array) {
+    auto text = mlir::dyn_cast<mlir::StringAttr>(element);
+    if (!text)
+      return bindError(
+          (where + ": '" + name + "' has a non-string entry").str());
+    values.push_back(text.getValue().str());
+  }
+  return values;
+}
+
 mlir::DictionaryAttr
 stringMapAttr(mlir::MLIRContext *context,
               const llvm::StringMap<std::string> &entries) {
@@ -426,120 +489,330 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
 
   const MachineModel &machine = target.machine();
   llvm::Error failure = llvm::Error::success();
+  /// Records the first violation. Callers return immediately afterwards, so a
+  /// later walk (guarded by `if (failure) return;`) never overwrites it.
+  auto fail = [&](DiagnosticCode code, std::string message) {
+    failure = verifyError(code, std::move(message));
+  };
+  /// Reports malformed generic metadata with the §22.3 code that names it
+  /// (design §25.1). The reader already produced the detail.
+  auto failMetadata = [&](llvm::Error error) {
+    fail(DiagnosticCode::InvalidMappingMetadata,
+         llvm::toString(std::move(error)));
+  };
 
-  // 2. machine-aware, and 3. target
+  // --- 2a. kernel completeness -------------------------------------------
+  //
+  // Phase 2 verifies the *mapped* form of a kernel. A kernel without
+  // `micro.plan` was never bound: it carries no selection to resolve, so
+  // accepting it would report success for exactly the input the pass exists to
+  // reject. Every kernel is checked, so a module that maps one of two kernels
+  // fails on the second rather than passing on the first. Inside a mapped
+  // kernel, every workload operation that is not a binder-emitted movement must
+  // carry its own `micro.mapping`, or the kernel is only partly mapped.
+  module->walk([&](mlir::Operation *kernel) {
+    if (failure)
+      return;
+    if (kernel->getName().getStringRef() != "micro.kernel")
+      return;
+    const std::string where = "kernel " + kernelLabel(kernel);
+
+    auto plan = kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr);
+    if (!plan) {
+      fail(DiagnosticCode::NoMatchingRule,
+           where + " is not mapped: it has no micro.plan");
+      return;
+    }
+    // The plan container is generic metadata; validate its shape before read.
+    for (llvm::StringRef name : {"id", "binding_hash"}) {
+      mlir::Attribute raw = plan.get(name);
+      if (!raw) {
+        failMetadata(
+            bindError(where + ": micro.plan is missing '" + name.str() + "'"));
+        return;
+      }
+      if (!mlir::isa<mlir::IntegerAttr>(raw)) {
+        failMetadata(bindError(where + ": micro.plan '" + name.str() +
+                               "' is not an integer"));
+        return;
+      }
+    }
+    if (mlir::Attribute truncated = plan.get("truncated"))
+      if (!mlir::isa<mlir::BoolAttr>(truncated)) {
+        failMetadata(
+            bindError(where + ": micro.plan 'truncated' is not a bool"));
+        return;
+      }
+
+    kernel->walk([&](mlir::Operation *op) {
+      if (failure)
+        return;
+      if (!isWorkloadNodeOp(op->getName()))
+        return;
+      // A binder-emitted movement is a materialized connection, not a workload
+      // operation that needed a rule; it is identified by the connection
+      // bookkeeping the binder stamps on the copy.
+      if (op->hasAttr("micro.value"))
+        return;
+      if (!op->getAttr(kMappingAttr))
+        fail(DiagnosticCode::NoMatchingRule,
+             where + ": op '" + op->getName().getStringRef().str() +
+                 "' carries no micro.mapping");
+    });
+  });
+  if (failure)
+    return failure;
+
+  // --- 2b. per-operation metadata ----------------------------------------
   module->walk([&](mlir::Operation *op) {
     if (failure)
       return;
-    auto mapping = op->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
-    if (!mapping)
+    mlir::Attribute rawMapping = op->getAttr(kMappingAttr);
+    if (!rawMapping)
       return;
-    std::string where =
+    const std::string where =
         "mapped op '" + op->getName().getStringRef().str() + "'";
+    auto mapping = mlir::dyn_cast<mlir::DictionaryAttr>(rawMapping);
+    if (!mapping) {
+      failMetadata(bindError(where + ": micro.mapping is not a dictionary"));
+      return;
+    }
 
-    auto stringValue = [&](llvm::StringRef name) -> std::string {
-      if (auto attribute = mapping.getAs<mlir::StringAttr>(name))
-        return attribute.getValue().str();
-      return {};
-    };
-
-    std::string ruleId = stringValue("rule");
-    const RuleDef *rule = target.rules().find(ruleId);
+    llvm::Expected<std::string> ruleId = requiredString(mapping, "rule", where);
+    if (!ruleId) {
+      failMetadata(ruleId.takeError());
+      return;
+    }
+    const RuleDef *rule = target.rules().find(*ruleId);
     if (!rule) {
-      failure = verifyError(DiagnosticCode::NoMatchingRule,
-                            where + ": unknown rule '" + ruleId + "'");
+      fail(DiagnosticCode::NoMatchingRule,
+           where + ": unknown rule '" + *ruleId + "'");
+      return;
+    }
+    // The recorded rule must implement *this* operation, not merely exist: a
+    // vector op labelled with an MMA rule is not a mapping.
+    if (rule->matchOp != op->getName().getStringRef()) {
+      fail(DiagnosticCode::NoMatchingRule,
+           where + ": rule '" + *ruleId + "' implements '" + rule->matchOp +
+               "', not '" + op->getName().getStringRef().str() + "'");
       return;
     }
 
-    std::string executor = stringValue("executor");
-    if (!machine.findExecutor(executor)) {
-      failure = verifyError(DiagnosticCode::NoLegalExecutor,
-                            where + ": unknown executor '" + executor + "'");
+    llvm::Expected<std::string> executor =
+        requiredString(mapping, "executor", where);
+    if (!executor) {
+      failMetadata(executor.takeError());
+      return;
+    }
+    if (!machine.findExecutor(*executor)) {
+      fail(DiagnosticCode::NoLegalExecutor,
+           where + ": unknown executor '" + *executor + "'");
       return;
     }
 
-    if (auto memories = mapping.getAs<mlir::DictionaryAttr>("memories")) {
-      for (const mlir::NamedAttribute &entry : memories) {
-        std::string memoryId =
-            mlir::cast<mlir::StringAttr>(entry.getValue()).getValue().str();
-        const machine::MemoryNode *memory = machine.findMemory(memoryId);
-        if (!memory) {
-          failure = verifyError(DiagnosticCode::NoMemoryRoute,
-                                where + ": unknown memory '" + memoryId + "'");
+    // Memory role bindings: every bound id must resolve and be visible, and a
+    // rule that requires a memory kind must have bound one.
+    llvm::StringMap<std::string> memories;
+    if (mlir::Attribute rawMemories = mapping.get("memories")) {
+      llvm::Expected<llvm::StringMap<std::string>> read =
+          readStringMap(rawMemories, "memories", where);
+      if (!read) {
+        failMetadata(read.takeError());
+        return;
+      }
+      memories = std::move(*read);
+      for (const auto &entry : memories) {
+        if (!machine.findMemory(entry.second)) {
+          fail(DiagnosticCode::NoMemoryRoute,
+               where + ": unknown memory '" + entry.second + "'");
           return;
         }
-        if (!machine.isVisible(memoryId, executor)) {
-          failure = verifyError(DiagnosticCode::NoMemoryRoute,
-                                where + ": executor '" + executor +
-                                    "' cannot see memory '" + memoryId + "'");
+        if (!machine.isVisible(entry.second, *executor)) {
+          fail(DiagnosticCode::NoMemoryRoute,
+               where + ": executor '" + *executor + "' cannot see memory '" +
+                   entry.second + "'");
           return;
         }
       }
     }
+    for (const KindRequirement &requirement : rule->kindRequirements) {
+      if (requirement.role != "memory")
+        continue;
+      if (!memories.count(requirement.kind)) {
+        fail(DiagnosticCode::NoLegalExecutor,
+             where + ": rule '" + *ruleId + "' requires a '" +
+                 requirement.kind +
+                 "' memory, which the mapping does not bind");
+        return;
+      }
+    }
 
-    if (auto layouts = mapping.getAs<mlir::DictionaryAttr>("layouts")) {
-      for (const mlir::NamedAttribute &entry : layouts) {
-        std::string layoutId =
-            mlir::cast<mlir::StringAttr>(entry.getValue()).getValue().str();
-        if (!target.layouts().find(layoutId)) {
-          failure = verifyError(DiagnosticCode::NoLegalLayout,
-                                where + ": unknown layout '" + layoutId + "'");
+    // Layout role bindings: every bound id must resolve, and a rule that
+    // requires a layout on a port must have bound it.
+    llvm::StringMap<std::string> layouts;
+    if (mlir::Attribute rawLayouts = mapping.get("layouts")) {
+      llvm::Expected<llvm::StringMap<std::string>> read =
+          readStringMap(rawLayouts, "layouts", where);
+      if (!read) {
+        failMetadata(read.takeError());
+        return;
+      }
+      layouts = std::move(*read);
+      for (const auto &entry : layouts) {
+        if (!target.layouts().find(entry.second)) {
+          fail(DiagnosticCode::NoLegalLayout,
+               where + ": unknown layout '" + entry.second + "'");
           return;
         }
       }
     }
+    for (const RuleLayoutRequirement &requirement : rule->layoutRequirements) {
+      if (!layouts.count(requirement.layoutId)) {
+        fail(DiagnosticCode::NoLegalLayout,
+             where + ": rule '" + *ruleId + "' requires layout '" +
+                 requirement.layoutId + "' on port '" + requirement.port +
+                 "', which the mapping does not bind");
+        return;
+      }
+    }
 
-    // 3. target: the emitter the rule selected must be one the target declares.
-    std::string emitter = stringValue("emitter");
-    if (!target.isKnownEmitter(emitter)) {
-      failure = verifyError(DiagnosticCode::TargetBundleInvalid,
-                            where + ": unknown emitter '" + emitter + "'");
+    // 3. target: the recorded bundle and emitter must be the selected rule's,
+    // the emitter must be one the target declares, and the target's own
+    // emitter must accept the bundle before lowering (design §18.3, phase 3).
+    llvm::Expected<std::string> bundleName =
+        requiredString(mapping, "bundle", where);
+    if (!bundleName) {
+      failMetadata(bundleName.takeError());
       return;
+    }
+    if (*bundleName != rule->bundle) {
+      fail(DiagnosticCode::TargetBundleInvalid,
+           where + ": rule '" + *ruleId + "' selects bundle '" + rule->bundle +
+               "', but the mapping records '" + *bundleName + "'");
+      return;
+    }
+    llvm::Expected<std::string> emitterKey =
+        requiredString(mapping, "emitter", where);
+    if (!emitterKey) {
+      failMetadata(emitterKey.takeError());
+      return;
+    }
+    // Existence first, then rule compatibility: a key the target does not
+    // declare is "unknown" even when it also mismatches the rule, so the
+    // diagnostic names the more fundamental problem.
+    if (!target.isKnownEmitter(*emitterKey)) {
+      fail(DiagnosticCode::TargetBundleInvalid,
+           where + ": unknown emitter '" + *emitterKey + "'");
+      return;
+    }
+    if (*emitterKey != rule->emitter) {
+      fail(DiagnosticCode::TargetBundleInvalid,
+           where + ": rule '" + *ruleId + "' selects emitter '" +
+               rule->emitter + "', but the mapping records '" + *emitterKey +
+               "'");
+      return;
+    }
+    if (std::unique_ptr<TargetEmitter> emitter =
+            target.createEmitter(*emitterKey)) {
+      TargetBundle bundle;
+      bundle.name = *bundleName;
+      bundle.emitterKey = *emitterKey;
+      // Bundle parameters are not persisted by the binder yet (design §18.1
+      // open item); the plugin's shape check therefore sees the name and key
+      // only.
+      if (llvm::Error error = emitter->verify(bundle)) {
+        fail(DiagnosticCode::TargetBundleInvalid,
+             where + ": " + llvm::toString(std::move(error)));
+        return;
+      }
     }
   });
   if (failure)
     return failure;
 
-  // Routes: every node resolves, and consecutive nodes are joined by a link.
-  llvm::Error routeFailure = llvm::Error::success();
+  // --- 2c. routes --------------------------------------------------------
+  // Every route entry is a dictionary, every node resolves, consecutive nodes
+  // are joined by a link, and every named engine is one the machine declares.
   module->walk([&](mlir::Operation *op) {
-    if (routeFailure)
+    if (failure)
       return;
-    auto routes = op->getAttrOfType<mlir::ArrayAttr>(kRoutesAttr);
-    if (!routes)
+    mlir::Attribute rawRoutes = op->getAttr(kRoutesAttr);
+    if (!rawRoutes)
       return;
-    for (mlir::Attribute entry : routes) {
-      auto route = mlir::cast<mlir::DictionaryAttr>(entry);
-      auto nodes = route.getAs<mlir::ArrayAttr>("route");
-      if (!nodes)
-        continue;
-      for (mlir::Attribute node : nodes) {
-        std::string id = mlir::cast<mlir::StringAttr>(node).getValue().str();
+    const std::string where =
+        "micro.routes on '" + op->getName().getStringRef().str() + "'";
+    auto routes = mlir::dyn_cast<mlir::ArrayAttr>(rawRoutes);
+    if (!routes) {
+      failMetadata(bindError(where + " is not an array"));
+      return;
+    }
+    for (mlir::Attribute element : routes) {
+      if (failure)
+        return;
+      auto route = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+      if (!route) {
+        failMetadata(bindError(where + ": a route entry is not a dictionary"));
+        return;
+      }
+      llvm::Expected<std::string> kind = requiredString(route, "kind", where);
+      if (!kind) {
+        failMetadata(kind.takeError());
+        return;
+      }
+      if (!symbolizeConnectionKind(*kind)) {
+        failMetadata(
+            bindError(where + ": unknown connection kind '" + *kind + "'"));
+        return;
+      }
+      mlir::Attribute rawRoute = route.get("route");
+      if (!rawRoute) {
+        failMetadata(bindError(where + ": missing 'route'"));
+        return;
+      }
+      llvm::Expected<llvm::SmallVector<std::string, 4>> nodes =
+          readStringArray(rawRoute, "route", where);
+      if (!nodes) {
+        failMetadata(nodes.takeError());
+        return;
+      }
+      for (const std::string &id : *nodes) {
         if (!machine.findMemory(id)) {
-          routeFailure = verifyError(DiagnosticCode::NoMemoryRoute,
-                                     "route names unknown memory '" + id + "'");
+          fail(DiagnosticCode::NoMemoryRoute,
+               "route names unknown memory '" + id + "'");
           return;
         }
       }
-      for (size_t index = 1; index < nodes.size(); ++index) {
-        std::string from =
-            mlir::cast<mlir::StringAttr>(nodes[index - 1]).getValue().str();
-        std::string to =
-            mlir::cast<mlir::StringAttr>(nodes[index]).getValue().str();
+      for (size_t index = 1; index < nodes->size(); ++index) {
+        const std::string &from = (*nodes)[index - 1];
+        const std::string &to = (*nodes)[index];
         bool linked =
             llvm::any_of(machine.links, [&](const machine::LinkEdge &l) {
               return l.source == from && l.destination == to;
             });
         if (!linked) {
-          routeFailure = verifyError(DiagnosticCode::NoMemoryRoute,
-                                     "route hop '" + from + "' -> '" + to +
-                                         "' has no link");
+          fail(DiagnosticCode::NoMemoryRoute,
+               "route hop '" + from + "' -> '" + to + "' has no link");
           return;
+        }
+      }
+      if (mlir::Attribute rawEngines = route.get("engines")) {
+        llvm::Expected<llvm::SmallVector<std::string, 4>> engines =
+            readStringArray(rawEngines, "engines", where);
+        if (!engines) {
+          failMetadata(engines.takeError());
+          return;
+        }
+        for (const std::string &engine : *engines) {
+          if (!machine.findTransferEngine(engine)) {
+            fail(DiagnosticCode::NoMemoryRoute,
+                 "route names unknown transfer engine '" + engine + "'");
+            return;
+          }
         }
       }
     }
   });
-  return routeFailure;
+  return failure;
 }
 
 } // namespace mlir::llk::mapping
