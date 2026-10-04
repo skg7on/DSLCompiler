@@ -23,11 +23,13 @@
 #include "LLK/Mapping/LayoutConstraints.h"
 #include "LLK/Mapping/LlkMap.h"
 #include "LLK/Mapping/MappingPlan.h"
+#include "LLK/Mapping/SearchBinding.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
@@ -202,11 +204,25 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
 /// bounded parameter enumeration hit its assignment cap -- a possibly
 /// satisfiable rule that was not fully explored -- so a caller can report the
 /// search as truncated rather than concluding no match.
+///
+/// `pinned` is the search-space point this match is evaluated at, when the
+/// caller has one (see `CoveringSearch`'s binding): a declared parameter named
+/// in it may take *only* the bound value, so the enumeration for that parameter
+/// is a singleton. A bound value the parameter's declared domain does not
+/// contain, or one that makes a `require` unsatisfiable, yields `std::nullopt`
+/// -- the same non-match, never an error, so another rule for the node may
+/// still apply. Names the rule does not declare are ignored; a parameter
+/// `pinned` does not name is enumerated over its whole domain exactly as
+/// before. A null `pinned` is byte-identical to the pre-binding behaviour.
+/// The map is the binding's `values` directly -- no filtered projection -- so
+/// the rule stays the single authority on which of its own parameters a name
+/// refers to.
 std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason = nullptr,
-                   bool *truncated = nullptr);
+                   bool *truncated = nullptr,
+                   const llvm::StringMap<SearchValue> *pinned = nullptr);
 
 } // namespace mlir::llk::mapping
 

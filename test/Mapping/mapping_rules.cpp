@@ -1034,6 +1034,16 @@ rule r.lanes {
 }
 )llkmap";
 
+/// A search-space binding for `toMappingCandidate`'s trailing `pinned`
+/// argument: the map `CoveringSearch` copies off `SearchBinding::values`.
+llvm::StringMap<SearchValue> pinnedMap(
+    std::initializer_list<std::pair<llvm::StringRef, SearchValue>> entries) {
+  llvm::StringMap<SearchValue> map;
+  for (const auto &entry : entries)
+    map[entry.first] = entry.second;
+  return map;
+}
+
 } // namespace
 
 TEST(RuleMatch, EvaluatesRequireConstraintsAgainstTheMachine) {
@@ -1265,6 +1275,183 @@ rule r.two {
   ASSERT_EQ(candidate->resolvedParameters.count("VW"), 1u);
   EXPECT_EQ(std::get<int64_t>(candidate->resolvedParameters.lookup("VW")), 8);
   EXPECT_EQ(candidate->resolvedParameters.count("T"), 0u);
+}
+
+//===----------------------------------------------------------------------===//
+// A binding constrains rule parameter resolution (phase-4 T2)
+//===----------------------------------------------------------------------===//
+
+TEST(RuleMatch, ABindingPinsAParameterItNames) {
+  mlir::MLIRContext context;
+  // Every value in [4..8] satisfies `VW >= 4`, so the enumeration order -- not
+  // the constraint -- decides which assignment is derived today: the first
+  // declared value, 4.
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.pin {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  require VW >= 4;
+  input "operand0";
+  output "result";
+  bundle "b.pin";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.pin");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  WorkloadNode node = typedVectorNode(f32, f32);
+
+  std::optional<MappingCandidate> free =
+      toMappingCandidate(*rule, node, MachineModel{}, LayoutContext{});
+  ASSERT_TRUE(free.has_value());
+  EXPECT_EQ(std::get<int64_t>(free->resolvedParameters.lookup("VW")), 4);
+
+  // Pinned to 8, the rule resolves to 8 even though 4 also satisfies the
+  // constraint: the binding chooses the value, not the enumeration order.
+  llvm::StringMap<SearchValue> pinned = pinnedMap({{"VW", int64_t{8}}});
+  std::string reason;
+  std::optional<MappingCandidate> bound = toMappingCandidate(
+      *rule, node, MachineModel{}, LayoutContext{}, &reason, nullptr, &pinned);
+  ASSERT_TRUE(bound.has_value()) << reason;
+  ASSERT_EQ(bound->resolvedParameters.count("VW"), 1u);
+  EXPECT_EQ(std::get<int64_t>(bound->resolvedParameters.lookup("VW")), 8);
+}
+
+TEST(RuleMatch, ABindingWhosePinnedValueFailsTheRequireYieldsNoCandidate) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.pin {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  require VW == 8;
+  input "operand0";
+  output "result";
+  bundle "b.pin";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.pin");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  WorkloadNode node = typedVectorNode(f32, f32);
+
+  // Unpinned, the enumeration finds the one satisfying value, 8.
+  EXPECT_TRUE(toMappingCandidate(*rule, node, MachineModel{}, LayoutContext{})
+                  .has_value());
+
+  // Pinned to 4 -- a value inside the declared domain -- the only permitted
+  // assignment fails `VW == 8`: a non-match, never an error.
+  llvm::StringMap<SearchValue> pinned = pinnedMap({{"VW", int64_t{4}}});
+  std::string reason;
+  EXPECT_FALSE(toMappingCandidate(*rule, node, MachineModel{}, LayoutContext{},
+                                  &reason, nullptr, &pinned)
+                   .has_value());
+  EXPECT_FALSE(reason.empty());
+}
+
+TEST(RuleMatch, ABindingOutsideTheDeclaredDomainIsANonMatch) {
+  mlir::MLIRContext context;
+  // `VW >= 4` would hold for 16, so a pinned value outside [4..8] must not slip
+  // through on the strength of its constraint: the declared domain stays the
+  // admissible set, and a value it does not contain leaves nothing to try.
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.pin {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  require VW >= 4;
+  input "operand0";
+  output "result";
+  bundle "b.pin";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.pin");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  WorkloadNode node = typedVectorNode(f32, f32);
+
+  llvm::StringMap<SearchValue> pinned = pinnedMap({{"VW", int64_t{16}}});
+  std::string reason;
+  EXPECT_FALSE(toMappingCandidate(*rule, node, MachineModel{}, LayoutContext{},
+                                  &reason, nullptr, &pinned)
+                   .has_value());
+  EXPECT_FALSE(reason.empty());
+}
+
+TEST(RuleMatch, ABindingLeavesUnpinnedParametersEnumerated) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.two {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  param T in [1..3];
+  require VW == 8;
+  require T == 3;
+  input "operand0";
+  output "result";
+  bundle "b.two";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.two");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  WorkloadNode node = typedVectorNode(f32, f32);
+
+  // Pinning VW leaves T unpinned, so T is still enumerated over [1..3] -- past
+  // its first value -- and both derived values are recorded.
+  llvm::StringMap<SearchValue> pinned = pinnedMap({{"VW", int64_t{8}}});
+  std::string reason;
+  std::optional<MappingCandidate> candidate = toMappingCandidate(
+      *rule, node, MachineModel{}, LayoutContext{}, &reason, nullptr, &pinned);
+  ASSERT_TRUE(candidate.has_value()) << reason;
+  ASSERT_EQ(candidate->resolvedParameters.count("VW"), 1u);
+  ASSERT_EQ(candidate->resolvedParameters.count("T"), 1u);
+  EXPECT_EQ(std::get<int64_t>(candidate->resolvedParameters.lookup("VW")), 8);
+  EXPECT_EQ(std::get<int64_t>(candidate->resolvedParameters.lookup("T")), 3);
+}
+
+TEST(RuleMatch, ABindingNameTheRuleDoesNotDeclareIsIgnored) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.one {
+  match micro.vector(input[0].element_type = f32);
+  param VW in [4..8];
+  require VW >= 4;
+  input "operand0";
+  output "result";
+  bundle "b.one";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("r.one");
+  ASSERT_NE(rule, nullptr);
+
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  WorkloadNode node = typedVectorNode(f32, f32);
+
+  // The binding names a parameter this rule never declares, so it constrains
+  // nothing here and VW still enumerates to its first value, 4.
+  llvm::StringMap<SearchValue> pinned = pinnedMap({{"BM", int64_t{64}}});
+  std::optional<MappingCandidate> candidate = toMappingCandidate(
+      *rule, node, MachineModel{}, LayoutContext{}, nullptr, nullptr, &pinned);
+  ASSERT_TRUE(candidate.has_value());
+  EXPECT_EQ(std::get<int64_t>(candidate->resolvedParameters.lookup("VW")), 4);
 }
 
 TEST(RuleMatch, ATruncatedConstraintSearchIsReportedNotSilentlyRejected) {

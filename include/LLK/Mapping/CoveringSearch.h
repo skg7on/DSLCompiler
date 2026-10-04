@@ -142,9 +142,13 @@ private:
   mlir::MLIRContext &context_;
   LayoutContext layoutContext_;
   MappingSearchOptions options_;
-  /// The search-space point this search evaluates, when known. Every emitted
-  /// plan records its hash and parameters (design §8.3/§9.5); a search with no
-  /// binding leaves both default so its plan ids are unchanged.
+  /// The search-space point this search evaluates, when known. Its values
+  /// constrain rule parameter resolution: a rule parameter the binding names
+  /// takes only the bound value, so a binding can select among rules that
+  /// differ only in a parameter choice (a pinned value that no `require`
+  /// accepts makes the rule a non-match). Every emitted plan also records the
+  /// binding's hash and parameters (design §8.3/§9.5); a search with no binding
+  /// leaves all of that at its default, so its plan ids are unchanged.
   std::optional<SearchBinding> binding_;
 };
 

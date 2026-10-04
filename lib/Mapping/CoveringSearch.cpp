@@ -377,11 +377,17 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // the constraint search hit its cap the match was not proven false, so the
     // result is reported as truncated rather than silently treated as absent.
     bool producedCandidate = false;
+    // A binding is authoritative for the rule parameters it names: each rule
+    // resolves at that search-space point, so its pinned parameters take only
+    // the bound value. With no binding the pointer is null and resolution is
+    // exactly the pre-binding enumeration.
+    const llvm::StringMap<SearchValue> *pinned =
+        binding_ ? &binding_->values : nullptr;
     for (const RuleDef *rule : matches) {
       std::string reason;
       bool truncated = false;
       std::optional<MappingCandidate> candidate = toMappingCandidate(
-          *rule, *node, machine, layoutContext_, &reason, &truncated);
+          *rule, *node, machine, layoutContext_, &reason, &truncated, pinned);
       if (!candidate) {
         if (truncated) {
           result.searchTruncated = true;

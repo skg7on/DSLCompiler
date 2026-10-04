@@ -351,6 +351,43 @@ rule r.pe_only {
 }
 )llkmap";
 
+/// Two rules over the same node, each satisfied only by one value of the shared
+/// parameter `VW`: a binding selects between them. Unpinned, both match (and
+/// the cheaper `r.wide` wins); pinned to 4 only `r.narrow` matches.
+constexpr llvm::StringLiteral kParameterRules = R"llkmap(
+rule r.wide {
+  match micro.vector(op = "add");
+  param VW in [4..8];
+  require VW == 8;
+  require executor kind worker;
+  bundle "b.wide";
+  emit "e1";
+  cost 1;
+}
+rule r.narrow {
+  match micro.vector(op = "add");
+  param VW in [4..8];
+  require VW == 4;
+  require executor kind worker;
+  bundle "b.narrow";
+  emit "e1";
+  cost 2;
+}
+)llkmap";
+
+/// One rule over a node, satisfied only by VW = 8, so a binding that pins any
+/// other value leaves the node with no rule in effect.
+constexpr llvm::StringLiteral kSingleParameterRule = R"llkmap(
+rule r.wide {
+  match micro.vector(op = "add");
+  param VW in [4..8];
+  require VW == 8;
+  require executor kind worker;
+  bundle "b.wide";
+  emit "e1";
+}
+)llkmap";
+
 /// One producer feeding two consumers across the value `mid`. `producerOp` and
 /// `consumerOp` are the node attributes the rules predicate on, so a fixture
 /// can gate producer and consumer rules apart.
@@ -2569,6 +2606,104 @@ TEST(CoveringSearch, NoBindingLeavesTheHashZeroAndThePlanIdUnchanged) {
   EXPECT_EQ(result->plans[0].sourceBindingHash, 0u);
   EXPECT_TRUE(result->plans[0].globalParameters.empty());
   EXPECT_EQ(result->plans[0].id, kNoBindingPlanId);
+}
+
+//===----------------------------------------------------------------------===//
+// A binding constrains rule parameter resolution (phase-4 T2)
+//===----------------------------------------------------------------------===//
+
+TEST(CoveringSearch, ABindingDecidesWhichRuleResolvesForANode) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kParameterRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  // With no binding both rules match -- the enumeration resolves VW = 8 for
+  // `r.wide` and VW = 4 for `r.narrow` -- and deterministic mode keeps the
+  // first in canonical (rule-id) order, `r.narrow`.
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.narrow");
+  }
+
+  // Pinned to 8, `r.narrow` (which needs VW = 4) is a non-match for every node,
+  // so `r.wide` is the only rule left: the binding, not canonical order,
+  // decides. This is the case that is red before the binding constrains
+  // resolution -- the search would pick `r.narrow` regardless.
+  {
+    SearchBinding wide =
+        makeSearchBinding("candidate_8", values({{"VW", int64_t{8}}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          wide);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    ASSERT_EQ(result->plans[0].placements.size(), 2u);
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.wide");
+    // The rule the binding pinned out of range is reported, not silently
+    // dropped.
+    EXPECT_GE(result->frontier.codeCounts[DiagnosticCode::NoMatchingRule], 1u);
+  }
+
+  // Pinned to 4, symmetric: `r.wide` is a non-match and `r.narrow` remains.
+  {
+    SearchBinding narrow =
+        makeSearchBinding("candidate_4", values({{"VW", int64_t{4}}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          narrow);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty());
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.narrow");
+    EXPECT_GE(result->frontier.codeCounts[DiagnosticCode::NoMatchingRule], 1u);
+  }
+}
+
+TEST(CoveringSearch, ABindingThatFailsEveryRuleLeavesTheNodeWithoutARule) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kSingleParameterRule);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  // Pinned to the value the rule rejects, no rule applies to either node: the
+  // nodes fall into the failure frontier, and the search is not truncated.
+  SearchBinding binding =
+      makeSearchBinding("candidate_4", values({{"VW", int64_t{4}}}));
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                        binding);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_FALSE(result->searchTruncated);
+  EXPECT_EQ(result->frontier.nodesWithoutRules, 2u);
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
+
+  // The same fixture with the satisfying value pinned does produce plans.
+  SearchBinding matching =
+      makeSearchBinding("candidate_8", values({{"VW", int64_t{8}}}));
+  CoveringSearch matchingSearch(graph, *target, context, LayoutContext{},
+                                options, matching);
+  llvm::Expected<MappingSearchResult> matchingResult = matchingSearch.search();
+  ASSERT_TRUE(static_cast<bool>(matchingResult))
+      << llvm::toString(matchingResult.takeError());
+  EXPECT_FALSE(matchingResult->plans.empty());
 }
 
 //===----------------------------------------------------------------------===//
