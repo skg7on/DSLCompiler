@@ -356,6 +356,12 @@ connectionWithEndpoints(std::optional<PortRef> producerPort,
   return connection;
 }
 
+CoveringPlan planWithConnection(const PlanConnection &connection) {
+  CoveringPlan plan;
+  plan.connectionPlans.push_back(connection);
+  return plan;
+}
+
 } // namespace
 
 TEST(MappingPlan, ResolvedEndpointIsPartOfTheCandidateId) {
@@ -390,4 +396,57 @@ TEST(MappingPlan, ResolvedEndpointsArePartOfTheConnectionId) {
   EXPECT_NE(canonicalConnectionString(first),
             canonicalConnectionString(second));
   EXPECT_NE(computeConnectionId(first), computeConnectionId(second));
+}
+
+// The plan-level projection must expose the endpoint occurrences too. Two
+// connections of one value whose `consumers` instance projection is identical
+// (the repeated-operand case) are otherwise indistinguishable in a selected
+// plan, so a materializer would rewiring both to the same read.
+TEST(MappingPlan, PlanConnectionExposesEndpointOccurrences) {
+  ConnectionPlan firstConnection =
+      connectionWithEndpoints(PortRef{1, PortDirection::Output, 0},
+                              {PortRef{2, PortDirection::Input, 0}});
+  firstConnection.id = computeConnectionId(firstConnection);
+  ConnectionPlan secondConnection = firstConnection;
+  secondConnection.consumerPorts = {PortRef{2, PortDirection::Input, 1}};
+  secondConnection.id = computeConnectionId(secondConnection);
+
+  PlanConnection first;
+  first.id = firstConnection.id;
+  first.value = firstConnection.value;
+  first.kind = firstConnection.kind;
+  first.producerPort = firstConnection.producerPort;
+  first.consumerPorts = firstConnection.consumerPorts;
+  first.consumers = {9};
+  PlanConnection second = first; // identical instance projection
+  second.id = secondConnection.id;
+  second.consumerPorts = secondConnection.consumerPorts;
+
+  // The compatibility projection cannot tell the two uses apart ...
+  EXPECT_EQ(first.consumers, second.consumers);
+  // ... but the endpoint occurrences can, and they reach plan identity.
+  EXPECT_EQ(first.producerPort, second.producerPort);
+  ASSERT_EQ(first.consumerPorts.size(), 1u);
+  ASSERT_EQ(second.consumerPorts.size(), 1u);
+  EXPECT_NE(first.consumerPorts[0], second.consumerPorts[0]);
+  EXPECT_NE(computePlanId(planWithConnection(first)),
+            computePlanId(planWithConnection(second)));
+}
+
+// The control: a `PlanConnection` built without endpoint resolution stays
+// byte-identical, so no endpoint marker is introduced into its plan's canonical
+// string and its id is unchanged.
+TEST(MappingPlan, PlanConnectionWithoutEndpointsKeepsTheLegacyPlanId) {
+  PlanConnection connection;
+  connection.id = 7;
+  connection.value = 3;
+  connection.kind = ConnectionKind::Direct;
+  connection.consumers = {9};
+  EXPECT_FALSE(connection.producerPort.has_value());
+  EXPECT_TRUE(connection.consumerPorts.empty());
+
+  const std::string canonical =
+      canonicalPlanString(planWithConnection(connection));
+  EXPECT_EQ(canonical.find("producerPort"), std::string::npos);
+  EXPECT_EQ(canonical.find("consumerPort"), std::string::npos);
 }

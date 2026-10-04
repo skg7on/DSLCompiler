@@ -2080,8 +2080,18 @@ TEST(CoveringSearch, DistinctOperandUsesOfOneValueKeepTheirOwnLayouts) {
   EXPECT_TRUE(direct->transform == std::nullopt);
   // Both movements serve the same consumer instance; the compatibility
   // projection cannot tell the two uses apart, which is why the endpoint
-  // occurrence is the rewiring authority.
+  // occurrence is the rewiring authority. The exposed plan connections carry
+  // it: `direct` serves `operand0`, the transform serves `operand1`.
   EXPECT_EQ(direct->consumers, toBlocked->consumers);
+  ASSERT_TRUE(direct->producerPort.has_value());
+  EXPECT_EQ(direct->producerPort->direction, PortDirection::Output);
+  ASSERT_EQ(direct->consumerPorts.size(), 1u);
+  EXPECT_EQ(direct->consumerPorts[0].direction, PortDirection::Input);
+  EXPECT_EQ(direct->consumerPorts[0].index, 0u);
+  ASSERT_TRUE(toBlocked->producerPort.has_value());
+  ASSERT_EQ(toBlocked->consumerPorts.size(), 1u);
+  EXPECT_EQ(toBlocked->consumerPorts[0].direction, PortDirection::Input);
+  EXPECT_EQ(toBlocked->consumerPorts[0].index, 1u);
 }
 
 // The same-family, equal-parameterization control: both operand uses require
@@ -2105,6 +2115,11 @@ TEST(CoveringSearch, EqualLayoutsOnRepeatedOperandUsesShareOneConnection) {
   ASSERT_EQ(plan.connectionPlans.size(), 1u);
   EXPECT_EQ(plan.connectionPlans.front().kind, ConnectionKind::Direct);
   EXPECT_FALSE(plan.connectionPlans.front().transform.has_value());
+  // One shared read serves both operand uses, and its endpoint list names them
+  // both even though the instance projection repeats.
+  ASSERT_EQ(plan.connectionPlans.front().consumerPorts.size(), 2u);
+  EXPECT_EQ(plan.connectionPlans.front().consumerPorts[0].index, 0u);
+  EXPECT_EQ(plan.connectionPlans.front().consumerPorts[1].index, 1u);
 }
 
 // Two *different* values feeding the two operands, both requiring one family

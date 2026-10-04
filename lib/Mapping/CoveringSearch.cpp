@@ -1508,6 +1508,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       detail.consumers.assign(connection.consumers.begin(),
                               connection.consumers.end());
       llvm::sort(detail.consumers);
+      // Endpoint occurrences, copied from the connection that owns them and
+      // rendered sorted here if they ever join a canonical string. The
+      // `consumers` instance projection cannot tell two operand uses of one
+      // value apart, so this is what names the use a rewire must target.
+      detail.producerPort = connection.producerPort;
+      detail.consumerPorts.assign(connection.consumerPorts.begin(),
+                                  connection.consumerPorts.end());
+      llvm::sort(detail.consumerPorts,
+                 [](const PortRef &lhs, const PortRef &rhs) {
+                   if (lhs.node != rhs.node)
+                     return lhs.node < rhs.node;
+                   if (lhs.direction != rhs.direction)
+                     return lhs.direction < rhs.direction;
+                   return lhs.index < rhs.index;
+                 });
       plan.connectionPlans.push_back(std::move(detail));
     }
     llvm::sort(plan.connectionPlans,

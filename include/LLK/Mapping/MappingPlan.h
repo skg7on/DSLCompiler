@@ -301,6 +301,20 @@ struct PlanConnection {
   /// as two connections carry one value along different routes. Empty for a
   /// plan built without consumer associations.
   llvm::SmallVector<InstanceId> consumers;
+  /// The producer-side result occurrence this connection reads and the
+  /// consumer-side operand occurrences it serves, copied from the
+  /// `ConnectionPlan`. The `consumers` instance list above is a compatibility
+  /// projection that cannot tell two operand uses of one value apart -- both
+  /// connections of a repeated-operand edge list the same instance -- so the
+  /// endpoint occurrences are what a materializer must rewire by. Unset for a
+  /// plan built without endpoint resolution.
+  ///
+  /// Derived projection: the connection's `id` already folds these occurrences
+  /// (see `canonicalConnectionString`), so they are deliberately not rendered
+  /// again into `canonicalPlanString` -- that would only change every plan id
+  /// without adding identity.
+  std::optional<PortRef> producerPort;
+  llvm::SmallVector<PortRef> consumerPorts;
 };
 
 /// A complete executable proposal covering every required node.
