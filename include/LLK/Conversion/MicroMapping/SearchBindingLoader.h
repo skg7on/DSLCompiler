@@ -15,6 +15,25 @@
 // rule two homes. This layer only decides whether the point is inside the
 // space the IR declares.
 //
+// Authority for the domain check is split, and deliberately so. On the
+// file-to-load path the authority is the *dialect verifier*: `SearchSpaceOp::
+// verify` rejects a candidate that leaves a parameter unbound, binds an
+// undeclared name, mismatches integer and string, or names a value outside the
+// declared choices, so such a candidate never parses. The checks below are
+// therefore defence-in-depth, reachable only from programmatic or post-parse
+// IR that no verifier has blessed -- which is exactly why this is a public
+// API over an arbitrary `ModuleOp` rather than a private helper of a pass that
+// always runs on verified input. The rejections are kept (not removed) because
+// the loader is the last line before the tuner, and the two error texts are
+// kept in step on purpose: both say a value "is not one of the declared
+// choices", so the message contract cannot drift between the verifier and the
+// loader.
+//
+// One rejection *is* reachable from valid parsed IR and is the loader's own:
+// `micro.candidate` symbols are unique only within their `micro.search_space`,
+// so two spaces may both declare `@candidate_17`; the loader is what refuses
+// the resulting ambiguity.
+//
 // The loader lives in the MicroMapping pass library rather than in LLKMapping
 // because it reads the space through `llk::perf::loadSearchSpace`, and LLKPerf
 // depends on LLKMapping -- the reverse dependency is forbidden.

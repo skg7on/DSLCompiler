@@ -114,6 +114,28 @@ micro.search_space @space attributes {workload = "w"} {
 }
 )MLIR";
 
+/// Two spaces, each declaring `@candidate_17`. The dialect makes candidate
+/// symbols unique only *within* one space, so this parses and verifies -- the
+/// cross-space ambiguity check is the loader's own, and it is reachable from
+/// valid IR a user can write in a `.mlir` file.
+const char *kTwoSpacesShareCandidateName = R"MLIR(
+micro.search_space @a attributes {workload = "w"} {
+  micro.param "BM" {kind = "integer", choices = [32 : i64, 64 : i64]}
+  micro.candidate @candidate_17 {bindings = {BM = 32 : i64}}
+}
+micro.search_space @b attributes {workload = "w"} {
+  micro.param "BK" {kind = "integer", choices = [16 : i64, 32 : i64]}
+  micro.candidate @candidate_17 {bindings = {BK = 16 : i64}}
+}
+)MLIR";
+
+/// A candidate with no enclosing search space. Neither the dialect verifier
+/// nor the module verifier forbids this, so the loader is the layer that
+/// rejects it -- another rejection reachable from valid parsed IR.
+const char *kOrphanCandidate = R"MLIR(
+micro.candidate @orphan {bindings = {BM = 32 : i64}}
+)MLIR";
+
 TEST(SearchBindingLoader, LoadsEveryBoundParameterOfANamedCandidate) {
   auto parsed = parseFixture();
   ASSERT_TRUE(parsed);
@@ -233,9 +255,46 @@ TEST(SearchBindingLoader, RejectsAValueOutsideTheDeclaredDomain) {
 
   auto binding = loadSearchBinding(parsed->module.get(), "candidate_17");
   std::string error = takeError(binding);
-  EXPECT_NE(error.find("outside the declared choices"), std::string::npos)
+  // The loader mirrors the verifier's wording on purpose (see the header).
+  EXPECT_NE(error.find("is not one of the declared choices"), std::string::npos)
       << error;
   EXPECT_NE(error.find("BM"), std::string::npos) << error;
+}
+
+TEST(SearchBindingLoader, RejectsACandidateNameSharedAcrossSearchSpaces) {
+  // Reachable from valid parsed IR: the dialect only makes candidate symbols
+  // unique within one space, so this ambiguity is the loader's to catch.
+  auto parsed = parse(kTwoSpacesShareCandidateName);
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "candidate_17");
+  std::string error = takeError(binding);
+  EXPECT_NE(error.find("more than one micro.candidate named 'candidate_17'"),
+            std::string::npos)
+      << error;
+}
+
+TEST(SearchBindingLoader, EmptySymbolRejectsMoreThanOneCandidate) {
+  // The same two-space fixture with no symbol: the module has two candidates,
+  // so neither may be selected implicitly.
+  auto parsed = parse(kTwoSpacesShareCandidateName);
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get());
+  std::string error = takeError(binding);
+  EXPECT_NE(error.find("more than one micro.candidate"), std::string::npos)
+      << error;
+}
+
+TEST(SearchBindingLoader, RejectsACandidateWithNoEnclosingSearchSpace) {
+  auto parsed = parse(kOrphanCandidate);
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "orphan");
+  std::string error = takeError(binding);
+  EXPECT_NE(error.find("is not nested in a micro.search_space"),
+            std::string::npos)
+      << error;
 }
 
 TEST(SearchBindingLoader, AnAmbiguousModuleRequiresASymbol) {

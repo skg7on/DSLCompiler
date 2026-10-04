@@ -124,9 +124,11 @@ llvm::Expected<SearchBinding> loadSearchBinding(mlir::ModuleOp module,
         break;
       }
     if (!inDomain)
+      // Wording matches SearchSpaceOp::verify's "is not one of the declared
+      // choices" so the verifier/loader message contract cannot drift.
       return error("micro.candidate @" + candidate.getSymName() +
                    " value for '" + name +
-                   "' is outside the declared choices of micro.param '" +
+                   "' is not one of the declared choices of micro.param '" +
                    param->name + "'");
 
     values[name] = std::move(*value);

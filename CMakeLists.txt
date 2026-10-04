@@ -836,7 +836,7 @@ add_llk_mapping_test(MappingPropertiesTest test/Mapping/properties.cpp)
 add_llvm_executable(SearchBindingLoaderTest
     test/Conversion/MicroMapping/search_binding_loader.cpp)
 target_link_libraries(SearchBindingLoaderTest PRIVATE
-    LLKMicroMapping LLKPerf MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+    LLKMicroMapping MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 target_compile_definitions(SearchBindingLoaderTest PRIVATE
     LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME SearchBindingLoaderTest COMMAND SearchBindingLoaderTest)
