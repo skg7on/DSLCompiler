@@ -43,6 +43,7 @@
 #ifndef LLK_CONVERSION_MICROMAPPING_SEARCHBINDINGLOADER_H
 #define LLK_CONVERSION_MICROMAPPING_SEARCHBINDINGLOADER_H
 
+#include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/SearchBinding.h"
 
 #include "llvm/ADT/StringRef.h"
@@ -53,6 +54,7 @@
 
 namespace mlir {
 class ModuleOp;
+class Operation;
 } // namespace mlir
 
 namespace mlir::llk::mapping {
@@ -112,6 +114,28 @@ loadSearchBinding(mlir::ModuleOp module, llvm::StringRef candidateSymbol = "");
 /// through the binding -- a `SearchBinding` is deliberately IR-free.
 llvm::Expected<std::optional<std::string>>
 loadBoundLayout(mlir::ModuleOp module, const SearchBinding &binding);
+
+/// Evaluates the selected search space's `micro.constraint`s against the
+/// binding, using the machine model and a workload shape derived from `kernel`.
+///
+/// A `micro.constraint` is the space's *persistent global legality rule*, and a
+/// binding that violates one is not a legal point -- so the mapping path must
+/// reject it rather than let the search select a plan the space forbids. The
+/// rules live in the perf legality layer (`lib/Perf/Legality.cpp`), so this is
+/// where the two meet: the pass library links both, generic mapping does not.
+///
+/// The shape comes from the kernel's first `micro.mma` (its declared M/N/K and
+/// dtypes). A space that declares constraints but a kernel that offers no such
+/// shape cannot be evaluated, and is an error rather than a silent pass: an
+/// unenforced constraint must not look like an enforced one. A space with no
+/// constraints is always legal and costs nothing.
+///
+/// Returns the first violated constraint's stable reason, and fails only when
+/// the space or candidate cannot be resolved.
+llvm::Error verifyBindingLegality(mlir::ModuleOp module,
+                                  const SearchBinding &binding,
+                                  mlir::Operation *kernel,
+                                  const machine::MachineModel &machine);
 
 } // namespace mlir::llk::mapping
 

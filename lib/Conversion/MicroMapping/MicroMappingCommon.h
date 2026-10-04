@@ -421,6 +421,14 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     if (!loaded)
       return loaded.takeError();
     binding = std::move(*loaded);
+
+    // §16.5: the space's `micro.constraint`s are persistent global legality
+    // rules, so a binding that violates one is rejected *before* the search --
+    // rather than letting the search select a plan the space forbids.
+    if (llvm::Error error = mapping::verifyBindingLegality(
+            module, *binding, run.kernel, run.target->machine()))
+      return std::move(error);
+
     llvm::Expected<std::optional<std::string>> layout =
         mapping::loadBoundLayout(module, *binding);
     if (!layout)
