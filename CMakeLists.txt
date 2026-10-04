@@ -1090,9 +1090,12 @@ if(LLK_BUILD_TOOLS)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --micro-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg.mlir"
   )
   # MicroToLinalgInvalid: an op with no lowering must fail the conversion
-  # loudly rather than being silently left in the module.
+  # loudly rather than being silently left in the module. Each rejection needs
+  # its own chunk: the conversion aborts at the first illegal op, so one module
+  # can only ever report one of them.
   add_test(NAME MicroToLinalgInvalid
-      COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --micro-to-linalg
+      COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+              --micro-to-linalg
               ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg_invalid.mlir
   )
   # MicroToLinalgJit: the lowered kernel reaches the JIT. This is the check that
