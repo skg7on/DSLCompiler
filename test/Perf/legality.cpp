@@ -675,6 +675,32 @@ TEST(Legality, UnresolvedLayoutReferenceIsRejected) {
                  "layout_supported:", "operand9");
 }
 
+// A reference may name a role the parameter declares. `Candidate` has no role
+// lookup -- it is keyed by parameter name -- so the role must resolve to its
+// parameter *before* the binding check: a valid role reference is admitted and
+// evaluated, not rejected as an unbound parameter named after the role.
+TEST(Legality, ResolvedRoleReferenceIsEvaluated) {
+  const machine::MachineModel &machine = rowMajorOnlyMachine();
+
+  SearchSpace space;
+  space.params.push_back(
+      SearchParam{"lhs_layout",
+                  "layout",
+                  {SearchChoice("row_major"), SearchChoice("blocked")},
+                  "operand0"});
+  space.constraints.push_back(
+      SearchConstraint{ConstraintKind::LayoutSupported, {"operand0"}, {}});
+
+  Candidate c;
+  c.symbolicValues["lhs_layout"] = "row_major";
+  EXPECT_TRUE(checkLegality(space, c, BindingFacts{}, machine).legal);
+
+  c.symbolicValues["lhs_layout"] = "blocked";
+  LegalityResult result = checkLegality(space, c, BindingFacts{}, machine);
+  expectRejected(result, "layout_supported:", "blocked");
+  EXPECT_NE(result.reason.find("operand0"), std::string::npos) << result.reason;
+}
+
 // `mapping_extent` reads the thread count and the machine's capacity only, so
 // it must evaluate with no workload facts at all -- the review's vector-only
 // regression. The constraint is still enforced, not skipped.

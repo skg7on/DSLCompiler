@@ -791,29 +791,30 @@ LegalityResult checkConstraint(const SearchConstraint &constraint,
                                const Candidate &candidate,
                                const BindingFacts &facts,
                                const machine::MachineModel &machine) {
-  // Every reference must resolve to a declared parameter, or to a role a
-  // parameter declares. An unresolved reference is reported as such rather than
-  // attributed to the candidate by the binding check below -- a constraint that
-  // names nothing is a malformed space, not an unbound candidate.
+  // Resolve every reference to a declared parameter -- by name, or by a role a
+  // parameter declares. An unresolved reference is a malformed space and is
+  // reported as such rather than attributed to the candidate. Once resolved,
+  // the candidate is keyed by the parameter's *name* (Candidate has no role
+  // lookup), so a valid role reference is admitted and evaluated instead of
+  // being rejected as an unbound parameter. A parameter the candidate never
+  // bound is still a rejection: a malformed candidate must not pass by
+  // omission.
   for (const std::string &name : constraint.params) {
-    if (space.findParam(name))
-      continue;
-    bool matchesRole =
-        llvm::any_of(space.params, [&](const SearchParam &param) {
-          return !param.role.empty() && param.role == name;
-        });
-    if (!matchesRole)
+    const SearchParam *param = space.findParam(name);
+    if (!param)
+      for (const SearchParam &candidateParam : space.params)
+        if (!candidateParam.role.empty() && candidateParam.role == name) {
+          param = &candidateParam;
+          break;
+        }
+    if (!param)
       return illegal(constraint.kind, "references '" + name +
                                           "', which the space does not "
                                           "declare as a parameter or role");
-  }
-
-  // A rule cannot be evaluated against a value the candidate never bound; that
-  // is a malformed candidate, not a legal one.
-  for (const std::string &name : constraint.params)
-    if (!candidate.integer(name) && !candidate.symbol(name))
+    if (!candidate.integer(param->name) && !candidate.symbol(param->name))
       return illegal(constraint.kind,
-                     "candidate does not bind parameter '" + name + "'");
+                     "candidate does not bind parameter '" + param->name + "'");
+  }
 
   switch (constraint.kind) {
   case ConstraintKind::SramCapacity:

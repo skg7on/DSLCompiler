@@ -94,6 +94,26 @@ void setBindings(
   candidate->setAttr("bindings", builder.getDictionaryAttr(named));
 }
 
+/// Replaces the first `micro.constraint`'s `params` with `names`, bypassing the
+/// dialect verifier (which requires parameter names). This is the unverified
+/// state the loader must still resolve: a reference by declared role.
+void setConstraintParams(mlir::ModuleOp module, mlir::MLIRContext *context,
+                         llvm::ArrayRef<llvm::StringRef> names) {
+  mlir::Operation *constraint = nullptr;
+  module.walk([&](mlir::Operation *op) {
+    if (!constraint && op->getName().getStringRef() == "micro.constraint")
+      constraint = op;
+  });
+  if (!constraint) {
+    ADD_FAILURE() << "the fixture declares no micro.constraint";
+    return;
+  }
+  llvm::SmallVector<mlir::Attribute, 2> params;
+  for (llvm::StringRef name : names)
+    params.push_back(mlir::StringAttr::get(context, name));
+  constraint->setAttr("params", mlir::ArrayAttr::get(context, params));
+}
+
 std::unique_ptr<Parsed> parseFixture() {
   std::string error;
   auto source = llvm::MemoryBuffer::getFile(
@@ -662,6 +682,25 @@ module {
 }
 )mlir";
 
+/// A space whose layout parameter declares a role (`operand0`). The constraint
+/// names the parameter itself so the module verifies; the test then rewrites
+/// the reference to the role, the unverified state the loader must still
+/// resolve (the dialect requires constraint params to name parameters).
+constexpr llvm::StringLiteral kRoleReferencedLayoutSpace = R"mlir(
+module {
+  micro.kernel @plain {
+    %t = micro.tile_alloc : !micro.tile<8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  micro.search_space @space attributes {workload = "plain"} {
+    micro.param "lhs_layout" {kind = "layout", role = "operand0", choices = ["row_major", "blocked"]}
+    micro.constraint "layout_supported" {params = ["lhs_layout"]}
+    micro.candidate @ok {bindings = {lhs_layout = "row_major"}}
+    micro.candidate @bad {bindings = {lhs_layout = "blocked"}}
+  }
+}
+)mlir";
+
 /// The first `micro.kernel` in `module`, or null.
 mlir::Operation *firstKernel(mlir::ModuleOp module) {
   mlir::Operation *kernel = nullptr;
@@ -820,6 +859,38 @@ TEST(SearchBindingLoader, TailConstraintWithoutOriginalDimensionsIsRejected) {
   std::string text = llvm::toString(std::move(error));
   EXPECT_NE(text.find("tail_supported"), std::string::npos) << text;
   EXPECT_NE(text.find("cannot be evaluated"), std::string::npos) << text;
+}
+
+// A constraint may reference a parameter by the role it declares. The candidate
+// is keyed by parameter name, so the role resolves to `lhs_layout` and the
+// candidate is evaluated -- not rejected as an unbound parameter named
+// `operand0`. The bound value still decides: `blocked` is unsupported by the
+// machine's row_major-only SRAM.
+TEST(SearchBindingLoader, ResolvedRoleReferenceIsEvaluated) {
+  auto parsed = parse(kRoleReferencedLayoutSpace);
+  ASSERT_TRUE(parsed);
+  // The dialect requires constraint params to name parameters, so the role
+  // reference is the unverified state the loader must still resolve.
+  setConstraintParams(*parsed->module, parsed->context.get(), {"operand0"});
+  llvm::Expected<mlir::llk::machine::MachineModel> machine = vectorMachine();
+  ASSERT_TRUE(static_cast<bool>(machine))
+      << llvm::toString(machine.takeError());
+
+  auto ok = loadSearchBinding(parsed->module.get(), "ok");
+  ASSERT_TRUE(static_cast<bool>(ok)) << llvm::toString(ok.takeError());
+  llvm::Error okError = verifyBindingLegality(
+      *parsed->module, *ok, firstKernel(*parsed->module), *machine);
+  EXPECT_FALSE(static_cast<bool>(okError))
+      << llvm::toString(std::move(okError));
+
+  auto bad = loadSearchBinding(parsed->module.get(), "bad");
+  ASSERT_TRUE(static_cast<bool>(bad)) << llvm::toString(bad.takeError());
+  llvm::Error error = verifyBindingLegality(
+      *parsed->module, *bad, firstKernel(*parsed->module), *machine);
+  ASSERT_TRUE(static_cast<bool>(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("layout_supported"), std::string::npos) << text;
+  EXPECT_NE(text.find("blocked"), std::string::npos) << text;
 }
 
 // A space with no constraints is always legal, and the check costs nothing --
