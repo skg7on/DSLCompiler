@@ -272,6 +272,12 @@ struct PlanConnection {
   llvm::SmallVector<MemoryNodeId> route;
   llvm::SmallVector<ExecutorId> engines;
   std::optional<LayoutTransform> transform;
+  /// The instances this connection serves, sorted and unique. A materializer
+  /// rewires exactly these consumers to the connection's result; without them
+  /// it could only redirect *every* reader of the value, which is wrong as soon
+  /// as two connections carry one value along different routes. Empty for a
+  /// plan built without consumer associations.
+  llvm::SmallVector<InstanceId> consumers;
 };
 
 /// A complete executable proposal covering every required node.
@@ -293,7 +299,10 @@ struct CoveringPlan {
   /// layout) binding tuple, then node / instance id (design §22.1);
   /// `connectionPlans` by connection id.
   llvm::SmallVector<PlanPlacement> placements;
-  llvm::SmallVector<PlanConnection> connectionPlans;
+  /// Explicit inline capacity: `PlanConnection` is large (it carries its route,
+  /// engines, transform, and consumers), so the default inlined-element
+  /// heuristic would not apply.
+  llvm::SmallVector<PlanConnection, 4> connectionPlans;
   llvm::StringMap<SearchValue> globalParameters;
   Cost totalCost;
   PlanDiagnostics diagnostics;

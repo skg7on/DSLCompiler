@@ -1389,6 +1389,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       detail.route = connection.memoryRoute;
       detail.engines = connection.transferEngines;
       detail.transform = connection.transform;
+      detail.consumers.assign(connection.consumers.begin(),
+                              connection.consumers.end());
+      llvm::sort(detail.consumers);
       plan.connectionPlans.push_back(std::move(detail));
     }
     llvm::sort(plan.connectionPlans,

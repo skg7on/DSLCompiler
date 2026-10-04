@@ -67,10 +67,12 @@ enum class BindContract {
 /// the kernel, or when the plan names a rule the target does not declare.
 ///
 /// Materialization (design §18.2): a selected connection that moves a value
-/// between two memories is emitted as `micro.async_copy` followed by
-/// `micro.wait` right after the producing operation, and every other use of
-/// the original value is rewired to the copy -- so the value the consumer sees
-/// is the one that lives in its memory.
+/// between two memories is emitted as one `micro.async_copy` + `micro.wait` per
+/// route hop, right after the producing operation. One chain is emitted per
+/// (value, route), and each chain rewires only the consumers its connection
+/// names -- so a value carried two ways gets two chains, and neither redirects
+/// the other's readers. A `Replicate` (a fan-out copy) is materialized the same
+/// way; a connection whose consumers are not recorded rewires nobody.
 ///
 /// A connection the binder cannot materialize is *reported*, not silently
 /// dropped: `BoundPlan::unmaterialized` names it and why. The current limits
@@ -82,8 +84,9 @@ enum class BindContract {
 /// reported entry names the connection's value id; when the binder cannot
 /// materialize a whole connection kind, the entry also carries a stable reason
 /// token (a `LayoutTransform` connection is reported as
-/// `layout_transform_requires_dialect_op`), while a movement that fails reports
-/// its own specific cause.
+/// `layout_transform_requires_dialect_op` and a `Reduce` as
+/// `reduce_not_materialized`), while a movement that fails reports its own
+/// specific cause.
 ///
 /// `contract` decides what an unresolved decision means. Under
 /// `BindContract::Partial` (the default) the plan is bound with those
