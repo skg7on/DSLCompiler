@@ -67,6 +67,11 @@ struct SearchParam {
   /// fragment_shape, or tail_policy.
   std::string kind;
   std::vector<SearchChoice> choices;
+  /// The thing this parameter governs, when the space says so -- a rule's port
+  /// name (`operand0`, `lhs`) for the layout axis, which is the one that can
+  /// bind several parameters at once. Empty means the parameter governs its
+  /// axis as a whole.
+  std::string role;
 };
 
 /// The typed legality rules a `micro.constraint` can name. The enum order and

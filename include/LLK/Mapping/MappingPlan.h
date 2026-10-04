@@ -119,20 +119,21 @@ struct ResourceUsage {
   llvm::StringMap<uint64_t> memoryBytes;
 };
 
-/// A layout conversion over a value, expressed as an affine relationship so
-/// equivalence and composition use MLIR's canonicalization.
+/// A layout conversion over a value: the value read through `srcMap` is written
+/// through `dstMap`. Both are the logical-to-physical maps of the endpoints'
+/// *solved* layouts, so the conversion is concrete (`VW = 8`) rather than a
+/// family pair, and it is expressed as affine maps rather than target ids --
+/// which is what lets the binder emit a target-neutral `micro.transform`
+/// (design §13.4 keeps target layout ids out of `#micro.layout`).
 ///
-/// Known asymmetry with ruling R4: `srcLayout`/`dstLayout` name layout
-/// *families*, and `map` is left null by `synthesizeConnections`, so a
-/// connection's transform is under-specified exactly where an instance's
-/// `SolvedLayout` is now concrete (`VW = 8`, with its map). The endpoints'
-/// solved parameterizations are reachable through the plan's placements, but a
-/// materializer that must emit the conversion needs them here -- filling this
-/// in is follow-up work, deliberately not guessed from the placements now.
+/// A map is null when the corresponding layout declares no map clause, leaving
+/// that side's index relation to the target. `srcLayout`/`dstLayout` name the
+/// families, for diagnostics and for a reader that wants the id.
 struct LayoutTransform {
   std::string srcLayout;
   std::string dstLayout;
-  AffineMap map;
+  AffineMap srcMap;
+  AffineMap dstMap;
 };
 
 /// An unplaced rule match.
@@ -163,11 +164,20 @@ struct MappingCandidate {
 /// hashed: it is a pure function of the bound layout id and these values, so
 /// including its rendering would only add a dependency on MLIR's map printer.
 ///
-/// Invariant: in the maps that key a `SolvedLayout` by layout class, the key is
-/// the resolved definition id, so it is string-identical to the same class's
-/// entry in `layoutBindings` (both are written together by
-/// `enumeratePlacements` from the requirement's `layoutClass`).
+/// Keying: `enumeratePlacements` files each solution under its requirement's
+/// layout class. When one class is required by several ports of the same
+/// candidate, each requirement has its own solved parameters and port
+/// association, so the later ones are keyed by class plus the requirement's
+/// index (for example `t.blocked#1`) rather than overwriting the first. A class
+/// required once keeps the bare class as its key, so a class-keyed lookup still
+/// resolves for the common case; `SolvedLayout::portValue` is what an edge
+/// matches on, not the key.
 struct SolvedLayout {
+  /// The layout family this solution instantiates. Carried explicitly rather
+  /// than inferred from the containing map's key, because a class required by
+  /// several ports has index-disambiguated keys while the class itself is what
+  /// a connection and its transform name.
+  std::string layoutClass;
   llvm::StringMap<SearchValue> parameters;
   /// The logical-to-physical map with the integer parameters substituted; null
   /// when the layout declaration carries no map clause.
@@ -193,8 +203,9 @@ struct CandidateInstance {
   llvm::StringMap<MemoryNodeId> memoryBindings;
   llvm::StringMap<std::string> computeBindings;
   llvm::StringMap<LayoutId> layoutBindings;
-  /// The solved instantiation of each bound layout class, keyed exactly as
-  /// `layoutBindings` is. Empty when the candidate requires no layout.
+  /// The solved instantiation of each layout requirement, keyed by layout class
+  /// (index-disambiguated when one class is required by several ports; see
+  /// `SolvedLayout`). Empty when the candidate requires no layout.
   llvm::StringMap<SolvedLayout> layoutSolutions;
   ResourceUsage resourceUsage;
   Cost localCost;
@@ -262,6 +273,12 @@ struct PlanConnection {
   llvm::SmallVector<MemoryNodeId> route;
   llvm::SmallVector<ExecutorId> engines;
   std::optional<LayoutTransform> transform;
+  /// The instances this connection serves, sorted and unique. A materializer
+  /// rewires exactly these consumers to the connection's result; without them
+  /// it could only redirect *every* reader of the value, which is wrong as soon
+  /// as two connections carry one value along different routes. Empty for a
+  /// plan built without consumer associations.
+  llvm::SmallVector<InstanceId> consumers;
 };
 
 /// A complete executable proposal covering every required node.
@@ -283,7 +300,10 @@ struct CoveringPlan {
   /// layout) binding tuple, then node / instance id (design §22.1);
   /// `connectionPlans` by connection id.
   llvm::SmallVector<PlanPlacement> placements;
-  llvm::SmallVector<PlanConnection> connectionPlans;
+  /// Explicit inline capacity: `PlanConnection` is large (it carries its route,
+  /// engines, transform, and consumers), so the default inlined-element
+  /// heuristic would not apply.
+  llvm::SmallVector<PlanConnection, 4> connectionPlans;
   llvm::StringMap<SearchValue> globalParameters;
   Cost totalCost;
   PlanDiagnostics diagnostics;

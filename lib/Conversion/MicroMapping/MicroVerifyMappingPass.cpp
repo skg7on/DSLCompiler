@@ -123,12 +123,13 @@ struct MicroVerifyMappingPass
     // The pass verifies *mapped* Micro-IR, so a module with no `micro.kernel`
     // has nothing to verify. That is a failure, not a vacuous success: a
     // silent pass on the wrong file would look exactly like a verified one
-    // (the same reasoning that makes `micro-map` require a kernel).
-    if (!micro_mapping_detail::findMicroKernel(module))
-      return fail(module,
-                  llvm::createStringError(
-                      llvm::inconvertibleErrorCode(),
-                      (passName + ": the module has no micro.kernel").str()));
+    // (the same reasoning that makes `micro-map` require a kernel). Several
+    // kernels are likewise rejected: with no kernel selector, verifying "the
+    // kernel" would silently choose the first and ignore the rest.
+    if (llvm::Expected<mlir::Operation *> kernel =
+            micro_mapping_detail::resolveMicroKernel(module, passName);
+        !kernel)
+      return fail(module, kernel.takeError());
 
     if (llvm::Error error = mapping::verifyMappedMicroIR(module, **target))
       return fail(module, std::move(error));

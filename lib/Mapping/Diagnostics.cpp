@@ -40,6 +40,10 @@ llvm::StringRef stringifyDiagnosticCode(DiagnosticCode code) {
     return "target_bundle_invalid";
   case DiagnosticCode::AssumedValueSize:
     return "assumed_value_size";
+  case DiagnosticCode::InvalidMappingMetadata:
+    return "invalid_mapping_metadata";
+  case DiagnosticCode::ConnectionChoiceUnexplored:
+    return "connection_choice_unexplored";
   }
   return "";
 }
@@ -59,6 +63,9 @@ std::optional<DiagnosticCode> symbolizeDiagnosticCode(llvm::StringRef name) {
       .Case("latency_cache_miss", DiagnosticCode::LatencyCacheMiss)
       .Case("target_bundle_invalid", DiagnosticCode::TargetBundleInvalid)
       .Case("assumed_value_size", DiagnosticCode::AssumedValueSize)
+      .Case("invalid_mapping_metadata", DiagnosticCode::InvalidMappingMetadata)
+      .Case("connection_choice_unexplored",
+            DiagnosticCode::ConnectionChoiceUnexplored)
       .Default(std::nullopt);
 }
 

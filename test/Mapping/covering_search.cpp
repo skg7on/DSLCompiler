@@ -2105,6 +2105,82 @@ TEST(CoveringSearch, StagingMemoryWithRoomAdmitsTheConnection) {
   EXPECT_FALSE(result->plans.empty());
 }
 
+// Issue #109 defect 3: exact mode implies an exhaustive joint search, but each
+// connection's alternative is chosen locally -- only the cheapest is taken.
+// When more than one alternative exists the search now *says so*, rather than
+// letting exact mode's name imply a completeness it does not have. Two routes
+// (a direct hop and a staged one) make the choice observable.
+TEST(CoveringSearch, ExactModeReportsUnexploredConnectionChoices) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = occupiedStagingGraph(context, tile);
+
+  MachineModel machine = twoDestinationHopMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1u << 20; // every alternative fits
+  // A second route from dram.0 to acc.0: the direct hop, alongside the staged
+  // one through stage.0 the topology already offers.
+  LinkEdge direct;
+  direct.id = "dram_to_acc.0";
+  direct.source = "dram.0";
+  direct.destination = "acc.0";
+  direct.bandwidthBytesPerCycle = 32;
+  direct.latencyCycles = 10;
+  direct.transactionBytes = 64;
+  direct.transferEngines = {"dma.0"};
+  machine.links.push_back(direct);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kOccupiedStagingRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_TRUE(result->connectionChoicesUnexplored);
+  EXPECT_TRUE(
+      hasDiagnostic(*result, DiagnosticCode::ConnectionChoiceUnexplored));
+}
+
+// Control: the beam and deterministic modes are heuristic by contract, so they
+// make no exhaustiveness claim and leave the flag clear.
+TEST(CoveringSearch, DeterministicModeDoesNotReportUnexploredChoices) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = occupiedStagingGraph(context, tile);
+
+  MachineModel machine = twoDestinationHopMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1u << 20;
+  LinkEdge direct;
+  direct.id = "dram_to_acc.0";
+  direct.source = "dram.0";
+  direct.destination = "acc.0";
+  direct.bandwidthBytesPerCycle = 32;
+  direct.latencyCycles = 10;
+  direct.transactionBytes = 64;
+  direct.transferEngines = {"dma.0"};
+  machine.links.push_back(direct);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kOccupiedStagingRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->connectionChoicesUnexplored);
+}
+
 // A gather's intermediate tile is charged to the consumer's memory too: the
 // consumer instance fits acc.0, but the gathered tile it produces does not.
 TEST(CoveringSearch, GatherIntermediateCountsAgainstCapacity) {
@@ -2212,6 +2288,129 @@ TEST(CoveringSearch, ATransferWithinItsDestinationCapacityIsAdmitted) {
   llvm::Expected<MappingSearchResult> result = search.search();
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   EXPECT_FALSE(result->plans.empty());
+}
+
+/// One node writing two outputs and reading nothing: the simplest shape whose
+/// capacity accounting depends on how its outputs are attributed to memory.
+WorkloadGraph multiOutputGraph(mlir::MLIRContext &context, mlir::Type first,
+                               mlir::Type second) {
+  WorkloadGraph graph;
+  WorkloadValueId a =
+      graph.addValue(WorkloadValue{0, first, "a", /*external=*/false});
+  WorkloadValueId b =
+      graph.addValue(WorkloadValue{0, second, "b", /*external=*/false});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context);
+  node.outputs.push_back(WorkloadPort{a, first, std::nullopt});
+  node.outputs.push_back(WorkloadPort{b, second, std::nullopt});
+  graph.addNode(std::move(node));
+  graph.finalize();
+  return graph;
+}
+
+/// A rule binding two memory kinds, so a placed node carries two memory
+/// bindings and the graph fixes no output-to-binding association.
+constexpr llvm::StringLiteral kTwoMemoryRules = R"llkmap(
+rule r.two_memory {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  require memory kind dram;
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The same node with a single memory binding: no association is needed, so
+/// every output is charged to that one binding.
+constexpr llvm::StringLiteral kOneMemoryRules = R"llkmap(
+rule r.one_memory {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+// Issue #109 defect 1: a node with several outputs and several memory bindings
+// has no output-to-binding association, so its capacity cannot be established.
+// Charging only the *first* output to every binding is a lower bound, and a
+// 4-byte first output hid a 4096-byte second: the old search admitted the plan
+// into two 1024-byte memories. Ambiguous placement is now rejected rather than
+// admitted on that unsafe bound -- and here with capacity to spare, because the
+// ambiguity is structural, not a matter of size.
+TEST(CoveringSearch, AmbiguousMultiOutputMultiMemoryPlacementIsRejected) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  MachineModel machine = searchMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1u << 30; // plenty: rejection is not about size
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kTwoMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+// Control: one memory binding leaves nothing ambiguous -- the binding holds
+// every output -- so a two-output node whose outputs both fit is admitted.
+TEST(CoveringSearch, MultiOutputSingleMemoryIsAdmittedWhenTheTotalFits) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, small);
+
+  MachineModel machine = searchMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1024;
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kOneMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
+// Control: the same single-binding node is rejected once its *later* output is
+// large -- proving every output is charged, not only the first.
+TEST(CoveringSearch, MultiOutputSingleMemoryRejectsAnOversizedLaterOutput) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  MachineModel machine = searchMachine();
+  for (MemoryNode &memory : machine.memories)
+    memory.capacityBytes = 1024;
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kOneMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
 }
 
 /// Two independent producer -> consumer pairs over `fanMachine`, each moving a
@@ -2425,7 +2624,90 @@ TEST(CoveringSearch, AMeasurementChangesTheCostAndTheRanking) {
   EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 4.0);
   ASSERT_FALSE(result->plans[0].placements.empty());
   EXPECT_EQ(result->plans[0].placements[0].rule, "r.expensive");
-  EXPECT_FALSE(provider.lookups.empty());
+  ASSERT_FALSE(provider.lookups.empty());
+  // The search fills the whole §17.4 key, not just the rule: the operation's
+  // attributes and its placement class are part of what it asked about.
+  EXPECT_NE(provider.lookups.front().find("attributes={op = \"add\"}"),
+            std::string::npos)
+      << provider.lookups.front();
+  EXPECT_NE(provider.lookups.front().find("placement_class=worker"),
+            std::string::npos)
+      << provider.lookups.front();
+}
+
+// A typed fixture proves the cache key carries the operation's types and the
+// concrete placement, not only the rule: the fields are filled from the real
+// node and instance rather than left blank.
+TEST(CoveringSearch, LatencyKeyCarriesTheOperationsTypesAndPlacement) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, small);
+  FixedLatencyProvider provider;
+
+  std::unique_ptr<MappingTarget> target =
+      targetWithProvider(searchMachine(), kOneMemoryRules, &provider);
+  ASSERT_NE(target, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(provider.lookups.empty());
+
+  const std::string &key = provider.lookups.front();
+  EXPECT_NE(key.find("result_types=tensor<1xf32>"), std::string::npos) << key;
+  EXPECT_NE(key.find("placement=executor=e0,memories=sram=sram.0"),
+            std::string::npos)
+      << key;
+}
+
+// §17.4: the measurement cache key must separate any two pieces of work whose
+// measured cost could differ. Each pair below changes exactly one component and
+// must therefore produce a different key; an unchanged copy must not.
+TEST(CoveringSearch, LatencyKeysDistinguishWorkThatCanDiffer) {
+  OperationSignature base;
+  base.operation = "micro.vector";
+  base.operandTypes = "tensor<8x8xf32>";
+  base.resultTypes = "tensor<8x8xf32>";
+  base.attributes = "{op = \"add\"}";
+  base.rule = "r";
+  base.ruleVersion = 1;
+  base.bundle = "b";
+  base.bundleParameters = "{VW = 8 : i64}";
+  base.layout = "t.blocked(VW=8)";
+  base.placementClass = "core";
+  base.placement = "executor=e0,memories=sram.0";
+  base.routeClass = "direct";
+
+  const std::string key = base.canonicalString();
+
+  OperationSignature operand = base;
+  operand.operandTypes = "tensor<8x8xbf16>";
+  EXPECT_NE(operand.canonicalString(), key);
+
+  OperationSignature result = base;
+  result.resultTypes = "tensor<4x4xf32>";
+  EXPECT_NE(result.canonicalString(), key);
+
+  OperationSignature attributes = base;
+  attributes.attributes = "{op = \"mul\"}";
+  EXPECT_NE(attributes.canonicalString(), key);
+
+  OperationSignature bundleParameters = base;
+  bundleParameters.bundleParameters = "{VW = 4 : i64}";
+  EXPECT_NE(bundleParameters.canonicalString(), key);
+
+  OperationSignature layout = base;
+  layout.layout = "t.blocked(VW=4)";
+  EXPECT_NE(layout.canonicalString(), key);
+
+  OperationSignature placement = base;
+  placement.placement = "executor=e1,memories=acc.0";
+  EXPECT_NE(placement.canonicalString(), key);
+
+  OperationSignature unchanged = base;
+  EXPECT_EQ(unchanged.canonicalString(), key);
 }
 
 TEST(CoveringSearch, AnEntrylessProviderFallsBackToStaticCost) {
@@ -3029,7 +3311,8 @@ TEST(CoveringSearch, ABoundLayoutSelectsAmongTheLayoutsARuleOffers) {
         makeSearchBinding("candidate_blocked",
                           values({{"tile_layout", std::string("t.blocked")}}));
     CoveringSearch search(graph, *target, context, LayoutContext{}, options,
-                          binding, std::string("t.blocked"));
+                          binding,
+                          llvm::StringMap<std::string>{{"", "t.blocked"}});
     llvm::Expected<MappingSearchResult> result = search.search();
     ASSERT_TRUE(static_cast<bool>(result))
         << llvm::toString(result.takeError());
@@ -3076,7 +3359,8 @@ TEST(CoveringSearch, ABoundLayoutARuleDoesNotOfferIsANonMatch) {
         makeSearchBinding("candidate_blocked",
                           values({{"tile_layout", std::string("t.blocked")}}));
     CoveringSearch search(graph, *target, context, LayoutContext{}, options,
-                          binding, std::string("t.blocked"));
+                          binding,
+                          llvm::StringMap<std::string>{{"", "t.blocked"}});
     llvm::Expected<MappingSearchResult> result = search.search();
     ASSERT_TRUE(static_cast<bool>(result))
         << llvm::toString(result.takeError());
@@ -3119,7 +3403,8 @@ TEST(CoveringSearch, ABoundLayoutLeavesLayoutAgnosticRulesUnchanged) {
   // differs -- the binding's provenance is folded into it -- so compare the
   // selections, not the id.)
   CoveringSearch boundSearch(graph, *target, context, LayoutContext{}, options,
-                             binding, std::string("t.blocked"));
+                             binding,
+                             llvm::StringMap<std::string>{{"", "t.blocked"}});
   llvm::Expected<MappingSearchResult> boundResult = boundSearch.search();
   ASSERT_TRUE(static_cast<bool>(boundResult))
       << llvm::toString(boundResult.takeError());
@@ -3152,6 +3437,8 @@ TEST(MappingDiagnostics, EveryCodeRoundTripsThroughItsString) {
       DiagnosticCode::LatencyCacheMiss,
       DiagnosticCode::TargetBundleInvalid,
       DiagnosticCode::AssumedValueSize,
+      DiagnosticCode::InvalidMappingMetadata,
+      DiagnosticCode::ConnectionChoiceUnexplored,
   };
   for (DiagnosticCode code : codes) {
     llvm::StringRef text = stringifyDiagnosticCode(code);

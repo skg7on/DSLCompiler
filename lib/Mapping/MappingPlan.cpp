@@ -71,8 +71,10 @@ std::string transformString(const LayoutTransform &transform) {
   std::string out = transform.srcLayout;
   out += "->";
   out += transform.dstLayout;
-  out += ':';
-  out += mapString(transform.map);
+  out += ":src=";
+  out += mapString(transform.srcMap);
+  out += ":dst=";
+  out += mapString(transform.dstMap);
   return out;
 }
 

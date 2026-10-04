@@ -108,6 +108,22 @@ struct ConnectionRequest {
   MemoryNodeId consumerMemory;
   std::optional<LayoutId> producerLayout;
   std::optional<LayoutId> consumerLayout;
+  /// The concrete parameterization each endpoint solved for this value's
+  /// layout, when it solved one. Two endpoints whose layout *classes* agree may
+  /// still hold genuinely different representations (`VW = 4` versus `VW = 8`),
+  /// so a transform is required when the classes differ *or* these parameters
+  /// do. An unset map (the default, and what a caller that does not know the
+  /// parameters leaves) compares equal to any other unset map, so a caller that
+  /// only knows class ids keeps the class-only behaviour.
+  llvm::StringMap<SearchValue> producerLayoutParameters;
+  llvm::StringMap<SearchValue> consumerLayoutParameters;
+  /// The logical-to-physical map of the layout each endpoint solved for this
+  /// value, when it solved one. A transform connects the two, so a materializer
+  /// needs both maps -- the same reason it needs the parameters, taken one step
+  /// further. Null when the endpoint bound no layout, or its layout declares no
+  /// map clause.
+  mlir::AffineMap producerLayoutMap;
+  mlir::AffineMap consumerLayoutMap;
   /// The moved value's type, as far as it is known. A modelled shaped type
   /// (`tensor`, `memref`, `vector`) states both its element type and its
   /// logical shape; a `!micro.tile` is read through `TileFacts`, which unwraps
@@ -187,7 +203,8 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
     const ConnectionRequest &base, llvm::ArrayRef<ConnectionRequest> consumers,
     const machine::MachineModel &machine, const TopologyService &topology,
     const PlacementOptions &options = {}, bool *truncated = nullptr,
-    const ObjectiveOrder &objective = {});
+    const ObjectiveOrder &objective = {},
+    bool *choseAmongAlternatives = nullptr);
 
 /// Fan-in (design §15.3): one gather plan collecting several producers into one
 /// or more consumers that share a destination memory. `feedCost` is the summed

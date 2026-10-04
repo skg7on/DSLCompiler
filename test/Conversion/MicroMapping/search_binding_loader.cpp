@@ -22,7 +22,9 @@
 
 #include "LLK/Conversion/MicroMapping/SearchBindingLoader.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Mapping/SearchBinding.h"
+#include "MicroMappingCommon.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -327,7 +329,8 @@ TEST(SearchBindingLoader, AModuleWithoutACandidateIsRejected) {
 TEST(SearchBindingLoader, ResolvesTheLayoutParameterByKindNotName) {
   // The layout parameter is called `block_shape`, not `layout` or
   // `tile_layout`: resolution must go through the declared `kind`, because the
-  // name is the space's to choose.
+  // name is the space's to choose. It declares no role, so it governs the
+  // layout axis as a whole and is keyed by the empty role.
   auto parsed = parse(R"MLIR(
 micro.search_space @space attributes {workload = "w"} {
   micro.param "VW" {kind = "integer", choices = [4 : i64, 8 : i64]}
@@ -341,17 +344,42 @@ micro.search_space @space attributes {workload = "w"} {
   ASSERT_TRUE(static_cast<bool>(binding))
       << llvm::toString(binding.takeError());
 
-  auto layout = loadBoundLayout(parsed->module.get(), *binding);
-  ASSERT_TRUE(static_cast<bool>(layout)) << llvm::toString(layout.takeError());
-  ASSERT_TRUE(layout->has_value());
-  EXPECT_EQ(**layout, "blocked");
+  auto layouts = loadBoundLayouts(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(layouts))
+      << llvm::toString(layouts.takeError());
+  ASSERT_EQ(layouts->size(), 1u);
+  EXPECT_EQ(layouts->lookup(""), "blocked");
 }
 
-TEST(SearchBindingLoader, SeveralLayoutParametersCannotBeResolved) {
-  // Two layout parameters: neither is *the* layout role, and there is no
-  // per-role binding surface yet, so the axis cannot be resolved. It must be
-  // reported rather than silently left unbound -- a value the caller bound
-  // would otherwise be ignored without a word.
+TEST(SearchBindingLoader, ResolvesOneLayoutPerRole) {
+  // Two layout parameters, each naming the port it governs, so both resolve
+  // and the binding constrains the two operands differently. This is what a
+  // role-less parameter cannot express.
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "lhs_layout" {kind = "layout", role = "lhs", choices = ["blocked"]}
+  micro.param "rhs_layout" {kind = "layout", role = "rhs", choices = ["row_major"]}
+  micro.candidate @c {bindings = {lhs_layout = "blocked", rhs_layout = "row_major"}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto layouts = loadBoundLayouts(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(layouts))
+      << llvm::toString(layouts.takeError());
+  ASSERT_EQ(layouts->size(), 2u);
+  EXPECT_EQ(layouts->lookup("lhs"), "blocked");
+  EXPECT_EQ(layouts->lookup("rhs"), "row_major");
+}
+
+TEST(SearchBindingLoader, TwoLayoutsForOneRoleCannotBeResolved) {
+  // Two layout parameters claiming the *same* role: which one selects that
+  // role's layout is unanswerable, so it is reported rather than silently
+  // picking one -- a value the caller bound would otherwise be ignored.
   auto parsed = parse(R"MLIR(
 micro.search_space @space attributes {workload = "w"} {
   micro.param "lhs" {kind = "layout", choices = ["blocked"]}
@@ -365,9 +393,9 @@ micro.search_space @space attributes {workload = "w"} {
   ASSERT_TRUE(static_cast<bool>(binding))
       << llvm::toString(binding.takeError());
 
-  auto layout = loadBoundLayout(parsed->module.get(), *binding);
-  std::string error = takeError(layout);
-  EXPECT_NE(error.find("more than one layout-kind parameter"),
+  auto layouts = loadBoundLayouts(parsed->module.get(), *binding);
+  std::string error = takeError(layouts);
+  EXPECT_NE(error.find("more than one layout-kind parameter for role"),
             std::string::npos)
       << error;
 }
@@ -385,9 +413,10 @@ micro.search_space @space attributes {workload = "w"} {
   ASSERT_TRUE(static_cast<bool>(binding))
       << llvm::toString(binding.takeError());
 
-  auto layout = loadBoundLayout(parsed->module.get(), *binding);
-  ASSERT_TRUE(static_cast<bool>(layout)) << llvm::toString(layout.takeError());
-  EXPECT_FALSE(layout->has_value());
+  auto layouts = loadBoundLayouts(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(layouts))
+      << llvm::toString(layouts.takeError());
+  EXPECT_TRUE(layouts->empty());
 }
 
 TEST(SearchBindingLoader, RejectsABindingWhoseCandidateIsGone) {
@@ -399,10 +428,209 @@ TEST(SearchBindingLoader, RejectsABindingWhoseCandidateIsGone) {
   values["tile_layout"] = std::string("blocked");
   SearchBinding binding = makeSearchBinding("nope", std::move(values));
 
-  auto layout = loadBoundLayout(parsed->module.get(), binding);
-  std::string error = takeError(layout);
+  auto layouts = loadBoundLayouts(parsed->module.get(), binding);
+  std::string error = takeError(layouts);
   EXPECT_NE(error.find("no micro.candidate named 'nope'"), std::string::npos)
       << error;
+}
+
+//===----------------------------------------------------------------------===//
+// Objective selection (§17.1, issue #109 defect 6)
+//===----------------------------------------------------------------------===//
+
+/// Two search spaces, each with its own objective and one candidate. The
+/// objectives differ in direction, so which one is read is observable.
+constexpr llvm::StringLiteral kTwoSpacesTwoObjectives = R"mlir(
+module {
+  micro.search_space @space_a attributes {workload = "a"} {
+    micro.param "N" {kind = "integer", choices = [1 : i64]}
+    micro.candidate @cand_a {bindings = {N = 1 : i64}}
+    micro.objective {direction = "minimize", metric = "latency_cycles"}
+  }
+  micro.search_space @space_b attributes {workload = "b"} {
+    micro.param "N" {kind = "integer", choices = [1 : i64]}
+    micro.candidate @cand_b {bindings = {N = 1 : i64}}
+    micro.objective {direction = "maximize", metric = "dram_bytes"}
+  }
+}
+)mlir";
+
+// The objective must come from the search space the candidate belongs to. The
+// old code took the module's *first* objective, so a candidate in the second
+// space was ranked by the first space's order.
+TEST(SearchObjective, UsesTheSelectedSpacesObjective) {
+  auto parsed = parse(kTwoSpacesTwoObjectives);
+  ASSERT_TRUE(parsed);
+
+  auto a = mlir::llk::micro_mapping_detail::objectiveOrderFromModule(
+      *parsed->module, "cand_a");
+  ASSERT_TRUE(static_cast<bool>(a)) << llvm::toString(a.takeError());
+  ASSERT_TRUE(a->has_value());
+  EXPECT_TRUE((*a)->minimize);
+  EXPECT_EQ((*a)->primary, CostMetric::LatencyCycles);
+
+  auto b = mlir::llk::micro_mapping_detail::objectiveOrderFromModule(
+      *parsed->module, "cand_b");
+  ASSERT_TRUE(static_cast<bool>(b)) << llvm::toString(b.takeError());
+  ASSERT_TRUE(b->has_value());
+  EXPECT_FALSE((*b)->minimize);
+  EXPECT_EQ((*b)->primary, CostMetric::DramBytes);
+}
+
+// With no selector, several declared objectives are ambiguous: rejecting is
+// what keeps a candidate from being silently ranked by another space's order.
+TEST(SearchObjective, SeveralObjectivesWithoutASelectorAreRejected) {
+  auto parsed = parse(kTwoSpacesTwoObjectives);
+  ASSERT_TRUE(parsed);
+
+  auto order = mlir::llk::micro_mapping_detail::objectiveOrderFromModule(
+      *parsed->module);
+  std::string error = takeError(order);
+  EXPECT_NE(error.find("micro.objectives"), std::string::npos) << error;
+}
+
+//===----------------------------------------------------------------------===//
+// Persistent global constraints (issue #109 item 5)
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// A machine with one vector engine, so a `vector_width_supported` constraint
+/// has a lane count to compare against.
+constexpr llvm::StringLiteral kVectorMachine = R"yaml(
+schema: llk.machine.v2
+target: constrained
+executors:
+  - id: worker.0
+    kind: worker
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: worker.0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.0
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+)yaml";
+
+/// A space whose `vector_width_supported` constraint distinguishes its two
+/// candidates: `vector_width = 8` matches the engine's lanes, `16` exceeds
+/// them.
+constexpr llvm::StringLiteral kConstrainedSpace = R"mlir(
+module {
+  micro.kernel @gemm {
+    %a = micro.tile_alloc : !micro.tile<16x32xf32, memory = #micro.memory<sram>>
+    %b = micro.tile_alloc : !micro.tile<32x16xf32, memory = #micro.memory<sram>>
+    %c = micro.tile_alloc : !micro.tile<16x16xf32, memory = #micro.memory<sram>>
+    %r = micro.mma %a, %b, %c {shape = array<i64: 16, 16, 32>, input = #micro.dtype<f32>, accumulator = #micro.dtype<f32>} : !micro.tile<16x32xf32, memory = #micro.memory<sram>>, !micro.tile<32x16xf32, memory = #micro.memory<sram>>, !micro.tile<16x16xf32, memory = #micro.memory<sram>> -> !micro.tile<16x16xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  micro.search_space @space attributes {workload = "gemm"} {
+    micro.param "vector_width" {kind = "integer", choices = [8 : i64, 16 : i64]}
+    micro.constraint "vector_width_supported" {params = ["vector_width"]}
+    micro.candidate @ok {bindings = {vector_width = 8 : i64}}
+    micro.candidate @wide {bindings = {vector_width = 16 : i64}}
+  }
+}
+)mlir";
+
+/// The same constrained space over a kernel with no MMA, so no workload shape
+/// can be derived.
+constexpr llvm::StringLiteral kConstrainedSpaceWithoutMma = R"mlir(
+module {
+  micro.kernel @plain {
+    %t = micro.tile_alloc : !micro.tile<8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  micro.search_space @space attributes {workload = "plain"} {
+    micro.param "vector_width" {kind = "integer", choices = [8 : i64, 16 : i64]}
+    micro.constraint "vector_width_supported" {params = ["vector_width"]}
+    micro.candidate @ok {bindings = {vector_width = 8 : i64}}
+  }
+}
+)mlir";
+
+/// The first `micro.kernel` in `module`, or null.
+mlir::Operation *firstKernel(mlir::ModuleOp module) {
+  mlir::Operation *kernel = nullptr;
+  module.walk([&](mlir::Operation *op) {
+    if (!kernel && op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+  });
+  return kernel;
+}
+
+llvm::Expected<mlir::llk::machine::MachineModel> vectorMachine() {
+  return mlir::llk::machine::parseMachineModel(kVectorMachine, "<test>");
+}
+} // namespace
+
+// A binding that violates a `micro.constraint` is rejected before the search:
+// the constraint is the space's persistent global legality rule, so the plan
+// must never be selected.
+TEST(SearchBindingLoader, EnforcesTheSpacesConstraintsOnABinding) {
+  auto parsed = parse(kConstrainedSpace);
+  ASSERT_TRUE(parsed);
+  llvm::Expected<mlir::llk::machine::MachineModel> machine = vectorMachine();
+  ASSERT_TRUE(static_cast<bool>(machine))
+      << llvm::toString(machine.takeError());
+
+  auto ok = loadSearchBinding(parsed->module.get(), "ok");
+  ASSERT_TRUE(static_cast<bool>(ok)) << llvm::toString(ok.takeError());
+  EXPECT_FALSE(static_cast<bool>(verifyBindingLegality(
+      *parsed->module, *ok, firstKernel(*parsed->module), *machine)));
+
+  auto wide = loadSearchBinding(parsed->module.get(), "wide");
+  ASSERT_TRUE(static_cast<bool>(wide)) << llvm::toString(wide.takeError());
+  llvm::Error error = verifyBindingLegality(
+      *parsed->module, *wide, firstKernel(*parsed->module), *machine);
+  ASSERT_TRUE(static_cast<bool>(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("violates the search space's constraints"),
+            std::string::npos)
+      << text;
+  EXPECT_NE(text.find("vector_width 16 exceeds engine 'vpu' lanes 8"),
+            std::string::npos)
+      << text;
+}
+
+// A space that declares constraints over a kernel with no MMA cannot be
+// evaluated: failing is required, because an unenforced constraint must not
+// look like an enforced one.
+TEST(SearchBindingLoader, AConstrainedSpaceWithoutAShapeIsRejected) {
+  auto parsed = parse(kConstrainedSpaceWithoutMma);
+  ASSERT_TRUE(parsed);
+  llvm::Expected<mlir::llk::machine::MachineModel> machine = vectorMachine();
+  ASSERT_TRUE(static_cast<bool>(machine));
+
+  auto binding = loadSearchBinding(parsed->module.get(), "ok");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+  llvm::Error error = verifyBindingLegality(
+      *parsed->module, *binding, firstKernel(*parsed->module), *machine);
+  ASSERT_TRUE(static_cast<bool>(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("cannot be evaluated"),
+            std::string::npos);
+}
+
+// A space with no constraints is always legal, and the check costs nothing --
+// it does not even need a shape (a null kernel is fine).
+TEST(SearchBindingLoader, ASpaceWithoutConstraintsIsAlwaysLegal) {
+  auto parsed = parse(kTwoSpacesTwoObjectives);
+  ASSERT_TRUE(parsed);
+  llvm::Expected<mlir::llk::machine::MachineModel> machine = vectorMachine();
+  ASSERT_TRUE(static_cast<bool>(machine));
+
+  auto binding = loadSearchBinding(parsed->module.get(), "cand_a");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+  EXPECT_FALSE(static_cast<bool>(
+      verifyBindingLegality(*parsed->module, *binding, nullptr, *machine)));
 }
 
 } // namespace

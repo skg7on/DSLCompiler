@@ -24,13 +24,12 @@
 #      layout value that is a legal micro kind but not the id the rule declares
 #      (`row_major` vs `blocked`) both end in `no_matching_rule`;
 #   5. an unknown candidate symbol is a load error naming it;
-#   6. namespace honesty (carried item B): the *shipped* AVX2 rules declare
-#      `avx2.blocked_2d`, while a `layout`-kind parameter can only spell a micro
-#      layout *kind* (`blocked`). The two never compare equal, so the same
-#      fixture under the shipped target fails `no_matching_rule` rather than
-#      silently selecting the wrong layout. A target that expects a bound layout
-#      must name its layout ids after the kind spellings -- which is what the
-#      fixture target in binding_layouts.llkmap does.
+#   6. the kind-to-layout bridge: the *shipped* AVX2 rules declare
+#      `avx2.blocked_2d`, and that layout declares `implements blocked`, so the
+#      bound Micro kind `blocked` resolves to that target id and the same
+#      fixture maps under the shipped target. Before the bridge the two
+#      namespaces never compared equal, so a binding could only veto rules --
+#      never select a layout.
 #   7. the report -> bind round-trip survives a binding (ruling S8): the id the
 #      `--micro-map candidate=` run reports is reproduced by `--micro-bind-plan`
 #      with the *same* `candidate=`, byte-identically -- and is absent without
@@ -151,15 +150,17 @@ grep -q 'no_matching_rule' "$WORK/foreign.out" ||
 expect_failure "$PROBE mode=deterministic candidate=does_not_exist" \
     "no micro.candidate named 'does_not_exist'" "$WORK/unknown.out"
 
-# --- 6. Namespace honesty: the shipped ids never match a bound kind. ---------
+# --- 6. The kind-to-layout bridge: a bound kind selects a shipped layout. -----
 # The same satisfiable candidate, mapped against the shipped AVX2 target whose
-# rule declares `avx2.blocked_2d`: the bound `blocked` is not among the rule's
-# declared ids, so the vector node has no rule and the search fails -- the
-# alignment is required, and its absence is diagnosable rather than silent.
-expect_failure "$AVX2 mode=deterministic candidate=candidate_17" \
-    'the search produced no complete plan' "$WORK/namespace.out"
-grep -q 'no_matching_rule' "$WORK/namespace.out" ||
-  fail "the namespace mismatch did not report no_matching_rule"
+# `avx2.blocked_2d` declares `implements blocked`. The bound Micro kind
+# `blocked` resolves to that target id, so the rule's `require layout operand0
+# satisfies avx2.blocked_2d` is satisfied and the node maps.
+if ! "$LLK_OPT" "--micro-map=$AVX2 mode=deterministic candidate=candidate_17" \
+      "$FIXTURE" > "$WORK/shipped.mlir" 2> "$WORK/shipped.err"; then
+  fail "the shipped AVX2 target did not map under the bound kind: $(cat "$WORK/shipped.err")"
+fi
+grep -q 'avx2.blocked_2d' "$WORK/shipped.mlir" ||
+  fail "the shipped mapping did not record the selected avx2.blocked_2d layout"
 
 # --- 7. The report -> bind round-trip holds under a binding (ruling S8). -----
 # A plan id folds in the binding's hash, so the id `--micro-map

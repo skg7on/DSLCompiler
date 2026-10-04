@@ -108,6 +108,30 @@ public:
   llvm::Expected<KernelFn> lookupOrCompile(const KernelKey &key,
                                            mlir::ModuleOp module);
 
+  /// The compiled entry point as the signature the caller knows it has:
+  ///
+  ///   auto fn = cache.lookupTyped<MemRef2D (*)(MemRef2D, MemRef2D)>(key, m);
+  ///
+  /// `KernelFn` is the fixed five-descriptor signature the legacy kernels use.
+  /// A kernel from another front end -- a lowered `micro.kernel`, say -- has
+  /// whatever arity and result convention its lowerer produced, so a caller
+  /// that knows the signature must be able to ask for it directly rather than
+  /// forcing every kernel through one shape. This is the same compilation path
+  /// `lookupOrCompile` takes, so the L3 cache is shared between them.
+  ///
+  /// The cast is the caller's assertion about the kernel it compiled; nothing
+  /// here can check it, which is why the typed form is opt-in and the fixed
+  /// `KernelFn` remains the default.
+  template <typename Fn>
+  llvm::Expected<Fn> lookupTyped(const std::string &cache_key,
+                                 mlir::ModuleOp module) {
+    llvm::Expected<KernelFn> compiled =
+        lookupOrCompile(cache_key, std::move(module));
+    if (!compiled)
+      return compiled.takeError();
+    return reinterpret_cast<Fn>(*compiled);
+  }
+
   // -----------------------------------------------------------------------
   // L3: Object-code cache (KernelKey → function pointer)
   // -----------------------------------------------------------------------
@@ -205,6 +229,9 @@ private:
   std::unique_ptr<llvm::orc::LLJIT> jit_;
 
   // Backward-compat string-keyed cache (used by the string overload).
+  /// Compiled entry points. The address is signature-agnostic; a caller
+  /// reinterprets it as the `KernelFn` convention or, through `lookupTyped`,
+  /// as the signature its own kernel has.
   std::unordered_map<std::string, KernelFn> cache_;
   mutable std::shared_mutex mutex_;
 

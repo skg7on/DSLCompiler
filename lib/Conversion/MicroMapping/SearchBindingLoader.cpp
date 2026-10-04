@@ -13,6 +13,7 @@
 
 #include "LLK/Conversion/MicroMapping/SearchBindingLoader.h"
 
+#include "LLK/Perf/Legality.h"
 #include "LLK/Perf/SearchSpace.h"
 
 // MicroDialect/MicroEnums/MicroHelpers are prerequisites for the generated
@@ -163,11 +164,11 @@ llvm::Expected<SearchBinding> loadSearchBinding(mlir::ModuleOp module,
   return makeSearchBinding(candidate.getSymName().str(), std::move(values));
 }
 
-llvm::Expected<std::optional<std::string>>
-loadBoundLayout(mlir::ModuleOp module, const SearchBinding &binding) {
+llvm::Expected<llvm::StringMap<std::string>>
+loadBoundLayouts(mlir::ModuleOp module, const SearchBinding &binding) {
   // A binding names the candidate it was loaded from, so the space's parameter
   // declarations can be found again. The name is required: without it there is
-  // no space to read the layout role from.
+  // no space to read the layout roles from.
   if (binding.candidateId.empty())
     return error("a binding with no candidateId cannot resolve a bound layout");
 
@@ -189,32 +190,120 @@ loadBoundLayout(mlir::ModuleOp module, const SearchBinding &binding) {
     return loaded.takeError();
 
   // By kind, never by name: the space names its parameters, so only the
-  // declared `kind` says which one is the layout role.
-  const perf::SearchParam *layoutParam = loaded->findParamOfKind("layout");
-  if (!layoutParam) {
-    // `findParamOfKind` returns null both for "no layout parameter" and for
-    // "several, so none is *the* role". The two must not be conflated: the
-    // first leaves the axis to the rules, while the second would silently
-    // ignore a value the caller bound. There is no per-role layout binding
-    // surface yet, so the honest answer is an error naming the space.
-    for (const perf::SearchParam &param : loaded->params)
-      if (param.kind == "layout")
-        return error(
-            "micro.search_space '" + loaded->name +
-            "' declares more than one layout-kind parameter; a binding cannot "
-            "say which one selects the plan's layout (per-role layout bindings "
-            "are not implemented)");
-    return std::optional<std::string>{};
+  // declared `kind` says which of them is a layout. Each one is keyed by the
+  // role it governs -- the port a rule names, or "" for the whole axis.
+  llvm::StringMap<std::string> bound;
+  llvm::StringMap<std::string> declaredRoles;
+  for (const perf::SearchParam &param : loaded->params) {
+    if (param.kind != "layout")
+      continue;
+    // Two parameters for one role would leave "which one selects that role's
+    // layout" unanswerable, and picking either would silently ignore a value
+    // the caller bound. The space has to say.
+    auto role = declaredRoles.find(param.role);
+    if (role != declaredRoles.end())
+      return error("micro.search_space '" + loaded->name +
+                   "' declares more than one layout-kind parameter for role '" +
+                   (param.role.empty() ? std::string("<none>") : param.role) +
+                   "'; a binding cannot say which one selects that layout");
+    declaredRoles[param.role] = param.name;
+
+    auto value = binding.values.find(param.name);
+    if (value == binding.values.end())
+      return error("binding does not bind layout parameter '" + param.name +
+                   "'");
+    if (const std::string *text = std::get_if<std::string>(&value->second)) {
+      bound[param.role] = *text;
+      continue;
+    }
+    return error("binding value for layout parameter '" + param.name +
+                 "' is not a string");
+  }
+  return bound;
+}
+
+namespace {
+
+/// The workload shape the space's constraints are evaluated against, taken from
+/// the kernel's first `micro.mma`: its declared M/N/K and dtypes. A GEMM-shaped
+/// space cannot be evaluated against anything else, and a kernel with no MMA
+/// offers no such shape -- the two cases are distinguished by the caller.
+std::optional<perf::WorkloadShape> workloadShapeOf(mlir::Operation *kernel) {
+  perf::WorkloadShape shape;
+  bool found = false;
+  kernel->walk([&](mlir::Operation *op) {
+    if (found || op->getName().getStringRef() != "micro.mma")
+      return;
+    auto mma = llvm::dyn_cast<micro::MmaOp>(op);
+    if (!mma)
+      return;
+    llvm::ArrayRef<int64_t> dims = mma.getShape();
+    if (dims.size() != 3)
+      return;
+    shape.M = dims[0];
+    shape.N = dims[1];
+    shape.K = dims[2];
+    shape.inputDType = micro::stringifyDType(mma.getInput()).str();
+    shape.weightDType = shape.inputDType;
+    shape.accumulatorDType = micro::stringifyDType(mma.getAccumulator()).str();
+    shape.outputDType = shape.accumulatorDType;
+    found = true;
+  });
+  if (!found)
+    return std::nullopt;
+  return shape;
+}
+
+} // namespace
+
+llvm::Error verifyBindingLegality(mlir::ModuleOp module,
+                                  const SearchBinding &binding,
+                                  mlir::Operation *kernel,
+                                  const machine::MachineModel &machine) {
+  llvm::Expected<micro::CandidateOp> found =
+      findCandidateByName(module, binding.candidateId);
+  if (!found)
+    return found.takeError();
+  if (!*found)
+    return error("no micro.candidate named '" + binding.candidateId + "'");
+  auto space = dyn_cast<micro::SearchSpaceOp>((*found)->getParentOp());
+  if (!space)
+    return error("micro.candidate @" + binding.candidateId +
+                 " is not nested in a micro.search_space");
+
+  llvm::Expected<perf::SearchSpace> loaded = perf::loadSearchSpace(space);
+  if (!loaded)
+    return loaded.takeError();
+  // A space with no constraints is always legal, and reading the shape would
+  // only add a failure mode that does not exist.
+  if (loaded->constraints.empty())
+    return llvm::Error::success();
+
+  std::optional<perf::WorkloadShape> shape = workloadShapeOf(kernel);
+  if (!shape)
+    return error(
+        "micro.search_space '" + loaded->name +
+        "' declares micro.constraints, but the kernel has no micro.mma "
+        "to derive the workload shape from, so the constraints cannot "
+        "be evaluated");
+
+  perf::Candidate candidate;
+  candidate.id = binding.candidateId;
+  for (const auto &entry : binding.values) {
+    if (const int64_t *integer = std::get_if<int64_t>(&entry.second))
+      candidate.values[entry.first().str()] = *integer;
+    else
+      candidate.symbolicValues[entry.first().str()] =
+          std::get<std::string>(entry.second);
   }
 
-  auto bound = binding.values.find(layoutParam->name);
-  if (bound == binding.values.end())
-    return error("binding does not bind layout parameter '" +
-                 layoutParam->name + "'");
-  if (const std::string *text = std::get_if<std::string>(&bound->second))
-    return std::optional<std::string>(*text);
-  return error("binding value for layout parameter '" + layoutParam->name +
-               "' is not a string");
+  perf::LegalityResult legality =
+      perf::checkLegality(*loaded, candidate, *shape, machine);
+  if (!legality.legal)
+    return error(
+        "micro.candidate @" + binding.candidateId +
+        " violates the search space's constraints: " + legality.reason);
+  return llvm::Error::success();
 }
 
 } // namespace mlir::llk::mapping

@@ -179,6 +179,46 @@ TEST(PlanBinder, MappedIrVerifiesAndRoundTripsWithoutATargetPlugin) {
       static_cast<bool>(verifyMappedMicroIR(*reparsed, *fixture.target)));
 }
 
+// The bound IR must state the *concrete* layout instantiation the plan chose,
+// not merely the family: `avx2.blocked_2d` alone cannot tell a materializer
+// whether the plan meant `VW = 4` or `VW = 8`. The parameters are persisted as
+// typed attributes under `layout_parameters`, alongside the family ids.
+TEST(PlanBinder, PersistsTheSolvedLayoutParameters) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  llvm::Expected<BoundPlan> bound =
+      bindPlan(*fixture.module, *plan, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  bool sawSolvedWidth = false;
+  bound->kernel->walk([&](Operation *op) {
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping)
+      return;
+    auto layoutParameters = mapping.getAs<DictionaryAttr>("layout_parameters");
+    if (!layoutParameters)
+      return;
+    for (const NamedAttribute &entry : layoutParameters) {
+      auto parameters = dyn_cast<DictionaryAttr>(entry.getValue());
+      ASSERT_TRUE(parameters) << "layout_parameters entry is not a dictionary";
+      // The AVX2 blocked layout is parameterized by M, N, and VW; a solved
+      // integer VW is what says which instantiation was selected.
+      if (auto vw = parameters.getAs<IntegerAttr>("VW"))
+        sawSolvedWidth = true;
+    }
+  });
+  EXPECT_TRUE(sawSolvedWidth);
+
+  // The persisted parameters are ordinary metadata, so phase-2 verification
+  // still accepts the module.
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, *fixture.target)));
+}
+
 TEST(PlanBinder, MachineAwareVerificationRejectsAnUnknownExecutor) {
   Fixture fixture = makeFixture();
   ASSERT_TRUE(fixture.module);
@@ -319,6 +359,105 @@ llvm::Expected<std::unique_ptr<MappingTarget>> movementTarget() {
       std::vector<std::string>{"e1"});
 }
 
+/// The movement machine with a second route from SRAM to DRAM: a staged hop
+/// through an L2. One value can then be carried two legal ways, which is what
+/// exercises one copy chain per route.
+constexpr llvm::StringLiteral kTwoRouteMachine = R"yaml(
+schema: llk.machine.v2
+target: two-route
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.a
+    kind: cluster
+  - id: worker.a
+    kind: worker
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+  - id: worker.b
+    kind: worker
+    parent: cluster.b
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.a
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+  - id: stage.0
+    kind: l2
+    visible_from: cluster.a
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+  - id: dram.0
+    kind: dram
+    visible_from: cluster.b
+    capacity_bytes: 1073741824
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.a
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+transfer_engines:
+  - id: dma.a
+    kind: dma
+    attached_to: cluster.a
+    count: 1
+    max_outstanding: 1
+links:
+  - id: sram_to_dram.0
+    source: sram.0
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+  - id: sram_to_stage.0
+    source: sram.0
+    destination: stage.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+  - id: stage_to_dram.0
+    source: stage.0
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+)yaml";
+
+/// `movementTarget` over the two-route machine, so the same edge can be carried
+/// by a direct hop or a staged one.
+llvm::Expected<std::unique_ptr<MappingTarget>> twoRouteTarget() {
+  llvm::Expected<mlir::llk::machine::MachineModel> machine =
+      mlir::llk::machine::parseMachineModel(kTwoRouteMachine, "<test>");
+  if (!machine)
+    return machine.takeError();
+  llvm::Expected<LayoutRegistry> layouts = parseLayoutText("", "<test>");
+  if (!layouts)
+    return layouts.takeError();
+  llvm::Expected<RuleRegistry> rules = parseRuleText(kMovementRules, "<test>");
+  if (!rules)
+    return rules.takeError();
+  return std::make_unique<FileMappingTarget>(
+      "two-route", std::move(*machine), std::move(*layouts), std::move(*rules),
+      std::vector<std::string>{"e1"});
+}
+
 size_t countOps(ModuleOp module, llvm::StringRef name) {
   size_t count = 0;
   module->walk([&](Operation *op) {
@@ -379,73 +518,218 @@ TEST(PlanBinder, ReportsConnectionsItCannotMaterialize) {
   EXPECT_TRUE(bound->unmaterialized.empty());
 }
 
-TEST(PlanBinder, ReportsALayoutTransformConnectionItCannotMaterialize) {
-  // A `LayoutTransform` connection is same-memory: there is nothing to move,
-  // but the selected transform has no Micro operation form (design §13.4). The
-  // binder must report it, not drop it (design §18.2). The plan is built by
-  // hand because today's search never emits a transform-only connection -- the
-  // point is that *if* one is selected, it is named in `unmaterialized`.
+// A `LayoutTransform` connection moves nothing -- the value already sits in the
+// memory the consumer reads -- and the conversion becomes one target-neutral
+// `micro.transform`, which names the two layouts by their affine maps rather
+// than by a target id (design §13.4).
+TEST(PlanBinder, MaterializesALayoutTransformAsATransformOp) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+
+  // Turn the real movement into a transform-only connection: no hop, and a
+  // conversion with a solved map on each side.
+  mlir::MLIRContext *context = fixture.context.get();
+  PlanConnection &connection = plan->connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route.resize(1); // same memory: nothing to move
+  LayoutTransform transform;
+  transform.srcLayout = "t.plain";
+  transform.dstLayout = "t.blocked";
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  transform.dstMap = mlir::AffineMap::get(
+      2, 0,
+      {mlir::getAffineDimExpr(0, context),
+       mlir::getAffineBinaryOpExpr(mlir::AffineExprKind::FloorDiv,
+                                   mlir::getAffineDimExpr(1, context),
+                                   mlir::getAffineConstantExpr(8, context))},
+      context);
+  connection.transform = transform;
+
+  const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
+  const size_t transformsBefore = countOps(*fixture.module, "micro.transform");
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  for (const std::string &note : bound->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(bound->unmaterialized.empty());
+  // A transform-only connection emits no copy, and exactly one transform.
+  EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore);
+  EXPECT_EQ(countOps(*bound->module, "micro.transform"), transformsBefore + 1);
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
+}
+
+// A `TransferAndTransform` moves the value *and* converts it: the copies land
+// it in the consumer's memory and one `micro.transform` re-represents it there.
+TEST(PlanBinder, MaterializesATransferAndTransformAsCopiesPlusATransform) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+
+  mlir::MLIRContext *context = fixture.context.get();
+  PlanConnection &connection = plan->connectionPlans.front();
+  connection.kind = ConnectionKind::TransferAndTransform;
+  const size_t hops = connection.route.size() - 1;
+  LayoutTransform transform;
+  transform.srcLayout = "t.plain";
+  transform.dstLayout = "t.blocked";
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  connection.transform = transform;
+
+  const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  EXPECT_TRUE(bound->unmaterialized.empty());
+  EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore + hops);
+  EXPECT_EQ(countOps(*bound->module, "micro.transform"), 1u);
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
+}
+
+// The executable contract refuses exactly the plan the partial contract
+// reports: a caller that will hand the result to a backend must not receive IR
+// that silently omits a selected decision, while analysis/reporting keeps the
+// partial plan.
+TEST(PlanBinder, ExecutableContractRefusesAPlanThatOmitsADecision) {
   Fixture fixture = makeFixture();
   ASSERT_TRUE(fixture.module);
   ASSERT_NE(fixture.target, nullptr);
 
+  // A `Reduce` connection has no Micro operation form, so it is the decision
+  // the partial contract reports and the executable contract refuses.
   CoveringPlan plan;
   plan.id = 42;
   PlanConnection connection;
   connection.id = 1;
   connection.value = 7;
-  connection.kind = ConnectionKind::LayoutTransform;
-  connection.route.push_back("sram.0"); // a same-memory, in-place transform
+  connection.kind = ConnectionKind::Reduce;
+  plan.connectionPlans.push_back(connection);
+
+  // The partial contract binds it and reports the omission.
+  llvm::Expected<BoundPlan> partial =
+      bindPlan(*fixture.module, plan, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(partial))
+      << llvm::toString(partial.takeError());
+  EXPECT_FALSE(partial->unmaterialized.empty());
+
+  // The executable contract refuses it, naming the decision.
+  llvm::Expected<BoundPlan> executable = bindPlan(
+      *fixture.module, plan, *fixture.target, BindContract::Executable);
+  ASSERT_FALSE(static_cast<bool>(executable));
+  std::string error = llvm::toString(executable.takeError());
+  EXPECT_NE(error.find("not fully executable"), std::string::npos) << error;
+  EXPECT_NE(error.find("reduce_not_materialized"), std::string::npos) << error;
+}
+
+TEST(PlanBinder, ReduceIsStillReportedBecauseItHasNoMicroOperationForm) {
+  // `Reduce` (a gather) is not a movement, so the binder emits nothing for it
+  // and reports it rather than dropping it. `Replicate`, by contrast, is now
+  // materialized (see below): it is a fan-out copy, the same chain a movement
+  // uses. The plan is built by hand because the placement layer does not
+  // produce a `Reduce` yet -- the contract is what is under test.
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+
+  CoveringPlan plan;
+  plan.id = 1;
+  PlanConnection connection;
+  connection.id = 1;
+  connection.value = 9;
+  connection.kind = ConnectionKind::Reduce;
   plan.connectionPlans.push_back(connection);
 
   llvm::Expected<BoundPlan> bound =
       bindPlan(*fixture.module, plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
-
   ASSERT_EQ(bound->unmaterialized.size(), 1u);
-  // The entry is exactly "value <id>: <token>".
-  EXPECT_EQ(bound->unmaterialized.front(),
-            "value 7: layout_transform_requires_dialect_op");
+  EXPECT_EQ(bound->unmaterialized.front(), "value 9: reduce_not_materialized");
 }
 
-TEST(PlanBinder, ReportsOtherConnectionKindsItCannotMaterialize) {
-  // `Replicate` and `Reduce` are not plain movements, so the binder emits
-  // nothing for them today. They must still be reported rather than dropped.
-  // The placement layer does not produce these kinds yet, so the plan is built
-  // by hand -- the contract is what is under test.
-  Fixture fixture = makeFixture();
-  ASSERT_TRUE(fixture.module);
-  ASSERT_NE(fixture.target, nullptr);
-
-  const std::pair<ConnectionKind, std::string> cases[] = {
-      {ConnectionKind::Replicate, "value 9: replicate_not_materialized"},
-      {ConnectionKind::Reduce, "value 9: reduce_not_materialized"},
-  };
-  for (const auto &[kind, expected] : cases) {
-    CoveringPlan plan;
-    plan.id = 1;
-    PlanConnection connection;
-    connection.id = 1;
-    connection.value = 9;
-    connection.kind = kind;
-    plan.connectionPlans.push_back(connection);
-
-    llvm::Expected<BoundPlan> bound =
-        bindPlan(*fixture.module, plan, *fixture.target);
-    ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
-    ASSERT_EQ(bound->unmaterialized.size(), 1u);
-    EXPECT_EQ(bound->unmaterialized.front(), expected);
-  }
-}
-
-TEST(PlanBinder, ReportsADuplicateValueConnectionWithADifferentRoute) {
-  // One value can be reached by several connections when a producer feeds
-  // several consumers. A single copy chain can only serve the routes it takes,
-  // so a duplicate with a *different* route must be reported -- otherwise the
-  // second consumer silently reads the first route's memory.
+TEST(PlanBinder, MaterializesAReplicateConnectionAsACopyChain) {
+  // A `Replicate` is a fan-out copy: the same copy chain a movement emits,
+  // serving one destination group. It is materialized, not reported.
   Fixture fixture = makeFixture();
   ASSERT_TRUE(fixture.module);
   llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+  ASSERT_EQ(plan->connectionPlans.front().kind, ConnectionKind::Transfer);
+  const size_t hops = plan->connectionPlans.front().route.size() - 1;
+  for (PlanConnection &connection : plan->connectionPlans)
+    connection.kind = ConnectionKind::Replicate;
+
+  // The source kernel already carries an `async_copy`, so the emitted chain is
+  // counted against that baseline (as `EmitsACopyAndWaitWhenTheValueMustMove`
+  // does).
+  const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  EXPECT_TRUE(bound->unmaterialized.empty());
+  EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore + hops);
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
+}
+
+TEST(PlanBinder, RewiresOnlyTheConsumersItsConnectionNames) {
+  // Rewiring is scoped to the connection's own consumers. A connection with no
+  // recorded consumers therefore emits its copy but redirects nobody -- the
+  // reader keeps reading the original value. (The old binder rewired *every*
+  // reader of the value, which is wrong as soon as two connections carry one
+  // value along different routes.)
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+  for (PlanConnection &connection : plan->connectionPlans)
+    connection.consumers.clear();
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  EXPECT_TRUE(bound->unmaterialized.empty());
+
+  // The copy exists, but nothing reads it: no consumer was named.
+  Operation *copy = nullptr;
+  bound->kernel->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.async_copy")
+      copy = op;
+  });
+  ASSERT_NE(copy, nullptr);
+  EXPECT_TRUE(copy->getResult(0).use_empty());
+}
+
+TEST(PlanBinder, EmitsOneChainPerRouteAndSurvivesBoth) {
+  // One value reached by two connections with *different* routes gets one copy
+  // chain per route instead of being reported as un-materializable: each chain
+  // lands the value in its own memory, and each rewires only its own consumers.
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = twoRouteTarget();
   ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
 
   llvm::Expected<CoveringPlan> plan =
@@ -456,17 +740,26 @@ TEST(PlanBinder, ReportsADuplicateValueConnectionWithADifferentRoute) {
   ASSERT_EQ(first.kind, ConnectionKind::Transfer);
   ASSERT_GE(first.route.size(), 2u);
 
-  const WorkloadValueId value = first.value;
+  // The other legal route between the same endpoints: whichever the search did
+  // not take, the direct hop or the staged one.
+  const llvm::SmallVector<MemoryNodeId> direct{"sram.0", "dram.0"};
+  const llvm::SmallVector<MemoryNodeId> staged{"sram.0", "stage.0", "dram.0"};
   PlanConnection duplicate = first;
   duplicate.id = first.id + 1;
-  duplicate.route.push_back(first.route.back()); // a different route
+  duplicate.route = (first.route == direct) ? staged : direct;
   plan->connectionPlans.push_back(duplicate);
+
+  const size_t expectedCopies =
+      (first.route.size() - 1) + (duplicate.route.size() - 1);
+  const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
 
   llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
-  ASSERT_EQ(bound->unmaterialized.size(), 1u);
-  EXPECT_EQ(bound->unmaterialized.front(),
-            "value " + std::to_string(value) + ": duplicate_route_for_value");
+  EXPECT_TRUE(bound->unmaterialized.empty());
+  EXPECT_EQ(countOps(*bound->module, "micro.async_copy"),
+            copiesBefore + expectedCopies);
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
 }
 
 TEST(PlanBinder, MergesADuplicateValueConnectionWithTheSameRoute) {

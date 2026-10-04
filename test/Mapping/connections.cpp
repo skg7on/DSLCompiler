@@ -246,6 +246,48 @@ TEST(Connections, TransformOnlyWhenLayoutsDifferInPlace) {
   EXPECT_EQ((*plans)[0].transform->dstLayout, "t.b");
 }
 
+// Two endpoints that name the same layout *family* but solved different
+// parameters hold different representations: `t.a` with `VW = 4` is not the
+// same physical layout as `t.a` with `VW = 8`, so the pair needs a transform
+// even though the class ids match.
+TEST(Connections, TransformWhenOnlyTheSolvedParametersDiffer) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.consumerLayout = "t.a";
+  request.producerLayoutParameters["VW"] = int64_t(4);
+  request.consumerLayoutParameters["VW"] = int64_t(8);
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::LayoutTransform);
+  ASSERT_TRUE((*plans)[0].transform.has_value());
+  EXPECT_EQ((*plans)[0].transform->srcLayout, "t.a");
+  EXPECT_EQ((*plans)[0].transform->dstLayout, "t.a");
+}
+
+// The same family solved to the same parameters is the same representation, so
+// it still connects directly -- the parameter comparison must not turn every
+// matching pair into a transform.
+TEST(Connections, DirectWhenSolvedParametersAgree) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest request = baseRequest();
+  request.consumerMemory = request.producerMemory;
+  request.consumerLayout = "t.a";
+  request.producerLayoutParameters["VW"] = int64_t(8);
+  request.consumerLayoutParameters["VW"] = int64_t(8);
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ((*plans)[0].kind, ConnectionKind::Direct);
+}
+
 TEST(Connections, DirectReadAndTransferRoutesWhenOnlyMemoryDiffers) {
   // §10.2 defines direct compatibility by memory *visibility*, not by the two
   // memories being the same node: a consumer that can address the producer's

@@ -37,13 +37,34 @@ inline constexpr uint64_t kCostModelVersion = 1;
 
 /// What work is being looked up. Every field is part of the cache key; an
 /// empty field means "not modelled", never "any".
+///
+/// The key must distinguish any two pieces of work whose measured cost could
+/// differ, so it carries the operation's *types* and attributes alongside its
+/// rule, and the *concrete* bundle parameters, layout parameterization, and
+/// placement it resolved to -- not merely the rule and the layout families.
+/// Two candidates that share a rule but differ in dtype, shape, an attribute,
+/// a bundle parameter, a solved layout parameter, or the executor/memory they
+/// bound are different work; keying them together would reuse a measurement
+/// taken under conditions that no longer hold (design §17.4).
 struct OperationSignature {
   std::string operation;
+  /// Canonical rendering of the consuming node's operand and result types --
+  /// dtype and shape -- and of its attributes.
+  std::string operandTypes;
+  std::string resultTypes;
+  std::string attributes;
   std::string rule;
   uint64_t ruleVersion = 0;
   std::string bundle;
+  /// The resolved bundle's typed parameters, canonically rendered.
+  std::string bundleParameters;
+  /// The instance's complete layout identity: each bound requirement's family
+  /// *and* the parameters solved for it, canonically rendered and sorted.
   std::string layout;
+  /// The executor's kind (the placement *class*) and, separately, the concrete
+  /// placement: the executor id bound and its memory bindings.
   std::string placementClass;
+  std::string placement;
   std::string routeClass;
   uint64_t costModelVersion = kCostModelVersion;
 

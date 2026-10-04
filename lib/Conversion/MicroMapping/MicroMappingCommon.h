@@ -166,31 +166,102 @@ inline std::vector<std::string> parseEmitterKeys(llvm::StringRef text) {
   return keys;
 }
 
-/// The first `micro.kernel` in the module, or null. Matched by dialect op name
-/// so this library does not depend on the Micro dialect's generated classes.
-inline Operation *findMicroKernel(ModuleOp module) {
-  Operation *kernel = nullptr;
+/// The module's single `micro.kernel`, resolved by dialect op name so this
+/// library does not depend on the Micro dialect's generated classes.
+///
+/// Fails when the module has no kernel (nothing to map) or more than one. There
+/// is no kernel selector yet, so silently picking the first kernel would map
+/// one and ignore the rest -- exactly the ambiguity the caller must see. The
+/// message names the symbols so the fix (split the module, or name the kernel)
+/// is obvious.
+inline llvm::Expected<Operation *>
+resolveMicroKernel(ModuleOp module, llvm::StringRef passName) {
+  llvm::SmallVector<Operation *, 2> kernels;
   module.walk([&](Operation *op) {
-    if (!kernel && op->getName().getStringRef() == "micro.kernel")
-      kernel = op;
+    if (op->getName().getStringRef() == "micro.kernel")
+      kernels.push_back(op);
   });
-  return kernel;
+  if (kernels.empty())
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        (passName + ": the module has no micro.kernel").str());
+  if (kernels.size() > 1) {
+    std::string names;
+    for (Operation *kernel : kernels) {
+      auto symbol = kernel->getAttrOfType<StringAttr>("sym_name");
+      if (!names.empty())
+        names += ", ";
+      names += symbol ? ("@" + symbol.getValue()).str() : "<unnamed>";
+    }
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        (passName + ": the module has " + std::to_string(kernels.size()) +
+         " micro.kernels (" + names +
+         "); mapping one kernel per module is required, since there is no "
+         "kernel selector")
+            .str());
+  }
+  return kernels.front();
 }
 
-/// The comparison order the module's `micro.objective` declares, if it has one.
-/// Absence is not an error: the caller keeps its default (latency minimized).
-/// A *declared* objective the cost model cannot honor is an error, never a
-/// silent downgrade to latency (§17.1: a target may not replace the declared
-/// objective).
+/// The comparison order the selected search space's `micro.objective` declares,
+/// if it has one. Absence is not an error: the caller keeps its default
+/// (latency minimized). A *declared* objective the cost model cannot honor is
+/// an error, never a silent downgrade to latency (§17.1: a target may not
+/// replace the declared objective).
+///
+/// The objective belongs to the search space the plan is selected *in*, not to
+/// whichever space happens to appear first in the module: two spaces may
+/// declare different objectives, and ranking one space's candidate by another
+/// space's order would silently mis-rank it. When `candidateSymbol` names a
+/// candidate, its enclosing `micro.search_space` supplies the objective.
+/// Without a selector the module's objective is used only when it is
+/// unambiguous: zero, or exactly one. Several objectives with no selector is
+/// rejected.
 inline llvm::Expected<std::optional<mapping::ObjectiveOrder>>
-objectiveOrderFromModule(ModuleOp module) {
+objectiveOrderFromModule(ModuleOp module,
+                         llvm::StringRef candidateSymbol = "") {
   Operation *objectiveOp = nullptr;
-  module.walk([&](Operation *op) {
-    if (!objectiveOp && op->getName().getStringRef() == "micro.objective")
-      objectiveOp = op;
-  });
-  if (!objectiveOp)
-    return std::optional<mapping::ObjectiveOrder>{};
+  if (!candidateSymbol.empty()) {
+    Operation *candidate = nullptr;
+    module.walk([&](Operation *op) {
+      if (candidate || op->getName().getStringRef() != "micro.candidate")
+        return;
+      if (auto symbol = op->getAttrOfType<StringAttr>("sym_name"))
+        if (symbol.getValue() == candidateSymbol)
+          candidate = op;
+    });
+    // An unknown or unspaced candidate is not diagnosed here: the binding
+    // loader owns that error and its message, and it runs on every path that
+    // reaches this. Returning "no objective" keeps this lookup from preempting
+    // the canonical diagnostic with a second, differently-worded one.
+    if (!candidate)
+      return std::optional<mapping::ObjectiveOrder>{};
+    Operation *space = candidate->getParentOp();
+    if (!space || space->getName().getStringRef() != "micro.search_space")
+      return std::optional<mapping::ObjectiveOrder>{};
+    space->walk([&](Operation *op) {
+      if (!objectiveOp && op->getName().getStringRef() == "micro.objective")
+        objectiveOp = op;
+    });
+    if (!objectiveOp)
+      return std::optional<mapping::ObjectiveOrder>{};
+  } else {
+    llvm::SmallVector<Operation *, 2> objectives;
+    module.walk([&](Operation *op) {
+      if (op->getName().getStringRef() == "micro.objective")
+        objectives.push_back(op);
+    });
+    if (objectives.empty())
+      return std::optional<mapping::ObjectiveOrder>{};
+    if (objectives.size() > 1)
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "the module declares " + std::to_string(objectives.size()) +
+              " micro.objectives; pass candidate=<sym> so the objective is "
+              "taken from the selected search space");
+    objectiveOp = objectives.front();
+  }
 
   auto metric = objectiveOp->getAttrOfType<StringAttr>("metric");
   auto direction = objectiveOp->getAttrOfType<StringAttr>("direction");
@@ -305,11 +376,10 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     return target.takeError();
   run.target = std::move(*target);
 
-  run.kernel = findMicroKernel(module);
-  if (!run.kernel)
-    return llvm::createStringError(
-        llvm::inconvertibleErrorCode(),
-        (passName + ": the module has no micro.kernel").str());
+  llvm::Expected<Operation *> kernel = resolveMicroKernel(module, passName);
+  if (!kernel)
+    return kernel.takeError();
+  run.kernel = *kernel;
 
   llvm::Expected<mapping::WorkloadGraph> graph =
       mapping::extractWorkloadGraph(run.kernel);
@@ -324,7 +394,7 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   // module without one leaves the default (latency minimized) in place; one
   // the cost model cannot honor fails the pass rather than being downgraded.
   llvm::Expected<std::optional<mapping::ObjectiveOrder>> objective =
-      objectiveOrderFromModule(module);
+      objectiveOrderFromModule(module, options.candidate);
   if (!objective)
     return objective.takeError();
   if (*objective)
@@ -344,23 +414,76 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   // and the pass fails with the frontier's diagnostics (below) instead of
   // binding a plan the binding does not describe.
   std::optional<mapping::SearchBinding> binding;
-  std::optional<std::string> boundLayout;
+  llvm::StringMap<std::string> boundLayouts;
   if (!options.candidate.empty()) {
     llvm::Expected<mapping::SearchBinding> loaded =
         mapping::loadSearchBinding(module, options.candidate);
     if (!loaded)
       return loaded.takeError();
     binding = std::move(*loaded);
-    llvm::Expected<std::optional<std::string>> layout =
-        mapping::loadBoundLayout(module, *binding);
-    if (!layout)
-      return layout.takeError();
-    boundLayout = std::move(*layout);
+
+    // §16.5: the space's `micro.constraint`s are persistent global legality
+    // rules, so a binding that violates one is rejected *before* the search --
+    // rather than letting the search select a plan the space forbids.
+    if (llvm::Error error = mapping::verifyBindingLegality(
+            module, *binding, run.kernel, run.target->machine()))
+      return std::move(error);
+
+    llvm::Expected<llvm::StringMap<std::string>> layouts =
+        mapping::loadBoundLayouts(module, *binding);
+    if (!layouts)
+      return layouts.takeError();
+    boundLayouts = std::move(*layouts);
+
+    // Bridge each bound Micro layout *kind* to the target layout the rules name
+    // through the target's own declaration (`layout <id> implements <kind>;`).
+    // The two namespaces are otherwise unrelated strings, so without the bridge
+    // a binding can only veto rules that name a different id -- it can never
+    // select the target layout it means. Generic code still only
+    // string-compares the resolved id (ruling S7); the kind is never read as
+    // target semantics.
+    //
+    // The map is keyed by role: a space may bind `operand0` and `lhs`
+    // separately, and each is bridged on its own.
+    for (auto &entry : boundLayouts) {
+      if (entry.second.empty())
+        continue;
+      std::vector<const mapping::LayoutDef *> implementing =
+          run.target->layouts().implementing(entry.second);
+      if (implementing.size() == 1) {
+        entry.second = implementing.front()->id;
+      } else if (implementing.size() > 1) {
+        // Several target layouts implement the bound kind, so the bridge does
+        // not land on one id. Rejected as ambiguous rather than guessing: the
+        // target must disambiguate (name a different kind, or one layout per
+        // kind) before a binding can select among them.
+        std::string names;
+        for (const mapping::LayoutDef *def : implementing) {
+          if (!names.empty())
+            names += ", ";
+          names += "'" + def->id + "'";
+        }
+        return llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
+            (passName + ": the bound layout kind '" + entry.second + "'" +
+             (entry.first().empty()
+                  ? std::string()
+                  : " for role '" + entry.first().str() + "'") +
+             " is implemented by " + std::to_string(implementing.size()) +
+             " target layouts (" + names +
+             "); the kind-to-layout bridge is ambiguous")
+                .str());
+      }
+      // Zero: no target layout claims the kind. The bound value is left as the
+      // bare kind, so a rule that happens to spell its id like the kind still
+      // matches (the pre-bridge behaviour) and any other rule keeps the veto
+      // semantics a binding has always had.
+    }
   }
 
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),
                                  deriveLayoutContext(*graph), searchOptions,
-                                 std::move(binding), std::move(boundLayout));
+                                 std::move(binding), std::move(boundLayouts));
   llvm::Expected<mapping::MappingSearchResult> result = search.search();
   if (!result)
     return result.takeError();
@@ -392,11 +515,12 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
 /// report is surfaced as a warning and the pass still succeeds. The reports are
 /// captured before `takeBody`, because taking the body is what lets the
 /// `BoundPlan` fall out of scope.
-inline llvm::Error bindPlanOntoModule(ModuleOp module,
-                                      const mapping::CoveringPlan &plan,
-                                      const mapping::MappingTarget &target) {
+inline llvm::Error bindPlanOntoModule(
+    ModuleOp module, const mapping::CoveringPlan &plan,
+    const mapping::MappingTarget &target,
+    mapping::BindContract contract = mapping::BindContract::Partial) {
   llvm::Expected<mapping::BoundPlan> bound =
-      mapping::bindPlan(module, plan, target);
+      mapping::bindPlan(module, plan, target, contract);
   if (!bound)
     return bound.takeError();
   for (const std::string &unmaterialized : bound->unmaterialized)

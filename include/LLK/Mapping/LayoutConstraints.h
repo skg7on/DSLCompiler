@@ -89,6 +89,17 @@ struct LayoutDef {
   std::map<std::string, ParamDomain> domains;
   std::vector<ExprPtr> constraints;
   std::optional<AffineMapSpec> map;
+  /// The Micro layout *kind* this target layout implements (`blocked`,
+  /// `row_major`, ...), declared by an optional `implements <kind>;` clause.
+  /// Empty when the layout declares none.
+  ///
+  /// A search-space binding names a Micro kind, while a rule names a
+  /// target-owned layout id; the two namespaces are equal only by accident.
+  /// This clause is the bridge: a pass resolves a bound kind to the target
+  /// layout(s) that declare they implement it, so the binding can *select* a
+  /// target layout rather than only veto rules. Generic mapping code still
+  /// compares strings; it never reads the kind as target semantics.
+  std::string implementsKind;
 
   const LayoutParam *findParam(llvm::StringRef name) const;
   bool isSymbolic(llvm::StringRef name) const;
@@ -109,6 +120,12 @@ public:
 
   const LayoutDef *find(llvm::StringRef id) const;
   llvm::ArrayRef<LayoutDef> all() const { return defs_; }
+
+  /// Every layout declaring `implements <kind>`, in declaration order. Empty
+  /// when no layout implements the kind. More than one is an ambiguity the
+  /// caller resolves (or rejects): the bridge from a Micro kind to a target id
+  /// is only well-defined when it lands on one layout.
+  std::vector<const LayoutDef *> implementing(llvm::StringRef kind) const;
 
   /// FNV-1a 64 hash over every declaration's canonical rendering, folded in id
   /// order so it is independent of file or insertion order and stable across

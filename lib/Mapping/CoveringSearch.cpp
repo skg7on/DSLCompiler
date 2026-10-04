@@ -30,6 +30,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -163,19 +164,28 @@ MemoryNodeId primaryMemory(const MachineModel &machine,
 ///
 /// Two layout classes solved for the same value are ambiguous -- the edge
 /// cannot say which governs -- so that is treated as unattributable too.
-std::optional<LayoutId> boundLayoutForValue(const CandidateInstance &instance,
-                                            WorkloadValueId value) {
-  std::optional<LayoutId> found;
+const SolvedLayout *boundSolvedLayoutForValue(const CandidateInstance &instance,
+                                              WorkloadValueId value) {
+  const SolvedLayout *found = nullptr;
   for (const auto &entry : instance.layoutSolutions) {
     if (entry.second.portValue != static_cast<int64_t>(value))
       continue;
     if (found)
-      return std::nullopt;
-    // The key is the resolved definition id, string-identical to this class's
-    // `layoutBindings` entry (see `SolvedLayout`'s invariant).
-    found = entry.first().str();
+      return nullptr; // two classes for one value: nothing governs it
+    found = &entry.second;
   }
   return found;
+}
+
+/// The layout *family* `instance` bound for `value`. Taken from the solved
+/// layout's own class rather than its containing map's key, which is
+/// index-disambiguated when one class is required by several ports.
+std::optional<LayoutId> boundLayoutForValue(const CandidateInstance &instance,
+                                            WorkloadValueId value) {
+  const SolvedLayout *solved = boundSolvedLayoutForValue(instance, value);
+  if (!solved)
+    return std::nullopt;
+  return solved->layoutClass;
 }
 
 /// Hashes the chosen instance ids, so a partial plan has a stable identity
@@ -225,6 +235,64 @@ sortedKeys(const llvm::StringMap<ValueT> &map) {
     keys.push_back(entry.first());
   llvm::sort(keys);
   return keys;
+}
+
+/// A type's printed form, or "" for a null type.
+std::string renderedType(mlir::Type type) {
+  if (!type)
+    return {};
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  type.print(stream);
+  return stream.str();
+}
+
+/// A node's port types, space-joined in declaration order.
+std::string renderedPortTypes(llvm::ArrayRef<WorkloadPort> ports) {
+  std::vector<std::string> texts;
+  texts.reserve(ports.size());
+  for (const WorkloadPort &port : ports)
+    texts.push_back(renderedType(port.type));
+  return llvm::join(texts, " ");
+}
+
+/// An attribute's printed form, or "" for a null attribute.
+std::string renderedAttribute(mlir::Attribute attribute) {
+  if (!attribute)
+    return {};
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  attribute.print(stream);
+  return stream.str();
+}
+
+/// The instance's complete layout identity: for each bound requirement its
+/// layout family and the parameters solved for it, canonically rendered and
+/// sorted. Two placements that chose different parameterizations of one family
+/// (`VW = 4` versus `VW = 8`) are different work and must not share a key.
+std::string layoutIdentity(const CandidateInstance &instance) {
+  std::vector<std::string> entries;
+  entries.reserve(instance.layoutSolutions.size());
+  for (const auto &entry : instance.layoutSolutions) {
+    std::string text = entry.second.layoutClass;
+    text += "(";
+    text += canonicalSearchValueString(entry.second.parameters);
+    text += ")";
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return llvm::join(entries, ",");
+}
+
+/// The instance's concrete placement identity: the executor it bound and its
+/// sorted memory bindings. Two placements of one rule on different executors or
+/// memories are different work.
+std::string placementIdentity(const CandidateInstance &instance) {
+  std::string text = "executor=";
+  text += instance.executorBindings.lookup("executor");
+  text += ",memories=";
+  text += llvm::join(sortedBindings(instance.memoryBindings), ",");
+  return text;
 }
 
 /// Canonical placement order (design §22.1): the executor id, then the sorted
@@ -278,10 +346,10 @@ CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
                                const LayoutContext &layoutContext,
                                const MappingSearchOptions &options,
                                std::optional<SearchBinding> binding,
-                               std::optional<std::string> boundLayout)
+                               llvm::StringMap<std::string> boundLayouts)
     : workload_(workload), target_(target), context_(context),
       layoutContext_(layoutContext), options_(options),
-      binding_(std::move(binding)), boundLayout_(std::move(boundLayout)) {}
+      binding_(std::move(binding)), boundLayouts_(std::move(boundLayouts)) {}
 
 llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   const MachineModel &machine = target_.machine();
@@ -384,16 +452,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // exactly the pre-binding enumeration.
     const llvm::StringMap<SearchValue> *pinned =
         binding_ ? &binding_->values : nullptr;
-    // The layout the binding resolves to, resolved from its `layout`-kind
-    // parameter by the caller. A null pointer when no binding, or a binding
-    // with no layout-kind parameter, leaves layout selection unchanged.
-    const std::string *boundLayout = boundLayout_ ? &*boundLayout_ : nullptr;
+    // The layouts the binding resolves to, one per role, resolved from the
+    // space's `layout`-kind parameters by the caller. An empty map -- no
+    // binding, or a binding with no layout-kind parameter -- leaves layout
+    // selection unchanged.
+    const llvm::StringMap<std::string> *boundLayouts =
+        boundLayouts_.empty() ? nullptr : &boundLayouts_;
     for (const RuleDef *rule : matches) {
       std::string reason;
       bool truncated = false;
       std::optional<MappingCandidate> candidate =
           toMappingCandidate(*rule, *node, machine, layoutContext_, &reason,
-                             &truncated, pinned, boundLayout);
+                             &truncated, pinned, boundLayouts);
       if (!candidate) {
         if (truncated) {
           result.searchTruncated = true;
@@ -437,19 +507,26 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           if (const LatencyProvider *provider = target_.latencyProvider()) {
             OperationSignature signature;
             signature.operation = node->opName;
+            // The operation's own types and attributes: two workloads on one
+            // rule that differ in dtype, shape, or a predicate-relevant
+            // attribute are different work at different costs.
+            signature.operandTypes = renderedPortTypes(node->inputs);
+            signature.resultTypes = renderedPortTypes(node->outputs);
+            signature.attributes = renderedAttribute(node->attributes);
             signature.rule = rule->id;
             signature.ruleVersion = rule->version;
-            signature.bundle = rule->bundle;
-            if (!entry.instance.layoutBindings.empty()) {
-              std::vector<std::string> layouts;
-              for (const auto &binding : entry.instance.layoutBindings)
-                layouts.push_back(binding.second);
-              llvm::sort(layouts);
-              signature.layout = layouts.front();
-            }
+            signature.bundle = entry.instance.bundle.name.empty()
+                                   ? rule->bundle
+                                   : entry.instance.bundle.name;
+            signature.bundleParameters =
+                renderedAttribute(entry.instance.bundle.parameters);
+            // Every bound requirement's family *and* solved parameters, not
+            // merely the first family id.
+            signature.layout = layoutIdentity(entry.instance);
             if (const machine::ExecutorNode *executor = machine.findExecutor(
                     entry.instance.executorBindings.lookup("executor")))
               signature.placementClass = executor->kind;
+            signature.placement = placementIdentity(entry.instance);
             TargetContext context{target_.name().str(),
                                   hexId(machine.contentHash)};
             if (std::optional<double> measured =
@@ -562,9 +639,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // the first output alone under-charges a multi-output node, the unsafe
     // direction for a capacity check. When a node declares several bindings the
     // graph fixes no output-to-binding pairing (a memory requirement names a
-    // requirement *kind*, never the port that goes there), so each binding
-    // keeps the first-output fallback, an admitted lower bound, rather than
-    // guessing a pairing.
+    // requirement *kind*, never the port that goes there). A single output can
+    // still be charged to each binding conservatively (that over-charges, the
+    // safe direction); several outputs with several bindings cannot be charged
+    // soundly at all, so that branch is rejected below rather than admitted on
+    // an unsafe lower bound.
     //
     // Each charged output is also recorded as a live range: the bytes are
     // released once its last consumer is placed (below), so a sequential
@@ -587,6 +666,24 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           partial.memoryBytes[memory] += bytes;
           partial.liveValueCharges[output.value].push_back({memory, bytes});
         }
+      } else if (workload.outputs.size() > 1) {
+        // Several outputs *and* several memory bindings. A memory requirement
+        // names a kind, never the port that writes into it, so the graph fixes
+        // no output-to-binding pairing: there is no sound way to charge these
+        // outputs. Sizing every binding from the first output alone is a lower
+        // bound that can admit an over-capacity plan -- a 4-byte first output
+        // hiding a 4096-byte second -- so the branch is rejected rather than
+        // admitted on an unsafe bound. A single binding has no such ambiguity
+        // (one binding holds every output, charged below), and a single output
+        // cannot be misattributed among bindings.
+        report(
+            DiagnosticCode::MemoryCapacityExceeded,
+            "node " + std::to_string(workload.id) + ": " +
+                std::to_string(workload.outputs.size()) + " outputs with " +
+                std::to_string(instance.memoryBindings.size()) +
+                " memory bindings have no output-to-memory association; "
+                "placement is ambiguous and cannot be proven within capacity");
+        return false;
       } else {
         const WorkloadValueId first = workload.outputs.front().value;
         const uint64_t bytes = factsForValue(first).bytes;
@@ -626,6 +723,19 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // unreachable from the search.
       request.producerLayout = boundLayoutForValue(producer, value);
       request.consumerLayout = boundLayoutForValue(consumer, value);
+      // The concrete parameterization each endpoint solved, so a pair that
+      // agrees on the class but not on its parameters is a transform rather
+      // than a direct connection.
+      if (const SolvedLayout *solved =
+              boundSolvedLayoutForValue(producer, value)) {
+        request.producerLayoutParameters = solved->parameters;
+        request.producerLayoutMap = solved->map;
+      }
+      if (const SolvedLayout *solved =
+              boundSolvedLayoutForValue(consumer, value)) {
+        request.consumerLayoutParameters = solved->parameters;
+        request.consumerLayoutMap = solved->map;
+      }
       const TileFacts facts = factsForValue(value);
       request.bytes = facts.bytes;
       request.alignmentBytes = facts.alignment;
@@ -715,6 +825,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                      request.consumerMemory + ": no legal route");
         return false;
       }
+      // Several legal ways to connect this pair, but only the locally cheapest
+      // is taken. In exact mode -- which otherwise implies an exhaustive joint
+      // search -- that is a restriction, not a cap: two individually cheapest
+      // routes through a shared intermediate can jointly exceed its capacity
+      // while more expensive direct routes would fit, so a feasible covering
+      // can be missed with no `searchTruncated` to explain it. Report it
+      // explicitly rather than implying exhaustiveness.
+      if (alternatives->size() > 1 && options_.mode == SearchMode::Exact) {
+        result.connectionChoicesUnexplored = true;
+        report(DiagnosticCode::ConnectionChoiceUnexplored,
+               "connection " + request.producerMemory + " -> " +
+                   request.consumerMemory + ": chose the cheapest of " +
+                   std::to_string(alternatives->size()) +
+                   " alternatives without branching over them");
+      }
       staged.push_back(*pickBest(*alternatives));
       cost = addCost(cost, staged.back().cost);
       // §9.3: a plain movement fills a destination buffer in the consumer's
@@ -797,10 +922,20 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
               makeRequest(producer, *partial.chosen[consumerEnd.node],
                           producerEnd.port, consumerEnd.port, link.value));
         bool fanOutTruncated = false;
+        bool fanOutChoseAmongAlternatives = false;
         llvm::Expected<std::vector<ConnectionPlan>> alternatives =
             synthesizeFanOut(consumerRequests.front(), consumerRequests,
                              machine, topology, placementOptions,
-                             &fanOutTruncated, options_.objective);
+                             &fanOutTruncated, options_.objective,
+                             &fanOutChoseAmongAlternatives);
+        if (fanOutChoseAmongAlternatives &&
+            options_.mode == SearchMode::Exact) {
+          result.connectionChoicesUnexplored = true;
+          report(DiagnosticCode::ConnectionChoiceUnexplored,
+                 "fan-out from " + consumerRequests.front().producerMemory +
+                     ": chose the cheapest alternative per destination group "
+                     "without branching over them");
+        }
         if (alternatives)
           result.routeCount += alternatives->size();
         reportTruncation(fanOutTruncated);
@@ -844,11 +979,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       struct GatherKey {
         MemoryNodeId memory;
         std::optional<LayoutId> layout;
+        /// The solved parameterization of `layout` the consumer bound, rendered
+        /// canonically. Two consumers that name the same layout family but
+        /// solved different parameters (VW = 4 versus VW = 8) hold different
+        /// representations, so one gathered tile cannot serve both -- the same
+        /// reason the class id is part of the key.
+        std::string layoutParameters;
         ExecutorId executor;
         mlir::Type portType;
         std::optional<mlir::AffineMap> portMap;
         bool operator==(const GatherKey &other) const {
           return memory == other.memory && layout == other.layout &&
+                 layoutParameters == other.layoutParameters &&
                  executor == other.executor && portType == other.portType &&
                  portMap == other.portMap;
         }
@@ -865,6 +1007,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         GatherKey key;
         key.memory = primaryMemory(machine, consumer);
         key.layout = boundLayoutForValue(consumer, link.value);
+        if (const SolvedLayout *solved =
+                boundSolvedLayoutForValue(consumer, link.value))
+          key.layoutParameters = canonicalSearchValueString(solved->parameters);
         key.executor = consumer.executorBindings.lookup("executor");
         if (consumerEnd.port) {
           key.portType = consumerEnd.port->type;
@@ -1250,6 +1395,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       detail.route = connection.memoryRoute;
       detail.engines = connection.transferEngines;
       detail.transform = connection.transform;
+      detail.consumers.assign(connection.consumers.begin(),
+                              connection.consumers.end());
+      llvm::sort(detail.consumers);
       plan.connectionPlans.push_back(std::move(detail));
     }
     llvm::sort(plan.connectionPlans,
