@@ -1,15 +1,19 @@
 //===- MicroMappingPasses.h - Mapping entry points (design §21) -----------===//
 //
-// The two composable, user-facing entry points into the target-independent
-// mapping engine (epic #67, design §21):
+// The composable, user-facing entry points into the target-independent mapping
+// engine (epic #67, design §21):
 //
-//   * `micro-map`      -- runs the whole chain (extract -> search -> bind) and
-//                         binds the best plan directly;
-//   * `micro-bind-plan`-- binds one plan selected by its stable,
+//   * `micro-map`          -- runs the whole chain (extract -> search -> bind)
+//                             and binds the best plan directly;
+//   * `micro-bind-plan`    -- binds one plan selected by its stable,
 //   content-derived
-//                         id.
+//                             id;
+//   * `micro-verify-mapping`-- verifies already-mapped Micro-IR against a
+//                             target: phase 2 of the layered verification
+//                             (design §18.3), resolving the ids the binder
+//                             recorded.
 //
-// Both passes are strictly target-neutral: a target is named and loaded from
+// All passes are strictly target-neutral: a target is named and loaded from
 // files on disk (`target`/`machine`/`layouts`/`rules`/`emitters`), and no pass
 // branch ever mentions a specific backend. The target plugin gives its own ids
 // meaning, exactly as the mapping core does.
@@ -81,6 +85,36 @@ std::unique_ptr<Pass> createMicroMapPass(const MicroMapOptions &options);
 std::unique_ptr<Pass> createMicroBindPlanPass();
 std::unique_ptr<Pass>
 createMicroBindPlanPass(const MicroBindPlanOptions &options);
+
+/// Everything `micro-verify-mapping` needs to resolve a mapped kernel's ids.
+/// Phase 2 does not search, so it takes only the target configuration -- the
+/// same five keys `micro-map` loads its target with -- and no search options
+/// (mode, top-k, beam-width) and no plan id. Exposed on the command line as
+/// `--micro-verify-mapping="target=<name> machine=<path> layouts=<path>
+/// rules=<path> emitters=<csv>"`; the design's short `machine=<path>` spelling
+/// (design §21) is not enough on its own, because resolving rule, layout, and
+/// emitter ids needs those registries.
+struct MicroVerifyMappingOptions {
+  /// Opaque target label. It is only a label -- verification never interprets
+  /// it -- but it is required, exactly as `micro-map` requires it, so the two
+  /// entry points take the same target configuration.
+  std::string target;
+  std::string machinePath;
+  std::string layoutPath;
+  std::string rulePath;
+  /// Emitter keys the target plugin understands, comma-separated on the command
+  /// line and split here.
+  std::vector<std::string> emitterKeys;
+};
+
+/// Verifies the module's mapped `micro.kernel` against the target named by
+/// `options`: every recorded rule, executor, memory and visibility, layout,
+/// route node/link, and emitter must resolve. The pass changes nothing -- a
+/// successful run is a report, not a rewrite -- and fails with a stable §22.3
+/// diagnostic on the first violation.
+std::unique_ptr<Pass> createMicroVerifyMappingPass();
+std::unique_ptr<Pass>
+createMicroVerifyMappingPass(const MicroVerifyMappingOptions &options);
 
 } // namespace llk
 } // namespace mlir

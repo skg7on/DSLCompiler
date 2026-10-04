@@ -435,6 +435,7 @@ target_compile_options(LLKTargetMapping PRIVATE -fno-rtti -fno-exceptions)
 add_library(LLKMicroMapping STATIC
     lib/Conversion/MicroMapping/MicroMapPass.cpp
     lib/Conversion/MicroMapping/MicroBindPlanPass.cpp
+    lib/Conversion/MicroMapping/MicroVerifyMappingPass.cpp
 )
 target_include_directories(LLKMicroMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -859,6 +860,29 @@ if(LLK_BUILD_TOOLS)
   # option string is the user-facing contract from design §21.
   add_llk_filecheck_test(MicroMappingMap test/Conversion/MicroMapping/micro_map.mlir
       "\"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=deterministic\"")
+
+  # MicroMappingVerify: phase 2 of the layered verification (design §18.3).
+  # The pipeline chains `--micro-map` (which binds a plan and records its ids)
+  # into `--micro-verify-mapping` (which loads the same target and resolves every
+  # recorded id). A successful verify leaves the IR byte-identical, so the
+  # FileCheck assertions are the plan/mapping metadata MicroMappingMap checks --
+  # a verifier that mutated would have to break them. Raw add_test (rather than
+  # add_llk_filecheck_test) because two passes are chained with their own option
+  # strings; the helper's ARGN list would hand sh a command separator.
+  add_test(NAME MicroMappingVerify
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=deterministic\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/verify_mapping.mlir | $<TARGET_FILE:llk-opt> \"--micro-verify-mapping=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store\" | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/verify_mapping.mlir"
+  )
+
+  # MicroMappingVerifyInvalid: the negative half of phase 2. Each chunk of the
+  # fixture is mapped IR with one recorded id that does not resolve (or a module
+  # with no kernel at all), and `--verify-diagnostics` asserts the stable §22.3
+  # code *and* the specific detail on the diagnostic. The same test also pins
+  # that a fully resolved chunk produces no diagnostic.
+  add_test(NAME MicroMappingVerifyInvalid
+      COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+              "--micro-verify-mapping=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store"
+              ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/verify_mapping_invalid.mlir
+  )
 
   # MicroMappingUnmaterialized: a plan whose edge is an unmaterializable
   # movement (see the fixture's rules file). The binder reports such a
