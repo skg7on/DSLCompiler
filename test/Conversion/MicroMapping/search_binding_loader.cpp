@@ -343,9 +343,11 @@ micro.search_space @space attributes {workload = "w"} {
   EXPECT_EQ(**layout, "blocked");
 }
 
-TEST(SearchBindingLoader, AKindSharedBySeveralParametersIsNotARole) {
-  // Two layout parameters: neither is *the* layout role, so the axis is left to
-  // the rules rather than guessed at.
+TEST(SearchBindingLoader, SeveralLayoutParametersCannotBeResolved) {
+  // Two layout parameters: neither is *the* layout role, and there is no
+  // per-role binding surface yet, so the axis cannot be resolved. It must be
+  // reported rather than silently left unbound -- a value the caller bound
+  // would otherwise be ignored without a word.
   auto parsed = parse(R"MLIR(
 micro.search_space @space attributes {workload = "w"} {
   micro.param "lhs" {kind = "layout", choices = ["blocked"]}
@@ -360,8 +362,10 @@ micro.search_space @space attributes {workload = "w"} {
       << llvm::toString(binding.takeError());
 
   auto layout = loadBoundLayout(parsed->module.get(), *binding);
-  ASSERT_TRUE(static_cast<bool>(layout)) << llvm::toString(layout.takeError());
-  EXPECT_FALSE(layout->has_value());
+  std::string error = takeError(layout);
+  EXPECT_NE(error.find("more than one layout-kind parameter"),
+            std::string::npos)
+      << error;
 }
 
 TEST(SearchBindingLoader, NoLayoutKindParameterLeavesTheAxisUnbound) {

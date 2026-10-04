@@ -939,14 +939,17 @@ if(LLK_BUILD_TOOLS)
           ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingReportOnly
   )
 
-  # MicroMappingCandidate: `candidate=<sym>` drives `--micro-map` from a
-  # persistent `micro.candidate` (phase-4 task 4). The candidate's values pin
-  # rule parameters and its `layout`-kind parameter -- resolved by kind, not by
-  # name -- selects the bound layout, so the plan the pass binds is traceable to
-  # the search-space point it came from. A script because the binding's hash is
-  # read back out of the report file and compared against the bound IR, and
-  # because the rejection and namespace cases are separate invocations whose
-  # diagnostics are asserted.
+  # MicroMappingCandidate: `candidate=<sym>` drives `--micro-map` (and, for the
+  # replay half, `--micro-bind-plan`) from a persistent `micro.candidate`
+  # (phase-4 task 4). The candidate's values pin rule parameters and its
+  # `layout`-kind parameter -- resolved by kind, not by name -- selects the
+  # bound layout, so the plan the pass binds is traceable to the search-space
+  # point it came from. Because the plan id folds in the binding's hash, the
+  # round trip needs the same `candidate=` on both runs (ruling S8); this test
+  # proves it, and that the id is genuinely absent from a binding-free replay.
+  # A script because the binding's hash is read back out of the report file and
+  # compared against the bound IR, and because the rejection and namespace cases
+  # are separate invocations whose diagnostics are asserted.
   add_test(NAME MicroMappingCandidate
       COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_candidate.sh
           $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
@@ -984,6 +987,11 @@ if(LLK_BUILD_TOOLS)
   # kernel, and exact over IR that `--llk-to-micro` produced, so the round-trip
   # is covered on compiler-generated IR too. A script because it compares two
   # IR streams the way FileCheck cannot.
+  #
+  # The ids here are all binding-free, so the replay passes no `candidate=`. A
+  # plan id folds the search point in, so a binding-derived id needs the same
+  # `candidate=` on both runs; MicroMappingCandidate covers that round trip
+  # (ruling S8).
   add_test(NAME MicroMappingBindPlanRoundtrip
       COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_bind_plan_roundtrip.sh
           $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}

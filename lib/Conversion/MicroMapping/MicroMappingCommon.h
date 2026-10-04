@@ -109,6 +109,13 @@ parseSearchMode(llvm::StringRef text) {
 /// read as hex. Write it in `0x` hex instead, or in any other form that is not
 /// 16 bare hex digits. The round-trip of the report's token is the primary
 /// contract, and it is exactly this width, so it wins at this width.
+///
+/// Parsing the id is not the same as reproducing it: a plan id folds in the
+/// search *point* as well as the plan content, so an id produced by a
+/// `candidate=`-bound search is only found by a search given the same
+/// `candidate=` (ruling S8). Every caller that replays a reported id -- both
+/// `micro-map` and `micro-bind-plan` -- takes `candidate=` for exactly this
+/// reason.
 inline std::optional<uint64_t> parsePlanId(llvm::StringRef text) {
   llvm::StringRef body = text;
   if (body.consume_front("0x") || body.consume_front("0X")) {

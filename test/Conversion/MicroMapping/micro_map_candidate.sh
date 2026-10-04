@@ -30,6 +30,10 @@
 #      silently selecting the wrong layout. A target that expects a bound layout
 #      must name its layout ids after the kind spellings -- which is what the
 #      fixture target in binding_layouts.llkmap does.
+#   7. the report -> bind round-trip survives a binding (ruling S8): the id the
+#      `--micro-map candidate=` run reports is reproduced by `--micro-bind-plan`
+#      with the *same* `candidate=`, byte-identically -- and is absent without
+#      it, because the id folds in the binding's hash.
 #
 # Usage: micro_map_candidate.sh <llk-opt> <source-dir> <work-dir>
 #===- -------------------------------------------------------------------===//
@@ -86,8 +90,11 @@ HASH=$((0x$HEX))
 grep -q "binding_hash = $HASH : i64" "$WORK/bound.mlir" ||
   fail "the bound IR does not record the candidate's stableHash ($HASH)"
 
-# ...and the values are the candidate's, including the layout parameter whose
-# name is not `layout` -- proof the layout axis was read by kind.
+# ...and the values are the candidate's -- the report echoes the binding it
+# searched at. This does *not* by itself show the layout axis was consumed
+# (`sourceBinding` is just the binding's values, whatever the rules do with
+# them); that the axis is live is shown by the outcome: the same candidate with
+# `block_shape = "row_major"` (case 4) is a non-match, so the value decides.
 grep -q '"sourceBinding": "VW=i:8;block_shape=s:blocked"' "$WORK/bound.json" ||
   fail "the report's sourceBinding is not candidate_17's values"
 
@@ -129,3 +136,28 @@ expect_failure "$AVX2 mode=deterministic candidate=candidate_17" \
     'the search produced no complete plan' "$WORK/namespace.out"
 grep -q 'no_matching_rule' "$WORK/namespace.out" ||
   fail "the namespace mismatch did not report no_matching_rule"
+
+# --- 7. The report -> bind round-trip holds under a binding (ruling S8). -----
+# A plan id folds in the binding's hash, so the id `--micro-map
+# candidate=candidate_17` reported is reproducible only by a `--micro-bind-plan`
+# given the *same* `candidate=`. Without it the id is genuinely absent from the
+# search -- which is what makes the option load-bearing rather than decorative.
+ID=$(sed -n 's/.*"selectedPlanId": "\([0-9a-f][0-9a-f]*\)".*/\1/p' \
+        "$WORK/bound.json" | head -n 1)
+[ -n "$ID" ] || fail "the report carried no selectedPlanId"
+
+if ! "$LLK_OPT" "--micro-bind-plan=plan-id=$ID $PROBE mode=deterministic candidate=candidate_17" \
+      "$FIXTURE" > "$WORK/roundtrip.mlir" 2> "$WORK/roundtrip.err"; then
+  fail "the bound id was not reproducible with the same candidate=: $(cat "$WORK/roundtrip.err")"
+fi
+# Reproducing the id reproduces the *plan*: the replayed IR is byte-identical
+# to the `--micro-map candidate=` output.
+diff "$WORK/bound.mlir" "$WORK/roundtrip.mlir" ||
+  fail "the replayed plan is not the plan the report named"
+
+if "$LLK_OPT" "--micro-bind-plan=plan-id=$ID $PROBE mode=deterministic" \
+      "$FIXTURE" > "$WORK/roundtrip_nocand.out" 2>&1; then
+  fail "a binding-derived id was found by a binding-free bind-plan search"
+fi
+grep -q 'no plan in the deterministic search has id' "$WORK/roundtrip_nocand.out" ||
+  fail "the binding-free replay did not report the missing id"

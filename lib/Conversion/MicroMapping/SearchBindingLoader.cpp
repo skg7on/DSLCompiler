@@ -189,11 +189,23 @@ loadBoundLayout(mlir::ModuleOp module, const SearchBinding &binding) {
     return loaded.takeError();
 
   // By kind, never by name: the space names its parameters, so only the
-  // declared `kind` says which one is the layout role (and a kind shared by
-  // several parameters is not a role -- `findParamOfKind` returns null).
+  // declared `kind` says which one is the layout role.
   const perf::SearchParam *layoutParam = loaded->findParamOfKind("layout");
-  if (!layoutParam)
+  if (!layoutParam) {
+    // `findParamOfKind` returns null both for "no layout parameter" and for
+    // "several, so none is *the* role". The two must not be conflated: the
+    // first leaves the axis to the rules, while the second would silently
+    // ignore a value the caller bound. There is no per-role layout binding
+    // surface yet, so the honest answer is an error naming the space.
+    for (const perf::SearchParam &param : loaded->params)
+      if (param.kind == "layout")
+        return error(
+            "micro.search_space '" + loaded->name +
+            "' declares more than one layout-kind parameter; a binding cannot "
+            "say which one selects the plan's layout (per-role layout bindings "
+            "are not implemented)");
     return std::optional<std::string>{};
+  }
 
   auto bound = binding.values.find(layoutParam->name);
   if (bound == binding.values.end())

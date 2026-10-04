@@ -1260,13 +1260,15 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   // LLKPerf); here it is only string-compared against the rule's declared
   // layout ids, which stay target-owned. A rule that declares layout
   // requirements but offers none of them contradicts the binding, so it is a
-  // non-match (ruling S1), never an error: a sibling rule that does offer the
-  // layout may still match. A rule that declares *no* layout requirement takes
-  // on no layout obligation, so it neither offers nor contradicts the bound
-  // value and matches unchanged (ruling S7) -- the layout-axis analogue of T2's
-  // "a binding name the rule does not declare is ignored". Vetoing such a rule
-  // would make every movement/reduce rule (which the shipped rule files leave
-  // layout-agnostic) unmappable under any bound layout.
+  // non-match, never an error: a sibling rule that does offer the layout may
+  // still match. A rule that declares *no* layout requirement takes on no
+  // layout obligation, so it neither offers nor contradicts the bound value and
+  // matches unchanged. Both halves are the same ruling (S7): the layout axis
+  // vetoes only a rule that takes on an obligation it cannot meet, which is the
+  // layout-axis analogue of T2's "a binding name the rule does not declare is
+  // ignored". Vetoing a rule with no obligation would make every
+  // movement/reduce rule (which the shipped rule files leave layout-agnostic)
+  // unmappable under any bound layout.
   if (boundLayout && !rule.layoutRequirements.empty()) {
     bool offered = false;
     for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)

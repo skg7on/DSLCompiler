@@ -69,6 +69,11 @@ struct MicroMapOptions {
   /// rule must offer. A binding changes which plans are *legal*, so a candidate
   /// no rule can satisfy is a search failure carrying the frontier's
   /// diagnostics, never a silently different plan (design §8.3/§9.5).
+  ///
+  /// Both `--micro-map` and `--micro-bind-plan` honour it, and both must be
+  /// given the *same* value to speak about the same plan: a plan id folds in
+  /// the binding's hash, so a binding-derived id is only reproducible by a
+  /// search at the same candidate (ruling S8).
   std::string candidate;
 };
 
@@ -76,8 +81,11 @@ struct MicroMapOptions {
 /// caller names, so it carries a whole `MicroMapOptions` plus that id. A plan
 /// id is a content hash, so the only way to reproduce it is to re-run the
 /// search -- plans are never persisted between passes. The search options
-/// (mode, beam-width, top-k) must be the ones the id was produced with, or the
-/// search can order or cap the plans differently and the id will not be found.
+/// (mode, beam-width, top-k) *and* the search point (`search.candidate`) must
+/// be the ones the id was produced with, or the search can order, cap, or
+/// constrain the plans differently and the id will not be found. A plan
+/// produced without a binding and one produced at a candidate are different
+/// points, so their ids are never interchangeable.
 struct MicroBindPlanOptions {
   MicroMapOptions search;
   uint64_t planId = 0;

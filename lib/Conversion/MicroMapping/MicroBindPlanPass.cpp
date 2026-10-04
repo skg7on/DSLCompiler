@@ -4,10 +4,12 @@
 // module's kernel. A plan id is a hash of the plan's content, so the only way
 // to reproduce it is to re-run the search -- plans are never persisted between
 // passes. Reproduction therefore requires the same search options the id was
-// produced with: the mode, beam-width, and top-k, as well as the same target
-// files (machine, rules, layouts, emitters). A different search can order or
-// cap the plans differently and so fail to contain the id, which is reported
-// rather than silently binding a different plan.
+// produced with: the mode, beam-width, and top-k, the same search point
+// (`candidate=`, when the id came from a bound search -- the id folds in the
+// binding's hash), and the same target files (machine, rules, layouts,
+// emitters). A different search can order, cap, or constrain the plans
+// differently and so fail to contain the id, which is reported rather than
+// silently binding a different plan.
 //
 //===----------------------------------------------------------------------===//
 
@@ -64,6 +66,11 @@ struct MicroBindPlanPass
                                             "match the width that produced the "
                                             "plan id)"),
                              llvm::cl::init(64)};
+  Option<std::string> candidate{
+      *this, "candidate",
+      llvm::cl::desc("Symbol (without @) of the micro.candidate the id was "
+                     "produced at; must match the --micro-map run that "
+                     "produced the id. Absent searches binding-free")};
 
   StringRef getArgument() const override { return "micro-bind-plan"; }
 
@@ -72,8 +79,10 @@ struct MicroBindPlanPass
            "micro.kernel. The id is the spelling --micro-map report= prints "
            "(bare 16-digit hex), 0x-prefixed hex, or decimal. Reproducing a "
            "content-hash id needs the same search options (mode, beam-width, "
-           "top-k) and target files (machine, rules, layouts, emitters) "
-           "--micro-map ran with, e.g. "
+           "top-k), the same search point (candidate=, when the id came from a "
+           "bound search -- the id folds in the binding's hash), and the same "
+           "target files (machine, rules, layouts, emitters) --micro-map ran "
+           "with, e.g. "
            "--micro-bind-plan=\"plan-id=0081ef1286442d39 "
            "target=x86-avx2 machine=machines/x86-avx2-v2.yaml "
            "layouts=mapping/x86-avx2/layouts.llkmap "
@@ -92,6 +101,7 @@ struct MicroBindPlanPass
     options.mode = mode.getValue();
     options.topK = topK.getValue();
     options.beamWidth = beamWidth.getValue();
+    options.candidate = candidate.getValue();
     return options;
   }
 
@@ -178,6 +188,10 @@ createMicroBindPlanPass(const MicroBindPlanOptions &options) {
   pass->mode = options.search.mode;
   pass->topK = options.search.topK;
   pass->beamWidth = options.search.beamWidth;
+  // The search point travels with the id: a plan produced at a candidate folds
+  // the binding's hash into its id, so dropping `candidate` here would turn a
+  // reproducible id into one no search can find (ruling S8).
+  pass->candidate = options.search.candidate;
   pass->planId = std::to_string(options.planId);
   return pass;
 }
