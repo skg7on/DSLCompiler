@@ -1,5 +1,8 @@
 # LLKMap Rule Grammar
 
+For the formal merged-implementation grammar and validation rules, see
+[LLKMap formal syntax](llkmap-syntax.md) and [the EBNF](llkmap.ebnf).
+
 The rule subset of LLKMap describes how a Micro operation is implemented on a
 target. Rules live beside the layouts they reference:
 
@@ -19,11 +22,11 @@ extension.
 
 ```text
 file      ::= rule*
-rule      ::= "rule" id [ "v" int ] "{" stmt* "}"
+rule      ::= "rule" id [ version ] "{" stmt* "}"
 stmt      ::= match | domain | require | port | bundle | emit | cost
 match     ::= "match" micro-op "(" [ predicate ("," predicate)* ] ")" ";"
 predicate ::= ident "=" literal
-domain    ::= "param" ident "in" ( "[" int ".." int "]" | "{" literal ("," literal)* "}" ) ";"
+domain    ::= "param" ident "in" ( "[" int ".." int "]" | "{" domain-literal ("," domain-literal)* "}" ) ";"
 require   ::= "require" expr ";"
             | "require" executor "kind" ident ";"
             | "require" compute  "kind" ident ";"
@@ -34,6 +37,8 @@ bundle    ::= "bundle" string ";"
 emit      ::= "emit" string ";"
 cost      ::= "cost" int ";"
 micro-op  ::= "micro." ident
+version   ::= one identifier token matching v[0-9]+
+domain-literal ::= int | string
 literal   ::= int | string | ident      // a bare name such as `f32`
 ```
 
@@ -44,7 +49,7 @@ comparisons, boolean logic, and `machine.*` queries.
 
 ```text
 rule avx2.vector_add v1 {
-  match micro.vector(kind = "add", element_type = f32);
+  match micro.vector(op = "add");
   param VW in [4..8];
   require VW == machine.compute("vector_engine").lanes(element_type);
   require executor kind worker;
