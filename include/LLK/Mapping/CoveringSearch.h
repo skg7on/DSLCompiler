@@ -153,11 +153,14 @@ private:
   std::optional<SearchBinding> binding_;
   /// The layout the binding selects, resolved from its `layout`-kind parameter
   /// by the caller -- the pass layer, which alone can see the search space, so
-  /// lib/Mapping keeps no LLKPerf dependency. A rule must offer it (`require
-  /// layout ... satisfies <it>`) or it is a non-match for the node; when it
-  /// does, only that layout is materialized, so the binding -- not the rule
-  /// file -- decides which of the rule's declared layouts applies. Absent
-  /// leaves layout selection exactly as it was before bindings.
+  /// lib/Mapping keeps no LLKPerf dependency. A rule that declares layout
+  /// requirements must offer it (`require layout ... satisfies <it>`) or it is
+  /// a non-match for the node; when it does, only that layout is materialized,
+  /// so the binding -- not the rule file -- decides which of the rule's
+  /// declared layouts applies. A rule that declares *no* layout requirement
+  /// matches unchanged: it takes on no layout obligation, so it neither offers
+  /// nor contradicts the bound value. Absent leaves layout selection exactly as
+  /// it was before bindings.
   std::optional<std::string> boundLayout_;
 };
 

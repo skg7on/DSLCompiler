@@ -28,6 +28,10 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 
+#include <optional>
+#include <string>
+#include <variant>
+
 // Micro attribute, type, and op declarations.
 #define GET_ATTRDEF_CLASSES
 #include "LLK/Dialect/Micro/MicroAttributes.h.inc"
@@ -53,6 +57,23 @@ llvm::SmallVector<micro::CandidateOp, 4> findCandidates(mlir::ModuleOp module) {
   module.walk(
       [&](micro::CandidateOp candidate) { candidates.push_back(candidate); });
   return candidates;
+}
+
+/// The candidate named `symbol`, or a null op when there is none. An error when
+/// the module has more than one: a candidate symbol is unique only within its
+/// own space, so two spaces may both declare `@candidate_17` and the
+/// module-wide lookup is then ambiguous -- the loader's own rejection (see the
+/// header).
+llvm::Expected<micro::CandidateOp> findCandidateByName(mlir::ModuleOp module,
+                                                       StringRef symbol) {
+  micro::CandidateOp candidate;
+  for (micro::CandidateOp found : findCandidates(module))
+    if (found.getSymName() == symbol) {
+      if (candidate)
+        return error("more than one micro.candidate named '" + symbol + "'");
+      candidate = found;
+    }
+  return candidate;
 }
 
 /// Reads one binding attribute as a `SearchValue`. The dialect verifier only
@@ -82,15 +103,13 @@ llvm::Expected<SearchBinding> loadSearchBinding(mlir::ModuleOp module,
                    "load");
     candidate = candidates.front();
   } else {
-    for (micro::CandidateOp found : candidates)
-      if (found.getSymName() == candidateSymbol) {
-        if (candidate)
-          return error("more than one micro.candidate named '" +
-                       candidateSymbol + "'");
-        candidate = found;
-      }
-    if (!candidate)
+    llvm::Expected<micro::CandidateOp> found =
+        findCandidateByName(module, candidateSymbol);
+    if (!found)
+      return found.takeError();
+    if (!*found)
       return error("no micro.candidate named '" + candidateSymbol + "'");
+    candidate = *found;
   }
 
   // The parameters are declared by the enclosing space, so read them through
@@ -142,6 +161,48 @@ llvm::Expected<SearchBinding> loadSearchBinding(mlir::ModuleOp module,
                    " does not bind parameter '" + param.name + "'");
 
   return makeSearchBinding(candidate.getSymName().str(), std::move(values));
+}
+
+llvm::Expected<std::optional<std::string>>
+loadBoundLayout(mlir::ModuleOp module, const SearchBinding &binding) {
+  // A binding names the candidate it was loaded from, so the space's parameter
+  // declarations can be found again. The name is required: without it there is
+  // no space to read the layout role from.
+  if (binding.candidateId.empty())
+    return error("a binding with no candidateId cannot resolve a bound layout");
+
+  llvm::Expected<micro::CandidateOp> found =
+      findCandidateByName(module, binding.candidateId);
+  if (!found)
+    return found.takeError();
+  if (!*found)
+    return error("no micro.candidate named '" + binding.candidateId + "'");
+  micro::CandidateOp candidate = *found;
+
+  auto space = dyn_cast<micro::SearchSpaceOp>(candidate->getParentOp());
+  if (!space)
+    return error("micro.candidate @" + candidate.getSymName() +
+                 " is not nested in a micro.search_space");
+
+  llvm::Expected<perf::SearchSpace> loaded = perf::loadSearchSpace(space);
+  if (!loaded)
+    return loaded.takeError();
+
+  // By kind, never by name: the space names its parameters, so only the
+  // declared `kind` says which one is the layout role (and a kind shared by
+  // several parameters is not a role -- `findParamOfKind` returns null).
+  const perf::SearchParam *layoutParam = loaded->findParamOfKind("layout");
+  if (!layoutParam)
+    return std::optional<std::string>{};
+
+  auto bound = binding.values.find(layoutParam->name);
+  if (bound == binding.values.end())
+    return error("binding does not bind layout parameter '" +
+                 layoutParam->name + "'");
+  if (const std::string *text = std::get_if<std::string>(&bound->second))
+    return std::optional<std::string>(*text);
+  return error("binding value for layout parameter '" + layoutParam->name +
+               "' is not a string");
 }
 
 } // namespace mlir::llk::mapping

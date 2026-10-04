@@ -14,6 +14,7 @@
 #define LLK_CONVERSION_MICROMAPPING_MICROMAPPINGCOMMON_H
 
 #include "LLK/Conversion/MicroMapping/MicroMappingPasses.h"
+#include "LLK/Conversion/MicroMapping/SearchBindingLoader.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanBinder.h"
@@ -322,8 +323,37 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   if (*objective)
     searchOptions.objective = **objective;
   run.searchOptions = searchOptions;
+
+  // §8.3/§9.5: `candidate=` binds the search to one point of the module's own
+  // search space. The candidate is loaded from the module (phase-4 task 1) --
+  // its values pin rule parameters of the same name -- and its layout-kind
+  // parameter, resolved *by kind* rather than by name, becomes the bound layout
+  // the rules must offer (carried item A). An absent candidate loads nothing,
+  // so the search is byte-identical to the binding-free one.
+  //
+  // A binding changes which plans are *legal*, not just which is cheapest: a
+  // candidate that pins a parameter no `require` accepts, or a layout no rule
+  // offers, leaves nodes without a rule, so the search finds no complete plan
+  // and the pass fails with the frontier's diagnostics (below) instead of
+  // binding a plan the binding does not describe.
+  std::optional<mapping::SearchBinding> binding;
+  std::optional<std::string> boundLayout;
+  if (!options.candidate.empty()) {
+    llvm::Expected<mapping::SearchBinding> loaded =
+        mapping::loadSearchBinding(module, options.candidate);
+    if (!loaded)
+      return loaded.takeError();
+    binding = std::move(*loaded);
+    llvm::Expected<std::optional<std::string>> layout =
+        mapping::loadBoundLayout(module, *binding);
+    if (!layout)
+      return layout.takeError();
+    boundLayout = std::move(*layout);
+  }
+
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),
-                                 deriveLayoutContext(*graph), searchOptions);
+                                 deriveLayoutContext(*graph), searchOptions,
+                                 std::move(binding), std::move(boundLayout));
   llvm::Expected<mapping::MappingSearchResult> result = search.search();
   if (!result)
     return result.takeError();

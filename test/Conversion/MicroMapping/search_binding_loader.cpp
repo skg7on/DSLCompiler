@@ -316,4 +316,85 @@ TEST(SearchBindingLoader, AModuleWithoutACandidateIsRejected) {
   EXPECT_NE(error.find("no micro.candidate"), std::string::npos) << error;
 }
 
+//===----------------------------------------------------------------------===//
+// loadBoundLayout (phase-4 task 4, carried item A)
+//===----------------------------------------------------------------------===//
+
+TEST(SearchBindingLoader, ResolvesTheLayoutParameterByKindNotName) {
+  // The layout parameter is called `block_shape`, not `layout` or
+  // `tile_layout`: resolution must go through the declared `kind`, because the
+  // name is the space's to choose.
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "VW" {kind = "integer", choices = [4 : i64, 8 : i64]}
+  micro.param "block_shape" {kind = "layout", choices = ["blocked", "row_major"]}
+  micro.candidate @c {bindings = {VW = 8 : i64, block_shape = "blocked"}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto layout = loadBoundLayout(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(layout)) << llvm::toString(layout.takeError());
+  ASSERT_TRUE(layout->has_value());
+  EXPECT_EQ(**layout, "blocked");
+}
+
+TEST(SearchBindingLoader, AKindSharedBySeveralParametersIsNotARole) {
+  // Two layout parameters: neither is *the* layout role, so the axis is left to
+  // the rules rather than guessed at.
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "lhs" {kind = "layout", choices = ["blocked"]}
+  micro.param "rhs" {kind = "layout", choices = ["row_major"]}
+  micro.candidate @c {bindings = {lhs = "blocked", rhs = "row_major"}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto layout = loadBoundLayout(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(layout)) << llvm::toString(layout.takeError());
+  EXPECT_FALSE(layout->has_value());
+}
+
+TEST(SearchBindingLoader, NoLayoutKindParameterLeavesTheAxisUnbound) {
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "VW" {kind = "integer", choices = [4 : i64, 8 : i64]}
+  micro.candidate @c {bindings = {VW = 8 : i64}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto layout = loadBoundLayout(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(layout)) << llvm::toString(layout.takeError());
+  EXPECT_FALSE(layout->has_value());
+}
+
+TEST(SearchBindingLoader, RejectsABindingWhoseCandidateIsGone) {
+  auto parsed = parseFixture();
+  ASSERT_TRUE(parsed);
+
+  llvm::StringMap<SearchValue> values;
+  values["BM"] = int64_t{64};
+  values["tile_layout"] = std::string("blocked");
+  SearchBinding binding = makeSearchBinding("nope", std::move(values));
+
+  auto layout = loadBoundLayout(parsed->module.get(), binding);
+  std::string error = takeError(layout);
+  EXPECT_NE(error.find("no micro.candidate named 'nope'"), std::string::npos)
+      << error;
+}
+
 } // namespace

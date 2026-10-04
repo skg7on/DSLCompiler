@@ -939,6 +939,20 @@ if(LLK_BUILD_TOOLS)
           ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingReportOnly
   )
 
+  # MicroMappingCandidate: `candidate=<sym>` drives `--micro-map` from a
+  # persistent `micro.candidate` (phase-4 task 4). The candidate's values pin
+  # rule parameters and its `layout`-kind parameter -- resolved by kind, not by
+  # name -- selects the bound layout, so the plan the pass binds is traceable to
+  # the search-space point it came from. A script because the binding's hash is
+  # read back out of the report file and compared against the bound IR, and
+  # because the rejection and namespace cases are separate invocations whose
+  # diagnostics are asserted.
+  add_test(NAME MicroMappingCandidate
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_candidate.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingCandidate
+  )
+
   # MicroMappingBindPlanId: `--micro-bind-plan` accepts the id the report prints
   # (bare hex), plus 0x-hex and signed/unsigned decimal, and rejects anything
   # else. End-to-end because the id is obtained by running `--micro-map report=`

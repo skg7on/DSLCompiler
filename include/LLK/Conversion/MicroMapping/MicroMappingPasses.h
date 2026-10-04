@@ -37,7 +37,7 @@ namespace llk {
 /// are exposed on the command line as `--micro-map="target=<name>
 /// machine=<path> layouts=<path> rules=<path> emitters=<csv>
 /// mode=<deterministic|beam|exact> beam-width=<n> top-k=<n> report=<path>
-/// report-only=<bool>"`.
+/// report-only=<bool> candidate=<sym>"`.
 struct MicroMapOptions {
   /// Opaque target label, recorded on the selected plan; never interpreted by
   /// generic code.
@@ -62,6 +62,14 @@ struct MicroMapOptions {
   /// discard its own result. A search that finds no plan still fails the pass,
   /// report-only or not, so the mode cannot hide a real failure.
   bool reportOnly = false;
+  /// The `micro.candidate` symbol to search at, or empty for a binding-free
+  /// search. The candidate is loaded from the module (phase-4 task 1): its
+  /// values pin the rule parameters of the same name, and its `layout`-kind
+  /// parameter -- resolved by `kind`, never by name -- becomes the layout every
+  /// rule must offer. A binding changes which plans are *legal*, so a candidate
+  /// no rule can satisfy is a search failure carrying the frontier's
+  /// diagnostics, never a silently different plan (design §8.3/§9.5).
+  std::string candidate;
 };
 
 /// `micro-bind-plan` runs the same search and binds the one plan whose id the

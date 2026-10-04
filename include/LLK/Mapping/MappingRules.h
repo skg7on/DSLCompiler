@@ -226,11 +226,15 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
 /// A rule that declares at least one `require layout ... satisfies <id>` equal
 /// to the bound value matches, and only the requirements naming that value are
 /// materialized: the binding selects which of the rule's declared layouts
-/// applies. A rule that offers no such requirement (including a rule with no
-/// layout requirement at all) yields `std::nullopt` -- the same non-match as an
-/// unsatisfiable `require`, never an error, so a sibling rule that does offer
-/// the layout may still match. A null `boundLayout` leaves layout selection
-/// byte-identical to the pre-binding behaviour.
+/// applies. A rule that declares layout requirements none of which equals the
+/// bound value contradicts the binding and yields `std::nullopt` -- the same
+/// non-match as an unsatisfiable `require`, never an error, so a sibling rule
+/// that does offer the layout may still match. A rule that declares *no* layout
+/// requirement takes on no layout obligation, so it neither offers nor
+/// contradicts the bound value and matches unchanged: vetoing such a rule would
+/// make every movement/reduce rule -- which the shipped rule files leave
+/// layout-agnostic -- unmappable under any bound layout. A null `boundLayout`
+/// leaves layout selection byte-identical to the pre-binding behaviour.
 std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,

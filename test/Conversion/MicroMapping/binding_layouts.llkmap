@@ -1,0 +1,16 @@
+// Layout declarations for the binding-driven mapping fixture.
+//
+// The id `blocked` is deliberate. A `micro.param` of kind `layout` may only
+// name a Micro layout *kind* (row_major, col_major, blocked, vectorized,
+// swizzled) -- `ParamOp::verify` rejects anything else -- so a bound layout
+// value is always one of those spellings. For a rule's `require layout ...
+// satisfies <id>` to accept a bound value, the target must therefore name the
+// layout id it expects the bound value to select with the *same* string. This
+// target does exactly that: the id is `blocked`, the spelling the search space
+// binds. Which ids a target declares stays target-owned; generic code only
+// string-compares (carried item B, phase-4 task 4).
+layout blocked(int N) {
+  param N in [1..16];
+  require rank == 2;
+  map (m, n) -> (m, n);
+}

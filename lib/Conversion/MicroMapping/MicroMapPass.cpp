@@ -63,18 +63,27 @@ struct MicroMapPass
                      "leave the module unmodified: the selected plan is not "
                      "bound onto it (design §21)"),
       llvm::cl::init(false)};
+  Option<std::string> candidate{
+      *this, "candidate",
+      llvm::cl::desc("Symbol (without @) of the micro.candidate to search at; "
+                     "its values pin rule parameters and its layout-kind "
+                     "parameter selects the bound layout. Absent leaves the "
+                     "search binding-free")};
 
   StringRef getArgument() const override { return "micro-map"; }
 
   StringRef getDescription() const override {
     return "Search a micro.kernel for a covering plan and bind the best one to "
            "it; with report-only=1 (and report=<path>) the plan is reported "
-           "but not bound, so the input IR is left unmodified (e.g. "
+           "but not bound, so the input IR is left unmodified; with "
+           "candidate=<sym> the search is bound to that micro.candidate's "
+           "search-space point (e.g. "
            "--micro-map=\"target=x86-avx2 "
            "machine=machines/x86-avx2-v2.yaml "
            "layouts=mapping/x86-avx2/layouts.llkmap "
            "rules=mapping/x86-avx2/rules.llkmap "
-           "emitters=avx2_vector_add mode=beam top-k=8\")";
+           "emitters=avx2_vector_add mode=beam top-k=8 "
+           "candidate=candidate_17\")";
   }
 
   MicroMapOptions currentOptions() const {
@@ -90,6 +99,7 @@ struct MicroMapPass
     options.beamWidth = beamWidth.getValue();
     options.reportPath = report.getValue();
     options.reportOnly = reportOnly.getValue();
+    options.candidate = candidate.getValue();
     return options;
   }
 
@@ -164,6 +174,7 @@ std::unique_ptr<Pass> createMicroMapPass(const MicroMapOptions &options) {
   pass->beamWidth = options.beamWidth;
   pass->report = options.reportPath;
   pass->reportOnly = options.reportOnly;
+  pass->candidate = options.candidate;
   return pass;
 }
 

@@ -48,6 +48,9 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
+#include <optional>
+#include <string>
+
 namespace mlir {
 class ModuleOp;
 } // namespace mlir
@@ -66,6 +69,31 @@ namespace mlir::llk::mapping {
 /// outside its parameter's declared choices.
 llvm::Expected<SearchBinding>
 loadSearchBinding(mlir::ModuleOp module, llvm::StringRef candidateSymbol = "");
+
+/// The layout the binding selects, when the space it came from declares a
+/// `layout`-kind parameter: that parameter's bound value, as a string. This is
+/// the bridge from the search space's layout *choice* to the mapping engine's
+/// bound layout (phase-4 task 4, carried item A).
+///
+/// The parameter is found by its declared `kind`, never by its name, because a
+/// space may call it anything (`tile_layout` is the conventional spelling; the
+/// naming is not a contract). Returns `nullopt` when the space declares no
+/// layout-kind parameter, or more than one -- a kind shared by several
+/// parameters is not a role (`SearchSpace::findParamOfKind`) -- so a space with
+/// no single layout role leaves the layout axis exactly as the rules declare
+/// it, byte-identical to a binding-free search.
+///
+/// The value is returned as a bare string and never interpreted here: it is
+/// compared, exactly, against the layout ids the rules declare, and those ids
+/// are target-owned. Nothing in this layer maps a layout kind to a target id.
+/// A space may therefore only drive the layout axis of a target whose layout
+/// ids are spelled like the bound kind (see `binding_layouts.llkmap`).
+///
+/// Fails when `binding.candidateId` names no candidate in `module`, when the
+/// candidate is not nested in a `micro.search_space`, or when a bound
+/// layout-kind parameter does not hold a string.
+llvm::Expected<std::optional<std::string>>
+loadBoundLayout(mlir::ModuleOp module, const SearchBinding &binding);
 
 } // namespace mlir::llk::mapping
 
