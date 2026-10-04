@@ -938,6 +938,21 @@ if(LLK_BUILD_TOOLS)
           ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBindPlanMode
   )
 
+  # MicroMappingBindPlanRoundtrip: the strongest form of the report -> bind
+  # contract -- binding the reported id reproduces the *same* plan, not merely
+  # *a* plan, so the bound IR is byte-identical to the `--micro-map report=`
+  # output. The id-parsing and mode tests above prove the id is accepted and the
+  # search is replayed; this one proves the replayed search selects the plan the
+  # report named. Three cases: deterministic and beam over the hand-authored
+  # kernel, and exact over IR that `--llk-to-micro` produced, so the round-trip
+  # is covered on compiler-generated IR too. A script because it compares two
+  # IR streams the way FileCheck cannot.
+  add_test(NAME MicroMappingBindPlanRoundtrip
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_bind_plan_roundtrip.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBindPlanRoundtrip
+  )
+
   # MicroMappingMatmulE2E / MicroMappingSwiGLUE2E: the gap-#3 acceptance. Each
   # runs the two-pass pipeline `--llk-to-micro | --micro-map mode=exact` over
   # the LLK source, so the kernel being mapped is genuinely compiler-generated
