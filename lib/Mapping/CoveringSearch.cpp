@@ -34,6 +34,7 @@
 #include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
+#include <cassert>
 #include <optional>
 #include <string>
 #include <utility>
@@ -623,6 +624,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // they are charged. A plain single-consumer `Transfer` is deliberately not
     // charged here: its destination tile is the consumer instance's own tile,
     // already counted through that instance's memory binding.
+    //
+    // Unlike the materialized values above, these bytes do *not* expire with
+    // their value: a copy or gather intermediate is an object whose own live
+    // range is not modeled yet, and giving it one is task 3's surface
+    // (route/intermediate capacity and liveness). Charging it for the whole
+    // partial plan is the conservative direction.
     llvm::StringMap<uint64_t> stagedBytes; // memory -> replica/gather bytes
 
     // Synthesizes one plain-edge connection, staging the chosen alternative.
@@ -872,7 +879,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         continue;
       for (const auto &charge : charges->second) {
         uint64_t &held = partial.memoryBytes[charge.first];
-        held -= std::min(held, charge.second);
+        // Subtract exactly what was charged. The charge can never exceed what
+        // the memory still holds -- every release is a charge made earlier and
+        // not yet released -- so `held >= charge.second` holds; `min` only
+        // keeps a future accounting bug from underflowing instead of failing
+        // loudly, and never masks drift by clamping a correct value.
+        assert(held >= charge.second &&
+               "live-value release exceeds the memory's charged bytes");
+        held -= charge.second;
       }
       partial.liveValueCharges.erase(charges);
     }

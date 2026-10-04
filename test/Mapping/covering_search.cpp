@@ -3,6 +3,7 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/LatencyProvider.h"
+#include "LLK/Mapping/TileFacts.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 
@@ -139,26 +140,26 @@ WorkloadGraph twoNodeTileGraph(mlir::MLIRContext &context, mlir::Type tile) {
 }
 
 /// A three-node chain `in -> n0 -> v0 -> n1 -> v1 -> n2 -> out`, every node a
-/// `micro.vector(op = "add")` over untyped values. Each node binds one memory
-/// and materializes the 4096-byte fallback tile.
-WorkloadGraph threeNodeChainGraph(mlir::MLIRContext &context) {
+/// `micro.vector(op = "add")` over `tile`-typed values. Each node binds one
+/// memory and materializes the derived tile size.
+WorkloadGraph threeNodeChainGraph(mlir::MLIRContext &context, mlir::Type tile) {
   WorkloadGraph graph;
   WorkloadValueId input =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
+      graph.addValue(WorkloadValue{0, tile, "in", /*external=*/true});
   WorkloadValueId v0 =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "v0", /*external=*/false});
+      graph.addValue(WorkloadValue{0, tile, "v0", /*external=*/false});
   WorkloadValueId v1 =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "v1", /*external=*/false});
+      graph.addValue(WorkloadValue{0, tile, "v1", /*external=*/false});
   WorkloadValueId output =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+      graph.addValue(WorkloadValue{0, tile, "out", /*external=*/false});
 
   auto node = [&](unsigned ordinal, WorkloadValueId in, WorkloadValueId out) {
     WorkloadNode n;
     n.opName = "micro.vector";
     n.sourceOrdinal = ordinal;
     n.attributes = vectorAttributes(context, "add");
-    n.inputs.push_back(WorkloadPort{in, mlir::Type(), std::nullopt});
-    n.outputs.push_back(WorkloadPort{out, mlir::Type(), std::nullopt});
+    n.inputs.push_back(WorkloadPort{in, tile, std::nullopt});
+    n.outputs.push_back(WorkloadPort{out, tile, std::nullopt});
     graph.addNode(std::move(n));
   };
   node(0, input, v0);
@@ -1289,16 +1290,34 @@ TEST(CoveringSearch, CapacityUsesTheRealValueSizeNotAConstant) {
 }
 
 // Phase-3 T2: a value's bytes are released once its last consumer is placed.
-// Three 4096-byte tiles chained n0 -> n1 -> n2 each fit sram.0 *sequentially*,
+// Three 1024-byte tiles chained n0 -> n1 -> n2 each fit sram.0 *sequentially*,
 // but never all three at once: the live peak is two tiles (the one a consumer
 // reads plus the one it writes). Monotonic accumulation charged all three and
-// rejected the chain; live-range expiry makes it legal.
+// rejected the chain; live-range expiry makes it legal. The tiles are typed and
+// the capacity is tied to their derived size, so the test cannot keep passing
+// after a derivation change that would make three tiles fit.
 TEST(CoveringSearch, ExpiresAValueWhenItsLastConsumerIsPlaced) {
   mlir::MLIRContext context;
-  WorkloadGraph graph = threeNodeChainGraph(context);
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = threeNodeChainGraph(context, tile);
+
+  // Task 1's derivation, not the fallback: the test exercises the real-size
+  // path the rest of the stack uses.
+  const uint64_t tileBytes = tileFactsFor(tile).bytes;
+  ASSERT_EQ(tileBytes, 1024u); // 8 * 32 * 4
   std::unique_ptr<MappingTarget> target =
-      targetWith(sramCapacityMachine(2u * 4096u), kSharedReadRules);
+      targetWith(sramCapacityMachine(2u * 1024u), kSharedReadRules);
   ASSERT_NE(target, nullptr);
+  // Premise: two tiles fit, three do not. Only then is monotonic accumulation
+  // guaranteed to reject while the live peak of two is admitted; if the derived
+  // tile ever shrank, this fails loudly rather than letting the test pass
+  // without detecting the regression.
+  const MemoryNode *sram = target->machine().findMemory("sram.0");
+  ASSERT_NE(sram, nullptr);
+  ASSERT_GE(sram->capacityBytes, 2u * tileBytes);
+  ASSERT_LT(sram->capacityBytes, 3u * tileBytes);
 
   MappingSearchOptions options;
   options.mode = SearchMode::Deterministic;
