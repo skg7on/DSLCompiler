@@ -166,13 +166,22 @@ mlir::ArrayAttr stringArrayAttr(mlir::MLIRContext *context,
   return mlir::ArrayAttr::get(context, attributes);
 }
 
-mlir::Operation *findKernel(mlir::ModuleOp module) {
-  mlir::Operation *kernel = nullptr;
+/// The module's single `micro.kernel`. Fails when there is none (nothing to
+/// bind) or more than one (no selector exists, so binding "the first" would
+/// silently ignore the rest).
+llvm::Expected<mlir::Operation *> findKernel(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::Operation *, 2> kernels;
   module->walk([&](mlir::Operation *op) {
-    if (!kernel && op->getName().getStringRef() == "micro.kernel")
-      kernel = op;
+    if (op->getName().getStringRef() == "micro.kernel")
+      kernels.push_back(op);
   });
-  return kernel;
+  if (kernels.empty())
+    return bindError("bindPlan: the source module has no micro.kernel");
+  if (kernels.size() > 1)
+    return bindError("bindPlan: the source module has " +
+                     std::to_string(kernels.size()) +
+                     " micro.kernels; one kernel per module is required");
+  return kernels.front();
 }
 
 } // namespace
@@ -182,9 +191,10 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
                                    const MappingTarget &target) {
   mlir::OwningOpRef<mlir::ModuleOp> module(
       mlir::cast<mlir::ModuleOp>(source->clone()));
-  mlir::Operation *kernel = findKernel(*module);
-  if (!kernel)
-    return bindError("bindPlan: the source module has no micro.kernel");
+  llvm::Expected<mlir::Operation *> resolvedKernel = findKernel(*module);
+  if (!resolvedKernel)
+    return resolvedKernel.takeError();
+  mlir::Operation *kernel = *resolvedKernel;
 
   WorkloadGraphBinding binding;
   llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel, &binding);

@@ -23,6 +23,7 @@
 #include "LLK/Conversion/MicroMapping/SearchBindingLoader.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/SearchBinding.h"
+#include "MicroMappingCommon.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -403,6 +404,61 @@ TEST(SearchBindingLoader, RejectsABindingWhoseCandidateIsGone) {
   std::string error = takeError(layout);
   EXPECT_NE(error.find("no micro.candidate named 'nope'"), std::string::npos)
       << error;
+}
+
+//===----------------------------------------------------------------------===//
+// Objective selection (§17.1, issue #109 defect 6)
+//===----------------------------------------------------------------------===//
+
+/// Two search spaces, each with its own objective and one candidate. The
+/// objectives differ in direction, so which one is read is observable.
+constexpr llvm::StringLiteral kTwoSpacesTwoObjectives = R"mlir(
+module {
+  micro.search_space @space_a attributes {workload = "a"} {
+    micro.param "N" {kind = "integer", choices = [1 : i64]}
+    micro.candidate @cand_a {bindings = {N = 1 : i64}}
+    micro.objective {direction = "minimize", metric = "latency_cycles"}
+  }
+  micro.search_space @space_b attributes {workload = "b"} {
+    micro.param "N" {kind = "integer", choices = [1 : i64]}
+    micro.candidate @cand_b {bindings = {N = 1 : i64}}
+    micro.objective {direction = "maximize", metric = "dram_bytes"}
+  }
+}
+)mlir";
+
+// The objective must come from the search space the candidate belongs to. The
+// old code took the module's *first* objective, so a candidate in the second
+// space was ranked by the first space's order.
+TEST(SearchObjective, UsesTheSelectedSpacesObjective) {
+  auto parsed = parse(kTwoSpacesTwoObjectives);
+  ASSERT_TRUE(parsed);
+
+  auto a = mlir::llk::micro_mapping_detail::objectiveOrderFromModule(
+      *parsed->module, "cand_a");
+  ASSERT_TRUE(static_cast<bool>(a)) << llvm::toString(a.takeError());
+  ASSERT_TRUE(a->has_value());
+  EXPECT_TRUE((*a)->minimize);
+  EXPECT_EQ((*a)->primary, CostMetric::LatencyCycles);
+
+  auto b = mlir::llk::micro_mapping_detail::objectiveOrderFromModule(
+      *parsed->module, "cand_b");
+  ASSERT_TRUE(static_cast<bool>(b)) << llvm::toString(b.takeError());
+  ASSERT_TRUE(b->has_value());
+  EXPECT_FALSE((*b)->minimize);
+  EXPECT_EQ((*b)->primary, CostMetric::DramBytes);
+}
+
+// With no selector, several declared objectives are ambiguous: rejecting is
+// what keeps a candidate from being silently ranked by another space's order.
+TEST(SearchObjective, SeveralObjectivesWithoutASelectorAreRejected) {
+  auto parsed = parse(kTwoSpacesTwoObjectives);
+  ASSERT_TRUE(parsed);
+
+  auto order = mlir::llk::micro_mapping_detail::objectiveOrderFromModule(
+      *parsed->module);
+  std::string error = takeError(order);
+  EXPECT_NE(error.find("micro.objectives"), std::string::npos) << error;
 }
 
 } // namespace

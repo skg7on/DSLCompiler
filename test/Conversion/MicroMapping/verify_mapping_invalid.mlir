@@ -263,3 +263,21 @@ module {
     return
   }
 }
+
+// -----
+
+// Two kernels and no kernel selector: verifying "the kernel" would silently
+// choose the first and ignore the rest, so the module is rejected as ambiguous.
+// expected-error @below {{micro-verify-mapping: the module has 2 micro.kernels (@a, @b); mapping one kernel per module is required, since there is no kernel selector}}
+module {
+  micro.kernel @a attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+  micro.kernel @b attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+}

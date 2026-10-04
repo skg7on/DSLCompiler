@@ -166,31 +166,102 @@ inline std::vector<std::string> parseEmitterKeys(llvm::StringRef text) {
   return keys;
 }
 
-/// The first `micro.kernel` in the module, or null. Matched by dialect op name
-/// so this library does not depend on the Micro dialect's generated classes.
-inline Operation *findMicroKernel(ModuleOp module) {
-  Operation *kernel = nullptr;
+/// The module's single `micro.kernel`, resolved by dialect op name so this
+/// library does not depend on the Micro dialect's generated classes.
+///
+/// Fails when the module has no kernel (nothing to map) or more than one. There
+/// is no kernel selector yet, so silently picking the first kernel would map
+/// one and ignore the rest -- exactly the ambiguity the caller must see. The
+/// message names the symbols so the fix (split the module, or name the kernel)
+/// is obvious.
+inline llvm::Expected<Operation *>
+resolveMicroKernel(ModuleOp module, llvm::StringRef passName) {
+  llvm::SmallVector<Operation *, 2> kernels;
   module.walk([&](Operation *op) {
-    if (!kernel && op->getName().getStringRef() == "micro.kernel")
-      kernel = op;
+    if (op->getName().getStringRef() == "micro.kernel")
+      kernels.push_back(op);
   });
-  return kernel;
+  if (kernels.empty())
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        (passName + ": the module has no micro.kernel").str());
+  if (kernels.size() > 1) {
+    std::string names;
+    for (Operation *kernel : kernels) {
+      auto symbol = kernel->getAttrOfType<StringAttr>("sym_name");
+      if (!names.empty())
+        names += ", ";
+      names += symbol ? ("@" + symbol.getValue()).str() : "<unnamed>";
+    }
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        (passName + ": the module has " + std::to_string(kernels.size()) +
+         " micro.kernels (" + names +
+         "); mapping one kernel per module is required, since there is no "
+         "kernel selector")
+            .str());
+  }
+  return kernels.front();
 }
 
-/// The comparison order the module's `micro.objective` declares, if it has one.
-/// Absence is not an error: the caller keeps its default (latency minimized).
-/// A *declared* objective the cost model cannot honor is an error, never a
-/// silent downgrade to latency (§17.1: a target may not replace the declared
-/// objective).
+/// The comparison order the selected search space's `micro.objective` declares,
+/// if it has one. Absence is not an error: the caller keeps its default
+/// (latency minimized). A *declared* objective the cost model cannot honor is
+/// an error, never a silent downgrade to latency (§17.1: a target may not
+/// replace the declared objective).
+///
+/// The objective belongs to the search space the plan is selected *in*, not to
+/// whichever space happens to appear first in the module: two spaces may
+/// declare different objectives, and ranking one space's candidate by another
+/// space's order would silently mis-rank it. When `candidateSymbol` names a
+/// candidate, its enclosing `micro.search_space` supplies the objective.
+/// Without a selector the module's objective is used only when it is
+/// unambiguous: zero, or exactly one. Several objectives with no selector is
+/// rejected.
 inline llvm::Expected<std::optional<mapping::ObjectiveOrder>>
-objectiveOrderFromModule(ModuleOp module) {
+objectiveOrderFromModule(ModuleOp module,
+                         llvm::StringRef candidateSymbol = "") {
   Operation *objectiveOp = nullptr;
-  module.walk([&](Operation *op) {
-    if (!objectiveOp && op->getName().getStringRef() == "micro.objective")
-      objectiveOp = op;
-  });
-  if (!objectiveOp)
-    return std::optional<mapping::ObjectiveOrder>{};
+  if (!candidateSymbol.empty()) {
+    Operation *candidate = nullptr;
+    module.walk([&](Operation *op) {
+      if (candidate || op->getName().getStringRef() != "micro.candidate")
+        return;
+      if (auto symbol = op->getAttrOfType<StringAttr>("sym_name"))
+        if (symbol.getValue() == candidateSymbol)
+          candidate = op;
+    });
+    // An unknown or unspaced candidate is not diagnosed here: the binding
+    // loader owns that error and its message, and it runs on every path that
+    // reaches this. Returning "no objective" keeps this lookup from preempting
+    // the canonical diagnostic with a second, differently-worded one.
+    if (!candidate)
+      return std::optional<mapping::ObjectiveOrder>{};
+    Operation *space = candidate->getParentOp();
+    if (!space || space->getName().getStringRef() != "micro.search_space")
+      return std::optional<mapping::ObjectiveOrder>{};
+    space->walk([&](Operation *op) {
+      if (!objectiveOp && op->getName().getStringRef() == "micro.objective")
+        objectiveOp = op;
+    });
+    if (!objectiveOp)
+      return std::optional<mapping::ObjectiveOrder>{};
+  } else {
+    llvm::SmallVector<Operation *, 2> objectives;
+    module.walk([&](Operation *op) {
+      if (op->getName().getStringRef() == "micro.objective")
+        objectives.push_back(op);
+    });
+    if (objectives.empty())
+      return std::optional<mapping::ObjectiveOrder>{};
+    if (objectives.size() > 1)
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "the module declares " + std::to_string(objectives.size()) +
+              " micro.objectives; pass candidate=<sym> so the objective is "
+              "taken from the selected search space");
+    objectiveOp = objectives.front();
+  }
 
   auto metric = objectiveOp->getAttrOfType<StringAttr>("metric");
   auto direction = objectiveOp->getAttrOfType<StringAttr>("direction");
@@ -305,11 +376,10 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     return target.takeError();
   run.target = std::move(*target);
 
-  run.kernel = findMicroKernel(module);
-  if (!run.kernel)
-    return llvm::createStringError(
-        llvm::inconvertibleErrorCode(),
-        (passName + ": the module has no micro.kernel").str());
+  llvm::Expected<Operation *> kernel = resolveMicroKernel(module, passName);
+  if (!kernel)
+    return kernel.takeError();
+  run.kernel = *kernel;
 
   llvm::Expected<mapping::WorkloadGraph> graph =
       mapping::extractWorkloadGraph(run.kernel);
@@ -324,7 +394,7 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   // module without one leaves the default (latency minimized) in place; one
   // the cost model cannot honor fails the pass rather than being downgraded.
   llvm::Expected<std::optional<mapping::ObjectiveOrder>> objective =
-      objectiveOrderFromModule(module);
+      objectiveOrderFromModule(module, options.candidate);
   if (!objective)
     return objective.takeError();
   if (*objective)
