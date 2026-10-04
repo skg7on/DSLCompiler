@@ -322,3 +322,72 @@ TEST(MappingPlan, ConnectionKindRoundTrips) {
     EXPECT_EQ(symbolizeConnectionKind(stringifyConnectionKind(kind)), kind);
   }
 }
+
+//===----------------------------------------------------------------------===//
+// Endpoint occurrence identity (A1)
+//===----------------------------------------------------------------------===//
+
+// An endpoint is an occurrence, not the value it carries: two operand specs
+// that share a value and side but sit at different ports must not collide. A
+// spec with no resolved endpoint keeps the legacy value-only rendering, so ids
+// stay stable until endpoint resolution migrates in (B1 owns that migration).
+namespace {
+
+MappingCandidate candidateWithPort(std::optional<PortRef> endpoint) {
+  MappingCandidate candidate;
+  candidate.rule = "r";
+  PortSpec spec;
+  spec.name = "lhs";
+  spec.value = 3;
+  spec.isInput = true;
+  spec.port = endpoint;
+  candidate.ports.push_back(std::move(spec));
+  return candidate;
+}
+
+ConnectionPlan
+connectionWithEndpoints(std::optional<PortRef> producerPort,
+                        llvm::SmallVector<PortRef> consumerPorts) {
+  ConnectionPlan connection;
+  connection.producer = 1;
+  connection.value = 3;
+  connection.producerPort = producerPort;
+  connection.consumerPorts = std::move(consumerPorts);
+  return connection;
+}
+
+} // namespace
+
+TEST(MappingPlan, ResolvedEndpointIsPartOfTheCandidateId) {
+  MappingCandidate plain = candidateWithPort(std::nullopt);
+  MappingCandidate first =
+      candidateWithPort(PortRef{7, PortDirection::Input, 0});
+  MappingCandidate second =
+      candidateWithPort(PortRef{7, PortDirection::Input, 1});
+
+  // Unresolved: the legacy value-only key carries no endpoint marker.
+  EXPECT_EQ(canonicalCandidateString(plain).find("node="), std::string::npos);
+  // Resolved: the occurrence tells two uses of one value apart.
+  EXPECT_NE(canonicalCandidateString(first), canonicalCandidateString(second));
+  EXPECT_NE(computeCandidateId(first), computeCandidateId(second));
+}
+
+TEST(MappingPlan, ResolvedEndpointsArePartOfTheConnectionId) {
+  ConnectionPlan plain = connectionWithEndpoints(std::nullopt, {});
+  ConnectionPlan first =
+      connectionWithEndpoints(PortRef{1, PortDirection::Output, 0},
+                              {PortRef{2, PortDirection::Input, 0}});
+  ConnectionPlan second =
+      connectionWithEndpoints(PortRef{1, PortDirection::Output, 0},
+                              {PortRef{2, PortDirection::Input, 1}});
+
+  // Unresolved: neither endpoint marker is emitted, so the id is unchanged.
+  EXPECT_EQ(canonicalConnectionString(plain).find("producerPort="),
+            std::string::npos);
+  EXPECT_EQ(canonicalConnectionString(plain).find("consumerPorts="),
+            std::string::npos);
+  // Resolved: the consumer occurrence is part of the connection's identity.
+  EXPECT_NE(canonicalConnectionString(first),
+            canonicalConnectionString(second));
+  EXPECT_NE(computeConnectionId(first), computeConnectionId(second));
+}
