@@ -26,7 +26,8 @@ queries only, so a layout file never names a concrete executor.
 file       ::= layout*
 layout     ::= "layout" id "(" params ")" "{" stmt* "}"
 params     ::= [ param ("," param)* ]
-param      ::= [ "int" | "sym" ] ident          // a bare name means int
+param      ::= ( "int" | "sym" ) ident | untyped-name
+untyped-name ::= ident except "int" and "sym"   // a bare name means int
 stmt       ::= domain | require | map
 domain     ::= "param" ident "in" ( "[" int ".." int "]" | "{" literal ("," literal)* "}" ) ";"
 require    ::= "require" expr ";"
