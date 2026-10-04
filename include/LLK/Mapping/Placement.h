@@ -108,6 +108,15 @@ struct ConnectionRequest {
   MemoryNodeId consumerMemory;
   std::optional<LayoutId> producerLayout;
   std::optional<LayoutId> consumerLayout;
+  /// The concrete parameterization each endpoint solved for this value's
+  /// layout, when it solved one. Two endpoints whose layout *classes* agree may
+  /// still hold genuinely different representations (`VW = 4` versus `VW = 8`),
+  /// so a transform is required when the classes differ *or* these parameters
+  /// do. An unset map (the default, and what a caller that does not know the
+  /// parameters leaves) compares equal to any other unset map, so a caller that
+  /// only knows class ids keeps the class-only behaviour.
+  llvm::StringMap<SearchValue> producerLayoutParameters;
+  llvm::StringMap<SearchValue> consumerLayoutParameters;
   /// The moved value's type, as far as it is known. A modelled shaped type
   /// (`tensor`, `memref`, `vector`) states both its element type and its
   /// logical shape; a `!micro.tile` is read through `TileFacts`, which unwraps

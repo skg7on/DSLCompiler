@@ -2,6 +2,7 @@
 
 #include "LLK/Mapping/Placement.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -420,6 +421,49 @@ TEST(Placement, RecordsTheSolversFirstLegalAssignment) {
   auto layout = instances->front().layoutSolutions.find("t.choosy");
   ASSERT_NE(layout, instances->front().layoutSolutions.end());
   EXPECT_EQ(layout->second.portValue, -1);
+}
+
+// One layout class required by two different ports: each requirement carries
+// its own port association and its own solved parameterization, so both must
+// survive. Filing every solution under the bare class let the second overwrite
+// the first, so the earlier edge could no longer find the layout its
+// requirement named and fell back to a direct connection without it.
+TEST(Placement, KeepsEveryPortsSolvedLayoutForARepeatedClass) {
+  std::unique_ptr<MappingTarget> target =
+      targetFor(placementMachine(), kParameterizedLayout);
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withLayout = candidate();
+  for (int64_t portValue : {11, 22}) {
+    LayoutRequirement requirement;
+    requirement.layoutClass = "t.blocked";
+    requirement.portValue = portValue;
+    withLayout.layoutRequirements.push_back(requirement);
+  }
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withLayout, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  ASSERT_FALSE(instances->empty());
+  const CandidateInstance &instance = instances->front();
+
+  // The binding still records the class once -- a class is one family -- while
+  // the solved layouts keep one entry per requirement.
+  EXPECT_EQ(instance.layoutBindings.size(), 1u);
+  ASSERT_EQ(instance.layoutSolutions.size(), 2u);
+
+  std::vector<int64_t> portValues;
+  for (const auto &entry : instance.layoutSolutions) {
+    portValues.push_back(entry.second.portValue);
+    auto vw = entry.second.parameters.find("VW");
+    ASSERT_NE(vw, entry.second.parameters.end());
+    const int64_t *integer = std::get_if<int64_t>(&vw->second);
+    ASSERT_NE(integer, nullptr);
+    EXPECT_EQ(*integer, 8);
+  }
+  llvm::sort(portValues);
+  EXPECT_EQ(portValues, (std::vector<int64_t>{11, 22}));
 }
 
 // A candidate that requires no layout records no solved layout: the field is

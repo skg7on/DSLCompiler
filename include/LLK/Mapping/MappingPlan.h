@@ -163,11 +163,20 @@ struct MappingCandidate {
 /// hashed: it is a pure function of the bound layout id and these values, so
 /// including its rendering would only add a dependency on MLIR's map printer.
 ///
-/// Invariant: in the maps that key a `SolvedLayout` by layout class, the key is
-/// the resolved definition id, so it is string-identical to the same class's
-/// entry in `layoutBindings` (both are written together by
-/// `enumeratePlacements` from the requirement's `layoutClass`).
+/// Keying: `enumeratePlacements` files each solution under its requirement's
+/// layout class. When one class is required by several ports of the same
+/// candidate, each requirement has its own solved parameters and port
+/// association, so the later ones are keyed by class plus the requirement's
+/// index (for example `t.blocked#1`) rather than overwriting the first. A class
+/// required once keeps the bare class as its key, so a class-keyed lookup still
+/// resolves for the common case; `SolvedLayout::portValue` is what an edge
+/// matches on, not the key.
 struct SolvedLayout {
+  /// The layout family this solution instantiates. Carried explicitly rather
+  /// than inferred from the containing map's key, because a class required by
+  /// several ports has index-disambiguated keys while the class itself is what
+  /// a connection and its transform name.
+  std::string layoutClass;
   llvm::StringMap<SearchValue> parameters;
   /// The logical-to-physical map with the integer parameters substituted; null
   /// when the layout declaration carries no map clause.
@@ -193,8 +202,9 @@ struct CandidateInstance {
   llvm::StringMap<MemoryNodeId> memoryBindings;
   llvm::StringMap<std::string> computeBindings;
   llvm::StringMap<LayoutId> layoutBindings;
-  /// The solved instantiation of each bound layout class, keyed exactly as
-  /// `layoutBindings` is. Empty when the candidate requires no layout.
+  /// The solved instantiation of each layout requirement, keyed by layout class
+  /// (index-disambiguated when one class is required by several ports; see
+  /// `SolvedLayout`). Empty when the candidate requires no layout.
   llvm::StringMap<SolvedLayout> layoutSolutions;
   ResourceUsage resourceUsage;
   Cost localCost;

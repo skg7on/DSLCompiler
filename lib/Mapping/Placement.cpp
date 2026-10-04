@@ -2,6 +2,7 @@
 
 #include "LLK/Mapping/Placement.h"
 
+#include "LLK/Mapping/SearchBinding.h"
 #include "LLK/Mapping/TileFacts.h"
 
 #include "mlir/IR/BuiltinTypes.h"
@@ -186,15 +187,38 @@ std::optional<size_t> legalTransformHop(llvm::ArrayRef<MemoryNodeId> nodes,
   return std::nullopt;
 }
 
+/// True when two solved layout parameterizations denote the same physical
+/// representation: same names, same values. An absent entry on either side is a
+/// different (empty) map, but two absent maps compare equal -- so a caller that
+/// states only layout class ids is unaffected.
+bool sameLayoutParameters(const llvm::StringMap<SearchValue> &lhs,
+                          const llvm::StringMap<SearchValue> &rhs) {
+  if (lhs.size() != rhs.size())
+    return false;
+  for (const auto &entry : lhs) {
+    auto other = rhs.find(entry.first());
+    if (other == rhs.end() || !(other->second == entry.second))
+      return false;
+  }
+  return true;
+}
+
 } // namespace
 
 bool portsDirectCompatible(const ConnectionRequest &request,
                            const machine::MachineModel &machine) {
   if (!elementAndShapeCompatible(request))
     return false;
-  // Different layouts are a transform, not a direct connection.
+  // A different layout is a transform, not a direct connection. "Different"
+  // covers both the family id and the concrete parameterization: two endpoints
+  // that both name `t.blocked` but solved `VW = 4` against `VW = 8` hold
+  // different representations and cannot be read as one another. A caller that
+  // states only class ids leaves both parameter maps empty, which compare
+  // equal, so that behaviour is unchanged.
   if (request.producerLayout && request.consumerLayout &&
-      *request.producerLayout != *request.consumerLayout)
+      (*request.producerLayout != *request.consumerLayout ||
+       !sameLayoutParameters(request.producerLayoutParameters,
+                             request.consumerLayoutParameters)))
     return false;
   if (!affineCompatible(request))
     return false;
@@ -274,6 +298,14 @@ enumeratePlacements(const MappingCandidate &candidate,
     solvedDefs.push_back(def);
     solvedSolutions.push_back(solved->solutions.front());
   }
+
+  // How many requirements share each layout class. One class may be required by
+  // more than one port of the same candidate (the same blocked layout on two
+  // operands, say), and each requirement has its own port association and its
+  // own solved parameterization -- so their solutions must not share a key.
+  llvm::StringMap<unsigned> layoutClassCounts;
+  for (const LayoutRequirement &requirement : candidate.layoutRequirements)
+    ++layoutClassCounts[requirement.layoutClass];
 
   std::vector<const ExecutorNode *> executors;
   for (const ExecutorNode &executor : machine.executors) {
@@ -381,21 +413,33 @@ enumeratePlacements(const MappingCandidate &candidate,
         instance.memoryBindings[candidate.memoryRequirements[j].kind] =
             memoryChoices[j][pick[computeChoices.size() + j]]->id;
       for (size_t i = 0; i < solvedDefs.size(); ++i) {
-        const std::string &layoutClass =
-            candidate.layoutRequirements[i].layoutClass;
+        const LayoutRequirement &requirement = candidate.layoutRequirements[i];
+        const std::string &layoutClass = requirement.layoutClass;
         instance.layoutBindings[layoutClass] = solvedDefs[i]->id;
         // The solved assignment and its affine map, so the instance states
         // *which* parameterization of the bound layout it uses (`VW = 8`, not
         // merely "some legal `VW`"). `LayoutValue` and `SearchValue` are the
         // same variant, so the values carry over without conversion.
+        //
+        // A class required once keeps the bare class as its key, so a
+        // single-requirement instance is byte-identical to before and a
+        // class-keyed lookup still resolves. A class required by several ports
+        // is keyed by class plus the requirement's index -- unique within the
+        // candidate and deterministic -- so each requirement keeps its own
+        // solved parameters and port association instead of the last one
+        // overwriting the rest.
+        std::string solutionKey = layoutClass;
+        if (layoutClassCounts[layoutClass] > 1)
+          solutionKey += "#" + std::to_string(i);
         SolvedLayout solvedLayout;
+        solvedLayout.layoutClass = layoutClass;
         for (const auto &value : solvedSolutions[i].values)
           solvedLayout.parameters[value.first] = value.second;
         solvedLayout.map = solvedSolutions[i].map;
         // Which value the requirement was solved for, so an edge can ask for
         // *its* layout rather than the instance's only one.
-        solvedLayout.portValue = candidate.layoutRequirements[i].portValue;
-        instance.layoutSolutions[layoutClass] = std::move(solvedLayout);
+        solvedLayout.portValue = requirement.portValue;
+        instance.layoutSolutions[solutionKey] = std::move(solvedLayout);
       }
 
       instance.resourceUsage.executorSlots = 1;
@@ -454,9 +498,15 @@ synthesizeConnections(const ConnectionRequest &request,
   if (!elementAndShapeCompatible(request) || !affineCompatible(request))
     return std::vector<ConnectionPlan>{};
 
+  // A layout difference is a difference of family *or* of the concrete
+  // parameterization solved for the value: two endpoints that both bound
+  // `t.blocked` but solved `VW = 4` against `VW = 8` hold different
+  // representations, and connecting them directly would be wrong.
   const bool transformRequired =
       request.producerLayout && request.consumerLayout &&
-      *request.producerLayout != *request.consumerLayout;
+      (*request.producerLayout != *request.consumerLayout ||
+       !sameLayoutParameters(request.producerLayoutParameters,
+                             request.consumerLayoutParameters));
   auto transformOf = [&]() -> std::optional<LayoutTransform> {
     if (!transformRequired)
       return std::nullopt;
@@ -646,11 +696,25 @@ synthesizeFanOut(const ConnectionRequest &base,
   // partitions the group as well as the memory: grouping by memory alone would
   // assign one member's resulting layout to a consumer that requires a
   // different one, a representation it could never read.
-  std::vector<std::pair<MemoryNodeId, std::optional<LayoutId>>> groupKeys;
+  // The layout a consumer binds partitions the group by *family and concrete
+  // parameterization*: two consumers that both name `t.blocked` but solved
+  // `VW = 4` against `VW = 8` require different representations, so one copy
+  // cannot serve both.
+  struct FanOutKey {
+    MemoryNodeId memory;
+    std::optional<LayoutId> layout;
+    std::string layoutParameters;
+    bool operator==(const FanOutKey &other) const {
+      return memory == other.memory && layout == other.layout &&
+             layoutParameters == other.layoutParameters;
+    }
+  };
+  std::vector<FanOutKey> groupKeys;
   std::vector<std::vector<size_t>> groups;
   for (size_t index = 0; index < consumers.size(); ++index) {
-    std::pair<MemoryNodeId, std::optional<LayoutId>> key{
-        consumers[index].consumerMemory, consumers[index].consumerLayout};
+    FanOutKey key{
+        consumers[index].consumerMemory, consumers[index].consumerLayout,
+        canonicalSearchValueString(consumers[index].consumerLayoutParameters)};
     size_t group = 0;
     for (; group < groupKeys.size(); ++group)
       if (groupKeys[group] == key)

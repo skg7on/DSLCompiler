@@ -163,19 +163,28 @@ MemoryNodeId primaryMemory(const MachineModel &machine,
 ///
 /// Two layout classes solved for the same value are ambiguous -- the edge
 /// cannot say which governs -- so that is treated as unattributable too.
-std::optional<LayoutId> boundLayoutForValue(const CandidateInstance &instance,
-                                            WorkloadValueId value) {
-  std::optional<LayoutId> found;
+const SolvedLayout *boundSolvedLayoutForValue(const CandidateInstance &instance,
+                                              WorkloadValueId value) {
+  const SolvedLayout *found = nullptr;
   for (const auto &entry : instance.layoutSolutions) {
     if (entry.second.portValue != static_cast<int64_t>(value))
       continue;
     if (found)
-      return std::nullopt;
-    // The key is the resolved definition id, string-identical to this class's
-    // `layoutBindings` entry (see `SolvedLayout`'s invariant).
-    found = entry.first().str();
+      return nullptr; // two classes for one value: nothing governs it
+    found = &entry.second;
   }
   return found;
+}
+
+/// The layout *family* `instance` bound for `value`. Taken from the solved
+/// layout's own class rather than its containing map's key, which is
+/// index-disambiguated when one class is required by several ports.
+std::optional<LayoutId> boundLayoutForValue(const CandidateInstance &instance,
+                                            WorkloadValueId value) {
+  const SolvedLayout *solved = boundSolvedLayoutForValue(instance, value);
+  if (!solved)
+    return std::nullopt;
+  return solved->layoutClass;
 }
 
 /// Hashes the chosen instance ids, so a partial plan has a stable identity
@@ -626,6 +635,15 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // unreachable from the search.
       request.producerLayout = boundLayoutForValue(producer, value);
       request.consumerLayout = boundLayoutForValue(consumer, value);
+      // The concrete parameterization each endpoint solved, so a pair that
+      // agrees on the class but not on its parameters is a transform rather
+      // than a direct connection.
+      if (const SolvedLayout *solved =
+              boundSolvedLayoutForValue(producer, value))
+        request.producerLayoutParameters = solved->parameters;
+      if (const SolvedLayout *solved =
+              boundSolvedLayoutForValue(consumer, value))
+        request.consumerLayoutParameters = solved->parameters;
       const TileFacts facts = factsForValue(value);
       request.bytes = facts.bytes;
       request.alignmentBytes = facts.alignment;
@@ -844,11 +862,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       struct GatherKey {
         MemoryNodeId memory;
         std::optional<LayoutId> layout;
+        /// The solved parameterization of `layout` the consumer bound, rendered
+        /// canonically. Two consumers that name the same layout family but
+        /// solved different parameters (VW = 4 versus VW = 8) hold different
+        /// representations, so one gathered tile cannot serve both -- the same
+        /// reason the class id is part of the key.
+        std::string layoutParameters;
         ExecutorId executor;
         mlir::Type portType;
         std::optional<mlir::AffineMap> portMap;
         bool operator==(const GatherKey &other) const {
           return memory == other.memory && layout == other.layout &&
+                 layoutParameters == other.layoutParameters &&
                  executor == other.executor && portType == other.portType &&
                  portMap == other.portMap;
         }
@@ -865,6 +890,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         GatherKey key;
         key.memory = primaryMemory(machine, consumer);
         key.layout = boundLayoutForValue(consumer, link.value);
+        if (const SolvedLayout *solved =
+                boundSolvedLayoutForValue(consumer, link.value))
+          key.layoutParameters = canonicalSearchValueString(solved->parameters);
         key.executor = consumer.executorBindings.lookup("executor");
         if (consumerEnd.port) {
           key.portType = consumerEnd.port->type;
