@@ -1,7 +1,8 @@
 # LLKMap formal syntax
 
 This reference describes the `.llkmap` language implemented on merged `main`
-at commit `31fd9eb440f9cd7fe9946a873237200d57dee5ed`. It specifies syntax,
+at commit `31fd9eb440f9cd7fe9946a873237200d57dee5ed`, with the accompanying
+fix to inclusive range parsing at the signed 64-bit maximum. It specifies syntax,
 name resolution, and the validation stages separately. It does not introduce
 new language behavior. The complete token-level grammar is [llkmap.ebnf](llkmap.ebnf).
 
@@ -25,6 +26,7 @@ Comma-separated lists have no trailing comma.
 | Token | Portable spelling | Interpretation |
 |---|---|---|
 | `IDENT` | `[A-Za-z_][A-Za-z0-9_.]*` | Case-sensitive identifier; dots belong to the token |
+| `UNTYPED_PARAM` | Any `IDENT` except exactly `int` or `sym` | Untyped layout header parameter name |
 | `UINT` | `[0-9]+` | Decimal non-negative integer, including leading zeros |
 | `STRING` | `"` followed by any characters except `"`, followed by `"` | Quoted string; no escape sequences |
 | `VERSION` | One `IDENT` matching `v[0-9]+` | Rule version, e.g. `v12`; not `v 12` |
@@ -62,7 +64,7 @@ and costs are not accepted.
 ```ebnf
 layout = "layout", IDENT, "(", [ layout_param, { ",", layout_param } ],
          ")", "{", { layout_stmt }, "}" ;
-layout_param = [ "int" | "sym" ], IDENT ;
+layout_param = ( "int" | "sym" ), IDENT | UNTYPED_PARAM ;
 layout_stmt = domain_stmt | expr_requirement | map_stmt ;
 domain_stmt = "param", IDENT, "in", domain, ";" ;
 domain = "[", UINT, "..", UINT, "]"
@@ -74,6 +76,10 @@ map_stmt = "map", "(", [ IDENT, { ",", IDENT } ], ")", "->",
 ```
 
 A bare header parameter defaults to `int`; `sym` records symbolic intent.
+At the start of a header parameter, `int` and `sym` always select the typed
+alternative and require a following identifier. Thus `layout r(int)` and
+`layout r(sym)` are invalid, while `layout r(int int, sym sym)` is valid.
+These names remain allowed in other identifier positions.
 Ranges are inclusive, require upper bound >= lower bound, and are materialized
 as ascending values. Brace domains must contain at least one integer or quoted
 string. Bare symbols such as `{f32, bf16}` are invalid domains; use

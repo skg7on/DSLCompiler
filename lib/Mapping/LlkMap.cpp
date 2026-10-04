@@ -678,8 +678,13 @@ bool LlkMapParser::parseDomainValues(std::vector<LayoutValue> &out) {
       return false;
     if (upper < lower)
       return failAt(current(), "empty integer range");
-    for (int64_t value = lower; value <= upper; ++value)
+    for (int64_t value = lower;; ++value) {
       out.push_back(value);
+      // Stop before incrementing the inclusive upper bound: it may be
+      // INT64_MAX.
+      if (value == upper)
+        break;
+    }
     return true;
   }
   if (isPunct("{")) {
