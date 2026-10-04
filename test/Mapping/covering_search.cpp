@@ -2128,6 +2128,242 @@ TEST(CoveringSearch, GatherIntermediateCountsAgainstCapacity) {
   EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
 }
 
+/// Producer -> consumer across `fanMachine`'s dram.0 -> acc.0 where the value
+/// the consumer reads is `large` and the tile it writes is `small`. The two
+/// sizes differ so the transfer's destination input buffer is distinguishable
+/// from the consumer's own output tile.
+WorkloadGraph transferCapacityGraph(mlir::MLIRContext &context,
+                                    mlir::Type large, mlir::Type small) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, large, "in", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, large, "mid", /*external=*/false});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, small, "out", /*external=*/false});
+
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.attributes = vectorAttributes(context, "produce");
+  producer.inputs.push_back(WorkloadPort{input, large, std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, large, std::nullopt});
+  graph.addNode(std::move(producer));
+
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.sourceOrdinal = 1;
+  consumer.attributes = vectorAttributes(context, "consume");
+  consumer.inputs.push_back(WorkloadPort{middle, large, std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{output, small, std::nullopt});
+  graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+// §9.3: a transfer's destination memory holds the consumer's *input* buffer,
+// which is not the consumer's output tile. A 4096-byte value moved into a
+// 1024-byte acc.0 must be charged there even though the consumer writes only 4
+// bytes -- the old accounting only counted the consumer's outputs, so a
+// narrowing (or reducing) consumer let an oversized input through.
+TEST(CoveringSearch, ATransferChargesItsDestinationInputBuffer) {
+  mlir::MLIRContext context;
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = transferCapacityGraph(context, large, small);
+
+  MachineModel machine = fanMachine();
+  // The 4-byte output fits; the 4096-byte input buffer it reads does not.
+  machine.memories[1].capacityBytes = 1024;
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// Control: sizing the destination for the input buffer *and* the consumer's
+// output admits the same plan, so the rejection above is the charged input
+// buffer and not some unrelated failure.
+TEST(CoveringSearch, ATransferWithinItsDestinationCapacityIsAdmitted) {
+  mlir::MLIRContext context;
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = transferCapacityGraph(context, large, small);
+
+  MachineModel machine = fanMachine();
+  machine.memories[1].capacityBytes = 4096u + 4u; // input buffer + output tile
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
+/// Two independent producer -> consumer pairs over `fanMachine`, each moving a
+/// `value`-sized tile from dram.0 into acc.0 and writing a 4-byte result. The
+/// pairs share no value, so the only thing linking them is the destination
+/// memory both transfers fill.
+WorkloadGraph twoSequentialTransferGraph(mlir::MLIRContext &context,
+                                         mlir::Type value) {
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph;
+  auto pair = [&](llvm::StringRef tag, unsigned ordinal) {
+    WorkloadValueId input = graph.addValue(
+        WorkloadValue{0, value, tag.str() + ".in", /*external=*/true});
+    WorkloadValueId middle = graph.addValue(
+        WorkloadValue{0, value, tag.str() + ".mid", /*external=*/false});
+    WorkloadValueId output = graph.addValue(
+        WorkloadValue{0, small, tag.str() + ".out", /*external=*/false});
+
+    WorkloadNode producer;
+    producer.opName = "micro.vector";
+    producer.sourceOrdinal = ordinal;
+    producer.attributes = vectorAttributes(context, "produce");
+    producer.inputs.push_back(WorkloadPort{input, value, std::nullopt});
+    producer.outputs.push_back(WorkloadPort{middle, value, std::nullopt});
+    graph.addNode(std::move(producer));
+
+    WorkloadNode consumer;
+    consumer.opName = "micro.vector";
+    consumer.sourceOrdinal = ordinal + 1;
+    consumer.attributes = vectorAttributes(context, "consume");
+    consumer.inputs.push_back(WorkloadPort{middle, value, std::nullopt});
+    consumer.outputs.push_back(WorkloadPort{output, small, std::nullopt});
+    graph.addNode(std::move(consumer));
+  };
+  pair("a", 0);
+  pair("b", 2);
+  graph.finalize();
+  return graph;
+}
+
+// A transfer destination is released once its consumer is placed, so two
+// sequential transfers into one memory need room for only one buffer at a time.
+// acc.0 holds both 4-byte outputs plus one 4096-byte input buffer (4104), not
+// both buffers (8200): charging the destination without its lifetime would
+// reject this legal plan, the over-charging direction the report warns about.
+TEST(CoveringSearch, SequentialTransfersReuseTheirDestinationBuffer) {
+  mlir::MLIRContext context;
+  mlir::Type value =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = twoSequentialTransferGraph(context, value);
+
+  MachineModel machine = fanMachine();
+  machine.memories[1].capacityBytes = 4200; // one 4096 buffer + both outputs
+  std::unique_ptr<MappingTarget> target = targetWith(machine, kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
+/// Two producers and two consumers of one `middle` value over `fanMachine`'s
+/// dram.0 -> acc.0. The second consumer's input port carries `secondPortType`,
+/// so a caller can make it incompatible with the `f32` value both consumers
+/// read.
+WorkloadGraph twoConsumerGatherGraph(mlir::MLIRContext &context,
+                                     mlir::Type secondPortType) {
+  mlir::Type f32 =
+      mlir::RankedTensorType::get({16}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph;
+  WorkloadValueId in1 =
+      graph.addValue(WorkloadValue{0, f32, "in1", /*external=*/true});
+  WorkloadValueId in2 =
+      graph.addValue(WorkloadValue{0, f32, "in2", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, f32, "mid", /*external=*/false});
+  WorkloadValueId out1 =
+      graph.addValue(WorkloadValue{0, f32, "o1", /*external=*/false});
+  WorkloadValueId out2 =
+      graph.addValue(WorkloadValue{0, f32, "o2", /*external=*/false});
+
+  auto producer = [&](WorkloadValueId input, unsigned ordinal) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.attributes = vectorAttributes(context, "produce");
+    node.inputs.push_back(WorkloadPort{input, f32, std::nullopt});
+    node.outputs.push_back(WorkloadPort{middle, f32, std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  producer(in1, 0);
+  producer(in2, 1);
+
+  auto consumer = [&](WorkloadValueId output, mlir::Type portType,
+                      unsigned ordinal) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.attributes = vectorAttributes(context, "consume");
+    node.inputs.push_back(WorkloadPort{middle, portType, std::nullopt});
+    node.outputs.push_back(WorkloadPort{output, f32, std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  consumer(out1, f32, 2);
+  consumer(out2, secondPortType, 3);
+  graph.finalize();
+  return graph;
+}
+
+// §15.3: a gather validates *every* consumer, not one representative. When the
+// second consumer's port carries a different element type, no feed can legally
+// serve it, so the whole gather must fail rather than attach it to a plan built
+// from the first consumer's compatible facts. The guard first proves the
+// fixture is viable with two compatible consumers, so the empty result below is
+// the mismatched port. `WorkloadGraph::finalize` orders nodes by content key;
+// the compatible consumer sorts first here, which is the order that puts the
+// representative's facts in agreement while the other consumer disagrees.
+TEST(CoveringSearch, GatherValidatesEveryConsumerNotJustTheFirst) {
+  mlir::MLIRContext context;
+  mlir::Type f32 =
+      mlir::RankedTensorType::get({16}, mlir::Float32Type::get(&context));
+  mlir::Type incompatible =
+      mlir::RankedTensorType::get({16}, mlir::Float64Type::get(&context));
+
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  {
+    // Guard: two compatible consumers are a legal gather.
+    WorkloadGraph viable = twoConsumerGatherGraph(context, f32);
+    CoveringSearch search(viable, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_FALSE(result->plans.empty());
+  }
+  {
+    WorkloadGraph split = twoConsumerGatherGraph(context, incompatible);
+    CoveringSearch search(split, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_TRUE(result->plans.empty());
+  }
+}
+
 TEST(CoveringSearch, ReportsTruncationWhenInstanceCapIsHit) {
   mlir::MLIRContext context;
   WorkloadGraph graph = twoNodeGraph(context);

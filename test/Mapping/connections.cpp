@@ -968,6 +968,68 @@ TEST(Connections, FanOutSelectsCopiesByTheDeclaredObjective) {
   EXPECT_EQ((*byDramBytes)[0].cost.dramBytes, 0u);
 }
 
+// A legal *layout-only* alternative must survive fan-out. Two consumers sharing
+// the producer's memory and needing the same conversion have no transfer to
+// make: the only legal shape is one in-place `LayoutTransform` both read. The
+// fan-out used to keep only replication-shaped plans, so this returned nothing
+// even though the single-consumer case below finds the transform.
+TEST(Connections, FanOutKeepsALayoutOnlyTransformAlternative) {
+  MachineModel machine = connectionMachine();
+  TopologyService topology(machine);
+  ConnectionRequest base = baseRequest();
+  base.consumerMemory = base.producerMemory; // no movement: transform in place
+  base.consumerLayout = "t.b";               // differs from the producer's t.a
+
+  llvm::Expected<std::vector<ConnectionPlan>> single =
+      synthesizeConnections(base, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(single)) << llvm::toString(single.takeError());
+  ASSERT_EQ(single->size(), 1u);
+  ASSERT_EQ((*single)[0].kind, ConnectionKind::LayoutTransform);
+
+  std::vector<ConnectionRequest> consumers = {
+      consumerRequest(base, 11, base.producerMemory),
+      consumerRequest(base, 12, base.producerMemory)};
+  llvm::Expected<std::vector<ConnectionPlan>> group =
+      synthesizeFanOut(base, consumers, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(group)) << llvm::toString(group.takeError());
+  ASSERT_EQ(group->size(), 1u);
+  EXPECT_EQ((*group)[0].kind, ConnectionKind::LayoutTransform);
+  ASSERT_EQ((*group)[0].consumers.size(), 2u);
+  EXPECT_EQ((*group)[0].consumers[0], 11u);
+  EXPECT_EQ((*group)[0].consumers[1], 12u);
+}
+
+// Consumers that share a destination memory but need *different* resulting
+// layouts cannot share one copy/transform: whichever member's representation
+// was chosen would be unreadable to the others. Each must get its own plan.
+TEST(Connections, FanOutSplitsConsumersThatNeedDifferentLayouts) {
+  MachineModel machine = connectionMachine();
+  for (MemoryNode &node : machine.memories)
+    if (node.id == "dram.0" || node.id == "acc.0")
+      node.supportedLayouts = {"t.a", "t.b", "t.c"};
+  TopologyService topology(machine);
+
+  ConnectionRequest base = baseRequest(); // producer on dram.0 in t.a
+  ConnectionRequest first = consumerRequest(base, 11, "acc.0");
+  first.consumerLayout = "t.b";
+  ConnectionRequest second = consumerRequest(base, 12, "acc.0");
+  second.consumerLayout = "t.c";
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeFanOut(base, {first, second}, machine, topology);
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 2u);
+  for (const ConnectionPlan &plan : *plans) {
+    ASSERT_EQ(plan.consumers.size(), 1u);
+    ASSERT_TRUE(plan.transform.has_value());
+  }
+  EXPECT_NE((*plans)[0].transform->dstLayout, (*plans)[1].transform->dstLayout);
+  const std::string firstLayout = (*plans)[0].transform->dstLayout;
+  const std::string secondLayout = (*plans)[1].transform->dstLayout;
+  EXPECT_TRUE((firstLayout == "t.b" && secondLayout == "t.c") ||
+              (firstLayout == "t.c" && secondLayout == "t.b"));
+}
+
 TEST(Connections, FanInProducesOneReducePlan) {
   ConnectionPlan plan =
       synthesizeFanIn(std::vector<InstanceId>{1, 2, 3},

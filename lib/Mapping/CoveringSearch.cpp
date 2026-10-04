@@ -717,6 +717,27 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       }
       staged.push_back(*pickBest(*alternatives));
       cost = addCost(cost, staged.back().cost);
+      // §9.3: a plain movement fills a destination buffer in the consumer's
+      // memory -- the consumer's *input*, not its output tile (which the
+      // consumer instance charges through its own memory binding). The two
+      // sizes differ whenever the value is narrowed or reduced, so the
+      // transferred bytes are charged here rather than assumed away as the
+      // already-counted consumer tile. `Direct` and `LayoutTransform` move
+      // nothing and charge nothing. The charge is a live range under the value,
+      // so the capacity check below sees it and the link loop releases it in
+      // the same placement: a transfer destination exists only while its
+      // consumer runs. No aliasing with the consumer's own tile is assumed --
+      // the model establishes none, and a lower charge is the unsafe direction.
+      const ConnectionPlan &chosen = staged.back();
+      if (chosen.kind == ConnectionKind::Transfer ||
+          chosen.kind == ConnectionKind::TransferAndTransform) {
+        const MemoryNodeId destination = chosen.memoryRoute.empty()
+                                             ? request.consumerMemory
+                                             : chosen.memoryRoute.back();
+        partial.memoryBytes[destination] += request.bytes;
+        partial.liveValueCharges[request.value].push_back(
+            {destination, request.bytes});
+      }
       return true;
     };
 
@@ -811,32 +832,57 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       }
 
       // Fan-in (design §15.3): several producers feed one value. Consumers
-      // sharing a destination memory are served by one gather, so the feeds and
-      // the intermediate tile are counted once per memory, not once per
-      // consumer.
+      // sharing a destination memory *and* the same required representation are
+      // served by one gather, so the feeds and the intermediate tile are
+      // counted once per representation, not once per consumer. Grouping by
+      // memory alone validated the feeds against one representative and then
+      // attached every consumer to the result, so a second consumer with a
+      // different element type, affine relation, layout or executor was never
+      // checked. The key is exactly what `makeRequest` reads from the consumer,
+      // so every member of a group is equivalent to its representative by
+      // construction.
+      struct GatherKey {
+        MemoryNodeId memory;
+        std::optional<LayoutId> layout;
+        ExecutorId executor;
+        mlir::Type portType;
+        std::optional<mlir::AffineMap> portMap;
+        bool operator==(const GatherKey &other) const {
+          return memory == other.memory && layout == other.layout &&
+                 executor == other.executor && portType == other.portType &&
+                 portMap == other.portMap;
+        }
+      };
       std::vector<InstanceId> producerIds;
       for (const ValueEndpoint &producerEnd : link.producers)
         producerIds.push_back(partial.chosen[producerEnd.node]->id);
       llvm::sort(producerIds);
 
-      std::vector<MemoryNodeId> gatherMemories;
+      std::vector<GatherKey> gatherKeys;
       std::vector<std::vector<const ValueEndpoint *>> gatherGroups;
       for (const ValueEndpoint &consumerEnd : link.consumers) {
-        MemoryNodeId memory =
-            primaryMemory(machine, *partial.chosen[consumerEnd.node]);
+        const CandidateInstance &consumer = *partial.chosen[consumerEnd.node];
+        GatherKey key;
+        key.memory = primaryMemory(machine, consumer);
+        key.layout = boundLayoutForValue(consumer, link.value);
+        key.executor = consumer.executorBindings.lookup("executor");
+        if (consumerEnd.port) {
+          key.portType = consumerEnd.port->type;
+          key.portMap = consumerEnd.port->accessMap;
+        }
         size_t group = 0;
-        for (; group < gatherMemories.size(); ++group)
-          if (gatherMemories[group] == memory)
+        for (; group < gatherKeys.size(); ++group)
+          if (gatherKeys[group] == key)
             break;
-        if (group == gatherMemories.size()) {
-          gatherMemories.push_back(memory);
+        if (group == gatherKeys.size()) {
+          gatherKeys.push_back(std::move(key));
           gatherGroups.emplace_back();
         }
         gatherGroups[group].push_back(&consumerEnd);
       }
 
       for (size_t group = 0; group < gatherGroups.size(); ++group) {
-        MemoryNodeId consumerMemory = gatherMemories[group];
+        MemoryNodeId consumerMemory = gatherKeys[group].memory;
         const std::vector<const ValueEndpoint *> &groupEndpoints =
             gatherGroups[group];
         const ValueEndpoint &representative = *groupEndpoints.front();
