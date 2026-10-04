@@ -414,6 +414,9 @@ enumeratePlacements(const MappingCandidate &candidate,
         for (const auto &value : solvedSolutions[i].values)
           solvedLayout.parameters[value.first] = value.second;
         solvedLayout.map = solvedSolutions[i].map;
+        // Which value the requirement was solved for, so an edge can ask for
+        // *its* layout rather than the instance's only one.
+        solvedLayout.portValue = candidate.layoutRequirements[i].portValue;
         instance.layoutSolutions[layoutClass] = std::move(solvedLayout);
       }
 

@@ -540,12 +540,19 @@ MachineModel transformMachine() {
 }
 
 /// Producer and consumer bind *different* layouts for the value they exchange.
+/// The producer names the port that carries the crossing value (`result`, its
+/// only output) and the consumer names its input, so both bindings are
+/// attributable to the edge. Both rules declare their ports: a layout
+/// requirement is attributed to the value its named port carries, and a rule
+/// that names no port attributes nothing.
 constexpr llvm::StringLiteral kTransformRules = R"llkmap(
 rule r.produce {
   match micro.vector(op = "produce");
   require executor kind worker;
   require memory kind sram;
-  require layout operand0 satisfies t.plain;
+  require layout result satisfies t.plain;
+  input "operand0";
+  output "result";
   bundle "b.produce";
   emit "e1";
   cost 1;
@@ -555,20 +562,24 @@ rule r.consume {
   require executor kind worker;
   require memory kind sram;
   require layout operand0 satisfies t.blocked;
+  input "operand0";
+  output "result";
   bundle "b.consume";
   emit "e1";
   cost 1;
 }
 )llkmap";
 
-/// The control: the same two rules, both requiring `t.plain`, so the endpoints
-/// agree and the pair must stay a direct connection.
+/// The control: the same two rules, both requiring `t.plain` for the crossing
+/// value, so the endpoints agree and the pair must stay a direct connection.
 constexpr llvm::StringLiteral kSameLayoutRules = R"llkmap(
 rule r.produce {
   match micro.vector(op = "produce");
   require executor kind worker;
   require memory kind sram;
-  require layout operand0 satisfies t.plain;
+  require layout result satisfies t.plain;
+  input "operand0";
+  output "result";
   bundle "b.produce";
   emit "e1";
   cost 1;
@@ -578,6 +589,38 @@ rule r.consume {
   require executor kind worker;
   require memory kind sram;
   require layout operand0 satisfies t.plain;
+  input "operand0";
+  output "result";
+  bundle "b.consume";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The `avx2.mma_bf16` shape: the producer's layout requirement names an
+/// *input* port (`lhs`), while the value crossing the edge is its `result`. The
+/// producer therefore says nothing about the result's layout, and the edge must
+/// inherit nothing from it -- even though the consumer asks for a different
+/// layout.
+constexpr llvm::StringLiteral kMmaShapedRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind sram;
+  require layout lhs satisfies t.plain;
+  input "lhs";
+  output "result";
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume {
+  match micro.vector(op = "consume");
+  require executor kind worker;
+  require memory kind sram;
+  require layout operand0 satisfies t.blocked;
+  input "operand0";
+  output "result";
   bundle "b.consume";
   emit "e1";
   cost 1;
@@ -1739,6 +1782,54 @@ TEST(CoveringSearch, MatchingBoundLayoutsStayDirect) {
   ASSERT_EQ(plan.connectionPlans.size(), 1u);
   EXPECT_EQ(plan.connectionPlans[0].kind, ConnectionKind::Direct);
   EXPECT_FALSE(plan.connectionPlans[0].transform.has_value());
+}
+
+// The other direction of the same attribution rule, and the reason it is by
+// value rather than by "the instance's one layout": a layout named on a port
+// that does *not* carry the crossing value must not be inherited by the edge.
+// This is the shipped `avx2.mma_bf16` shape -- `require layout lhs satisfies
+// avx2.row_major` names an input, while the edge carries the mma's `result`.
+// Attributing `lhs`'s layout to the result would fabricate a transform (and,
+// because differing layouts suppress `Direct`, could drop a valid connection).
+TEST(CoveringSearch, ALayoutOnAnotherPortIsNotAttributedToTheEdge) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, /*producerOp=*/"produce",
+                                     /*consumerOp=*/"consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWithLayouts(transformMachine(), kMmaShapedRules, kTwoLayouts);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  // The producer bound `t.plain`, but for its *input*; the edge carries its
+  // result, whose layout it never named. So the edge is not a transform: the
+  // producer's layout is unknown, not `t.plain`.
+  EXPECT_EQ(plan.connectionPlans[0].kind, ConnectionKind::Direct);
+  EXPECT_FALSE(plan.connectionPlans[0].transform.has_value());
+
+  // The premise: the producer really did bind `t.plain` (for its input), so
+  // this is an attribution decision and not a missing solve.
+  const PlanPlacement *producer = nullptr;
+  for (const PlanPlacement &placement : plan.placements)
+    if (placement.rule == "r.produce")
+      producer = &placement;
+  ASSERT_NE(producer, nullptr);
+  auto solved = producer->layoutSolutions.find("t.plain");
+  ASSERT_NE(solved, producer->layoutSolutions.end());
+  const WorkloadNode *producerNode = graph.findNode(producer->node);
+  ASSERT_NE(producerNode, nullptr);
+  ASSERT_EQ(producerNode->inputs.size(), 1u);
+  ASSERT_EQ(producerNode->outputs.size(), 1u);
+  EXPECT_EQ(solved->second.portValue,
+            static_cast<int64_t>(producerNode->inputs[0].value));
+  EXPECT_NE(solved->second.portValue,
+            static_cast<int64_t>(producerNode->outputs[0].value));
 }
 
 //===----------------------------------------------------------------------===//

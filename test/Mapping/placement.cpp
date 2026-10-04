@@ -362,6 +362,10 @@ TEST(Placement, RecordsTheSolvedLayoutParametersAndAffineMap) {
   MappingCandidate withLayout = candidate();
   LayoutRequirement requirement;
   requirement.layoutClass = "t.blocked";
+  // A hand-built candidate points the requirement at a value directly (a rule
+  // bridge fills this from the port it names); the number is carried through
+  // unchanged so an edge can later ask for this value's layout.
+  requirement.portValue = 7;
   withLayout.layoutRequirements.push_back(requirement);
   mlir::MLIRContext context;
 
@@ -384,6 +388,10 @@ TEST(Placement, RecordsTheSolvedLayoutParametersAndAffineMap) {
   ASSERT_TRUE(layout->second.map);
   const std::string printed = printedMap(layout->second.map);
   EXPECT_NE(printed.find("floordiv 8"), std::string::npos) << printed;
+
+  // The value the requirement was resolved for travels with the binding, so a
+  // connection request can attribute it to the right edge.
+  EXPECT_EQ(layout->second.portValue, 7);
 }
 
 // The solver enumerates the declared domain in declaration order, and placement
@@ -407,6 +415,11 @@ TEST(Placement, RecordsTheSolversFirstLegalAssignment) {
   // 4 and 8 both satisfy `VW % 4 == 0`; the first declared is recorded.
   EXPECT_EQ(solvedInteger(instances->front(), "t.choosy", "VW"),
             std::optional<int64_t>(4));
+  // A requirement that names no value records the unset sentinel, never a
+  // fabricated value: nothing may attribute this binding to an edge.
+  auto layout = instances->front().layoutSolutions.find("t.choosy");
+  ASSERT_NE(layout, instances->front().layoutSolutions.end());
+  EXPECT_EQ(layout->second.portValue, -1);
 }
 
 // A candidate that requires no layout records no solved layout: the field is

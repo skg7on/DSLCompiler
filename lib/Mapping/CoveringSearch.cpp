@@ -144,17 +144,38 @@ MemoryNodeId primaryMemory(const MachineModel &machine,
   return MemoryNodeId();
 }
 
-/// The one layout an instance binds, when it binds exactly one; nullopt
-/// otherwise. `layoutBindings` is keyed by layout *class*, not by port, so an
-/// instance holding two classes cannot say which one applies to a given edge.
-/// That fact is genuinely unknown here, and a connection request leaves an
-/// unknown fact unset rather than guessing: a guessed-wrong layout would
-/// fabricate a transform for an edge whose ends actually agree, while a missed
-/// one only costs the transform alternative for a multi-layout instance.
-std::optional<LayoutId> soleBoundLayout(const CandidateInstance &instance) {
-  if (instance.layoutBindings.size() != 1)
-    return std::nullopt;
-  return instance.layoutBindings.begin()->second;
+/// The layout `instance` bound for the value `value`, or nullopt when it bound
+/// none for it.
+///
+/// The match is by *value*, not by "the instance's one layout": a rule's layout
+/// requirement names a port, and the solved binding is recorded against the
+/// workload value that port carries. The edge being connected carries that same
+/// value (a port's value *is* the edge's value), so a binding solved for
+/// another value -- or for no resolvable port at all -- does not match. That is
+/// what keeps a layout named on one port from being attributed to an edge
+/// carrying a different one: `avx2.mma_bf16` requires `lhs` to be
+/// `avx2.row_major`, and `lhs` is an *input*, so the edge carrying the mma's
+/// `result` must not inherit that layout. Both directions of error are avoided
+/// rather than traded: a mis-attributed layout could fabricate a transform (or,
+/// because differing layouts now suppress `Direct`, drop a connection that was
+/// valid), while no attribution at all only costs the transform alternative for
+/// that edge.
+///
+/// Two layout classes solved for the same value are ambiguous -- the edge
+/// cannot say which governs -- so that is treated as unattributable too.
+std::optional<LayoutId> boundLayoutForValue(const CandidateInstance &instance,
+                                            WorkloadValueId value) {
+  std::optional<LayoutId> found;
+  for (const auto &entry : instance.layoutSolutions) {
+    if (entry.second.portValue != static_cast<int64_t>(value))
+      continue;
+    if (found)
+      return std::nullopt;
+    // The key is the resolved definition id, string-identical to this class's
+    // `layoutBindings` entry (see `SolvedLayout`'s invariant).
+    found = entry.first().str();
+  }
+  return found;
 }
 
 /// Hashes the chosen instance ids, so a partial plan has a stable identity
@@ -586,12 +607,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       request.value = value;
       request.producerMemory = primaryMemory(machine, producer);
       request.consumerMemory = primaryMemory(machine, consumer);
-      // The layouts each endpoint *bound*, so differing layouts make this pair
-      // a transform rather than a direct connection (§15.2). Without them the
-      // search could only ever reach `synthesizeConnections`' direct path, and
-      // a transform alternative was unreachable from the search.
-      request.producerLayout = soleBoundLayout(producer);
-      request.consumerLayout = soleBoundLayout(consumer);
+      // The layout each endpoint bound for *this* value, so differing layouts
+      // make the pair a transform rather than a direct connection (§15.2).
+      // Without them the search could only ever reach
+      // `synthesizeConnections`' direct path, and a transform alternative was
+      // unreachable from the search.
+      request.producerLayout = boundLayoutForValue(producer, value);
+      request.consumerLayout = boundLayoutForValue(consumer, value);
       const TileFacts facts = factsForValue(value);
       request.bytes = facts.bytes;
       request.alignmentBytes = facts.alignment;

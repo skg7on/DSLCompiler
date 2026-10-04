@@ -1299,6 +1299,10 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
       if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
               staticShapeOf(nodePort->type))
         resolved.rank = static_cast<int64_t>(shape->size());
+      // The value this port carries, so the solved binding can be attributed to
+      // the edge that carries it. A rule that names only an input port
+      // therefore does *not* claim a layout for the value its node produces.
+      resolved.portValue = static_cast<int64_t>(nodePort->value);
     }
     candidate.layoutRequirements.push_back(std::move(resolved));
   }

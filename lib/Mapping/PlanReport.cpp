@@ -195,6 +195,14 @@ std::string writePlanReport(const MappingSearchResult &result,
       for (size_t rank = 0; rank < result.plans.size(); ++rank) {
         const CoveringPlan &plan = result.plans[rank];
         json.object([&] {
+          // The plan's content id. It is a snapshot for correlation, *not*
+          // something a reader can recompute from this document: the id folds
+          // content the summary below does not emit -- since phase-3 T4 the
+          // solved layout parameterization of every instance and placement
+          // (`CoveringPlan` -> `PlanPlacement::layoutSolutions`), as well as
+          // the placements' layouts -- so re-deriving an id from the report, or
+          // re-emitting a report and expecting the ids to survive, is not a
+          // supported round trip.
           json.attribute("id", hexId(plan.id));
           json.attribute("rank", static_cast<uint64_t>(rank));
           json.attribute("sourceBindingHash", hexId(plan.sourceBindingHash));
