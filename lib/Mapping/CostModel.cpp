@@ -6,8 +6,11 @@
 
 #include "llvm/ADT/Twine.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace mlir::llk::mapping {
 
@@ -138,6 +141,48 @@ bool ranksBefore(const Cost &lhs, uint64_t lhsId, const Cost &rhs,
   if (costLess(rhs, lhs, order))
     return false;
   return lhsId < rhsId;
+}
+
+Cost bestCostForObjective(const Cost &lhs, const Cost &rhs,
+                          const ObjectiveOrder &order) {
+  auto pick = [&](double l, double r) {
+    return order.minimize ? std::min(l, r) : std::max(l, r);
+  };
+  auto pickUnsigned = [&](uint64_t l, uint64_t r) {
+    return order.minimize ? std::min(l, r) : std::max(l, r);
+  };
+  Cost best;
+  best.latencyCycles = pick(lhs.latencyCycles, rhs.latencyCycles);
+  best.dramBytes = pickUnsigned(lhs.dramBytes, rhs.dramBytes);
+  best.localBytes = pickUnsigned(lhs.localBytes, rhs.localBytes);
+  best.spillBytes = pickUnsigned(lhs.spillBytes, rhs.spillBytes);
+  best.computeUtilization =
+      pick(lhs.computeUtilization, rhs.computeUtilization);
+  best.transferUtilization =
+      pick(lhs.transferUtilization, rhs.transferUtilization);
+  return best;
+}
+
+Cost infiniteCost() {
+  Cost cost;
+  cost.latencyCycles = std::numeric_limits<double>::infinity();
+  cost.dramBytes = std::numeric_limits<uint64_t>::max();
+  cost.localBytes = std::numeric_limits<uint64_t>::max();
+  cost.spillBytes = std::numeric_limits<uint64_t>::max();
+  cost.computeUtilization = std::numeric_limits<double>::infinity();
+  cost.transferUtilization = std::numeric_limits<double>::infinity();
+  return cost;
+}
+
+bool boundIsDead(const Cost &cost) { return std::isinf(cost.latencyCycles); }
+
+bool boundIsBetterThan(const Cost &lhs, const Cost &rhs,
+                       const ObjectiveOrder &order) {
+  if (boundIsDead(lhs))
+    return false;
+  if (boundIsDead(rhs))
+    return true;
+  return costLess(lhs, rhs, order);
 }
 
 llvm::Expected<ObjectiveOrder>

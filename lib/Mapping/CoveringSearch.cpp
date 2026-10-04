@@ -11,8 +11,10 @@
 // dies at the first pair that cannot be connected rather than at completion.
 //
 // The bound used for ordering and pruning is admissible: accumulated cost plus,
-// for each uncovered node, the cheapest instance available for it. Connection
-// costs are non-negative, so it never overestimates.
+// for each uncovered node, the componentwise best still reachable -- the
+// measured-or-static `entry.cost`, never the stale static estimate -- added
+// onto the accumulated cost. Its direction follows the declared objective, and
+// connection costs are non-negative, so it never overestimates.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,7 +30,6 @@
 #include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
-#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -100,7 +101,10 @@ struct Partial {
   /// (when every endpoint is chosen), so a fan-out is built exactly once.
   std::vector<char> linked;
   Cost cost;
-  double lowerBound = std::numeric_limits<double>::infinity();
+  /// Optimistic completion cost, direction-aware and measured (`boundCost`).
+  /// Multi-dimensional: the beam order and the exact prune both compare it
+  /// through `boundIsBetterThan`, never as a bare latency.
+  Cost lowerBound = infiniteCost();
   uint64_t id = 0;
   unsigned covered = 0;
   uint64_t executorSlots = 0;
@@ -757,19 +761,28 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return true;
   };
 
-  // Admissible bound: accumulated cost plus the cheapest instance still
-  // available for every uncovered node.
-  auto bound = [&](const Partial &partial) -> double {
-    double total = partial.cost.latencyCycles;
+  // Optimistic completion cost: accumulated cost plus, for every uncovered
+  // node, the componentwise best still reachable. "Best" is direction-aware --
+  // a minimize objective wants the smallest reachable value, a maximize
+  // objective the largest, or the bound stops favouring the branch it bounds
+  // and pruning becomes inadmissible. The per-instance value is `entry.cost`
+  // (measured-or-static), never `instance.localCost`: a calibrated-down
+  // instance must lower the bound, not be pruned by a stale static estimate.
+  // A node with no reachable instance makes the bound infinite, which
+  // `boundIsBetterThan` always loses whichever direction is declared.
+  auto boundCost = [&](const Partial &partial) -> Cost {
+    Cost total = partial.cost;
     for (size_t index = 0; index < tables.size(); ++index) {
       if (partial.chosen[index])
         continue;
-      double cheapest = std::numeric_limits<double>::infinity();
+      std::optional<Cost> best;
       for (const InstanceEntry &entry : tables[index].instances)
-        cheapest = std::min(cheapest, entry.instance.localCost.latencyCycles);
-      if (!std::isfinite(cheapest))
-        return std::numeric_limits<double>::infinity();
-      total += cheapest;
+        best = best
+                   ? bestCostForObjective(*best, entry.cost, options_.objective)
+                   : entry.cost;
+      if (!best)
+        return infiniteCost();
+      total = addCost(total, *best);
     }
     return total;
   };
@@ -796,14 +809,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         for (const InstanceEntry &entry : tables[*node].instances) {
           Partial branch = partial;
           if (extend(branch, *node, entry)) {
-            branch.lowerBound = bound(branch);
+            branch.lowerBound = boundCost(branch);
             next.push_back(std::move(branch));
           }
         }
       }
-      llvm::sort(next, [](const Partial &lhs, const Partial &rhs) {
-        if (lhs.lowerBound != rhs.lowerBound)
-          return lhs.lowerBound < rhs.lowerBound;
+      // Task 2 replaces this comparator; `boundIsBetterThan` is the exposed,
+      // direction-aware swap point. An exact tie falls back to the deeper (more
+      // covered) plan, then the stable partial id.
+      llvm::sort(next, [&](const Partial &lhs, const Partial &rhs) {
+        if (boundIsBetterThan(lhs.lowerBound, rhs.lowerBound,
+                              options_.objective))
+          return true;
+        if (boundIsBetterThan(rhs.lowerBound, lhs.lowerBound,
+                              options_.objective))
+          return false;
         if (lhs.covered != rhs.covered)
           return lhs.covered > rhs.covered;
         return lhs.id < rhs.id;
@@ -826,7 +846,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // Deterministic and exact share a depth-first walk; they differ in when
     // they stop and in whether the bound prunes.
     bool exact = options_.mode == SearchMode::Exact;
-    std::vector<double> bestCosts; // best complete costs, ascending
+    // Best complete costs, ranked by the declared objective (best first). The
+    // worst kept plan is `back()`, whichever direction the objective prefers.
+    std::vector<Cost> bestCosts;
     std::function<void(Partial &, bool &)> visit = [&](Partial &partial,
                                                        bool &stop) {
       if (stop)
@@ -834,8 +856,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       std::optional<size_t> node = lowestUncovered(partial);
       if (!node) {
         complete.push_back(partial);
-        bestCosts.push_back(partial.cost.latencyCycles);
-        llvm::sort(bestCosts);
+        bestCosts.push_back(partial.cost);
+        llvm::sort(bestCosts, [&](const Cost &lhs, const Cost &rhs) {
+          return costLess(lhs, rhs, options_.objective);
+        });
         if (bestCosts.size() > options_.topK)
           bestCosts.resize(options_.topK);
         return;
@@ -847,9 +871,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         if (!extend(branch, *node, entry))
           continue;
         if (exact) {
-          branch.lowerBound = bound(branch);
+          branch.lowerBound = boundCost(branch);
+          // Task 2 replaces this prune; `boundIsBetterThan` is the exposed,
+          // direction-aware swap point. A bound that cannot beat the worst
+          // kept plan is pruned -- `>=` under a minimize objective, `<=`
+          // under a maximize one, and a dead bound always loses.
           if (bestCosts.size() >= options_.topK &&
-              branch.lowerBound >= bestCosts.back()) {
+              !boundIsBetterThan(branch.lowerBound, bestCosts.back(),
+                                 options_.objective)) {
             // A full top-K list makes this prune exact -- it cannot drop a
             // plan we would keep -- but the space was not exhausted, and the
             // caller is told so.

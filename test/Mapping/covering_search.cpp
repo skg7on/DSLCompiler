@@ -606,6 +606,103 @@ values(std::initializer_list<std::pair<llvm::StringRef, SearchValue>> entries) {
 /// drift silently; it changes only when the canonical plan form does.
 constexpr PlanId kNoBindingPlanId = 13971994565763734923ULL;
 
+//===----------------------------------------------------------------------===//
+// Search bound fixtures
+//===----------------------------------------------------------------------===//
+
+/// Both rules declare the *same* static 100-cycle cost, so a bound that reads
+/// the static estimate cannot tell them apart -- only the measured cost can.
+/// `r.a_static` sorts first, which pins the depth-first instance order.
+constexpr llvm::StringLiteral kMeasuredBoundRules = R"llkmap(
+rule r.a_static {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.a";
+  emit "e1";
+  cost 100;
+}
+rule r.b_measured {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.b";
+  emit "e1";
+  cost 100;
+}
+)llkmap";
+
+/// Two workers under a shared `root` scope, joined by a near-free
+/// `dram.0 -> sram.0` link. Both workers can address `sram.0`, but only `e0`
+/// can address `dram.0`, so a consumer on `e1` must *move* a DRAM value rather
+/// than read it in place. The route latency stays small, so latency and DRAM
+/// pull in opposite directions.
+MachineModel objectiveMachine() {
+  MachineModel model;
+  model.target = "objective";
+  model.executors = {{"root", "cluster", std::nullopt, {}, 1, {}},
+                     {"e0", "a", std::string("root"), {}, 1, {}},
+                     {"e1", "b", std::string("root"), {}, 1, {}}};
+  MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "root";
+  sram.capacityBytes = 1u << 20;
+  sram.alignmentBytes = 64;
+  MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "e0";
+  dram.capacityBytes = 1u << 30;
+  dram.alignmentBytes = 64;
+  model.memories = {sram, dram};
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+  LinkEdge edge;
+  edge.id = "dram_to_sram.0";
+  edge.source = "dram.0";
+  edge.destination = "sram.0";
+  edge.bandwidthBytesPerCycle = 4096;
+  edge.latencyCycles = 0;
+  edge.transactionBytes = 4096;
+  edge.transferEngines = {"dma.0"};
+  model.links = {edge};
+  return model;
+}
+
+/// The consumer is pinned to a 1-cycle SRAM placement on `e1`. The producer
+/// chooses between a 1-cycle DRAM placement (which the consumer cannot read in
+/// place, so 4096 bytes cross DRAM) and a 50-cycle SRAM placement (read in
+/// place, 0 DRAM bytes). Minimizing latency picks the DRAM plan, minimizing
+/// DRAM the SRAM one -- opposite answers, so the bound must follow the metric.
+constexpr llvm::StringLiteral kObjectiveRules = R"llkmap(
+rule r.p_dram {
+  match micro.vector(op = "produce");
+  require executor kind a;
+  require memory kind dram;
+  bundle "b.pd";
+  emit "e1";
+  cost 1;
+}
+rule r.p_sram {
+  match micro.vector(op = "produce");
+  require executor kind a;
+  require memory kind sram;
+  bundle "b.ps";
+  emit "e1";
+  cost 50;
+}
+rule r.c_sram {
+  match micro.vector(op = "consume");
+  require executor kind b;
+  require memory kind sram;
+  bundle "b.c";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
 } // namespace
 
 TEST(CoveringSearch, DeterministicReturnsTheFirstCompletePlan) {
@@ -1296,6 +1393,88 @@ TEST(CoveringSearch, DramObjectiveRanksBeforeLatency) {
   ObjectiveOrder byLatency{CostMetric::LatencyCycles, {}, true};
   EXPECT_TRUE(ranksBefore(a, 1, b, 2, byLatency));
   EXPECT_FALSE(ranksBefore(b, 2, a, 1, byLatency));
+}
+
+//===----------------------------------------------------------------------===//
+// The search bound: multi-dimensional, measured, direction-aware
+//===----------------------------------------------------------------------===//
+
+// The bound must follow the *measured* cost. Both rules declare a static
+// 100-cycle cost; a provider measures `r.b_measured` down to 1. The genuinely
+// cheapest plan therefore places `r.b_measured` on both nodes -- and the bound
+// must not over-estimate it from the static 100 and prune it.
+TEST(CoveringSearch, TheBoundUsesTheMeasuredCostNotTheStaticOne) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  FixedLatencyProvider provider;
+  provider.byRule["r.b_measured"] = 1.0; // `r.a_static` keeps the static 100
+  std::unique_ptr<MappingTarget> target =
+      targetWithProvider(searchMachine(), kMeasuredBoundRules, &provider);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1; // a full top-K list is what arms the prune
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // 1 + 1 measured cycles; a static-only bound prunes this branch at 101.
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 2.0);
+  ASSERT_FALSE(result->plans[0].placements.empty());
+  EXPECT_EQ(result->plans[0].placements[0].rule, "r.b_measured");
+}
+
+// The bound must answer to the *declared* metric. The latency-cheaper plan
+// moves 4096 bytes through DRAM; the plan that minimizes DRAM is 50 cycles
+// slower in place. A latency-only bound prunes the DRAM-cheap plan; a bound
+// that reads the DramBytes dimension keeps it, and it ranks first.
+TEST(CoveringSearch, TheBoundIsObjectiveAware) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, "produce", "consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(objectiveMachine(), kObjectiveRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  options.objective = ObjectiveOrder{CostMetric::DramBytes, {}, true};
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // The SRAM producer reads in place: no DRAM traffic, 51 cycles rather than
+  // the DRAM plan's 3. A latency-only bound prunes it and reports the 4096-byte
+  // plan instead.
+  EXPECT_EQ(result->plans[0].totalCost.dramBytes, 0u);
+  bool usesDramCheap = false;
+  for (const PlanPlacement &placement : result->plans[0].placements)
+    usesDramCheap |= placement.rule == "r.p_sram";
+  EXPECT_TRUE(usesDramCheap);
+}
+
+// The bound must be direction-aware. Maximizing latency keeps the *largest*
+// reachable completion; a componentwise-min bound (the minimize rule) would
+// keep the 1-cycle branch and prune the 10-cycle plan the objective asks for.
+TEST(CoveringSearch, TheBoundFollowsTheObjectiveDirection) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Beam;
+  options.beamWidth = 1; // the sort, not the final rank, decides what survives
+  options.objective =
+      ObjectiveOrder{CostMetric::LatencyCycles, {}, /*minimize=*/false};
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_FALSE(result->plans[0].placements.empty());
+  EXPECT_EQ(result->plans[0].placements[0].rule, "r.expensive");
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 20.0);
 }
 
 //===----------------------------------------------------------------------===//

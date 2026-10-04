@@ -120,6 +120,34 @@ bool costLess(const Cost &lhs, const Cost &rhs, const ObjectiveOrder &order);
 bool ranksBefore(const Cost &lhs, uint64_t lhsId, const Cost &rhs,
                  uint64_t rhsId, const ObjectiveOrder &order);
 
+/// Component-wise best of two costs under `order`'s direction: each metric
+/// takes the smaller value when `order.minimize`, the larger otherwise. This is
+/// the optimistic combination a search bound folds in -- the value the
+/// objective would most prefer to see in every dimension -- so a bound built
+/// from it is never worse than a completion that exists.
+Cost bestCostForObjective(const Cost &lhs, const Cost &rhs,
+                          const ObjectiveOrder &order);
+
+/// A bound no completion can improve on: every metric at its worst
+/// representable value. Returned when an uncovered node has no reachable
+/// instance, so the branch can never complete and must be pruned.
+Cost infiniteCost();
+
+/// True when `cost` is the `infiniteCost()` sentinel. A dead bound is never
+/// "better" than a live one, whichever direction the objective prefers: a
+/// branch that cannot complete must not win a maximize objective on the
+/// strength of an infinitely large optimistic value.
+bool boundIsDead(const Cost &cost);
+
+/// True when bound `lhs` is more promising than bound `rhs` under `order`.
+/// Direction-aware: a minimizing objective ranks the smaller bound ahead, a
+/// maximizing objective the larger -- a componentwise-min bound would be
+/// inadmissible for a maximize objective, since pruning keeps the largest and
+/// an under-estimate would discard exactly what maximize wants. An exact tie
+/// returns false in both directions.
+bool boundIsBetterThan(const Cost &lhs, const Cost &rhs,
+                       const ObjectiveOrder &order);
+
 /// Builds the comparison order a `micro.objective` declares from its metric
 /// spelling, direction (`minimize == false` means maximize), and optional
 /// secondary metrics, which are kept in the declared order as tie-breakers
