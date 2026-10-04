@@ -11,14 +11,28 @@
 //   2. that the JIT accepts it -- a build without a working ORC JIT is a skip,
 //      the same contract the legacy execution tests take.
 //
-// KNOWN GAP: the test does *not* call the symbol and check numbers. `JitCache`
-// hands back a fixed `void(*)(MemRef2D*, MemRef2D*, MemRef2D*, MemRef2D*,
-// MemRef2D*)`, and this kernel's real signature -- two by-value memref
-// descriptors, one descriptor returned indirectly -- does not match it, so
-// invoking through that pointer type crashes rather than returning. Calling a
-// micro kernel needs either a fixed-arity kernel ABI (the legacy path always
-// has five descriptors) or a JitCache entry point that exposes a typed symbol.
-// Until then, "it compiles" is as far as this test can honestly go.
+// KNOWN GAP -- the symbol is not *called*. Making the call work needs an ABI
+// decision, and the reason is concrete:
+//
+//   * MLIR does not pass a memref as one aggregate. Each memref parameter is
+//     *expanded* into its seven fields (allocated, aligned, offset, size[2],
+//     stride[2]), so a lowered kernel's LLVM signature is fourteen scalars --
+//     not two descriptors.
+//   * On AArch64 an aggregate result larger than 16 bytes comes back through a
+//     hidden pointer in `x8`. With fourteen scalar arguments, `x8` is also the
+//     *ninth* argument's register, so no C declaration can express the emitted
+//     signature: declaring the parameters as descriptors passes them byval (a
+//     pointer each) and leaves the result buffer unwritten, and declaring the
+//     fourteen scalars collides with the indirect-result register.
+//   * The runtime's `KernelFn` (five `MemRef2D *`) assumes descriptor
+//     *pointers*, which is not what MLIR emits either. The legacy execution
+//     tests would catch that -- but they are skipped on this machine, so the
+//     mismatch has never been exercised.
+//
+// Resolving it is a design choice: lower the kernel ABI to descriptor pointers
+// (`!llvm.ptr` parameters) so it matches the runtime, or give the runtime a
+// trampoline that adapts `MemRef2D *` to the expanded form. Until then "it
+// compiles" is as far as this test can honestly go.
 //
 //===----------------------------------------------------------------------===//
 
