@@ -200,9 +200,10 @@ std::string writePlanReport(const MappingSearchResult &result,
           // content the summary below does not emit -- since phase-3 T4 the
           // solved layout parameterization of every instance and placement
           // (`CoveringPlan` -> `PlanPlacement::layoutSolutions`), as well as
-          // the placements' layouts -- so re-deriving an id from the report, or
-          // re-emitting a report and expecting the ids to survive, is not a
-          // supported round trip.
+          // the placements' layouts -- so an id cannot be re-derived from the
+          // report's content. (Re-emitting the same search's report does carry
+          // every id through verbatim; it just cannot be recomputed from what
+          // the document shows.)
           json.attribute("id", hexId(plan.id));
           json.attribute("rank", static_cast<uint64_t>(rank));
           json.attribute("sourceBindingHash", hexId(plan.sourceBindingHash));

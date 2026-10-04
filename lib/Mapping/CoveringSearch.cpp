@@ -674,10 +674,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // already counted through that instance's memory binding.
     //
     // Unlike the materialized values above, these bytes do *not* expire with
-    // their value: a copy or gather intermediate is an object whose own live
-    // range is not modeled yet, and giving it one is task 3's surface
-    // (route/intermediate capacity and liveness). Charging it for the whole
-    // partial plan is the conservative direction.
+    // their value: the live range of a copy or gather intermediate is simply
+    // not modelled yet, so it is charged for the whole partial plan. That is
+    // the conservative direction -- an intermediate is assumed live from the
+    // moment its copy is staged until the plan ends.
     llvm::StringMap<uint64_t> stagedBytes; // memory -> replica/gather bytes
 
     // Synthesizes one plain-edge connection, staging the chosen alternative.

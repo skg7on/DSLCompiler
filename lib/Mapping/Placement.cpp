@@ -2,6 +2,8 @@
 
 #include "LLK/Mapping/Placement.h"
 
+#include "LLK/Mapping/TileFacts.h"
+
 #include "mlir/IR/BuiltinTypes.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -108,48 +110,24 @@ reduceSymmetric(const MachineModel &machine,
   return representatives;
 }
 
-/// The element type a port type exposes for §10.2 comparison, or nullopt when
-/// this target-independent core cannot read one. A modelled shaped type
-/// (`tensor`, `memref`, `vector`) states its element type; a bare float or
-/// integer type *is* an element type. A `!micro.tile` is opaque here -- the
-/// core never names the Micro dialect -- so it yields nullopt rather than a
-/// guessed element type.
-std::optional<mlir::Type> comparableElementType(mlir::Type type) {
-  if (!type)
-    return std::nullopt;
-  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
-    return shaped.getElementType();
-  if (mlir::isa<mlir::FloatType, mlir::IntegerType, mlir::IndexType>(type))
-    return type;
-  return std::nullopt;
-}
-
-/// The static logical shape a port type exposes, or nullopt for a dynamic,
-/// unranked, or opaque type.
-std::optional<llvm::SmallVector<int64_t, 4>> staticShape(mlir::Type type) {
-  if (!type)
-    return std::nullopt;
-  if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
-    if (shaped.hasStaticShape())
-      return llvm::SmallVector<int64_t, 4>(shaped.getShape());
-  return std::nullopt;
-}
-
 /// §10.2: a changed element type or logical tile shape admits no alternative --
 /// neither a layout transform nor a transfer rewrites it -- so it rejects the
-/// pair outright. Only a fact both ends state is compared.
+/// pair outright. Only a fact both ends state is compared: an unstated end (a
+/// null type, or a type neither helper can read) yields no fact and can never
+/// reject. The reads go through `TileFacts`, the one place a `!micro.tile` is
+/// unwrapped to the tensor its head spells, so a tile-typed port is compared
+/// rather than silently skipped -- the same element type and shape that size
+/// the moving value are what §10.2 compares here.
 bool elementAndShapeCompatible(const ConnectionRequest &request) {
-  std::optional<mlir::Type> producer =
-      comparableElementType(request.elementType);
-  std::optional<mlir::Type> consumer =
-      comparableElementType(request.consumerType);
-  if (producer && consumer && *producer != *consumer)
+  mlir::Type producer = elementTypeOf(request.elementType);
+  mlir::Type consumer = elementTypeOf(request.consumerType);
+  if (producer && consumer && producer != consumer)
     return false;
 
   std::optional<llvm::SmallVector<int64_t, 4>> producerShape =
-      staticShape(request.elementType);
+      staticShapeOf(request.elementType);
   std::optional<llvm::SmallVector<int64_t, 4>> consumerShape =
-      staticShape(request.consumerType);
+      staticShapeOf(request.consumerType);
   if (producerShape && consumerShape && *producerShape != *consumerShape)
     return false;
   return true;

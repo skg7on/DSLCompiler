@@ -110,8 +110,9 @@ struct ConnectionRequest {
   std::optional<LayoutId> consumerLayout;
   /// The moved value's type, as far as it is known. A modelled shaped type
   /// (`tensor`, `memref`, `vector`) states both its element type and its
-  /// logical shape; a `!micro.tile` is opaque to this target-independent core,
-  /// so a tile here contributes no comparable fact.
+  /// logical shape; a `!micro.tile` is read through `TileFacts`, which unwraps
+  /// its printed head to the tensor it spells, so a tile here contributes the
+  /// same element type and static shape an equivalent tensor would.
   mlir::Type elementType;
   /// The consumer port's expected type. When both it and `elementType` expose
   /// an element type or a static shape, they must agree.
