@@ -14,49 +14,50 @@
 // `//` lines are comments. The real invocation is the MicroToLinalg CTest entry
 // in CMakeLists.txt.
 //
-// What the pass drops is stated at the top of the pass: a tile's memory space,
-// layout, and owner are placement facts the target owns, so a tile becomes a
-// plain tensor of the same shape and element type. A kernel has no arguments
-// and no results, so its entry values -- the `tensor.empty` ops it reads --
-// stay tensors, and its result values are unused. Wiring real inputs and
-// outputs is the kernel-ABI slice, and is what a harness needs to observe a
-// result.
+// The kernel ABI is the signature: the values the body reads from outside --
+// its entry tensors -- become arguments, and the value it stores becomes the
+// result. A tile's memory space, layout, and owner are placement facts the
+// target owns and are dropped here, so a tile becomes a plain tensor of the
+// same shape and element type.
 
-// CHECK-LABEL: func.func @elementwise()
+// CHECK-LABEL: func.func @elementwise(%arg0: tensor<8x8xf32>, %arg1: tensor<8x8xf32>)
 module {
   micro.kernel @elementwise {
-    // CHECK: %[[A:.*]] = tensor.empty() : tensor<8x8xf32>
-    // CHECK: %[[B:.*]] = tensor.empty() : tensor<8x8xf32>
+    // A logical view allocates nothing and copies nothing: it is its source.
     %a = tensor.empty() : tensor<8x8xf32>
     %b = tensor.empty() : tensor<8x8xf32>
-    // A logical view allocates nothing and copies nothing: it is its source.
     %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     %tb = micro.tile_view %b {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     // An elementwise fragment materializes a tensor of its own.
     // CHECK: %[[OUT:.*]] = tensor.empty() : tensor<8x8xf32>
     // CHECK: linalg.generic
-    // CHECK-SAME: ins(%[[A]], %[[B]] : tensor<8x8xf32>, tensor<8x8xf32>)
+    // CHECK-SAME: ins(%arg0, %arg1 : tensor<8x8xf32>, tensor<8x8xf32>)
     // CHECK-SAME: outs(%[[OUT]] : tensor<8x8xf32>)
     // CHECK: arith.addf
     %r = micro.vector "add" %ta, %tb : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<acc>>
     micro.yield
   }
 
-  // A movement and a representation change both materialize as copies.
-  // CHECK-LABEL: func.func @staged()
+  // A kernel that stores produces a result: the stored value is what the
+  // caller receives, and the two entry tensors are what it passes in.
+  // CHECK-LABEL: func.func @staged(%arg0: tensor<8x8xf32>) -> tensor<8x8xf32>
   micro.kernel @staged {
-    // CHECK: %[[SRC:.*]] = tensor.empty() : tensor<8x8xf32>
     %ext = tensor.empty() : tensor<8x8xf32>
     // The async movement is synchronous once lowered: a copy, with the token
     // and the wait erased.
     // CHECK: %[[MOVED:.*]] = linalg.generic
-    // CHECK-SAME: ins(%[[SRC]] : tensor<8x8xf32>)
-    // CHECK: linalg.yield
+    // CHECK-SAME: ins(%arg0 : tensor<8x8xf32>)
     %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
     micro.wait %tok
+    %tv = micro.tile_view %t {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    // A representation change materializes the same way: a copy, since the
+    // physical layouts are dropped with the tile's placement facts.
     // CHECK: %[[CONV:.*]] = linalg.generic
     // CHECK-SAME: ins(%[[MOVED]] : tensor<8x8xf32>)
-    %conv = micro.transform %t {src_map = affine_map<(d0, d1) -> (d0, d1)>, dst_map = affine_map<(d0, d1) -> (d0, d1 floordiv 8, d1 mod 8)>} : tensor<8x8xf32> -> tensor<8x8xf32>
+    %conv = micro.transform %tv {src_map = affine_map<(d0, d1) -> (d0, d1)>, dst_map = affine_map<(d0, d1) -> (d0, d1 floordiv 8, d1 mod 8)>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<acc>>
+    // The store becomes the return: the value leaves the kernel here.
+    // CHECK: return %{{.*}} : tensor<8x8xf32>
+    micro.tile_store %conv {dst_memory = #micro.memory<dram>} : !micro.tile<8x8xf32, memory = #micro.memory<acc>>
     micro.yield
   }
 }

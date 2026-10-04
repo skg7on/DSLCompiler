@@ -47,12 +47,23 @@ def Micro_YieldOp : Micro_Op<"yield", [Terminator]> {
   let summary = "Terminator for micro.kernel, micro.for, micro.spatial_for, "
                 "and micro.pipeline";
   let description = [{
-        Terminates a micro dialect region. No operands in the MVP.
+        Terminates a micro dialect region. A `micro.kernel` yields the values it
+        produces, which is what lets a lowered kernel return something a caller
+        can observe -- the kernel-ABI half of the bridge to the backend
+        pipeline. A loop terminator carries none: loop-carried values are a
+        later slice.
     }];
 
-  let arguments = (ins);
+  let arguments = (ins Variadic<AnyType>:$results);
 
-  let assemblyFormat = "attr-dict";
+  let assemblyFormat = "($results^ `:` type($results))? attr-dict";
+
+  // The implicit-terminator trait on `micro.kernel` and the loop ops builds a
+  // terminator with no operands, so that overload has to exist alongside the
+  // variadic one.
+  let builders = [
+    OpBuilder<(ins), [{ /* a bare terminator carries no results */ }]>
+  ];
 }
 
 //===----------------------------------------------------------------------===//

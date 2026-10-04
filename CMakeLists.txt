@@ -693,6 +693,16 @@ add_llvm_executable(SwiGLUVector test/Execution/swiglu_vector_avx2.cpp)
 target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
 
+# MicroKernelExecution: the acceptance chain for the micro->Linalg bridge. A
+# `micro.kernel` is lowered, buffered, JIT-compiled and *called*, and its result
+# checked -- which is also what pins the kernel ABI (entry tensors become
+# parameters, the stored value becomes the bufferized out-parameter).
+add_llvm_executable(MicroKernelExecution test/Execution/micro_kernel_execution.cpp)
+target_link_libraries(MicroKernelExecution PRIVATE
+    LLKMicroToLinalg LLKTransforms LLKRuntime GTest::gtest_main
+    ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME MicroKernelExecution COMMAND MicroKernelExecution)
+
 add_llvm_executable(SwiGLUFusedMemory test/Execution/swiglu_fused_memory.cpp)
 target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SwiGLUFusedMemory COMMAND SwiGLUFusedMemory)

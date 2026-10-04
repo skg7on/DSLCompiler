@@ -320,16 +320,17 @@ struct WaitOpLowering : OpConversionPattern<micro::WaitOp> {
   }
 };
 
-/// The kernel terminator becomes the function's.
+/// The kernel terminator becomes the function's, carrying the values the
+/// kernel yields -- the result a caller observes.
 struct YieldOpLowering : OpConversionPattern<micro::YieldOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
-  matchAndRewrite(micro::YieldOp op, OpAdaptor,
+  matchAndRewrite(micro::YieldOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     if (!isa<func::FuncOp>(op->getParentOp()))
       return rewriter.notifyMatchFailure(op,
                                          "only a kernel terminator is lowered");
-    rewriter.replaceOpWithNewOp<func::ReturnOp>(op);
+    rewriter.replaceOpWithNewOp<func::ReturnOp>(op, adaptor.getResults());
     return success();
   }
 };
@@ -359,12 +360,51 @@ struct MicroToLinalgPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
     MLIRContext *context = &getContext();
+    MicroTypeConverter converter(context);
 
-    // Phase 1: structure. Each kernel becomes an ordinary function.
+    // Phase 1: structure and the kernel ABI. Each kernel becomes an ordinary
+    // function with a signature a caller can use: the values its body reads
+    // from outside become arguments, and the value it stores becomes the
+    // result. Without this the lowered function computed dead work -- nothing
+    // to pass in, nothing to observe.
     llvm::SmallVector<micro::KernelOp> kernels;
     module.walk([&](micro::KernelOp kernel) { kernels.push_back(kernel); });
     for (micro::KernelOp kernel : kernels) {
       IRRewriter rewriter(context);
+
+      // What the kernel produces. A kernel stores to one destination in the
+      // current model; several would need several results, which is a later
+      // slice rather than something to guess at.
+      llvm::SmallVector<micro::TileStoreOp, 2> stores;
+      kernel.getBody().walk(
+          [&](micro::TileStoreOp store) { stores.push_back(store); });
+      if (stores.size() > 1) {
+        kernel.emitError("more than one micro.tile_store: the kernel ABI "
+                         "returns a single result, and a multi-output kernel "
+                         "is not implemented yet");
+        signalPassFailure();
+        return;
+      }
+
+      // What the kernel reads: the entry tensors its body materializes. They
+      // sit at the top of the body (the export emits one per external tensor),
+      // so only direct children of the body block are candidates.
+      llvm::SmallVector<Operation *, 4> entries;
+      for (Operation &op : kernel.getBody().front())
+        if (isa<tensor::EmptyOp>(op))
+          entries.push_back(&op);
+
+      llvm::SmallVector<Type> argumentTypes;
+      for (Operation *entry : entries)
+        argumentTypes.push_back(
+            converter.convertType(entry->getResult(0).getType()));
+      llvm::SmallVector<Type> resultTypes;
+      Value stored;
+      if (!stores.empty()) {
+        stored = stores.front().getSource();
+        resultTypes.push_back(converter.convertType(stored.getType()));
+      }
+
       rewriter.setInsertionPoint(kernel);
       // The kernel itself holds the symbol, so it must not count as a
       // collision with the function that replaces it.
@@ -375,15 +415,37 @@ struct MicroToLinalgPass
           break;
         name = kernel.getSymName().str() + "_" + std::to_string(suffix);
       }
-      auto function = func::FuncOp::create(rewriter, kernel.getLoc(), name,
-                                           rewriter.getFunctionType({}, {}));
+      auto function = func::FuncOp::create(
+          rewriter, kernel.getLoc(), name,
+          rewriter.getFunctionType(argumentTypes, resultTypes));
+
+      // An entry becomes the argument that carries it.
+      Block &body = kernel.getBody().front();
+      for (size_t index = 0; index < entries.size(); ++index) {
+        Value entry = entries[index]->getResult(0);
+        entry.replaceAllUsesWith(
+            body.addArgument(argumentTypes[index], entries[index]->getLoc()));
+      }
+      for (Operation *entry : entries)
+        entry->erase();
+      for (micro::TileStoreOp store : stores)
+        store.erase();
+
+      // The stored value leaves through the terminator.
+      if (stored)
+        if (auto terminator = dyn_cast<micro::YieldOp>(body.getTerminator())) {
+          rewriter.setInsertionPoint(terminator);
+          micro::YieldOp::create(rewriter, terminator.getLoc(),
+                                 ValueRange{stored});
+          rewriter.eraseOp(terminator);
+        }
+
       function.getBody().takeBody(kernel.getBody());
       rewriter.eraseOp(kernel);
     }
 
     // Phase 2: types and ops. The micro dialect is illegal, so anything this
     // pass cannot lower fails the conversion rather than being left behind.
-    MicroTypeConverter converter(context);
     ConversionTarget target(*context);
     target.addIllegalDialect<micro::MicroDialect>();
     target.addLegalDialect<arith::ArithDialect, func::FuncDialect,
