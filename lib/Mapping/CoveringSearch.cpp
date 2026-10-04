@@ -105,8 +105,11 @@ struct Partial {
   std::vector<char> linked;
   Cost cost;
   /// Optimistic completion cost, direction-aware and measured (`boundCost`).
-  /// Multi-dimensional: the beam order and the exact prune both compare it
-  /// through `boundIsBetterThan`, never as a bare latency.
+  /// Multi-dimensional: the beam order always compares it through
+  /// `boundIsBetterThan`, never as a bare latency. The exact prune compares it
+  /// through the same predicate -- but only under a minimize objective, the
+  /// only direction the bound is admissible for; an exact maximize run skips
+  /// the prune block entirely.
   Cost lowerBound = infiniteCost();
   uint64_t id = 0;
   unsigned covered = 0;
@@ -825,8 +828,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       }
       // Bound order: the more promising bound first, direction-aware. An exact
       // tie falls back to the deeper (more covered) plan, then the stable
-      // partial id. The beam is a bounded heuristic that always reports
-      // truncation, so it may sort on a bound the exact prune would reject.
+      // partial id. The beam is a bounded heuristic that may sort on a bound
+      // the exact prune would reject; it flags truncation only when a level
+      // exceeds `beamWidth` and is cut below, not unconditionally.
       llvm::sort(next, [&](const Partial &lhs, const Partial &rhs) {
         if (boundIsBetterThan(lhs.lowerBound, rhs.lowerBound,
                               options_.objective))
@@ -856,8 +860,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // Deterministic and exact share a depth-first walk; they differ in when
     // they stop and in whether the bound prunes.
     bool exact = options_.mode == SearchMode::Exact;
-    // Best complete costs, ranked by the declared objective (best first). The
-    // worst kept plan is `back()`, whichever direction the objective prefers.
+    // Best complete costs for the exact-minimize prune, ranked by the declared
+    // objective (best first, so the worst kept plan is `back()`). Only the
+    // prune reads it, and only a minimize objective arms that prune, so a
+    // maximize or deterministic run skips this bookkeeping along with the
+    // prune block below.
     std::vector<Cost> bestCosts;
     std::function<void(Partial &, bool &)> visit = [&](Partial &partial,
                                                        bool &stop) {
@@ -866,12 +873,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       std::optional<size_t> node = lowestUncovered(partial);
       if (!node) {
         complete.push_back(partial);
-        bestCosts.push_back(partial.cost);
-        llvm::sort(bestCosts, [&](const Cost &lhs, const Cost &rhs) {
-          return costLess(lhs, rhs, options_.objective);
-        });
-        if (bestCosts.size() > options_.topK)
-          bestCosts.resize(options_.topK);
+        if (exact && options_.objective.minimize) {
+          bestCosts.push_back(partial.cost);
+          llvm::sort(bestCosts, [&](const Cost &lhs, const Cost &rhs) {
+            return costLess(lhs, rhs, options_.objective);
+          });
+          if (bestCosts.size() > options_.topK)
+            bestCosts.resize(options_.topK);
+        }
         return;
       }
       for (const InstanceEntry &entry : tables[*node].instances) {

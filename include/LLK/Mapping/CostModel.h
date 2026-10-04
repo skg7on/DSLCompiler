@@ -123,8 +123,16 @@ bool ranksBefore(const Cost &lhs, uint64_t lhsId, const Cost &rhs,
 /// Component-wise best of two costs under `order`'s direction: each metric
 /// takes the smaller value when `order.minimize`, the larger otherwise. This is
 /// the optimistic combination a search bound folds in -- the value the
-/// objective would most prefer to see in every dimension -- so a bound built
-/// from it is never worse than a completion that exists.
+/// objective would most prefer to see in every dimension.
+///
+/// **That optimism is admissible only for a minimize objective.** The bound
+/// also omits connection costs, a non-negative term (a connection exists only
+/// once both endpoints are chosen). Omitting it can only raise a completion, so
+/// for a *minimize* objective the bound stays at or below every completion and
+/// is never worse than one that exists. For a *maximize* objective the same
+/// omission makes the bound *too small* -- not the value the objective most
+/// prefers -- so it is inadmissible and cannot license pruning; a maximize
+/// search relies on its caps for soundness instead (see `boundIsBetterThan`).
 Cost bestCostForObjective(const Cost &lhs, const Cost &rhs,
                           const ObjectiveOrder &order);
 

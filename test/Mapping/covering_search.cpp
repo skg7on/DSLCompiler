@@ -703,6 +703,40 @@ rule r.c_sram {
 }
 )llkmap";
 
+/// Both producer placements reach the consumer in 51 cycles, but on different
+/// metrics: `r.p_dram` pays 49 in place plus a 1-cycle 4096-byte move across
+/// `dram.0 -> sram.0`, `r.p_sram` pays 50 and the consumer reads it in place.
+/// The two plans tie on latency and differ only on `dram_bytes` (4096 vs 0), so
+/// a primary-only comparison cannot tell them apart -- the declared secondary
+/// metric must. `r.p_dram` is declared first (and sorts first), so its plan
+/// completes first and becomes the plan a tie-breaking prune would defend.
+constexpr llvm::StringLiteral kTieRules = R"llkmap(
+rule r.p_dram {
+  match micro.vector(op = "produce");
+  require executor kind a;
+  require memory kind dram;
+  bundle "b.pd";
+  emit "e1";
+  cost 49;
+}
+rule r.p_sram {
+  match micro.vector(op = "produce");
+  require executor kind a;
+  require memory kind sram;
+  bundle "b.ps";
+  emit "e1";
+  cost 50;
+}
+rule r.c_sram {
+  match micro.vector(op = "consume");
+  require executor kind b;
+  require memory kind sram;
+  bundle "b.c";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
 /// Two producer destinations feeding one consumer memory over links of very
 /// different latency (11 vs 101 cycles for the 4096-byte value). The consumer
 /// on `e1` sees neither producer memory, so every plan moves the value. A
@@ -1537,6 +1571,65 @@ TEST(CoveringSearch, TheBoundIsObjectiveAware) {
   for (const PlanPlacement &placement : result->plans[0].placements)
     usesDramCheap |= placement.rule == "r.p_sram";
   EXPECT_TRUE(usesDramCheap);
+}
+
+// §17.1: the objective's secondary metrics are tie-breakers, not decoration.
+// Two complete plans here tie at 51 cycles on the primary metric and differ
+// only on `dram_bytes`; the DRAM-free plan must rank first even though the
+// primary sees a tie. With `topK = 1` the exact prune is armed, so a prune that
+// compared only the primary -- treating an exact primary tie as "not better" --
+// would drop the DRAM-free branch. It must survive on the secondary metric.
+TEST(CoveringSearch, SecondaryMetricBreaksAPrimaryTie) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context, "produce", "consume");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(objectiveMachine(), kTieRules);
+  ASSERT_NE(target, nullptr);
+
+  ObjectiveOrder order{CostMetric::LatencyCycles,
+                       {CostMetric::DramBytes},
+                       /*minimize=*/true};
+
+  // A wide top-K keeps both plans, so the tie and the tie-break are both
+  // observable rather than inferred from which plan survived a prune.
+  {
+    MappingSearchOptions options;
+    options.mode = SearchMode::Exact;
+    options.topK = 2;
+    options.objective = order;
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_EQ(result->plans.size(), 2u);
+    EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 51.0);
+    EXPECT_DOUBLE_EQ(result->plans[1].totalCost.latencyCycles, 51.0);
+    // ...and the only difference is the secondary metric, which ranks the
+    // DRAM-free plan first.
+    EXPECT_EQ(result->plans[0].totalCost.dramBytes, 0u);
+    EXPECT_EQ(result->plans[1].totalCost.dramBytes, 4096u);
+  }
+
+  // A full top-K list arms the exact prune. The DRAM plan completes first, so
+  // the DRAM-free branch's bound ties it on latency; only the secondary metric
+  // can keep that branch alive.
+  {
+    MappingSearchOptions options;
+    options.mode = SearchMode::Exact;
+    options.topK = 1;
+    options.objective = order;
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_EQ(result->plans.size(), 1u);
+    EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 51.0);
+    EXPECT_EQ(result->plans[0].totalCost.dramBytes, 0u);
+    bool usesDramFree = false;
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      usesDramFree |= placement.rule == "r.p_sram";
+    EXPECT_TRUE(usesDramFree);
+  }
 }
 
 // The bound must be direction-aware. Maximizing latency keeps the *largest*
