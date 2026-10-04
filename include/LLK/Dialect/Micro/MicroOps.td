@@ -15,50 +15,44 @@ class Micro_Op<string mnemonic, list<Trait> traits = []>
 // micro.kernel
 //===----------------------------------------------------------------------===//
 
-def Micro_KernelOp : Micro_Op<"kernel", [
-    IsolatedFromAbove,
-    SingleBlockImplicitTerminator<"YieldOp">
-]> {
-    let summary = "Top-level container for a concrete execution schedule";
-    let description = [{
+def Micro_KernelOp
+    : Micro_Op<"kernel", [IsolatedFromAbove,
+                          SingleBlockImplicitTerminator<"YieldOp">]> {
+  let summary = "Top-level container for a concrete execution schedule";
+  let description = [{
         Encapsulates a scheduled kernel with optional workload and target
         metadata. The body contains the execution schedule as micro ops.
     }];
 
-    let arguments = (ins
-        SymbolNameAttr:$sym_name,
-        OptionalAttr<StrAttr>:$workload,
-        OptionalAttr<StrAttr>:$target,
-        OptionalAttr<StrAttr>:$candidate,
-        OptionalAttr<I64Attr>:$schedule_id
-    );
+  let arguments = (ins SymbolNameAttr:$sym_name,
+      OptionalAttr<StrAttr>:$workload, OptionalAttr<StrAttr>:$target,
+      OptionalAttr<StrAttr>:$candidate, OptionalAttr<I64Attr>:$schedule_id);
 
-    let regions = (region SizedRegion<1>:$body);
+  let regions = (region SizedRegion<1>:$body);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $sym_name
         attr-dict-with-keyword
         $body
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
 // micro.yield
 //===----------------------------------------------------------------------===//
 
-def Micro_YieldOp : Micro_Op<"yield", [
-    Terminator
-]> {
-    let summary = "Terminator for micro.kernel, micro.for, micro.spatial_for, and micro.pipeline";
-    let description = [{
+def Micro_YieldOp : Micro_Op<"yield", [Terminator]> {
+  let summary = "Terminator for micro.kernel, micro.for, micro.spatial_for, "
+                "and micro.pipeline";
+  let description = [{
         Terminates a micro dialect region. No operands in the MVP.
     }];
 
-    let arguments = (ins);
+  let arguments = (ins);
 
-    let assemblyFormat = "attr-dict";
+  let assemblyFormat = "attr-dict";
 }
 
 //===----------------------------------------------------------------------===//
@@ -66,28 +60,24 @@ def Micro_YieldOp : Micro_Op<"yield", [
 //===----------------------------------------------------------------------===//
 
 def Micro_TileViewOp : Micro_Op<"tile_view"> {
-    let summary = "Logical zero-cost tile view of a tensor or larger tile";
-    let description = [{
+  let summary = "Logical zero-cost tile view of a tensor or larger tile";
+  let description = [{
         Creates a logical tile view over a windowed slice of a source tensor
         or larger tile. The optional offsets index the source; when absent the
         view covers the whole source. A view is zero-cost: it does not allocate
         storage or produce a copy token.
     }];
 
-    let arguments = (ins
-        AnyType:$source,
-        Variadic<Index>:$offsets,
-        DenseI64ArrayAttr:$shape,
-        OptionalAttr<Micro_LayoutAttr>:$layout
-    );
+  let arguments = (ins AnyType:$source, Variadic<Index>:$offsets,
+      DenseI64ArrayAttr:$shape, OptionalAttr<Micro_LayoutAttr>:$layout);
 
-    let results = (outs AnyType:$result);
+  let results = (outs AnyType:$result);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $source (`[` $offsets^ `]`)? attr-dict `:` type($source) `->` type($result)
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -95,19 +85,19 @@ def Micro_TileViewOp : Micro_Op<"tile_view"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_TileAllocOp : Micro_Op<"tile_alloc"> {
-    let summary = "Allocate a materialized tile in a memory space";
-    let description = [{
+  let summary = "Allocate a materialized tile in a memory space";
+  let description = [{
         Allocates a tile with physical storage in a memory space. The memory
         space and owner are carried by the result tile type.
     }];
 
-    let arguments = (ins);
+  let arguments = (ins);
 
-    let results = (outs AnyType:$result);
+  let results = (outs AnyType:$result);
 
-    let assemblyFormat = "attr-dict `:` type($result)";
+  let assemblyFormat = "attr-dict `:` type($result)";
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -115,27 +105,23 @@ def Micro_TileAllocOp : Micro_Op<"tile_alloc"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_TilePartitionOp : Micro_Op<"tile_partition"> {
-    let summary = "Partition a tile into smaller logical or execution fragments";
-    let description = [{
+  let summary = "Partition a tile into smaller logical or execution fragments";
+  let description = [{
         Partitions a tile into smaller fragments. Logical unless followed by
         materialization or compute consumption. The fragment shape must divide
         the parent shape or carry explicit mask metadata.
     }];
 
-    let arguments = (ins
-        AnyType:$source,
-        DenseI64ArrayAttr:$shape,
-        OptionalAttr<Micro_OwnerAttr>:$owner,
-        OptionalAttr<BoolAttr>:$tail
-    );
+  let arguments = (ins AnyType:$source, DenseI64ArrayAttr:$shape,
+      OptionalAttr<Micro_OwnerAttr>:$owner, OptionalAttr<BoolAttr>:$tail);
 
-    let results = (outs AnyType:$result);
+  let results = (outs AnyType:$result);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $source attr-dict `:` type($source) `->` type($result)
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -143,26 +129,23 @@ def Micro_TilePartitionOp : Micro_Op<"tile_partition"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_TileAsyncCopyOp : Micro_Op<"tile_async_copy"> {
-    let summary = "Asynchronous tile movement between memory spaces";
-    let description = [{
+  let summary = "Asynchronous tile movement between memory spaces";
+  let description = [{
         Moves a tile to a destination memory space asynchronously, returning
         a materialized tile and an async token for synchronization.
     }];
 
-    let arguments = (ins
-        AnyType:$source,
-        Micro_MemorySpaceAttr:$dst_memory,
-        OptionalAttr<Micro_OwnerAttr>:$owner
-    );
+  let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$dst_memory,
+      OptionalAttr<Micro_OwnerAttr>:$owner);
 
-    let results = (outs AnyType:$result, AnyType:$token);
+  let results = (outs AnyType:$result, AnyType:$token);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $source attr-dict
         `:` type($source) `->` type($result) `,` type($token)
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -170,23 +153,20 @@ def Micro_TileAsyncCopyOp : Micro_Op<"tile_async_copy"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_TileStoreOp : Micro_Op<"tile_store"> {
-    let summary = "Store a tile to a destination memory space";
-    let description = [{
+  let summary = "Store a tile to a destination memory space";
+  let description = [{
         Stores a materialized tile to an external or previously allocated
         destination memory space.
     }];
 
-    let arguments = (ins
-        AnyType:$source,
-        Micro_MemorySpaceAttr:$dst_memory
-    );
+  let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$dst_memory);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $source attr-dict
         `:` type($source)
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -194,31 +174,25 @@ def Micro_TileStoreOp : Micro_Op<"tile_store"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_MmaOp : Micro_Op<"mma"> {
-    let summary = "Matrix engine compute one level above vendor ISA";
-    let description = [{
+  let summary = "Matrix engine compute one level above vendor ISA";
+  let description = [{
         Computes a tile-typed matrix fragment: acc += lhs x rhs. The shape
         attribute is interpreted as M, N, K.
     }];
 
-    let arguments = (ins
-        AnyType:$lhs,
-        AnyType:$rhs,
-        AnyType:$acc,
-        DenseI64ArrayAttr:$shape,
-        Micro_DTypeAttr:$input,
-        Micro_DTypeAttr:$accumulator,
-        OptionalAttr<StrAttr>:$engine
-    );
+  let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$acc,
+      DenseI64ArrayAttr:$shape, Micro_DTypeAttr:$input,
+      Micro_DTypeAttr:$accumulator, OptionalAttr<StrAttr>:$engine);
 
-    let results = (outs AnyType:$result);
+  let results = (outs AnyType:$result);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $lhs `,` $rhs `,` $acc
         attr-dict
         `:` type($lhs) `,` type($rhs) `,` type($acc) `->` type($result)
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -226,26 +200,23 @@ def Micro_MmaOp : Micro_Op<"mma"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_VectorOp : Micro_Op<"vector"> {
-    let summary = "Tile-typed vector elementwise operation";
-    let description = [{
+  let summary = "Tile-typed vector elementwise operation";
+  let description = [{
         Applies a vector elementwise operation to one or more tile operands.
     }];
 
-    let arguments = (ins
-        StrAttr:$op,
-        Variadic<AnyType>:$inputs,
-        OptionalAttr<StrAttr>:$math_mode
-    );
+  let arguments = (ins StrAttr:$op, Variadic<AnyType>:$inputs,
+      OptionalAttr<StrAttr>:$math_mode);
 
-    let results = (outs AnyType:$result);
+  let results = (outs AnyType:$result);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $op $inputs
         attr-dict
         `:` type($inputs) `->` type($result)
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -253,53 +224,43 @@ def Micro_VectorOp : Micro_Op<"vector"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_ReduceOp : Micro_Op<"reduce"> {
-    let summary = "Tile-typed reduction along one axis";
-    let description = [{
+  let summary = "Tile-typed reduction along one axis";
+  let description = [{
         Reduces a tile along a single axis using sum, max, min, or prod.
     }];
 
-    let arguments = (ins
-        StrAttr:$op,
-        AnyType:$input,
-        I64Attr:$axis
-    );
+  let arguments = (ins StrAttr:$op, AnyType:$input, I64Attr:$axis);
 
-    let results = (outs AnyType:$result);
+  let results = (outs AnyType:$result);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $op $input
         attr-dict
         `:` type($input) `->` type($result)
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
 // micro.for — temporal loop
 //===----------------------------------------------------------------------===//
 
-def Micro_ForOp : Micro_Op<"for", [
-    SingleBlockImplicitTerminator<"YieldOp">
-]> {
-    let summary = "Temporal loop";
-    let description = [{
+def Micro_ForOp : Micro_Op<"for", [SingleBlockImplicitTerminator<"YieldOp">]> {
+  let summary = "Temporal loop";
+  let description = [{
         A temporal loop over an index induction variable with lower bound,
         upper bound, and step. Modeled after scf.for; no iter_args in the MVP.
     }];
 
-    let arguments = (ins
-        Index:$lower_bound,
-        Index:$upper_bound,
-        Index:$step
-    );
+  let arguments = (ins Index:$lower_bound, Index:$upper_bound, Index:$step);
 
-    let regions = (region SizedRegion<1>:$body);
+  let regions = (region SizedRegion<1>:$body);
 
-    let hasCustomAssemblyFormat = 1;
-    let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 
-    let extraClassDeclaration = [{
+  let extraClassDeclaration = [{
         BlockArgument getInductionVar() {
           return getBody().front().getArgument(0);
         }
@@ -310,28 +271,23 @@ def Micro_ForOp : Micro_Op<"for", [
 // micro.spatial_for — spatial loop over machine resources
 //===----------------------------------------------------------------------===//
 
-def Micro_SpatialForOp : Micro_Op<"spatial_for", [
-    SingleBlockImplicitTerminator<"YieldOp">
-]> {
-    let summary = "Spatial loop over machine resources";
-    let description = [{
+def Micro_SpatialForOp
+    : Micro_Op<"spatial_for", [SingleBlockImplicitTerminator<"YieldOp">]> {
+  let summary = "Spatial loop over machine resources";
+  let description = [{
         A spatial loop mapping iterations over machine resources via a
         #micro.map target. Modeled after micro.for with an additional map.
     }];
 
-    let arguments = (ins
-        Index:$lower_bound,
-        Index:$upper_bound,
-        Index:$step,
-        Micro_MappingTargetAttr:$map
-    );
+  let arguments = (ins Index:$lower_bound, Index:$upper_bound, Index:$step,
+      Micro_MappingTargetAttr:$map);
 
-    let regions = (region SizedRegion<1>:$body);
+  let regions = (region SizedRegion<1>:$body);
 
-    let hasCustomAssemblyFormat = 1;
-    let hasVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 
-    let extraClassDeclaration = [{
+  let extraClassDeclaration = [{
         BlockArgument getInductionVar() {
           return getBody().front().getArgument(0);
         }
@@ -342,22 +298,21 @@ def Micro_SpatialForOp : Micro_Op<"spatial_for", [
 // micro.pipeline — pipeline overlap between movement and compute
 //===----------------------------------------------------------------------===//
 
-def Micro_PipelineOp : Micro_Op<"pipeline", [
-    SingleBlockImplicitTerminator<"YieldOp">
-]> {
-    let summary = "Pipeline overlap between movement and compute";
-    let description = [{
+def Micro_PipelineOp
+    : Micro_Op<"pipeline", [SingleBlockImplicitTerminator<"YieldOp">]> {
+  let summary = "Pipeline overlap between movement and compute";
+  let description = [{
         Marks pipeline overlap between data movement and compute. The stages
         attribute controls the number of pipeline stages.
     }];
 
-    let arguments = (ins I64Attr:$stages);
+  let arguments = (ins I64Attr:$stages);
 
-    let regions = (region SizedRegion<1>:$body);
+  let regions = (region SizedRegion<1>:$body);
 
-    let assemblyFormat = "`stages` `=` $stages attr-dict-with-keyword $body";
+  let assemblyFormat = "`stages` `=` $stages attr-dict-with-keyword $body";
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -365,19 +320,19 @@ def Micro_PipelineOp : Micro_Op<"pipeline", [
 //===----------------------------------------------------------------------===//
 
 def Micro_AllocOp : Micro_Op<"alloc"> {
-    let summary = "Allocate logical tile storage in a memory space";
-    let description = [{
+  let summary = "Allocate logical tile storage in a memory space";
+  let description = [{
         Allocates tensor storage in a memory space. DRAM operands represent
         external buffers, so local allocations must not target dram.
     }];
 
-    let arguments = (ins Micro_MemorySpaceAttr:$memory);
+  let arguments = (ins Micro_MemorySpaceAttr:$memory);
 
-    let results = (outs AnyType:$result);
+  let results = (outs AnyType:$result);
 
-    let assemblyFormat = "attr-dict `:` type($result)";
+  let assemblyFormat = "attr-dict `:` type($result)";
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -385,25 +340,22 @@ def Micro_AllocOp : Micro_Op<"alloc"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_AsyncCopyOp : Micro_Op<"async_copy"> {
-    let summary = "Asynchronous movement between memory spaces";
-    let description = [{
+  let summary = "Asynchronous movement between memory spaces";
+  let description = [{
         Moves a tensor between two memory spaces asynchronously, returning the
         materialized tensor and an async token for synchronization.
     }];
 
-    let arguments = (ins
-        AnyType:$source,
-        Micro_MemorySpaceAttr:$src_memory,
-        Micro_MemorySpaceAttr:$dst_memory
-    );
+  let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$src_memory,
+      Micro_MemorySpaceAttr:$dst_memory);
 
-    let results = (outs AnyType:$result, AnyType:$token);
+  let results = (outs AnyType:$result, AnyType:$token);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $source attr-dict `:` type($source) `->` type($result) `,` type($token)
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -411,16 +363,49 @@ def Micro_AsyncCopyOp : Micro_Op<"async_copy"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_WaitOp : Micro_Op<"wait"> {
-    let summary = "Wait on async movement or compute tokens";
-    let description = [{
+  let summary = "Wait on async movement or compute tokens";
+  let description = [{
         Blocks until all operand async tokens have completed.
     }];
 
-    let arguments = (ins Variadic<Micro_AsyncToken>:$tokens);
+  let arguments = (ins Variadic<Micro_AsyncToken>:$tokens);
 
-    let assemblyFormat = "$tokens attr-dict";
+  let assemblyFormat = "$tokens attr-dict";
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.transform — re-represent a value under a different layout
+//===----------------------------------------------------------------------===//
+
+def Micro_TransformOp : Micro_Op<"transform"> {
+  let summary = "Re-represent a shaped value under a different layout";
+  let description = [{
+        Converts a shaped value from one layout to another in place: the value
+        read through `src_map` is written through `dst_map`. Each map is the
+        logical-to-physical affine map of the layout on that side, so the
+        operation is target-neutral -- it names layouts by their index relation,
+        never by a target-owned id (design §13.4). A map is absent when the
+        corresponding layout declares no map clause, which leaves that side's
+        index relation to the target.
+
+        The operation is deliberately not `Pure`: it performs real work with a
+        cost, so it is neither eliminated nor commoned away. A `LayoutTransform`
+        connection in a bound plan becomes one of these, and a
+        `TransferAndTransform` connection emits its copies followed by one.
+    }];
+
+  let arguments = (ins AnyType:$source, OptionalAttr<AffineMapAttr>:$src_map,
+      OptionalAttr<AffineMapAttr>:$dst_map);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = [{
+        $source attr-dict `:` type($source) `->` type($result)
+    }];
+
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -428,35 +413,31 @@ def Micro_WaitOp : Micro_Op<"wait"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_StoreOp : Micro_Op<"store"> {
-    let summary = "Store a value to a destination memory space";
-    let description = [{
+  let summary = "Store a value to a destination memory space";
+  let description = [{
         Stores a shaped value to a destination memory space. The source and
         destination memory spaces must differ.
     }];
 
-    let arguments = (ins
-        AnyType:$source,
-        Micro_MemorySpaceAttr:$src_memory,
-        Micro_MemorySpaceAttr:$dst_memory
-    );
+  let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$src_memory,
+      Micro_MemorySpaceAttr:$dst_memory);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $source attr-dict `:` type($source)
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
 // micro.search_space — container for legal schedule choices
 //===----------------------------------------------------------------------===//
 
-def Micro_SearchSpaceOp : Micro_Op<"search_space", [
-    IsolatedFromAbove,
-    SingleBlockImplicitTerminator<"YieldOp">
-]> {
-    let summary = "Top-level container for legal schedule choices";
-    let description = [{
+def Micro_SearchSpaceOp
+    : Micro_Op<"search_space", [IsolatedFromAbove,
+                                SingleBlockImplicitTerminator<"YieldOp">]> {
+  let summary = "Top-level container for legal schedule choices";
+  let description = [{
         Holds the search-space metadata an auto-scheduler consumes: tunable
         parameters, legality constraints, ranking objectives, and candidate
         bindings. Concrete execution ops are not allowed in the body.
@@ -465,18 +446,15 @@ def Micro_SearchSpaceOp : Micro_Op<"search_space", [
         and are symbols so that later stages can refer to a specific candidate.
     }];
 
-    let arguments = (ins
-        SymbolNameAttr:$sym_name,
-        StrAttr:$workload
-    );
+  let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$workload);
 
-    let regions = (region SizedRegion<1>:$body);
+  let regions = (region SizedRegion<1>:$body);
 
-    let assemblyFormat = [{
+  let assemblyFormat = [{
         $sym_name attr-dict-with-keyword $body
     }];
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -484,8 +462,8 @@ def Micro_SearchSpaceOp : Micro_Op<"search_space", [
 //===----------------------------------------------------------------------===//
 
 def Micro_ParamOp : Micro_Op<"param"> {
-    let summary = "Declare one tunable search parameter";
-    let description = [{
+  let summary = "Declare one tunable search parameter";
+  let description = [{
         Declares a named parameter and its legal values. The kind names the
         domain so that verifiers do not have to infer semantics from the
         parameter name:
@@ -501,15 +479,11 @@ def Micro_ParamOp : Micro_Op<"param"> {
         referred to by name, not bound to SSA values.
     }];
 
-    let arguments = (ins
-        StrAttr:$name,
-        StrAttr:$kind,
-        ArrayAttr:$choices
-    );
+  let arguments = (ins StrAttr:$name, StrAttr:$kind, ArrayAttr:$choices);
 
-    let assemblyFormat = "$name attr-dict";
+  let assemblyFormat = "$name attr-dict";
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -517,8 +491,8 @@ def Micro_ParamOp : Micro_Op<"param"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_ConstraintOp : Micro_Op<"constraint"> {
-    let summary = "Declare one typed legality constraint";
-    let description = [{
+  let summary = "Declare one typed legality constraint";
+  let description = [{
         Records that a set of search parameters must satisfy a named legality
         rule. This is a typed record, not a free-form expression language:
         machine-aware evaluation of capacity, MMA compatibility, and the like
@@ -530,14 +504,11 @@ def Micro_ConstraintOp : Micro_Op<"constraint"> {
         fragment_compatible, or pipeline_live_tiles.
     }];
 
-    let arguments = (ins
-        StrAttr:$kind,
-        ArrayAttr:$params
-    );
+  let arguments = (ins StrAttr:$kind, ArrayAttr:$params);
 
-    let assemblyFormat = "$kind attr-dict";
+  let assemblyFormat = "$kind attr-dict";
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -545,22 +516,19 @@ def Micro_ConstraintOp : Micro_Op<"constraint"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_ObjectiveOp : Micro_Op<"objective"> {
-    let summary = "Ranking objective for candidate search";
-    let description = [{
+  let summary = "Ranking objective for candidate search";
+  let description = [{
         Names the metric candidates are ranked by, the direction to optimize
         it in, and optional secondary metrics used as tie-breakers in the
         order given.
     }];
 
-    let arguments = (ins
-        StrAttr:$direction,
-        StrAttr:$metric,
-        OptionalAttr<ArrayAttr>:$secondary
-    );
+  let arguments = (ins StrAttr:$direction, StrAttr:$metric,
+      OptionalAttr<ArrayAttr>:$secondary);
 
-    let assemblyFormat = "attr-dict";
+  let assemblyFormat = "attr-dict";
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -568,21 +536,18 @@ def Micro_ObjectiveOp : Micro_Op<"objective"> {
 //===----------------------------------------------------------------------===//
 
 def Micro_CandidateOp : Micro_Op<"candidate"> {
-    let summary = "Bind every search parameter to one selected value";
-    let description = [{
+  let summary = "Bind every search parameter to one selected value";
+  let description = [{
         A candidate is a named assignment of every parameter declared in the
         enclosing micro.search_space. Binding a candidate to a concrete
         micro.kernel happens in the tuning stage, not here.
     }];
 
-    let arguments = (ins
-        SymbolNameAttr:$sym_name,
-        DictionaryAttr:$bindings
-    );
+  let arguments = (ins SymbolNameAttr:$sym_name, DictionaryAttr:$bindings);
 
-    let assemblyFormat = "$sym_name attr-dict";
+  let assemblyFormat = "$sym_name attr-dict";
 
-    let hasVerifier = 1;
+  let hasVerifier = 1;
 }
 
 #endif

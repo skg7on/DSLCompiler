@@ -725,11 +725,15 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // agrees on the class but not on its parameters is a transform rather
       // than a direct connection.
       if (const SolvedLayout *solved =
-              boundSolvedLayoutForValue(producer, value))
+              boundSolvedLayoutForValue(producer, value)) {
         request.producerLayoutParameters = solved->parameters;
+        request.producerLayoutMap = solved->map;
+      }
       if (const SolvedLayout *solved =
-              boundSolvedLayoutForValue(consumer, value))
+              boundSolvedLayoutForValue(consumer, value)) {
         request.consumerLayoutParameters = solved->parameters;
+        request.consumerLayoutMap = solved->map;
+      }
       const TileFacts facts = factsForValue(value);
       request.bytes = facts.bytes;
       request.alignmentBytes = facts.alignment;

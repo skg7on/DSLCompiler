@@ -497,6 +497,31 @@ LogicalResult AsyncCopyOp::verify() {
   return success();
 }
 
+LogicalResult TransformOp::verify() {
+  // `!micro.tile` is a Micro type, not an MLIR `ShapedType`, so both are
+  // accepted: a bound plan's transform may be emitted over either (the workload
+  // graph carries tensors; a hand-written kernel uses tiles).
+  Type sourceType = getSource().getType();
+  if (!isa<ShapedType>(sourceType) && !isa<TileType>(sourceType))
+    return emitOpError("source and result must be shaped or tile types");
+  // A layout transform re-represents a value; it must not change it. Shape and
+  // element type stay identical, which is what lets a consumer read the result
+  // as the value it already expected.
+  if (sourceType != getResult().getType())
+    return emitOpError(
+        "source and result must have the same type: a layout "
+        "transform re-represents a value, it does not change it");
+  // Both maps describe the *same* value, so their logical rank (dimension
+  // count) must agree. Their physical rank (result count) may differ -- a
+  // blocked layout writes more physical indices than a row-major one.
+  std::optional<AffineMap> src = getSrcMap();
+  std::optional<AffineMap> dst = getDstMap();
+  if (src && dst && src->getNumDims() != dst->getNumDims())
+    return emitOpError("src_map and dst_map must have the same number of "
+                       "dimensions (the value's logical rank)");
+  return success();
+}
+
 LogicalResult WaitOp::verify() {
   if (getTokens().empty())
     return emitOpError("wait requires at least one token operand");

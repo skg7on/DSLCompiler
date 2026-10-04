@@ -128,6 +128,41 @@ func.func @test_tile_store(%tile : !micro.tile<32x64xbf16, memory = #micro.memor
 }
 
 //===----------------------------------------------------------------------===//
+// micro.transform — re-represent a value under a different layout
+//===----------------------------------------------------------------------===//
+
+// A layout transform names the two layouts by their index relation, not by a
+// target-owned id, so the operation stays target-neutral. The maps print in
+// attribute-name order (dst before src), through MLIR's affine-map aliases
+// (`#map`), which the second `llk-opt` pass re-parses -- so the round trip
+// checks the maps themselves.
+// CHECK-LABEL: func.func @test_tile_transform
+func.func @test_tile_transform(%acc : !micro.tile<32x64xf32>) {
+  // CHECK: micro.transform %{{.*}} {dst_map = #{{.*}}, src_map = #{{.*}}} : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  %r = micro.transform %acc {src_map = affine_map<(d0, d1) -> (d0, d1 floordiv 8, d1 mod 8)>, dst_map = affine_map<(d0, d1) -> (d0, d1)>} : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  return
+}
+
+// A layout that declares no map clause leaves its side to the target: the
+// operation carries only what is known, and an empty attribute dictionary is
+// valid.
+// CHECK-LABEL: func.func @test_tile_transform_no_maps
+func.func @test_tile_transform_no_maps(%acc : !micro.tile<32x64xf32>) {
+  // CHECK: micro.transform %{{.*}} : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  %r = micro.transform %acc : !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  return
+}
+
+// A tensor-typed transform is legal too: the bound plan's movement ops are
+// emitted over the values the workload graph carries, which may be tensors.
+// CHECK-LABEL: func.func @test_tensor_transform
+func.func @test_tensor_transform(%t : tensor<32x64xf32>) {
+  // CHECK: micro.transform %{{.*}} {dst_map = #{{.*}}} : tensor<32x64xf32> -> tensor<32x64xf32>
+  %r = micro.transform %t {dst_map = affine_map<(d0, d1) -> (d0, d1)>} : tensor<32x64xf32> -> tensor<32x64xf32>
+  return
+}
+
+//===----------------------------------------------------------------------===//
 // micro.mma — tile-typed matrix engine fragment
 //===----------------------------------------------------------------------===//
 

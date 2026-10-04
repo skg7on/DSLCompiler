@@ -117,6 +117,13 @@ struct ConnectionRequest {
   /// only knows class ids keeps the class-only behaviour.
   llvm::StringMap<SearchValue> producerLayoutParameters;
   llvm::StringMap<SearchValue> consumerLayoutParameters;
+  /// The logical-to-physical map of the layout each endpoint solved for this
+  /// value, when it solved one. A transform connects the two, so a materializer
+  /// needs both maps -- the same reason it needs the parameters, taken one step
+  /// further. Null when the endpoint bound no layout, or its layout declares no
+  /// map clause.
+  mlir::AffineMap producerLayoutMap;
+  mlir::AffineMap consumerLayoutMap;
   /// The moved value's type, as far as it is known. A modelled shaped type
   /// (`tensor`, `memref`, `vector`) states both its element type and its
   /// logical shape; a `!micro.tile` is read through `TileFacts`, which unwraps

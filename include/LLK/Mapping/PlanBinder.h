@@ -74,19 +74,20 @@ enum class BindContract {
 /// the other's readers. A `Replicate` (a fan-out copy) is materialized the same
 /// way; a connection whose consumers are not recorded rewires nobody.
 ///
+/// A layout conversion becomes one target-neutral `micro.transform`, which
+/// names the two layouts by their solved affine maps rather than by target ids
+/// (design §13.4 keeps target layout ids out of `#micro.layout`): a
+/// `LayoutTransform` connection emits it in place, and a
+/// `TransferAndTransform` connection emits its copies followed by it. Only
+/// `Reduce` (a gather) still has no Micro operation form and is reported.
+///
 /// A connection the binder cannot materialize is *reported*, not silently
-/// dropped: `BoundPlan::unmaterialized` names it and why. The current limits
-/// are deliberate and documented in the implementation: a value whose type is
-/// not a shaped (tensor) type has no generic copy form (`micro.tile_async_copy`
-/// needs a destination-memory-typed tile, which cannot be built without the
-/// dialect's type class), and a target layout id has no Micro operation form at
-/// all (design §13.4 keeps target layout ids out of `#micro.layout`). Every
-/// reported entry names the connection's value id; when the binder cannot
-/// materialize a whole connection kind, the entry also carries a stable reason
-/// token (a `LayoutTransform` connection is reported as
-/// `layout_transform_requires_dialect_op` and a `Reduce` as
-/// `reduce_not_materialized`), while a movement that fails reports its own
-/// specific cause.
+/// dropped: `BoundPlan::unmaterialized` names it and why. The remaining limit
+/// is deliberate: a `Reduce` (a gather) has no Micro operation form yet, so it
+/// is reported as `reduce_not_materialized`; every other connection kind is
+/// emitted. (A value whose type is not shaped has no generic copy form either
+/// -- `micro.tile_async_copy` needs a destination-memory-typed tile the binder
+/// cannot construct -- and such an entry names its own specific cause.)
 ///
 /// `contract` decides what an unresolved decision means. Under
 /// `BindContract::Partial` (the default) the plan is bound with those

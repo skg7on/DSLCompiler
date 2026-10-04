@@ -518,33 +518,87 @@ TEST(PlanBinder, ReportsConnectionsItCannotMaterialize) {
   EXPECT_TRUE(bound->unmaterialized.empty());
 }
 
-TEST(PlanBinder, ReportsALayoutTransformConnectionItCannotMaterialize) {
-  // A `LayoutTransform` connection is same-memory: there is nothing to move,
-  // but the selected transform has no Micro operation form (design §13.4). The
-  // binder must report it, not drop it (design §18.2). The plan is built by
-  // hand because today's search never emits a transform-only connection -- the
-  // point is that *if* one is selected, it is named in `unmaterialized`.
+// A `LayoutTransform` connection moves nothing -- the value already sits in the
+// memory the consumer reads -- and the conversion becomes one target-neutral
+// `micro.transform`, which names the two layouts by their affine maps rather
+// than by a target id (design §13.4).
+TEST(PlanBinder, MaterializesALayoutTransformAsATransformOp) {
   Fixture fixture = makeFixture();
   ASSERT_TRUE(fixture.module);
-  ASSERT_NE(fixture.target, nullptr);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
 
-  CoveringPlan plan;
-  plan.id = 42;
-  PlanConnection connection;
-  connection.id = 1;
-  connection.value = 7;
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+
+  // Turn the real movement into a transform-only connection: no hop, and a
+  // conversion with a solved map on each side.
+  mlir::MLIRContext *context = fixture.context.get();
+  PlanConnection &connection = plan->connectionPlans.front();
   connection.kind = ConnectionKind::LayoutTransform;
-  connection.route.push_back("sram.0"); // a same-memory, in-place transform
-  plan.connectionPlans.push_back(connection);
+  connection.route.resize(1); // same memory: nothing to move
+  LayoutTransform transform;
+  transform.srcLayout = "t.plain";
+  transform.dstLayout = "t.blocked";
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  transform.dstMap = mlir::AffineMap::get(
+      2, 0,
+      {mlir::getAffineDimExpr(0, context),
+       mlir::getAffineBinaryOpExpr(mlir::AffineExprKind::FloorDiv,
+                                   mlir::getAffineDimExpr(1, context),
+                                   mlir::getAffineConstantExpr(8, context))},
+      context);
+  connection.transform = transform;
 
-  llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, plan, *fixture.target);
+  const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
+  const size_t transformsBefore = countOps(*fixture.module, "micro.transform");
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  for (const std::string &note : bound->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(bound->unmaterialized.empty());
+  // A transform-only connection emits no copy, and exactly one transform.
+  EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore);
+  EXPECT_EQ(countOps(*bound->module, "micro.transform"), transformsBefore + 1);
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
+}
 
-  ASSERT_EQ(bound->unmaterialized.size(), 1u);
-  // The entry is exactly "value <id>: <token>".
-  EXPECT_EQ(bound->unmaterialized.front(),
-            "value 7: layout_transform_requires_dialect_op");
+// A `TransferAndTransform` moves the value *and* converts it: the copies land
+// it in the consumer's memory and one `micro.transform` re-represents it there.
+TEST(PlanBinder, MaterializesATransferAndTransformAsCopiesPlusATransform) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+
+  mlir::MLIRContext *context = fixture.context.get();
+  PlanConnection &connection = plan->connectionPlans.front();
+  connection.kind = ConnectionKind::TransferAndTransform;
+  const size_t hops = connection.route.size() - 1;
+  LayoutTransform transform;
+  transform.srcLayout = "t.plain";
+  transform.dstLayout = "t.blocked";
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  connection.transform = transform;
+
+  const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  EXPECT_TRUE(bound->unmaterialized.empty());
+  EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore + hops);
+  EXPECT_EQ(countOps(*bound->module, "micro.transform"), 1u);
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
 }
 
 // The executable contract refuses exactly the plan the partial contract
@@ -556,13 +610,14 @@ TEST(PlanBinder, ExecutableContractRefusesAPlanThatOmitsADecision) {
   ASSERT_TRUE(fixture.module);
   ASSERT_NE(fixture.target, nullptr);
 
+  // A `Reduce` connection has no Micro operation form, so it is the decision
+  // the partial contract reports and the executable contract refuses.
   CoveringPlan plan;
   plan.id = 42;
   PlanConnection connection;
   connection.id = 1;
   connection.value = 7;
-  connection.kind = ConnectionKind::LayoutTransform;
-  connection.route.push_back("sram.0");
+  connection.kind = ConnectionKind::Reduce;
   plan.connectionPlans.push_back(connection);
 
   // The partial contract binds it and reports the omission.
@@ -578,9 +633,7 @@ TEST(PlanBinder, ExecutableContractRefusesAPlanThatOmitsADecision) {
   ASSERT_FALSE(static_cast<bool>(executable));
   std::string error = llvm::toString(executable.takeError());
   EXPECT_NE(error.find("not fully executable"), std::string::npos) << error;
-  EXPECT_NE(error.find("layout_transform_requires_dialect_op"),
-            std::string::npos)
-      << error;
+  EXPECT_NE(error.find("reduce_not_materialized"), std::string::npos) << error;
 }
 
 TEST(PlanBinder, ReduceIsStillReportedBecauseItHasNoMicroOperationForm) {
