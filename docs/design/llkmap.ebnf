@@ -1,0 +1,49 @@
+(* LLKMap merged profile: main 31fd9eb. Token-level EBNF.
+   Quoted text is a terminal; [] optional; {} repetition; | alternative.
+   IDENT, UINT, STRING, VERSION and EOF are defined in llkmap-syntax.md.
+   VERSION is an IDENT constrained to v followed by decimal digits.
+   Lexical rules and semantic restrictions are part of the specification. *)
+layout_file = { layout }, EOF ;
+rule_file = { rule }, EOF ;
+
+layout = "layout", IDENT, "(", [ layout_param, { ",", layout_param } ],
+         ")", "{", { layout_stmt }, "}" ;
+layout_param = [ "int" | "sym" ], IDENT ;
+layout_stmt = domain_stmt | expr_requirement | map_stmt ;
+domain_stmt = "param", IDENT, "in", domain, ";" ;
+domain = "[", UINT, "..", UINT, "]"
+       | "{", domain_literal, { ",", domain_literal }, "}" ;
+domain_literal = UINT | STRING ;
+expr_requirement = "require", expr, ";" ;
+map_stmt = "map", "(", [ IDENT, { ",", IDENT } ], ")", "->",
+           "(", expr, { ",", expr }, ")", ";" ;
+
+rule = "rule", IDENT, [ VERSION ], "{", { rule_stmt }, "}" ;
+rule_stmt = match_stmt | domain_stmt | expr_requirement | kind_requirement
+          | layout_requirement | port_stmt | bundle_stmt | emit_stmt | cost_stmt ;
+match_stmt = "match", micro_op, "(", [ predicate, { ",", predicate } ], ")", ";" ;
+predicate = IDENT, "=", predicate_literal ;
+predicate_literal = UINT | STRING | IDENT ;
+micro_op = "micro.mma" | "micro.vector" | "micro.reduce"
+         | "micro.async_copy" | "micro.tile_async_copy"
+         | "micro.store" | "micro.tile_store" ;
+kind_requirement = "require", role, "kind", IDENT, ";" ;
+role = "executor" | "compute" | "memory" ;
+layout_requirement = "require", "layout", IDENT, "satisfies", IDENT, ";" ;
+port_stmt = ( "input" | "output" ), STRING, ";" ;
+bundle_stmt = "bundle", STRING, ";" ;
+emit_stmt = "emit", STRING, ";" ;
+cost_stmt = "cost", UINT, ";" ;
+
+expr = logical_or ;
+logical_or = logical_and, { "||", logical_and } ;
+logical_and = equality, { "&&", equality } ;
+equality = relational, { ( "==" | "!=" ), relational } ;
+relational = additive, { ( "<" | "<=" | ">" | ">=" ), additive } ;
+additive = multiplicative, { ( "+" | "-" ), multiplicative } ;
+multiplicative = unary, { ( "*" | "/" | "%" ), unary } ;
+unary = ( "!" | "-" ), unary | postfix ;
+postfix = primary, { ".", IDENT, [ "(", [ arguments ], ")" ] } ;
+primary = UINT | STRING | IDENT, [ "(", [ arguments ], ")" ]
+        | "(", expr, ")" ;
+arguments = expr, { ",", expr } ;
