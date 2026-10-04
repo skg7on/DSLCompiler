@@ -179,6 +179,56 @@ rule r.expensive {
 }
 )llkmap";
 
+/// Six interchangeable rules for one node, every one the same 1-cycle cost and
+/// an interchangeable placement. Kept under a five-candidate cap,
+/// cross-producing them over a two-node graph yields a large set of *cost-tied*
+/// complete plans, so which K survive a top-K cap is decided purely by the
+/// tie-break key rather than by cost.
+constexpr llvm::StringLiteral kDenseTieRules = R"llkmap(
+rule r.0 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.0";
+  emit "e1";
+  cost 1;
+}
+rule r.1 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.1";
+  emit "e1";
+  cost 1;
+}
+rule r.2 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.2";
+  emit "e1";
+  cost 1;
+}
+rule r.3 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.3";
+  emit "e1";
+  cost 1;
+}
+rule r.4 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.4";
+  emit "e1";
+  cost 1;
+}
+rule r.5 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.5";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
 constexpr llvm::StringLiteral kRulesWithMemory = R"llkmap(
 rule r.cheap {
   match micro.vector(op = "add");
@@ -972,6 +1022,57 @@ TEST(CoveringSearch, EveryPlanIsRankedAndCappedAtTopK) {
   EXPECT_EQ(result->plans.size(), 1u);
   // Two rules per node give four plans; asking for one is a cap.
   EXPECT_TRUE(result->searchTruncated);
+}
+
+// §22.1: the retained top-K is chosen by the documented (objective, plan id)
+// key. The beam's frontier order over *partial* plans is a search heuristic and
+// must not decide which K survive: with many cost-tied plans the two orders
+// disagree, so trimming before the exposed id exists keeps the wrong K.
+TEST(CoveringSearch, TopKRetainsThePlanIdSmallestAmongCostTies) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kDenseTieRules);
+  ASSERT_NE(target, nullptr);
+
+  // Six rules match but the candidate cap keeps five, so the search is already
+  // truncated before the top-K decision -- both runs below fold the same
+  // `truncated` bit into every plan id, which is what makes their ids directly
+  // comparable.
+  MappingSearchOptions wideOptions;
+  wideOptions.mode = SearchMode::Beam;
+  wideOptions.beamWidth = 64;
+  wideOptions.topK = 64;
+  wideOptions.maxCandidatesPerNode = 5;
+  CoveringSearch wide(graph, *target, context, LayoutContext{}, wideOptions);
+  llvm::Expected<MappingSearchResult> wideResult = wide.search();
+  ASSERT_TRUE(static_cast<bool>(wideResult))
+      << llvm::toString(wideResult.takeError());
+  ASSERT_TRUE(wideResult->searchTruncated);
+  // Five interchangeable instances per node over two nodes: twenty-five
+  // complete plans, every one tied at the same cost.
+  ASSERT_EQ(wideResult->plans.size(), 25u);
+  ASSERT_EQ(wideResult->planCount, 25u);
+  // With every cost equal, the emitted order is exactly the plan-id order.
+  for (size_t i = 1; i < wideResult->plans.size(); ++i)
+    EXPECT_LT(wideResult->plans[i - 1].id, wideResult->plans[i].id);
+
+  // A capped run over the same complete set must retain the plan-id-smallest K.
+  const unsigned k = 2;
+  MappingSearchOptions cappedOptions = wideOptions;
+  cappedOptions.topK = k;
+  CoveringSearch capped(graph, *target, context, LayoutContext{},
+                        cappedOptions);
+  llvm::Expected<MappingSearchResult> cappedResult = capped.search();
+  ASSERT_TRUE(static_cast<bool>(cappedResult))
+      << llvm::toString(cappedResult.takeError());
+  ASSERT_EQ(cappedResult->plans.size(), k);
+  // The tally still counts every complete plan before the cap (design §22.2).
+  EXPECT_EQ(cappedResult->planCount, 25u);
+  EXPECT_TRUE(cappedResult->searchTruncated);
+  EXPECT_TRUE(hasDiagnostic(*cappedResult, DiagnosticCode::SearchTruncated));
+  for (unsigned i = 0; i < k; ++i)
+    EXPECT_EQ(cappedResult->plans[i].id, wideResult->plans[i].id);
 }
 
 TEST(CoveringSearch, NarrowBeamDisclosesTruncationAndExactDoesNot) {

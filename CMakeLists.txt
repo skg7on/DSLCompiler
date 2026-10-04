@@ -892,6 +892,17 @@ if(LLK_BUILD_TOOLS)
           ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBindPlanId
   )
 
+  # MicroMappingBindPlanMode: a plan id is a content hash, so reproducing one
+  # means replaying the search -- same mode, beam-width, and top-k. This pins
+  # that `--micro-bind-plan` takes those options and honours them: a beam id
+  # round-trips in beam mode, and a deterministic id is absent from a beam
+  # search with the same cap (the diagnostic names the mode it searched).
+  add_test(NAME MicroMappingBindPlanMode
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_bind_plan_mode.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBindPlanMode
+  )
+
   # LLKToMicro lowering tests. The schedule database is pointed at a path that
   # does not exist on purpose: the export then uses its built-in conservative
   # schedule, so the expected tile sizes do not depend on the working directory

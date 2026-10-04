@@ -214,9 +214,9 @@ objectiveOrderFromModule(ModuleOp module) {
 struct MappingRun {
   std::unique_ptr<mapping::MappingTarget> target;
   Operation *kernel = nullptr;
-  /// The options the search actually ran with -- including a forced
-  /// deterministic mode and the module's declared objective -- so a report can
-  /// state them without reconstructing them from the CLI.
+  /// The options the search actually ran with -- the requested mode and the
+  /// module's declared objective included -- so a report can state them without
+  /// reconstructing them from the CLI.
   mapping::MappingSearchOptions searchOptions;
   mapping::MappingSearchResult result;
 };
@@ -244,12 +244,13 @@ inline llvm::Error requireKey(llvm::StringRef passName, llvm::StringRef key,
 }
 
 /// The whole chain up to (but not including) plan selection: load the target,
-/// find the kernel, extract its workload graph, and search it. `mode` is forced
-/// to `deterministic` when `forceDeterministic` is set, which is what makes a
-/// content-derived plan id reproducible.
+/// find the kernel, extract its workload graph, and search it in the mode
+/// `options.mode` names. Both entry points share this so a plan id is
+/// reproducible from either: re-running with the same options replays the same
+/// search and so exposes the same content-derived ids.
 inline llvm::Expected<MappingRun>
 runMappingSearch(ModuleOp module, llvm::StringRef passName,
-                 const MicroMapOptions &options, bool forceDeterministic) {
+                 const MicroMapOptions &options) {
   if (llvm::Error error = requireKey(passName, "target", options.target))
     return std::move(error);
   if (llvm::Error error = requireKey(passName, "machine", options.machinePath))
@@ -263,17 +264,14 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
         llvm::inconvertibleErrorCode(),
         (passName + ": missing required key 'emitters'").str());
 
-  mapping::SearchMode mode = mapping::SearchMode::Beam;
-  if (!forceDeterministic) {
-    std::optional<mapping::SearchMode> parsed = parseSearchMode(options.mode);
-    if (!parsed)
-      return llvm::createStringError(
-          llvm::inconvertibleErrorCode(),
-          (passName + ": unknown mode '" + options.mode +
-           "' (expected deterministic, beam, or exact)")
-              .str());
-    mode = *parsed;
-  }
+  std::optional<mapping::SearchMode> parsed = parseSearchMode(options.mode);
+  if (!parsed)
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        (passName + ": unknown mode '" + options.mode +
+         "' (expected deterministic, beam, or exact)")
+            .str());
+  mapping::SearchMode mode = *parsed;
 
   MappingRun run;
   llvm::Expected<std::unique_ptr<mapping::MappingTarget>> target =

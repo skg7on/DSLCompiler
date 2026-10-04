@@ -3,8 +3,11 @@
 // Binds one specific plan, named by its stable content-derived id, onto the
 // module's kernel. A plan id is a hash of the plan's content, so the only way
 // to reproduce it is to re-run the search -- plans are never persisted between
-// passes. The search runs deterministically, which is what makes an id from a
-// deterministic `--micro-map` reproducible here.
+// passes. Reproduction therefore requires the same search options the id was
+// produced with: the mode, beam-width, and top-k, as well as the same target
+// files (machine, rules, layouts, emitters). A different search can order or
+// cap the plans differently and so fail to contain the id, which is reported
+// rather than silently binding a different plan.
 //
 //===----------------------------------------------------------------------===//
 
@@ -46,22 +49,36 @@ struct MicroBindPlanPass
   Option<std::string> emitters{
       *this, "emitters",
       llvm::cl::desc("Comma-separated emitter keys the target understands")};
+  Option<std::string> mode{
+      *this, "mode",
+      llvm::cl::desc("Search mode: deterministic, beam, or exact (must match "
+                     "the mode that produced the plan id)"),
+      llvm::cl::init("beam")};
   Option<unsigned> topK{
       *this, "top-k",
-      llvm::cl::desc("Maximum number of complete plans to keep"),
+      llvm::cl::desc("Maximum number of complete plans to keep (must match the "
+                     "cap that produced the plan id)"),
       llvm::cl::init(8)};
+  Option<unsigned> beamWidth{*this, "beam-width",
+                             llvm::cl::desc("Beam mode's frontier width (must "
+                                            "match the width that produced the "
+                                            "plan id)"),
+                             llvm::cl::init(64)};
 
   StringRef getArgument() const override { return "micro-bind-plan"; }
 
   StringRef getDescription() const override {
     return "Bind the covering plan with the requested stable id onto a "
            "micro.kernel. The id is the spelling --micro-map report= prints "
-           "(bare 16-digit hex), or 0x-prefixed hex, or decimal, e.g. "
+           "(bare 16-digit hex), 0x-prefixed hex, or decimal. Reproducing a "
+           "content-hash id needs the same search options (mode, beam-width, "
+           "top-k) and target files (machine, rules, layouts, emitters) "
+           "--micro-map ran with, e.g. "
            "--micro-bind-plan=\"plan-id=0081ef1286442d39 "
            "target=x86-avx2 machine=machines/x86-avx2-v2.yaml "
            "layouts=mapping/x86-avx2/layouts.llkmap "
            "rules=mapping/x86-avx2/rules.llkmap "
-           "emitters=avx2_vector_add\"";
+           "emitters=avx2_vector_add mode=beam beam-width=64 top-k=8\"";
   }
 
   MicroMapOptions currentOptions() const {
@@ -72,7 +89,9 @@ struct MicroBindPlanPass
     options.rulePath = rules.getValue();
     options.emitterKeys =
         micro_mapping_detail::parseEmitterKeys(emitters.getValue());
+    options.mode = mode.getValue();
     options.topK = topK.getValue();
+    options.beamWidth = beamWidth.getValue();
     return options;
   }
 
@@ -104,8 +123,7 @@ struct MicroBindPlanPass
 
     llvm::Expected<micro_mapping_detail::MappingRun> run =
         micro_mapping_detail::runMappingSearch(module, "micro-bind-plan",
-                                               currentOptions(),
-                                               /*forceDeterministic=*/true);
+                                               currentOptions());
     if (!run) {
       module.emitError() << llvm::toString(run.takeError());
       signalPassFailure();
@@ -120,10 +138,10 @@ struct MicroBindPlanPass
       }
     }
     if (!selected) {
-      module.emitError()
-          << "micro-bind-plan: no plan in the deterministic search has id "
-          << requestedId << " (the search produced " << run->result.plans.size()
-          << " plan(s))";
+      module.emitError() << "micro-bind-plan: no plan in the "
+                         << mode.getValue() << " search has id " << requestedId
+                         << " (the search produced " << run->result.plans.size()
+                         << " plan(s))";
       signalPassFailure();
       return;
     }
@@ -157,7 +175,9 @@ createMicroBindPlanPass(const MicroBindPlanOptions &options) {
     emitters += key;
   }
   pass->emitters = emitters;
+  pass->mode = options.search.mode;
   pass->topK = options.search.topK;
+  pass->beamWidth = options.search.beamWidth;
   pass->planId = std::to_string(options.planId);
   return pass;
 }

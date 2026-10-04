@@ -32,7 +32,7 @@ namespace llk {
 /// Everything `micro-map` needs to load a target and search it. The same fields
 /// are exposed on the command line as `--micro-map="target=<name>
 /// machine=<path> layouts=<path> rules=<path> emitters=<csv>
-/// mode=<deterministic|beam|exact> top-k=<n>"`.
+/// mode=<deterministic|beam|exact> beam-width=<n> top-k=<n>"`.
 struct MicroMapOptions {
   /// Opaque target label, recorded on the selected plan; never interpreted by
   /// generic code.
@@ -52,10 +52,12 @@ struct MicroMapOptions {
   std::string reportPath;
 };
 
-/// `micro-bind-plan` runs the same search deterministically and binds the one
-/// plan whose id the caller names, so it carries a whole `MicroMapOptions` plus
-/// that id. A plan id is a content hash, so the only way to reproduce it is to
-/// re-run the search -- plans are never persisted between passes.
+/// `micro-bind-plan` runs the same search and binds the one plan whose id the
+/// caller names, so it carries a whole `MicroMapOptions` plus that id. A plan
+/// id is a content hash, so the only way to reproduce it is to re-run the
+/// search -- plans are never persisted between passes. The search options
+/// (mode, beam-width, top-k) must be the ones the id was produced with, or the
+/// search can order or cap the plans differently and the id will not be found.
 struct MicroBindPlanOptions {
   MicroMapOptions search;
   uint64_t planId = 0;

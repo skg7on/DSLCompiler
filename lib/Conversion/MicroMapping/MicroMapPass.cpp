@@ -88,8 +88,7 @@ struct MicroMapPass
     ModuleOp module = getOperation();
     MicroMapOptions options = currentOptions();
     llvm::Expected<micro_mapping_detail::MappingRun> run =
-        micro_mapping_detail::runMappingSearch(module, "micro-map", options,
-                                               /*forceDeterministic=*/false);
+        micro_mapping_detail::runMappingSearch(module, "micro-map", options);
     if (!run) {
       module.emitError() << llvm::toString(run.takeError());
       signalPassFailure();

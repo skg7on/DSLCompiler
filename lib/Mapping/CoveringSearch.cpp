@@ -932,20 +932,26 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return std::move(pendingError);
 
   // --- finalize --------------------------------------------------------
-  // The declared objective ranks complete plans; the stable id breaks an exact
-  // tie so the order is deterministic (design §17.1).
-  llvm::sort(complete, [&](const Partial &lhs, const Partial &rhs) {
-    return ranksBefore(lhs.cost, lhs.id, rhs.cost, rhs.id, options_.objective);
-  });
   // Tally complete plans before the top-K cap drops the tail (design §22.2).
   result.planCount = complete.size();
+  // The top-K cap, when it bites, is a search truncation like any other. Fold
+  // it into the flag *before* any plan's content id is computed, because the
+  // flag is part of that content (see `canonicalPlanString`); this keeps every
+  // plan's id identical whether the cap was recorded before or after it was
+  // built.
   if (complete.size() > options_.topK) {
-    complete.resize(options_.topK);
     result.searchTruncated = true;
     report(DiagnosticCode::SearchTruncated,
            "top-K cap reached (topK=" + std::to_string(options_.topK) + ")");
   }
 
+  // Build every complete plan before trimming, so each one's *exposed* content
+  // id exists. The internal `Partial::id` is a search heuristic over partial
+  // plans; the documented tie-break is the exposed plan id (design §22.1), so
+  // the trim below must see the latter -- trimming on the partial hash would
+  // keep whichever K the search happened to order first.
+  std::vector<CoveringPlan> plans;
+  plans.reserve(complete.size());
   for (const Partial &partial : complete) {
     CoveringPlan plan;
     std::vector<InstanceId> instances;
@@ -1010,20 +1016,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       plan.globalParameters = binding_->values;
     }
     plan.id = computePlanId(plan);
-    result.plans.push_back(std::move(plan));
+    plans.push_back(std::move(plan));
   }
 
-  // §22.1: the emitted list is ordered by the declared objective and then the
-  // *exposed* plan id. The beam's `partialId` order chosen above is a search
-  // heuristic over partial plans; it must not leak into the reported order, so
-  // re-sort here, where each plan's content id exists. An exact cost tie now
-  // breaks on `plan.id`, making the emitted order reproducible from
-  // `(totalCost, plan.id)` alone.
-  llvm::sort(result.plans,
-             [&](const CoveringPlan &lhs, const CoveringPlan &rhs) {
-               return ranksBefore(lhs.totalCost, lhs.id, rhs.totalCost, rhs.id,
-                                  options_.objective);
-             });
+  // §22.1: order and retain by the declared objective and then the *exposed*
+  // plan id -- the documented key. The beam's `partialId` ordering stays where
+  // it belongs, inside the beam's frontier heuristic; it never decides which K
+  // survive a cap nor the emitted order. An exact cost tie breaks on `plan.id`,
+  // so both are reproducible from `(totalCost, plan.id)` alone.
+  llvm::sort(plans, [&](const CoveringPlan &lhs, const CoveringPlan &rhs) {
+    return ranksBefore(lhs.totalCost, lhs.id, rhs.totalCost, rhs.id,
+                       options_.objective);
+  });
+  if (plans.size() > options_.topK)
+    plans.resize(options_.topK);
+  result.plans = std::move(plans);
 
   // §22.1/§22.3: the frontier's codes are the stable interface, so their order
   // must not depend on the order branches happened to be explored.

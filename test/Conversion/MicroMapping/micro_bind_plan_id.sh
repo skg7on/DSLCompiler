@@ -32,12 +32,13 @@ WORK=$3
 mkdir -p "$WORK"
 
 # The five required target keys. `--micro-map` runs in deterministic mode so the
-# printed id is reproducible across runs (beam/exact reproducibility is a
-# separate task). The binder forces deterministic mode internally, so the id
-# round-trips; it takes no `mode=` option of its own.
+# printed id is reproducible across runs. A plan id is a content hash, so the
+# binder must replay the same search: it is handed the same `mode=deterministic`
+# and the same cap, or the reported id would not be found. (Mode-aware
+# reproduction is pinned separately by micro_bind_plan_mode.sh.)
 TARGET="target=x86-avx2 machine=$SRC/machines/x86-avx2-v2.yaml layouts=$SRC/mapping/x86-avx2/layouts.llkmap rules=$SRC/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_mma,avx2_reduce,avx2_copy"
 MAP_OPTIONS="$TARGET mode=deterministic"
-BIND="$TARGET top-k=8"
+BIND="$TARGET mode=deterministic top-k=8"
 KERNEL="$SRC/test/Conversion/MicroMapping/micro_map.mlir"
 
 # A successful bind stamps `micro.plan` onto the kernel; a parse failure does

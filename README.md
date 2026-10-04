@@ -264,8 +264,9 @@ llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml \
   layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap \
   emitters=avx2_vector_add report=plan.json" input.mlir
 
-# Bind a specific plan by its stable id (same target keys as --micro-map)
-llk-opt --micro-bind-plan="plan-id=<id> target=x86-avx2 machine=... layouts=... rules=... emitters=..." input.mlir
+# Bind a specific plan by its stable id (reproduce the search: same target keys
+# AND search options as the --micro-map run that reported the id)
+llk-opt --micro-bind-plan="plan-id=<id> target=x86-avx2 machine=... layouts=... rules=... emitters=... mode=beam beam-width=64 top-k=8" input.mlir
 
 # Evaluate concrete Micro-IR against a machine profile
 micro-perf --machine machines/x86-avx2-v2.yaml --level l1 input.micro.mlir
