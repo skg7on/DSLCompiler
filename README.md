@@ -275,7 +275,7 @@ micro-perf --machine machines/x86-avx2-v2.yaml --level l1 input.micro.mlir
 llk-tune --search-space swiglu.micro.mlir --machine machines/x86-avx2-v2.yaml
 ```
 
-`--micro-map` and `--micro-bind-plan` emit a versioned JSON plan report (input/machine/layout-library/rule-library hashes, search options and truncation flags, rejection counts by stable reason code, top-K plans with component costs, selected plan id, compiler and cost-model version).
+`--micro-map` writes a versioned JSON plan report when given `report=<path>` -- including in `report-only` mode, where it reports the selected plan without binding it onto the IR. The report carries input/machine/layout-library/rule-library hashes, search options and truncation flags, rejection counts by stable reason code, top-K plans with component costs, selected plan id, and compiler and cost-model version. `--micro-bind-plan` does not write a report: it re-runs the search to bind a plan by its id.
 
 ## Tech Stack
 

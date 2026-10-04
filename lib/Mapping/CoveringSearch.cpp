@@ -903,9 +903,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           if (bestCosts.size() >= options_.topK &&
               !boundIsBetterThan(branch.lowerBound, bestCosts.back(),
                                  options_.objective)) {
-            // A full top-K list makes this prune exact -- it cannot drop a
-            // plan we would keep -- but the space was not exhausted, and the
-            // caller is told so.
+            // A full top-K list makes this prune exact for a *strictly better*
+            // cost: it cannot drop a completion strictly cheaper than the worst
+            // kept plan. On an exact cost *tie* it is not exact -- the bound
+            // compares against `bestCosts.back()`, which is cost-only, while
+            // the final top-K trim keys on `(cost, plan.id)`, so a tie can
+            // prune a plan whose smaller id the trim would have kept. Either
+            // way the space was not exhausted, and the caller is told so
+            // (`searchTruncated`).
             result.searchTruncated = true;
             report(DiagnosticCode::SearchTruncated,
                    "exact search pruned by the top-K bound (topK=" +
