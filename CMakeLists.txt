@@ -858,7 +858,7 @@ if(LLK_BUILD_TOOLS)
   # The pass options are quoted so sh hands llk-opt one argv token; the whole
   # option string is the user-facing contract from design §21.
   add_llk_filecheck_test(MicroMappingMap test/Conversion/MicroMapping/micro_map.mlir
-      "\"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=deterministic\"")
+      "\"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=deterministic\"")
 
   # MicroMappingUnmaterialized: a plan whose edge is an unmaterializable
   # movement (see the fixture's rules file). The binder reports such a
@@ -901,6 +901,21 @@ if(LLK_BUILD_TOOLS)
       COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_bind_plan_mode.sh
           $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
           ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBindPlanMode
+  )
+
+  # MicroMappingMatmulE2E / MicroMappingSwiGLUE2E: the gap-#3 acceptance. Each
+  # runs the two-pass pipeline `--llk-to-micro | --micro-map mode=exact` over
+  # the LLK source, so the kernel being mapped is genuinely compiler-generated
+  # (the input is the same LLK program as the matching LLKToMicro fixture), and
+  # asserts the shipped AVX2 target binds a complete plan onto it: a
+  # `micro.plan` on the kernel and a `micro.mapping` on every covered node,
+  # including the `micro.vector` op variants the lowering emits and the
+  # `micro.tile_async_copy`/`micro.tile_store` movement ops.
+  add_test(NAME MicroMappingMatmulE2E
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | $<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=exact\" | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir"
+  )
+  add_test(NAME MicroMappingSwiGLUE2E
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/swiglu_e2e.mlir | $<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=exact\" | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/swiglu_e2e.mlir"
   )
 
   # LLKToMicro lowering tests. The schedule database is pointed at a path that

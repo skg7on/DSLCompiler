@@ -1,16 +1,26 @@
 //===- avx2_target.cpp - AVX2 mapping target (D7) ------------------------===//
 
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/PlanBinder.h"
+#include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
+#include "LLK/Dialect/Micro/MicroDialect.h"
+
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/Parser/Parser.h"
 
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
 
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace mlir::llk::mapping;
 
@@ -50,6 +60,22 @@ WorkloadGraph vectorGraph(mlir::MLIRContext &context) {
 llvm::Expected<std::unique_ptr<MappingTarget>> loadTarget() {
   return avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
 }
+
+/// A kernel in the shape `llk-to-micro` emits for a tile program: a logical
+/// view of an external tensor, an async staging copy into SRAM, and a store
+/// back to DRAM. Used to carry the tile-movement rules past matching and
+/// through the binder, where a wrong port split would show.
+constexpr llvm::StringLiteral kTileMovementKernel = R"mlir(
+module {
+  micro.kernel @tiles {
+    %ext = tensor.empty() : tensor<8x32xbf16>
+    %v = micro.tile_view %ext {shape = array<i64: 8, 32>} : tensor<8x32xbf16> -> !micro.tile<8x32xbf16, memory = #micro.memory<dram>>
+    %t, %tok = micro.tile_async_copy %v {dst_memory = #micro.memory<sram>, owner = #micro.owner<worker>} : !micro.tile<8x32xbf16, memory = #micro.memory<dram>> -> !micro.tile<8x32xbf16, memory = #micro.memory<sram>, owner = #micro.owner<worker>>, !micro.async_token
+    micro.tile_store %t {dst_memory = #micro.memory<dram>} : !micro.tile<8x32xbf16, memory = #micro.memory<sram>, owner = #micro.owner<worker>>
+    micro.yield
+  }
+}
+)mlir";
 
 /// A bundle naming `emitterKey` with one well-typed integer parameter.
 TargetBundle makeBundle(llvm::StringRef emitterKey,
@@ -165,6 +191,20 @@ TEST(Avx2Target, MatchesItsOwnRuleForTheVectorOperation) {
   EXPECT_EQ(matches[0]->id, "avx2.vector_add");
 }
 
+TEST(Avx2Target, LeavesUnruledVectorVariantsUnmatched) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target));
+  mlir::MLIRContext context;
+
+  // Matching is per `op` value, not per op name: a variant the target has no
+  // implementation for must stay uncovered rather than fall back to a
+  // catch-all. `exp` is a `micro.vector` op the AVX2 target does not implement.
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context, "exp");
+  EXPECT_TRUE(matchRules(node, (*target)->rules()).empty());
+}
+
 TEST(Avx2Target, CoversTheTileMovementOpsTheLoweringEmits) {
   llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
   ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
@@ -180,6 +220,65 @@ TEST(Avx2Target, CoversTheTileMovementOpsTheLoweringEmits) {
     for (const RuleDef *rule : matches)
       EXPECT_TRUE((*target)->isKnownEmitter(rule->emitter)) << rule->id;
   }
+}
+
+TEST(Avx2Target, BindsTheTileMovementOpsTheLoweringEmits) {
+  // Carried acceptance from the rules that cover `micro.tile_async_copy` and
+  // `micro.tile_store`: a match is not a binding. This carries those rules
+  // through extraction, search, and the binder, so a rule that matches but
+  // declares a wrong port split -- which
+  // `CoversTheTileMovementOpsTheLoweringEmits` cannot see -- fails here instead
+  // of slipping through.
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  context.getOrLoadDialect<mlir::tensor::TensorDialect>();
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kTileMovementKernel, &context);
+  ASSERT_TRUE(module);
+  mlir::Operation *kernel = nullptr;
+  module->walk([&](mlir::Operation *op) {
+    if (!kernel && op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+  });
+  ASSERT_NE(kernel, nullptr);
+
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "bf16";
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(*graph, **target, context, layoutContext, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 1u);
+
+  llvm::Expected<BoundPlan> bound =
+      bindPlan(*module, result->plans.front(), **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  EXPECT_TRUE(bound->unmaterialized.empty());
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  bound->module->print(stream);
+  llvm::StringRef mapped(stream.str());
+
+  // Each movement op is stamped with its own rule and emitter, and the store's
+  // operand is the copy's result -- the port split the two rules declare.
+  EXPECT_NE(mapped.find("rule = \"avx2.tile_async_copy\""),
+            llvm::StringRef::npos);
+  EXPECT_NE(mapped.find("emitter = \"avx2_tile_copy\""), llvm::StringRef::npos);
+  EXPECT_NE(mapped.find("rule = \"avx2.tile_store\""), llvm::StringRef::npos);
+  EXPECT_NE(mapped.find("emitter = \"avx2_tile_store\""),
+            llvm::StringRef::npos);
+  EXPECT_NE(mapped.find("micro.tile_store %result"), llvm::StringRef::npos);
+  // Exactly one placement per node: the copy and the store.
+  EXPECT_EQ(mapped.count("micro.mapping"), 2u);
 }
 
 TEST(Avx2Target, MapsAVectorNodeEndToEnd) {
