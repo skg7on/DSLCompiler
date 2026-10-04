@@ -638,19 +638,25 @@ synthesizeFanOut(const ConnectionRequest &base,
     return std::vector<ConnectionPlan>{std::move(plan)};
   }
 
-  // §15.3(b): replication. Consumers that share a destination memory share one
-  // copy, so a copy's cost and capacity are counted once per memory rather
-  // than once per consumer. Each consumer is still validated on its own
-  // request, so a mismatched element type or affine relation is not missed.
-  std::vector<MemoryNodeId> groupMemories;
+  // §15.3(b): replication. Consumers that share a destination memory *and* the
+  // same required representation share one copy or transform, so its cost and
+  // capacity are counted once per representation rather than once per consumer.
+  // Each consumer is still validated on its own request, so a mismatched
+  // element type or affine relation is not missed. The layout a consumer binds
+  // partitions the group as well as the memory: grouping by memory alone would
+  // assign one member's resulting layout to a consumer that requires a
+  // different one, a representation it could never read.
+  std::vector<std::pair<MemoryNodeId, std::optional<LayoutId>>> groupKeys;
   std::vector<std::vector<size_t>> groups;
   for (size_t index = 0; index < consumers.size(); ++index) {
+    std::pair<MemoryNodeId, std::optional<LayoutId>> key{
+        consumers[index].consumerMemory, consumers[index].consumerLayout};
     size_t group = 0;
-    for (; group < groupMemories.size(); ++group)
-      if (groupMemories[group] == consumers[index].consumerMemory)
+    for (; group < groupKeys.size(); ++group)
+      if (groupKeys[group] == key)
         break;
-    if (group == groupMemories.size()) {
-      groupMemories.push_back(consumers[index].consumerMemory);
+    if (group == groupKeys.size()) {
+      groupKeys.push_back(key);
       groups.emplace_back();
     }
     groups[group].push_back(index);
@@ -681,11 +687,24 @@ synthesizeFanOut(const ConnectionRequest &base,
       continue;
     }
 
+    // An in-place layout transform is a shared read of the producer's memory,
+    // so it can serve the whole group only when *every* member can reach that
+    // memory. A member that cannot would have offered a transfer instead, so
+    // excluding it here keeps a shared transform from being assigned to a
+    // consumer that cannot read where it lands.
+    bool groupSeesProducer = true;
+    for (size_t index : group)
+      if (!consumerSeesProducerMemory(consumers[index], machine)) {
+        groupSeesProducer = false;
+        break;
+      }
+
     // A copy into this memory serves the whole group. Validate every member and
-    // pick the cheapest copy among their alternatives; group members share a
+    // pick the cheapest alternative among them; group members share a
     // destination memory, so one copy's route is the group's route. Only plans
-    // that actually move the value into the memory count -- a member's in-place
-    // read or transform does not serve the group's non-sharing members.
+    // that actually serve the group count -- a member's in-place read or
+    // transform does not serve the group's non-sharing members unless every
+    // member can read the producer's memory too.
     std::vector<ConnectionPlan> alternatives;
     for (size_t index : group) {
       llvm::Expected<std::vector<ConnectionPlan>> member =
@@ -702,7 +721,8 @@ synthesizeFanOut(const ConnectionRequest &base,
           // `kind` is part of the canonical string, so the id is recomputed.
           plan.id = computeConnectionId(plan);
         }
-        if (plan.kind == ConnectionKind::Replicate)
+        if (plan.kind == ConnectionKind::Replicate ||
+            (plan.kind == ConnectionKind::LayoutTransform && groupSeesProducer))
           alternatives.push_back(std::move(plan));
       }
     }
