@@ -3,6 +3,7 @@
 #include "LLK/Mapping/PlanBinder.h"
 
 #include "LLK/Mapping/Diagnostics.h"
+#include "LLK/Mapping/TileFacts.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/AsmParser/AsmParser.h"
@@ -194,6 +195,82 @@ readStringArray(mlir::Attribute raw, llvm::StringRef name,
     values.push_back(text.getValue().str());
   }
   return values;
+}
+
+/// The printed form of a type, for the `element_type` a `LayoutContext` reads.
+/// (The mapping core keeps one such helper per translation unit rather than
+/// exposing a printer for a value it only ever compares as text.)
+std::string printedTypeOf(mlir::Type type) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  type.print(stream);
+  return stream.str();
+}
+
+/// The layout class a `layout_parameters` key names. Placement keys a class
+/// required by several ports as `class#<index>` so each occurrence keeps its
+/// own assignment, so the disambiguating suffix is stripped before the
+/// declaration is resolved. A key with no numeric suffix is returned unchanged.
+llvm::StringRef baseLayoutClass(llvm::StringRef key) {
+  size_t hash = key.rfind('#');
+  if (hash == llvm::StringRef::npos)
+    return key;
+  llvm::StringRef suffix = key.substr(hash + 1);
+  if (suffix.empty() ||
+      !llvm::all_of(suffix, [](char c) { return c >= '0' && c <= '9'; }))
+    return key;
+  return key.substr(0, hash);
+}
+
+/// A recorded parameter value in the variant the solver evaluates. The caller
+/// has already narrowed it to an integer or a string attribute.
+LayoutValue layoutValueOf(mlir::Attribute attribute) {
+  if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(attribute))
+    return integer.getInt();
+  return mlir::cast<mlir::StringAttr>(attribute).getValue().str();
+}
+
+/// The rank and element type a layout requirement is validated against: the
+/// operand the rule names, resolved positionally against the node's ports, so
+/// the layout is checked against the value it constrains rather than a
+/// graph-wide fact. `fallback` supplies any fact the named port does not
+/// expose.
+LayoutContext layoutContextForRule(const RuleDef &rule,
+                                   const WorkloadNode &node,
+                                   llvm::StringRef layoutId,
+                                   const LayoutContext &fallback) {
+  LayoutContext context = fallback;
+  size_t inputIndex = 0;
+  size_t outputIndex = 0;
+  for (const RulePort &port : rule.ports) {
+    const WorkloadPort *nodePort = nullptr;
+    if (port.isInput) {
+      if (inputIndex < node.inputs.size())
+        nodePort = &node.inputs[inputIndex];
+      ++inputIndex;
+    } else {
+      if (outputIndex < node.outputs.size())
+        nodePort = &node.outputs[outputIndex];
+      ++outputIndex;
+    }
+    if (!nodePort)
+      continue;
+    bool required = false;
+    for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)
+      if (requirement.layoutId == layoutId && requirement.port == port.name) {
+        required = true;
+        break;
+      }
+    if (!required)
+      continue;
+    if (mlir::Type element = elementTypeOf(nodePort->type))
+      context.elementType = printedTypeOf(element);
+    if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
+            staticShapeOf(nodePort->type))
+      context.rank = static_cast<int64_t>(shape->size());
+    break;
+  }
+  return context;
 }
 
 /// One search value -- an integer or a string -- as a typed attribute, so a
@@ -994,6 +1071,28 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                where + ": unknown layout '" + entry.second + "'");
           return;
         }
+        // The recorded class must be a layout family the rule requires (its
+        // role), and the recorded family must be that class's own declaration:
+        // a mapping that points a class at some other layout would otherwise
+        // satisfy the requirement with the wrong family.
+        bool required =
+            llvm::any_of(rule->layoutRequirements,
+                         [&](const RuleLayoutRequirement &requirement) {
+                           return requirement.layoutId == entry.first();
+                         });
+        if (!required) {
+          fail(DiagnosticCode::NoLegalLayout,
+               where + ": rule '" + *ruleId + "' does not require layout '" +
+                   entry.first().str() + "', which the mapping records");
+          return;
+        }
+        if (entry.second != entry.first()) {
+          fail(DiagnosticCode::NoLegalLayout,
+               where + ": layout class '" + entry.first().str() +
+                   "' records family '" + entry.second +
+                   "', which is not its own declaration");
+          return;
+        }
       }
     }
     for (const RuleLayoutRequirement &requirement : rule->layoutRequirements) {
@@ -1089,6 +1188,66 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                                    "' is not an integer or string"));
             return;
           }
+      }
+      // The container is well-formed; now re-validate *what* it records. Each
+      // recorded class must be a family the rule requires, and each recorded
+      // assignment must be a complete, legal, in-domain instantiation of that
+      // declaration. The values are never re-chosen: a tampered width is
+      // rejected, not quietly replaced by the legal one (issue #67, stage A).
+      for (const RuleLayoutRequirement &requirement :
+           rule->layoutRequirements) {
+        bool recorded =
+            llvm::any_of(byClass, [&](const mlir::NamedAttribute &entry) {
+              return baseLayoutClass(entry.getName().getValue()) ==
+                     requirement.layoutId;
+            });
+        if (!recorded) {
+          fail(DiagnosticCode::NoLegalLayout,
+               where + ": rule '" + *ruleId + "' requires layout '" +
+                   requirement.layoutId +
+                   "', which the mapping records no assignment for");
+          return;
+        }
+      }
+      for (const mlir::NamedAttribute &entry : byClass) {
+        if (failure)
+          return;
+        llvm::StringRef layoutClass =
+            baseLayoutClass(entry.getName().getValue());
+        bool required =
+            llvm::any_of(rule->layoutRequirements,
+                         [&](const RuleLayoutRequirement &requirement) {
+                           return requirement.layoutId == layoutClass;
+                         });
+        if (!required) {
+          fail(DiagnosticCode::NoLegalLayout,
+               where + ": rule '" + *ruleId + "' does not require layout '" +
+                   layoutClass.str() + "', which the mapping records");
+          return;
+        }
+        const LayoutDef *def = target.layouts().find(layoutClass);
+        if (!def) {
+          fail(DiagnosticCode::NoLegalLayout,
+               where + ": unknown layout '" + layoutClass.str() + "'");
+          return;
+        }
+        llvm::StringMap<LayoutValue> recordedValues;
+        for (const mlir::NamedAttribute &parameter :
+             mlir::cast<mlir::DictionaryAttr>(entry.getValue()))
+          recordedValues[parameter.getName()] =
+              layoutValueOf(parameter.getValue());
+        LayoutContext portContext = layoutContextForRule(
+            *rule, *lookup.node, layoutClass, LayoutContext{});
+        // A phase-2 binding records parameters, not maps: the map is a pure
+        // function of the declaration and these values, so none is recorded
+        // and `verifySolvedLayout` rebuilds it from the confirmed assignment.
+        if (llvm::Error error =
+                verifySolvedLayout(*def, machine, *module.getContext(),
+                                   portContext, recordedValues,
+                                   /*recordedMap=*/{}, {}, where)) {
+          failure = std::move(error);
+          return;
+        }
       }
     }
 

@@ -219,6 +219,93 @@ TEST(PlanBinder, PersistsTheSolvedLayoutParameters) {
       static_cast<bool>(verifyMappedMicroIR(*bound->module, *fixture.target)));
 }
 
+// Regression (issue #67, stage A): the verifier checked the *container* types
+// of `layout_parameters` but never re-solved the values, so a tampered solved
+// assignment -- a vector width the target layout's own constraints forbid --
+// verified successfully. The recorded assignment must be validated against the
+// declaration it names, and never replaced by a different legal one.
+TEST(PlanBinder, RejectsTamperedSolvedVectorWidth) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_TRUE(f.target);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  auto legal = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_FALSE(bool(legal)) << llvm::toString(std::move(legal));
+  unsigned mutations = 0;
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    ASSERT_TRUE(mapping);
+    auto layouts = mapping.getAs<DictionaryAttr>("layout_parameters");
+    ASSERT_TRUE(layouts);
+    NamedAttrList newLayouts(layouts);
+    for (NamedAttribute entry : layouts) {
+      auto parameters = dyn_cast<DictionaryAttr>(entry.getValue());
+      if (!parameters || !parameters.getAs<IntegerAttr>("VW"))
+        continue;
+      NamedAttrList newParameters(parameters);
+      newParameters.set(
+          "VW", IntegerAttr::get(IntegerType::get(f.context.get(), 64), 4));
+      newLayouts.set(entry.getName(),
+                     newParameters.getDictionary(f.context.get()));
+      ++mutations;
+    }
+    NamedAttrList newMapping(mapping);
+    newMapping.set("layout_parameters",
+                   newLayouts.getDictionary(f.context.get()));
+    op->setAttr("micro.mapping", newMapping.getDictionary(f.context.get()));
+  });
+  ASSERT_GT(mutations, 0u);
+  auto error = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("no_legal_layout"),
+            std::string::npos);
+}
+
+// A layout family the plan records must be the family the rule requires and
+// the class's own declaration: pointing a class at some other legal layout is
+// tampering the verifier must reject, not accept because the id resolves.
+TEST(PlanBinder, RejectsTamperedLayoutFamily) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_TRUE(f.target);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
+
+  unsigned mutations = 0;
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    ASSERT_TRUE(mapping);
+    auto layouts = mapping.getAs<DictionaryAttr>("layouts");
+    ASSERT_TRUE(layouts);
+    NamedAttrList newLayouts(layouts);
+    for (NamedAttribute entry : layouts) {
+      // Repoint the recorded family at another layout the registry declares.
+      newLayouts.set(entry.getName(),
+                     StringAttr::get(f.context.get(), "avx2.row_major"));
+      ++mutations;
+    }
+    NamedAttrList newMapping(mapping);
+    newMapping.set("layouts", newLayouts.getDictionary(f.context.get()));
+    op->setAttr("micro.mapping", newMapping.getDictionary(f.context.get()));
+  });
+  ASSERT_GT(mutations, 0u);
+
+  auto error = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("no_legal_layout"),
+            std::string::npos);
+}
+
 TEST(PlanBinder, MachineAwareVerificationRejectsAnUnknownExecutor) {
   Fixture fixture = makeFixture();
   ASSERT_TRUE(fixture.module);
