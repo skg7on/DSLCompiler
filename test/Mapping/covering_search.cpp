@@ -2624,7 +2624,90 @@ TEST(CoveringSearch, AMeasurementChangesTheCostAndTheRanking) {
   EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles, 4.0);
   ASSERT_FALSE(result->plans[0].placements.empty());
   EXPECT_EQ(result->plans[0].placements[0].rule, "r.expensive");
-  EXPECT_FALSE(provider.lookups.empty());
+  ASSERT_FALSE(provider.lookups.empty());
+  // The search fills the whole §17.4 key, not just the rule: the operation's
+  // attributes and its placement class are part of what it asked about.
+  EXPECT_NE(provider.lookups.front().find("attributes={op = \"add\"}"),
+            std::string::npos)
+      << provider.lookups.front();
+  EXPECT_NE(provider.lookups.front().find("placement_class=worker"),
+            std::string::npos)
+      << provider.lookups.front();
+}
+
+// A typed fixture proves the cache key carries the operation's types and the
+// concrete placement, not only the rule: the fields are filled from the real
+// node and instance rather than left blank.
+TEST(CoveringSearch, LatencyKeyCarriesTheOperationsTypesAndPlacement) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, small);
+  FixedLatencyProvider provider;
+
+  std::unique_ptr<MappingTarget> target =
+      targetWithProvider(searchMachine(), kOneMemoryRules, &provider);
+  ASSERT_NE(target, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(provider.lookups.empty());
+
+  const std::string &key = provider.lookups.front();
+  EXPECT_NE(key.find("result_types=tensor<1xf32>"), std::string::npos) << key;
+  EXPECT_NE(key.find("placement=executor=e0,memories=sram=sram.0"),
+            std::string::npos)
+      << key;
+}
+
+// §17.4: the measurement cache key must separate any two pieces of work whose
+// measured cost could differ. Each pair below changes exactly one component and
+// must therefore produce a different key; an unchanged copy must not.
+TEST(CoveringSearch, LatencyKeysDistinguishWorkThatCanDiffer) {
+  OperationSignature base;
+  base.operation = "micro.vector";
+  base.operandTypes = "tensor<8x8xf32>";
+  base.resultTypes = "tensor<8x8xf32>";
+  base.attributes = "{op = \"add\"}";
+  base.rule = "r";
+  base.ruleVersion = 1;
+  base.bundle = "b";
+  base.bundleParameters = "{VW = 8 : i64}";
+  base.layout = "t.blocked(VW=8)";
+  base.placementClass = "core";
+  base.placement = "executor=e0,memories=sram.0";
+  base.routeClass = "direct";
+
+  const std::string key = base.canonicalString();
+
+  OperationSignature operand = base;
+  operand.operandTypes = "tensor<8x8xbf16>";
+  EXPECT_NE(operand.canonicalString(), key);
+
+  OperationSignature result = base;
+  result.resultTypes = "tensor<4x4xf32>";
+  EXPECT_NE(result.canonicalString(), key);
+
+  OperationSignature attributes = base;
+  attributes.attributes = "{op = \"mul\"}";
+  EXPECT_NE(attributes.canonicalString(), key);
+
+  OperationSignature bundleParameters = base;
+  bundleParameters.bundleParameters = "{VW = 4 : i64}";
+  EXPECT_NE(bundleParameters.canonicalString(), key);
+
+  OperationSignature layout = base;
+  layout.layout = "t.blocked(VW=4)";
+  EXPECT_NE(layout.canonicalString(), key);
+
+  OperationSignature placement = base;
+  placement.placement = "executor=e1,memories=acc.0";
+  EXPECT_NE(placement.canonicalString(), key);
+
+  OperationSignature unchanged = base;
+  EXPECT_EQ(unchanged.canonicalString(), key);
 }
 
 TEST(CoveringSearch, AnEntrylessProviderFallsBackToStaticCost) {

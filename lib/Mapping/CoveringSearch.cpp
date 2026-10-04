@@ -30,6 +30,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -234,6 +235,64 @@ sortedKeys(const llvm::StringMap<ValueT> &map) {
     keys.push_back(entry.first());
   llvm::sort(keys);
   return keys;
+}
+
+/// A type's printed form, or "" for a null type.
+std::string renderedType(mlir::Type type) {
+  if (!type)
+    return {};
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  type.print(stream);
+  return stream.str();
+}
+
+/// A node's port types, space-joined in declaration order.
+std::string renderedPortTypes(llvm::ArrayRef<WorkloadPort> ports) {
+  std::vector<std::string> texts;
+  texts.reserve(ports.size());
+  for (const WorkloadPort &port : ports)
+    texts.push_back(renderedType(port.type));
+  return llvm::join(texts, " ");
+}
+
+/// An attribute's printed form, or "" for a null attribute.
+std::string renderedAttribute(mlir::Attribute attribute) {
+  if (!attribute)
+    return {};
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  attribute.print(stream);
+  return stream.str();
+}
+
+/// The instance's complete layout identity: for each bound requirement its
+/// layout family and the parameters solved for it, canonically rendered and
+/// sorted. Two placements that chose different parameterizations of one family
+/// (`VW = 4` versus `VW = 8`) are different work and must not share a key.
+std::string layoutIdentity(const CandidateInstance &instance) {
+  std::vector<std::string> entries;
+  entries.reserve(instance.layoutSolutions.size());
+  for (const auto &entry : instance.layoutSolutions) {
+    std::string text = entry.second.layoutClass;
+    text += "(";
+    text += canonicalSearchValueString(entry.second.parameters);
+    text += ")";
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return llvm::join(entries, ",");
+}
+
+/// The instance's concrete placement identity: the executor it bound and its
+/// sorted memory bindings. Two placements of one rule on different executors or
+/// memories are different work.
+std::string placementIdentity(const CandidateInstance &instance) {
+  std::string text = "executor=";
+  text += instance.executorBindings.lookup("executor");
+  text += ",memories=";
+  text += llvm::join(sortedBindings(instance.memoryBindings), ",");
+  return text;
 }
 
 /// Canonical placement order (design §22.1): the executor id, then the sorted
@@ -446,19 +505,26 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           if (const LatencyProvider *provider = target_.latencyProvider()) {
             OperationSignature signature;
             signature.operation = node->opName;
+            // The operation's own types and attributes: two workloads on one
+            // rule that differ in dtype, shape, or a predicate-relevant
+            // attribute are different work at different costs.
+            signature.operandTypes = renderedPortTypes(node->inputs);
+            signature.resultTypes = renderedPortTypes(node->outputs);
+            signature.attributes = renderedAttribute(node->attributes);
             signature.rule = rule->id;
             signature.ruleVersion = rule->version;
-            signature.bundle = rule->bundle;
-            if (!entry.instance.layoutBindings.empty()) {
-              std::vector<std::string> layouts;
-              for (const auto &binding : entry.instance.layoutBindings)
-                layouts.push_back(binding.second);
-              llvm::sort(layouts);
-              signature.layout = layouts.front();
-            }
+            signature.bundle = entry.instance.bundle.name.empty()
+                                   ? rule->bundle
+                                   : entry.instance.bundle.name;
+            signature.bundleParameters =
+                renderedAttribute(entry.instance.bundle.parameters);
+            // Every bound requirement's family *and* solved parameters, not
+            // merely the first family id.
+            signature.layout = layoutIdentity(entry.instance);
             if (const machine::ExecutorNode *executor = machine.findExecutor(
                     entry.instance.executorBindings.lookup("executor")))
               signature.placementClass = executor->kind;
+            signature.placement = placementIdentity(entry.instance);
             TargetContext context{target_.name().str(),
                                   hexId(machine.contentHash)};
             if (std::optional<double> measured =
