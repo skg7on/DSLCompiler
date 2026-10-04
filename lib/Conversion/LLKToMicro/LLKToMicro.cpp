@@ -873,7 +873,11 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
   startRegionBody(builder, space.getBody(), loc);
 
   auto addParam = [&](StringRef name, StringRef kind, ArrayAttr choices) {
-    micro::ParamOp::create(builder, loc, name, kind, choices);
+    // No role: the exported space declares one parameter per axis, so each
+    // governs its axis as a whole. A space that binds several layouts for
+    // different ports would name them.
+    micro::ParamOp::create(builder, loc, name, kind, choices,
+                           /*role=*/mlir::StringAttr());
   };
   auto addConstraint = [&](StringRef kind, ArrayRef<StringRef> params) {
     SmallVector<Attribute, 4> names;

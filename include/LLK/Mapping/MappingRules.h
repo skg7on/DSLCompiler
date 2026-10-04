@@ -241,7 +241,7 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const LayoutContext &context, std::string *reason = nullptr,
                    bool *truncated = nullptr,
                    const llvm::StringMap<SearchValue> *pinned = nullptr,
-                   const std::string *boundLayout = nullptr);
+                   const llvm::StringMap<std::string> *boundLayouts = nullptr);
 
 } // namespace mlir::llk::mapping
 

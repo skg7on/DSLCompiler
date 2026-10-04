@@ -488,9 +488,18 @@ def Micro_ParamOp : Micro_Op<"param"> {
 
         Parameters are lexically scoped to their micro.search_space and are
         referred to by name, not bound to SSA values.
+
+        `role` is optional and names the *thing* a parameter governs, for the
+        axes where one space may bind several at once. The layout axis is the
+        one that needs it: a rule requires a layout on a named port
+        (`operand0`, `lhs`), so a space that binds more than one layout kind
+        must say which port each one is for. A parameter with no role governs
+        the axis as a whole -- the behaviour before roles existed, and still
+        the right spelling for a space that binds one layout.
     }];
 
-  let arguments = (ins StrAttr:$name, StrAttr:$kind, ArrayAttr:$choices);
+  let arguments = (ins StrAttr:$name, StrAttr:$kind, ArrayAttr:$choices,
+                       OptionalAttr<StrAttr>:$role);
 
   let assemblyFormat = "$name attr-dict";
 

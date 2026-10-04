@@ -142,7 +142,7 @@ public:
                  mlir::MLIRContext &context, const LayoutContext &layoutContext,
                  const MappingSearchOptions &options = {},
                  std::optional<SearchBinding> binding = std::nullopt,
-                 std::optional<std::string> boundLayout = std::nullopt);
+                 llvm::StringMap<std::string> boundLayouts = {});
 
   llvm::Expected<MappingSearchResult> search();
 
@@ -175,7 +175,7 @@ private:
   /// matches unchanged: it takes on no layout obligation, so it neither offers
   /// nor contradicts the bound value. Absent leaves layout selection exactly as
   /// it was before bindings.
-  std::optional<std::string> boundLayout_;
+  llvm::StringMap<std::string> boundLayouts_;
 };
 
 } // namespace mlir::llk::mapping

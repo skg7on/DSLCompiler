@@ -3311,7 +3311,8 @@ TEST(CoveringSearch, ABoundLayoutSelectsAmongTheLayoutsARuleOffers) {
         makeSearchBinding("candidate_blocked",
                           values({{"tile_layout", std::string("t.blocked")}}));
     CoveringSearch search(graph, *target, context, LayoutContext{}, options,
-                          binding, std::string("t.blocked"));
+                          binding,
+                          llvm::StringMap<std::string>{{"", "t.blocked"}});
     llvm::Expected<MappingSearchResult> result = search.search();
     ASSERT_TRUE(static_cast<bool>(result))
         << llvm::toString(result.takeError());
@@ -3358,7 +3359,8 @@ TEST(CoveringSearch, ABoundLayoutARuleDoesNotOfferIsANonMatch) {
         makeSearchBinding("candidate_blocked",
                           values({{"tile_layout", std::string("t.blocked")}}));
     CoveringSearch search(graph, *target, context, LayoutContext{}, options,
-                          binding, std::string("t.blocked"));
+                          binding,
+                          llvm::StringMap<std::string>{{"", "t.blocked"}});
     llvm::Expected<MappingSearchResult> result = search.search();
     ASSERT_TRUE(static_cast<bool>(result))
         << llvm::toString(result.takeError());
@@ -3401,7 +3403,8 @@ TEST(CoveringSearch, ABoundLayoutLeavesLayoutAgnosticRulesUnchanged) {
   // differs -- the binding's provenance is folded into it -- so compare the
   // selections, not the id.)
   CoveringSearch boundSearch(graph, *target, context, LayoutContext{}, options,
-                             binding, std::string("t.blocked"));
+                             binding,
+                             llvm::StringMap<std::string>{{"", "t.blocked"}});
   llvm::Expected<MappingSearchResult> boundResult = boundSearch.search();
   ASSERT_TRUE(static_cast<bool>(boundResult))
       << llvm::toString(boundResult.takeError());

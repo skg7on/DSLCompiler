@@ -414,7 +414,7 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   // and the pass fails with the frontier's diagnostics (below) instead of
   // binding a plan the binding does not describe.
   std::optional<mapping::SearchBinding> binding;
-  std::optional<std::string> boundLayout;
+  llvm::StringMap<std::string> boundLayouts;
   if (!options.candidate.empty()) {
     llvm::Expected<mapping::SearchBinding> loaded =
         mapping::loadSearchBinding(module, options.candidate);
@@ -429,24 +429,29 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
             module, *binding, run.kernel, run.target->machine()))
       return std::move(error);
 
-    llvm::Expected<std::optional<std::string>> layout =
-        mapping::loadBoundLayout(module, *binding);
-    if (!layout)
-      return layout.takeError();
-    boundLayout = std::move(*layout);
+    llvm::Expected<llvm::StringMap<std::string>> layouts =
+        mapping::loadBoundLayouts(module, *binding);
+    if (!layouts)
+      return layouts.takeError();
+    boundLayouts = std::move(*layouts);
 
-    // Bridge the bound Micro layout *kind* to the target layout the rules name
+    // Bridge each bound Micro layout *kind* to the target layout the rules name
     // through the target's own declaration (`layout <id> implements <kind>;`).
     // The two namespaces are otherwise unrelated strings, so without the bridge
     // a binding can only veto rules that name a different id -- it can never
     // select the target layout it means. Generic code still only
     // string-compares the resolved id (ruling S7); the kind is never read as
     // target semantics.
-    if (boundLayout && !boundLayout->empty()) {
+    //
+    // The map is keyed by role: a space may bind `operand0` and `lhs`
+    // separately, and each is bridged on its own.
+    for (auto &entry : boundLayouts) {
+      if (entry.second.empty())
+        continue;
       std::vector<const mapping::LayoutDef *> implementing =
-          run.target->layouts().implementing(*boundLayout);
+          run.target->layouts().implementing(entry.second);
       if (implementing.size() == 1) {
-        boundLayout = implementing.front()->id;
+        entry.second = implementing.front()->id;
       } else if (implementing.size() > 1) {
         // Several target layouts implement the bound kind, so the bridge does
         // not land on one id. Rejected as ambiguous rather than guessing: the
@@ -458,14 +463,16 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
             names += ", ";
           names += "'" + def->id + "'";
         }
-        return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                       (passName + ": the bound layout kind '" +
-                                        *boundLayout + "' is implemented by " +
-                                        std::to_string(implementing.size()) +
-                                        " target layouts (" + names +
-                                        "); the kind-to-layout bridge is "
-                                        "ambiguous")
-                                           .str());
+        return llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
+            (passName + ": the bound layout kind '" + entry.second + "'" +
+             (entry.first().empty()
+                  ? std::string()
+                  : " for role '" + entry.first().str() + "'") +
+             " is implemented by " + std::to_string(implementing.size()) +
+             " target layouts (" + names +
+             "); the kind-to-layout bridge is ambiguous")
+                .str());
       }
       // Zero: no target layout claims the kind. The bound value is left as the
       // bare kind, so a rule that happens to spell its id like the kind still
@@ -476,7 +483,7 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
 
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),
                                  deriveLayoutContext(*graph), searchOptions,
-                                 std::move(binding), std::move(boundLayout));
+                                 std::move(binding), std::move(boundLayouts));
   llvm::Expected<mapping::MappingSearchResult> result = search.search();
   if (!result)
     return result.takeError();

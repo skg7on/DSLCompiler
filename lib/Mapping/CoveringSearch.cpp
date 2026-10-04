@@ -346,10 +346,10 @@ CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
                                const LayoutContext &layoutContext,
                                const MappingSearchOptions &options,
                                std::optional<SearchBinding> binding,
-                               std::optional<std::string> boundLayout)
+                               llvm::StringMap<std::string> boundLayouts)
     : workload_(workload), target_(target), context_(context),
       layoutContext_(layoutContext), options_(options),
-      binding_(std::move(binding)), boundLayout_(std::move(boundLayout)) {}
+      binding_(std::move(binding)), boundLayouts_(std::move(boundLayouts)) {}
 
 llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   const MachineModel &machine = target_.machine();
@@ -452,16 +452,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // exactly the pre-binding enumeration.
     const llvm::StringMap<SearchValue> *pinned =
         binding_ ? &binding_->values : nullptr;
-    // The layout the binding resolves to, resolved from its `layout`-kind
-    // parameter by the caller. A null pointer when no binding, or a binding
-    // with no layout-kind parameter, leaves layout selection unchanged.
-    const std::string *boundLayout = boundLayout_ ? &*boundLayout_ : nullptr;
+    // The layouts the binding resolves to, one per role, resolved from the
+    // space's `layout`-kind parameters by the caller. An empty map -- no
+    // binding, or a binding with no layout-kind parameter -- leaves layout
+    // selection unchanged.
+    const llvm::StringMap<std::string> *boundLayouts =
+        boundLayouts_.empty() ? nullptr : &boundLayouts_;
     for (const RuleDef *rule : matches) {
       std::string reason;
       bool truncated = false;
       std::optional<MappingCandidate> candidate =
           toMappingCandidate(*rule, *node, machine, layoutContext_, &reason,
-                             &truncated, pinned, boundLayout);
+                             &truncated, pinned, boundLayouts);
       if (!candidate) {
         if (truncated) {
           result.searchTruncated = true;

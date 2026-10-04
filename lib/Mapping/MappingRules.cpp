@@ -1241,7 +1241,7 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason,
                    bool *truncated, const llvm::StringMap<SearchValue> *pinned,
-                   const std::string *boundLayout) {
+                   const llvm::StringMap<std::string> *boundLayouts) {
   RuleResolution resolution =
       resolveRuleConstraints(rule, node, machine, context, pinned);
   if (!resolution.matched) {
@@ -1269,15 +1269,41 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   // ignored". Vetoing a rule with no obligation would make every
   // movement/reduce rule (which the shipped rule files leave layout-agnostic)
   // unmappable under any bound layout.
-  if (boundLayout && !rule.layoutRequirements.empty()) {
-    bool offered = false;
-    for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)
-      offered |= requirement.layoutId == *boundLayout;
-    if (!offered) {
-      if (reason)
-        *reason = "binding selects layout '" + *boundLayout +
-                  "', which the rule does not offer";
-      return std::nullopt;
+  if (boundLayouts && !rule.layoutRequirements.empty()) {
+    // Each bound value is checked against the obligation it belongs to. A
+    // value bound for a *role* governs the requirement on that port: a rule
+    // that declares no requirement there takes on no obligation and matches
+    // unchanged (the same omission rule as the role-less case -- see below). A
+    // value bound with no role governs the axis as a whole, so the rule must
+    // offer it somewhere.
+    for (const auto &entry : *boundLayouts) {
+      llvm::StringRef role = entry.first();
+      const std::string &value = entry.second;
+      bool satisfied = false;
+      for (const RuleLayoutRequirement &requirement : rule.layoutRequirements) {
+        if (!role.empty() && requirement.port != role)
+          continue;
+        satisfied |= requirement.layoutId == value;
+      }
+      // A role the rule does not mention is no obligation -- unless the value
+      // is the role-less one, which the rule must offer somewhere.
+      if (!satisfied && role.empty()) {
+        if (reason)
+          *reason = "binding selects layout '" + value +
+                    "', which the rule does not offer";
+        return std::nullopt;
+      }
+      if (!satisfied && !role.empty()) {
+        bool mentionsRole = false;
+        for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)
+          mentionsRole |= requirement.port == role;
+        if (mentionsRole) {
+          if (reason)
+            *reason = "binding selects layout '" + value + "' for port '" +
+                      role.str() + "', which the rule does not offer there";
+          return std::nullopt;
+        }
+      }
     }
   }
 
@@ -1337,8 +1363,19 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     // direction to the empty-list veto S7 fixed. Every shipped rule declares at
     // most one `require layout`, so the cases do not yet diverge; a per-port
     // selection surface is the place to split them if one appears.
-    if (boundLayout && requirement.layoutId != *boundLayout)
-      continue;
+    // Keep a requirement only when it is the one the binding selected for its
+    // role -- or for the role-less axis, which applies to every role. With no
+    // binding, every requirement is kept exactly as before.
+    if (boundLayouts) {
+      const std::string *byRole = nullptr;
+      if (auto it = boundLayouts->find(requirement.port);
+          it != boundLayouts->end())
+        byRole = &it->second;
+      else if (auto it = boundLayouts->find(""); it != boundLayouts->end())
+        byRole = &it->second;
+      if (byRole && requirement.layoutId != *byRole)
+        continue;
+    }
     LayoutRequirement resolved;
     resolved.layoutClass = requirement.layoutId;
     // A layout applies to the operand the requirement names, so resolve that
