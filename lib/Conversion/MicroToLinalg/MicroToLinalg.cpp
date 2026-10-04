@@ -1,21 +1,27 @@
-//===- MicroToLinalg.cpp - Lower micro kernels to Linalg + SCF + MemRef ---===//
+//===- MicroToLinalg.cpp - Lower micro kernels to Linalg over tensors -----===//
 //
 // `micro` is the canonical execution IR, and until this pass it was a sink:
 // nothing lowered it to anything a backend consumes. This is the bridge that
 // lets a `micro.kernel` -- hand-written, exported by `--llk-to-micro`, or bound
 // from a mapping plan -- reach the same downstream pipeline the legacy path
-// uses (`Linalg -> loops -> memref -> LLVM -> ORC JIT`).
+// uses (`Linalg -> tiling -> vector -> bufferization -> LLVM -> ORC JIT`).
 //
 // Two phases, because they are different kinds of change:
 //
 //   1. Structure. Each `micro.kernel` becomes a `func.func` with the same
 //      symbol and its body inlined, so the result is an ordinary callable the
 //      downstream pipeline already knows how to handle.
-//   2. Types and ops. A full dialect conversion: `!micro.tile` and the tensors
-//      the kernel reads become memrefs, and every micro op is rewritten to a
-//      memref/Linalg/arith equivalent. The micro dialect is marked *illegal*,
-//      so an op this pass cannot lower fails the conversion loudly rather than
-//      being silently left behind.
+//   2. Types and ops. A full dialect conversion: `!micro.tile` becomes a ranked
+//      tensor, and every micro op is rewritten to a Linalg/arith equivalent.
+//      The micro dialect is marked *illegal*, so an op this pass cannot lower
+//      fails the conversion loudly rather than being silently left behind.
+//
+// The output is deliberately *tensor*-based, not bufferized. `llk-compile`
+// bufferizes tensors itself, and feeding it already-bufferized memrefs leaves
+// the IR in a mixed state it cannot finish lowering -- a surviving unrealized
+// `!llvm.array<4 x vector<8xf32>>` cast that LLVM translation rejects. Staying
+// in tensor land hands the pipeline a `linalg.generic` over tensors, which is
+// exactly what it tiles, vectorizes, and buffers on its own.
 //
 // This is deliberately a subset. The tile types' memory space, layout, and
 // owner are placement facts: they are recorded on the mapping metadata and
@@ -25,10 +31,10 @@
 // not lowered yet -- each is a later slice, and each fails loudly until then.
 //
 // Kernel ABI: a `micro.kernel` has no arguments and no results. Its entry
-// values are the `tensor.empty` ops its body reads, which become allocations
-// here, so the lowered function is self-contained rather than callable with
-// caller-provided buffers. Wiring real inputs and outputs is a later slice,
-// and is what the JIT harness needs.
+// values are the `tensor.empty` ops its body reads, and its result values are
+// unused, so the lowered function computes dead work. Binding real inputs and
+// outputs is a later slice, and is what the JIT harness needs to observe a
+// result.
 //
 //===----------------------------------------------------------------------===//
 
@@ -48,7 +54,6 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
@@ -70,11 +75,10 @@ namespace mlir {
 namespace llk {
 namespace {
 
-/// `!micro.tile` and the tensors a kernel reads both become memrefs of the same
-/// shape and element type. The tile's memory space, layout, and owner are
-/// placement facts the target owns, so they are dropped here rather than
-/// invented as memref layout/memory-space attributes. An async token lowers to
-/// an `index`: it carries no data, only a dependency the erased wait names.
+/// `!micro.tile` becomes a ranked tensor of the same shape and element type.
+/// The tile's memory space, layout, and owner are placement facts the target
+/// owns and are dropped here. An async token lowers to an `index`: it carries
+/// no data, only a dependency the erased wait names.
 class MicroTypeConverter : public mlir::TypeConverter {
 public:
   explicit MicroTypeConverter(mlir::MLIRContext *context) : context(context) {
@@ -85,17 +89,35 @@ public:
     addConversion([this](micro::AsyncTokenType) -> Type {
       return IndexType::get(this->context);
     });
-    addConversion([](RankedTensorType tensor) -> Type {
-      return MemRefType::get(tensor.getShape(), tensor.getElementType());
-    });
     addConversion([](micro::TileType tile) -> Type {
-      return MemRefType::get(tile.getShape(), tile.getElementType());
+      return RankedTensorType::get(tile.getShape(), tile.getElementType());
     });
   }
 
 private:
   mlir::MLIRContext *context;
 };
+
+/// A pure movement, and a layout conversion once the layouts themselves are
+/// dropped, both lower to a `linalg.generic` copy: a fresh tensor of the same
+/// shape carrying the same elements.
+Value buildTensorCopy(OpBuilder &builder, Location loc, Value source,
+                      RankedTensorType resultType) {
+  auto empty = tensor::EmptyOp::create(builder, loc, resultType.getShape(),
+                                       resultType.getElementType());
+  SmallVector<AffineMap> maps{
+      builder.getMultiDimIdentityMap(resultType.getRank()),
+      builder.getMultiDimIdentityMap(resultType.getRank())};
+  SmallVector<utils::IteratorType> iterators(resultType.getRank(),
+                                             utils::IteratorType::parallel);
+  auto copy = linalg::GenericOp::create(
+      builder, loc, TypeRange{resultType}, ValueRange{source},
+      ValueRange{empty}, maps, iterators,
+      [&](OpBuilder &nested, Location nestedLoc, ValueRange args) {
+        linalg::YieldOp::create(nested, nestedLoc, args[0]);
+      });
+  return copy.getResult(0);
+}
 
 /// The elementwise operations this pass can express in arith, and the arity
 /// each takes. A mnemonic with no arith equivalent yet -- `silu`,
@@ -165,70 +187,56 @@ Value buildElementwise(OpBuilder &builder, Location loc, ElementwiseKind kind,
 // Op patterns
 //===----------------------------------------------------------------------===//
 
-/// A kernel entry value is a buffer: the graph model gives it no producer, and
-/// the lowered function owns it.
-struct TensorEmptyOpLowering : OpConversionPattern<tensor::EmptyOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(tensor::EmptyOp op, OpAdaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto type =
-        dyn_cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
-    if (!type)
-      return rewriter.notifyMatchFailure(op, "not convertible to a memref");
-    rewriter.replaceOpWithNewOp<memref::AllocOp>(op, type);
-    return success();
-  }
-};
-
-/// A materialized tile is an allocation.
+/// A materialized tile is a value with storage: in tensor land, that is an
+/// `tensor.empty` of the same shape, which bufferization turns into an
+/// allocation.
 struct TileAllocOpLowering : OpConversionPattern<micro::TileAllocOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
   matchAndRewrite(micro::TileAllocOp op, OpAdaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto type =
-        dyn_cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
+    auto type = dyn_cast<RankedTensorType>(
+        getTypeConverter()->convertType(op.getType()));
     if (!type)
-      return rewriter.notifyMatchFailure(op, "not convertible to a memref");
-    rewriter.replaceOpWithNewOp<memref::AllocOp>(op, type);
+      return rewriter.notifyMatchFailure(op, "not convertible to a tensor");
+    rewriter.replaceOpWithNewOp<tensor::EmptyOp>(op, type.getShape(),
+                                                 type.getElementType());
     return success();
   }
 };
 
-/// A logical view allocates nothing: it is the source buffer, when it covers
-/// the whole source. A windowed view needs a `memref.subview`, which is a later
+/// A logical view allocates nothing: it is the source value, when it covers the
+/// whole source. A windowed view needs `tensor.extract_slice`, which is a later
 /// slice -- it fails loudly rather than silently reading the wrong elements.
 struct TileViewOpLowering : OpConversionPattern<micro::TileViewOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
   matchAndRewrite(micro::TileViewOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto resultType =
-        dyn_cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
-    auto sourceType = dyn_cast<MemRefType>(adaptor.getSource().getType());
+    auto resultType = dyn_cast<RankedTensorType>(
+        getTypeConverter()->convertType(op.getType()));
+    auto sourceType = dyn_cast<RankedTensorType>(adaptor.getSource().getType());
     if (!resultType || !sourceType)
-      return rewriter.notifyMatchFailure(op, "not convertible to a memref");
+      return rewriter.notifyMatchFailure(op, "not convertible to a tensor");
     if (sourceType.getShape() != resultType.getShape())
       return rewriter.notifyMatchFailure(
-          op, "a windowed micro.tile_view needs subview lowering, which is not "
+          op, "a windowed micro.tile_view needs slice lowering, which is not "
               "implemented yet");
     rewriter.replaceOp(op, adaptor.getSource());
     return success();
   }
 };
 
-/// An elementwise fragment becomes a `linalg.generic` over the destination
-/// buffer the fragment materializes into.
+/// An elementwise fragment becomes a `linalg.generic` producing a tensor.
 struct VectorOpLowering : OpConversionPattern<micro::VectorOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
   matchAndRewrite(micro::VectorOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto resultType =
-        dyn_cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
+    auto resultType = dyn_cast<RankedTensorType>(
+        getTypeConverter()->convertType(op.getType()));
     if (!resultType)
-      return rewriter.notifyMatchFailure(op, "not convertible to a memref");
+      return rewriter.notifyMatchFailure(op, "not convertible to a tensor");
     llvm::StringRef name = op.getOp();
     Type elementType = resultType.getElementType();
     std::optional<ElementwiseKind> kind =
@@ -237,70 +245,66 @@ struct VectorOpLowering : OpConversionPattern<micro::VectorOp> {
       return rewriter.notifyMatchFailure(
           op,
           ("elementwise op '" + name + "' has no arith lowering yet").str());
-    auto out = memref::AllocOp::create(rewriter, op.getLoc(), resultType);
+    auto empty = tensor::EmptyOp::create(rewriter, op.getLoc(),
+                                         resultType.getShape(), elementType);
     SmallVector<AffineMap> maps(
         adaptor.getInputs().size() + 1,
         rewriter.getMultiDimIdentityMap(resultType.getRank()));
     SmallVector<utils::IteratorType> iterators(resultType.getRank(),
                                                utils::IteratorType::parallel);
-    linalg::GenericOp::create(
-        rewriter, op.getLoc(), TypeRange{}, adaptor.getInputs(),
-        ValueRange{out}, maps, iterators,
+    auto generic = linalg::GenericOp::create(
+        rewriter, op.getLoc(), TypeRange{resultType}, adaptor.getInputs(),
+        ValueRange{empty}, maps, iterators,
         [&](OpBuilder &builder, Location loc, ValueRange args) {
           linalg::YieldOp::create(
               builder, loc,
               buildElementwise(builder, loc, *kind, args, elementType));
         });
-    rewriter.replaceOp(op, out);
+    rewriter.replaceOp(op, generic.getResult(0));
+    return success();
+  }
+};
+
+/// A layout conversion materializes as a copy. The two affine maps describe
+/// *physical* layouts, which this pass drops along with the tile's memory
+/// space, layout and owner, so the repack is a same-shape copy here. Encoding
+/// the layouts as tensor/memref layout maps -- and so making the copy do the
+/// actual repack -- is the next slice, and belongs with the target's
+/// memory-space mapping.
+struct TransformOpLowering : OpConversionPattern<micro::TransformOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(micro::TransformOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultType = dyn_cast<RankedTensorType>(
+        getTypeConverter()->convertType(op.getType()));
+    if (!resultType)
+      return rewriter.notifyMatchFailure(op, "not convertible to a tensor");
+    rewriter.replaceOp(op, buildTensorCopy(rewriter, op.getLoc(),
+                                           adaptor.getSource(), resultType));
     return success();
   }
 };
 
 /// `micro.async_copy` and `micro.tile_async_copy` are movements. The lowered
-/// form is synchronous (`memref.copy`): the async token and the `micro.wait`
-/// that consumes it exist to model overlap in the cost model, not to change
-/// what the data movement means, so the wait is erased and the token becomes a
-/// dummy `index`.
+/// form is a synchronous copy: the async token and the `micro.wait` that
+/// consumes it exist to model overlap in the cost model, not to change what the
+/// data movement means, so the wait is erased and the token becomes a dummy
+/// `index`.
 template <typename CopyOp>
 struct AsyncCopyOpLowering : OpConversionPattern<CopyOp> {
   using OpConversionPattern<CopyOp>::OpConversionPattern;
   LogicalResult
   matchAndRewrite(CopyOp op, typename CopyOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto destinationType = dyn_cast<MemRefType>(
+    auto resultType = dyn_cast<RankedTensorType>(
         this->getTypeConverter()->convertType(op.getResult().getType()));
-    if (!destinationType)
-      return rewriter.notifyMatchFailure(op, "not convertible to a memref");
-    auto destination =
-        memref::AllocOp::create(rewriter, op.getLoc(), destinationType);
-    memref::CopyOp::create(rewriter, op.getLoc(), adaptor.getSource(),
-                           destination);
-    auto token = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
-    rewriter.replaceOp(op, ValueRange{destination, token});
-    return success();
-  }
-};
-
-/// A layout conversion materializes: a fresh buffer of the destination shape is
-/// written from the source. The two affine maps describe *physical* layouts,
-/// which this pass drops along with the tile's memory space, layout and owner,
-/// so the repack is a same-shape copy here. Encoding the layouts as memref
-/// layout maps -- and so making the copy do the actual repack -- is the next
-/// slice, and belongs with the target's memory-space mapping.
-struct TransformOpLowering : OpConversionPattern<micro::TransformOp> {
-  using OpConversionPattern::OpConversionPattern;
-  LogicalResult
-  matchAndRewrite(micro::TransformOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto resultType =
-        dyn_cast<MemRefType>(getTypeConverter()->convertType(op.getType()));
     if (!resultType)
-      return rewriter.notifyMatchFailure(op, "not convertible to a memref");
-    auto destination =
-        memref::AllocOp::create(rewriter, op.getLoc(), resultType);
-    memref::CopyOp::create(rewriter, op.getLoc(), adaptor.getSource(),
-                           destination);
-    rewriter.replaceOp(op, destination);
+      return rewriter.notifyMatchFailure(op, "not convertible to a tensor");
+    Value copied =
+        buildTensorCopy(rewriter, op.getLoc(), adaptor.getSource(), resultType);
+    auto token = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
+    rewriter.replaceOp(op, ValueRange{copied, token});
     return success();
   }
 };
@@ -341,8 +345,9 @@ struct MicroToLinalgPass
   StringRef getArgument() const override { return "micro-to-linalg"; }
 
   StringRef getDescription() const override {
-    return "Lower micro kernels to Linalg + SCF + MemRef, so a mapped or "
-           "exported micro.kernel can reach the existing LLVM/JIT pipeline";
+    return "Lower micro kernels to Linalg over tensors, so a mapped or "
+           "exported "
+           "micro.kernel can reach the existing LLVM/JIT pipeline";
   }
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -381,17 +386,13 @@ struct MicroToLinalgPass
     MicroTypeConverter converter(context);
     ConversionTarget target(*context);
     target.addIllegalDialect<micro::MicroDialect>();
-    // A kernel's entry values are `tensor.empty`; they become allocations, so
-    // the op is illegal even though its dialect is otherwise legal here.
-    target.addIllegalOp<tensor::EmptyOp>();
     target.addLegalDialect<arith::ArithDialect, func::FuncDialect,
                            linalg::LinalgDialect, memref::MemRefDialect,
                            scf::SCFDialect, tensor::TensorDialect>();
 
     RewritePatternSet patterns(context);
-    patterns.add<TensorEmptyOpLowering, TileAllocOpLowering, TileViewOpLowering,
-                 VectorOpLowering, TransformOpLowering,
-                 AsyncCopyOpLowering<micro::AsyncCopyOp>,
+    patterns.add<TileAllocOpLowering, TileViewOpLowering, VectorOpLowering,
+                 TransformOpLowering, AsyncCopyOpLowering<micro::AsyncCopyOp>,
                  AsyncCopyOpLowering<micro::TileAsyncCopyOp>, WaitOpLowering,
                  YieldOpLowering>(converter, context);
 

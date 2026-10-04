@@ -1085,6 +1085,13 @@ if(LLK_BUILD_TOOLS)
       COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --micro-to-linalg
               ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg_invalid.mlir
   )
+  # MicroToLinalgJit: the lowered kernel reaches the JIT. This is the check that
+  # the bridge produces IR the backend pipeline can finish -- which is why the
+  # lowering stays in tensor land: an already-bufferized module leaves an
+  # unrealized vector cast that LLVM translation rejects.
+  add_test(NAME MicroToLinalgJit
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --micro-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg_jit.mlir | $<TARGET_FILE:llk-compile> - | grep -q 'Compilation successful'"
+  )
   # math_mode=triton_fast on the SiLU path: the sigmoid's exp must take the
   # bounded-fast (math.exp2) path, like bounded_fast and unsafe_fast do.
   add_test(NAME LLKToLinalgTritonFast
