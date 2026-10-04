@@ -13,10 +13,12 @@
 #   4. signed decimal (the same hash read as a signed i64).
 # Anything else is a usage error carrying the "must be a 64-bit" diagnostic.
 #
-# Ambiguity rule: a string of decimal digits that contains no hex letter is
-# decimal, so `12345` is 12345 and not 0x12345. `0x` forces hex; a letter
-# (a-f) in an otherwise-hex-digit string forces hex. This script pins both the
-# rule and the precedence by asserting the exact id the binder echoes back.
+# Spelling rule, in order: `0x`/`0X` forces hex; else exactly 16 hex digits is
+# hex (the report's `%016llx` width, so its token round-trips even when all 16
+# digits are decimal); else all-hex-digits containing a hex letter (a-f) is hex;
+# else decimal. So `12345` is decimal and `12ab` is hex, but the 16-digit
+# `1234567890123456` is hex. This script pins the rule and the precedence by
+# asserting the exact id the binder echoes back.
 #
 # Usage: micro_bind_plan_id.sh <llk-opt> <source-dir> <work-dir>
 #===- -------------------------------------------------------------------===//
@@ -89,10 +91,19 @@ probe_accepts "$HEX" "$WORK/hex.mlir"
 # 3. `0x`-prefixed hex binds too.
 probe_accepts "0x$HEX" "$WORK/hex0x.mlir"
 
-# 4. Decimal binds. The report's id fits in a signed i64, so its unsigned and
-#    signed spellings coincide here; the high-bit cases below separate them.
-DEC=$((0x$HEX))
-probe_accepts "$DEC" "$WORK/decimal.mlir"
+# 4. Decimal binds. `$((0x...))` is signed 64-bit arithmetic, so it is only
+#    well-defined here while the id's top hex digit is below 8; the report's
+#    deterministic id is `0081...`, so this runs. Guarded so a future high-bit id
+#    skips this probe rather than leaning on implementation-defined overflow; the
+#    high-bit cases below still cover decimal parsing, signed and unsigned.
+top=$(printf '%s' "$HEX" | cut -c1)
+case $top in
+  8|9|a|b|c|d|e|f|A|B|C|D|E|F) : ;;
+  *)
+    DEC=$((0x$HEX))
+    probe_accepts "$DEC" "$WORK/decimal.mlir"
+    ;;
+esac
 
 # 5. Signed and unsigned decimals of a high-bit hash denote the same id: both
 #    are accepted by the parser (they reach the "no plan" diagnostic, not the
@@ -105,6 +116,12 @@ probe_interprets_as 18446744073709551615 18446744073709551615 \
 #    while a hex letter forces hex (`12ab` == 4779).
 probe_interprets_as 12345 12345 "$WORK/decimal_only.mlir"
 probe_interprets_as 12ab 4779 "$WORK/hex_letter.mlir"
+
+# 6b. ...but the report always prints exactly 16 hex digits, so at that exact
+#     width hex wins even when every digit is decimal: 0x1234567890123456 must be
+#     looked up as 1311768467284833366, never as decimal 1234567890123456.
+probe_interprets_as 1234567890123456 1311768467284833366 \
+    "$WORK/hex_digits_only.mlir"
 
 # 7. Anything else is rejected with the diagnostic.
 probe_rejects "0xbeefg" "$WORK/bad_hex.mlir"

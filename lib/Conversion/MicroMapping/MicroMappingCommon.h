@@ -90,12 +90,24 @@ parseSearchMode(llvm::StringRef text) {
 /// decimal read as either unsigned or signed (a hash with the high bit set is
 /// negative when read as a signed i64, and both spellings must round-trip).
 ///
-/// Spelling rule, deterministic and tested: a `0x`/`0X` prefix forces hex;
-/// otherwise a string made only of hex digits that contains at least one hex
-/// letter (`a`-`f`, either case) is hex; everything else is decimal. So the
-/// digit-only `12345` is decimal 12345 and not 0x12345, while `12ab` is hex
-/// 4779. Numbers too large for the chosen base, or containing any other
+/// Spelling rule, deterministic and tested. In order:
+///   1. a `0x`/`0X` prefix forces hex;
+///   2. otherwise exactly 16 characters, all hex digits, is hex -- this is
+///      `hexId`'s `%016llx` output, so the report's token round-trips even when
+///      all 16 digits happen to be decimal;
+///   3. otherwise a string made only of hex digits that contains at least one
+///      hex letter (`a`-`f`, either case) is hex;
+///   4. everything else is decimal, read as unsigned then (for a leading `-`)
+///      signed.
+/// So the digit-only `12345` is decimal 12345 and not 0x12345, while `12ab` is
+/// hex 4779. Numbers too large for the chosen base, or containing any other
 /// character, are rejected. Returns nullopt on rejection.
+///
+/// Trade-off, stated plainly: at exactly 16 bare hex digits the parser prefers
+/// hex, so a 16-digit *decimal* value cannot be written bare -- it would be
+/// read as hex. Write it in `0x` hex instead, or in any other form that is not
+/// 16 bare hex digits. The round-trip of the report's token is the primary
+/// contract, and it is exactly this width, so it wins at this width.
 inline std::optional<uint64_t> parsePlanId(llvm::StringRef text) {
   llvm::StringRef body = text;
   if (body.consume_front("0x") || body.consume_front("0X")) {
@@ -108,13 +120,15 @@ inline std::optional<uint64_t> parsePlanId(llvm::StringRef text) {
   if (body.empty())
     return std::nullopt;
 
-  // Hex-letter detection is what separates the two ambiguous spellings: a
-  // digit-only run is decimal, a run with a hex letter is hex.
+  // The report always prints 16 hex digits; at that exact width hex wins, so an
+  // id like 0x1234567890123456 (all-decimal digits) round-trips. Off that
+  // width, a hex letter is what separates the two ambiguous spellings.
   bool allHexDigits =
       llvm::all_of(body, [](char c) { return llvm::isHexDigit(c); });
+  bool reportWidth = body.size() == 16;
   bool hasHexLetter = llvm::any_of(
       body, [](char c) { return llvm::isHexDigit(c) && !llvm::isDigit(c); });
-  if (allHexDigits && hasHexLetter) {
+  if (allHexDigits && (reportWidth || hasHexLetter)) {
     uint64_t hex = 0;
     if (body.getAsInteger(16, hex))
       return std::nullopt;

@@ -55,7 +55,9 @@ struct MicroBindPlanPass
 
   StringRef getDescription() const override {
     return "Bind the covering plan with the requested stable id onto a "
-           "micro.kernel, e.g. --micro-bind-plan=\"plan-id=12345 "
+           "micro.kernel. The id is the spelling --micro-map report= prints "
+           "(bare 16-digit hex), or 0x-prefixed hex, or decimal, e.g. "
+           "--micro-bind-plan=\"plan-id=0081ef1286442d39 "
            "target=x86-avx2 machine=machines/x86-avx2-v2.yaml "
            "layouts=mapping/x86-avx2/layouts.llkmap "
            "rules=mapping/x86-avx2/rules.llkmap "
