@@ -949,3 +949,192 @@ TEST(PlanBinder, EmitsOneCopyPerRouteHop) {
   EXPECT_FALSE(
       static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
 }
+
+//===----------------------------------------------------------------------===//
+// Full rule-legality verification (A3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A machine with two `worker` executors, only one of which carries a
+/// `vector_engine`. A rule that requires the capability is therefore legal on
+/// exactly one of them, so verification can be pointed at a worker that has the
+/// right *kind* but not the *capability*.
+constexpr llvm::StringLiteral kComputeMachine = R"yaml(
+schema: llk.machine.v2
+target: compute
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.c
+    kind: cluster
+  - id: worker.vec
+    kind: worker
+    parent: cluster.c
+  - id: worker.plain
+    kind: worker
+    parent: cluster.c
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.c
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.vec
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+)yaml";
+
+/// One rule whose executor requirement both workers satisfy but whose compute
+/// requirement only one does.
+constexpr llvm::StringLiteral kComputeRules = R"llkmap(
+rule c.vector {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  bundle "c.vector";
+  emit "e1";
+}
+)llkmap";
+
+/// A kernel whose only workload node is the vector add.
+constexpr llvm::StringLiteral kVectorOnlyKernel = R"mlir(
+module {
+  micro.kernel @vector {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+}
+)mlir";
+
+llvm::Expected<std::unique_ptr<MappingTarget>> computeTarget() {
+  llvm::Expected<mlir::llk::machine::MachineModel> machine =
+      mlir::llk::machine::parseMachineModel(kComputeMachine, "<test>");
+  if (!machine)
+    return machine.takeError();
+  llvm::Expected<LayoutRegistry> layouts = parseLayoutText("", "<test>");
+  if (!layouts)
+    return layouts.takeError();
+  llvm::Expected<RuleRegistry> rules = parseRuleText(kComputeRules, "<test>");
+  if (!rules)
+    return rules.takeError();
+  return std::make_unique<FileMappingTarget>(
+      "compute", std::move(*machine), std::move(*layouts), std::move(*rules),
+      std::vector<std::string>{"e1"});
+}
+
+/// Rewrites every recorded executor in `module` to `executor`.
+void rewriteRecordedExecutor(ModuleOp module, MLIRContext &context,
+                             llvm::StringRef executor) {
+  module->walk([&](Operation *op) {
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping)
+      return;
+    llvm::SmallVector<NamedAttribute> attributes(mapping.begin(),
+                                                 mapping.end());
+    for (NamedAttribute &attribute : attributes)
+      if (attribute.getName() == "executor")
+        attribute = NamedAttribute(attribute.getName(),
+                                   StringAttr::get(&context, executor));
+    op->setAttr("micro.mapping", DictionaryAttr::get(&context, attributes));
+  });
+}
+
+} // namespace
+
+// The unmodified mapped fixture is the legal control for every rejection
+// below: shared verification must not turn a valid selection into a failure.
+TEST(PlanBinder, MappedFixtureVerifiesWithFullRuleLegality) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  llvm::Expected<BoundPlan> bound =
+      bindPlan(*fixture.module, *plan, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  EXPECT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, *fixture.target)));
+}
+
+// A recorded rule whose predicate no longer holds for the operation it labels
+// is not a mapping: verification must re-evaluate the rule's predicates, not
+// only confirm that its mnemonic matches. `micro.vector "mul"` labelled with
+// the add rule is the canonical case.
+TEST(PlanBinder, RejectsASelectedRuleWhosePredicateNoLongerMatches) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  llvm::Expected<CoveringPlan> p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  llvm::Expected<BoundPlan> b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.vector")
+      op->setAttr("op", StringAttr::get(f.context.get(), "mul"));
+  });
+  llvm::Error e = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(e));
+  EXPECT_NE(llvm::toString(std::move(e)).find("no_matching_rule"),
+            std::string::npos);
+}
+
+// The recorded executor must satisfy the rule's executor *kind*, not merely
+// exist in the machine: `veng.0` is a real executor of kind `vector_engine`,
+// which no worker rule accepts.
+TEST(PlanBinder, RejectsAnExecutorOfTheWrongKind) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  ASSERT_NE(fixture.target, nullptr);
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  llvm::Expected<BoundPlan> bound =
+      bindPlan(*fixture.module, *plan, *fixture.target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  rewriteRecordedExecutor(*bound->module, *fixture.context, "veng.0");
+
+  llvm::Error e = verifyMappedMicroIR(*bound->module, *fixture.target);
+  ASSERT_TRUE(bool(e));
+  EXPECT_NE(llvm::toString(std::move(e)).find("no_legal_executor"),
+            std::string::npos);
+}
+
+// The recorded executor must actually offer the capability a rule requires:
+// `worker.plain` is a legal worker, but no `vector_engine` is attached to it.
+TEST(PlanBinder, RejectsAComputeRequirementTheExecutorCannotSupply) {
+  MLIRContext context;
+  context.getOrLoadDialect<micro::MicroDialect>();
+  context.getOrLoadDialect<tensor::TensorDialect>();
+  OwningOpRef<ModuleOp> module =
+      parseSourceString<ModuleOp>(kVectorOnlyKernel, &context);
+  ASSERT_TRUE(module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = computeTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan = selectPlan(context, *module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  llvm::Expected<BoundPlan> bound = bindPlan(*module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  // The search placed the vector on `worker.vec`, the only worker with a
+  // `vector_engine`. Naming `worker.plain` keeps the executor kind legal but
+  // drops the capability.
+  rewriteRecordedExecutor(*bound->module, context, "worker.plain");
+
+  llvm::Error e = verifyMappedMicroIR(*bound->module, **target);
+  ASSERT_TRUE(bool(e));
+  EXPECT_NE(llvm::toString(std::move(e)).find("unsupported_compute_fragment"),
+            std::string::npos);
+}

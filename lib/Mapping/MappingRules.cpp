@@ -14,6 +14,7 @@
 
 #include "LLK/Mapping/MappingRules.h"
 
+#include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/StableHash.h"
 #include "LLK/Mapping/TileFacts.h"
 #include "LLK/Mapping/WorkloadGraph.h"
@@ -1431,6 +1432,184 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
 
   candidate.id = computeCandidateId(candidate);
   return candidate;
+}
+
+//===----------------------------------------------------------------------===//
+// Re-verifying a recorded selection (design §18.3, phase 2)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Why a recorded parameter assignment is illegal, or nullopt when it is legal.
+/// Validates the assignment the plan *recorded* -- it never searches for a
+/// different one -- so an unknown name, a value outside its declared domain, a
+/// required name left out, and a constraint the recorded values do not satisfy
+/// are each reported. The fallback satisfiability test lives in the caller, so
+/// this is reached only when an assignment was actually persisted.
+std::optional<std::string>
+recordedParameterProblem(const RuleDef &rule, const WorkloadNode &node,
+                         const machine::MachineModel &machine,
+                         const llvm::StringMap<SearchValue> &recorded) {
+  for (const auto &entry : recorded) {
+    if (!rule.findParam(entry.first()))
+      return "records parameter '" + entry.first().str() +
+             "', which it does not declare";
+    auto domain = rule.domains.find(entry.first().str());
+    if (domain == rule.domains.end() ||
+        !llvm::is_contained(domain->second.values, entry.second))
+      return "records parameter '" + entry.first().str() + " = " +
+             canonicalValueString(entry.second) +
+             "', outside its declared domain";
+  }
+
+  // Every parameter a constraint derives must have been recorded: verification
+  // cannot reconstruct the value the plan actually used.
+  llvm::StringSet<> referenced;
+  llvm::StringSet<> bound; // no quantifier is in scope at the top level
+  for (const ExprPtr &constraint : rule.constraints)
+    collectIdentifiers(*constraint, referenced, bound);
+  for (const LayoutParam &param : rule.params)
+    if (referenced.contains(param.name) && !recorded.count(param.name))
+      return "does not record the derived parameter '" + param.name + "'";
+
+  llvm::StringMap<LayoutValue> bindings;
+  for (const auto &entry : recorded)
+    bindings[entry.first()] = entry.second;
+
+  LayoutContext ruleContext = ruleLayoutContext(node, LayoutContext{});
+  QuantifierBudget budget;
+  budget.limit = kMaxRuleAssignments;
+  auto resolveDomain =
+      [&rule](
+          llvm::StringRef name) -> std::optional<llvm::ArrayRef<LayoutValue>> {
+    auto it = rule.domains.find(name.str());
+    if (it == rule.domains.end())
+      return std::nullopt;
+    return llvm::ArrayRef<LayoutValue>(it->second.values);
+  };
+  EvalOptions options;
+  options.budget = &budget;
+  options.domainResolver = resolveDomain;
+
+  for (const ExprPtr &constraint : rule.constraints) {
+    llvm::Expected<EvalValue> value =
+        evaluateExpr(*constraint, bindings, machine, ruleContext, options);
+    if (!value)
+      return "does not satisfy its require constraints: " +
+             llvm::toString(value.takeError());
+    if (value->kind != EvalValue::Kind::Int || value->intValue == 0)
+      return "records a parameter assignment its require constraints reject";
+  }
+  if (budget.exhausted)
+    return "require evaluation exceeded the quantifier bound without deciding "
+           "every constraint";
+  return std::nullopt;
+}
+
+} // namespace
+
+llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
+                                const machine::MachineModel &machine,
+                                const RecordedRuleSelection &selection,
+                                llvm::StringRef where) {
+  auto reject = [&](DiagnosticCode code, std::string detail) {
+    std::string message = stringifyDiagnosticCode(code).str();
+    message += ": ";
+    if (!where.empty()) {
+      message += where.str();
+      message += ": ";
+    }
+    message += detail;
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+  };
+
+  // 1. The recorded rule must implement this operation, not merely exist.
+  if (rule.matchOp != node.opName)
+    return reject(DiagnosticCode::NoMatchingRule,
+                  "rule '" + rule.id + "' implements '" + rule.matchOp +
+                      "', not '" + node.opName + "'");
+
+  // 2. Every predicate must still hold for the operation's endpoints.
+  for (const RulePredicate &predicate : rule.predicates)
+    if (!predicateMatches(predicate, node))
+      return reject(DiagnosticCode::NoMatchingRule,
+                    "rule '" + rule.id + "' predicate '" +
+                        printPredicate(predicate) +
+                        "' does not match the operation");
+
+  // 3. The recorded parameter assignment, or -- when none was recorded --
+  // generation's existential check, so a rule that no assignment can satisfy is
+  // still rejected.
+  if (!selection.parameters.empty()) {
+    if (std::optional<std::string> problem =
+            recordedParameterProblem(rule, node, machine, selection.parameters))
+      return reject(DiagnosticCode::NoMatchingRule,
+                    "rule '" + rule.id + "' " + *problem);
+  } else if (!rule.constraints.empty()) {
+    RuleResolution resolution =
+        resolveRuleConstraints(rule, node, machine, LayoutContext{}, nullptr);
+    if (!resolution.matched)
+      return reject(DiagnosticCode::NoMatchingRule,
+                    "rule '" + rule.id + "' " +
+                        (resolution.reason.empty()
+                             ? std::string("require constraints not satisfied")
+                             : resolution.reason));
+  }
+
+  // 4. The recorded executor, and the executor *kind* each requirement names.
+  if (!selection.executor.empty() && !machine.findExecutor(selection.executor))
+    return reject(DiagnosticCode::NoLegalExecutor,
+                  "unknown executor '" + selection.executor + "'");
+  for (const KindRequirement &requirement : rule.kindRequirements)
+    if (requirement.role == "executor" &&
+        !machine.ownerMatches(requirement.kind, selection.executor))
+      return reject(DiagnosticCode::NoLegalExecutor,
+                    "executor '" + selection.executor +
+                        "' does not satisfy the rule's required kind '" +
+                        requirement.kind + "'");
+
+  // 5. Attached compute capabilities.
+  for (const KindRequirement &requirement : rule.kindRequirements) {
+    if (requirement.role != "compute")
+      continue;
+    bool attached = false;
+    for (const mlir::llk::machine::ComputeNode *compute :
+         machine.computesFor(selection.executor))
+      if (compute->kind == requirement.kind) {
+        attached = true;
+        break;
+      }
+    if (!attached)
+      return reject(DiagnosticCode::UnsupportedComputeFragment,
+                    "executor '" + selection.executor + "' has no attached '" +
+                        requirement.kind + "' compute capability");
+  }
+
+  // 6. Memory kinds and visibility.
+  for (const KindRequirement &requirement : rule.kindRequirements) {
+    if (requirement.role != "memory")
+      continue;
+    auto bound = selection.memories.find(requirement.kind);
+    if (bound == selection.memories.end())
+      return reject(DiagnosticCode::NoMemoryRoute,
+                    "rule '" + rule.id + "' requires a '" + requirement.kind +
+                        "' memory, which the mapping does not bind");
+    const mlir::llk::machine::MemoryNode *memory =
+        machine.findMemory(bound->second);
+    if (!memory)
+      return reject(DiagnosticCode::NoMemoryRoute,
+                    "unknown memory '" + bound->second + "'");
+    if (memory->kind != requirement.kind)
+      return reject(DiagnosticCode::NoMemoryRoute,
+                    "memory '" + bound->second + "' has kind '" + memory->kind +
+                        "', not the required '" + requirement.kind + "'");
+    if (!machine.isVisible(bound->second, selection.executor))
+      return reject(DiagnosticCode::NoMemoryRoute,
+                    "executor '" + selection.executor +
+                        "' cannot see memory '" + bound->second + "'");
+  }
+
+  return llvm::Error::success();
 }
 
 } // namespace mlir::llk::mapping

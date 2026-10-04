@@ -1816,3 +1816,228 @@ rule r.two_ports {
   // somewhere, so it matches.
   EXPECT_TRUE(matches({{"", "t.blocked"}}));
 }
+
+//===----------------------------------------------------------------------===//
+// Full rule-legality verification (A3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A machine offering one `worker` executor with a `vector_engine` attached
+/// (f32 lanes), a second worker with no capability, and a `lane` executor.
+/// Enough for verification's executor-kind, compute and parameter checks.
+MachineModel verificationMachine() {
+  MachineModel model;
+  model.target = "verify";
+  mlir::llk::machine::ExecutorNode worker;
+  worker.id = "worker.0";
+  worker.kind = "worker";
+  mlir::llk::machine::ExecutorNode bare;
+  bare.id = "worker.bare";
+  bare.kind = "worker";
+  mlir::llk::machine::ExecutorNode lane;
+  lane.id = "lane.0";
+  lane.kind = "lane";
+  model.executors = {worker, bare, lane};
+  mlir::llk::machine::ComputeNode vector;
+  vector.id = "vec.0";
+  vector.kind = "vector_engine";
+  vector.attachedTo = "worker.0";
+  vector.lanes = {{"f32", 8}};
+  model.computes = {vector};
+  return model;
+}
+
+/// A rule exercising every check: an element-type predicate, two
+/// machine-derived parameters, an executor kind, and a compute capability.
+constexpr llvm::StringLiteral kVerificationRule = R"llkmap(
+rule r.verify {
+  match micro.vector(op = "add", input[0].element_type = f32);
+  param VW in [4..8];
+  param U in [1..1];
+  require VW == machine.compute("vector_engine").lanes(element_type);
+  require U == 1;
+  require executor kind worker;
+  require compute kind vector_engine;
+  input "operand0";
+  output "result";
+  bundle "b";
+  emit "e";
+}
+)llkmap";
+
+const RuleDef *verificationRule() {
+  static llvm::Expected<RuleRegistry> registry = parse(kVerificationRule);
+  if (!registry)
+    return nullptr;
+  return registry->find("r.verify");
+}
+
+RecordedRuleSelection recordedOn(llvm::StringRef executor) {
+  RecordedRuleSelection recorded;
+  recorded.executor = executor.str();
+  return recorded;
+}
+
+/// A `micro.vector "add"` node carrying the `op` attribute the rule's predicate
+/// reads, and typed ports the element-type predicate and constraints read.
+WorkloadNode typedAddNode(mlir::MLIRContext &context, mlir::Type inputType,
+                          mlir::Type outputType) {
+  WorkloadNode node = typedVectorNode(inputType, outputType);
+  node.attributes = vectorAttributes(context, "add");
+  return node;
+}
+
+std::string verifyText(const RuleDef &rule, const WorkloadNode &node,
+                       const MachineModel &machine,
+                       const RecordedRuleSelection &recorded) {
+  return llvm::toString(
+      verifyRuleSelection(rule, node, machine, recorded, "op"));
+}
+
+} // namespace
+
+TEST(RuleVerify, AcceptsALegalRecordedSelection) {
+  const RuleDef *rule = verificationRule();
+  ASSERT_NE(rule, nullptr);
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  RecordedRuleSelection recorded;
+  recorded.executor = "worker.0";
+  recorded.parameters["VW"] = int64_t(8);
+  recorded.parameters["U"] = int64_t(1);
+  std::string error = verifyText(*rule, typedAddNode(context, f32, f32),
+                                 verificationMachine(), recorded);
+  EXPECT_TRUE(error.empty()) << error;
+}
+
+TEST(RuleVerify, RejectsADifferentElementType) {
+  const RuleDef *rule = verificationRule();
+  ASSERT_NE(rule, nullptr);
+  mlir::MLIRContext context;
+  mlir::Type bf16 = mlir::BFloat16Type::get(&context);
+  std::string error = verifyText(*rule, typedAddNode(context, bf16, bf16),
+                                 verificationMachine(), recordedOn("worker.0"));
+  EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+}
+
+TEST(RuleVerify, RejectsADifferentAccessMap) {
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule r.map {
+  match micro.vector(input[0].access_map = (d0, d1) -> (d0, d1));
+  bundle "b";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const RuleDef *mapRule = registry->find("r.map");
+  ASSERT_NE(mapRule, nullptr);
+
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  MachineModel empty;
+
+  // The node's first operand is addressed by the identity map, which is what
+  // the rule declares: a legal selection.
+  WorkloadNode identity = typedVectorNode(f32, f32);
+  identity.inputs[0].accessMap = mlir::AffineMap::getPermutationMap(
+      llvm::ArrayRef<unsigned>{0, 1}, &context);
+  EXPECT_TRUE(verifyText(*mapRule, identity, empty, recordedOn("")).empty());
+
+  // The same node with a transposed map no longer satisfies the rule.
+  WorkloadNode transposed = typedVectorNode(f32, f32);
+  transposed.inputs[0].accessMap = mlir::AffineMap::getPermutationMap(
+      llvm::ArrayRef<unsigned>{1, 0}, &context);
+  std::string error = verifyText(*mapRule, transposed, empty, recordedOn(""));
+  EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+}
+
+TEST(RuleVerify, RejectsAnExecutorOfTheWrongKind) {
+  const RuleDef *rule = verificationRule();
+  ASSERT_NE(rule, nullptr);
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  std::string error = verifyText(*rule, typedAddNode(context, f32, f32),
+                                 verificationMachine(), recordedOn("lane.0"));
+  EXPECT_NE(error.find("no_legal_executor"), std::string::npos) << error;
+}
+
+TEST(RuleVerify, RejectsAComputeCapabilityTheExecutorDoesNotOffer) {
+  const RuleDef *rule = verificationRule();
+  ASSERT_NE(rule, nullptr);
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  std::string error =
+      verifyText(*rule, typedAddNode(context, f32, f32), verificationMachine(),
+                 recordedOn("worker.bare"));
+  EXPECT_NE(error.find("unsupported_compute_fragment"), std::string::npos)
+      << error;
+}
+
+TEST(RuleVerify, RejectsARecordedParameterOutsideItsDomain) {
+  const RuleDef *rule = verificationRule();
+  ASSERT_NE(rule, nullptr);
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  RecordedRuleSelection recorded = recordedOn("worker.0");
+  recorded.parameters["VW"] = int64_t(3); // outside [4..8]
+  recorded.parameters["U"] = int64_t(1);
+  std::string error = verifyText(*rule, typedVectorNode(f32, f32),
+                                 verificationMachine(), recorded);
+  EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+}
+
+TEST(RuleVerify, RejectsARecordedValueTheConstraintsDoNotAccept) {
+  const RuleDef *rule = verificationRule();
+  ASSERT_NE(rule, nullptr);
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  RecordedRuleSelection recorded = recordedOn("worker.0");
+  recorded.parameters["VW"] = int64_t(6); // machine models 8 lanes
+  recorded.parameters["U"] = int64_t(1);
+  std::string error = verifyText(*rule, typedVectorNode(f32, f32),
+                                 verificationMachine(), recorded);
+  EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+}
+
+TEST(RuleVerify, RejectsAnUnknownRecordedParameter) {
+  const RuleDef *rule = verificationRule();
+  ASSERT_NE(rule, nullptr);
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  RecordedRuleSelection recorded = recordedOn("worker.0");
+  recorded.parameters["VW"] = int64_t(8);
+  recorded.parameters["U"] = int64_t(1);
+  recorded.parameters["XX"] = int64_t(2);
+  std::string error = verifyText(*rule, typedVectorNode(f32, f32),
+                                 verificationMachine(), recorded);
+  EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+}
+
+TEST(RuleVerify, RejectsAMissingDerivedParameter) {
+  const RuleDef *rule = verificationRule();
+  ASSERT_NE(rule, nullptr);
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  RecordedRuleSelection recorded = recordedOn("worker.0");
+  recorded.parameters["U"] = int64_t(1); // VW omitted
+  std::string error = verifyText(*rule, typedVectorNode(f32, f32),
+                                 verificationMachine(), recorded);
+  EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+}
+
+TEST(RuleVerify, RejectsWhenNoAssignmentSatisfiesTheRule) {
+  const RuleDef *rule = verificationRule();
+  ASSERT_NE(rule, nullptr);
+  mlir::MLIRContext context;
+  mlir::Type f32 = mlir::Float32Type::get(&context);
+  // No parameter assignment was recorded, so verification falls back to
+  // generation's satisfiability test -- which must still reject a machine whose
+  // lane count no value in [4..8] can equal.
+  MachineModel model = verificationMachine();
+  model.computes[0].lanes = {{"f32", 16}};
+  std::string error = verifyText(*rule, typedAddNode(context, f32, f32), model,
+                                 recordedOn("worker.0"));
+  EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
+}

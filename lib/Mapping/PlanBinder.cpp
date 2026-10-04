@@ -15,6 +15,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -96,6 +97,40 @@ llvm::Error verifyError(DiagnosticCode code, const std::string &message) {
 mlir::IntegerAttr u64Attr(mlir::MLIRContext *context, uint64_t value) {
   return mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
                                 static_cast<int64_t>(value));
+}
+
+/// A workload node rebuilt with the binder's own bookkeeping attributes
+/// removed, so a rule predicate reads the operation's declared attributes
+/// (`op = "add"`) rather than the metadata the binder stamped onto it.
+WorkloadNode strippedWorkloadNode(const WorkloadNode &node) {
+  if (!node.attributes)
+    return node;
+  llvm::SmallVector<mlir::NamedAttribute> kept;
+  bool stripped = false;
+  for (mlir::NamedAttribute attribute : node.attributes) {
+    llvm::StringRef name = attribute.getName().getValue();
+    if (name == kMappingAttr || name == "micro.value" ||
+        name == "micro.dst_node") {
+      stripped = true;
+      continue;
+    }
+    kept.push_back(attribute);
+  }
+  if (!stripped)
+    return node;
+  WorkloadNode copy = node;
+  copy.attributes =
+      mlir::DictionaryAttr::get(node.attributes.getContext(), kept);
+  return copy;
+}
+
+/// The `micro.kernel` an operation sits in, or null when it is outside one.
+mlir::Operation *enclosingKernel(mlir::Operation *op) {
+  for (mlir::Operation *parent = op->getParentOp(); parent;
+       parent = parent->getParentOp())
+    if (parent->getName().getStringRef() == "micro.kernel")
+      return parent;
+  return nullptr;
 }
 
 /// A `micro.kernel`'s symbol name for diagnostics, or a placeholder when it has
@@ -785,6 +820,39 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     return failure;
 
   // --- 2b. per-operation metadata ----------------------------------------
+  //
+  // Rule selection is re-checked against the *original* workload endpoints:
+  // each kernel's graph is re-extracted once and a recorded operation's node
+  // looked up by its own operation, so a predicate reads the boundary ports
+  // generation classified rather than the metadata the binder stamped.
+  struct KernelWorkload {
+    WorkloadGraph graph;
+    llvm::DenseMap<mlir::Operation *, const WorkloadNode *> byOp;
+  };
+  llvm::DenseMap<mlir::Operation *, std::unique_ptr<KernelWorkload>> workloads;
+  auto workloadNodeFor = [&](mlir::Operation *op) -> const WorkloadNode * {
+    mlir::Operation *kernel = enclosingKernel(op);
+    if (!kernel)
+      return nullptr;
+    auto entry = workloads.find(kernel);
+    if (entry == workloads.end()) {
+      WorkloadGraphBinding binding;
+      llvm::Expected<WorkloadGraph> graph =
+          extractWorkloadGraph(kernel, &binding);
+      auto fresh = std::make_unique<KernelWorkload>();
+      if (graph) {
+        fresh->graph = std::move(*graph);
+        for (const auto &pair : binding.nodeOps)
+          fresh->byOp[pair.second] = fresh->graph.findNode(pair.first);
+      } else {
+        llvm::consumeError(graph.takeError());
+      }
+      entry = workloads.insert({kernel, std::move(fresh)}).first;
+    }
+    auto found = entry->second->byOp.find(op);
+    return found == entry->second->byOp.end() ? nullptr : found->second;
+  };
+
   module->walk([&](mlir::Operation *op) {
     if (failure)
       return;
@@ -864,6 +932,28 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
              where + ": rule '" + *ruleId + "' requires a '" +
                  requirement.kind +
                  "' memory, which the mapping does not bind");
+        return;
+      }
+    }
+
+    // The recorded rule must still be fully legal for this operation under
+    // generation's own predicates, constraints and machine capabilities: a
+    // matching mnemonic and existing ids are not enough. The node is the
+    // original workload endpoint, with the binder's bookkeeping attributes
+    // removed, so a predicate reads the operation rather than the metadata.
+    if (const WorkloadNode *node = workloadNodeFor(op)) {
+      WorkloadNode endpoint = strippedWorkloadNode(*node);
+      RecordedRuleSelection selection;
+      selection.executor = *executor;
+      for (const auto &entry : memories)
+        selection.memories[entry.first()] = entry.second;
+      // Resolved rule parameters are not persisted on this schema yet, so the
+      // selection carries none and verification falls back to the same
+      // existential requirement check generation applied. Schema v2 records
+      // them and this call validates the recorded assignment exactly.
+      if (llvm::Error error =
+              verifyRuleSelection(*rule, endpoint, machine, selection, where)) {
+        failure = std::move(error);
         return;
       }
     }

@@ -184,6 +184,45 @@ bool predicateMatches(const RulePredicate &predicate, const WorkloadNode &node);
 std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
                                         const RuleRegistry &rules);
 
+//===----------------------------------------------------------------------===//
+// Re-verifying a recorded selection (design §18.3, phase 2)
+//===----------------------------------------------------------------------===//
+
+/// The resource bindings a mapped operation records for its selected rule: the
+/// executor its work is placed on, the memory id bound per rule memory-kind
+/// requirement, and -- from schema v2 onward -- the resolved values of the
+/// rule's declared parameters. Verification re-checks these against the machine
+/// and the operation; it never chooses a different legal binding.
+struct RecordedRuleSelection {
+  std::string executor;
+  /// Memory id per required memory kind, keyed exactly as generation binds it
+  /// (`instance.memoryBindings[requirement.kind]`).
+  llvm::StringMap<std::string> memories;
+  /// The resolved parameter assignment, when the binding records one. Empty for
+  /// a binding that predates parameter persistence: verification then falls
+  /// back to generation's existential requirement check (some assignment
+  /// satisfies every constraint), because the plan did not state *which* one.
+  llvm::StringMap<SearchValue> parameters;
+};
+
+/// Re-validates that `rule` still legally implements `node` under the recorded
+/// `selection`, using exactly the semantics generation applied: the same match
+/// operation and predicate evaluation (`predicateMatches`), the same parameter
+/// domains and `require` expressions, and the same machine-capability tests
+/// placement runs (executor kind, attached compute kind, memory kind and
+/// visibility). A recorded parameter assignment is validated as-is -- unknown
+/// names, values outside their declared domain, omitted required names, and
+/// constraints the recorded values do not satisfy are all violations -- so
+/// verification never substitutes a different legal assignment for the recorded
+/// one. `where` is prepended to the message for context.
+///
+/// Returns a stable, diagnostic-coded error naming the first violation, or
+/// success.
+llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
+                                const machine::MachineModel &machine,
+                                const RecordedRuleSelection &selection,
+                                llvm::StringRef where);
+
 /// Bridges a matched rule onto the workload node it covers: the result is the
 /// unplaced `MappingCandidate` the placement engine consumes. Rule ports are
 /// wired positionally to the node's inputs and then its outputs.
