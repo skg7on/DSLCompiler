@@ -2245,6 +2245,94 @@ TEST(CoveringSearch, GatherSumsTheProducerFeeds) {
                    3.0 + 2.0 * kFanTransferCycles);
 }
 
+// Exact mode does not branch over a gather feed's legal alternatives; it keeps
+// only the locally cheapest per producer. That is a choice collapse, not a cap,
+// so it must disclose itself -- `connectionChoicesUnexplored` set and the
+// stable notice filed -- while every cap remains lifted (`searchTruncated`
+// clear). Before the fix the gather path reported neither.
+TEST(CoveringSearch, GatherExactChoicesAreDisclosed) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanInGraph(context);
+  MachineModel machine = fanMachine();
+  // A second parallel dram.0 -> acc.0 route. The original (latency 10) stays
+  // cheaper than the copy (latency 20), so each feed has two legal alternatives
+  // and exact mode keeps one without branching over them.
+  LinkEdge second = machine.links.front();
+  second.id = "second_route";
+  second.latencyCycles = 20;
+  machine.links.push_back(second);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_TRUE(result->connectionChoicesUnexplored);
+  EXPECT_FALSE(result->searchTruncated);
+  EXPECT_TRUE(
+      hasDiagnostic(*result, DiagnosticCode::ConnectionChoiceUnexplored));
+  EXPECT_FALSE(hasDiagnostic(*result, DiagnosticCode::SearchTruncated));
+  // The disclosure is a single stable notice, however many feeds collapsed it:
+  // `report` deduplicates on (code, message), so the distinct-notice list does
+  // not grow per producer or per branch.
+  size_t notices = 0;
+  for (const Diagnostic &diagnostic : result->frontier.diagnostics)
+    if (diagnostic.code == DiagnosticCode::ConnectionChoiceUnexplored)
+      ++notices;
+  EXPECT_EQ(notices, 1u);
+}
+
+// Control: a gather whose every feed has exactly one legal route collapses no
+// choice, so it must not claim an unexplored one. `fanMachine` offers a single
+// dram.0 -> acc.0 link.
+TEST(CoveringSearch, SingleRouteGatherReportsNoUnexploredChoices) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanInGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_FALSE(result->connectionChoicesUnexplored);
+  EXPECT_FALSE(result->searchTruncated);
+}
+
+// Control: a route cap is a cap, not a choice collapse. Capping the feed's
+// routes to one reports truncation through the ordinary path, so the two
+// disclosures stay independent.
+TEST(CoveringSearch, GatherRouteCapReportsTruncation) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanInGraph(context);
+  MachineModel machine = fanMachine();
+  LinkEdge second = machine.links.front();
+  second.id = "second_route";
+  second.latencyCycles = 20;
+  machine.links.push_back(second);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(std::move(machine), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.maxRoutesPerConnection = 1; // two parallel routes exceed the cap
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_TRUE(result->searchTruncated);
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::SearchTruncated));
+}
+
 // A route cap reached inside fan-out replication reaches `searchTruncated`
 // through the fan-out out-parameter.
 TEST(CoveringSearch, FanOutRouteCapSetsSearchTruncated) {

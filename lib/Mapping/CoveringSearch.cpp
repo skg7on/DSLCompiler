@@ -832,6 +832,23 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       ++result.frontier.incompatibleInstancePairs;
       report(DiagnosticCode::NoMemoryRoute, message);
     };
+    // The single place an exact-mode *choice collapse* is disclosed: when a
+    // local decision has several legal alternatives, the search keeps only the
+    // locally cheapest instead of branching over them. That is a restriction,
+    // not a cap -- two individually cheapest routes can jointly exceed a shared
+    // intermediate's capacity while more expensive direct routes would fit, so
+    // a covering can be missed with no `searchTruncated` to explain it. Every
+    // such collapse (plain edge, fan-out destination group, gather feed) routes
+    // through here, so the flag and the stable §22.3 notice are decided in one
+    // place, and a site that collapsed nothing cannot set either. `report`
+    // deduplicates on (code, message), so a collapse repeated across branches
+    // is one notice.
+    auto discloseCollapsedChoice = [&](std::string detail) {
+      if (options_.mode != SearchMode::Exact)
+        return;
+      result.connectionChoicesUnexplored = true;
+      report(DiagnosticCode::ConnectionChoiceUnexplored, std::move(detail));
+    };
 
     // Connections are staged locally and committed to the pool only after the
     // capacity check, so a rejected branch leaves no partial state behind.
@@ -883,14 +900,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // while more expensive direct routes would fit, so a feasible covering
       // can be missed with no `searchTruncated` to explain it. Report it
       // explicitly rather than implying exhaustiveness.
-      if (alternatives->size() > 1 && options_.mode == SearchMode::Exact) {
-        result.connectionChoicesUnexplored = true;
-        report(DiagnosticCode::ConnectionChoiceUnexplored,
-               "connection " + request.producerMemory + " -> " +
-                   request.consumerMemory + ": chose the cheapest of " +
-                   std::to_string(alternatives->size()) +
-                   " alternatives without branching over them");
-      }
+      if (alternatives->size() > 1)
+        discloseCollapsedChoice("connection " + request.producerMemory +
+                                " -> " + request.consumerMemory +
+                                ": chose the cheapest of " +
+                                std::to_string(alternatives->size()) +
+                                " alternatives without branching over them");
       staged.push_back(*pickBest(*alternatives));
       if (!consumerPorts.empty()) {
         staged.back().consumerPorts.assign(consumerPorts.begin(),
@@ -1072,14 +1087,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                              machine, topology, placementOptions,
                              &fanOutTruncated, options_.objective,
                              &fanOutChoseAmongAlternatives);
-        if (fanOutChoseAmongAlternatives &&
-            options_.mode == SearchMode::Exact) {
-          result.connectionChoicesUnexplored = true;
-          report(DiagnosticCode::ConnectionChoiceUnexplored,
-                 "fan-out from " + consumerRequests.front().producerMemory +
-                     ": chose the cheapest alternative per destination group "
-                     "without branching over them");
-        }
+        if (fanOutChoseAmongAlternatives)
+          discloseCollapsedChoice(
+              "fan-out from " + consumerRequests.front().producerMemory +
+              ": chose the cheapest alternative per destination group "
+              "without branching over them");
         if (alternatives)
           result.routeCount += alternatives->size();
         reportTruncation(fanOutTruncated);
@@ -1170,6 +1182,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             incompatible("gather: a producer has no legal route");
             return false;
           }
+          if (alternatives->size() > 1)
+            discloseCollapsedChoice(
+                "gather into " + consumerMemory + ": chose the cheapest of " +
+                std::to_string(alternatives->size()) +
+                " producer feed alternatives without branching over them");
           const ConnectionPlan *best = pickBest(*alternatives);
           feedCost = addCost(feedCost, best->cost);
           for (const ExecutorId &engine : best->transferEngines)

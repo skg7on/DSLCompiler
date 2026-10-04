@@ -310,6 +310,50 @@ TEST(MappingPlanReportTest, AssumedValueSizeIsANoticeNotARejection) {
   EXPECT_NE(noticed.find("latency_cache_miss"), noticed.end());
 }
 
+// A collapsed connection choice is a notice, never a rejection: like a
+// truncation or an assumed size, `connection_choice_unexplored` belongs under
+// `notices` and must not inflate §22.2's rejected tally. A restricted search is
+// not a search that refused the plan, so reporting it as a rejection would make
+// a feasible-but-collapsed run look like a failure.
+TEST(MappingPlanReportTest, ConnectionChoiceUnexploredIsANoticeNotARejection) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchResult result;
+  result.connectionChoicesUnexplored = true;
+  result.frontier.codeCounts[DiagnosticCode::ConnectionChoiceUnexplored] = 1;
+  result.frontier.codeCounts[DiagnosticCode::MemoryCapacityExceeded] = 2;
+
+  MappingSearchOptions options;
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash("collapse"));
+  llvm::Expected<llvm::json::Value> json = llvm::json::parse(report);
+  ASSERT_TRUE(static_cast<bool>(json)) << llvm::toString(json.takeError());
+  const llvm::json::Object *root = json->getAsObject();
+  ASSERT_TRUE(root);
+
+  auto codesIn = [](const llvm::json::Array *array) {
+    llvm::StringSet<> codes;
+    for (const llvm::json::Value &entry : *array)
+      if (const llvm::json::Object *object = entry.getAsObject())
+        if (std::optional<llvm::StringRef> code = object->getString("code"))
+          codes.insert(*code);
+    return codes;
+  };
+  const llvm::json::Array *rejections = root->getArray("rejections");
+  const llvm::json::Array *notices = root->getArray("notices");
+  ASSERT_TRUE(rejections);
+  ASSERT_TRUE(notices);
+  llvm::StringSet<> rejected = codesIn(rejections);
+  llvm::StringSet<> noticed = codesIn(notices);
+
+  EXPECT_EQ(rejected.find("connection_choice_unexplored"), rejected.end());
+  EXPECT_NE(noticed.find("connection_choice_unexplored"), noticed.end());
+  EXPECT_NE(rejected.find("memory_capacity_exceeded"), rejected.end());
+  EXPECT_EQ(noticed.find("memory_capacity_exceeded"), noticed.end());
+}
+
 // The library hashes are content-derived and stable, and differ between the
 // two registries (a layout library is not a rule library).
 TEST(MappingPlanReportTest, RegistryHashesAreContentDerivedAndStable) {
