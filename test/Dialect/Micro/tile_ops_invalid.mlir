@@ -190,9 +190,9 @@ func.func @reduce_bad_axis(%scores : !micro.tile<32x64xf32>) {
 
 // -----
 
-// micro.transform re-represents a value: it must not change its type.
-func.func @transform_type_changed(%x : !micro.tile<32x64xf32>) {
-  // expected-error @+1 {{source and result must have the same type}}
+// micro.transform re-represents a value: it must not change its shape.
+func.func @transform_shape_changed(%x : !micro.tile<32x64xf32>) {
+  // expected-error @+1 {{source and result must have the same shape and element type}}
   %r = micro.transform %x : !micro.tile<32x64xf32> -> !micro.tile<16x64xf32>
   return
 }

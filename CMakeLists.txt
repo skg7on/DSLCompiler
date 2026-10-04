@@ -348,6 +348,19 @@ mlir_target_link_libraries(LLKToMicro PUBLIC
     MLIRArithDialect MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
+# Library: micro -> Linalg bridge. `micro` was a sink: nothing lowered it to
+# something a backend consumes, so a mapped or exported micro.kernel could not
+# reach the LLVM/JIT pipeline. This is that bridge.
+add_mlir_library(LLKMicroToLinalg
+    lib/Conversion/MicroToLinalg/MicroToLinalg.cpp
+    DEPENDS MicroDialect
+    LINK_LIBS PUBLIC MicroDialect
+)
+mlir_target_link_libraries(LLKMicroToLinalg PUBLIC
+    MLIRArithDialect MLIRFuncDialect MLIRLinalgDialect MLIRMemRefDialect
+    MLIRSCFDialect MLIRTensorDialect MLIRPass MLIRTransforms
+)
+
 # Library: JIT cache runtime + weight packing
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
@@ -630,7 +643,7 @@ endif()
 
 if(LLK_BUILD_TOOLS)
 add_llvm_executable(llk-opt tools/llk-opt/llk-opt.cpp)
-target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection LLKToMicro LLKMicroMapping TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKForallToOpenMP LLKShapeSpecialization LLKScheduleSelection LLKToMicro LLKMicroToLinalg LLKMicroMapping TritonToLLKPasses MicroDialect MLIRMlirOptMain ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
@@ -1058,6 +1071,19 @@ if(LLK_BUILD_TOOLS)
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
+  )
+
+  # MicroToLinalg: the bridge from canonical Micro-IR to the backend pipeline.
+  # A `micro.kernel` becomes a `func.func` over memrefs and Linalg, which is
+  # what lets a mapped or exported kernel reach LLVM and the JIT.
+  add_test(NAME MicroToLinalg
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --micro-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg.mlir"
+  )
+  # MicroToLinalgInvalid: an op with no lowering must fail the conversion
+  # loudly rather than being silently left in the module.
+  add_test(NAME MicroToLinalgInvalid
+      COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --micro-to-linalg
+              ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg_invalid.mlir
   )
   # math_mode=triton_fast on the SiLU path: the sigmoid's exp must take the
   # bounded-fast (math.exp2) path, like bounded_fast and unsafe_fast do.

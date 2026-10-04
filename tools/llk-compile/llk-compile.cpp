@@ -52,6 +52,7 @@
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/Transforms/SubsetOpInterfaceImpl.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -59,6 +60,7 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
+#include "mlir/Target/LLVMIR/Dialect/All.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Config/llvm-config.h"
@@ -195,6 +197,11 @@ static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
   // Stage 19: Convert Math → LLVM.
   pm.addPass(mlir::createConvertMathToLLVMPass());
 
+  // Stage 19b: Lower `ub` to LLVM. Vectorization pads out-of-bounds reads with
+  // `ub.poison`, which has no LLVM IR translation in this LLVM release, so it
+  // must be converted away before translation rather than handed to it.
+  pm.addPass(mlir::createUBToLLVMConversionPass());
+
   // Stage 20: Convert Func → LLVM.
   pm.addPass(mlir::createConvertFuncToLLVMPass());
 
@@ -295,7 +302,8 @@ int main(int argc, char **argv) {
                   mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
                   mlir::tensor::TensorDialect, mlir::scf::SCFDialect,
                   mlir::arith::ArithDialect, mlir::math::MathDialect,
-                  mlir::memref::MemRefDialect, mlir::LLVM::LLVMDialect>();
+                  mlir::memref::MemRefDialect, mlir::LLVM::LLVMDialect,
+                  mlir::ub::UBDialect>();
 
   // Register TilingInterface external models so Linalg ops can be tiled.
   mlir::linalg::registerTilingInterfaceExternalModels(registry);
@@ -318,6 +326,13 @@ int main(int argc, char **argv) {
   mlir::arith::registerValueBoundsOpInterfaceExternalModels(registry);
   mlir::linalg::registerValueBoundsOpInterfaceExternalModels(registry);
   mlir::scf::registerValueBoundsOpInterfaceExternalModels(registry);
+
+  // Register the LLVM IR translations for every dialect. The legacy LLK ->
+  // Linalg pipeline never produced e.g. `ub.poison`, so its translation was
+  // never needed; a frontier reached by lowering a `micro.kernel` --
+  // uninitialized allocations, vector ops, CF -- does, and without this the
+  // JIT step fails with "missing LLVMTranslationDialectInterface".
+  mlir::registerAllToLLVMIRTranslations(registry);
 
   mlir::MLIRContext ctx(registry);
   ctx.loadAllAvailableDialects();

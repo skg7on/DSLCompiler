@@ -501,15 +501,25 @@ LogicalResult TransformOp::verify() {
   // `!micro.tile` is a Micro type, not an MLIR `ShapedType`, so both are
   // accepted: a bound plan's transform may be emitted over either (the workload
   // graph carries tensors; a hand-written kernel uses tiles).
-  Type sourceType = getSource().getType();
-  if (!isa<ShapedType>(sourceType) && !isa<TileType>(sourceType))
+  auto shapeAndElement =
+      [](Type type) -> std::optional<std::pair<llvm::ArrayRef<int64_t>, Type>> {
+    if (auto shaped = dyn_cast<ShapedType>(type))
+      return std::make_pair(shaped.getShape(), shaped.getElementType());
+    if (auto tile = dyn_cast<TileType>(type))
+      return std::make_pair(tile.getShape(), tile.getElementType());
+    return std::nullopt;
+  };
+  auto source = shapeAndElement(getSource().getType());
+  auto result = shapeAndElement(getResult().getType());
+  if (!source || !result)
     return emitOpError("source and result must be shaped or tile types");
   // A layout transform re-represents a value; it must not change it. Shape and
   // element type stay identical, which is what lets a consumer read the result
-  // as the value it already expected.
-  if (sourceType != getResult().getType())
+  // as the value it already expected. The *layout* may differ -- that is the
+  // whole point of the op -- and so may the memory space and owner.
+  if (source->first != result->first || source->second != result->second)
     return emitOpError(
-        "source and result must have the same type: a layout "
+        "source and result must have the same shape and element type: a layout "
         "transform re-represents a value, it does not change it");
   // Both maps describe the *same* value, so their logical rank (dimension
   // count) must agree. Their physical rank (result count) may differ -- a
