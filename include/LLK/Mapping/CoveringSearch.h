@@ -146,7 +146,8 @@ public:
                  mlir::MLIRContext &context, const LayoutContext &layoutContext,
                  const MappingSearchOptions &options = {},
                  std::optional<SearchBinding> binding = std::nullopt,
-                 llvm::StringMap<std::string> boundLayouts = {});
+                 llvm::StringMap<std::string> boundLayouts = {},
+                 BoundAxes boundAxes = {});
 
   llvm::Expected<MappingSearchResult> search();
 
@@ -180,6 +181,13 @@ private:
   /// nor contradicts the bound value. Absent leaves layout selection exactly as
   /// it was before bindings.
   llvm::StringMap<std::string> boundLayouts_;
+  /// The `owner_mapping`/`memory_path` axes the binding resolves, projected by
+  /// the caller (the pass layer, which alone can see the parameter *kinds*).
+  /// Placement is otherwise binding-independent (ruling S3); these axes are the
+  /// exception because they name abstract capability choices, not concrete
+  /// machine resources. Empty leaves every axis exactly as the rules declare
+  /// it.
+  BoundAxes boundAxes_;
 };
 
 } // namespace mlir::llk::mapping

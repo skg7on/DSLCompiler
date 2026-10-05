@@ -180,6 +180,30 @@ LayoutContext layoutContextForRule(const RuleDef &rule,
   return context;
 }
 
+/// The occurrence a rule port resolves to on `node`, mirroring the positional
+/// wiring generation uses (inputs then outputs, in declaration order).
+std::optional<PortRef> portRefForRulePort(const RuleDef &rule,
+                                          const WorkloadNode &node,
+                                          const RulePort &subject) {
+  size_t inputIndex = 0;
+  size_t outputIndex = 0;
+  for (const RulePort &port : rule.ports) {
+    size_t &index = port.isInput ? inputIndex : outputIndex;
+    if (port.name == subject.name && port.isInput == subject.isInput) {
+      llvm::ArrayRef<WorkloadPort> ports =
+          port.isInput ? node.inputs : node.outputs;
+      if (index < ports.size())
+        return PortRef{node.id,
+                       port.isInput ? PortDirection::Input
+                                    : PortDirection::Output,
+                       static_cast<uint32_t>(index)};
+      return std::nullopt;
+    }
+    ++index;
+  }
+  return std::nullopt;
+}
+
 /// Reads a required integer bookkeeping attribute from a materialized movement
 /// with a checked cast.
 llvm::Expected<uint64_t> movementUintAttr(mlir::Operation *op,
@@ -713,11 +737,113 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         }
       }
     }
+    // Named-port memory associations (task B2). Each recorded occurrence must
+    // resolve in the source graph and name a memory the executor can see; the
+    // association, not the kind-keyed map, is what a named requirement is
+    // re-checked against.
+    std::vector<PortMemoryBinding> portMemories;
+    if (mlir::Attribute rawPortMemories = mapping.get("port_memories")) {
+      auto array = mlir::dyn_cast<mlir::ArrayAttr>(rawPortMemories);
+      if (!array) {
+        failMetadata(bindError(where + ": 'port_memories' is not an array"));
+        return;
+      }
+      for (mlir::Attribute element : array) {
+        auto entry = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+        if (!entry) {
+          failMetadata(
+              bindError(where + ": 'port_memories' entry is not a dictionary"));
+          return;
+        }
+        llvm::Expected<PortRef> ref =
+            readMetadataPortRef(entry.get("port"), "port", where);
+        if (!ref) {
+          failMetadata(ref.takeError());
+          return;
+        }
+        // The recorded occurrence names *this* op's source node (the id in the
+        // mapping's `node`), and must resolve in the source graph -- the same
+        // two checks a recorded layout endpoint gets. The materialized graph's
+        // ids shift once the binder inserts movement ops, so the association is
+        // re-keyed to the mapped node's materialized id for the replay check.
+        auto recordedNode = mapping.getAs<mlir::IntegerAttr>("node");
+        if (!recordedNode || ref->node != recordedNode.getInt()) {
+          fail(DiagnosticCode::NoMemoryRoute,
+               where + ": port_memories port does not name this operation's "
+                       "node");
+          return;
+        }
+        llvm::ArrayRef<WorkloadPort> ports =
+            ref->direction == PortDirection::Input ? lookup.node->inputs
+                                                   : lookup.node->outputs;
+        if (ref->index >= ports.size()) {
+          fail(DiagnosticCode::NoMemoryRoute,
+               where + ": port_memories port does not resolve on the mapped "
+                       "operation");
+          return;
+        }
+        llvm::Expected<SourceGraphView> sourceView =
+            buildSourceGraphView(enclosingKernel(op));
+        if (!sourceView) {
+          failMetadata(sourceView.takeError());
+          return;
+        }
+        if (!lookupPort(sourceView->graph, *ref)) {
+          fail(DiagnosticCode::NoMemoryRoute,
+               where + ": port_memories port does not resolve in the source "
+                       "graph");
+          return;
+        }
+        llvm::Expected<std::string> memory =
+            readMetadataString(entry, "memory", where);
+        if (!memory) {
+          failMetadata(memory.takeError());
+          return;
+        }
+        if (!machine.findMemory(*memory)) {
+          fail(DiagnosticCode::NoMemoryRoute,
+               where + ": unknown memory '" + *memory + "'");
+          return;
+        }
+        if (!machine.isVisible(*memory, *executor)) {
+          fail(DiagnosticCode::NoMemoryRoute,
+               where + ": executor '" + *executor + "' cannot see memory '" +
+                   *memory + "'");
+          return;
+        }
+        portMemories.push_back(PortMemoryBinding{
+            PortRef{lookup.node->id, ref->direction, ref->index}, *memory});
+      }
+    }
     for (const KindRequirement &requirement : rule->kindRequirements) {
       if (requirement.role != "memory")
         continue;
-      if (!memories.count(requirement.kind)) {
-        fail(DiagnosticCode::NoLegalExecutor,
+      if (requirement.port) {
+        std::optional<PortRef> ref =
+            portRefForRulePort(*rule, *lookup.node, *requirement.port);
+        if (!ref) {
+          fail(DiagnosticCode::NoMemoryRoute,
+               where + ": rule '" + *ruleId + "' requires a '" +
+                   requirement.kind + "' memory on port '" +
+                   requirement.port->name +
+                   "', which the operation does not expose");
+          return;
+        }
+        bool bound = false;
+        for (const PortMemoryBinding &entry : portMemories)
+          bound |= entry.port == *ref;
+        if (!bound) {
+          // Memory-specific code: this is a missing memory association, not an
+          // executor problem.
+          fail(DiagnosticCode::NoMemoryRoute,
+               where + ": rule '" + *ruleId + "' requires a '" +
+                   requirement.kind + "' memory on port '" +
+                   requirement.port->name +
+                   "', which the mapping does not bind");
+          return;
+        }
+      } else if (!memories.count(requirement.kind)) {
+        fail(DiagnosticCode::NoMemoryRoute,
              where + ": rule '" + *ruleId + "' requires a '" +
                  requirement.kind +
                  "' memory, which the mapping does not bind");
@@ -730,6 +856,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     selection.executor = *executor;
     for (const auto &entry : memories)
       selection.memories[entry.first()] = entry.second;
+    selection.portMemories = std::move(portMemories);
     // The resolved rule parameters (task B1, Critical 1). A v2 binding must
     // record the container; when it does, verification validates *that*
     // assignment via `verifyRuleSelection`'s recorded-assignment branch instead

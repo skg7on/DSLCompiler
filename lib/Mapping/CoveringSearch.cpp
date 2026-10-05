@@ -401,16 +401,15 @@ bool FailureFrontier::has(DiagnosticCode code) const {
   return false;
 }
 
-CoveringSearch::CoveringSearch(const WorkloadGraph &workload,
-                               const MappingTarget &target,
-                               mlir::MLIRContext &context,
-                               const LayoutContext &layoutContext,
-                               const MappingSearchOptions &options,
-                               std::optional<SearchBinding> binding,
-                               llvm::StringMap<std::string> boundLayouts)
+CoveringSearch::CoveringSearch(
+    const WorkloadGraph &workload, const MappingTarget &target,
+    mlir::MLIRContext &context, const LayoutContext &layoutContext,
+    const MappingSearchOptions &options, std::optional<SearchBinding> binding,
+    llvm::StringMap<std::string> boundLayouts, BoundAxes boundAxes)
     : workload_(workload), target_(target), context_(context),
       layoutContext_(layoutContext), options_(options),
-      binding_(std::move(binding)), boundLayouts_(std::move(boundLayouts)) {}
+      binding_(std::move(binding)), boundLayouts_(std::move(boundLayouts)),
+      boundAxes_(std::move(boundAxes)) {}
 
 llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   const MachineModel &machine = target_.machine();
@@ -519,12 +518,16 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // selection unchanged.
     const llvm::StringMap<std::string> *boundLayouts =
         boundLayouts_.empty() ? nullptr : &boundLayouts_;
+    // The owner_mapping/memory_path axes, resolved by parameter *kind* by the
+    // caller, so a space that names the parameter differently is still
+    // honoured.
+    const BoundAxes *boundAxes = boundAxes_.empty() ? nullptr : &boundAxes_;
     for (const RuleDef *rule : matches) {
       std::string reason;
       bool truncated = false;
       std::optional<MappingCandidate> candidate =
           toMappingCandidate(*rule, *node, machine, layoutContext_, &reason,
-                             &truncated, pinned, boundLayouts);
+                             &truncated, pinned, boundLayouts, boundAxes);
       if (!candidate) {
         if (truncated) {
           result.searchTruncated = true;
@@ -776,9 +779,43 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           partial.liveValueCharges[workload.outputs[index].value].push_back(
               {*memory, bytes});
         }
+      } else {
+        // Every named requirement governs an *input* operand, so no output is
+        // associated. The node still materializes its outputs, so they are
+        // charged with the conservative bare policy over the distinct bound
+        // memories -- never silently zero. (An input's own bytes are produced
+        // elsewhere; an output's are written here.)
+        std::vector<MemoryNodeId> memories;
+        for (const PortMemoryBinding &binding : instance.portMemoryBindings)
+          if (!llvm::is_contained(memories, binding.memory))
+            memories.push_back(binding.memory);
+        if (memories.size() == 1) {
+          for (const WorkloadPort &output : workload.outputs) {
+            const uint64_t bytes = factsForValue(output.value).bytes;
+            partial.memoryBytes[memories.front()] += bytes;
+            partial.liveValueCharges[output.value].push_back(
+                {memories.front(), bytes});
+          }
+        } else if (workload.outputs.size() > 1) {
+          // Several outputs and several distinct input memories: no output to
+          // memory pairing can be proven, so reject rather than under-charge.
+          report(DiagnosticCode::MemoryCapacityExceeded,
+                 "node " + std::to_string(workload.id) + ": " +
+                     std::to_string(workload.outputs.size()) +
+                     " outputs with " + std::to_string(memories.size()) +
+                     " named input memories have no output-to-memory "
+                     "association; placement is ambiguous and cannot be proven "
+                     "within capacity");
+          return false;
+        } else {
+          const WorkloadValueId first = workload.outputs.front().value;
+          const uint64_t bytes = factsForValue(first).bytes;
+          for (const MemoryNodeId &memory : memories) {
+            partial.memoryBytes[memory] += bytes;
+            partial.liveValueCharges[first].push_back({memory, bytes});
+          }
+        }
       }
-      // A rule that associates only input operands charges no output here: the
-      // value is materialized by whoever produces it.
     } else if (!instance.memoryBindings.empty()) {
       if (workload.outputs.empty()) {
         // No output to attribute: charge the first-input fallback for the whole

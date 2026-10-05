@@ -481,9 +481,24 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     }
   }
 
+  // §B2: the space's `owner_mapping`/`memory_path` parameters are resolved by
+  // declared *kind* -- the same rule that finds the layout kinds above -- and
+  // handed to the search as explicit axes, so a space that named its parameter
+  // differently is honoured rather than silently ignored. A binding-free search
+  // resolves nothing and stays byte-identical.
+  mapping::BoundAxes boundAxes;
+  if (binding) {
+    llvm::Expected<mapping::BoundAxes> loadedAxes =
+        mapping::loadBoundAxes(module, *binding);
+    if (!loadedAxes)
+      return loadedAxes.takeError();
+    boundAxes = std::move(*loadedAxes);
+  }
+
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),
                                  deriveLayoutContext(*graph), searchOptions,
-                                 std::move(binding), std::move(boundLayouts));
+                                 std::move(binding), std::move(boundLayouts),
+                                 std::move(boundAxes));
   llvm::Expected<mapping::MappingSearchResult> result = search.search();
   if (!result)
     return result.takeError();

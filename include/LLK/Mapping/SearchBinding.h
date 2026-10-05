@@ -55,6 +55,22 @@ uint64_t computeSearchBindingHash(const llvm::StringMap<SearchValue> &values);
 SearchBinding makeSearchBinding(std::string candidateId,
                                 llvm::StringMap<SearchValue> values);
 
+/// The symbolic search-space axes a binding resolves to target-neutral values,
+/// projected by the caller that can see the parameter *kinds*. This value type
+/// is IR- and perf-free, so the loader (which alone reads `micro.search_space`)
+/// is what resolves it (`loadBoundAxes`); the mapping engine consumes the
+/// result as explicit requirements instead of guessing a parameter name. A
+/// space that names its parameter anything (`owner` as well as `owner_mapping`)
+/// is therefore still honoured. An empty field leaves that axis unprojected,
+/// byte-identical to a binding-free search.
+struct BoundAxes {
+  /// The `owner_mapping` axis: an owner chain, e.g. `worker/vector_engine`.
+  std::string ownerMapping;
+  /// The `memory_path` axis: the allowed memory levels, e.g. `dram:sram:acc`.
+  std::string memoryPath;
+  bool empty() const { return ownerMapping.empty() && memoryPath.empty(); }
+};
+
 /// Sorted, type-tagged rendering of a value map: `a=s:z;b=i:2`. Sorted for
 /// determinism and tagged so an integer and a symbolic value never print
 /// alike. Shared with other plan structures that carry parameter maps.

@@ -447,6 +447,48 @@ llvm::Expected<std::unique_ptr<MappingTarget>> movementTarget() {
       std::vector<std::string>{"e1"});
 }
 
+/// Rules that bind each node's *output* port to its own memory by name, so a
+/// selected plan carries per-occurrence bindings (B2) that must survive
+/// persistence, the report, and replay.
+constexpr llvm::StringLiteral kNamedPortRules = R"llkmap(
+rule t.copy {
+  match micro.async_copy();
+  require executor kind worker;
+  require memory output "result" kind sram;
+  output "result";
+  bundle "b.copy";
+  emit "e1";
+  cost 1;
+}
+rule t.vector {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory output "result" kind dram;
+  output "result";
+  bundle "b.vector";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// `movementTarget` with named-port rules: the copy binds SRAM and the vector
+/// binds DRAM, but each through an explicit output occurrence.
+llvm::Expected<std::unique_ptr<MappingTarget>> namedPortTarget() {
+  llvm::Expected<mlir::llk::machine::MachineModel> machine =
+      mlir::llk::machine::parseMachineModel(kMovementMachine, "<test>");
+  if (!machine)
+    return machine.takeError();
+  llvm::Expected<LayoutRegistry> layouts = parseLayoutText("", "<test>");
+  if (!layouts)
+    return layouts.takeError();
+  llvm::Expected<RuleRegistry> rules = parseRuleText(kNamedPortRules, "<test>");
+  if (!rules)
+    return rules.takeError();
+  return std::make_unique<FileMappingTarget>(
+      "named-port", std::move(*machine), std::move(*layouts), std::move(*rules),
+      std::vector<std::string>{"e1"});
+}
+
 /// The movement machine with a second route from SRAM to DRAM: a staged hop
 /// through an L2. One value can then be carried two legal ways, which is what
 /// exercises one copy chain per route.
@@ -2245,4 +2287,141 @@ TEST(PlanBinder, RejectsAnEmptyRecordedAssignmentForAParametrizedRule) {
       << "an empty recorded assignment must not downgrade a parametrized rule";
   EXPECT_NE(llvm::toString(std::move(error)).find("recorded parameter"),
             std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Fix round 1 (task B2) — named-port memory associations round-trip and replay
+//===----------------------------------------------------------------------===//
+
+/// Rewrites the `memory` of every `port_memories` entry on an op whose rule is
+/// `ruleId`, bypassing re-verification, so what is re-checked is the recorded
+/// association.
+bool retargetPortMemories(ModuleOp module, llvm::StringRef ruleId,
+                          llvm::StringRef memory) {
+  bool changed = false;
+  mlir::MLIRContext *context = module.getContext();
+  module->walk([&](Operation *op) {
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping)
+      return;
+    auto rule = mapping.getAs<StringAttr>("rule");
+    if (!rule || rule.getValue() != ruleId)
+      return;
+    auto array = mapping.getAs<ArrayAttr>("port_memories");
+    if (!array)
+      return;
+    SmallVector<Attribute> entries;
+    for (Attribute element : array) {
+      auto entry = mlir::cast<DictionaryAttr>(element);
+      NamedAttrList fields(entry);
+      fields.set("memory", StringAttr::get(context, memory));
+      entries.push_back(DictionaryAttr::get(context, fields));
+    }
+    NamedAttrList updated(mapping);
+    updated.set("port_memories", ArrayAttr::get(context, entries));
+    op->setAttr("micro.mapping", updated.getDictionary(context));
+    changed = true;
+  });
+  return changed;
+}
+
+// A selected plan whose rules name their output ports carries per-occurrence
+// memory bindings, and both the metadata round trip and the replay retain them.
+TEST(PlanBinder, RoundTripsNamedPortMemoryBindings) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = namedPortTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  bool sawPortBindings = false;
+  for (const PlanPlacement &placement : plan->placements)
+    sawPortBindings |= !placement.portMemoryBindings.empty();
+  ASSERT_TRUE(sawPortBindings)
+      << "the named-port rules must produce per-occurrence bindings";
+
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  llvm::Error verify = verifyMappedMicroIR(*bound->module, **target);
+  EXPECT_FALSE(static_cast<bool>(verify)) << llvm::toString(std::move(verify));
+
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*bound->module, **target);
+  ASSERT_TRUE(static_cast<bool>(decoded))
+      << llvm::toString(decoded.takeError());
+  for (const PlanPlacement &placement : plan->placements) {
+    const PlanPlacement *match = nullptr;
+    for (const PlanPlacement &candidate : decoded->placements)
+      if (candidate.node == placement.node)
+        match = &candidate;
+    ASSERT_NE(match, nullptr)
+        << "node " << placement.node << " was not decoded";
+    EXPECT_EQ(match->portMemoryBindings, placement.portMemoryBindings);
+  }
+}
+
+// Tampering the recorded port→memory association (pointing the vector node's
+// output at SRAM instead of DRAM) is a memory violation, reported with the
+// memory-specific code rather than an executor one.
+TEST(PlanBinder, ReplayRejectsATamperedPortMemoryAssociation) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = namedPortTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  ASSERT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
+
+  ASSERT_TRUE(retargetPortMemories(*bound->module, "t.vector", "sram.0"));
+  auto error = verifyMappedMicroIR(*bound->module, **target);
+  ASSERT_TRUE(static_cast<bool>(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("no_memory_route"), std::string::npos) << text;
+  EXPECT_EQ(text.find("no_legal_executor"), std::string::npos) << text;
+}
+
+// Deleting the recorded association of a rule that requires one is rejected
+// (fail-closed), with the memory code -- a missing memory association is not an
+// executor problem.
+TEST(PlanBinder, ReplayWithoutThePortAssociationIsRejected) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = namedPortTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  ASSERT_FALSE(
+      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
+
+  // Strip `port_memories` from the mapped ops whose rules require one.
+  mlir::MLIRContext *context = fixture.context.get();
+  unsigned stripped = 0;
+  bound->module->walk([&](Operation *op) {
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping || !mapping.get("port_memories"))
+      return;
+    NamedAttrList kept;
+    for (NamedAttribute attribute : mapping)
+      if (attribute.getName() != "port_memories")
+        kept.push_back(attribute);
+    op->setAttr("micro.mapping", DictionaryAttr::get(context, kept));
+    ++stripped;
+  });
+  ASSERT_GT(stripped, 0u);
+
+  auto error = verifyMappedMicroIR(*bound->module, **target);
+  ASSERT_TRUE(static_cast<bool>(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("no_memory_route"), std::string::npos) << text;
 }

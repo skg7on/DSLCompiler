@@ -223,6 +223,69 @@ loadBoundLayouts(mlir::ModuleOp module, const SearchBinding &binding) {
   return bound;
 }
 
+llvm::Expected<BoundAxes> loadBoundAxes(mlir::ModuleOp module,
+                                        const SearchBinding &binding) {
+  if (binding.candidateId.empty())
+    return error("a binding with no candidateId cannot resolve a bound axis");
+
+  llvm::Expected<micro::CandidateOp> found =
+      findCandidateByName(module, binding.candidateId);
+  if (!found)
+    return found.takeError();
+  if (!*found)
+    return error("no micro.candidate named '" + binding.candidateId + "'");
+  micro::CandidateOp candidate = *found;
+
+  auto space = dyn_cast<micro::SearchSpaceOp>(candidate->getParentOp());
+  if (!space)
+    return error("micro.candidate @" + candidate.getSymName() +
+                 " is not nested in a micro.search_space");
+
+  llvm::Expected<perf::SearchSpace> loaded = perf::loadSearchSpace(space);
+  if (!loaded)
+    return loaded.takeError();
+
+  // By kind, never by name: whichever parameter the space declares with the
+  // axis kind is the axis, whatever it is called. Two parameters of one kind
+  // leave "which one selects the axis" unanswerable and are rejected rather
+  // than silently picking one.
+  auto resolveAxis = [&](llvm::StringRef kind,
+                         std::string &slot) -> std::optional<llvm::Error> {
+    const perf::SearchParam *chosen = nullptr;
+    for (const perf::SearchParam &param : loaded->params) {
+      if (param.kind != kind)
+        continue;
+      if (chosen)
+        return error("micro.search_space '" + loaded->name +
+                     "' declares more than one '" + kind +
+                     "' parameter; a binding cannot say which one selects the "
+                     "axis");
+      chosen = &param;
+    }
+    if (!chosen)
+      return std::nullopt;
+    auto value = binding.values.find(chosen->name);
+    if (value == binding.values.end())
+      return error("binding does not bind " + kind + " parameter '" +
+                   chosen->name + "'");
+    if (const std::string *text = std::get_if<std::string>(&value->second)) {
+      slot = *text;
+      return std::nullopt;
+    }
+    return error("binding value for " + kind + " parameter '" + chosen->name +
+                 "' is not a string");
+  };
+
+  BoundAxes axes;
+  if (std::optional<llvm::Error> failure =
+          resolveAxis("owner_mapping", axes.ownerMapping))
+    return std::move(*failure);
+  if (std::optional<llvm::Error> failure =
+          resolveAxis("memory_path", axes.memoryPath))
+    return std::move(*failure);
+  return axes;
+}
+
 namespace {
 
 /// Reads the original, pre-tiling workload dimensions the export records as

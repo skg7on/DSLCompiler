@@ -203,8 +203,14 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
 struct RecordedRuleSelection {
   std::string executor;
   /// Memory id per required memory kind, keyed exactly as generation binds it
-  /// (`instance.memoryBindings[requirement.kind]`).
+  /// (`instance.memoryBindings[requirement.kind]`). A requirement that named a
+  /// port records into `portMemories` instead, because a kind-keyed map cannot
+  /// tell two same-kind requirements apart.
   llvm::StringMap<std::string> memories;
+  /// The port to memory id assignment of every requirement that named a port,
+  /// as generation records it (`instance.portMemoryBindings`). A named
+  /// requirement is re-checked against *this*, never the kind-keyed map.
+  std::vector<PortMemoryBinding> portMemories;
   /// The resolved parameter assignment, when the binding records one. Empty for
   /// a binding that predates parameter persistence: verification then falls
   /// back to generation's existential requirement check (some assignment
@@ -290,13 +296,24 @@ bool ruleDerivesParameters(const RuleDef &rule);
 /// make every movement/reduce rule -- which the shipped rule files leave
 /// layout-agnostic -- unmappable under any bound layout. A null `boundLayout`
 /// leaves layout selection byte-identical to the pre-binding behaviour.
+///
+/// `boundAxes` carries the binding's `owner_mapping`/`memory_path` axes, which
+/// the caller resolved by parameter *kind* (only it can see the search space).
+/// They are projected onto explicit executor/compute/memory requirements -- a
+/// rule the axis contradicts, or an axis the machine does not model, is a
+/// non-match with a reason, never a silent drop. When an axis is unset the
+/// caller's `pinned` values are consulted for the conventional exported name as
+/// a fallback, so a name-keyed binding still projects; a null `boundAxes` with
+/// no such name leaves both axes unprojected, byte-identical to the
+/// pre-binding behaviour.
 std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason = nullptr,
                    bool *truncated = nullptr,
                    const llvm::StringMap<SearchValue> *pinned = nullptr,
-                   const llvm::StringMap<std::string> *boundLayouts = nullptr);
+                   const llvm::StringMap<std::string> *boundLayouts = nullptr,
+                   const BoundAxes *boundAxes = nullptr);
 
 } // namespace mlir::llk::mapping
 

@@ -308,6 +308,34 @@ std::string writePlanReport(const MappingSearchResult &result,
               for (const std::string &key : keys)
                 json.attribute(key, placement.memories.lookup(key));
             });
+            // The port-to-memory association of every named-port requirement,
+            // sorted by occurrence so the report stays byte-identical.
+            json.attributeArray("portMemories", [&] {
+              std::vector<PortMemoryBinding> sorted =
+                  placement.portMemoryBindings;
+              llvm::sort(sorted, [](const PortMemoryBinding &lhs,
+                                    const PortMemoryBinding &rhs) {
+                if (lhs.port.node != rhs.port.node)
+                  return lhs.port.node < rhs.port.node;
+                if (lhs.port.direction != rhs.port.direction)
+                  return lhs.port.direction < rhs.port.direction;
+                return lhs.port.index < rhs.port.index;
+              });
+              for (const PortMemoryBinding &binding : sorted)
+                json.object([&] {
+                  json.attributeObject("port", [&] {
+                    json.attribute("node",
+                                   static_cast<uint64_t>(binding.port.node));
+                    json.attribute("direction", binding.port.direction ==
+                                                        PortDirection::Input
+                                                    ? "input"
+                                                    : "output");
+                    json.attribute("index",
+                                   static_cast<uint64_t>(binding.port.index));
+                  });
+                  json.attribute("memory", binding.memory);
+                });
+            });
             json.attributeObject("layouts", [&] {
               std::vector<std::string> keys;
               for (const auto &entry : placement.layouts)
@@ -637,6 +665,28 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         for (const auto &entry : *layouts)
           if (std::optional<llvm::StringRef> value = entry.second.getAsString())
             placement.layouts[entry.first] = value->str();
+      if (const llvm::json::Array *portMemories =
+              object->getArray("portMemories")) {
+        for (const llvm::json::Value &element : *portMemories) {
+          const llvm::json::Object *entry = element.getAsObject();
+          if (!entry)
+            return reportError("plan report port memory is not an object");
+          const llvm::json::Object *port = entry->getObject("port");
+          if (!port)
+            return reportError("plan report port memory has no port");
+          llvm::Expected<PortRef> ref = jsonPortRef(port, "port memory port");
+          if (!ref)
+            return ref.takeError();
+          if (!lookupPort(graph, *ref))
+            return reportError("plan report port memory endpoint does not "
+                               "resolve in the source graph");
+          std::optional<llvm::StringRef> memory = entry->getString("memory");
+          if (!memory)
+            return reportError("plan report port memory has no memory");
+          placement.portMemoryBindings.push_back(
+              PortMemoryBinding{*ref, memory->str()});
+        }
+      }
       if (const llvm::json::Array *solutions = object->getArray("solutions")) {
         for (const llvm::json::Value &solution : *solutions) {
           const llvm::json::Object *entry = solution.getAsObject();

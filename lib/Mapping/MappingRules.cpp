@@ -670,18 +670,22 @@ std::string canonicalRuleDefString(const RuleDef &def) {
     field("constraint",
           constraint ? canonicalExprString(*constraint) : "<null>");
   for (const KindRequirement &requirement : def.kindRequirements) {
-    // Unit separators keep a port name containing the printable delimiter from
-    // being read as the kind. A bare requirement omits the port field entirely,
-    // so it renders exactly as before.
     std::string text = requirement.role;
     if (requirement.port) {
+      // Unit separators keep a port name containing the printable delimiter
+      // from being read as the kind.
       text += '\x1f';
       text += requirement.port->isInput ? 'i' : 'o';
       text += '\x1f';
       text += requirement.port->name;
+      text += '\x1f';
+      text += requirement.kind;
+    } else {
+      // The bare form renders exactly as before, so a rule that names no port
+      // keeps its pre-existing content hash.
+      text += ':';
+      text += requirement.kind;
     }
-    text += '\x1f';
-    text += requirement.kind;
     field("require", text);
   }
   for (const RuleLayoutRequirement &requirement : def.layoutRequirements)
@@ -1306,6 +1310,33 @@ mlir::DictionaryAttr buildBundleParameters(const RuleDef &rule,
   return mlir::DictionaryAttr::get(context, attributes);
 }
 
+/// The rule port `subject` resolves to on `node`, mirroring the positional
+/// wiring generation uses: rule ports map to the node's inputs then its outputs
+/// in declaration order, so a port's position within its direction is the
+/// occurrence index. Nullopt when the rule declares no such port or the node
+/// does not expose that occurrence.
+std::optional<PortRef> resolveRulePort(const RuleDef &rule,
+                                       const WorkloadNode &node,
+                                       const RulePort &subject) {
+  size_t inputIndex = 0;
+  size_t outputIndex = 0;
+  for (const RulePort &port : rule.ports) {
+    size_t &index = port.isInput ? inputIndex : outputIndex;
+    if (port.name == subject.name && port.isInput == subject.isInput) {
+      llvm::ArrayRef<WorkloadPort> nodePorts =
+          port.isInput ? node.inputs : node.outputs;
+      if (index < nodePorts.size())
+        return PortRef{node.id,
+                       port.isInput ? PortDirection::Input
+                                    : PortDirection::Output,
+                       static_cast<uint32_t>(index)};
+      return std::nullopt;
+    }
+    ++index;
+  }
+  return std::nullopt;
+}
+
 /// Projects the bound `owner_mapping` and `memory_path` search axes onto the
 /// candidate's abstract requirements, validating each against machine data. The
 /// projection is explicit: a bound axis changes which executors, computes, and
@@ -1323,15 +1354,32 @@ mlir::DictionaryAttr buildBundleParameters(const RuleDef &rule,
 /// the allowed levels. Every memory a rule requires must sit on it. A level the
 /// machine does not model, or an owner kind it does not model, is rejected
 /// explicitly -- a selected axis is never silently dropped.
-std::optional<std::string> projectBoundAxes(
-    const RuleDef &rule, const llvm::StringMap<SearchValue> &pinned,
-    const machine::MachineModel &machine, MappingCandidate &candidate) {
-  if (auto entry = pinned.find("owner_mapping"); entry != pinned.end()) {
-    const std::string *value = std::get_if<std::string>(&entry->second);
-    if (!value || value->empty())
-      return "owner_mapping axis must be a non-empty symbolic value";
+///
+/// The value for an axis is taken from `boundAxes` (resolved by parameter
+/// *kind* by the caller) when set, else from the binding's conventional
+/// exported name in `pinned` -- so a name-keyed binding still projects, and a
+/// space that named its parameter differently is honoured because the caller
+/// resolved it by kind rather than by name.
+std::optional<std::string>
+projectBoundAxes(const RuleDef &rule, const BoundAxes *boundAxes,
+                 const llvm::StringMap<SearchValue> *pinned,
+                 const machine::MachineModel &machine,
+                 MappingCandidate &candidate) {
+  std::string ownerValue;
+  if (boundAxes && !boundAxes->ownerMapping.empty())
+    ownerValue = boundAxes->ownerMapping;
+  else if (pinned)
+    if (auto entry = pinned->find("owner_mapping"); entry != pinned->end()) {
+      const std::string *value = std::get_if<std::string>(&entry->second);
+      if (!value || value->empty())
+        return "owner_mapping axis must be a non-empty symbolic value";
+      ownerValue = *value;
+    }
+
+  if (!ownerValue.empty()) {
+    llvm::StringRef value = ownerValue;
     llvm::SmallVector<llvm::StringRef, 4> owners;
-    llvm::StringRef(*value).split(owners, '/');
+    value.split(owners, '/');
     for (llvm::StringRef owner : owners)
       if (owner.empty())
         return "owner_mapping axis has an empty owner";
@@ -1341,8 +1389,8 @@ std::optional<std::string> projectBoundAxes(
              "', which machine '" + machine.target + "' does not model";
     for (const KindRequirement &requirement : rule.kindRequirements)
       if (requirement.role == "executor" && requirement.kind != owners.front())
-        return "owner_mapping '" + *value + "' contradicts executor kind '" +
-               requirement.kind + "'";
+        return "owner_mapping '" + value.str() +
+               "' contradicts executor kind '" + requirement.kind + "'";
     // Inner components are nested owners or attached compute capabilities; each
     // must be modeled as one or the other.
     llvm::SmallVector<std::string, 2> projectedComputes;
@@ -1362,8 +1410,8 @@ std::optional<std::string> projectBoundAxes(
         continue;
       if (!projectedComputes.empty() &&
           !llvm::is_contained(projectedComputes, requirement.kind))
-        return "owner_mapping '" + *value + "' does not reach compute kind '" +
-               requirement.kind + "'";
+        return "owner_mapping '" + value.str() +
+               "' does not reach compute kind '" + requirement.kind + "'";
     }
     // Project the outer owner as an executor requirement, and each inner
     // compute kind as a compute requirement -- deduplicated, so a rule that
@@ -1388,19 +1436,28 @@ std::optional<std::string> projectBoundAxes(
     }
   }
 
-  if (auto entry = pinned.find("memory_path"); entry != pinned.end()) {
-    const std::string *value = std::get_if<std::string>(&entry->second);
-    if (!value || value->empty())
-      return "memory_path axis must be a non-empty symbolic value";
+  std::string memoryPathValue;
+  if (boundAxes && !boundAxes->memoryPath.empty())
+    memoryPathValue = boundAxes->memoryPath;
+  else if (pinned)
+    if (auto entry = pinned->find("memory_path"); entry != pinned->end()) {
+      const std::string *value = std::get_if<std::string>(&entry->second);
+      if (!value || value->empty())
+        return "memory_path axis must be a non-empty symbolic value";
+      memoryPathValue = *value;
+    }
+
+  if (!memoryPathValue.empty()) {
+    llvm::StringRef value = memoryPathValue;
     llvm::SmallVector<llvm::StringRef, 4> path;
-    llvm::StringRef(*value).split(path, ':');
+    value.split(path, ':');
     for (llvm::StringRef level : path)
       if (level.empty() || !machine.findMemoryOfKind(level))
         return "memory_path names level '" + level.str() +
                "', which machine '" + machine.target + "' does not model";
     for (const MemoryRequirement &requirement : candidate.memoryRequirements)
       if (!llvm::is_contained(path, llvm::StringRef(requirement.kind)))
-        return "memory_path '" + *value + "' excludes memory kind '" +
+        return "memory_path '" + value.str() + "' excludes memory kind '" +
                requirement.kind + "'";
   }
   return std::nullopt;
@@ -1413,7 +1470,8 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason,
                    bool *truncated, const llvm::StringMap<SearchValue> *pinned,
-                   const llvm::StringMap<std::string> *boundLayouts) {
+                   const llvm::StringMap<std::string> *boundLayouts,
+                   const BoundAxes *boundAxes) {
   RuleResolution resolution =
       resolveRuleConstraints(rule, node, machine, context, pinned);
   if (!resolution.matched) {
@@ -1531,21 +1589,7 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
       // cannot be attributed, so the rule is a non-match rather than a bare
       // fallback.
       if (requirement.port) {
-        size_t inputIndex = 0;
-        size_t outputIndex = 0;
-        for (const RulePort &port : rule.ports) {
-          llvm::ArrayRef<WorkloadPort> nodePorts =
-              port.isInput ? node.inputs : node.outputs;
-          size_t &index = port.isInput ? inputIndex : outputIndex;
-          if (port.name == requirement.port->name &&
-              port.isInput == requirement.port->isInput &&
-              index < nodePorts.size())
-            resolved.port = PortRef{node.id,
-                                    port.isInput ? PortDirection::Input
-                                                 : PortDirection::Output,
-                                    static_cast<uint32_t>(index)};
-          ++index;
-        }
+        resolved.port = resolveRulePort(rule, node, *requirement.port);
         if (!resolved.port) {
           if (reason)
             *reason = "memory requirement names port '" +
@@ -1565,9 +1609,9 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   // Bound search axes are projected onto explicit requirements before the
   // candidate is identified, so placement consumes what the binding selected
   // rather than ignoring it as provenance.
-  if (pinned) {
+  if (pinned || (boundAxes && !boundAxes->empty())) {
     if (std::optional<std::string> axisError =
-            projectBoundAxes(rule, *pinned, machine, candidate)) {
+            projectBoundAxes(rule, boundAxes, pinned, machine, candidate)) {
       if (reason)
         *reason = *axisError;
       return std::nullopt;
@@ -1809,28 +1853,55 @@ llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
                         requirement.kind + "' compute capability");
   }
 
-  // 6. Memory kinds and visibility.
+  // 6. Memory kinds and visibility. A requirement that named a port is checked
+  // against the recorded port-to-memory association -- the kind-keyed map
+  // cannot tell two same-kind requirements apart -- and a bare requirement
+  // against the kind-keyed map, exactly as generation bound each.
   for (const KindRequirement &requirement : rule.kindRequirements) {
     if (requirement.role != "memory")
       continue;
-    auto bound = selection.memories.find(requirement.kind);
-    if (bound == selection.memories.end())
-      return reject(DiagnosticCode::NoMemoryRoute,
-                    "rule '" + rule.id + "' requires a '" + requirement.kind +
-                        "' memory, which the mapping does not bind");
+    std::string boundMemory;
+    if (requirement.port) {
+      std::optional<PortRef> ref =
+          resolveRulePort(rule, node, *requirement.port);
+      if (!ref)
+        return reject(DiagnosticCode::NoMemoryRoute,
+                      "rule '" + rule.id + "' requires a '" + requirement.kind +
+                          "' memory on port '" + requirement.port->name +
+                          "', which the operation does not expose");
+      const PortMemoryBinding *found = nullptr;
+      for (const PortMemoryBinding &binding : selection.portMemories)
+        if (binding.port == *ref) {
+          found = &binding;
+          break;
+        }
+      if (!found)
+        return reject(DiagnosticCode::NoMemoryRoute,
+                      "rule '" + rule.id + "' requires a '" + requirement.kind +
+                          "' memory on port '" + requirement.port->name +
+                          "', which the mapping does not bind");
+      boundMemory = found->memory;
+    } else {
+      auto bound = selection.memories.find(requirement.kind);
+      if (bound == selection.memories.end())
+        return reject(DiagnosticCode::NoMemoryRoute,
+                      "rule '" + rule.id + "' requires a '" + requirement.kind +
+                          "' memory, which the mapping does not bind");
+      boundMemory = bound->second;
+    }
     const mlir::llk::machine::MemoryNode *memory =
-        machine.findMemory(bound->second);
+        machine.findMemory(boundMemory);
     if (!memory)
       return reject(DiagnosticCode::NoMemoryRoute,
-                    "unknown memory '" + bound->second + "'");
+                    "unknown memory '" + boundMemory + "'");
     if (memory->kind != requirement.kind)
       return reject(DiagnosticCode::NoMemoryRoute,
-                    "memory '" + bound->second + "' has kind '" + memory->kind +
+                    "memory '" + boundMemory + "' has kind '" + memory->kind +
                         "', not the required '" + requirement.kind + "'");
-    if (!machine.isVisible(bound->second, selection.executor))
+    if (!machine.isVisible(boundMemory, selection.executor))
       return reject(DiagnosticCode::NoMemoryRoute,
                     "executor '" + selection.executor +
-                        "' cannot see memory '" + bound->second + "'");
+                        "' cannot see memory '" + boundMemory + "'");
   }
 
   return llvm::Error::success();

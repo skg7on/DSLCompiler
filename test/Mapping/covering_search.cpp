@@ -2972,6 +2972,86 @@ TEST(CoveringSearch, SameKindNamedPortsBindDifferentMemories) {
   EXPECT_TRUE(sawSplit);
 }
 
+/// One `micro.vector` node reading a `tile`-typed input and writing `output`,
+/// so a rule that names only the input still has an output to charge.
+WorkloadGraph oneInOneOutGraph(mlir::MLIRContext &context, mlir::Type input,
+                               mlir::Type output) {
+  WorkloadGraph graph;
+  WorkloadValueId in =
+      graph.addValue(WorkloadValue{0, input, "in", /*external=*/true});
+  WorkloadValueId out =
+      graph.addValue(WorkloadValue{0, output, "out", /*external=*/false});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context);
+  node.inputs.push_back(WorkloadPort{in, input, std::nullopt});
+  node.outputs.push_back(WorkloadPort{out, output, std::nullopt});
+  graph.addNode(std::move(node));
+  graph.finalize();
+  return graph;
+}
+
+/// A rule that names only its *input* port's memory. The node it covers still
+/// produces an output, which must be charged rather than left unchecked.
+constexpr llvm::StringLiteral kInputOnlyPortRule = R"llkmap(
+rule r.in_ported {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory input "operand0" kind sram;
+  input "operand0";
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+// A named-port requirement that names only an input must not silently exempt
+// the node's outputs from capacity: the 4096-byte output does not fit the
+// 1024-byte sram the rule binds, so the plan rejects. (An input's own bytes are
+// produced elsewhere; the output's are not.)
+TEST(CoveringSearch, InputOnlyNamedMemoryStillChargesTheOutput) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = oneInOneOutGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(1024, 1u << 30), kInputOnlyPortRule);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+// Control: the same input-only rule admits the plan once the bound memory holds
+// the output, proving the charge is real rather than a blanket rejection.
+TEST(CoveringSearch, InputOnlyNamedMemoryAdmitsWhenTheOutputFits) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = oneInOneOutGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(8192, 1u << 30), kInputOnlyPortRule);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
 /// One `micro.vector` node reading a single input and writing nothing: a sink.
 WorkloadGraph sinkGraph(mlir::MLIRContext &context, mlir::Type input) {
   WorkloadGraph graph;
@@ -3890,6 +3970,34 @@ TEST(CoveringSearch, ABoundMemoryPathGatesMemoryRequirements) {
   ASSERT_TRUE(static_cast<bool>(bogus)) << llvm::toString(bogus.takeError());
   EXPECT_TRUE(bogus->plans.empty());
   EXPECT_TRUE(hasDiagnostic(*bogus, DiagnosticCode::NoMatchingRule));
+}
+
+// A kind-resolved axis is honoured however the space spelled its parameter: the
+// caller resolves the binding's axis by parameter *kind* (only it can see the
+// search space) and passes the value explicitly, so a binding keyed by an
+// arbitrary name -- here "owner" rather than "owner_mapping" -- is projected
+// rather than silently ignored.
+TEST(CoveringSearch, AKindResolvedOwnerAxisIsHonouredRegardlessOfItsName) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(ownerMachine(), kOwnerFreeRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  SearchBinding binding =
+      makeSearchBinding("c", values({{"owner", std::string("worker")}}));
+
+  BoundAxes axes;
+  axes.ownerMapping = "worker";
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                        binding, {}, axes);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  for (const PlanPlacement &placement : result->plans[0].placements)
+    EXPECT_EQ(placement.executor, "w0");
 }
 
 //===----------------------------------------------------------------------===//

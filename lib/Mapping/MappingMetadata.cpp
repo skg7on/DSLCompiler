@@ -754,6 +754,21 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
                             mlir::StringAttr::get(context, placement.executor));
     attributes.emplace_back(mlir::StringAttr::get(context, "memories"),
                             stringMapAttr(context, memories));
+    // The port-to-memory association of every named-port requirement, so the
+    // occurrence→memory decision survives a round trip. Always recorded
+    // (possibly empty), so a v2 reader can require the container when the rule
+    // declares a named-port requirement.
+    llvm::SmallVector<mlir::Attribute> portMemories;
+    for (const PortMemoryBinding &binding : placement.portMemoryBindings) {
+      llvm::SmallVector<mlir::NamedAttribute> entry;
+      entry.emplace_back(mlir::StringAttr::get(context, "port"),
+                         metadataPortRefAttr(context, binding.port));
+      entry.emplace_back(mlir::StringAttr::get(context, "memory"),
+                         mlir::StringAttr::get(context, binding.memory));
+      portMemories.push_back(mlir::DictionaryAttr::get(context, entry));
+    }
+    attributes.emplace_back(mlir::StringAttr::get(context, "port_memories"),
+                            mlir::ArrayAttr::get(context, portMemories));
     attributes.emplace_back(mlir::StringAttr::get(context, "layouts"),
                             stringMapAttr(context, layouts));
     if (placement.bundle.parameters)
@@ -1113,6 +1128,51 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       }
       for (const auto &entry : *read)
         placement.memories[entry.first()] = entry.second;
+    }
+    // The named-port memory associations. Each recorded occurrence must resolve
+    // in the source graph, so a tampered association cannot point at a made-up
+    // port. A v2 binding whose rule declares a named-port requirement must
+    // record the container (it may be empty only when the rule has none), so
+    // deleting it cannot skip the association.
+    if (mlir::Attribute rawPortMemories = mapping.get("port_memories")) {
+      auto array = mlir::dyn_cast<mlir::ArrayAttr>(rawPortMemories);
+      if (!array) {
+        sawUnrecoverable = true;
+        return;
+      }
+      for (mlir::Attribute element : array) {
+        auto entry = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+        if (!entry) {
+          sawUnrecoverable = true;
+          return;
+        }
+        llvm::Expected<PortRef> ref =
+            readMetadataPortRef(entry.get("port"), "port", where);
+        if (!ref) {
+          sawUnrecoverable = true;
+          return;
+        }
+        if (!lookupPort(sourceGraph, *ref)) {
+          sawUnrecoverable = true;
+          return;
+        }
+        llvm::Expected<std::string> memory =
+            readMetadataString(entry, "memory", where);
+        if (!memory) {
+          sawUnrecoverable = true;
+          return;
+        }
+        placement.portMemoryBindings.push_back(
+            PortMemoryBinding{*ref, *memory});
+      }
+    } else if (v2) {
+      if (const RuleDef *def = target.rules().find(placement.rule)) {
+        for (const KindRequirement &requirement : def->kindRequirements)
+          if (requirement.role == "memory" && requirement.port) {
+            sawUnrecoverable = true;
+            return;
+          }
+      }
     }
     if (mlir::Attribute layouts = mapping.get("layouts")) {
       llvm::Expected<llvm::StringMap<std::string>> read =

@@ -493,6 +493,56 @@ TEST(MappingPlanReportTest, ReplayReportRoundTripsSelectedState) {
         EXPECT_NE(report.find(renderMap(entry.second.map)), std::string::npos);
 }
 
+// A report carries each placement's per-occurrence memory bindings, so a replay
+// reconstructs them exactly (task B2 fix round 1).
+TEST(MappingPlanReportTest, ReportRoundTripsNamedPortMemoryBindings) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult result =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  ASSERT_FALSE(result.plans.empty());
+
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  // Attach a per-occurrence binding to a placement whose node has an output the
+  // graph can resolve.
+  bool attached = false;
+  for (PlanPlacement &placement : result.plans.front().placements) {
+    const WorkloadNode *node = graph->findNode(placement.node);
+    if (!node || node->outputs.empty())
+      continue;
+    placement.portMemoryBindings.push_back(PortMemoryBinding{
+        PortRef{placement.node, PortDirection::Output, 0}, "sram.0"});
+    attached = true;
+    break;
+  }
+  ASSERT_TRUE(attached) << "no placement had a resolvable output occurrence";
+
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash(kKernel));
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, **target, *graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+
+  for (const PlanPlacement &original : result.plans.front().placements) {
+    if (original.portMemoryBindings.empty())
+      continue;
+    const PlanPlacement *match = nullptr;
+    for (const PlanPlacement &candidate : replay->placements)
+      if (candidate.node == original.node)
+        match = &candidate;
+    ASSERT_NE(match, nullptr);
+    EXPECT_EQ(match->portMemoryBindings, original.portMemoryBindings);
+  }
+}
+
 // A report replayed against a target whose content differs is rejected: the
 // recorded target hash no longer matches.
 TEST(MappingPlanReportTest, ReplayRejectsAChangedTarget) {

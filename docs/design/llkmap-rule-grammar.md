@@ -140,7 +140,10 @@ and the search keeps the conservative rule that a node with several outputs and
 several bare bindings has no output-to-memory association and is rejected rather
 than admitted on an unsafe lower bound. A bare and a named requirement of the
 same kind, or one named port and kind twice, overlap ambiguously and are
-rejected at load time. `executor` and `compute` requirements may not name a port.
+rejected at load time. A rule that mixes a bare requirement of one kind with a
+named requirement of another parses but is rejected at search time as an
+ambiguous association, since it leaves some occurrence's memory unfixed.
+`executor` and `compute` requirements may not name a port.
 
 ## Bound search axes
 
