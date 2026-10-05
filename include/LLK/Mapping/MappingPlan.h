@@ -322,6 +322,12 @@ struct PlanPlacement {
   /// The solved instantiation of each layout in `layouts`, so the selected
   /// plan states the parameterization it chose, not just the family name.
   llvm::StringMap<SolvedLayout> layoutSolutions;
+  /// The resolved values of the rule's own declared parameters (the ones its
+  /// `require` constraints derive), so the selected plan states the exact
+  /// assignment generation solved rather than leaving a reader to re-derive
+  /// one. Verification validates *this* assignment and never substitutes a
+  /// different legal one.
+  llvm::StringMap<SearchValue> resolvedParameters;
 };
 
 /// One selected connection, with the route it takes.

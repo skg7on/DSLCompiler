@@ -151,6 +151,17 @@ llvm::Expected<PortRef> readMetadataPortRef(mlir::Attribute raw,
 mlir::Attribute metadataPortRefAttr(mlir::MLIRContext *context,
                                     const PortRef &port);
 
+/// Reads a typed parameter value (an integer or a string) with a checked cast.
+llvm::Expected<SearchValue> readMetadataSearchValue(mlir::Attribute raw,
+                                                    llvm::StringRef where);
+
+/// True when a `micro.plan` dictionary denotes a schema-v2 (or newer) binding.
+/// A binding is v2 when it declares `schema_version >= 2` *or* records any
+/// v2-only field (`graph_hash`, `target_hash`, `machine_hash`, `layout_hash`,
+/// `rule_hash`). Deleting `schema_version` therefore cannot silently downgrade
+/// a v2 binding to v1 and re-open the layout/hash bypasses.
+bool planMetadataIsSchemaV2(mlir::DictionaryAttr plan);
+
 } // namespace mlir::llk::mapping
 
 #endif // LLK_MAPPING_MAPPINGMETADATA_H

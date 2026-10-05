@@ -1917,3 +1917,231 @@ TEST(PlanBinder, RejectsAmbiguousV1ExecutableReplay) {
   EXPECT_NE(llvm::toString(decoded.takeError()).find("ambiguous"),
             std::string::npos);
 }
+
+//===----------------------------------------------------------------------===//
+// Fix round 1 — Critical 1: resolved rule parameters
+//===----------------------------------------------------------------------===//
+
+// The rule's resolved parameter assignment is part of the selected state: it
+// must be persisted, and verification must validate the *recorded* assignment
+// (not substitute a legal one). `avx2.vector_add` derives `VW` from
+// `VW == machine.compute("vector_engine").lanes(element_type)`, so a recorded
+// VW outside its domain is a tampered selection.
+TEST(PlanBinder, PersistsAndValidatesResolvedRuleParameters) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
+
+  bool sawParameters = false;
+  unsigned tampered = 0;
+  mlir::MLIRContext *context = f.context.get();
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping)
+      return;
+    auto parameters = mapping.getAs<DictionaryAttr>("rule_parameters");
+    if (!parameters)
+      return;
+    sawParameters = true;
+    NamedAttrList mutated(parameters);
+    mutated.set("VW", IntegerAttr::get(IntegerType::get(context, 64), 99));
+    NamedAttrList updated(mapping);
+    updated.set("rule_parameters", mutated.getDictionary(context));
+    op->setAttr("micro.mapping", updated.getDictionary(context));
+    ++tampered;
+  });
+  EXPECT_TRUE(sawParameters)
+      << "the selected rule's resolved parameters must be persisted";
+  ASSERT_GT(tampered, 0u);
+  auto error = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("no_matching_rule"),
+            std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Fix round 1 — Important 4: storage and synchronization state
+//===----------------------------------------------------------------------===//
+
+// B1 declares the storage/synchronization model; the selected state must carry
+// it through encode/decode even when B3 has not yet populated it.
+TEST(PlanBinder, RoundTripsStorageAndSynchronizationState) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+
+  CoveringPlan plan = *p;
+  StorageAllocation allocation;
+  allocation.id = 5;
+  allocation.value = 3;
+  allocation.memory = "sram.0";
+  allocation.bytes = 4096;
+  allocation.beginStep = 1;
+  allocation.endStep = 7;
+  plan.allocations.push_back(allocation);
+  StorageAllocation aliased;
+  aliased.id = 6;
+  aliased.value = 4;
+  aliased.memory = "dram.0";
+  aliased.bytes = 128;
+  aliased.aliasOf = 5;
+  plan.allocations.push_back(aliased);
+  SynchronizationStep step;
+  step.id = 9;
+  step.waitsFor = {1};
+  step.requiresBarrier = true;
+  plan.synchronization.push_back(step);
+
+  auto b = bindPlan(*f.module, plan, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  auto decoded = decodeSelectedPlan(*b->module, *f.target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+
+  ASSERT_EQ(decoded->allocations.size(), 2u);
+  EXPECT_EQ(decoded->allocations[0].id, 5u);
+  EXPECT_EQ(decoded->allocations[0].value, 3u);
+  EXPECT_EQ(decoded->allocations[0].memory, "sram.0");
+  EXPECT_EQ(decoded->allocations[0].bytes, 4096u);
+  EXPECT_FALSE(decoded->allocations[0].aliasOf.has_value());
+  EXPECT_EQ(decoded->allocations[0].beginStep, 1u);
+  EXPECT_EQ(decoded->allocations[0].endStep, 7u);
+  ASSERT_TRUE(decoded->allocations[1].aliasOf.has_value());
+  EXPECT_EQ(*decoded->allocations[1].aliasOf, 5u);
+  ASSERT_EQ(decoded->synchronization.size(), 1u);
+  EXPECT_EQ(decoded->synchronization[0].id, 9u);
+  EXPECT_EQ(decoded->synchronization[0].waitsFor,
+            (std::vector<ConnectionId>{1}));
+  EXPECT_TRUE(decoded->synchronization[0].requiresBarrier);
+}
+
+//===----------------------------------------------------------------------===//
+// Fix round 1 — Important 5: never silently downgrade v2 to v1
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A kernel whose only workload node is a `convert`, whose rule requires a
+/// layout (`avx2.blocked_2d`) but declares no parameter constraint -- so
+/// deleting the layout container would bypass solved-layout validation.
+constexpr llvm::StringLiteral kConvertKernel = R"mlir(
+module {
+  micro.kernel @convert {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "convert" %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+}
+)mlir";
+
+/// Reparses `text`, selects a plan against AVX2, and binds it.
+llvm::Expected<BoundPlan> bindConvertKernel(MLIRContext &context,
+                                            MappingTarget &target) {
+  OwningOpRef<ModuleOp> module =
+      parseSourceString<ModuleOp>(kConvertKernel, &context);
+  if (!module)
+    return llvm::createStringError("failed to parse the convert kernel");
+  llvm::Expected<CoveringPlan> plan = selectPlan(context, *module, target);
+  if (!plan)
+    return plan.takeError();
+  return bindPlan(*module, *plan, target);
+}
+
+/// Removes `name` from the `micro.plan` dictionary on `kernel`.
+void eraseFromPlan(Operation *kernel, MLIRContext &context,
+                   llvm::StringRef name) {
+  auto plan = kernel->getAttrOfType<DictionaryAttr>("micro.plan");
+  ASSERT_TRUE(plan);
+  llvm::SmallVector<NamedAttribute> kept;
+  for (NamedAttribute attribute : plan)
+    if (attribute.getName() != name)
+      kept.push_back(attribute);
+  kernel->setAttr("micro.plan", DictionaryAttr::get(&context, kept));
+}
+
+/// Removes `name` from the first `micro.vector`'s mapping.
+void eraseFromVectorMapping(ModuleOp module, MLIRContext &context,
+                            llvm::StringRef name) {
+  module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping)
+      return;
+    llvm::SmallVector<NamedAttribute> kept;
+    for (NamedAttribute attribute : mapping)
+      if (attribute.getName() != name)
+        kept.push_back(attribute);
+    op->setAttr("micro.mapping", DictionaryAttr::get(&context, kept));
+  });
+}
+
+} // namespace
+
+// Deleting `schema_version` must not downgrade a v2 binding to v1 and re-open
+// the A4 container bypass.
+TEST(PlanBinder, DeletingSchemaVersionDoesNotReopenTheLayoutBypass) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.target);
+  auto b = bindConvertKernel(*f.context, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
+
+  eraseFromPlan(b->kernel, *f.context.get(), "schema_version");
+  eraseFromVectorMapping(*b->module, *f.context.get(), "layout_parameters");
+
+  auto error = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(error))
+      << "deleting schema_version must not disable the v2 layout requirement";
+  EXPECT_NE(llvm::toString(std::move(error)).find("no_legal_layout"),
+            std::string::npos);
+}
+
+// The v2 content-hash checks must also survive `schema_version` deletion: a
+// frozen plan still cannot bypass current graph verification.
+TEST(PlanBinder, DeletingSchemaVersionDoesNotDisableGraphHashChecks) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  eraseFromPlan(b->kernel, *f.context.get(), "schema_version");
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.vector")
+      op->setAttr("op", StringAttr::get(f.context.get(), "mul"));
+  });
+
+  auto decoded = decodeSelectedPlan(*b->module, *f.target);
+  ASSERT_FALSE(bool(decoded));
+  EXPECT_NE(llvm::toString(decoded.takeError()).find("graph_hash"),
+            std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Fix round 1 — minor 7: layout_entries must accompany layout_parameters
+//===----------------------------------------------------------------------===//
+
+TEST(PlanBinder, DecodeRejectsMissingLayoutEntries) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  eraseFromVectorMapping(*b->module, *f.context.get(), "layout_entries");
+  auto decoded = decodeSelectedPlan(*b->module, *f.target);
+  ASSERT_FALSE(bool(decoded));
+}

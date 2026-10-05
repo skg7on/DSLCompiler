@@ -76,11 +76,21 @@ llvm::Error writePlanReportFile(llvm::StringRef path,
 /// Reconstructs the selected plan a v2 report recorded, so a caller holding the
 /// report and the exact target and source workload graph can replay the
 /// selection (task B1). This reconstructs *data*, not executable code: semantic
-/// verification and materialization remain mandatory, and `graph`/`target` are
-/// validated first -- the report's target content hash must match `target`, and
-/// every recorded placement must still resolve in `graph` with its rule. A
-/// report written by a different schema version, or one whose target or graph
-/// no longer matches, is rejected.
+/// verification and materialization remain mandatory, and both content hashes
+/// are validated first -- the report's `graphHash` must match
+/// `computeSourceGraphHash(graph)` and its `targetHash` must match `target`, so
+/// a semantically-changed input graph or a different target is rejected before
+/// any executable binding. Every recorded placement must also still resolve in
+/// `graph`. A report written by a different schema version is rejected.
+///
+/// NOTE: the returned plan does *not* carry context-bound `mlir::AffineMap`s
+/// (a solved layout's concrete map or a transform's maps). An `AffineMap` is
+/// owned by an `MLIRContext`, and this function has none that outlives the
+/// call, so a map parsed into a temporary context would dangle. The report
+/// still records every map in its printed form; a caller that needs the maps
+/// (C5) must re-derive them from the recorded parameters and the layout
+/// declaration (and re-validate them), exactly as `decodeSelectedPlan` does
+/// against a live module.
 llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
                                             const MappingTarget &target,
                                             const WorkloadGraph &graph);

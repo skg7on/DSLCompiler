@@ -514,15 +514,14 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
 }
 
 /// True when the kernel's `micro.plan` records a schema-v2 (or newer) binding.
+/// Delegates to `planMetadataIsSchemaV2`, so a deleted `schema_version` cannot
+/// downgrade a binding that still records v2-only fields.
 bool kernelUsesSchemaV2(mlir::Operation *op) {
   mlir::Operation *kernel = enclosingKernel(op);
   if (!kernel)
     return false;
-  auto plan = kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr);
-  if (!plan)
-    return false;
-  auto version = plan.getAs<mlir::IntegerAttr>("schema_version");
-  return version && version.getInt() >= 2;
+  return planMetadataIsSchemaV2(
+      kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr));
 }
 
 } // namespace
@@ -652,6 +651,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       failMetadata(bindError(where + ": micro.mapping is not a dictionary"));
       return;
     }
+    const bool schemaV2 = kernelUsesSchemaV2(op);
 
     llvm::Expected<std::string> ruleId =
         readMetadataString(mapping, "rule", where);
@@ -731,6 +731,33 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     selection.executor = *executor;
     for (const auto &entry : memories)
       selection.memories[entry.first()] = entry.second;
+    // The resolved rule parameters (task B1, Critical 1). A v2 binding must
+    // record the container; when it does, verification validates *that*
+    // assignment via `verifyRuleSelection`'s recorded-assignment branch instead
+    // of generation's existential fallback, so a tampered parameter is rejected
+    // rather than substituted.
+    if (mlir::Attribute rawRuleParameters = mapping.get("rule_parameters")) {
+      auto parameters = mlir::dyn_cast<mlir::DictionaryAttr>(rawRuleParameters);
+      if (!parameters) {
+        failMetadata(
+            bindError(where + ": 'rule_parameters' is not a dictionary"));
+        return;
+      }
+      for (const mlir::NamedAttribute &parameter : parameters) {
+        llvm::Expected<SearchValue> value =
+            readMetadataSearchValue(parameter.getValue(), where);
+        if (!value) {
+          failMetadata(value.takeError());
+          return;
+        }
+        selection.parameters[parameter.getName()] = *value;
+      }
+    } else if (schemaV2) {
+      failMetadata(bindError(
+          where + ": micro.mapping records no 'rule_parameters' for a v2 "
+                  "binding"));
+      return;
+    }
     if (llvm::Error error =
             verifyRuleSelection(*rule, endpoint, machine, selection, where)) {
       failure = std::move(error);
@@ -787,7 +814,6 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     // whether its rule requires a layout. Deleting the container can therefore
     // no longer skip solved-layout verification; a v1 binding keeps its
     // historical shape for analysis.
-    const bool schemaV2 = kernelUsesSchemaV2(op);
     if (schemaV2) {
       const bool hasContainer = mapping.get("layout_parameters") != nullptr;
       const bool noLayoutMarker = [&] {
@@ -1172,8 +1198,9 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     auto plan = kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr);
     if (!plan)
       return;
-    auto version = plan.getAs<mlir::IntegerAttr>("schema_version");
-    if (!version || version.getInt() < 2)
+    // v2 is inferred from any v2-only field too, so deleting `schema_version`
+    // cannot disable these content-hash checks.
+    if (!planMetadataIsSchemaV2(plan))
       return;
     const std::string where = "kernel " + kernelLabel(kernel);
     llvm::Expected<std::string> graphHash =

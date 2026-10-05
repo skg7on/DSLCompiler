@@ -24,6 +24,7 @@
 #include "LLK/Mapping/CoveringSearch.h"
 
 #include "LLK/Mapping/LatencyProvider.h"
+#include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/Routing.h"
 #include "LLK/Mapping/StableHash.h"
 #include "LLK/Mapping/TileFacts.h"
@@ -64,6 +65,10 @@ struct InstanceEntry {
   /// The instance's cost, after any measurement the target provides. Legality
   /// was decided before this and is not revisited.
   Cost cost;
+  /// The resolved values of the rule's constraint-derived parameters, copied
+  /// from the candidate so the selected plan can persist the assignment
+  /// generation solved (task B1).
+  llvm::StringMap<SearchValue> resolvedParameters;
 };
 
 struct NodeTable {
@@ -513,8 +518,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                          stringifyDiagnosticCode(code).str() + ")");
       }
       for (CandidateInstance &instance : *instances) {
-        InstanceEntry entry{std::move(instance), rule, {}};
+        InstanceEntry entry{std::move(instance), rule, {}, {}};
         entry.cost = entry.instance.localCost;
+        entry.resolvedParameters = candidate->resolvedParameters;
         if (options_.enableLatencyCache) {
           if (const LatencyProvider *provider = target_.latencyProvider()) {
             OperationSignature signature;
@@ -1500,6 +1506,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       for (const InstanceEntry &entry : tables[index].instances) {
         if (&entry.instance == instance) {
           placement.rule = entry.rule->id;
+          // The resolved parameter assignment travels with the placement, so
+          // the selected plan records *which* assignment generation solved and
+          // verification can validate it rather than re-deriving one.
+          placement.resolvedParameters = entry.resolvedParameters;
           break;
         }
       }
@@ -1576,6 +1586,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   // §22.1/§22.3: the frontier's codes are the stable interface, so their order
   // must not depend on the order branches happened to be explored.
   llvm::sort(result.frontier.diagnostics, diagnosticLess);
+  // The canonical source-graph identity, so a report can require the same
+  // pre-materialization workload before replaying the selected data.
+  result.workloadHash = computeSourceGraphHash(workload_);
+
   return result;
 }
 

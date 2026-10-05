@@ -158,6 +158,10 @@ std::string writePlanReport(const MappingSearchResult &result,
     // hashes). A replay must match it, so a report cannot be replayed against a
     // target the plan was not bound for.
     json.attribute("targetHash", hexId(computeTargetContentHash(target)));
+    // The canonical, pre-materialization source-graph hash the search ran over.
+    // A replay must match the graph it is handed, so a report cannot be
+    // replayed against a semantically-changed workload.
+    json.attribute("graphHash", hexId(result.workloadHash));
 
     // --- options --------------------------------------------------------
     json.attributeObject("searchOptions", [&] {
@@ -356,6 +360,22 @@ std::string writePlanReport(const MappingSearchResult &result,
                 });
               }
             });
+            // The resolved rule parameters generation solved, so a replay
+            // validates the recorded assignment rather than re-deriving one.
+            json.attributeObject("ruleParameters", [&] {
+              std::vector<std::string> names;
+              for (const auto &parameter : placement.resolvedParameters)
+                names.push_back(parameter.first().str());
+              llvm::sort(names);
+              for (const std::string &name : names) {
+                const SearchValue &bound =
+                    placement.resolvedParameters.lookup(name);
+                if (const int64_t *integer = std::get_if<int64_t>(&bound))
+                  json.attribute(name, static_cast<int64_t>(*integer));
+                else
+                  json.attribute(name, std::get<std::string>(bound));
+              }
+            });
           });
         }
       });
@@ -419,6 +439,49 @@ std::string writePlanReport(const MappingSearchResult &result,
                       "dstMap", printedMapString(connection.transform->dstMap));
               });
             }
+          });
+        }
+      });
+      // Storage and synchronization state (design §9.6). B1 persists it; B3
+      // populates it, so an empty array is legal today.
+      json.attributeArray("allocations", [&] {
+        if (!selected)
+          return;
+        for (const StorageAllocation &allocation : selected->allocations) {
+          json.object([&] {
+            json.attribute("id", hexId(allocation.id));
+            json.attribute("value", static_cast<uint64_t>(allocation.value));
+            json.attribute("memory", allocation.memory);
+            json.attribute("bytes", allocation.bytes);
+            if (allocation.aliasOf)
+              json.attribute("aliasOf", hexId(*allocation.aliasOf));
+            json.attribute("beginStep", allocation.beginStep);
+            json.attribute("endStep", allocation.endStep);
+          });
+        }
+      });
+      json.attributeArray("synchronization", [&] {
+        if (!selected)
+          return;
+        for (const SynchronizationStep &step : selected->synchronization) {
+          json.object([&] {
+            json.attribute("id", step.id);
+            json.attributeArray("waitsFor", [&] {
+              for (ConnectionId connection : step.waitsFor)
+                json.value(hexId(connection));
+            });
+            json.attributeArray("precedes", [&] {
+              for (const PortRef &port : step.precedes)
+                json.object([&] {
+                  json.attribute("node", static_cast<uint64_t>(port.node));
+                  json.attribute("direction",
+                                 port.direction == PortDirection::Input
+                                     ? "input"
+                                     : "output");
+                  json.attribute("index", static_cast<uint64_t>(port.index));
+                });
+            });
+            json.attribute("requiresBarrier", step.requiresBarrier);
           });
         }
       });
@@ -508,6 +571,13 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
     return reportError(
         "plan report target_hash does not match the target; the plan was not "
         "bound for it");
+  // The report records the canonical source-graph hash, so a semantic change to
+  // the input graph is rejected before any executable binding -- not merely a
+  // structural "the placement node still resolves" check.
+  std::optional<llvm::StringRef> graphHash = root->getString("graphHash");
+  if (!graphHash || *graphHash != hexId(computeSourceGraphHash(graph)))
+    return reportError(
+        "plan report graph_hash does not match the supplied source graph");
   const llvm::json::Object *state = root->getObject("selectedState");
   if (!state)
     return reportError("plan report has no selectedState");
@@ -610,6 +680,18 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
           placement.layoutSolutions[*key] = std::move(solved);
         }
       }
+      if (const llvm::json::Object *parameters =
+              object->getObject("ruleParameters"))
+        for (const auto &parameter : *parameters) {
+          if (std::optional<int64_t> integer = parameter.second.getAsInteger())
+            placement.resolvedParameters[parameter.first] = *integer;
+          else if (std::optional<llvm::StringRef> text =
+                       parameter.second.getAsString())
+            placement.resolvedParameters[parameter.first] = text->str();
+          else
+            return reportError("plan report rule parameter is neither an "
+                               "integer nor a string");
+        }
       plan.placements.push_back(std::move(placement));
     }
   }
@@ -685,6 +767,57 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         connection.transform = layoutTransform;
       }
       plan.connectionPlans.push_back(std::move(connection));
+    }
+  }
+
+  if (const llvm::json::Array *allocations = state->getArray("allocations")) {
+    for (const llvm::json::Value &element : *allocations) {
+      const llvm::json::Object *object = element.getAsObject();
+      if (!object)
+        return reportError("plan report allocation is not an object");
+      StorageAllocation allocation;
+      if (std::optional<llvm::StringRef> id = object->getString("id"))
+        allocation.id = parseHexId(*id);
+      if (std::optional<int64_t> value = object->getInteger("value"))
+        allocation.value = static_cast<WorkloadValueId>(*value);
+      if (std::optional<llvm::StringRef> memory = object->getString("memory"))
+        allocation.memory = memory->str();
+      if (std::optional<int64_t> bytes = object->getInteger("bytes"))
+        allocation.bytes = static_cast<uint64_t>(*bytes);
+      if (std::optional<llvm::StringRef> alias = object->getString("aliasOf"))
+        allocation.aliasOf = parseHexId(*alias);
+      if (std::optional<int64_t> begin = object->getInteger("beginStep"))
+        allocation.beginStep = static_cast<uint64_t>(*begin);
+      if (std::optional<int64_t> end = object->getInteger("endStep"))
+        allocation.endStep = static_cast<uint64_t>(*end);
+      plan.allocations.push_back(std::move(allocation));
+    }
+  }
+  if (const llvm::json::Array *synchronization =
+          state->getArray("synchronization")) {
+    for (const llvm::json::Value &element : *synchronization) {
+      const llvm::json::Object *object = element.getAsObject();
+      if (!object)
+        return reportError("plan report synchronization step is not an object");
+      SynchronizationStep step;
+      if (std::optional<int64_t> id = object->getInteger("id"))
+        step.id = static_cast<uint64_t>(*id);
+      if (const llvm::json::Array *waitsFor = object->getArray("waitsFor"))
+        for (const llvm::json::Value &id : *waitsFor)
+          if (std::optional<llvm::StringRef> text = id.getAsString())
+            step.waitsFor.push_back(
+                static_cast<ConnectionId>(parseHexId(*text)));
+      if (const llvm::json::Array *precedes = object->getArray("precedes"))
+        for (const llvm::json::Value &port : *precedes) {
+          llvm::Expected<PortRef> ref =
+              jsonPortRef(port.getAsObject(), "synchronization precedes");
+          if (!ref)
+            return ref.takeError();
+          step.precedes.push_back(*ref);
+        }
+      if (std::optional<bool> barrier = object->getBoolean("requiresBarrier"))
+        step.requiresBarrier = *barrier;
+      plan.synchronization.push_back(std::move(step));
     }
   }
 

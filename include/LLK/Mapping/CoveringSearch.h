@@ -133,6 +133,10 @@ struct MappingSearchResult {
   uint64_t routeCount = 0;
   /// Complete plans found before the top-K cap truncated `plans`.
   uint64_t planCount = 0;
+  /// The canonical, pre-materialization content hash of the workload graph the
+  /// search ran over (`computeSourceGraphHash`). A report records it so a
+  /// reader can require the same source identity before replaying a selection.
+  uint64_t workloadHash = 0;
 };
 
 /// Searches one workload graph against one target.

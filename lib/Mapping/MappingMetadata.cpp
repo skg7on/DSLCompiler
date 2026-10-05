@@ -332,6 +332,22 @@ llvm::Expected<SearchValue> searchValueOf(mlir::Attribute attribute,
   return metadataError(where.str() + ": parameter is not an integer or string");
 }
 
+/// A sorted, typed dictionary of resolved rule parameters.
+mlir::DictionaryAttr
+parametersAttr(mlir::MLIRContext *context,
+               const llvm::StringMap<SearchValue> &parameters) {
+  std::vector<std::string> names;
+  names.reserve(parameters.size());
+  for (const auto &entry : parameters)
+    names.push_back(entry.first().str());
+  llvm::sort(names);
+  llvm::SmallVector<mlir::NamedAttribute> attributes;
+  for (const std::string &name : names)
+    attributes.emplace_back(mlir::StringAttr::get(context, name),
+                            searchValueAttr(context, parameters.lookup(name)));
+  return mlir::DictionaryAttr::get(context, attributes);
+}
+
 mlir::DictionaryAttr
 stringMapAttr(mlir::MLIRContext *context,
               const llvm::StringMap<std::string> &entries) {
@@ -571,6 +587,24 @@ mlir::Attribute metadataPortRefAttr(mlir::MLIRContext *context,
   return mlir::DictionaryAttr::get(context, fields);
 }
 
+llvm::Expected<SearchValue> readMetadataSearchValue(mlir::Attribute raw,
+                                                    llvm::StringRef where) {
+  return searchValueOf(raw, where);
+}
+
+bool planMetadataIsSchemaV2(mlir::DictionaryAttr plan) {
+  if (!plan)
+    return false;
+  if (auto version = plan.getAs<mlir::IntegerAttr>("schema_version"))
+    if (version.getInt() >= 2)
+      return true;
+  for (llvm::StringRef name : {"graph_hash", "target_hash", "machine_hash",
+                               "layout_hash", "rule_hash"})
+    if (plan.get(name))
+      return true;
+  return false;
+}
+
 //===----------------------------------------------------------------------===//
 // Encoding
 //===----------------------------------------------------------------------===//
@@ -616,6 +650,51 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
   planFields.emplace_back(
       mlir::StringAttr::get(context, "truncated"),
       mlir::BoolAttr::get(context, plan.diagnostics.searchTruncated));
+  // Concrete storage allocations and synchronization decisions (design §9.6).
+  // B1 persists them; B3 populates them. Empty is legal today.
+  llvm::SmallVector<mlir::Attribute> allocations;
+  for (const StorageAllocation &allocation : plan.allocations) {
+    llvm::SmallVector<mlir::NamedAttribute> fields;
+    fields.emplace_back(mlir::StringAttr::get(context, "id"),
+                        u64Attr(context, allocation.id));
+    fields.emplace_back(mlir::StringAttr::get(context, "value"),
+                        u64Attr(context, allocation.value));
+    fields.emplace_back(mlir::StringAttr::get(context, "memory"),
+                        mlir::StringAttr::get(context, allocation.memory));
+    fields.emplace_back(mlir::StringAttr::get(context, "bytes"),
+                        u64Attr(context, allocation.bytes));
+    if (allocation.aliasOf)
+      fields.emplace_back(mlir::StringAttr::get(context, "alias_of"),
+                          u64Attr(context, *allocation.aliasOf));
+    fields.emplace_back(mlir::StringAttr::get(context, "begin_step"),
+                        u64Attr(context, allocation.beginStep));
+    fields.emplace_back(mlir::StringAttr::get(context, "end_step"),
+                        u64Attr(context, allocation.endStep));
+    allocations.push_back(mlir::DictionaryAttr::get(context, fields));
+  }
+  planFields.emplace_back(mlir::StringAttr::get(context, "allocations"),
+                          mlir::ArrayAttr::get(context, allocations));
+  llvm::SmallVector<mlir::Attribute> synchronization;
+  for (const SynchronizationStep &step : plan.synchronization) {
+    llvm::SmallVector<mlir::NamedAttribute> fields;
+    fields.emplace_back(mlir::StringAttr::get(context, "id"),
+                        u64Attr(context, step.id));
+    llvm::SmallVector<mlir::Attribute> waitsFor;
+    for (ConnectionId connection : step.waitsFor)
+      waitsFor.push_back(u64Attr(context, connection));
+    fields.emplace_back(mlir::StringAttr::get(context, "waits_for"),
+                        mlir::ArrayAttr::get(context, waitsFor));
+    llvm::SmallVector<mlir::Attribute> precedes;
+    for (const PortRef &port : step.precedes)
+      precedes.push_back(metadataPortRefAttr(context, port));
+    fields.emplace_back(mlir::StringAttr::get(context, "precedes"),
+                        mlir::ArrayAttr::get(context, precedes));
+    fields.emplace_back(mlir::StringAttr::get(context, "requires_barrier"),
+                        mlir::BoolAttr::get(context, step.requiresBarrier));
+    synchronization.push_back(mlir::DictionaryAttr::get(context, fields));
+  }
+  planFields.emplace_back(mlir::StringAttr::get(context, "synchronization"),
+                          mlir::ArrayAttr::get(context, synchronization));
   kernel->setAttr(kPlanAttr, mlir::DictionaryAttr::get(context, planFields));
 
   for (const PlanPlacement &placement : plan.placements) {
@@ -661,6 +740,11 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
       attributes.emplace_back(
           mlir::StringAttr::get(context, "bundle_parameters"),
           placement.bundle.parameters);
+    // The resolved rule parameters are always recorded (possibly empty), so a
+    // v2 reader can require the container and validate the recorded assignment.
+    attributes.emplace_back(
+        mlir::StringAttr::get(context, "rule_parameters"),
+        parametersAttr(context, placement.resolvedParameters));
 
     if (rule->layoutRequirements.empty()) {
       // An explicit "no layout" marker: a v2 reader requires exactly one of the
@@ -807,18 +891,36 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
   if (!planAttr)
     return metadataError("the kernel is not mapped: it has no micro.plan");
 
+  bool schemaDeclared = false;
   uint64_t schemaVersion = 1;
   if (auto version = planAttr.getAs<mlir::IntegerAttr>("schema_version")) {
     if (version.getInt() < 0)
       return metadataError("micro.plan schema_version is negative");
     schemaVersion = static_cast<uint64_t>(version.getInt());
+    schemaDeclared = true;
   }
   if (schemaVersion > kSupportedMappingMetadataVersion)
     return metadataError("micro.plan records unsupported schema version " +
                          std::to_string(schemaVersion) +
                          "; this reader understands at most " +
                          std::to_string(kSupportedMappingMetadataVersion));
-  const bool v2 = schemaVersion >= 2;
+  // A v2-only field implies v2 even when `schema_version` is missing, so
+  // deleting the version stamp cannot silently downgrade the binding to v1. A
+  // binding that *declares* an old version but records v2 fields is a tampered
+  // stamp and is rejected.
+  bool hasV2Fields = false;
+  for (llvm::StringRef name : {"graph_hash", "target_hash", "machine_hash",
+                               "layout_hash", "rule_hash"})
+    if (planAttr.get(name)) {
+      hasV2Fields = true;
+      break;
+    }
+  if (schemaDeclared && schemaVersion < 2 && hasV2Fields)
+    return metadataError(
+        "micro.plan declares schema_version < 2 but records v2 fields");
+  const bool v2 = (schemaDeclared && schemaVersion >= 2) || hasV2Fields;
+  if (v2)
+    schemaVersion = kMappingMetadataVersion;
 
   WorkloadGraphBinding binding;
   llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel, &binding);
@@ -867,6 +969,65 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
     plan.layoutHash = target.layouts().computeContentHash();
     plan.ruleHash = target.rules().computeContentHash();
     plan.targetHash = computeTargetContentHash(target);
+  }
+
+  // --- storage and synchronization state (design §9.6) -------------------
+  // B1 persists these; B3 populates them. An empty container is legal today.
+  if (auto allocations = planAttr.getAs<mlir::ArrayAttr>("allocations")) {
+    for (mlir::Attribute element : allocations) {
+      auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+      if (!dict)
+        return metadataError(
+            "micro.plan 'allocations' entry is not a dictionary");
+      StorageAllocation allocation;
+      if (auto value = dict.getAs<mlir::IntegerAttr>("id"))
+        allocation.id = value.getValue().getZExtValue();
+      if (auto value = dict.getAs<mlir::IntegerAttr>("value"))
+        allocation.value =
+            static_cast<WorkloadValueId>(value.getValue().getZExtValue());
+      llvm::Expected<std::string> memory =
+          readMetadataString(dict, "memory", "micro.plan allocations");
+      if (!memory)
+        return memory.takeError();
+      allocation.memory = *memory;
+      if (auto value = dict.getAs<mlir::IntegerAttr>("bytes"))
+        allocation.bytes = value.getValue().getZExtValue();
+      if (auto value = dict.getAs<mlir::IntegerAttr>("alias_of"))
+        allocation.aliasOf = value.getValue().getZExtValue();
+      if (auto value = dict.getAs<mlir::IntegerAttr>("begin_step"))
+        allocation.beginStep = value.getValue().getZExtValue();
+      if (auto value = dict.getAs<mlir::IntegerAttr>("end_step"))
+        allocation.endStep = value.getValue().getZExtValue();
+      plan.allocations.push_back(std::move(allocation));
+    }
+  }
+  if (auto synchronization =
+          planAttr.getAs<mlir::ArrayAttr>("synchronization")) {
+    for (mlir::Attribute element : synchronization) {
+      auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+      if (!dict)
+        return metadataError(
+            "micro.plan 'synchronization' entry is not a dictionary");
+      SynchronizationStep step;
+      if (auto value = dict.getAs<mlir::IntegerAttr>("id"))
+        step.id = value.getValue().getZExtValue();
+      if (auto waitsFor = dict.getAs<mlir::ArrayAttr>("waits_for"))
+        for (mlir::Attribute id : waitsFor)
+          if (auto value = mlir::dyn_cast<mlir::IntegerAttr>(id))
+            step.waitsFor.push_back(
+                static_cast<ConnectionId>(value.getValue().getZExtValue()));
+      if (auto precedes = dict.getAs<mlir::ArrayAttr>("precedes"))
+        for (mlir::Attribute port : precedes) {
+          llvm::Expected<PortRef> ref = readMetadataPortRef(
+              port, "precedes", "micro.plan synchronization");
+          if (!ref)
+            return ref.takeError();
+          step.precedes.push_back(*ref);
+        }
+      if (auto barrier = dict.getAs<mlir::BoolAttr>("requires_barrier"))
+        step.requiresBarrier = barrier.getValue();
+      plan.synchronization.push_back(std::move(step));
+    }
   }
 
   // --- placements --------------------------------------------------------
@@ -955,6 +1116,37 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       }
       for (const auto &entry : *read)
         placement.layouts[entry.first()] = entry.second;
+    }
+
+    // The resolved rule parameters. A v2 binding must record the container (it
+    // may be empty), so deleting it cannot downgrade verification to
+    // generation's existential fallback.
+    if (mlir::Attribute rawRuleParameters = mapping.get("rule_parameters")) {
+      auto parameters = mlir::dyn_cast<mlir::DictionaryAttr>(rawRuleParameters);
+      if (!parameters) {
+        sawUnrecoverable = true;
+        return;
+      }
+      for (const mlir::NamedAttribute &parameter : parameters) {
+        llvm::Expected<SearchValue> value =
+            readMetadataSearchValue(parameter.getValue(), where);
+        if (!value) {
+          sawUnrecoverable = true;
+          return;
+        }
+        placement.resolvedParameters[parameter.getName()] = *value;
+      }
+    } else if (v2) {
+      sawUnrecoverable = true;
+      return;
+    }
+
+    // A v2 solved-layout container must be accompanied by its entries, so
+    // deleting `layout_entries` fails on decode as well as on verify.
+    if (v2 && mapping.get("layout_parameters") &&
+        !mapping.get("layout_entries")) {
+      sawUnrecoverable = true;
+      return;
     }
 
     // Endpoints and concrete maps of each solved layout, when recorded.

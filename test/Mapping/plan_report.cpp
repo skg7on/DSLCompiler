@@ -526,8 +526,9 @@ TEST(MappingPlanReportTest, ReplayRejectsAChangedTarget) {
             std::string::npos);
 }
 
-// A report replayed against a changed input graph is rejected: a recorded
-// placement no longer resolves in the graph.
+// A report replayed against a graph whose workload changed semantically -- the
+// same node ids and port shapes, but a different operation attribute -- is
+// rejected by the source-graph content hash, not merely by node resolution.
 TEST(MappingPlanReportTest, ReplayRejectsAChangedInputGraph) {
   Parsed parsed = parseKernel(kKernel);
   ASSERT_TRUE(parsed.module);
@@ -541,15 +542,15 @@ TEST(MappingPlanReportTest, ReplayRejectsAChangedInputGraph) {
   std::string report = writePlanReport(result, (**target).machine(), **target,
                                        options, stableHash(kKernel));
 
-  // A graph with no workload nodes: the recorded placements cannot resolve.
-  Parsed changed = parseKernel(R"mlir(
-module {
-  micro.kernel @mapped {
-    micro.yield
-  }
-}
-)mlir");
+  // The same kernel with one semantic attribute changed. Node ids, ports and
+  // the placement's rule mnemonic all still resolve, so only a content hash can
+  // distinguish it.
+  Parsed changed = parseKernel(kKernel);
   ASSERT_TRUE(changed.module);
+  changed.module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.vector")
+      op->setAttr("op", StringAttr::get(changed.context.get(), "mul"));
+  });
   llvm::Expected<WorkloadGraph> changedGraph =
       extractWorkloadGraph(changed.kernel);
   ASSERT_TRUE(static_cast<bool>(changedGraph));
@@ -557,6 +558,6 @@ module {
   llvm::Expected<CoveringPlan> replay =
       readPlanReport(report, **target, *changedGraph);
   ASSERT_FALSE(static_cast<bool>(replay));
-  EXPECT_NE(llvm::toString(replay.takeError()).find("source graph"),
+  EXPECT_NE(llvm::toString(replay.takeError()).find("graph"),
             std::string::npos);
 }
