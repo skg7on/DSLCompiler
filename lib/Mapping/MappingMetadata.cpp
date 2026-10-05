@@ -287,6 +287,18 @@ std::string canonicalProjectedGraphString(const WorkloadGraph &graph) {
     }
     record += "|attrs=";
     record += strippedAttributesString(node);
+    // The node's execution multiplicity is a semantic fact -- a trip count
+    // scales the storage reservation -- so it joins the source-graph identity.
+    // Two kernels identical but for a loop bound must hash differently, or a
+    // report bound for one would replay onto the other. `?` marks an unknown
+    // count, distinct from any known value. Deliberately *not* folded into
+    // `structuralNodeKey`, which correlates source nodes with their
+    // materialized counterparts and must stay multiplicity-free.
+    record += "|mult=";
+    if (node.executionMultiplicity)
+      record += std::to_string(*node.executionMultiplicity);
+    else
+      record += "?";
     records.push_back(std::move(record));
   }
   llvm::sort(records);

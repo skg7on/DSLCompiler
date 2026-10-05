@@ -497,10 +497,11 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
 
   auto emitConnection = [&](size_t index) {
     const PlanConnection &connection = plan.connectionPlans[index];
-    connectionStep[connection.id] =
-        addStep(PlanStepKind::Movement, 0, connection.id);
+    // A Direct connection materializes nothing, so it gets no Movement step.
     if (!materializesMovement(connection))
       return;
+    connectionStep[connection.id] =
+        addStep(PlanStepKind::Movement, 0, connection.id);
     SynchronizationStep sync;
     sync.id = nextSyncId++;
     sync.waitsFor.push_back(connection.id);

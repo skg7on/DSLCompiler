@@ -9,6 +9,7 @@
 #include "LLK/Mapping/StoragePlan.h"
 
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanReport.h"
@@ -656,4 +657,129 @@ TEST(StoragePlan, ATransformedReplicaIsChargedToItsDestinationMemory) {
       << "the transformed replica must be charged to dram.0";
   EXPECT_TRUE(sawSource)
       << "the immutable producer must stay charged in sram.0";
+}
+
+//===----------------------------------------------------------------------===//
+// Fix round 2: multiplicity joins source-graph identity; metadata round trip
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// `kLoopedKernelConstant` with the trip count doubled to eight.
+constexpr llvm::StringLiteral kLoopedKernelEight = R"mlir(
+module {
+  micro.kernel @loop {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c8 = arith.constant 8 : index
+    micro.for %i = %c0 to %c8 step %c1 {
+      %t = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+      %r = micro.vector "add" %t, %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    }
+    micro.yield
+  }
+}
+)mlir";
+
+} // namespace
+
+TEST(StoragePlan, AChangedLoopTripCountChangesTheGraphHashAndRejectsReplay) {
+  ParsedKernel four = parseKernel(kLoopedKernelConstant);
+  ParsedKernel eight = parseKernel(kLoopedKernelEight);
+  ASSERT_TRUE(four.module);
+  ASSERT_TRUE(eight.module);
+  llvm::Expected<WorkloadGraph> graphFour = extractWorkloadGraph(four.kernel);
+  llvm::Expected<WorkloadGraph> graphEight = extractWorkloadGraph(eight.kernel);
+  ASSERT_TRUE(static_cast<bool>(graphFour))
+      << llvm::toString(graphFour.takeError());
+  ASSERT_TRUE(static_cast<bool>(graphEight))
+      << llvm::toString(graphEight.takeError());
+
+  // A trip count is a semantic fact: two kernels identical but for it must not
+  // share a source-graph identity.
+  EXPECT_NE(computeSourceGraphHash(*graphFour),
+            computeSourceGraphHash(*graphEight));
+
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(*graphFour, *target, *four.context, LayoutContext{},
+                        options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_FALSE(bool(finalizeStoragePlan(*graphFour, result->plans.front(),
+                                        storageMachine())));
+  std::string report = writePlanReport(*result, target->machine(), *target,
+                                       options, /*moduleHash=*/0);
+
+  // The report bound for the four-iteration kernel is rejected against the
+  // eight-iteration kernel's graph, whose storage reservation would be double.
+  llvm::Expected<CoveringPlan> replayed =
+      readPlanReport(report, *target, *graphEight);
+  EXPECT_FALSE(static_cast<bool>(replayed));
+
+  // The control: the same report replays against its own graph.
+  llvm::Expected<CoveringPlan> control =
+      readPlanReport(report, *target, *graphFour);
+  EXPECT_TRUE(static_cast<bool>(control))
+      << llvm::toString(control.takeError());
+}
+
+TEST(StoragePlan, DirectConnectionsProduceNoMovementStep) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = chainGraph(context, tileType(context, "8x8xf32"), 1);
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+  std::optional<CoveringPlan> plan = searchOne(graph, *target, context);
+  ASSERT_TRUE(plan.has_value());
+  ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
+
+  // Every connection in this all-sram chain is Direct, so the plan-step DAG is
+  // compute steps only: a connection that materializes nothing gets no step.
+  size_t computeSteps = 0;
+  for (const PlanStep &step : plan->steps) {
+    EXPECT_NE(step.kind, PlanStepKind::Movement);
+    EXPECT_NE(step.kind, PlanStepKind::Synchronization);
+    if (step.kind == PlanStepKind::Compute)
+      ++computeSteps;
+  }
+  EXPECT_EQ(computeSteps, graph.getNodes().size());
+}
+
+TEST(StoragePlan, ModuleMetadataRoundTripsThePlanStepDag) {
+  ParsedKernel parsed = parseKernel(kLoopedKernelConstant);
+  ASSERT_TRUE(parsed.module);
+  ASSERT_NE(parsed.kernel, nullptr);
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(*graph, *target, *parsed.context, LayoutContext{},
+                        options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  CoveringPlan &plan = result->plans.front();
+  ASSERT_FALSE(bool(finalizeStoragePlan(*graph, plan, storageMachine())));
+  ASSERT_FALSE(plan.steps.empty());
+
+  llvm::Error encoded = encodeSelectedPlan(parsed.module.get(), plan, *target);
+  ASSERT_FALSE(bool(encoded)) << llvm::toString(std::move(encoded));
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(parsed.module.get(), *target);
+  ASSERT_TRUE(static_cast<bool>(decoded))
+      << llvm::toString(decoded.takeError());
+  ASSERT_EQ(decoded->steps.size(), plan.steps.size());
+  for (size_t i = 0; i < plan.steps.size(); ++i) {
+    EXPECT_EQ(decoded->steps[i].id, plan.steps[i].id);
+    EXPECT_EQ(decoded->steps[i].kind, plan.steps[i].kind);
+    EXPECT_EQ(decoded->steps[i].node, plan.steps[i].node);
+    EXPECT_EQ(decoded->steps[i].connection, plan.steps[i].connection);
+  }
+  EXPECT_EQ(decoded->stepEdges, plan.stepEdges);
 }

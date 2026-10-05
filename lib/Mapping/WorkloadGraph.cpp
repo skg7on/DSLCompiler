@@ -8,6 +8,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <functional>
+#include <limits>
 #include <numeric>
 
 namespace mlir::llk::mapping {
@@ -82,8 +83,13 @@ std::optional<uint64_t> loopTripCount(Operation *loop) {
   std::optional<int64_t> step = constantIndex(loop->getOperand(2));
   if (!lower || !upper || !step || *step <= 0 || *upper <= *lower)
     return std::nullopt;
-  uint64_t span = static_cast<uint64_t>(*upper - *lower);
+  // Compute the span in unsigned arithmetic: `*upper - *lower` as signed int64
+  // would be UB for pathological bounds (for example INT64_MIN..INT64_MAX) even
+  // though the `*upper > *lower` guard above makes the difference positive.
+  uint64_t span = static_cast<uint64_t>(*upper) - static_cast<uint64_t>(*lower);
   uint64_t stride = static_cast<uint64_t>(*step);
+  if (span > std::numeric_limits<uint64_t>::max() - (stride - 1))
+    return std::nullopt; // the rounded-up span would overflow
   return (span + stride - 1) / stride;
 }
 
