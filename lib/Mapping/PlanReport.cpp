@@ -13,9 +13,13 @@
 #include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/LatencyProvider.h"
+#include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/StableHash.h"
 #include "LLK/Version.h"
+
+#include "mlir/AsmParser/AsmParser.h"
+#include "mlir/IR/BuiltinAttributes.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
@@ -25,7 +29,11 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
+#include <utility>
+#include <variant>
+#include <vector>
 
 namespace mlir::llk::mapping {
 
@@ -91,6 +99,16 @@ std::string fixedDouble(double value) {
   return std::string(buffer);
 }
 
+/// The printed form of an affine map, for the report's replay state.
+std::string printedMapString(mlir::AffineMap map) {
+  if (!map)
+    return {};
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  map.print(stream);
+  return stream.str();
+}
+
 } // namespace
 
 llvm::StringRef compilerVersion() { return LLK_COMPILER_VERSION; }
@@ -136,6 +154,10 @@ std::string writePlanReport(const MappingSearchResult &result,
                    hexId(target.layouts().computeContentHash()));
     json.attribute("ruleLibraryHash",
                    hexId(target.rules().computeContentHash()));
+    // The target's folded content identity (name + machine + layout + rule
+    // hashes). A replay must match it, so a report cannot be replayed against a
+    // target the plan was not bound for.
+    json.attribute("targetHash", hexId(computeTargetContentHash(target)));
 
     // --- options --------------------------------------------------------
     json.attributeObject("searchOptions", [&] {
@@ -251,6 +273,157 @@ std::string writePlanReport(const MappingSearchResult &result,
       }
     });
 
+    // --- selected plan state, for versioned replay ----------------------
+    // The exact execution-affecting selection: endpoints, routes, resolved
+    // layout parameters and concrete maps, resource bindings. `readPlanReport`
+    // reconstructs it, so a report alone (plus the target and source graph) can
+    // replay the selected plan's data.
+    json.attributeObject("selectedState", [&] {
+      json.attribute("id", hexId(selected ? selected->id : 0));
+      json.attribute("sourceBindingHash",
+                     hexId(selected ? selected->sourceBindingHash : 0));
+      json.attribute("materialized", selected ? selected->materialized : false);
+      json.attributeArray("placements", [&] {
+        if (!selected)
+          return;
+        for (const PlanPlacement &placement : selected->placements) {
+          json.object([&] {
+            json.attribute("node", static_cast<uint64_t>(placement.node));
+            json.attribute("instance", hexId(placement.instance));
+            json.attribute("rule", placement.rule);
+            json.attribute("bundle", placement.bundle.name);
+            json.attribute("emitter", placement.bundle.emitterKey);
+            json.attribute("executor", placement.executor);
+            // `StringMap` iteration order is not a contract; sort the keys so
+            // the report stays byte-identical across runs (§29.12).
+            json.attributeObject("memories", [&] {
+              std::vector<std::string> keys;
+              for (const auto &entry : placement.memories)
+                keys.push_back(entry.first().str());
+              llvm::sort(keys);
+              for (const std::string &key : keys)
+                json.attribute(key, placement.memories.lookup(key));
+            });
+            json.attributeObject("layouts", [&] {
+              std::vector<std::string> keys;
+              for (const auto &entry : placement.layouts)
+                keys.push_back(entry.first().str());
+              llvm::sort(keys);
+              for (const std::string &key : keys)
+                json.attribute(key, placement.layouts.lookup(key));
+            });
+            json.attributeArray("solutions", [&] {
+              std::vector<std::string> keys;
+              for (const auto &entry : placement.layoutSolutions)
+                keys.push_back(entry.first().str());
+              llvm::sort(keys);
+              for (const std::string &key : keys) {
+                const SolvedLayout &solved =
+                    placement.layoutSolutions.lookup(key);
+                json.object([&] {
+                  json.attribute("key", key);
+                  json.attribute("class", solved.layoutClass);
+                  json.attribute("family",
+                                 placement.layouts.lookup(solved.layoutClass));
+                  if (solved.port)
+                    json.attributeObject("port", [&] {
+                      json.attribute("node",
+                                     static_cast<uint64_t>(solved.port->node));
+                      json.attribute("direction", solved.port->direction ==
+                                                          PortDirection::Input
+                                                      ? "input"
+                                                      : "output");
+                      json.attribute("index",
+                                     static_cast<uint64_t>(solved.port->index));
+                    });
+                  json.attributeObject("parameters", [&] {
+                    std::vector<std::string> names;
+                    for (const auto &parameter : solved.parameters)
+                      names.push_back(parameter.first().str());
+                    llvm::sort(names);
+                    for (const std::string &parameter : names) {
+                      const SearchValue &bound =
+                          solved.parameters.lookup(parameter);
+                      if (const int64_t *integer = std::get_if<int64_t>(&bound))
+                        json.attribute(parameter,
+                                       static_cast<int64_t>(*integer));
+                      else
+                        json.attribute(parameter, std::get<std::string>(bound));
+                    }
+                  });
+                  if (solved.map)
+                    json.attribute("map", printedMapString(solved.map));
+                });
+              }
+            });
+          });
+        }
+      });
+      json.attributeArray("connections", [&] {
+        if (!selected)
+          return;
+        for (const PlanConnection &connection : selected->connectionPlans) {
+          json.object([&] {
+            json.attribute("id", hexId(connection.id));
+            json.attribute("value", static_cast<uint64_t>(connection.value));
+            json.attribute("kind",
+                           stringifyConnectionKind(connection.kind).str());
+            json.attributeArray("route", [&] {
+              for (const MemoryNodeId &node : connection.route)
+                json.value(node);
+            });
+            json.attributeArray("engines", [&] {
+              for (const ExecutorId &engine : connection.engines)
+                json.value(engine);
+            });
+            json.attributeArray("consumers", [&] {
+              for (InstanceId consumer : connection.consumers)
+                json.value(hexId(consumer));
+            });
+            json.attributeArray("storageIds", [&] {
+              for (uint64_t id : connection.storageIds)
+                json.value(hexId(id));
+            });
+            if (connection.producerPort)
+              json.attributeObject("producerPort", [&] {
+                json.attribute("node", static_cast<uint64_t>(
+                                           connection.producerPort->node));
+                json.attribute("direction",
+                               connection.producerPort->direction ==
+                                       PortDirection::Input
+                                   ? "input"
+                                   : "output");
+                json.attribute("index", static_cast<uint64_t>(
+                                            connection.producerPort->index));
+              });
+            json.attributeArray("consumerPorts", [&] {
+              for (const PortRef &port : connection.consumerPorts)
+                json.object([&] {
+                  json.attribute("node", static_cast<uint64_t>(port.node));
+                  json.attribute("direction",
+                                 port.direction == PortDirection::Input
+                                     ? "input"
+                                     : "output");
+                  json.attribute("index", static_cast<uint64_t>(port.index));
+                });
+            });
+            if (connection.transform) {
+              json.attributeObject("transform", [&] {
+                json.attribute("src", connection.transform->srcLayout);
+                json.attribute("dst", connection.transform->dstLayout);
+                if (connection.transform->srcMap)
+                  json.attribute(
+                      "srcMap", printedMapString(connection.transform->srcMap));
+                if (connection.transform->dstMap)
+                  json.attribute(
+                      "dstMap", printedMapString(connection.transform->dstMap));
+              });
+            }
+          });
+        }
+      });
+    });
+
     json.attribute("selectedPlanId", hexId(selected ? selected->id : 0));
   });
 
@@ -277,6 +450,254 @@ llvm::Error writePlanReportFile(llvm::StringRef path,
     return llvm::createStringError(
         out.error(), llvm::Twine("cannot write plan report to '") + path + "'");
   return llvm::Error::success();
+}
+
+namespace {
+
+llvm::Error reportError(std::string message) {
+  return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                 std::move(message));
+}
+
+/// Parses the fixed-width lowercase hexadecimal id `hexId` writes. A non-hex
+/// string yields 0, which then fails the identity checks that follow.
+uint64_t parseHexId(llvm::StringRef text) {
+  return std::strtoull(text.str().c_str(), nullptr, 16);
+}
+
+/// Reads an endpoint occurrence from a report object with checked types.
+llvm::Expected<PortRef> jsonPortRef(const llvm::json::Object *object,
+                                    llvm::StringRef where) {
+  if (!object)
+    return reportError(where.str() + ": expected a port object");
+  PortRef ref;
+  std::optional<int64_t> node = object->getInteger("node");
+  std::optional<int64_t> index = object->getInteger("index");
+  std::optional<llvm::StringRef> direction = object->getString("direction");
+  if (!node || !index || !direction)
+    return reportError(where.str() + ": malformed port reference");
+  if (*node < 0 || *index < 0)
+    return reportError(where.str() + ": negative port reference");
+  ref.node = static_cast<WorkloadNodeId>(*node);
+  ref.index = static_cast<uint32_t>(*index);
+  if (*direction == "input")
+    ref.direction = PortDirection::Input;
+  else if (*direction == "output")
+    ref.direction = PortDirection::Output;
+  else
+    return reportError(where.str() + ": unknown port direction");
+  return ref;
+}
+
+} // namespace
+
+llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
+                                            const MappingTarget &target,
+                                            const WorkloadGraph &graph) {
+  llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(json);
+  if (!parsed)
+    return parsed.takeError();
+  const llvm::json::Object *root = parsed->getAsObject();
+  if (!root)
+    return reportError("plan report is not a JSON object");
+  std::optional<int64_t> version = root->getInteger("version");
+  if (!version || *version != static_cast<int64_t>(kPlanReportVersion))
+    return reportError("plan report has an unsupported version");
+  std::optional<llvm::StringRef> targetHash = root->getString("targetHash");
+  if (!targetHash || *targetHash != hexId(computeTargetContentHash(target)))
+    return reportError(
+        "plan report target_hash does not match the target; the plan was not "
+        "bound for it");
+  const llvm::json::Object *state = root->getObject("selectedState");
+  if (!state)
+    return reportError("plan report has no selectedState");
+
+  CoveringPlan plan;
+  plan.schemaVersion = 2;
+  if (std::optional<llvm::StringRef> id = state->getString("id"))
+    plan.id = parseHexId(*id);
+  if (std::optional<llvm::StringRef> binding =
+          state->getString("sourceBindingHash"))
+    plan.sourceBindingHash = parseHexId(*binding);
+  if (std::optional<bool> materialized = state->getBoolean("materialized"))
+    plan.materialized = *materialized;
+  plan.targetHash = computeTargetContentHash(target);
+  plan.machineHash = machine::computeContentHash(target.machine());
+  plan.layoutHash = target.layouts().computeContentHash();
+  plan.ruleHash = target.rules().computeContentHash();
+
+  if (const llvm::json::Array *placements = state->getArray("placements")) {
+    for (const llvm::json::Value &element : *placements) {
+      const llvm::json::Object *object = element.getAsObject();
+      if (!object)
+        return reportError("plan report placement is not an object");
+      PlanPlacement placement;
+      std::optional<int64_t> node = object->getInteger("node");
+      if (!node || *node < 0)
+        return reportError("plan report placement has no node");
+      placement.node = static_cast<WorkloadNodeId>(*node);
+      // A placement must still resolve in the supplied source graph, so a
+      // report cannot be replayed against a changed input graph.
+      const WorkloadNode *workloadNode = graph.findNode(placement.node);
+      if (!workloadNode)
+        return reportError("plan report placement node does not resolve in the "
+                           "source graph");
+      if (std::optional<llvm::StringRef> instance =
+              object->getString("instance"))
+        placement.instance = static_cast<InstanceId>(parseHexId(*instance));
+      if (std::optional<llvm::StringRef> rule = object->getString("rule")) {
+        placement.rule = rule->str();
+        if (const RuleDef *def = target.rules().find(placement.rule))
+          if (def->matchOp != workloadNode->opName)
+            return reportError("plan report placement rule does not implement "
+                               "the source graph's operation");
+      }
+      if (std::optional<llvm::StringRef> bundle = object->getString("bundle"))
+        placement.bundle.name = bundle->str();
+      if (std::optional<llvm::StringRef> emitter = object->getString("emitter"))
+        placement.bundle.emitterKey = emitter->str();
+      if (std::optional<llvm::StringRef> executor =
+              object->getString("executor"))
+        placement.executor = executor->str();
+      if (const llvm::json::Object *memories = object->getObject("memories"))
+        for (const auto &entry : *memories)
+          if (std::optional<llvm::StringRef> value = entry.second.getAsString())
+            placement.memories[entry.first] = value->str();
+      if (const llvm::json::Object *layouts = object->getObject("layouts"))
+        for (const auto &entry : *layouts)
+          if (std::optional<llvm::StringRef> value = entry.second.getAsString())
+            placement.layouts[entry.first] = value->str();
+      if (const llvm::json::Array *solutions = object->getArray("solutions")) {
+        for (const llvm::json::Value &solution : *solutions) {
+          const llvm::json::Object *entry = solution.getAsObject();
+          if (!entry)
+            return reportError("plan report solution is not an object");
+          std::optional<llvm::StringRef> key = entry->getString("key");
+          if (!key)
+            return reportError("plan report solution has no key");
+          SolvedLayout solved;
+          if (std::optional<llvm::StringRef> klass = entry->getString("class"))
+            solved.layoutClass = klass->str();
+          if (const llvm::json::Object *port = entry->getObject("port")) {
+            llvm::Expected<PortRef> ref = jsonPortRef(port, "solution port");
+            if (!ref)
+              return ref.takeError();
+            if (!lookupPort(graph, *ref))
+              return reportError(
+                  "plan report solution endpoint does not resolve in the "
+                  "source graph");
+            solved.port = *ref;
+          }
+          if (const llvm::json::Object *parameters =
+                  entry->getObject("parameters"))
+            for (const auto &parameter : *parameters) {
+              if (std::optional<int64_t> integer =
+                      parameter.second.getAsInteger())
+                solved.parameters[parameter.first] = *integer;
+              else if (std::optional<llvm::StringRef> text =
+                           parameter.second.getAsString())
+                solved.parameters[parameter.first] = text->str();
+              else
+                return reportError("plan report solution parameter is neither "
+                                   "an integer nor a string");
+            }
+          // The concrete map is a pure function of the parameters and the
+          // layout declaration, and an `AffineMap` is owned by an
+          // `MLIRContext`. The report records the map for verification, but a
+          // replay reconstructs it from the parameters (and, when binding,
+          // re-validates it against the declaration) rather than returning a
+          // context-bound object whose lifetime this reader cannot own.
+          placement.layoutSolutions[*key] = std::move(solved);
+        }
+      }
+      plan.placements.push_back(std::move(placement));
+    }
+  }
+
+  if (const llvm::json::Array *connections = state->getArray("connections")) {
+    for (const llvm::json::Value &element : *connections) {
+      const llvm::json::Object *object = element.getAsObject();
+      if (!object)
+        return reportError("plan report connection is not an object");
+      PlanConnection connection;
+      if (std::optional<llvm::StringRef> id = object->getString("id"))
+        connection.id = static_cast<ConnectionId>(parseHexId(*id));
+      if (std::optional<int64_t> value = object->getInteger("value"))
+        connection.value = static_cast<WorkloadValueId>(*value);
+      std::optional<llvm::StringRef> kind = object->getString("kind");
+      if (!kind)
+        return reportError("plan report connection has no kind");
+      std::optional<ConnectionKind> symbolized = symbolizeConnectionKind(*kind);
+      if (!symbolized)
+        return reportError("plan report connection has an unknown kind");
+      connection.kind = *symbolized;
+      if (const llvm::json::Array *route = object->getArray("route"))
+        for (const llvm::json::Value &node : *route)
+          if (std::optional<llvm::StringRef> text = node.getAsString())
+            connection.route.push_back(text->str());
+      if (const llvm::json::Array *engines = object->getArray("engines"))
+        for (const llvm::json::Value &engine : *engines)
+          if (std::optional<llvm::StringRef> text = engine.getAsString())
+            connection.engines.push_back(text->str());
+      if (const llvm::json::Array *consumers = object->getArray("consumers"))
+        for (const llvm::json::Value &consumer : *consumers)
+          if (std::optional<llvm::StringRef> id = consumer.getAsString())
+            connection.consumers.push_back(
+                static_cast<InstanceId>(parseHexId(*id)));
+      if (const llvm::json::Array *storageIds = object->getArray("storageIds"))
+        for (const llvm::json::Value &id : *storageIds)
+          if (std::optional<llvm::StringRef> value = id.getAsString())
+            connection.storageIds.push_back(parseHexId(*value));
+      if (const llvm::json::Object *producer =
+              object->getObject("producerPort")) {
+        llvm::Expected<PortRef> ref = jsonPortRef(producer, "producerPort");
+        if (!ref)
+          return ref.takeError();
+        if (!lookupPort(graph, *ref))
+          return reportError(
+              "plan report connection endpoint does not resolve in the source "
+              "graph");
+        connection.producerPort = *ref;
+      }
+      if (const llvm::json::Array *consumerPorts =
+              object->getArray("consumerPorts"))
+        for (const llvm::json::Value &port : *consumerPorts) {
+          llvm::Expected<PortRef> ref =
+              jsonPortRef(port.getAsObject(), "consumerPorts");
+          if (!ref)
+            return ref.takeError();
+          if (!lookupPort(graph, *ref))
+            return reportError(
+                "plan report connection endpoint does not resolve in the "
+                "source graph");
+          connection.consumerPorts.push_back(*ref);
+        }
+      if (const llvm::json::Object *transform =
+              object->getObject("transform")) {
+        LayoutTransform layoutTransform;
+        if (std::optional<llvm::StringRef> src = transform->getString("src"))
+          layoutTransform.srcLayout = src->str();
+        if (std::optional<llvm::StringRef> dst = transform->getString("dst"))
+          layoutTransform.dstLayout = dst->str();
+        // The transform's maps are context-bound and re-derived by a
+        // materializer from the declaration and parameters; the report records
+        // them for inspection only.
+        connection.transform = layoutTransform;
+      }
+      plan.connectionPlans.push_back(std::move(connection));
+    }
+  }
+
+  for (const PlanPlacement &placement : plan.placements)
+    plan.instances.push_back(placement.instance);
+  llvm::sort(plan.instances);
+  plan.instances.erase(
+      std::unique(plan.instances.begin(), plan.instances.end()),
+      plan.instances.end());
+  for (const PlanConnection &connection : plan.connectionPlans)
+    plan.connections.push_back(connection.id);
+  llvm::sort(plan.connections);
+  return plan;
 }
 
 } // namespace mlir::llk::mapping

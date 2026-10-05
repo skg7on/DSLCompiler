@@ -2,6 +2,7 @@
 
 #include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
@@ -1456,4 +1457,463 @@ TEST(PlanBinder, RejectsAMovementOnAnUnsupportedTransferEngine) {
   std::string text = llvm::toString(std::move(e));
   EXPECT_NE(text.find("invalid_mapping_metadata"), std::string::npos) << text;
   EXPECT_NE(text.find("no_such_engine"), std::string::npos) << text;
+}
+
+//===----------------------------------------------------------------------===//
+// Persisted schema-v2 selected state (task B1)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Rewrites the first `consumer_ports` endpoint index of every route.
+void rewriteFirstConsumerPortIndex(Operation *kernel, MLIRContext &context,
+                                   unsigned newIndex) {
+  auto routes = kernel->getAttrOfType<ArrayAttr>("micro.routes");
+  ASSERT_TRUE(routes);
+  llvm::SmallVector<Attribute> rewritten;
+  for (Attribute element : routes) {
+    auto route = dyn_cast<DictionaryAttr>(element);
+    ASSERT_TRUE(route);
+    NamedAttrList attributes(route);
+    auto ports = route.getAs<ArrayAttr>("consumer_ports");
+    ASSERT_TRUE(ports);
+    llvm::SmallVector<Attribute> portAttrs;
+    for (size_t i = 0; i < ports.size(); ++i) {
+      auto port = dyn_cast<DictionaryAttr>(ports[i]);
+      ASSERT_TRUE(port);
+      if (i == 0) {
+        NamedAttrList fields(port);
+        fields.set("index",
+                   IntegerAttr::get(IntegerType::get(&context, 64), newIndex));
+        portAttrs.push_back(fields.getDictionary(&context));
+      } else {
+        portAttrs.push_back(port);
+      }
+    }
+    attributes.set("consumer_ports", ArrayAttr::get(&context, portAttrs));
+    rewritten.push_back(attributes.getDictionary(&context));
+  }
+  kernel->setAttr("micro.routes", ArrayAttr::get(&context, rewritten));
+}
+
+} // namespace
+
+TEST(PlanBinder, RoundTripsConnectionEndpointsAndResourceBindings) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_FALSE(p->connectionPlans.empty());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  auto decoded = decodeSelectedPlan(*b->module, **target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  EXPECT_EQ(decoded->schemaVersion, 2u);
+  EXPECT_EQ(decoded->id, p->id);
+
+  ASSERT_EQ(decoded->connectionPlans.size(), p->connectionPlans.size());
+  for (size_t i = 0; i < p->connectionPlans.size(); ++i) {
+    EXPECT_EQ(decoded->connectionPlans[i].id, p->connectionPlans[i].id);
+    EXPECT_EQ(decoded->connectionPlans[i].kind, p->connectionPlans[i].kind);
+    EXPECT_EQ(decoded->connectionPlans[i].route, p->connectionPlans[i].route);
+    EXPECT_EQ(decoded->connectionPlans[i].engines,
+              p->connectionPlans[i].engines);
+    EXPECT_EQ(decoded->connectionPlans[i].consumers,
+              p->connectionPlans[i].consumers);
+    ASSERT_EQ(decoded->connectionPlans[i].consumerPorts,
+              p->connectionPlans[i].consumerPorts);
+    EXPECT_EQ(decoded->connectionPlans[i].producerPort,
+              p->connectionPlans[i].producerPort);
+    EXPECT_FALSE(p->connectionPlans[i].consumerPorts.empty());
+  }
+  ASSERT_EQ(decoded->placements.size(), p->placements.size());
+  for (size_t i = 0; i < p->placements.size(); ++i) {
+    EXPECT_EQ(decoded->placements[i].node, p->placements[i].node);
+    EXPECT_EQ(decoded->placements[i].instance, p->placements[i].instance);
+    EXPECT_EQ(decoded->placements[i].rule, p->placements[i].rule);
+    EXPECT_EQ(decoded->placements[i].executor, p->placements[i].executor);
+    EXPECT_EQ(decoded->placements[i].layouts.size(),
+              p->placements[i].layouts.size());
+    EXPECT_EQ(decoded->placements[i].layoutSolutions.size(),
+              p->placements[i].layoutSolutions.size());
+  }
+}
+
+// The solved layout assignment -- the concrete parameters and the affine map
+// they substitute into -- must survive a round trip, not only the family name.
+TEST(PlanBinder, RoundTripsSolvedLayoutAssignmentsAndMaps) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  auto decoded = decodeSelectedPlan(*b->module, *f.target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  ASSERT_EQ(decoded->placements.size(), p->placements.size());
+
+  size_t solvedCount = 0;
+  for (size_t i = 0; i < p->placements.size(); ++i) {
+    ASSERT_EQ(decoded->placements[i].layoutSolutions.size(),
+              p->placements[i].layoutSolutions.size());
+    for (const auto &entry : p->placements[i].layoutSolutions) {
+      ++solvedCount;
+      ASSERT_TRUE(decoded->placements[i].layoutSolutions.count(entry.first()));
+      const SolvedLayout &actual =
+          decoded->placements[i].layoutSolutions.lookup(entry.first());
+      EXPECT_EQ(actual.layoutClass, entry.second.layoutClass);
+      EXPECT_EQ(canonicalSearchValueString(actual.parameters),
+                canonicalSearchValueString(entry.second.parameters));
+      EXPECT_EQ(actual.map, entry.second.map);
+      EXPECT_EQ(actual.port, entry.second.port);
+    }
+  }
+  EXPECT_GT(solvedCount, 0u);
+}
+
+// A plan bound for one target must not decode against another: the recorded
+// target content hash no longer matches.
+TEST(PlanBinder, DecodeRejectsAChangedTarget) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  llvm::Expected<std::unique_ptr<MappingTarget>> other = movementTarget();
+  ASSERT_TRUE(bool(other)) << llvm::toString(other.takeError());
+  auto decoded = decodeSelectedPlan(*b->module, **other);
+  ASSERT_FALSE(bool(decoded));
+  EXPECT_NE(llvm::toString(decoded.takeError()).find("target_hash"),
+            std::string::npos);
+}
+
+// A frozen plan cannot bypass current graph verification: changing a semantic
+// workload attribute changes the source-graph hash and decoding fails.
+TEST(PlanBinder, DecodeRejectsAChangedSourceGraph) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.vector")
+      op->setAttr("op", StringAttr::get(f.context.get(), "mul"));
+  });
+
+  auto decoded = decodeSelectedPlan(*b->module, *f.target);
+  ASSERT_FALSE(bool(decoded));
+  EXPECT_NE(llvm::toString(decoded.takeError()).find("graph_hash"),
+            std::string::npos);
+}
+
+// A recorded endpoint with an out-of-range index is malformed metadata, not a
+// plan that resolves.
+TEST(PlanBinder, DecodeRejectsAMalformedEndpointIndex) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  rewriteFirstConsumerPortIndex(b->kernel, *f.context.get(), /*newIndex=*/99);
+  auto decoded = decodeSelectedPlan(*b->module, **target);
+  ASSERT_FALSE(bool(decoded));
+}
+
+// A plan recording a metadata schema this reader does not understand must not
+// be replayed under these semantics.
+TEST(PlanBinder, DecodeRejectsAnUnsupportedSchemaVersion) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  auto plan = b->kernel->getAttrOfType<DictionaryAttr>("micro.plan");
+  ASSERT_TRUE(plan);
+  NamedAttrList updated(plan);
+  updated.set("schema_version",
+              IntegerAttr::get(IntegerType::get(f.context.get(), 64), 3));
+  b->kernel->setAttr("micro.plan", updated.getDictionary(f.context.get()));
+
+  auto decoded = decodeSelectedPlan(*b->module, *f.target);
+  ASSERT_FALSE(bool(decoded));
+  EXPECT_NE(llvm::toString(decoded.takeError()).find("unsupported"),
+            std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Stage-A A4: the layout container (or an explicit no-layout marker) is
+// required
+//===----------------------------------------------------------------------===//
+
+// Regression (issue #67, stage A, A4): deleting the whole `layout_parameters`
+// container skipped solved-layout validation. Under schema v2 the container is
+// required, so the deletion is rejected.
+TEST(PlanBinder, RejectsADeletedLayoutContainer) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
+
+  unsigned mutations = 0;
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping || !mapping.get("layout_parameters"))
+      return;
+    llvm::SmallVector<NamedAttribute> kept;
+    for (NamedAttribute attribute : mapping)
+      if (attribute.getName() != "layout_parameters")
+        kept.push_back(attribute);
+    op->setAttr("micro.mapping", DictionaryAttr::get(f.context.get(), kept));
+    ++mutations;
+  });
+  ASSERT_GT(mutations, 0u);
+
+  auto error = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("no_legal_layout"),
+            std::string::npos);
+}
+
+namespace {
+
+/// Rewrites the first `layout_entries` entry of the vector op's mapping,
+/// applying `mutate` to its fields. Returns false when there is no such entry.
+template <typename Fn>
+bool mutateLayoutEntry(ModuleOp module, MLIRContext &context, Fn mutate) {
+  bool mutated = false;
+  module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping)
+      return;
+    auto entries = mapping.getAs<ArrayAttr>("layout_entries");
+    if (!entries || entries.empty())
+      return;
+    llvm::SmallVector<Attribute> rewritten;
+    for (size_t i = 0; i < entries.size(); ++i) {
+      auto entry = dyn_cast<DictionaryAttr>(entries[i]);
+      if (i != 0) {
+        rewritten.push_back(entry);
+        continue;
+      }
+      NamedAttrList fields(entry);
+      mutate(fields, context);
+      rewritten.push_back(fields.getDictionary(&context));
+    }
+    NamedAttrList updated(mapping);
+    updated.set("layout_entries", ArrayAttr::get(&context, rewritten));
+    op->setAttr("micro.mapping", updated.getDictionary(&context));
+    mutated = true;
+  });
+  return mutated;
+}
+
+} // namespace
+
+// A v2 layout entry records the endpoint its solved assignment is attributed
+// to; an endpoint index outside the source graph is malformed metadata.
+TEST(PlanBinder, RejectsAMalformedLayoutEntryEndpoint) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
+
+  bool mutated = mutateLayoutEntry(
+      *b->module, *f.context.get(), [](NamedAttrList &fields, MLIRContext &c) {
+        auto port = dyn_cast<DictionaryAttr>(fields.get("port"));
+        NamedAttrList updated(port);
+        updated.set("index", IntegerAttr::get(IntegerType::get(&c, 64), 99));
+        fields.set("port", updated.getDictionary(&c));
+      });
+  ASSERT_TRUE(mutated);
+  auto error = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("source graph"),
+            std::string::npos);
+}
+
+// A v2 layout entry records the concrete map its parameters substitute into; a
+// map that is not the one the recorded parameters rebuild is rejected.
+TEST(PlanBinder, RejectsATamperedLayoutEntryMap) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
+
+  bool mutated = mutateLayoutEntry(
+      *b->module, *f.context.get(), [](NamedAttrList &fields, MLIRContext &c) {
+        fields.set("map", AffineMapAttr::get(
+                              AffineMap::getMultiDimIdentityMap(2, &c)));
+      });
+  ASSERT_TRUE(mutated);
+  auto error = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("no_legal_layout"),
+            std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Stage-A A5: recorded consumers must actually read the movement's value
+//===----------------------------------------------------------------------===//
+
+// Regression (issue #67, stage A, A5): consumer-side movement verification only
+// checked that the consumer list was integer-shaped. A recorded consumer
+// endpoint that does not read the connection's value is now rejected.
+TEST(PlanBinder, RejectsAConsumerEndpointThatDoesNotReadTheValue) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_NE(materializedCopy(*b->module), nullptr);
+  ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
+
+  auto routes = b->kernel->getAttrOfType<ArrayAttr>("micro.routes");
+  ASSERT_TRUE(routes);
+  llvm::SmallVector<Attribute> rewritten;
+  for (Attribute element : routes) {
+    auto route = dyn_cast<DictionaryAttr>(element);
+    ASSERT_TRUE(route);
+    NamedAttrList attributes(route);
+    auto ports = route.getAs<ArrayAttr>("consumer_ports");
+    ASSERT_TRUE(ports);
+    ASSERT_FALSE(ports.empty());
+    auto producer = route.getAs<DictionaryAttr>("producer_port");
+    ASSERT_TRUE(producer);
+    auto producerNode = producer.getAs<IntegerAttr>("node");
+    ASSERT_TRUE(producerNode);
+    llvm::SmallVector<Attribute> portAttrs;
+    for (size_t i = 0; i < ports.size(); ++i) {
+      if (i != 0) {
+        portAttrs.push_back(ports[i]);
+        continue;
+      }
+      NamedAttrList fields(dyn_cast<DictionaryAttr>(ports[i]));
+      fields.set("node", producerNode);
+      fields.set("direction", StringAttr::get(f.context.get(), "input"));
+      fields.set("index",
+                 IntegerAttr::get(IntegerType::get(f.context.get(), 64), 0));
+      portAttrs.push_back(fields.getDictionary(f.context.get()));
+    }
+    attributes.set("consumer_ports",
+                   ArrayAttr::get(f.context.get(), portAttrs));
+    rewritten.push_back(attributes.getDictionary(f.context.get()));
+  }
+  b->kernel->setAttr("micro.routes",
+                     ArrayAttr::get(f.context.get(), rewritten));
+
+  auto error = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("consumer_ports"),
+            std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Legacy (v1) metadata: uniquely recoverable vs ambiguous
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A v1-mapped kernel: the plan records no schema version and the mapping omits
+/// endpoint/instance associations. With one node and no connections its missing
+/// associations are uniquely recoverable.
+constexpr llvm::StringLiteral kV1Kernel = R"mlir(
+module {
+  micro.kernel @k attributes {micro.plan = {id = 7 : i64, binding_hash = 0 : i64, truncated = false}} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 4 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+}
+)mlir";
+
+/// The same v1 kernel with a selected connection that records no endpoints: its
+/// missing associations are not uniquely recoverable.
+constexpr llvm::StringLiteral kV1AmbiguousKernel = R"mlir(
+module {
+  micro.kernel @k attributes {micro.plan = {id = 7 : i64, binding_hash = 0 : i64, truncated = false}, micro.routes = [{id = 1 : i64, value = 0 : i64, kind = "transfer", route = ["dram.0", "sram.0"], engines = ["dma.0"], consumers = [1 : i64]}]} {
+    %0 = tensor.empty() : tensor<8x8xf32>
+    %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 4 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+}
+)mlir";
+
+} // namespace
+
+TEST(PlanBinder, DecodesUnambiguousV1Metadata) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.target);
+  MLIRContext context;
+  context.getOrLoadDialect<micro::MicroDialect>();
+  context.getOrLoadDialect<tensor::TensorDialect>();
+  OwningOpRef<ModuleOp> module =
+      parseSourceString<ModuleOp>(kV1Kernel, &context);
+  ASSERT_TRUE(module);
+
+  auto decoded = decodeSelectedPlan(*module, *f.target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  EXPECT_EQ(decoded->schemaVersion, 1u);
+  EXPECT_EQ(decoded->id, 7u);
+  ASSERT_EQ(decoded->placements.size(), 1u);
+  EXPECT_EQ(decoded->placements[0].rule, "avx2.vector_add");
+  ASSERT_EQ(decoded->placements[0].layoutSolutions.size(), 1u);
+  const SolvedLayout &solved =
+      decoded->placements[0].layoutSolutions.lookup("avx2.blocked_2d");
+  EXPECT_EQ(solved.parameters.size(), 3u);
+  ASSERT_TRUE(solved.port.has_value());
+  EXPECT_EQ(solved.port->direction, PortDirection::Input);
+  EXPECT_EQ(solved.port->index, 0u);
+}
+
+TEST(PlanBinder, RejectsAmbiguousV1ExecutableReplay) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.target);
+  MLIRContext context;
+  context.getOrLoadDialect<micro::MicroDialect>();
+  context.getOrLoadDialect<tensor::TensorDialect>();
+  OwningOpRef<ModuleOp> module =
+      parseSourceString<ModuleOp>(kV1AmbiguousKernel, &context);
+  ASSERT_TRUE(module);
+
+  auto decoded = decodeSelectedPlan(*module, *f.target);
+  ASSERT_FALSE(bool(decoded));
+  EXPECT_NE(llvm::toString(decoded.takeError()).find("ambiguous"),
+            std::string::npos);
 }

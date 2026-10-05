@@ -305,6 +305,8 @@ add_library(LLKMapping STATIC
     lib/Mapping/Placement.cpp
     lib/Mapping/CoveringSearch.cpp
     lib/Mapping/PlanBinder.cpp
+    lib/Mapping/MappingMetadata.cpp
+    lib/Mapping/PlanVerification.cpp
     lib/Mapping/Routing.cpp
     lib/Mapping/PlanReport.cpp
 )

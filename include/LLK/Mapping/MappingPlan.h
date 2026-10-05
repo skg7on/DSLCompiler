@@ -224,6 +224,43 @@ struct CandidateInstance {
   Cost localCost;
 };
 
+/// A compute/memory assignment for one endpoint port (design §9.6): the memory
+/// node a named occurrence's value is bound to. Persisted with the selected
+/// state so a materializer can attribute a storage decision to the occurrence
+/// that owns it rather than to a whole instance.
+struct PortMemoryBinding {
+  PortRef port;
+  MemoryNodeId memory;
+  bool operator==(const PortMemoryBinding &) const = default;
+};
+
+/// A scheduling step index. Concrete storage lifetimes are expressed in these
+/// (design §9.6); B1 persists them, B3 builds them.
+using PlanStepId = uint64_t;
+
+/// One concrete storage allocation the selected plan reserves: the workload
+/// value it holds, the memory it lives in, its footprint, an optional aliased
+/// allocation, and the step interval it is live over. All arithmetic over these
+/// fields is checked by their consumers; an unknown footprint is not zero.
+struct StorageAllocation {
+  uint64_t id = 0;
+  WorkloadValueId value = 0;
+  MemoryNodeId memory;
+  uint64_t bytes = 0;
+  std::optional<uint64_t> aliasOf;
+  PlanStepId beginStep = 0;
+  PlanStepId endStep = 0; // live through this step
+};
+
+/// One synchronization decision: a step that waits for a set of connections,
+/// precedes a set of endpoint occurrences, and may require a barrier.
+struct SynchronizationStep {
+  uint64_t id = 0;
+  std::vector<ConnectionId> waitsFor;
+  std::vector<PortRef> precedes;
+  bool requiresBarrier = false;
+};
+
 enum class ConnectionKind {
   Direct,
   Transfer,
@@ -319,6 +356,10 @@ struct PlanConnection {
   /// the later B1/B4 work. Until then they are recorded, not acted on.
   std::optional<PortRef> producerPort;
   llvm::SmallVector<PortRef> consumerPorts;
+  /// The storage allocations (design §9.6) this connection reads or writes,
+  /// by `StorageAllocation::id`. B1 persists the ids; B3 populates them. Empty
+  /// for a plan built before storage planning.
+  llvm::SmallVector<uint64_t> storageIds;
 };
 
 /// A complete executable proposal covering every required node.
@@ -347,6 +388,39 @@ struct CoveringPlan {
   llvm::StringMap<SearchValue> globalParameters;
   Cost totalCost;
   PlanDiagnostics diagnostics;
+
+  // --- persisted selected state (schema v2, task B1) ------------------------
+  //
+  // These are deliberately excluded from `canonicalPlanString`: they are
+  // provenance and persisted selection metadata, not fields that change a
+  // plan's content id. A plan decoded from metadata keeps the id it was encoded
+  // with.
+  //
+  // The metadata schema this plan was persisted under (0 when it was never
+  // persisted -- an in-memory search result).
+  uint64_t schemaVersion = 0;
+  /// True when every execution-affecting decision was materialized. A partial
+  /// plan (see `BindContract`) records `false`.
+  bool materialized = true;
+  /// Content hash of the canonical, pre-materialization source workload graph
+  /// (see `computeSourceGraphHash`): operand occurrences, types, access maps
+  /// and semantic attributes, with bookkeeping attributes omitted. Retained
+  /// when a materialized graph is validated through its recorded connection
+  /// provenance.
+  uint64_t graphHash = 0;
+  /// Content hash of the target: its name plus the machine, layout and rule
+  /// library hashes. A plan is only executable against the target it was bound
+  /// for.
+  uint64_t targetHash = 0;
+  uint64_t machineHash = 0;
+  uint64_t layoutHash = 0;
+  uint64_t ruleHash = 0;
+  /// Concrete storage allocations the plan reserves (design §9.6). B3 builds
+  /// these; B1 round-trips them.
+  std::vector<StorageAllocation> allocations;
+  /// Synchronization decisions the plan makes (design §9.6). B3 builds these;
+  /// B1 round-trips them.
+  std::vector<SynchronizationStep> synchronization;
 };
 
 /// Sorts and removes duplicates. Used to enforce the "sorted and unique"

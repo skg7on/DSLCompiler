@@ -27,6 +27,7 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingTarget.h"
+#include "LLK/Mapping/WorkloadGraph.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -71,6 +72,18 @@ llvm::Error writePlanReportFile(llvm::StringRef path,
                                 const MappingTarget &target,
                                 const MappingSearchOptions &options,
                                 uint64_t moduleHash);
+
+/// Reconstructs the selected plan a v2 report recorded, so a caller holding the
+/// report and the exact target and source workload graph can replay the
+/// selection (task B1). This reconstructs *data*, not executable code: semantic
+/// verification and materialization remain mandatory, and `graph`/`target` are
+/// validated first -- the report's target content hash must match `target`, and
+/// every recorded placement must still resolve in `graph` with its rule. A
+/// report written by a different schema version, or one whose target or graph
+/// no longer matches, is rejected.
+llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
+                                            const MappingTarget &target,
+                                            const WorkloadGraph &graph);
 
 } // namespace mlir::llk::mapping
 
