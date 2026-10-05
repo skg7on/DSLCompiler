@@ -70,6 +70,60 @@ std::optional<int64_t> constantIndex(Value value) {
   return std::nullopt;
 }
 
+/// The number of iterations a `micro.for` / `micro.spatial_for` performs, when
+/// its lower bound, upper bound, and step are all constant indices. `nullopt`
+/// when any bound is not a constant (a non-positive step or an empty range is
+/// likewise not represented as a multiplicity).
+std::optional<uint64_t> loopTripCount(Operation *loop) {
+  if (loop->getNumOperands() < 3)
+    return std::nullopt;
+  std::optional<int64_t> lower = constantIndex(loop->getOperand(0));
+  std::optional<int64_t> upper = constantIndex(loop->getOperand(1));
+  std::optional<int64_t> step = constantIndex(loop->getOperand(2));
+  if (!lower || !upper || !step || *step <= 0 || *upper <= *lower)
+    return std::nullopt;
+  uint64_t span = static_cast<uint64_t>(*upper - *lower);
+  uint64_t stride = static_cast<uint64_t>(*step);
+  return (span + stride - 1) / stride;
+}
+
+/// The stage count a `micro.pipeline` declares, when positive.
+std::optional<uint64_t> pipelineStages(Operation *pipeline) {
+  if (auto stages = pipeline->getAttrOfType<IntegerAttr>("stages"))
+    if (stages.getInt() > 0)
+      return static_cast<uint64_t>(stages.getInt());
+  return std::nullopt;
+}
+
+/// The execution multiplicity of a compute op: the product of the factors of
+/// every structural op between it and `kernel` (`micro.for` /
+/// `micro.spatial_for` trip counts, `micro.pipeline` stage counts). `1` when no
+/// structural op encloses it -- a bare op runs once. `nullopt` when any
+/// enclosing factor is not statically recoverable, so an unknown loop is
+/// *reported* as unknown rather than assumed to run once.
+std::optional<uint64_t> executionMultiplicityOf(Operation *op,
+                                                Operation *kernel) {
+  uint64_t product = 1;
+  for (Operation *parent = op->getParentOp(); parent && parent != kernel;
+       parent = parent->getParentOp()) {
+    llvm::StringRef name = parent->getName().getStringRef();
+    std::optional<uint64_t> factor;
+    if (name == "micro.for" || name == "micro.spatial_for")
+      factor = loopTripCount(parent);
+    else if (name == "micro.pipeline")
+      factor = pipelineStages(parent);
+    else
+      continue;
+    if (!factor)
+      return std::nullopt;
+    uint64_t scaled = 0;
+    if (__builtin_mul_overflow(product, *factor, &scaled))
+      return std::nullopt;
+    product = scaled;
+  }
+  return product;
+}
+
 /// The affine relationship a chain of logical ops states between an operand's
 /// local index space and the value it ultimately resolves to, or nullopt when
 /// the chain states none (design §10.1/§10.2).
@@ -397,6 +451,10 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
       node.opName = name.getStringRef().str();
       node.attributes = op->getAttrDictionary();
       node.sourceOrdinal = ordinal;
+      // Recover the node's execution multiplicity from its enclosing structural
+      // ops, so a strict storage plan sees a real, statically-known loop bound
+      // rather than an always-unknown node.
+      node.executionMultiplicity = executionMultiplicityOf(op, kernel);
       ordinalOps[ordinal] = op;
       ++ordinal;
       for (Value operand : op->getOperands()) {

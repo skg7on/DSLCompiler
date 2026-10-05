@@ -199,6 +199,30 @@ std::optional<ConnectionKind> symbolizeConnectionKind(llvm::StringRef text) {
   return std::nullopt;
 }
 
+llvm::StringRef stringifyPlanStepKind(PlanStepKind kind) {
+  switch (kind) {
+  case PlanStepKind::Compute:
+    return "compute";
+  case PlanStepKind::Movement:
+    return "movement";
+  case PlanStepKind::Synchronization:
+    return "synchronization";
+  }
+  return "";
+}
+
+std::optional<PlanStepKind> symbolizePlanStepKind(llvm::StringRef text) {
+  constexpr std::array<std::pair<llvm::StringLiteral, PlanStepKind>, 3> kKinds{{
+      {"compute", PlanStepKind::Compute},
+      {"movement", PlanStepKind::Movement},
+      {"synchronization", PlanStepKind::Synchronization},
+  }};
+  for (const auto &entry : kKinds)
+    if (entry.first == text)
+      return entry.second;
+  return std::nullopt;
+}
+
 std::string canonicalCandidateString(const MappingCandidate &candidate) {
   std::vector<std::string> ports;
   ports.reserve(candidate.ports.size());

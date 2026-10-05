@@ -94,6 +94,18 @@ struct WorkloadNode {
   /// Program position, used only to break content-key ties during
   /// canonicalization; it never survives as an ordering key on its own.
   uint32_t sourceOrdinal = 0;
+  /// How many times this node executes, recovered during extraction from the
+  /// structural ops that enclose it: the product of a `micro.for` /
+  /// `micro.spatial_for` trip count and a `micro.pipeline` stage count. A node
+  /// outside any structural op runs exactly once, so `1` -- not unset -- is the
+  /// common case. It is unset only when a bound is not statically recoverable
+  /// (a non-constant bound), and a strict executable plan must not pretend such
+  /// a loop runs once.
+  ///
+  /// Deliberately *not* folded into `nodeContentKey` / `canonicalString`: it is
+  /// a recovered execution fact, not graph identity, so populating it does not
+  /// churn node ids, content hashes, or plan ids.
+  std::optional<uint64_t> executionMultiplicity;
 };
 
 /// A target-independent view of one concrete `micro.kernel`'s work.

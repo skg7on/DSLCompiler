@@ -11,13 +11,17 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingTarget.h"
+#include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/TileFacts.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/Parser/Parser.h"
 
 #include "llvm/Support/Error.h"
 
@@ -61,23 +65,10 @@ mlir::Type tileType(mlir::MLIRContext &context, llvm::StringRef inner) {
   return mlir::parseType(text, &context);
 }
 
-/// The node attributes a fixture carries: the `op` the rule predicates on and
-/// the execution multiplicity the strict planner reads.
-mlir::DictionaryAttr nodeAttributes(mlir::MLIRContext &context,
-                                    uint64_t multiplicity) {
-  return mlir::DictionaryAttr::get(
-      &context,
-      {mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
-                            mlir::StringAttr::get(&context, "add")),
-       mlir::NamedAttribute(
-           mlir::StringAttr::get(&context, kExecutionMultiplicityAttr),
-           mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64),
-                                  multiplicity))});
-}
-
 /// A three-node chain `in -> n0 -> v0 -> n1 -> v1 -> n2 -> out`, every node a
 /// `micro.vector` over an 8x8xf32 tile. When `multiplicity` is set each node
-/// declares it, so the strict planner has a known execution count.
+/// carries it, so the strict planner has a known execution count; unset means
+/// the count is unknown.
 WorkloadGraph chainGraph(mlir::MLIRContext &context, mlir::Type tile,
                          std::optional<uint64_t> multiplicity) {
   WorkloadGraph graph;
@@ -95,13 +86,7 @@ WorkloadGraph chainGraph(mlir::MLIRContext &context, mlir::Type tile,
     WorkloadNode n;
     n.opName = "micro.vector";
     n.sourceOrdinal = ordinal;
-    if (multiplicity)
-      n.attributes = nodeAttributes(context, *multiplicity);
-    else
-      n.attributes = mlir::DictionaryAttr::get(
-          &context,
-          {mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
-                                mlir::StringAttr::get(&context, "add"))});
+    n.executionMultiplicity = multiplicity;
     n.inputs.push_back(WorkloadPort{input, tile, std::nullopt});
     n.outputs.push_back(WorkloadPort{output, tile, std::nullopt});
     graph.addNode(std::move(n));
@@ -294,11 +279,13 @@ TEST(StoragePlan, BuildsAllocationsAndOccupancyForASelectedPlan) {
   // steps strictly increase.
   EXPECT_LT(plan->allocations[0].beginStep, plan->allocations[1].beginStep);
   EXPECT_LT(plan->allocations[1].beginStep, plan->allocations[2].beginStep);
-  // The occupancy is recorded in the report.
+  // The occupancy is recorded in the report, as an informational note that does
+  // not enter the plan's identity.
   bool noted = false;
-  for (const std::string &warning : plan->diagnostics.warnings)
-    noted |= warning.find("sram.0") != std::string::npos;
+  for (const std::string &note : plan->diagnostics.storageNotes)
+    noted |= note.find("sram.0") != std::string::npos;
   EXPECT_TRUE(noted);
+  EXPECT_TRUE(plan->diagnostics.warnings.empty());
 }
 
 TEST(StoragePlan, ReleasesAProducerAllocationAfterItsLastReader) {
@@ -381,8 +368,8 @@ TEST(StoragePlan, AnalysisModeReportsUnknownMultiplicityAndFallsBack) {
   llvm::Error error = finalizeStoragePlan(graph, *plan, storageMachine());
   ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
   bool reported = false;
-  for (const std::string &warning : plan->diagnostics.warnings)
-    reported |= warning.find("multiplicity") != std::string::npos;
+  for (const std::string &note : plan->diagnostics.storageNotes)
+    reported |= note.find("multiplicity") != std::string::npos;
   EXPECT_TRUE(reported);
 }
 
@@ -412,4 +399,261 @@ TEST(StoragePlan, RejectsAPlanThatDoesNotCoverEveryNode) {
   plan->placements.clear();
   llvm::Error error = finalizeStoragePlan(graph, *plan, storageMachine());
   EXPECT_TRUE(bool(error));
+}
+
+//===----------------------------------------------------------------------===//
+// Extraction recovers the execution multiplicity (fix round 1)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+struct ParsedKernel {
+  std::unique_ptr<mlir::MLIRContext> context;
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  mlir::Operation *kernel = nullptr;
+};
+
+ParsedKernel parseKernel(llvm::StringRef text) {
+  ParsedKernel parsed;
+  parsed.context = std::make_unique<mlir::MLIRContext>();
+  parsed.context->getOrLoadDialect<mlir::micro::MicroDialect>();
+  parsed.context->getOrLoadDialect<mlir::arith::ArithDialect>();
+  parsed.module =
+      mlir::parseSourceString<mlir::ModuleOp>(text, parsed.context.get());
+  if (parsed.module)
+    parsed.module->walk([&](mlir::Operation *op) {
+      if (op->getName().getStringRef() == "micro.kernel")
+        parsed.kernel = op;
+    });
+  return parsed;
+}
+
+/// A single `micro.vector` inside `micro.for(0, upper, 1)`. `upper` is a
+/// constant when `constantBound`, otherwise a computed (non-constant) index.
+constexpr llvm::StringLiteral kLoopedKernel = R"mlir(
+module {
+  micro.kernel @loop {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %upper = arith.addi %c4, %c1 : index
+    micro.for %i = %c0 to %upper step %c1 {
+      %t = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+      %r = micro.vector "add" %t, %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    }
+    micro.yield
+  }
+}
+)mlir";
+
+constexpr llvm::StringLiteral kLoopedKernelConstant = R"mlir(
+module {
+  micro.kernel @loop {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    micro.for %i = %c0 to %c4 step %c1 {
+      %t = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+      %r = micro.vector "add" %t, %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    }
+    micro.yield
+  }
+}
+)mlir";
+
+} // namespace
+
+TEST(StoragePlan, ExtractedKnownLoopMultiplicityFinalizesInStrictMode) {
+  ParsedKernel parsed = parseKernel(kLoopedKernelConstant);
+  ASSERT_TRUE(parsed.module);
+  ASSERT_NE(parsed.kernel, nullptr);
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+  ASSERT_EQ(graph->getNodes().size(), 1u);
+  // Extraction recovers the enclosing loop's trip count.
+  ASSERT_TRUE(graph->getNodes()[0].executionMultiplicity.has_value());
+  EXPECT_EQ(*graph->getNodes()[0].executionMultiplicity, 4u);
+
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+  std::optional<CoveringPlan> plan =
+      searchOne(*graph, *target, *parsed.context);
+  ASSERT_TRUE(plan.has_value());
+  ASSERT_TRUE(plan->materialized); // strict executable planning
+
+  llvm::Error error = finalizeStoragePlan(*graph, *plan, storageMachine());
+  ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
+  ASSERT_EQ(plan->allocations.size(), 1u);
+  // 8x8xf32 = 256 bytes per iteration, four iterations.
+  EXPECT_EQ(plan->allocations[0].bytes, 1024u);
+}
+
+TEST(StoragePlan, AnUnresolvedLoopBoundStaysUnknownAndRefusesStrictPlanning) {
+  ParsedKernel parsed = parseKernel(kLoopedKernel);
+  ASSERT_TRUE(parsed.module);
+  ASSERT_NE(parsed.kernel, nullptr);
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+  ASSERT_EQ(graph->getNodes().size(), 1u);
+  // A computed bound is not statically recoverable, so it stays unknown rather
+  // than being assumed to run once.
+  EXPECT_FALSE(graph->getNodes()[0].executionMultiplicity.has_value());
+
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+  std::optional<CoveringPlan> plan =
+      searchOne(*graph, *target, *parsed.context);
+  ASSERT_TRUE(plan.has_value());
+  llvm::Error error = finalizeStoragePlan(*graph, *plan, storageMachine());
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("multiplicity"),
+            std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Fix round 1: id stability, the report round trip, and staged replicas
+//===----------------------------------------------------------------------===//
+
+TEST(StoragePlan, FinalizingTwiceIsIdempotentAndLeavesTheIdStable) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = chainGraph(context, tileType(context, "8x8xf32"), 1);
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+  std::optional<CoveringPlan> plan = searchOne(graph, *target, context);
+  ASSERT_TRUE(plan.has_value());
+
+  const PlanId before = computePlanId(*plan);
+  ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
+  const size_t notes = plan->diagnostics.storageNotes.size();
+  EXPECT_FALSE(plan->steps.empty());
+  // Informational notes are excluded from the plan id, so finalizing does not
+  // change it.
+  EXPECT_EQ(computePlanId(*plan), before);
+
+  ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
+  EXPECT_EQ(plan->diagnostics.storageNotes.size(), notes);
+  EXPECT_EQ(computePlanId(*plan), before);
+}
+
+TEST(StoragePlan, ReportRoundTripsThePlanStepDag) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = chainGraph(context, tileType(context, "8x8xf32"), 1);
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  CoveringPlan &plan = result->plans.front();
+  ASSERT_FALSE(bool(finalizeStoragePlan(graph, plan, storageMachine())));
+  ASSERT_FALSE(plan.steps.empty());
+
+  std::string report = writePlanReport(*result, target->machine(), *target,
+                                       options, /*moduleHash=*/0);
+  llvm::Expected<CoveringPlan> replay = readPlanReport(report, *target, graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+  ASSERT_EQ(replay->steps.size(), plan.steps.size());
+  for (size_t i = 0; i < plan.steps.size(); ++i) {
+    EXPECT_EQ(replay->steps[i].id, plan.steps[i].id);
+    EXPECT_EQ(replay->steps[i].kind, plan.steps[i].kind);
+    EXPECT_EQ(replay->steps[i].node, plan.steps[i].node);
+    EXPECT_EQ(replay->steps[i].connection, plan.steps[i].connection);
+  }
+  EXPECT_EQ(replay->stepEdges, plan.stepEdges);
+}
+
+TEST(StoragePlan, ATransformedReplicaIsChargedToItsDestinationMemory) {
+  mlir::MLIRContext context;
+  mlir::Type tile = tileType(context, "8x8xf32");
+
+  // n0 (sram) -> v0 -> n1 (dram), with v0 transformed in place of a plain copy.
+  WorkloadGraph graph;
+  WorkloadValueId v0 =
+      graph.addValue(WorkloadValue{0, tile, "v0", /*external=*/false});
+  WorkloadValueId v1 =
+      graph.addValue(WorkloadValue{0, tile, "v1", /*external=*/false});
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.sourceOrdinal = 0;
+  producer.executionMultiplicity = 1;
+  producer.outputs.push_back(WorkloadPort{v0, tile, std::nullopt});
+  graph.addNode(std::move(producer));
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.sourceOrdinal = 1;
+  consumer.executionMultiplicity = 1;
+  consumer.inputs.push_back(WorkloadPort{v0, tile, std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{v1, tile, std::nullopt});
+  graph.addNode(std::move(consumer));
+  graph.finalize();
+
+  const WorkloadNode *producerNode = nullptr;
+  const WorkloadNode *consumerNode = nullptr;
+  for (const WorkloadNode &node : graph.getNodes())
+    (node.inputs.empty() ? producerNode : consumerNode) = &node;
+  ASSERT_NE(producerNode, nullptr);
+  ASSERT_NE(consumerNode, nullptr);
+  const WorkloadValueId mid = producerNode->outputs[0].value;
+
+  CoveringPlan plan;
+  plan.materialized = true;
+  PlanPlacement producerPlacement;
+  producerPlacement.node = producerNode->id;
+  producerPlacement.instance = 10;
+  producerPlacement.memories["sram"] = "sram.0";
+  plan.placements.push_back(producerPlacement);
+  PlanPlacement consumerPlacement;
+  consumerPlacement.node = consumerNode->id;
+  consumerPlacement.instance = 20;
+  consumerPlacement.memories["dram"] = "dram.0";
+  plan.placements.push_back(consumerPlacement);
+
+  mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, &context);
+  mlir::AffineExpr d1 = mlir::getAffineDimExpr(1, &context);
+  PlanConnection connection;
+  connection.id = 7;
+  connection.value = mid;
+  connection.kind = ConnectionKind::TransferAndTransform;
+  connection.route = {"sram.0", "dram.0"};
+  connection.consumers = {20};
+  LayoutTransform transform;
+  transform.srcLayout = "plain";
+  transform.dstLayout = "blocked";
+  transform.srcMap = mlir::AffineMap::get(2, 0, {d0, d1}, &context);
+  // `(m, n) -> (m, n * 2)` doubles the second extent, so the replica's physical
+  // image (8 x 15 x 4 = 480 bytes) is larger than the 256-byte logical tile.
+  transform.dstMap = mlir::AffineMap::get(
+      2, 0, {d0, d1 * mlir::getAffineConstantExpr(2, &context)}, &context);
+  connection.transform = transform;
+  plan.connectionPlans.push_back(connection);
+
+  // 700 bytes in dram holds the producer's 256-byte output but not the 736-byte
+  // live peak (the consumer output plus the 480-byte transformed replica).
+  MachineModel tight = storageMachine();
+  for (MemoryNode &memory : tight.memories)
+    if (memory.kind == "dram")
+      memory.capacityBytes = 700;
+  llvm::Error rejected = finalizeStoragePlan(graph, plan, tight);
+  ASSERT_TRUE(bool(rejected));
+  const std::string message = llvm::toString(std::move(rejected));
+  EXPECT_NE(message.find("dram.0"), std::string::npos);
+  EXPECT_NE(message.find("capacity"), std::string::npos);
+
+  // With room for the peak, the replica is charged to its own memory.
+  ASSERT_FALSE(bool(finalizeStoragePlan(graph, plan, storageMachine())));
+  bool sawReplica = false;
+  bool sawSource = false;
+  for (const StorageAllocation &allocation : plan.allocations) {
+    if (allocation.memory == "dram.0" && allocation.bytes == 480u)
+      sawReplica = true;
+    if (allocation.memory == "sram.0" && allocation.bytes == 256u)
+      sawSource = true;
+  }
+  EXPECT_TRUE(sawReplica)
+      << "the transformed replica must be charged to dram.0";
+  EXPECT_TRUE(sawSource)
+      << "the immutable producer must stay charged in sram.0";
 }

@@ -281,6 +281,33 @@ struct SynchronizationStep {
   bool requiresBarrier = false;
 };
 
+/// What a plan step does. `finalizeStoragePlan` builds a deterministic
+/// plan-step DAG: one `Compute` step per selected placement, one `Movement`
+/// step per materialized connection, and one `Synchronization` step per wait a
+/// movement implies.
+enum class PlanStepKind { Compute, Movement, Synchronization };
+
+llvm::StringRef stringifyPlanStepKind(PlanStepKind kind);
+std::optional<PlanStepKind> symbolizePlanStepKind(llvm::StringRef text);
+
+/// One node of the plan-step DAG (design §9.6). The `node` is set for a
+/// `Compute` step and the `connection` for a `Movement` or `Synchronization`
+/// step; the other is left 0. A storage allocation's `beginStep`/`endStep` and
+/// every dependency edge name these stable ids.
+struct PlanStep {
+  PlanStepId id = 0;
+  PlanStepKind kind = PlanStepKind::Compute;
+  WorkloadNodeId node = 0;
+  ConnectionId connection = 0;
+};
+
+/// A dependency edge in the plan-step DAG: `to` must follow `from`.
+struct PlanStepEdge {
+  PlanStepId from = 0;
+  PlanStepId to = 0;
+  bool operator==(const PlanStepEdge &) const = default;
+};
+
 enum class ConnectionKind {
   Direct,
   Transfer,
@@ -326,6 +353,13 @@ struct PlanDiagnostics {
   std::vector<std::string> errors;
   std::vector<std::string> warnings;
   bool searchTruncated = false;
+  /// Informational notes a post-search stage emits -- storage finalization's
+  /// occupancy and analysis-fallback reports. Deliberately separate from
+  /// `warnings`: `canonicalPlanString` does not fold this field, so a staged
+  /// note never changes a plan id and finalization is idempotent. A caller that
+  /// recomputes `plan.id` after `finalizeStoragePlan` gets the same id it had
+  /// before.
+  std::vector<std::string> storageNotes;
 };
 
 /// One selected placement: which node an instance covers, and the target facts
@@ -453,6 +487,13 @@ struct CoveringPlan {
   /// Synchronization decisions the plan makes (design §9.6). B3 builds these;
   /// B1 round-trips them.
   std::vector<SynchronizationStep> synchronization;
+  /// The deterministic plan-step DAG `finalizeStoragePlan` built (design §9.6):
+  /// every step's kind and what it names, and the dependency edges between
+  /// them. B3 builds these; B4-B6 consume them to order materialization. Like
+  /// the allocations they annotate, they are deliberately excluded from
+  /// `canonicalPlanString`, so storage planning never changes a plan id.
+  std::vector<PlanStep> steps;
+  std::vector<PlanStepEdge> stepEdges;
 };
 
 /// Sorts and removes duplicates. Used to enforce the "sorted and unique"

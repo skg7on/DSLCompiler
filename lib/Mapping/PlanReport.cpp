@@ -272,6 +272,14 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attribute(
                 "warningCount",
                 static_cast<uint64_t>(plan.diagnostics.warnings.size()));
+            // Storage finalization's informational notes: occupancy and
+            // analysis-mode reports. They are deliberately separate from the
+            // identity-bearing warnings, so a staged note never changes a plan
+            // id.
+            json.attributeArray("storageNotes", [&] {
+              for (const std::string &note : plan.diagnostics.storageNotes)
+                json.value(note);
+            });
           });
         });
       }
@@ -510,6 +518,30 @@ std::string writePlanReport(const MappingSearchResult &result,
                 });
             });
             json.attribute("requiresBarrier", step.requiresBarrier);
+          });
+        }
+      });
+      // The plan-step DAG (design §9.6): every step and the dependency edges
+      // between them, so B4-B6 can consume a replayed plan's ordering.
+      json.attributeArray("steps", [&] {
+        if (!selected)
+          return;
+        for (const PlanStep &step : selected->steps) {
+          json.object([&] {
+            json.attribute("id", step.id);
+            json.attribute("kind", stringifyPlanStepKind(step.kind));
+            json.attribute("node", static_cast<uint64_t>(step.node));
+            json.attribute("connection", hexId(step.connection));
+          });
+        }
+      });
+      json.attributeArray("stepEdges", [&] {
+        if (!selected)
+          return;
+        for (const PlanStepEdge &edge : selected->stepEdges) {
+          json.object([&] {
+            json.attribute("from", edge.from);
+            json.attribute("to", edge.to);
           });
         }
       });
@@ -868,6 +900,42 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
       if (std::optional<bool> barrier = object->getBoolean("requiresBarrier"))
         step.requiresBarrier = *barrier;
       plan.synchronization.push_back(std::move(step));
+    }
+  }
+  if (const llvm::json::Array *steps = state->getArray("steps")) {
+    for (const llvm::json::Value &element : *steps) {
+      const llvm::json::Object *object = element.getAsObject();
+      if (!object)
+        return reportError("plan report step is not an object");
+      PlanStep step;
+      if (std::optional<int64_t> id = object->getInteger("id"))
+        step.id = static_cast<uint64_t>(*id);
+      std::optional<llvm::StringRef> kind = object->getString("kind");
+      if (!kind)
+        return reportError("plan report step has no kind");
+      std::optional<PlanStepKind> symbolized = symbolizePlanStepKind(*kind);
+      if (!symbolized)
+        return reportError("plan report step has unknown kind");
+      step.kind = *symbolized;
+      if (std::optional<int64_t> node = object->getInteger("node"))
+        step.node = static_cast<WorkloadNodeId>(*node);
+      if (std::optional<llvm::StringRef> connection =
+              object->getString("connection"))
+        step.connection = static_cast<ConnectionId>(parseHexId(*connection));
+      plan.steps.push_back(step);
+    }
+  }
+  if (const llvm::json::Array *edges = state->getArray("stepEdges")) {
+    for (const llvm::json::Value &element : *edges) {
+      const llvm::json::Object *object = element.getAsObject();
+      if (!object)
+        return reportError("plan report step edge is not an object");
+      PlanStepEdge edge;
+      if (std::optional<int64_t> from = object->getInteger("from"))
+        edge.from = static_cast<uint64_t>(*from);
+      if (std::optional<int64_t> to = object->getInteger("to"))
+        edge.to = static_cast<uint64_t>(*to);
+      plan.stepEdges.push_back(edge);
     }
   }
 

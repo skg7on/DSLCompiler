@@ -482,24 +482,35 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   PlanStepId nextStep = 0;
   llvm::DenseMap<WorkloadNodeId, PlanStepId> computeStep;
   llvm::DenseMap<ConnectionId, PlanStepId> connectionStep;
+  llvm::DenseMap<ConnectionId, PlanStepId> syncStep;
   std::vector<char> emitted(plan.connectionPlans.size(), 0);
   std::vector<SynchronizationStep> synchronization;
+  std::vector<PlanStep> steps;
   uint64_t nextSyncId = 0;
+
+  auto addStep = [&](PlanStepKind kind, WorkloadNodeId node,
+                     ConnectionId connection) {
+    const PlanStepId id = nextStep++;
+    steps.push_back(PlanStep{id, kind, node, connection});
+    return id;
+  };
 
   auto emitConnection = [&](size_t index) {
     const PlanConnection &connection = plan.connectionPlans[index];
-    connectionStep[connection.id] = nextStep++;
+    connectionStep[connection.id] =
+        addStep(PlanStepKind::Movement, 0, connection.id);
     if (!materializesMovement(connection))
       return;
-    SynchronizationStep step;
-    step.id = nextSyncId++;
-    step.waitsFor.push_back(connection.id);
-    step.precedes.assign(connection.consumerPorts.begin(),
+    SynchronizationStep sync;
+    sync.id = nextSyncId++;
+    sync.waitsFor.push_back(connection.id);
+    sync.precedes.assign(connection.consumerPorts.begin(),
                          connection.consumerPorts.end());
-    step.requiresBarrier = connection.engines.size() > 1;
-    synchronization.push_back(std::move(step));
+    sync.requiresBarrier = connection.engines.size() > 1;
+    synchronization.push_back(std::move(sync));
     // A wait occupies its own step, so a consumer's compute step follows it.
-    ++nextStep;
+    syncStep[connection.id] =
+        addStep(PlanStepKind::Synchronization, 0, connection.id);
   };
 
   for (WorkloadNodeId nodeId : topo) {
@@ -517,13 +528,47 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
           emitted[index] = 1;
         }
     }
-    computeStep[nodeId] = nextStep++;
+    computeStep[nodeId] = addStep(PlanStepKind::Compute, nodeId, 0);
   }
   for (size_t i = 0; i < plan.connectionPlans.size(); ++i)
     if (!emitted[i]) {
       emitConnection(i);
       emitted[i] = 1;
     }
+
+  // Dependency edges: every movement follows its producer's compute step and
+  // precedes each consumer's compute step (through the wait when one exists).
+  std::vector<PlanStepEdge> stepEdges;
+  for (const PlanConnection &connection : plan.connectionPlans) {
+    auto movement = connectionStep.find(connection.id);
+    if (movement == connectionStep.end())
+      continue;
+    auto producer = valueProducer.find(connection.value);
+    if (producer != valueProducer.end()) {
+      auto step = computeStep.find(producer->second);
+      if (step != computeStep.end())
+        stepEdges.push_back(PlanStepEdge{step->second, movement->second});
+    }
+    PlanStepId tail = movement->second;
+    auto sync = syncStep.find(connection.id);
+    if (sync != syncStep.end()) {
+      stepEdges.push_back(PlanStepEdge{movement->second, sync->second});
+      tail = sync->second;
+    }
+    auto consumers = valueConsumers.find(connection.value);
+    if (consumers == valueConsumers.end())
+      continue;
+    for (WorkloadNodeId consumer : consumers->second) {
+      auto step = computeStep.find(consumer);
+      if (step != computeStep.end())
+        stepEdges.push_back(PlanStepEdge{tail, step->second});
+    }
+  }
+  llvm::sort(stepEdges, [](const PlanStepEdge &lhs, const PlanStepEdge &rhs) {
+    return lhs.from != rhs.from ? lhs.from < rhs.from : lhs.to < rhs.to;
+  });
+  stepEdges.erase(std::unique(stepEdges.begin(), stepEdges.end()),
+                  stepEdges.end());
 
   // --- allocation construction ----------------------------------------------
   const bool strict = plan.materialized;
@@ -659,32 +704,35 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     const WorkloadNode *node = graph.findNode(nodeId);
     const PlanPlacement *placement = placementFor.lookup(nodeId);
 
-    // Execution multiplicity: how many times this node runs. An unknown count
-    // is refused by a strict (materialized) plan and reported by an analysis
-    // one.
-    std::optional<uint64_t> multiplicity;
-    if (node->attributes)
-      if (auto attr = node->attributes.get(kExecutionMultiplicityAttr))
-        if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(attr))
-          if (integer.getInt() > 0)
-            multiplicity = static_cast<uint64_t>(integer.getInt());
+    // Execution multiplicity: how many times this node runs, recovered during
+    // extraction from its enclosing structural ops. An unknown count is refused
+    // by a strict (materialized) plan and reported by an analysis one.
+    //
+    // The analysis-mode fallback uses a single iteration. That is a *lower*
+    // bound, not a conservative one: a genuinely unknown loop may run many
+    // times, so an analysis-mode capacity result is advisory and must not be
+    // read as a proof. No finite upper bound exists for an unknown trip count,
+    // which is exactly why an executable (materialized) plan refuses instead of
+    // guessing -- strict mode is the gate, and the note below names the node so
+    // the under-report is never silent.
+    const std::optional<uint64_t> multiplicity = node->executionMultiplicity;
     uint64_t scale = 1;
     if (multiplicity) {
       scale = *multiplicity;
     } else if (strict) {
-      return storageError("storage plan: node " + std::to_string(nodeId) +
-                          " ('" + node->opName +
-                          "') has unknown execution multiplicity; strict "
-                          "executable planning cannot assume a single "
-                          "iteration (declare the '" +
-                          kExecutionMultiplicityAttr.str() +
-                          "' attribute or use analysis mode)");
+      return storageError(
+          "storage plan: node " + std::to_string(nodeId) + " ('" +
+          node->opName +
+          "') has unknown execution multiplicity; strict "
+          "executable planning cannot assume a single iteration "
+          "(recover the bound from the enclosing structural ops "
+          "or use analysis mode)");
     } else {
       notes.push_back(
           "storage plan: node " + std::to_string(nodeId) + " ('" +
           node->opName +
-          "') has unknown execution multiplicity; using a single iteration for "
-          "analysis");
+          "') has unknown execution multiplicity; the single-iteration used "
+          "here is a lower bound, so this analysis result is advisory");
     }
 
     for (unsigned index = 0; index < node->outputs.size(); ++index) {
@@ -792,11 +840,12 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
                     std::to_string(memory->capacityBytes));
   }
 
-  plan.diagnostics.warnings.insert(plan.diagnostics.warnings.end(),
-                                   notes.begin(), notes.end());
+  plan.diagnostics.storageNotes = std::move(notes);
   for (size_t index = 0; index < plan.connectionPlans.size(); ++index)
     plan.connectionPlans[index].storageIds.assign(
         connectionStorage[index].begin(), connectionStorage[index].end());
+  plan.steps = std::move(steps);
+  plan.stepEdges = std::move(stepEdges);
   plan.allocations = std::move(allocations);
   plan.synchronization = std::move(synchronization);
   return llvm::Error::success();

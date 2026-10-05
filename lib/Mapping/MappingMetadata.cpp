@@ -715,6 +715,36 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
   }
   planFields.emplace_back(mlir::StringAttr::get(context, "synchronization"),
                           mlir::ArrayAttr::get(context, synchronization));
+  // The plan-step DAG (design §9.6): each step's kind and what it names, plus
+  // the dependency edges between them. B4-B6 consume these to order
+  // materialization, so they must survive a round trip.
+  llvm::SmallVector<mlir::Attribute> steps;
+  for (const PlanStep &step : plan.steps) {
+    llvm::SmallVector<mlir::NamedAttribute> fields;
+    fields.emplace_back(mlir::StringAttr::get(context, "id"),
+                        u64Attr(context, step.id));
+    fields.emplace_back(
+        mlir::StringAttr::get(context, "kind"),
+        mlir::StringAttr::get(context, stringifyPlanStepKind(step.kind)));
+    fields.emplace_back(mlir::StringAttr::get(context, "node"),
+                        u64Attr(context, step.node));
+    fields.emplace_back(mlir::StringAttr::get(context, "connection"),
+                        u64Attr(context, step.connection));
+    steps.push_back(mlir::DictionaryAttr::get(context, fields));
+  }
+  planFields.emplace_back(mlir::StringAttr::get(context, "steps"),
+                          mlir::ArrayAttr::get(context, steps));
+  llvm::SmallVector<mlir::Attribute> stepEdges;
+  for (const PlanStepEdge &edge : plan.stepEdges) {
+    llvm::SmallVector<mlir::NamedAttribute> fields;
+    fields.emplace_back(mlir::StringAttr::get(context, "from"),
+                        u64Attr(context, edge.from));
+    fields.emplace_back(mlir::StringAttr::get(context, "to"),
+                        u64Attr(context, edge.to));
+    stepEdges.push_back(mlir::DictionaryAttr::get(context, fields));
+  }
+  planFields.emplace_back(mlir::StringAttr::get(context, "step_edges"),
+                          mlir::ArrayAttr::get(context, stepEdges));
   kernel->setAttr(kPlanAttr, mlir::DictionaryAttr::get(context, planFields));
 
   for (const PlanPlacement &placement : plan.placements) {
@@ -1049,6 +1079,48 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       if (auto barrier = dict.getAs<mlir::BoolAttr>("requires_barrier"))
         step.requiresBarrier = barrier.getValue();
       plan.synchronization.push_back(std::move(step));
+    }
+  }
+  // The plan-step DAG (design §9.6). An absent container is legal (a plan
+  // written before storage planning); a present one is read checked.
+  if (auto steps = planAttr.getAs<mlir::ArrayAttr>("steps")) {
+    for (mlir::Attribute element : steps) {
+      auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+      if (!dict)
+        return metadataError("micro.plan 'steps' entry is not a dictionary");
+      PlanStep step;
+      if (auto value = dict.getAs<mlir::IntegerAttr>("id"))
+        step.id = value.getValue().getZExtValue();
+      llvm::Expected<std::string> kind =
+          readMetadataString(dict, "kind", "micro.plan steps");
+      if (!kind)
+        return kind.takeError();
+      std::optional<PlanStepKind> symbolized = symbolizePlanStepKind(*kind);
+      if (!symbolized)
+        return metadataError("micro.plan step has unknown kind '" + *kind +
+                             "'");
+      step.kind = *symbolized;
+      if (auto value = dict.getAs<mlir::IntegerAttr>("node"))
+        step.node =
+            static_cast<WorkloadNodeId>(value.getValue().getZExtValue());
+      if (auto value = dict.getAs<mlir::IntegerAttr>("connection"))
+        step.connection =
+            static_cast<ConnectionId>(value.getValue().getZExtValue());
+      plan.steps.push_back(std::move(step));
+    }
+  }
+  if (auto edges = planAttr.getAs<mlir::ArrayAttr>("step_edges")) {
+    for (mlir::Attribute element : edges) {
+      auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+      if (!dict)
+        return metadataError(
+            "micro.plan 'step_edges' entry is not a dictionary");
+      PlanStepEdge edge;
+      if (auto value = dict.getAs<mlir::IntegerAttr>("from"))
+        edge.from = value.getValue().getZExtValue();
+      if (auto value = dict.getAs<mlir::IntegerAttr>("to"))
+        edge.to = value.getValue().getZExtValue();
+      plan.stepEdges.push_back(edge);
     }
   }
 

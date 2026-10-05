@@ -45,14 +45,6 @@ struct MachineModel;
 
 namespace mlir::llk::mapping {
 
-/// The attribute a workload node carries to declare how many times it executes
-/// (a loop trip count, a pipeline stage count). An integer attribute, read off
-/// `WorkloadNode::attributes`. Its absence means the multiplicity is *unknown*:
-/// a strict executable plan must not pretend an unknown loop runs once, while
-/// an explicit analysis plan may use a reported single-iteration fallback.
-inline constexpr llvm::StringLiteral kExecutionMultiplicityAttr =
-    "micro.multiplicity";
-
 /// The physical image a value occupies: the byte count of the bounding image of
 /// its layout map over its logical index space, padded as declared. `known` is
 /// true only when every part was derived from static facts.
