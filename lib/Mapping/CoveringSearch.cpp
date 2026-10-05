@@ -816,16 +816,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   };
 
   // The explicit gather combination a multi-producer value's consumer declares,
-  // in `micro.gather`'s own vocabulary: a string `kind` (`sum`|`max`|`concat`)
-  // and, for a concatenation, an integer `axis`. Nothing is inferred from the
-  // producer count, so a consumer that declares none yields no semantics and
-  // the `Reduce` stays unmaterializable (task B6's rule). The declaration is
-  // what makes a real gather -- not only a hand-built connection -- selectable.
+  // in `micro.gather`'s vocabulary but *namespaced*: a string
+  // `micro.gather_kind` (`sum`|`max`|`concat`) and, for a concatenation, an
+  // integer `micro.gather_axis`. The keys are qualified because a workload
+  // node's dictionary is its whole op attribute set: a bare `axis` is a real
+  // attribute on `micro.reduce`, so reading one would misread a reduction axis
+  // as a concatenation axis. Nothing is inferred from the producer count, so a
+  // consumer that declares none yields no semantics and the `Reduce` stays
+  // unmaterializable (task B6's rule). The declaration is what makes a real
+  // gather -- not only a hand-built connection -- selectable.
   auto declaredGather =
       [&](const WorkloadNode &node) -> std::optional<GatherSemantics> {
     if (!node.attributes)
       return std::nullopt;
-    if (auto kind = node.attributes.getAs<mlir::StringAttr>("kind"))
+    if (auto kind =
+            node.attributes.getAs<mlir::StringAttr>("micro.gather_kind"))
       return symbolizeGatherSemantics(kind.getValue());
     return std::nullopt;
   };
@@ -833,7 +838,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       [&](const WorkloadNode &node) -> std::optional<uint64_t> {
     if (!node.attributes)
       return std::nullopt;
-    if (auto axis = node.attributes.getAs<mlir::IntegerAttr>("axis"))
+    if (auto axis =
+            node.attributes.getAs<mlir::IntegerAttr>("micro.gather_axis"))
       return static_cast<uint64_t>(axis.getInt());
     return std::nullopt;
   };
@@ -1336,7 +1342,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           makeRequest(state, producer, *state.chosen[front.node], &producerEnd,
                       &front, link.value);
       llvm::Expected<ConnectionChoiceSet> choices = enumerateConnectionChoices(
-          llvm::ArrayRef<ConnectionRequest>(&request, 1), target_,
+          llvm::ArrayRef<ConnectionRequest>(&request, 1), machine, topology,
           placementOptions);
       if (!choices) {
         report(DiagnosticCode::NoMemoryRoute,
@@ -1406,6 +1412,9 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                        ": no legal route");
           return out;
         }
+      // §22.2: the fan-out plans synthesized -- one serving group each (or one
+      // shared read), the same figure `synthesizeFanOut` returned pre-B7.
+      result.routeCount += groups->size();
       // The joint product over the fan-out's destination groups, bounded by the
       // connection-choice cap.
       std::vector<size_t> pick(groups->size(), 0);
@@ -1479,14 +1488,25 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         semantics && *semantics == GatherSemantics::Concatenate
             ? declaredConcatAxis(consumerNode)
             : std::nullopt;
+    // A concatenation with no axis is a malformed declaration, not a default:
+    // `micro.gather` refuses it, and guessing an axis would materialize a
+    // different tile. Refuse the connection with a stable reason.
+    if (semantics && *semantics == GatherSemantics::Concatenate &&
+        !concatAxis) {
+      report(DiagnosticCode::InvalidGatherDeclaration,
+             "node " + std::to_string(consumerNode.id) +
+                 ": a Concatenate gather for value " +
+                 std::to_string(link.value) + " declares no axis");
+      return out;
+    }
 
     std::vector<ConnectionRequest> feedRequests;
     for (const ValueEndpoint &producerEnd : link.producers)
       feedRequests.push_back(makeRequest(state, *state.chosen[producerEnd.node],
                                          consumer, &producerEnd,
                                          &representative, link.value));
-    llvm::Expected<ConnectionChoiceSet> choices =
-        enumerateConnectionChoices(feedRequests, target_, placementOptions);
+    llvm::Expected<ConnectionChoiceSet> choices = enumerateConnectionChoices(
+        feedRequests, machine, topology, placementOptions);
     if (!choices) {
       report(DiagnosticCode::NoMemoryRoute,
              "gather: " + llvm::toString(choices.takeError()));

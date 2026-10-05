@@ -85,6 +85,11 @@ enum class DiagnosticCode {
   /// with every cap lifted. Admissible only for a *notice*, as `isRejection`
   /// classifies it.
   ConnectionChoiceUnexplored,
+  /// A gather's declaration is malformed: the `Concatenate` combination
+  /// requires an axis (`micro.gather` refuses a concat without one), but the
+  /// consumer declared none. Nothing is inferred -- a guessed axis would
+  /// materialize a different tile -- so the connection is refused.
+  InvalidGatherDeclaration,
 };
 
 /// The stable string for `code` (for example `no_matching_rule`). Never empty.

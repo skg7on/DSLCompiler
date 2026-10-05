@@ -4308,6 +4308,7 @@ TEST(MappingDiagnostics, EveryCodeRoundTripsThroughItsString) {
       DiagnosticCode::AssumedValueSize,
       DiagnosticCode::InvalidMappingMetadata,
       DiagnosticCode::ConnectionChoiceUnexplored,
+      DiagnosticCode::InvalidGatherDeclaration,
   };
   for (DiagnosticCode code : codes) {
     llvm::StringRef text = stringifyDiagnosticCode(code);
@@ -4757,20 +4758,30 @@ TEST(CoveringSearch, ConnectionChoiceCapReportsTruncationNotACollapse) {
 // A search-selected gather declares its semantics (B6 carry-over)
 //===----------------------------------------------------------------------===//
 
-/// The multi-producer value's consumer declared as a `micro.gather`, in the
-/// dialect's own vocabulary: `kind` names the combination and `axis` is the
-/// concatenation axis.
-mlir::DictionaryAttr gatherConsumerAttributes(mlir::MLIRContext &context,
-                                              llvm::StringRef kind,
-                                              std::optional<int64_t> axis) {
+/// The namespaced keys a consumer uses to declare its gather combination. They
+/// are qualified because a workload node's attribute dictionary is its whole op
+/// attribute set (extraction copies `getAttrDictionary()`): a bare `axis` is a
+/// real attribute on `micro.reduce`, so an unqualified key would misread a
+/// reduction axis as a concatenation axis.
+constexpr llvm::StringLiteral kGatherKindAttr = "micro.gather_kind";
+constexpr llvm::StringLiteral kGatherAxisAttr = "micro.gather_axis";
+
+/// A consumer declaring a gather combination. `kindAttr`/`axisAttr` default to
+/// the namespaced keys; a control passes the bare `kind`/`axis` to prove they
+/// are ignored.
+mlir::DictionaryAttr
+gatherConsumerAttributes(mlir::MLIRContext &context, llvm::StringRef kind,
+                         std::optional<int64_t> axis,
+                         llvm::StringRef kindAttr = kGatherKindAttr,
+                         llvm::StringRef axisAttr = kGatherAxisAttr) {
   std::vector<mlir::NamedAttribute> attributes{
       mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
                            mlir::StringAttr::get(&context, "consume")),
-      mlir::NamedAttribute(mlir::StringAttr::get(&context, "kind"),
+      mlir::NamedAttribute(mlir::StringAttr::get(&context, kindAttr),
                            mlir::StringAttr::get(&context, kind))};
   if (axis)
     attributes.push_back(mlir::NamedAttribute(
-        mlir::StringAttr::get(&context, "axis"),
+        mlir::StringAttr::get(&context, axisAttr),
         mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), *axis)));
   return mlir::DictionaryAttr::get(&context, attributes);
 }
@@ -4778,8 +4789,8 @@ mlir::DictionaryAttr gatherConsumerAttributes(mlir::MLIRContext &context,
 /// `fanInGraph` with the consumer declaring a gather combination, so the search
 /// can select a real gather rather than only a hand-built connection.
 WorkloadGraph declaredGatherGraph(mlir::MLIRContext &context,
-                                  llvm::StringRef kind,
-                                  std::optional<int64_t> axis) {
+                                  mlir::DictionaryAttr consumerAttributes,
+                                  llvm::StringRef consumerOp = "micro.vector") {
   WorkloadGraph graph;
   WorkloadValueId in1 =
       graph.addValue(WorkloadValue{0, mlir::Type(), "in1", /*external=*/true});
@@ -4803,9 +4814,9 @@ WorkloadGraph declaredGatherGraph(mlir::MLIRContext &context,
   producer(in2, 1);
 
   WorkloadNode consumer;
-  consumer.opName = "micro.vector";
+  consumer.opName = consumerOp.str();
   consumer.sourceOrdinal = 2;
-  consumer.attributes = gatherConsumerAttributes(context, kind, axis);
+  consumer.attributes = consumerAttributes;
   consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
   consumer.outputs.push_back(WorkloadPort{out, mlir::Type(), std::nullopt});
   graph.addNode(std::move(consumer));
@@ -4816,7 +4827,8 @@ WorkloadGraph declaredGatherGraph(mlir::MLIRContext &context,
 
 TEST(CoveringSearch, SearchSelectedPlanDeclaresASumGather) {
   mlir::MLIRContext context;
-  WorkloadGraph graph = declaredGatherGraph(context, "sum", std::nullopt);
+  WorkloadGraph graph = declaredGatherGraph(
+      context, gatherConsumerAttributes(context, "sum", std::nullopt));
   std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
   ASSERT_NE(target, nullptr);
 
@@ -4844,7 +4856,8 @@ TEST(CoveringSearch, SearchSelectedPlanDeclaresASumGather) {
 
 TEST(CoveringSearch, SearchSelectedPlanDeclaresAConcatGatherWithItsAxis) {
   mlir::MLIRContext context;
-  WorkloadGraph graph = declaredGatherGraph(context, "concat", 0);
+  WorkloadGraph graph = declaredGatherGraph(
+      context, gatherConsumerAttributes(context, "concat", 0));
   std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
   ASSERT_NE(target, nullptr);
 
@@ -4880,4 +4893,155 @@ TEST(CoveringSearch, AnUndeclaredGatherCarriesNoSemantics) {
   ASSERT_EQ(result->plans[0].connectionPlans.size(), 1u);
   EXPECT_EQ(result->plans[0].connectionPlans[0].kind, ConnectionKind::Reduce);
   EXPECT_FALSE(result->plans[0].connectionPlans[0].gatherSemantics.has_value());
+}
+
+// The declaration keys are namespaced, so another op's `kind`/`axis` is never
+// read as a gather. A bare `kind="concat"` plus a bare `axis` declares nothing.
+TEST(CoveringSearch, AnUnnamespacedGatherDeclarationIsIgnored) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context, gatherConsumerAttributes(context, "concat", 0, "kind", "axis"));
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_EQ(result->plans[0].connectionPlans.size(), 1u);
+  EXPECT_EQ(result->plans[0].connectionPlans[0].kind, ConnectionKind::Reduce);
+  EXPECT_FALSE(result->plans[0].connectionPlans[0].gatherSemantics.has_value());
+}
+
+// A `Concatenate` declares an axis or it is refused: `micro.gather` requires
+// one and guessing would materialize a different tile. A declaration whose axis
+// sits on a bare `axis` is not a namespaced axis, so the connection is refused
+// with a stable reason rather than silently reading the wrong key.
+TEST(CoveringSearch, AConcatGatherWithoutItsNamespacedAxisIsRejected) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context,
+      gatherConsumerAttributes(context, "concat", 0, kGatherKindAttr, "axis"));
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::InvalidGatherDeclaration));
+}
+
+/// A producer rule and a `micro.reduce` consumer rule, so a reduction consumer
+/// (which carries its own bare `axis`) can stand as a gather's consumer.
+constexpr llvm::StringLiteral kGatherReduceRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.reduce {
+  match micro.reduce(op = "sum");
+  require executor kind worker;
+  require memory kind acc;
+  bundle "b.reduce";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// A `micro.reduce` consumer's attribute dictionary. `axis` is the reduction's
+/// own attribute (`MicroOps.td`'s `I64Attr:$axis`); `gatherKind`/`gatherAxis`
+/// are the namespaced gather declaration, added only when wanted.
+mlir::DictionaryAttr reductionConsumerAttributes(
+    mlir::MLIRContext &context, std::optional<int64_t> axis,
+    llvm::StringRef gatherKind, std::optional<int64_t> gatherAxis) {
+  std::vector<mlir::NamedAttribute> attributes{
+      mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
+                           mlir::StringAttr::get(&context, "sum"))};
+  if (axis)
+    attributes.push_back(mlir::NamedAttribute(
+        mlir::StringAttr::get(&context, "axis"),
+        mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), *axis)));
+  if (!gatherKind.empty())
+    attributes.push_back(
+        mlir::NamedAttribute(mlir::StringAttr::get(&context, kGatherKindAttr),
+                             mlir::StringAttr::get(&context, gatherKind)));
+  if (gatherAxis)
+    attributes.push_back(mlir::NamedAttribute(
+        mlir::StringAttr::get(&context, kGatherAxisAttr),
+        mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64),
+                               *gatherAxis)));
+  return mlir::DictionaryAttr::get(&context, attributes);
+}
+
+// A `micro.reduce` consumer's own `axis` is a reduction axis, not a gather
+// declaration: with no `micro.gather_kind` it is never misread as a concat.
+TEST(CoveringSearch, AReductionConsumersOwnAxisIsNotAGatherDeclaration) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context, reductionConsumerAttributes(context, 1, "", std::nullopt),
+      "micro.reduce");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(fanMachine(), kGatherReduceRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_EQ(result->plans[0].connectionPlans.size(), 1u);
+  EXPECT_EQ(result->plans[0].connectionPlans[0].kind, ConnectionKind::Reduce);
+  EXPECT_FALSE(result->plans[0].connectionPlans[0].gatherSemantics.has_value());
+  EXPECT_FALSE(result->plans[0].connectionPlans[0].concatAxis.has_value());
+}
+
+// The same reduction consumer *may* declare a gather, and then its declared
+// namespaced axis governs -- the reduction's own `axis` is still not consulted.
+TEST(CoveringSearch, AReductionConsumerMayDeclareAGatherWithItsOwnAxis) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context, reductionConsumerAttributes(context, 1, "concat", 0),
+      "micro.reduce");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(fanMachine(), kGatherReduceRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const PlanConnection &connection = result->plans[0].connectionPlans[0];
+  ASSERT_TRUE(connection.gatherSemantics.has_value());
+  EXPECT_EQ(*connection.gatherSemantics, GatherSemantics::Concatenate);
+  ASSERT_TRUE(connection.concatAxis.has_value());
+  EXPECT_EQ(*connection.concatAxis, 0u); // not the reduction's bare axis=1
+}
+
+// §22.2: a fan-out's synthesized alternatives are tallied. Two destination
+// groups contribute two -- the figure the pre-B7 greedy synthesis reported.
+TEST(CoveringSearch, FanOutAlternativesAreCounted) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoConsumerGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sharedStagingFanOutMachine(), kTwoConsumerRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_EQ(result->routeCount, 2u);
 }

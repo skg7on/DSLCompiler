@@ -705,6 +705,14 @@ enumerateConnectionChoices(llvm::ArrayRef<ConnectionRequest> requests,
                            const MappingTarget &target,
                            const PlacementOptions &options) {
   const MachineModel &machine = target.machine();
+  TopologyService topology(machine,
+                           RouteOptions{options.maxRoutesPerConnection, 4});
+  return enumerateConnectionChoices(requests, machine, topology, options);
+}
+
+llvm::Expected<ConnectionChoiceSet> enumerateConnectionChoices(
+    llvm::ArrayRef<ConnectionRequest> requests, const MachineModel &machine,
+    const TopologyService &topology, const PlacementOptions &options) {
   ConnectionChoiceSet set;
   // No requests is one empty choice -- the identity of the product, so a caller
   // can treat a placement that completed no value as a single state.
@@ -712,9 +720,6 @@ enumerateConnectionChoices(llvm::ArrayRef<ConnectionRequest> requests,
     set.combinations.emplace_back();
     return set;
   }
-
-  TopologyService topology(machine,
-                           RouteOptions{options.maxRoutesPerConnection, 4});
 
   // Each request's own legal alternatives, in `synthesizeConnections`' order.
   // A request with no legal route makes the whole product empty: the pair is

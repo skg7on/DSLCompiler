@@ -44,6 +44,8 @@ llvm::StringRef stringifyDiagnosticCode(DiagnosticCode code) {
     return "invalid_mapping_metadata";
   case DiagnosticCode::ConnectionChoiceUnexplored:
     return "connection_choice_unexplored";
+  case DiagnosticCode::InvalidGatherDeclaration:
+    return "invalid_gather_declaration";
   }
   return "";
 }
@@ -66,6 +68,8 @@ std::optional<DiagnosticCode> symbolizeDiagnosticCode(llvm::StringRef name) {
       .Case("invalid_mapping_metadata", DiagnosticCode::InvalidMappingMetadata)
       .Case("connection_choice_unexplored",
             DiagnosticCode::ConnectionChoiceUnexplored)
+      .Case("invalid_gather_declaration",
+            DiagnosticCode::InvalidGatherDeclaration)
       .Default(std::nullopt);
 }
 

@@ -216,6 +216,14 @@ enumerateConnectionChoices(llvm::ArrayRef<ConnectionRequest> requests,
                            const MappingTarget &target,
                            const PlacementOptions &options = {});
 
+/// The same joint enumeration against a caller-held topology service, so a
+/// search that already owns one does not rebuild it per decision per prefix.
+llvm::Expected<ConnectionChoiceSet>
+enumerateConnectionChoices(llvm::ArrayRef<ConnectionRequest> requests,
+                           const machine::MachineModel &machine,
+                           const TopologyService &topology,
+                           const PlacementOptions &options = {});
+
 /// Fan-out (design §15.3). Every consumer is given by its own fully-specified
 /// `ConnectionRequest`, so §10.2 (element type, logical tile shape, visibility,
 /// affine index relation) is checked against *each* consumer rather than one
