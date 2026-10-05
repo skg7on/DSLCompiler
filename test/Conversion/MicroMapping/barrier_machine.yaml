@@ -1,0 +1,86 @@
+# A machine whose only route from SRAM to DRAM is through L2, so a movement
+# between them records *two* transfer engines rather than one. The storage plan
+# marks such a multi-engine movement as requiring a barrier
+# (StoragePlan.cpp: `sync.requiresBarrier = connection.engines.size() > 1`), so
+# the barrier fixture exercises the CLI's barrier emission end to end.
+#
+# SRAM lives in cluster.a (where the vector engine runs) and DRAM in cluster.b,
+# so a store in DRAM cannot read the vector's SRAM tile directly: the edge is a
+# real movement, routed sram -> l2 -> dram.
+#
+# The two memory levels live in different visibility scopes, matching the probe
+# machine the tile-transfer fixture uses, but with the direct SRAM -> DRAM link
+# removed and an L2 intermediate required instead.
+schema: llk.machine.v2
+target: barrier
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.a
+    kind: cluster
+  - id: worker.a
+    kind: worker
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+  - id: worker.b
+    kind: worker
+    parent: cluster.b
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.a
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+  - id: l2.0
+    kind: l2
+    visible_from: cluster.b
+    capacity_bytes: 262144
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+  - id: dram.0
+    kind: dram
+    visible_from: cluster.b
+    capacity_bytes: 1073741824
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.a
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+transfer_engines:
+  - id: dma.a
+    kind: dma
+    attached_to: cluster.a
+    count: 1
+    max_outstanding: 1
+  - id: dma.b
+    kind: dma
+    attached_to: cluster.b
+    count: 1
+    max_outstanding: 1
+links:
+  - id: sram_to_l2.0
+    source: sram.0
+    destination: l2.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+  - id: l2_to_dram.0
+    source: l2.0
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.b]

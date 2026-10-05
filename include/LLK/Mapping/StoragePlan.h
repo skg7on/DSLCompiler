@@ -105,7 +105,7 @@ computePeakStorage(llvm::ArrayRef<StorageAllocation> allocations);
 /// storage allocation live from its first writer through its last real reader,
 /// records the synchronization decisions the movements imply, and checks each
 /// memory's capacity against the occupancy the intervals produce. The occupancy
-/// notes are recorded in `plan.diagnostics.warnings`.
+/// notes are recorded in `plan.diagnostics.storageNotes`.
 ///
 /// A value's footprint is its physical image under the layout the placement
 /// solved for it, multiplied by its producer's execution multiplicity. When

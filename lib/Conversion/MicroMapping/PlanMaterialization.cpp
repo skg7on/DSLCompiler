@@ -25,6 +25,16 @@
 // `micro.tile_view` gets a fresh view over the movement result, so the recorded
 // endpoint genuinely reads what the connection produced rather than the
 // original value.
+//
+// Emission versus the storage plan (task B4): each movement lands in an
+// allocation in the movement's *route destination* memory.
+// `finalizeStoragePlan` selects the same memory for the connection's staged
+// copy (its destination is `route.back()`, or the consumer's primary memory for
+// a route-less movement), so the emitted copy and the storage allocation agree
+// by construction. The remaining B4 carry-over -- emitting a *producer's* write
+// into the allocation `outputMemoryOf` selected rather than into the route
+// destination -- is not changed here: it would re-map every producer write and
+// belongs with replay rewriting (stage C, C5).
 
 #include "LLK/Mapping/PlanBinder.h"
 
@@ -32,6 +42,7 @@
 #include "LLK/Dialect/Micro/MicroEnums.h"
 #include "LLK/Dialect/Micro/MicroHelpers.h"
 
+#include "LLK/Mapping/MappingHelpers.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/AsmParser/AsmParser.h"
@@ -98,16 +109,6 @@ mlir::IntegerAttr u64Attr(mlir::MLIRContext *context, uint64_t value) {
                                 static_cast<int64_t>(value));
 }
 
-/// The `#micro.memory<kind>` attribute a machine memory kind names, or null
-/// when the kind is not a canonical Micro abstract space. An unknown target
-/// memory kind has no canonical abstract-space mapping, so the caller rejects
-/// it rather than inventing a dialect enum: a machine kind either spells a real
-/// `#micro.memory<...>` space, or an explicit mapping must be added.
-mlir::Attribute memoryAttrFor(mlir::MLIRContext *context,
-                              llvm::StringRef kind) {
-  return mlir::parseAttribute(("#micro.memory<" + kind + ">").str(), context);
-}
-
 /// The identity of a connection's layout transform: the two families and the
 /// two solved maps. Two connections that move one value to one memory under
 /// *different* transforms are different work, so they must not share a copy
@@ -157,17 +158,6 @@ bool isTileType(mlir::Type type) { return llvm::isa<micro::TileType>(type); }
 bool isTransparentOp(mlir::Operation *op) {
   llvm::StringRef name = op->getName().getStringRef();
   return name == "micro.tile_view" || name == "micro.tile_partition";
-}
-
-/// Resolves `value` through the transparent logical ops to the value it
-/// ultimately reads.
-mlir::Value resolveThroughTransparent(mlir::Value value) {
-  while (mlir::Operation *defining = value.getDefiningOp()) {
-    if (!isTransparentOp(defining) || defining->getNumOperands() == 0)
-      break;
-    value = defining->getOperand(0);
-  }
-  return value;
 }
 
 /// The operation whose `micro.mapping` records source node `node`, or null.
@@ -893,7 +883,7 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       // served by the same transparent view is already rewired to the movement
       // result, which is equally valid.
       if (operand) {
-        mlir::Value current = resolveThroughTransparent(operand->get());
+        mlir::Value current = resolveThroughTransparentOps(operand->get());
         if (current == chain.result)
           continue;
         // A gather combines several feeds, so its consumer may currently read

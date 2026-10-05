@@ -15,6 +15,7 @@
 #include "LLK/Mapping/MappingRules.h"
 
 #include "LLK/Mapping/Diagnostics.h"
+#include "LLK/Mapping/MappingHelpers.h"
 #include "LLK/Mapping/StableHash.h"
 #include "LLK/Mapping/TileFacts.h"
 #include "LLK/Mapping/WorkloadGraph.h"
@@ -1310,33 +1311,6 @@ mlir::DictionaryAttr buildBundleParameters(const RuleDef &rule,
   return mlir::DictionaryAttr::get(context, attributes);
 }
 
-/// The rule port `subject` resolves to on `node`, mirroring the positional
-/// wiring generation uses: rule ports map to the node's inputs then its outputs
-/// in declaration order, so a port's position within its direction is the
-/// occurrence index. Nullopt when the rule declares no such port or the node
-/// does not expose that occurrence.
-std::optional<PortRef> resolveRulePort(const RuleDef &rule,
-                                       const WorkloadNode &node,
-                                       const RulePort &subject) {
-  size_t inputIndex = 0;
-  size_t outputIndex = 0;
-  for (const RulePort &port : rule.ports) {
-    size_t &index = port.isInput ? inputIndex : outputIndex;
-    if (port.name == subject.name && port.isInput == subject.isInput) {
-      llvm::ArrayRef<WorkloadPort> nodePorts =
-          port.isInput ? node.inputs : node.outputs;
-      if (index < nodePorts.size())
-        return PortRef{node.id,
-                       port.isInput ? PortDirection::Input
-                                    : PortDirection::Output,
-                       static_cast<uint32_t>(index)};
-      return std::nullopt;
-    }
-    ++index;
-  }
-  return std::nullopt;
-}
-
 /// Projects the bound `owner_mapping` and `memory_path` search axes onto the
 /// candidate's abstract requirements, validating each against machine data. The
 /// projection is explicit: a bound axis changes which executors, computes, and
@@ -1589,7 +1563,7 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
       // cannot be attributed, so the rule is a non-match rather than a bare
       // fallback.
       if (requirement.port) {
-        resolved.port = resolveRulePort(rule, node, *requirement.port);
+        resolved.port = portRefForRulePort(rule, node, *requirement.port);
         if (!resolved.port) {
           if (reason)
             *reason = "memory requirement names port '" +
@@ -1863,7 +1837,7 @@ llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
     std::string boundMemory;
     if (requirement.port) {
       std::optional<PortRef> ref =
-          resolveRulePort(rule, node, *requirement.port);
+          portRefForRulePort(rule, node, *requirement.port);
       if (!ref)
         return reject(DiagnosticCode::NoMemoryRoute,
                       "rule '" + rule.id + "' requires a '" + requirement.kind +

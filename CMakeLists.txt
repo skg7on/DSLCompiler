@@ -979,6 +979,28 @@ if(LLK_BUILD_TOOLS)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/probe_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | grep -q 'micro.tile_async_copy'"
   )
 
+  # MicroMappingBarrier: the storage plan (task B3) is now run on the selected
+  # plan (task C1), so a movement that needs more than one transfer engine is
+  # barrier-synchronized and the canonical materializer emits a `micro.barrier`.
+  # The fixture routes SRAM -> L2 -> DRAM (two links, two engines) on
+  # barrier_machine.yaml, so `requiresBarrier` is set and the barrier is
+  # observable in the IR. Raw add_test because FileCheck needs --check-prefix and
+  # stderr must be merged (the pass's diagnostics go to stderr).
+  add_test(NAME MicroMappingBarrier
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=barrier machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/barrier_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/barrier_sync.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=MAP ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/barrier_sync.mlir"
+  )
+
+  # MicroMappingBarrierStorage: the reported and verified half of C1 -- the
+  # report's selectedState carries populated allocations, synchronization and the
+  # plan-step DAG, and B6's barrier verification fires (deleting the barrier
+  # makes verification fail). A script because it compares the IR, the report
+  # file, and two verification outcomes.
+  add_test(NAME MicroMappingBarrierStorage
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/barrier_storage.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBarrierStorage
+  )
+
   # MicroMappingReport: the `report=<path>` option's contract -- the report file
   # is produced, the mapped IR is byte-identical with and without it (the report
   # is metadata), and two separate llk-opt runs produce identical reports. A

@@ -17,6 +17,7 @@
 #include "LLK/Mapping/PlanBinder.h"
 
 #include "LLK/Mapping/Diagnostics.h"
+#include "LLK/Mapping/MappingHelpers.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/StableHash.h"
 #include "LLK/Mapping/TileFacts.h"
@@ -116,23 +117,6 @@ std::string kernelLabel(mlir::Operation *kernel) {
   return "<unnamed>";
 }
 
-/// Resolves `value` through the transparent logical ops (`micro.tile_view`,
-/// `micro.tile_partition`) to the operation-produced value it ultimately reads.
-/// A5 accepts this indirection: a consumer reading the movement through a view
-/// still reads the movement.
-mlir::Value resolveThroughLogicalOps(mlir::Value value) {
-  while (mlir::Operation *defining = value.getDefiningOp()) {
-    llvm::StringRef name = defining->getName().getStringRef();
-    if ((name == "micro.tile_view" || name == "micro.tile_partition") &&
-        defining->getNumOperands() > 0) {
-      value = defining->getOperand(0);
-      continue;
-    }
-    break;
-  }
-  return value;
-}
-
 /// The operation in `kernel` whose `micro.mapping` records source node `node`,
 /// or null. Consumer endpoints name *source* node ids, and a mapped workload
 /// operation records the source node it covers, so this is the materialized
@@ -222,30 +206,6 @@ LayoutContext layoutContextForRule(const RuleDef &rule,
   return context;
 }
 
-/// The occurrence a rule port resolves to on `node`, mirroring the positional
-/// wiring generation uses (inputs then outputs, in declaration order).
-std::optional<PortRef> portRefForRulePort(const RuleDef &rule,
-                                          const WorkloadNode &node,
-                                          const RulePort &subject) {
-  size_t inputIndex = 0;
-  size_t outputIndex = 0;
-  for (const RulePort &port : rule.ports) {
-    size_t &index = port.isInput ? inputIndex : outputIndex;
-    if (port.name == subject.name && port.isInput == subject.isInput) {
-      llvm::ArrayRef<WorkloadPort> ports =
-          port.isInput ? node.inputs : node.outputs;
-      if (index < ports.size())
-        return PortRef{node.id,
-                       port.isInput ? PortDirection::Input
-                                    : PortDirection::Output,
-                       static_cast<uint32_t>(index)};
-      return std::nullopt;
-    }
-    ++index;
-  }
-  return std::nullopt;
-}
-
 /// Reads a required integer bookkeeping attribute from a materialized movement
 /// with a checked cast.
 llvm::Expected<uint64_t> movementUintAttr(mlir::Operation *op,
@@ -278,13 +238,6 @@ llvm::Expected<std::string> movementStringAttr(mlir::Operation *op,
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
                        prefix + ": '" + name.str() + "' is not a string");
   return text.getValue().str();
-}
-
-/// The `#micro.memory<kind>` attribute a machine memory kind names, or a null
-/// attribute when the kind is not a Micro memory space.
-mlir::Attribute memoryAttrFor(mlir::MLIRContext *context,
-                              llvm::StringRef kind) {
-  return mlir::parseAttribute(("#micro.memory<" + kind + ">").str(), context);
 }
 
 /// Validates that `op` is a binder-emitted materialized movement, so the
@@ -664,7 +617,7 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
                   std::to_string(ref->node) + ", which has only " +
                   std::to_string(consumer->getNumOperands()) + " operand(s)");
         mlir::Value read =
-            resolveThroughLogicalOps(consumer->getOperand(ref->index));
+            resolveThroughTransparentOps(consumer->getOperand(ref->index));
         // The consumer must read a value this connection materialized: either
         // this movement op itself, or -- for a transfer-and-transform, or a
         // later route hop -- another operation stamped with the same

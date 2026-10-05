@@ -861,6 +861,34 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
                 "source graph");
           connection.consumerPorts.push_back(*ref);
         }
+      // The explicit combination a reduce performs, the axis a concat joins
+      // along, and the producer occurrences it combines (task B6/B7). Without
+      // them a replayed `Reduce` connection degrades to
+      // `reduce_not_materialized` even though the report states what the gather
+      // means.
+      if (std::optional<llvm::StringRef> semantics =
+              object->getString("gatherSemantics")) {
+        std::optional<GatherSemantics> symbolized =
+            symbolizeGatherSemantics(*semantics);
+        if (!symbolized)
+          return reportError(
+              "plan report connection has an unknown gather semantics");
+        connection.gatherSemantics = *symbolized;
+      }
+      if (std::optional<int64_t> axis = object->getInteger("concatAxis"))
+        connection.concatAxis = static_cast<uint64_t>(*axis);
+      if (const llvm::json::Array *producerPorts =
+              object->getArray("producerPorts"))
+        for (const llvm::json::Value &port : *producerPorts) {
+          llvm::Expected<PortRef> ref =
+              jsonPortRef(port.getAsObject(), "producerPorts");
+          if (!ref)
+            return ref.takeError();
+          if (!lookupPort(graph, *ref))
+            return reportError("plan report connection endpoint does not "
+                               "resolve in the source graph");
+          connection.producerPorts.push_back(*ref);
+        }
       if (const llvm::json::Object *transform =
               object->getObject("transform")) {
         LayoutTransform layoutTransform;

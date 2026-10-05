@@ -91,6 +91,20 @@ llvm::Error writePlanReportFile(llvm::StringRef path,
 /// (C5) must re-derive them from the recorded parameters and the layout
 /// declaration (and re-validate them), exactly as `decodeSelectedPlan` does
 /// against a live module.
+///
+/// RANKING SCORE (stage C, task C5): a report-replayed plan carries *no*
+/// ranking score. The report records no `totalCost`/`accumulatedCost`, no
+/// `scoreSource`, and none of the derived execution facts `buildPlanEvents`
+/// charges -- each placement's `cost`/`workItems`, each connection's
+/// `cost`/`valueType` -- so `buildPlanEvents` rejects the replayed plan
+/// (`plan.schemaVersion != 0` with zero-cost placements) and any ranking over
+/// it would see cost 0. This is deliberate: inventing score facts here would
+/// let a replay claim a scheduled latency it never measured. A caller that
+/// needs to rank or bind a replayed plan must **re-score** it first -- re-run
+/// the search that produced it (or otherwise rebuild the plan's normalized
+/// events through `buildPlanEvents` + `schedulePlanEvents`) before calling
+/// `ranksBefore`. Replay-and-rank is a C5 deliverable, not satisfied by this
+/// reader.
 llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
                                             const MappingTarget &target,
                                             const WorkloadGraph &graph);

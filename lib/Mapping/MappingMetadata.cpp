@@ -18,6 +18,7 @@
 
 #include "LLK/Mapping/MappingMetadata.h"
 
+#include "LLK/Mapping/MappingHelpers.h"
 #include "LLK/Mapping/StableHash.h"
 
 #include "LLK/Machine/MachineModel.h"
@@ -981,29 +982,6 @@ readParameters(mlir::DictionaryAttr dict, llvm::StringRef where) {
     values[entry.getName()] = *value;
   }
   return values;
-}
-
-/// The rule's port occurrence for `portName`, mirroring the positional wiring
-/// generation uses (inputs then outputs).
-std::optional<PortRef> portRefForRulePort(const RuleDef &rule,
-                                          const WorkloadNode &node,
-                                          llvm::StringRef portName) {
-  size_t inputIndex = 0;
-  size_t outputIndex = 0;
-  for (const RulePort &port : rule.ports) {
-    if (port.isInput) {
-      if (port.name == portName && inputIndex < node.inputs.size())
-        return PortRef{node.id, PortDirection::Input,
-                       static_cast<uint32_t>(inputIndex)};
-      ++inputIndex;
-    } else {
-      if (port.name == portName && outputIndex < node.outputs.size())
-        return PortRef{node.id, PortDirection::Output,
-                       static_cast<uint32_t>(outputIndex)};
-      ++outputIndex;
-    }
-  }
-  return std::nullopt;
 }
 
 } // namespace

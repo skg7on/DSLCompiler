@@ -103,8 +103,14 @@ struct WorkloadNode {
   /// a loop runs once.
   ///
   /// Deliberately *not* folded into `nodeContentKey` / `canonicalString`: it is
-  /// a recovered execution fact, not graph identity, so populating it does not
-  /// churn node ids, content hashes, or plan ids.
+  /// a recovered execution fact, not a node's structural identity, so it never
+  /// churns node ids. It *is* folded into the projected source-graph identity
+  /// (`canonicalProjectedGraphString`, task B3): a changed trip count scales
+  /// the storage reservation, so two kernels identical but for a loop bound
+  /// must hash differently and a plan id derived from the source graph moves
+  /// with it. It is not folded into `structuralNodeKey`, which correlates
+  /// source nodes with their materialized counterparts and must stay
+  /// multiplicity-free.
   std::optional<uint64_t> executionMultiplicity;
 };
 

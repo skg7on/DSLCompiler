@@ -35,6 +35,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace mlir;
 using namespace mlir::llk::mapping;
@@ -491,6 +492,59 @@ TEST(MappingPlanReportTest, ReplayReportRoundTripsSelectedState) {
     for (const auto &entry : placement.layoutSolutions)
       if (entry.second.map)
         EXPECT_NE(report.find(renderMap(entry.second.map)), std::string::npos);
+}
+
+// A report round-trips a gather connection's declared combination semantics,
+// its concat axis, and the producer occurrences it combines (task I2). Without
+// them a replayed `Reduce` connection degrades to `reduce_not_materialized`
+// even though the report states what the gather means.
+TEST(MappingPlanReportTest, ReplayRoundTripsGatherSemantics) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult searched =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  ASSERT_FALSE(searched.plans.empty());
+
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  // Two resolvable producer occurrences to feed the gather, taken from the
+  // source graph so the reader's endpoint-resolution check accepts them.
+  std::vector<PortRef> producers;
+  for (const WorkloadNode &node : graph->getNodes())
+    for (uint32_t index = 0; index < node.outputs.size(); ++index)
+      producers.push_back(PortRef{node.id, PortDirection::Output, index});
+  ASSERT_GE(producers.size(), 2u);
+
+  MappingSearchResult result;
+  result.workloadHash = searched.workloadHash;
+  CoveringPlan plan = searched.plans.front();
+  PlanConnection gather;
+  gather.id = 0x1234;
+  gather.kind = ConnectionKind::Reduce;
+  gather.gatherSemantics = GatherSemantics::Sum;
+  gather.producerPorts = {producers[0], producers[1]};
+  plan.connectionPlans.clear();
+  plan.connectionPlans.push_back(gather);
+  result.plans.push_back(std::move(plan));
+
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash(kKernel));
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, **target, *graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+  ASSERT_EQ(replay->connectionPlans.size(), 1u);
+  const PlanConnection &replayed = replay->connectionPlans.front();
+  EXPECT_EQ(replayed.kind, ConnectionKind::Reduce);
+  ASSERT_TRUE(replayed.gatherSemantics.has_value());
+  EXPECT_EQ(*replayed.gatherSemantics, GatherSemantics::Sum);
+  EXPECT_EQ(replayed.producerPorts, gather.producerPorts);
 }
 
 // A report carries each placement's per-occurrence memory bindings, so a replay
