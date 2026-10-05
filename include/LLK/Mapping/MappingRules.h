@@ -93,10 +93,17 @@ struct RulePort {
 };
 
 /// An abstract capability requirement: role is `executor`, `compute`, or
-/// `memory`, and `kind` is the abstract kind a placement must satisfy.
+/// `memory`, and `kind` is the abstract kind a placement must satisfy. A
+/// `memory` requirement may additionally name the rule port it governs
+/// (`require memory output "large" kind dram`); the port is resolved through
+/// the rule's declared `RulePort`s and then to the matched node's occurrence.
+/// `executor` and `compute` requirements never name a port.
 struct KindRequirement {
   std::string role;
   std::string kind;
+  /// The rule port this requirement governs, when the clause named one. Unset
+  /// for the legacy bare form, which governs the requirement kind as a whole.
+  std::optional<RulePort> port;
 };
 
 /// A layout the value on `port` must satisfy, named by layout id.

@@ -176,6 +176,26 @@ bool RuleParser::parseRule(RuleDef &out) {
     return failAt(current(), "rule '" + out.id + "' is missing a bundle");
   if (out.emitter.empty())
     return failAt(current(), "rule '" + out.id + "' is missing an emit");
+  // A memory requirement's port subject must name a declared port of the same
+  // direction, or the requirement could never resolve to an occurrence. Checked
+  // after the whole rule body so declaration order does not matter.
+  for (const KindRequirement &requirement : out.kindRequirements) {
+    if (!requirement.port)
+      continue;
+    bool declared = false;
+    for (const RulePort &port : out.ports)
+      if (port.name == requirement.port->name &&
+          port.isInput == requirement.port->isInput) {
+        declared = true;
+        break;
+      }
+    if (!declared)
+      return failAt(current(),
+                    "rule '" + out.id +
+                        "': memory requirement names undeclared " +
+                        (requirement.port->isInput ? "input '" : "output '") +
+                        requirement.port->name + "'");
+  }
   return true;
 }
 
@@ -391,29 +411,61 @@ bool RuleParser::parseRequire(RuleDef &out) {
   bool isKindRole = current().kind == LlkMapToken::Kind::Identifier &&
                     (current().text == "executor" ||
                      current().text == "compute" || current().text == "memory");
-  if (isKindRole && peek().kind == LlkMapToken::Kind::Identifier &&
-      peek().text == "kind") {
-    KindRequirement requirement;
-    requirement.role = current().text;
-    const LlkMapToken roleToken = current();
-    advance(); // role
-    advance(); // 'kind'
-    if (!expectIdentifier("a capability kind", requirement.kind))
-      return false;
-    if (!expectPunct(";"))
-      return false;
-    // A rule may not require the same (role, kind) twice: placement binds
-    // attachments by kind, so a duplicate would collide in the binding map and
-    // emit indistinguishable instances. Rejected here, in source order, before
-    // any candidate is built.
-    for (const KindRequirement &existing : out.kindRequirements)
-      if (existing.role == requirement.role &&
-          existing.kind == requirement.kind)
-        return failAt(roleToken, "duplicate " + requirement.role +
-                                     " kind requirement '" + requirement.kind +
-                                     "'");
-    out.kindRequirements.push_back(std::move(requirement));
-    return true;
+  if (isKindRole) {
+    // Two clause forms share the role prefix: the legacy `kind <k>` and a
+    // memory requirement that names the port it governs, `output "x" kind <k>`.
+    const bool bareForm =
+        peek().kind == LlkMapToken::Kind::Identifier && peek().text == "kind";
+    const bool portForm = peek().kind == LlkMapToken::Kind::Identifier &&
+                          (peek().text == "input" || peek().text == "output");
+    if (bareForm || portForm) {
+      KindRequirement requirement;
+      requirement.role = current().text;
+      const LlkMapToken roleToken = current();
+      advance(); // role
+      if (portForm) {
+        // Only memory is materialized per port; the owner and compute roles are
+        // a property of the whole operation, so naming a port there is a
+        // load-time error rather than a silently ignored field.
+        if (requirement.role != "memory")
+          return failAt(roleToken, "only a memory requirement may name a port");
+        RulePort port;
+        port.isInput = current().text == "input";
+        advance(); // direction
+        if (current().kind != LlkMapToken::Kind::String)
+          return failAt(current(), "expected a quoted port name");
+        port.name = current().text;
+        advance();
+        requirement.port = std::move(port);
+        if (current().kind != LlkMapToken::Kind::Identifier ||
+            current().text != "kind")
+          return failAt(current(), "expected 'kind'");
+      }
+      advance(); // 'kind'
+      if (!expectIdentifier("a capability kind", requirement.kind))
+        return false;
+      if (!expectPunct(";"))
+        return false;
+      // Two requirements collide when they share role and kind and their port
+      // subjects overlap. Two distinct named ports are distinct requirements;
+      // a bare requirement and a named one of the same kind overlap (the bare
+      // one would have to govern every port), so that is rejected too.
+      auto collides = [](const std::optional<RulePort> &lhs,
+                         const std::optional<RulePort> &rhs) {
+        if (!lhs || !rhs)
+          return true;
+        return lhs->name == rhs->name && lhs->isInput == rhs->isInput;
+      };
+      for (const KindRequirement &existing : out.kindRequirements)
+        if (existing.role == requirement.role &&
+            existing.kind == requirement.kind &&
+            collides(existing.port, requirement.port))
+          return failAt(roleToken, "duplicate " + requirement.role +
+                                       " kind requirement '" +
+                                       requirement.kind + "'");
+      out.kindRequirements.push_back(std::move(requirement));
+      return true;
+    }
   }
 
   bool isLayoutRequirement = current().kind == LlkMapToken::Kind::Identifier &&
@@ -617,8 +669,21 @@ std::string canonicalRuleDefString(const RuleDef &def) {
   for (const ExprPtr &constraint : def.constraints)
     field("constraint",
           constraint ? canonicalExprString(*constraint) : "<null>");
-  for (const KindRequirement &requirement : def.kindRequirements)
-    field("require", requirement.role + ":" + requirement.kind);
+  for (const KindRequirement &requirement : def.kindRequirements) {
+    // Unit separators keep a port name containing the printable delimiter from
+    // being read as the kind. A bare requirement omits the port field entirely,
+    // so it renders exactly as before.
+    std::string text = requirement.role;
+    if (requirement.port) {
+      text += '\x1f';
+      text += requirement.port->isInput ? 'i' : 'o';
+      text += '\x1f';
+      text += requirement.port->name;
+    }
+    text += '\x1f';
+    text += requirement.kind;
+    field("require", text);
+  }
   for (const RuleLayoutRequirement &requirement : def.layoutRequirements)
     field("layout", requirement.port + ":" + requirement.layoutId);
   for (const RulePort &port : def.ports)
@@ -697,9 +762,15 @@ std::string printRule(const RuleDef &def) {
     out += constraint ? printExpr(*constraint) : "<null>";
     out += ";\n";
   }
-  for (const KindRequirement &requirement : def.kindRequirements)
-    out +=
-        "  require " + requirement.role + " kind " + requirement.kind + ";\n";
+  for (const KindRequirement &requirement : def.kindRequirements) {
+    out += "  require " + requirement.role;
+    if (requirement.port) {
+      out += requirement.port->isInput ? " input \"" : " output \"";
+      out += requirement.port->name;
+      out += '"';
+    }
+    out += " kind " + requirement.kind + ";\n";
+  }
   for (const RuleLayoutRequirement &requirement : def.layoutRequirements)
     out += "  require layout " + requirement.port + " satisfies " +
            requirement.layoutId + ";\n";
@@ -1235,6 +1306,106 @@ mlir::DictionaryAttr buildBundleParameters(const RuleDef &rule,
   return mlir::DictionaryAttr::get(context, attributes);
 }
 
+/// Projects the bound `owner_mapping` and `memory_path` search axes onto the
+/// candidate's abstract requirements, validating each against machine data. The
+/// projection is explicit: a bound axis changes which executors, computes, and
+/// memories placement may bind, rather than being recorded as provenance and
+/// ignored. Returns an error message when an axis is malformed, names something
+/// the machine does not model, or contradicts the rule's own requirements; on
+/// success it appends the projected requirements to `candidate`.
+///
+/// `owner_mapping` is a `/`-separated chain of owner kinds (`worker/pe`): the
+/// outer component is the executor the work must run on, and inner components
+/// are nested owners or compute capabilities. A rule's own executor and compute
+/// requirements must lie on that chain.
+///
+/// `memory_path` is a `:`-separated chain of memory kinds (`dram:sram:acc`),
+/// the allowed levels. Every memory a rule requires must sit on it. A level the
+/// machine does not model, or an owner kind it does not model, is rejected
+/// explicitly -- a selected axis is never silently dropped.
+std::optional<std::string> projectBoundAxes(
+    const RuleDef &rule, const llvm::StringMap<SearchValue> &pinned,
+    const machine::MachineModel &machine, MappingCandidate &candidate) {
+  if (auto entry = pinned.find("owner_mapping"); entry != pinned.end()) {
+    const std::string *value = std::get_if<std::string>(&entry->second);
+    if (!value || value->empty())
+      return "owner_mapping axis must be a non-empty symbolic value";
+    llvm::SmallVector<llvm::StringRef, 4> owners;
+    llvm::StringRef(*value).split(owners, '/');
+    for (llvm::StringRef owner : owners)
+      if (owner.empty())
+        return "owner_mapping axis has an empty owner";
+    // The outer component names the executor the work runs on.
+    if (!machine.hasOwnerKind(owners.front()))
+      return "owner_mapping names owner '" + owners.front().str() +
+             "', which machine '" + machine.target + "' does not model";
+    for (const KindRequirement &requirement : rule.kindRequirements)
+      if (requirement.role == "executor" && requirement.kind != owners.front())
+        return "owner_mapping '" + *value + "' contradicts executor kind '" +
+               requirement.kind + "'";
+    // Inner components are nested owners or attached compute capabilities; each
+    // must be modeled as one or the other.
+    llvm::SmallVector<std::string, 2> projectedComputes;
+    for (size_t index = 1; index < owners.size(); ++index) {
+      llvm::StringRef owner = owners[index];
+      bool isOwnerKind = machine.hasOwnerKind(owner);
+      bool isComputeKind = !machine.computesOfKind(owner).empty();
+      if (!isOwnerKind && !isComputeKind)
+        return "owner_mapping names owner '" + owner.str() +
+               "', which machine '" + machine.target + "' does not model";
+      if (isComputeKind)
+        projectedComputes.push_back(owner.str());
+    }
+    // A rule that requires a compute must require one the chain reaches.
+    for (const KindRequirement &requirement : rule.kindRequirements) {
+      if (requirement.role != "compute")
+        continue;
+      if (!projectedComputes.empty() &&
+          !llvm::is_contained(projectedComputes, requirement.kind))
+        return "owner_mapping '" + *value + "' does not reach compute kind '" +
+               requirement.kind + "'";
+    }
+    // Project the outer owner as an executor requirement, and each inner
+    // compute kind as a compute requirement -- deduplicated, so a rule that
+    // already declares them is left unchanged.
+    bool hasExecutor = false;
+    for (const ExecutorRequirement &existing : candidate.executorRequirements)
+      hasExecutor |= existing.capability == owners.front();
+    if (!hasExecutor) {
+      ExecutorRequirement resolved;
+      resolved.capability = owners.front().str();
+      candidate.executorRequirements.push_back(std::move(resolved));
+    }
+    for (const std::string &kind : projectedComputes) {
+      bool declared = false;
+      for (const ComputeRequirement &existing : candidate.computeRequirements)
+        declared |= existing.kind == kind;
+      if (!declared) {
+        ComputeRequirement resolved;
+        resolved.kind = kind;
+        candidate.computeRequirements.push_back(std::move(resolved));
+      }
+    }
+  }
+
+  if (auto entry = pinned.find("memory_path"); entry != pinned.end()) {
+    const std::string *value = std::get_if<std::string>(&entry->second);
+    if (!value || value->empty())
+      return "memory_path axis must be a non-empty symbolic value";
+    llvm::SmallVector<llvm::StringRef, 4> path;
+    llvm::StringRef(*value).split(path, ':');
+    for (llvm::StringRef level : path)
+      if (level.empty() || !machine.findMemoryOfKind(level))
+        return "memory_path names level '" + level.str() +
+               "', which machine '" + machine.target + "' does not model";
+    for (const MemoryRequirement &requirement : candidate.memoryRequirements)
+      if (!llvm::is_contained(path, llvm::StringRef(requirement.kind)))
+        return "memory_path '" + *value + "' excludes memory kind '" +
+               requirement.kind + "'";
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 std::optional<MappingCandidate>
@@ -1353,11 +1524,53 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     } else if (requirement.role == "memory") {
       MemoryRequirement resolved;
       resolved.kind = requirement.kind;
+      // A named port is resolved to the matched node's occurrence the same way
+      // a layout requirement is: rule ports wire positionally to the node's
+      // inputs then its outputs, so the port's position within its direction is
+      // the occurrence index. A requirement whose port the node does not have
+      // cannot be attributed, so the rule is a non-match rather than a bare
+      // fallback.
+      if (requirement.port) {
+        size_t inputIndex = 0;
+        size_t outputIndex = 0;
+        for (const RulePort &port : rule.ports) {
+          llvm::ArrayRef<WorkloadPort> nodePorts =
+              port.isInput ? node.inputs : node.outputs;
+          size_t &index = port.isInput ? inputIndex : outputIndex;
+          if (port.name == requirement.port->name &&
+              port.isInput == requirement.port->isInput &&
+              index < nodePorts.size())
+            resolved.port = PortRef{node.id,
+                                    port.isInput ? PortDirection::Input
+                                                 : PortDirection::Output,
+                                    static_cast<uint32_t>(index)};
+          ++index;
+        }
+        if (!resolved.port) {
+          if (reason)
+            *reason = "memory requirement names port '" +
+                      requirement.port->name +
+                      "', which the matched operation does not expose";
+          return std::nullopt;
+        }
+      }
       candidate.memoryRequirements.push_back(std::move(resolved));
     } else if (requirement.role == "compute") {
       ComputeRequirement resolved;
       resolved.kind = requirement.kind;
       candidate.computeRequirements.push_back(std::move(resolved));
+    }
+  }
+
+  // Bound search axes are projected onto explicit requirements before the
+  // candidate is identified, so placement consumes what the binding selected
+  // rather than ignoring it as provenance.
+  if (pinned) {
+    if (std::optional<std::string> axisError =
+            projectBoundAxes(rule, *pinned, machine, candidate)) {
+      if (reason)
+        *reason = *axisError;
+      return std::nullopt;
     }
   }
 

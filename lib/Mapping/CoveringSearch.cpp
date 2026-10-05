@@ -138,6 +138,23 @@ struct Partial {
       liveValueCharges;
 };
 
+/// A named-port memory assignment list rendered `port=memory`, sorted. Shared
+/// by the primary-memory pick and the placement-tie-break key so both agree on
+/// order.
+std::vector<std::string>
+sortedPortMemories(const std::vector<PortMemoryBinding> &bindings) {
+  std::vector<std::string> entries;
+  entries.reserve(bindings.size());
+  for (const PortMemoryBinding &binding : bindings) {
+    std::string text = canonicalPortRefString(binding.port);
+    text += '=';
+    text += binding.memory;
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return entries;
+}
+
 MemoryNodeId primaryMemory(const MachineModel &machine,
                            const CandidateInstance &instance) {
   std::vector<std::pair<std::string, std::string>> bindings;
@@ -146,6 +163,21 @@ MemoryNodeId primaryMemory(const MachineModel &machine,
   llvm::sort(bindings);
   if (!bindings.empty())
     return bindings.front().second;
+  // A named-port requirement files its node in `portMemoryBindings`, not in the
+  // kind-keyed map, so the first occurrence's node is the primary memory when
+  // there is no bare binding.
+  if (!instance.portMemoryBindings.empty()) {
+    const PortMemoryBinding *best = nullptr;
+    std::string bestKey;
+    for (const PortMemoryBinding &binding : instance.portMemoryBindings) {
+      std::string key = canonicalPortRefString(binding.port);
+      if (!best || key < bestKey) {
+        best = &binding;
+        bestKey = std::move(key);
+      }
+    }
+    return best->memory;
+  }
   std::string executor = instance.executorBindings.lookup("executor");
   for (const MemoryNode &memory : machine.memories)
     if (machine.isVisible(memory.id, executor))
@@ -309,6 +341,12 @@ std::string placementIdentity(const CandidateInstance &instance) {
   text += instance.executorBindings.lookup("executor");
   text += ",memories=";
   text += llvm::join(sortedBindings(instance.memoryBindings), ",");
+  // A named-port assignment distinguishes two placements that bind the same
+  // nodes to swapped occurrences, so it belongs in the placement key too.
+  if (!instance.portMemoryBindings.empty()) {
+    text += ",portmemories=";
+    text += llvm::join(sortedPortMemories(instance.portMemoryBindings), ",");
+  }
   return text;
 }
 
@@ -322,6 +360,12 @@ bool placementBefore(const PlanPlacement &lhs, const PlanPlacement &rhs) {
   std::vector<std::string> rhsMemories = sortedBindings(rhs.memories);
   if (lhsMemories != rhsMemories)
     return lhsMemories < rhsMemories;
+  std::vector<std::string> lhsPortMemories =
+      sortedPortMemories(lhs.portMemoryBindings);
+  std::vector<std::string> rhsPortMemories =
+      sortedPortMemories(rhs.portMemoryBindings);
+  if (lhsPortMemories != rhsPortMemories)
+    return lhsPortMemories < rhsPortMemories;
   std::vector<std::string> lhsLayouts = sortedBindings(lhs.layouts);
   std::vector<std::string> rhsLayouts = sortedBindings(rhs.layouts);
   if (lhsLayouts != rhsLayouts)
@@ -659,29 +703,83 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       partial.linked.assign(valueLinks.size(), 0);
     // A bound memory holds the tiles this instance materializes, plus anything
     // the rule declared explicitly. `memoryBytes` is keyed by memory *node*, so
-    // each byte is charged to the memory that actually holds it: the binding
-    // map resolves a requirement kind to the node placement chose, while
-    // `resourceUsage` is keyed by that requirement kind.
+    // each byte is charged to the memory that actually holds it.
     //
-    // The materialized tiles are the node's *outputs*. One binding holds every
-    // output the node writes, so it is charged their total -- sizing it from
-    // the first output alone under-charges a multi-output node, the unsafe
-    // direction for a capacity check. When a node declares several bindings the
-    // graph fixes no output-to-binding pairing (a memory requirement names a
-    // requirement *kind*, never the port that goes there). A single output can
-    // still be charged to each binding conservatively (that over-charges, the
-    // safe direction); several outputs with several bindings cannot be charged
-    // soundly at all, so that branch is rejected below rather than admitted on
-    // an unsafe lower bound.
+    // Two association regimes. A rule may bind each output occurrence to its
+    // own memory by naming the port (`require memory output "large" kind
+    // dram`): the occurrence fixes the pairing, so each output is charged its
+    // own bytes to its own node. Otherwise the legacy bare requirements apply,
+    // and the graph fixes no output-to-binding pairing -- one binding holds
+    // every output (its total, since sizing from the first output alone
+    // under-charges), a single output may be charged to each binding
+    // (over-charging, the safe direction), and several outputs with several
+    // bindings are rejected rather than admitted on an unsafe lower bound.
     //
     // Each charged output is also recorded as a live range: the bytes are
     // released once its last consumer is placed (below), so a sequential
-    // program is not charged as if every value were simultaneously live. Only
-    // size the tile when there is a binding to charge it to; a rule that
-    // declares no memory charges nothing and must not report an assumption for
-    // a size it never uses.
-    if (!instance.memoryBindings.empty()) {
-      const WorkloadNode &workload = *tables[nodeIndex].workload;
+    // program is not charged as if every value were simultaneously live.
+    const WorkloadNode &workload = *tables[nodeIndex].workload;
+    if (!instance.portMemoryBindings.empty()) {
+      // Explicit per-occurrence associations. Mixing them with bare
+      // requirements leaves some occurrence unfixed, so the branch is rejected.
+      if (!instance.memoryBindings.empty()) {
+        report(
+            DiagnosticCode::MemoryCapacityExceeded,
+            "node " + std::to_string(workload.id) +
+                ": memory requirements mix named-port and bare associations; "
+                "placement is ambiguous and cannot be proven within capacity");
+        return false;
+      }
+      bool anyOutputPort = false;
+      for (const PortMemoryBinding &binding : instance.portMemoryBindings)
+        anyOutputPort |= binding.port.direction == PortDirection::Output;
+      if (workload.outputs.empty()) {
+        // No output to attribute: charge the first-input fallback to each
+        // distinct bound memory. A sink materializes nothing we can expire.
+        const uint64_t bytes = portlessBytes(workload);
+        std::vector<MemoryNodeId> charged;
+        for (const PortMemoryBinding &binding : instance.portMemoryBindings)
+          if (!llvm::is_contained(charged, binding.memory)) {
+            charged.push_back(binding.memory);
+            partial.memoryBytes[binding.memory] += bytes;
+          }
+      } else if (anyOutputPort) {
+        // Every output must be associated with exactly one selected memory, and
+        // charged its own bytes. An output with none, or with several, has no
+        // proven capacity and rejects the branch.
+        for (uint32_t index = 0; index < workload.outputs.size(); ++index) {
+          const PortRef ref{workload.id, PortDirection::Output, index};
+          const MemoryNodeId *memory = nullptr;
+          bool ambiguous = false;
+          for (const PortMemoryBinding &binding : instance.portMemoryBindings) {
+            if (!(binding.port == ref))
+              continue;
+            if (memory) {
+              ambiguous = true;
+              break;
+            }
+            memory = &binding.memory;
+          }
+          if (!memory || ambiguous) {
+            report(DiagnosticCode::MemoryCapacityExceeded,
+                   "node " + std::to_string(workload.id) + ": output " +
+                       std::to_string(index) + " has " +
+                       (ambiguous ? "several memory associations"
+                                  : "no memory association") +
+                       "; placement is ambiguous and cannot be proven within "
+                       "capacity");
+            return false;
+          }
+          const uint64_t bytes =
+              factsForValue(workload.outputs[index].value).bytes;
+          partial.memoryBytes[*memory] += bytes;
+          partial.liveValueCharges[workload.outputs[index].value].push_back(
+              {*memory, bytes});
+        }
+      }
+      // A rule that associates only input operands charges no output here: the
+      // value is materialized by whoever produces it.
+    } else if (!instance.memoryBindings.empty()) {
       if (workload.outputs.empty()) {
         // No output to attribute: charge the first-input fallback for the whole
         // plan. A sink materializes nothing we can expire.
@@ -696,15 +794,17 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           partial.liveValueCharges[output.value].push_back({memory, bytes});
         }
       } else if (workload.outputs.size() > 1) {
-        // Several outputs *and* several memory bindings. A memory requirement
-        // names a kind, never the port that writes into it, so the graph fixes
-        // no output-to-binding pairing: there is no sound way to charge these
-        // outputs. Sizing every binding from the first output alone is a lower
-        // bound that can admit an over-capacity plan -- a 4-byte first output
-        // hiding a 4096-byte second -- so the branch is rejected rather than
-        // admitted on an unsafe bound. A single binding has no such ambiguity
-        // (one binding holds every output, charged below), and a single output
-        // cannot be misattributed among bindings.
+        // Several outputs *and* several memory bindings. A bare memory
+        // requirement names a kind, never the port that writes into it, so the
+        // graph fixes no output-to-binding pairing: there is no sound way to
+        // charge these outputs. Sizing every binding from the first output
+        // alone is a lower bound that can admit an over-capacity plan -- a
+        // 4-byte first output hiding a 4096-byte second -- so the branch is
+        // rejected rather than admitted on an unsafe bound. A single binding
+        // has no such ambiguity (one binding holds every output, charged
+        // below), and a single output cannot be misattributed among bindings.
+        // This is the legacy rejection an explicit named-port association is
+        // what avoids.
         report(
             DiagnosticCode::MemoryCapacityExceeded,
             "node " + std::to_string(workload.id) + ": " +
@@ -1515,6 +1615,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       }
       placement.executor = instance->executorBindings.lookup("executor");
       placement.memories = instance->memoryBindings;
+      // The per-occurrence memory assignments travel with the placement, so a
+      // materializer can attribute a storage decision to the occurrence that
+      // owns it.
+      placement.portMemoryBindings = instance->portMemoryBindings;
       placement.layouts = instance->layoutBindings;
       // The solved parameterization travels with the binding, so a selected
       // plan says which one it chose rather than only naming the layout family.

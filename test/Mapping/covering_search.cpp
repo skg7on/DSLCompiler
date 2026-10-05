@@ -2777,6 +2777,237 @@ TEST(CoveringSearch, MultiOutputSingleMemoryRejectsAnOversizedLaterOutput) {
   EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
 }
 
+/// `searchMachine` with explicit sram and dram capacities, so a per-port
+/// capacity test can pin exactly what each bound output affords.
+MachineModel sizedMemoryMachine(uint64_t sramBytes, uint64_t dramBytes) {
+  MachineModel model = searchMachine();
+  for (MemoryNode &memory : model.memories)
+    memory.capacityBytes = memory.kind == "sram" ? sramBytes : dramBytes;
+  return model;
+}
+
+/// `searchMachine` with two visible sram nodes of different capacities, so two
+/// same-kind roles can be bound to different nodes.
+MachineModel twoSramMachine(uint64_t smallBytes, uint64_t largeBytes) {
+  MachineModel model;
+  model.target = "samekind";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}}};
+  MemoryNode small;
+  small.id = "sram.small";
+  small.kind = "sram";
+  small.visibleFrom = "e0";
+  small.capacityBytes = smallBytes;
+  MemoryNode large;
+  large.id = "sram.large";
+  large.kind = "sram";
+  large.visibleFrom = "e0";
+  large.capacityBytes = largeBytes;
+  model.memories = {small, large};
+  return model;
+}
+
+/// A rule that binds each of its two output ports to its own memory kind by
+/// name. The output-to-memory association is explicit, so the search charges
+/// each output to the memory its port selected rather than replicating the
+/// first output across every binding.
+constexpr llvm::StringLiteral kPortedMemoryRules = R"llkmap(
+rule r.ported {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory output "small" kind sram;
+  require memory output "large" kind dram;
+  output "small";
+  output "large";
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The same two ports with their memory kinds swapped: the small output is
+/// bound to dram and the large one to sram.
+constexpr llvm::StringLiteral kSwappedMemoryRules = R"llkmap(
+rule r.swapped {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory output "small" kind dram;
+  require memory output "large" kind sram;
+  output "small";
+  output "large";
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Both output ports bound to the same memory kind, so the roles are
+/// distinguished by port, not by kind.
+constexpr llvm::StringLiteral kSameKindPortRules = R"llkmap(
+rule r.same_kind {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory output "small" kind sram;
+  require memory output "large" kind sram;
+  output "small";
+  output "large";
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Finds the memory bound to an output port occurrence in a placement, or "".
+std::string placementMemoryForPort(const PlanPlacement &placement,
+                                   uint32_t index) {
+  for (const PortMemoryBinding &binding : placement.portMemoryBindings)
+    if (binding.port.direction == PortDirection::Output &&
+        binding.port.index == index)
+      return binding.memory;
+  return {};
+}
+
+// The worked example: a 4-byte output bound to a 1024-byte SRAM and a
+// 4096-byte output bound to an 8192-byte DRAM is legal, and each output is
+// charged to the memory its own port selected.
+TEST(CoveringSearch, ExplicitNamedPortMemoriesAreChargedPerPort) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(1024, 8192), kPortedMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_FALSE(result->plans[0].placements.empty());
+  const PlanPlacement &placement = result->plans[0].placements[0];
+  EXPECT_EQ(placementMemoryForPort(placement, 0), "sram.0");
+  EXPECT_EQ(placementMemoryForPort(placement, 1), "dram.0");
+}
+
+// Swapping which port gets which memory rejects: the 4096-byte output no longer
+// fits the 1024-byte SRAM it is now bound to. Charging each port to its own
+// memory is what makes this observable; the old first-output-only accounting
+// would have charged both ports the 4-byte first output and admitted it.
+TEST(CoveringSearch, SwappedNamedPortMemoriesAreRejected) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(1024, 8192), kSwappedMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+// Both memories too small for the large port rejects, even though they are
+// plentiful for the small one.
+TEST(CoveringSearch, NamedPortMemoryTooSmallRejects) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(1024, 1024), kPortedMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+// Both ports require the same memory kind, so they are distinguished by port
+// alone. A 4-byte output lands in the small sram and a 4096-byte output in the
+// large one; the kind-keyed binding map could not have told them apart.
+TEST(CoveringSearch, SameKindNamedPortsBindDifferentMemories) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(twoSramMachine(1024, 8192), kSameKindPortRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // At least one legal placement binds the large output to the large node and
+  // the small output to the small node.
+  bool sawSplit = false;
+  for (const CoveringPlan &plan : result->plans)
+    for (const PlanPlacement &placement : plan.placements)
+      sawSplit |= placementMemoryForPort(placement, 0) == "sram.small" &&
+                  placementMemoryForPort(placement, 1) == "sram.large";
+  EXPECT_TRUE(sawSplit);
+}
+
+/// One `micro.vector` node reading a single input and writing nothing: a sink.
+WorkloadGraph sinkGraph(mlir::MLIRContext &context, mlir::Type input) {
+  WorkloadGraph graph;
+  WorkloadValueId value =
+      graph.addValue(WorkloadValue{0, input, "in", /*external=*/true});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context);
+  node.inputs.push_back(WorkloadPort{value, input, std::nullopt});
+  graph.addNode(std::move(node));
+  graph.finalize();
+  return graph;
+}
+
+// A sink writes no output to attribute, so a single bare binding is charged the
+// first-input fallback and the plan is admitted when it fits. This is the
+// control that keeps the port-association change from rejecting every
+// outputless rule.
+TEST(CoveringSearch, OutputlessSinkWithOneBindingIsAdmitted) {
+  mlir::MLIRContext context;
+  mlir::Type tile =
+      mlir::RankedTensorType::get({8}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = sinkGraph(context, tile);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
 /// Two independent producer -> consumer pairs over `fanMachine`, each moving a
 /// `value`-sized tile from dram.0 into acc.0 and writing a 4-byte result. The
 /// pairs share no value, so the only thing linking them is the destination
@@ -3488,6 +3719,177 @@ TEST(CoveringSearch, NoBindingLeavesTheHashZeroAndThePlanIdUnchanged) {
   EXPECT_EQ(result->plans[0].sourceBindingHash, 0u);
   EXPECT_TRUE(result->plans[0].globalParameters.empty());
   EXPECT_EQ(result->plans[0].id, kNoBindingPlanId);
+}
+
+//===----------------------------------------------------------------------===//
+// Bound owner_mapping / memory_path axes are projected, not ignored
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Two executors of different owner kinds, one visible memory system, so a
+/// bound `owner_mapping` axis can decide which executor a rule that names no
+/// owner of its own places on.
+MachineModel ownerMachine() {
+  MachineModel model;
+  model.target = "owner";
+  model.executors = {
+      {"cluster.0", "cluster", std::nullopt, {}, 1, {}},
+      {"w0", "worker", std::string("cluster.0"), {}, 1, {}},
+      {"v0", "vector_engine", std::string("cluster.0"), {}, 1, {}}};
+  MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "cluster.0";
+  sram.capacityBytes = 1u << 20;
+  MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "cluster.0";
+  dram.capacityBytes = 1u << 30;
+  model.memories = {sram, dram};
+  return model;
+}
+
+/// A rule that declares no owner of its own, so the only thing that can select
+/// an executor is the bound owner_mapping axis.
+constexpr llvm::StringLiteral kOwnerFreeRules = R"llkmap(
+rule r.free {
+  match micro.vector(op = "add");
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// A rule that pins the executor kind, so a contradictory bound owner rejects.
+constexpr llvm::StringLiteral kVectorOwnerRule = R"llkmap(
+rule r.vec {
+  match micro.vector(op = "add");
+  require executor kind vector_engine;
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+} // namespace
+
+// A bound owner_mapping projects onto an abstract executor requirement, so it
+// changes which executor the plan places on -- rather than being recorded as
+// provenance and ignored.
+TEST(CoveringSearch, ABoundOwnerMappingSelectsThePlacement) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(ownerMachine(), kOwnerFreeRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  auto searchWith = [&](llvm::StringRef owner) {
+    SearchBinding binding =
+        makeSearchBinding("c", values({{"owner_mapping", std::string(owner)}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          binding);
+    return search.search();
+  };
+
+  llvm::Expected<MappingSearchResult> worker = searchWith("worker");
+  ASSERT_TRUE(static_cast<bool>(worker)) << llvm::toString(worker.takeError());
+  ASSERT_FALSE(worker->plans.empty());
+  for (const PlanPlacement &placement : worker->plans[0].placements)
+    EXPECT_EQ(placement.executor, "w0");
+
+  llvm::Expected<MappingSearchResult> vector = searchWith("vector_engine");
+  ASSERT_TRUE(static_cast<bool>(vector)) << llvm::toString(vector.takeError());
+  ASSERT_FALSE(vector->plans.empty());
+  for (const PlanPlacement &placement : vector->plans[0].placements)
+    EXPECT_EQ(placement.executor, "v0");
+}
+
+// An owner_mapping naming an owner the machine does not model is rejected
+// explicitly: the node has no rule in effect rather than the value being
+// silently dropped.
+TEST(CoveringSearch, AnUnmodeledBoundOwnerMappingIsRejected) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(ownerMachine(), kOwnerFreeRules);
+  ASSERT_NE(target, nullptr);
+
+  SearchBinding binding =
+      makeSearchBinding("c", values({{"owner_mapping", std::string("pe")}}));
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                        binding);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
+}
+
+// A rule that requires a different executor kind than the bound owner is a
+// contradiction and rejects.
+TEST(CoveringSearch, AContradictoryBoundOwnerMappingIsRejected) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(ownerMachine(), kVectorOwnerRule);
+  ASSERT_NE(target, nullptr);
+
+  SearchBinding binding = makeSearchBinding(
+      "c", values({{"owner_mapping", std::string("worker")}}));
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                        binding);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
+}
+
+// A bound memory_path is the set of allowed memory kinds: a rule whose memory
+// requirement sits off the path rejects, one on the path is admitted, and a
+// path naming an unmodeled level rejects explicitly.
+TEST(CoveringSearch, ABoundMemoryPathGatesMemoryRequirements) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  auto searchWith = [&](llvm::StringRef path) {
+    SearchBinding binding =
+        makeSearchBinding("c", values({{"memory_path", std::string(path)}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          binding);
+    return search.search();
+  };
+
+  // sram is off this path, so the requirement cannot be met.
+  llvm::Expected<MappingSearchResult> offPath = searchWith("dram");
+  ASSERT_TRUE(static_cast<bool>(offPath))
+      << llvm::toString(offPath.takeError());
+  EXPECT_TRUE(offPath->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*offPath, DiagnosticCode::NoMatchingRule));
+
+  // sram is on this path, so the rule places as before.
+  llvm::Expected<MappingSearchResult> onPath = searchWith("dram:sram");
+  ASSERT_TRUE(static_cast<bool>(onPath)) << llvm::toString(onPath.takeError());
+  EXPECT_FALSE(onPath->plans.empty());
+
+  // An unmodeled level is an unsupported axis, rejected rather than ignored.
+  llvm::Expected<MappingSearchResult> bogus = searchWith("dram:bogus");
+  ASSERT_TRUE(static_cast<bool>(bogus)) << llvm::toString(bogus.takeError());
+  EXPECT_TRUE(bogus->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*bogus, DiagnosticCode::NoMatchingRule));
 }
 
 //===----------------------------------------------------------------------===//

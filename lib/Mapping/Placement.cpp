@@ -409,9 +409,28 @@ enumeratePlacements(const MappingCandidate &candidate,
       for (size_t i = 0; i < computeChoices.size(); ++i)
         instance.computeBindings[candidate.computeRequirements[i].kind] =
             computeChoices[i][pick[i]]->id;
-      for (size_t j = 0; j < memoryChoices.size(); ++j)
-        instance.memoryBindings[candidate.memoryRequirements[j].kind] =
+      for (size_t j = 0; j < memoryChoices.size(); ++j) {
+        const MemoryRequirement &requirement = candidate.memoryRequirements[j];
+        const MemoryNodeId memory =
             memoryChoices[j][pick[computeChoices.size() + j]]->id;
+        // A requirement that named a port records the occurrence it governs, so
+        // two same-kind requirements keep distinct nodes. A bare requirement
+        // stays keyed by kind, unchanged.
+        if (requirement.port)
+          instance.portMemoryBindings.push_back(
+              PortMemoryBinding{*requirement.port, memory});
+        else
+          instance.memoryBindings[requirement.kind] = memory;
+      }
+      // Sorted by occurrence so map iteration order never reaches an id.
+      llvm::sort(instance.portMemoryBindings, [](const PortMemoryBinding &lhs,
+                                                 const PortMemoryBinding &rhs) {
+        if (lhs.port.node != rhs.port.node)
+          return lhs.port.node < rhs.port.node;
+        if (lhs.port.direction != rhs.port.direction)
+          return lhs.port.direction < rhs.port.direction;
+        return lhs.port.index < rhs.port.index;
+      });
       for (size_t i = 0; i < solvedDefs.size(); ++i) {
         const LayoutRequirement &requirement = candidate.layoutRequirements[i];
         const std::string &layoutClass = requirement.layoutClass;
@@ -447,9 +466,13 @@ enumeratePlacements(const MappingCandidate &candidate,
       }
 
       instance.resourceUsage.executorSlots = 1;
+      // Only bare requirements contribute a kind-keyed byte figure; a
+      // named-port requirement's storage is accounted per occurrence, not per
+      // kind.
       for (const MemoryRequirement &requirement : candidate.memoryRequirements)
-        instance.resourceUsage.memoryBytes[requirement.kind] =
-            requirement.minBytes;
+        if (!requirement.port)
+          instance.resourceUsage.memoryBytes[requirement.kind] =
+              requirement.minBytes;
 
       instance.localCost = candidate.lowerBound;
       // Compute utilization is the rule-local compute cycles over the cycles

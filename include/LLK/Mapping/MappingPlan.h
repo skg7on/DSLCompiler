@@ -89,6 +89,13 @@ struct ExecutorRequirement {
 struct MemoryRequirement {
   std::string kind;
   uint64_t minBytes = 0;
+  /// The workload port occurrence this requirement governs, when the rule
+  /// named one (`require memory output "large" kind dram`). Unset for the
+  /// legacy bare form (`require memory kind sram`), which governs the whole
+  /// requirement kind rather than one port. A set port is what lets the search
+  /// charge a materialized output to the memory its own port selected instead
+  /// of replicating the first output across every binding.
+  std::optional<PortRef> port;
 };
 
 struct LayoutRequirement {
@@ -205,25 +212,6 @@ struct SolvedLayout {
   std::optional<PortRef> port;
 };
 
-/// One mapping candidate placed on concrete resources.
-struct CandidateInstance {
-  InstanceId id = 0;
-  CandidateId candidate = 0;
-  /// The candidate's opaque bundle, carried unchanged so a materializer reads
-  /// it off the placed instance rather than re-looking-up the rule.
-  TargetBundle bundle;
-  llvm::StringMap<ExecutorId> executorBindings;
-  llvm::StringMap<MemoryNodeId> memoryBindings;
-  llvm::StringMap<std::string> computeBindings;
-  llvm::StringMap<LayoutId> layoutBindings;
-  /// The solved instantiation of each layout requirement, keyed by layout class
-  /// (index-disambiguated when one class is required by several ports; see
-  /// `SolvedLayout`). Empty when the candidate requires no layout.
-  llvm::StringMap<SolvedLayout> layoutSolutions;
-  ResourceUsage resourceUsage;
-  Cost localCost;
-};
-
 /// A compute/memory assignment for one endpoint port (design §9.6): the memory
 /// node a named occurrence's value is bound to. Persisted with the selected
 /// state so a materializer can attribute a storage decision to the occurrence
@@ -232,6 +220,38 @@ struct PortMemoryBinding {
   PortRef port;
   MemoryNodeId memory;
   bool operator==(const PortMemoryBinding &) const = default;
+};
+
+/// One mapping candidate placed on concrete resources.
+struct CandidateInstance {
+  InstanceId id = 0;
+  CandidateId candidate = 0;
+  /// The candidate's opaque bundle, carried unchanged so a materializer reads
+  /// it off the placed instance rather than re-looking-up the rule.
+  TargetBundle bundle;
+  llvm::StringMap<ExecutorId> executorBindings;
+  /// Memory bindings of the legacy bare requirements, keyed by requirement
+  /// kind (`require memory kind sram`). A requirement that names a port records
+  /// a `PortMemoryBinding` instead, so this map stays byte-identical for the
+  /// rules that do not name ports.
+  llvm::StringMap<MemoryNodeId> memoryBindings;
+  llvm::StringMap<std::string> computeBindings;
+  llvm::StringMap<LayoutId> layoutBindings;
+  /// The solved instantiation of each layout requirement, keyed by layout class
+  /// (index-disambiguated when one class is required by several ports; see
+  /// `SolvedLayout`). Empty when the candidate requires no layout.
+  llvm::StringMap<SolvedLayout> layoutSolutions;
+  /// The memory each named endpoint occurrence is bound to, one entry per
+  /// requirement that named a port. Sorted by port. Unlike `memoryBindings`,
+  /// this is keyed by occurrence, so two same-kind requirements can select
+  /// different nodes. Part of the instance's canonical identity when non-empty
+  /// (a resolved memory assignment is execution-affecting), and empty for every
+  /// rule that declares no named-port requirement. An out-of-line container so
+  /// adding it does not push `PlanPlacement`/`CandidateInstance` past the
+  /// `SmallVector` element-size limit.
+  std::vector<PortMemoryBinding> portMemoryBindings;
+  ResourceUsage resourceUsage;
+  Cost localCost;
 };
 
 /// A scheduling step index. Concrete storage lifetimes are expressed in these
@@ -328,6 +348,12 @@ struct PlanPlacement {
   /// one. Verification validates *this* assignment and never substitutes a
   /// different legal one.
   llvm::StringMap<SearchValue> resolvedParameters;
+  /// The memory bound to each named endpoint occurrence, copied from the
+  /// instance's `portMemoryBindings`. Empty for a placement whose rule declares
+  /// no named-port memory requirement; when set it lets a materializer
+  /// attribute a storage decision to the occurrence that owns it. Sorted by
+  /// port.
+  std::vector<PortMemoryBinding> portMemoryBindings;
 };
 
 /// One selected connection, with the route it takes.

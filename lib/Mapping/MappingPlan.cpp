@@ -43,6 +43,24 @@ std::string joinStrings(const std::vector<std::string> &parts,
   return out;
 }
 
+/// A port-to-memory assignment list rendered `port=memory`, sorted so the order
+/// entries were appended in never reaches an id. Empty for an instance or
+/// placement whose rule declares no named-port memory requirement, so a
+/// canonical string for such a value is unchanged.
+std::string
+portMemoryBindingsString(const std::vector<PortMemoryBinding> &bindings) {
+  std::vector<std::string> entries;
+  entries.reserve(bindings.size());
+  for (const PortMemoryBinding &binding : bindings) {
+    std::string text = canonicalPortRefString(binding.port);
+    text += '=';
+    text += binding.memory;
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return joinStrings(entries, ",");
+}
+
 /// Renders numeric ids as a sorted, comma-separated list, so id order in the
 /// source vector never leaks into a canonical string.
 template <typename Container> std::string joinNumbers(const Container &input) {
@@ -270,6 +288,13 @@ std::string canonicalInstanceString(const CandidateInstance &instance) {
   out += joinStrings(sortedEntries(instance.executorBindings), ",");
   out += "|mem=";
   out += joinStrings(sortedEntries(instance.memoryBindings), ",");
+  // A named-port assignment is execution-affecting (which node holds which
+  // occurrence), so it joins the id -- but only when present, so a rule that
+  // declares no named-port requirement keeps its pre-existing id.
+  if (!instance.portMemoryBindings.empty()) {
+    out += "|portmem=";
+    out += portMemoryBindingsString(instance.portMemoryBindings);
+  }
   out += "|layout=";
   out += joinStrings(sortedEntries(instance.layoutBindings), ",");
   out += "|solvedlayout=";
@@ -361,6 +386,10 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
     text += placement.executor;
     text += ":mem=";
     text += joinStrings(sortedEntries(placement.memories), ",");
+    if (!placement.portMemoryBindings.empty()) {
+      text += ":portmem=";
+      text += portMemoryBindingsString(placement.portMemoryBindings);
+    }
     text += ":layout=";
     text += joinStrings(sortedEntries(placement.layouts), ",");
     text += ":solvedlayout=";

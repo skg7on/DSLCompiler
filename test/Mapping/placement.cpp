@@ -294,6 +294,50 @@ TEST(Placement, EnumeratesEveryVisibleMemoryAttachment) {
   EXPECT_EQ((*instances)[1].memoryBindings.lookup("sram"), "sram.b");
 }
 
+TEST(Placement, BindsANamedMemoryRequirementToItsOutputPort) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withPorts = coreCandidate();
+  // Two same-kind requirements, each governing its own output occurrence.
+  MemoryRequirement first;
+  first.kind = "sram";
+  first.port = PortRef{0, PortDirection::Output, 0};
+  MemoryRequirement second;
+  second.kind = "sram";
+  second.port = PortRef{0, PortDirection::Output, 1};
+  withPorts.memoryRequirements = {first, second};
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withPorts, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // core.0 sees two sram nodes, so the two requirements cross to four
+  // placements (the last requirement varies fastest).
+  ASSERT_EQ(instances->size(), 4u);
+  // Every requirement named a port, so nothing is filed by kind.
+  EXPECT_TRUE((*instances)[0].memoryBindings.empty());
+
+  auto memoryForPort = [](const CandidateInstance &instance, uint32_t index) {
+    for (const PortMemoryBinding &binding : instance.portMemoryBindings)
+      if (binding.port.direction == PortDirection::Output &&
+          binding.port.index == index)
+        return binding.memory;
+    return std::string();
+  };
+  EXPECT_EQ(memoryForPort((*instances)[0], 0), "sram.a");
+  EXPECT_EQ(memoryForPort((*instances)[0], 1), "sram.a");
+  EXPECT_EQ(memoryForPort((*instances)[1], 0), "sram.a");
+  EXPECT_EQ(memoryForPort((*instances)[1], 1), "sram.b");
+  EXPECT_EQ(memoryForPort((*instances)[2], 0), "sram.b");
+  EXPECT_EQ(memoryForPort((*instances)[2], 1), "sram.a");
+  EXPECT_EQ(memoryForPort((*instances)[3], 0), "sram.b");
+  EXPECT_EQ(memoryForPort((*instances)[3], 1), "sram.b");
+  // The occurrence-to-memory assignment is execution-affecting: two placements
+  // that swap which port gets which node must not share an id.
+  EXPECT_NE((*instances)[1].id, (*instances)[2].id);
+}
+
 TEST(Placement, EnumeratesComputeMemoryAttachmentCombinations) {
   std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
   ASSERT_NE(target, nullptr);
