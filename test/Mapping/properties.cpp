@@ -27,6 +27,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/LatencyProvider.h"
@@ -908,6 +909,69 @@ TEST(MappingProperties, ExactJointConnectionsMatchTheRouteOracle) {
     // Re-running reproduces the same ranked ids.
     MappingSearchResult again = runSearch(graph, *target, context, options);
     EXPECT_EQ(planIds(result), planIds(again));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Property 8 (task B8): the final candidate score is the shared schedule's
+// overlapped latency, not the additive sum of the rule and route costs.
+//===----------------------------------------------------------------------===//
+
+/// The staged fan-out machine with a second DMA engine and a vector engine on
+/// each executor, so its two independent customer transfers can overlap and a
+/// normalized plan event can name a compute resource.
+MachineModel twoEngineFanOutMachine(uint64_t stageCapacity) {
+  MachineModel model = stagedFanOutMachine(stageCapacity);
+  TransferEngineNode second;
+  second.id = "dma.1";
+  second.kind = "dma";
+  second.attachedTo = "e0";
+  model.transferEngines.push_back(second);
+  ComputeNode vpu0;
+  vpu0.id = "vpu.0";
+  vpu0.kind = "vector_engine";
+  vpu0.attachedTo = "e0";
+  vpu0.lanes["f32"] = 8;
+  vpu0.issueCycles = 1;
+  ComputeNode vpu1 = vpu0;
+  vpu1.id = "vpu.1";
+  vpu1.attachedTo = "e1";
+  model.computes = {vpu0, vpu1};
+  return model;
+}
+
+TEST(MappingProperties, FinalScoreComesFromTheSharedSchedule) {
+  Rng rng(kSeed ^ 0x0A);
+  for (unsigned draw = 0; draw < 12; ++draw) {
+    MLIRContext context;
+    WorkloadGraph graph = branchFanOutGraph(context);
+    std::unique_ptr<MappingTarget> target =
+        targetWith(twoEngineFanOutMachine(1u << 20), kBranchRules);
+    ASSERT_NE(target, nullptr);
+
+    MappingSearchOptions options;
+    options.mode = SearchMode::Deterministic;
+    MappingSearchResult result = runSearch(graph, *target, context, options);
+    ASSERT_FALSE(result.plans.empty());
+    const CoveringPlan &plan = result.plans[0];
+
+    // The final score is what the shared scheduler produces, so two independent
+    // transfers on the machine's two engines overlap: the score is strictly
+    // below the additive accumulation the search's optimistic model keeps.
+    EXPECT_LT(plan.totalCost.latencyCycles, plan.accumulatedCost.latencyCycles);
+    EXPECT_GT(plan.accumulatedCost.latencyCycles, 0.0);
+
+    // The score agrees with scheduling the plan's events independently: it is a
+    // schedule, not a sum.
+    llvm::Expected<PlanEventDAG> events =
+        buildPlanEvents(plan, target->machine());
+    ASSERT_TRUE(static_cast<bool>(events))
+        << llvm::toString(events.takeError());
+    llvm::Expected<Cost> scheduled =
+        schedulePlanEvents(*events, target->machine());
+    ASSERT_TRUE(static_cast<bool>(scheduled))
+        << llvm::toString(scheduled.takeError());
+    EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, scheduled->latencyCycles);
   }
 }
 

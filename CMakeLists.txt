@@ -295,6 +295,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/StoragePlan.cpp
     lib/Mapping/CostModel.cpp
     lib/Mapping/CostEvent.cpp
+    lib/Mapping/EventSchedule.cpp
     lib/Mapping/LatencyProvider.cpp
     lib/Mapping/SearchBinding.cpp
     lib/Mapping/WorkloadGraph.cpp

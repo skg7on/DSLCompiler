@@ -525,7 +525,18 @@ struct CoveringPlan {
   /// heuristic would not apply.
   llvm::SmallVector<PlanConnection, 4> connectionPlans;
   llvm::StringMap<SearchValue> globalParameters;
+  /// The final candidate score (task B8): the overlapped latency the *shared*
+  /// resource scheduler produces from the plan's normalized events, not the
+  /// additive sum of rule and connection costs. It folds into
+  /// `canonicalPlanString`, so a plan's id reflects the score a reader ranks it
+  /// by. Falls back to `accumulatedCost` only when the plan's events cannot be
+  /// built (an unknown strict fact), which is reported.
   Cost totalCost;
+  /// The additive accumulation of rule-local and connection costs over the
+  /// whole plan -- the search's optimistic partial-cost model, kept separately
+  /// named so it is never confused with the scheduled final score. Excluded
+  /// from `canonicalPlanString`: it is a search-internal quantity, not content.
+  Cost accumulatedCost;
   PlanDiagnostics diagnostics;
 
   // --- persisted selected state (schema v2, task B1) ------------------------
@@ -580,6 +591,15 @@ CandidateId computeCandidateId(const MappingCandidate &candidate);
 InstanceId computeInstanceId(const CandidateInstance &instance);
 ConnectionId computeConnectionId(const ConnectionPlan &connection);
 PlanId computePlanId(const CoveringPlan &plan);
+
+/// The executor a connection's layout conversion runs on: the first consumer
+/// placement's, else the producer placement's. The *one* policy the normalized
+/// plan events and the canonical materializer share, so the executor a
+/// transform event names and the `micro.engine` the binder stamps cannot
+/// disagree (task B8). Empty only when neither endpoint resolves to a
+/// placement.
+std::string transformExecutorFor(const CoveringPlan &plan,
+                                 const PlanConnection &connection);
 
 std::string canonicalCandidateString(const MappingCandidate &candidate);
 std::string canonicalInstanceString(const CandidateInstance &instance);

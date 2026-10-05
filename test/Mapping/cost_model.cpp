@@ -5,6 +5,7 @@
 #include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingPlan.h"
+#include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
@@ -489,13 +490,8 @@ TEST(CostEvent, PlanEventsNormalizeAGather) {
 }
 
 TEST(CostEvent, PlanEventsRejectAnUnknownStrictFact) {
-  CoveringPlan plan = twoHopPlan();
-  plan.steps.clear();
-  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, planEventMachine());
-  EXPECT_FALSE(static_cast<bool>(dag));
-  if (!dag)
-    llvm::consumeError(dag.takeError());
-
+  // A hop across a link the machine does not declare cannot be charged and is
+  // rejected rather than silently charged a single iteration.
   CoveringPlan missingRoute = twoHopPlan();
   missingRoute.connectionPlans.front().route = {"d0", "s0"};
   llvm::Expected<PlanEventDAG> unrouted =
@@ -503,6 +499,29 @@ TEST(CostEvent, PlanEventsRejectAnUnknownStrictFact) {
   EXPECT_FALSE(static_cast<bool>(unrouted));
   if (!unrouted)
     llvm::consumeError(unrouted.takeError());
+
+  // A transform with no maps has no measurable footprint.
+  CoveringPlan noTransform = twoHopPlan();
+  noTransform.connectionPlans.front().kind = ConnectionKind::LayoutTransform;
+  noTransform.connectionPlans.front().route = {"s0"};
+  llvm::Expected<PlanEventDAG> unmapped =
+      buildPlanEvents(noTransform, planEventMachine());
+  EXPECT_FALSE(static_cast<bool>(unmapped));
+  if (!unmapped)
+    llvm::consumeError(unmapped.takeError());
+
+  // A gather with no declared semantics cannot be materialized.
+  CoveringPlan noGather = twoHopPlan();
+  PlanConnection &gather = noGather.connectionPlans.front();
+  gather.kind = ConnectionKind::Reduce;
+  gather.route = {"s0"};
+  gather.producerPorts = {PortRef{0, PortDirection::Output, 0},
+                          PortRef{1, PortDirection::Output, 0}};
+  llvm::Expected<PlanEventDAG> undecided =
+      buildPlanEvents(noGather, planEventMachine());
+  EXPECT_FALSE(static_cast<bool>(undecided));
+  if (!undecided)
+    llvm::consumeError(undecided.takeError());
 }
 
 //===----------------------------------------------------------------------===//
@@ -551,6 +570,60 @@ TEST(CostEvent, ConnectionSignatureDistinguishesEveryDecision) {
   swapped.producerEndpoint = base.consumerEndpoints;
   swapped.consumerEndpoints = base.producerEndpoint;
   EXPECT_NE(swapped.canonicalString(), reference);
+}
+
+TEST(CostEvent, ConnectionSignatureFoldsConsumerMapsAndGatherSemantics) {
+  mlir::MLIRContext context;
+  WorkloadGraph workload;
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+
+  mlir::AffineMap identity =
+      mlir::AffineMap::getMultiDimIdentityMap(2, &context);
+  mlir::AffineMap transpose = transposeMap(&context);
+
+  ConnectionPlan base;
+  base.id = 1;
+  base.value = 0;
+  base.kind = ConnectionKind::Reduce;
+  base.gatherSemantics = GatherSemantics::Sum;
+  base.memoryRoute = {"s0"};
+  base.producerMap = identity;
+  base.consumerMaps = {identity, transpose};
+  const std::string reference =
+      connectionSignatureFor(base, workload, machine).canonicalString();
+
+  // Sum vs Max vs Concatenate are different work.
+  ConnectionPlan max = base;
+  max.gatherSemantics = GatherSemantics::Max;
+  EXPECT_NE(connectionSignatureFor(max, workload, machine).canonicalString(),
+            reference);
+
+  ConnectionPlan concat0 = base;
+  concat0.gatherSemantics = GatherSemantics::Concatenate;
+  concat0.concatAxis = 0;
+  ConnectionPlan concat1 = concat0;
+  concat1.concatAxis = 1;
+  const std::string axisZero =
+      connectionSignatureFor(concat0, workload, machine).canonicalString();
+  EXPECT_NE(axisZero, reference);
+  EXPECT_NE(
+      connectionSignatureFor(concat1, workload, machine).canonicalString(),
+      axisZero);
+
+  // A changed consumer-side affine relation changes the identity.
+  ConnectionPlan differentConsumerMaps = base;
+  differentConsumerMaps.consumerMaps = {transpose, transpose};
+  EXPECT_NE(connectionSignatureFor(differentConsumerMaps, workload, machine)
+                .canonicalString(),
+            reference);
+
+  // The consumer maps are rendered in a canonical (sorted) order, so a
+  // reordered description retains one key.
+  ConnectionPlan reordered = base;
+  reordered.consumerMaps = {transpose, identity};
+  EXPECT_EQ(
+      connectionSignatureFor(reordered, workload, machine).canonicalString(),
+      reference);
 }
 
 TEST(CostEvent, ConnectionSignatureIsNotAmbiguousConcatenation) {

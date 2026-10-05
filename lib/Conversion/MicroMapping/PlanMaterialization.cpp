@@ -447,21 +447,11 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
                                    ": " + reason.str());
   };
 
-  // The plan-selected executor a conversion runs on: the connection's first
-  // consumer placement's, else the producer placement's. The same rule the
-  // normalized plan events use (task B8), so the stamped resource and the
-  // plan's event name the same pool and the perf charge cannot disagree.
-  auto transformExecutorFor =
-      [&](const PlanConnection &connection) -> std::string {
-    for (const PlanPlacement &placement : plan.placements)
-      for (InstanceId consumer : connection.consumers)
-        if (placement.instance == consumer)
-          return placement.executor;
-    if (connection.producerPort)
-      for (const PlanPlacement &placement : plan.placements)
-        if (placement.node == connection.producerPort->node)
-          return placement.executor;
-    return {};
+  // The plan-selected executor a conversion runs on. The *one* shared policy
+  // (task B8) the normalized plan events also use, so the stamped resource and
+  // the plan's event name the same pool and the perf charge cannot disagree.
+  auto transformExecutorFor = [&](const PlanConnection &connection) {
+    return mapping::transformExecutorFor(plan, connection);
   };
 
   // Barrier requirements the selected plan recorded, by connection id (task

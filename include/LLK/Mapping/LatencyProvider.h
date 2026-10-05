@@ -41,10 +41,12 @@ namespace mlir::llk::mapping {
 inline constexpr uint64_t kCostModelVersion = 2;
 
 /// Bumped independently of `kCostModelVersion` whenever a *connection*
-/// measurement's identity changes. A connection's key gained ordered
-/// node/link/engine paths, concrete maps/parameters and storage rendering in
-/// version 2 (task B8).
-inline constexpr uint64_t kConnectionKeyVersion = 2;
+/// measurement's identity changes. Version 2 (task B8) gained ordered
+/// node/link/engine paths, concrete maps/parameters and storage rendering;
+/// version 3 folded the consumer-side affine maps and a gather's declared
+/// semantics/axis in, so two connections differing only there no longer
+/// collide.
+inline constexpr uint64_t kConnectionKeyVersion = 3;
 
 /// What work is being looked up. Every field is part of the cache key; an
 /// empty field means "not modelled", never "any".
@@ -89,9 +91,10 @@ struct OperationSignature {
 ///
 /// The machine hash alone is not the whole target identity (task B8): the rule
 /// library and the layout library are target content too, and a change to
-/// either changes what a piece of work *means*. Both hashes default to 0, so a
-/// caller that only knows the machine keeps source compatibility; a non-zero
-/// hash is required before a measurement can be reused.
+/// either changes what a piece of work *means*. Both extra hashes default to
+/// the empty string, so a caller that only knows the machine keeps source
+/// compatibility; a non-empty hash is required before a measurement can be
+/// reused.
 struct TargetContext {
   std::string target;
   std::string machineHash;
@@ -139,6 +142,19 @@ struct ConnectionSignature {
   /// same connection produce the same key and no two different connections do.
   std::string canonicalString() const;
 };
+
+struct ConnectionPlan;
+class WorkloadGraph;
+
+/// Builds the measurement identity of one synthesized connection (task B8)
+/// from the same facts the search decided: kind, value type, endpoint roles,
+/// ordered route/links/engines, the producer and consumer affine maps, the
+/// transform's layouts, the gather semantics/axis, and the destination storage.
+/// Public so a provider and its tests agree on exactly what a key contains.
+ConnectionSignature
+connectionSignatureFor(const ConnectionPlan &connection,
+                       const WorkloadGraph &workload,
+                       const machine::MachineModel &machine);
 
 /// An optional source of measured or calibrated cycle counts.
 class LatencyProvider {

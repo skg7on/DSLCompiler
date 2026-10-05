@@ -3,13 +3,17 @@
 #include "LLK/Mapping/CostEvent.h"
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/TileFacts.h"
+#include "LLK/Mapping/WorkloadGraph.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <array>
@@ -80,23 +84,6 @@ const machine::LinkEdge *linkBetween(const machine::MachineModel &machine,
   return nullptr;
 }
 
-/// The executor whose engine runs a connection's transform: the first consumer
-/// placement's, else the producer placement's. This is the resource the binder
-/// stamps on the emitted `micro.transform` (task B8), so the plan's normalized
-/// transform event and the materialized one name the same pool.
-std::string transformExecutor(const CoveringPlan &plan,
-                              const PlanConnection &connection) {
-  for (const PlanPlacement &placement : plan.placements)
-    for (InstanceId consumer : connection.consumers)
-      if (placement.instance == consumer)
-        return placement.executor;
-  if (connection.producerPort)
-    for (const PlanPlacement &placement : plan.placements)
-      if (placement.node == connection.producerPort->node)
-        return placement.executor;
-  return {};
-}
-
 /// The node a connection serves, for the data dependency from a movement to the
 /// consumer that reads it: the first consumer instance's covered node.
 std::optional<WorkloadNodeId> consumerNodeOf(const CoveringPlan &plan,
@@ -143,23 +130,93 @@ PlanCostEvent makePlanCostEvent(CostEventKind kind, std::string resource,
 llvm::Expected<PlanEventDAG>
 buildPlanEvents(const CoveringPlan &plan,
                 const machine::MachineModel &machine) {
-  if (plan.steps.empty())
-    return planEventError(
-        "plan events: the plan carries no step DAG; finalize its storage plan "
-        "before building event costs");
-
   // The placement covering each node, and the placement for each instance, so a
   // compute step and a connection's consumers resolve without the workload
   // graph.
   std::map<WorkloadNodeId, const PlanPlacement *> placementForNode;
-  for (const PlanPlacement &placement : plan.placements)
+  std::map<InstanceId, WorkloadNodeId> nodeForInstance;
+  for (const PlanPlacement &placement : plan.placements) {
     placementForNode[placement.node] = &placement;
+    nodeForInstance[placement.instance] = placement.node;
+  }
+
+  // A plan decoded from persisted metadata carries no execution facts -- they
+  // are provenance, not content -- so scoring it would silently undercharge
+  // every event. Reject explicitly rather than emit zero-cycle events.
+  if (plan.schemaVersion != 0) {
+    for (const PlanPlacement &placement : plan.placements)
+      if (placement.cost.latencyCycles == 0.0 &&
+          placement.cost.localBytes == 0 && placement.workItems == 0)
+        return planEventError(
+            "plan events: node " + llvm::Twine(placement.node) +
+            " carries no execution facts; a plan decoded from metadata must be "
+            "re-scored from its search result");
+  }
+
+  // The execution structure. A finalized plan carries its storage step DAG; a
+  // plan scored before finalization (the mapping search's candidate score) gets
+  // a deterministic one synthesized from its placements and connections, so the
+  // final score comes from the shared schedule without a separate, weaker
+  // scoring path.
+  std::vector<PlanStep> synthesizedSteps;
+  std::vector<PlanStepEdge> synthesizedEdges;
+  const bool haveSteps = !plan.steps.empty();
+  if (!haveSteps) {
+    PlanStepId next = 0;
+    std::map<WorkloadNodeId, PlanStepId> computeStep;
+    std::vector<WorkloadNodeId> nodes;
+    for (const PlanPlacement &placement : plan.placements)
+      nodes.push_back(placement.node);
+    llvm::sort(nodes);
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    for (WorkloadNodeId node : nodes) {
+      computeStep[node] = next;
+      synthesizedSteps.push_back(
+          PlanStep{next++, PlanStepKind::Compute, node, 0});
+    }
+    std::vector<const PlanConnection *> connections;
+    for (const PlanConnection &connection : plan.connectionPlans)
+      connections.push_back(&connection);
+    llvm::sort(connections,
+               [](const PlanConnection *lhs, const PlanConnection *rhs) {
+                 return lhs->id < rhs->id;
+               });
+    for (const PlanConnection *connection : connections) {
+      // A `Direct` connection materializes nothing, so it gets no step.
+      if (connection->kind == ConnectionKind::Direct)
+        continue;
+      PlanStepId movement = next;
+      synthesizedSteps.push_back(
+          PlanStep{movement, PlanStepKind::Movement, 0, connection->id});
+      PlanStepId sync = next++;
+      synthesizedSteps.push_back(
+          PlanStep{sync, PlanStepKind::Synchronization, 0, connection->id});
+      if (connection->producerPort) {
+        auto producer = computeStep.find(connection->producerPort->node);
+        if (producer != computeStep.end())
+          synthesizedEdges.push_back(PlanStepEdge{producer->second, movement});
+      }
+      synthesizedEdges.push_back(PlanStepEdge{movement, sync});
+      for (InstanceId consumer : connection->consumers) {
+        auto node = nodeForInstance.find(consumer);
+        if (node == nodeForInstance.end())
+          continue;
+        auto compute = computeStep.find(node->second);
+        if (compute != computeStep.end())
+          synthesizedEdges.push_back(PlanStepEdge{sync, compute->second});
+      }
+    }
+  }
+  const std::vector<PlanStep> &sourceSteps =
+      haveSteps ? plan.steps : synthesizedSteps;
+  const std::vector<PlanStepEdge> &sourceEdges =
+      haveSteps ? plan.stepEdges : synthesizedEdges;
 
   // The steps sorted by id: the storage plan builds them in a deterministic
   // topological order, so their ids are the execution order.
   std::vector<const PlanStep *> steps;
-  steps.reserve(plan.steps.size());
-  for (const PlanStep &step : plan.steps)
+  steps.reserve(sourceSteps.size());
+  for (const PlanStep &step : sourceSteps)
     steps.push_back(&step);
   llvm::sort(steps, [](const PlanStep *lhs, const PlanStep *rhs) {
     return lhs->id < rhs->id;
@@ -197,6 +254,16 @@ buildPlanEvents(const CoveringPlan &plan,
       // A compute event accounts for work, not traffic: the performance DAG's
       // vector/mma events carry no bytes, so this one carries none either and
       // the two streams stay comparable.
+      //
+      // `kPlanComputeUsesRuleEstimate` (named reason): the cycle input here is
+      // the selected instance's rule-local estimate, *not* the machine's
+      // elementwise formula the performance DAG charges. A mapping plan records
+      // a rule's declared cost and its output element count, never the
+      // operation kind (mma vs vector) the machine would need to pick a
+      // formula, so only the transform, transfer and synchronization events --
+      // for which both paths call one shared estimate -- agree cycle for cycle.
+      // The divergence is intentional and pinned by
+      // `L1ResourceDag.PlanComputeCyclesUseTheRuleEstimate`.
       produced.push_back(add(makePlanCostEvent(
           CostEventKind::Compute, engine->id, placed.cost.latencyCycles,
           placed.workItems, /*bytes=*/0)));
@@ -214,6 +281,15 @@ buildPlanEvents(const CoveringPlan &plan,
                               ", which the plan does not record");
       const PlanConnection &connection = *found;
       movementStep[connection.id] = step->id;
+
+      // A conversion kind with no maps has no measurable footprint: rejected,
+      // never silently emitted as a free event.
+      if ((connection.kind == ConnectionKind::LayoutTransform ||
+           connection.kind == ConnectionKind::TransferAndTransform) &&
+          !connection.transform)
+        return planEventError("plan events: transform connection " +
+                              llvm::Twine(connection.id) +
+                              " carries no maps to emit");
 
       // The transfer hops (and the wait each implies) a materialized movement
       // emits, one event per hop, chained so the data arrives in order.
@@ -288,7 +364,7 @@ buildPlanEvents(const CoveringPlan &plan,
             feedTails.push_back(hops->back());
         }
         const machine::ComputeNode *engine =
-            engineForExecutor(machine, transformExecutor(plan, connection));
+            engineForExecutor(machine, transformExecutorFor(plan, connection));
         if (!engine)
           return planEventError(
               "plan events: machine '" + machine.target +
@@ -316,7 +392,7 @@ buildPlanEvents(const CoveringPlan &plan,
       // disagree.
       if (connection.transform) {
         const machine::ComputeNode *engine =
-            engineForExecutor(machine, transformExecutor(plan, connection));
+            engineForExecutor(machine, transformExecutorFor(plan, connection));
         if (!engine)
           return planEventError(
               "plan events: machine '" + machine.target +
@@ -370,7 +446,7 @@ buildPlanEvents(const CoveringPlan &plan,
 
   // Inter-step dependencies: every event of a dependent step follows the last
   // event of each step it depends on.
-  for (const PlanStepEdge &edge : plan.stepEdges) {
+  for (const PlanStepEdge &edge : sourceEdges) {
     auto from = stepEvents.find(edge.from);
     auto to = stepEvents.find(edge.to);
     if (from == stepEvents.end() || to == stepEvents.end() ||
@@ -395,7 +471,7 @@ buildPlanEvents(const CoveringPlan &plan,
         consumerNodeOf(plan, connection);
     if (!consumerNode)
       continue;
-    for (const PlanStep &step : plan.steps) {
+    for (const PlanStep &step : sourceSteps) {
       if (step.kind != PlanStepKind::Compute || step.node != *consumerNode)
         continue;
       auto computeEvents = stepEvents.find(step.id);
@@ -412,6 +488,104 @@ buildPlanEvents(const CoveringPlan &plan,
                      event.deps.end());
   }
   return dag;
+}
+
+ConnectionSignature
+connectionSignatureFor(const ConnectionPlan &connection,
+                       const WorkloadGraph &workload,
+                       const machine::MachineModel &machine) {
+  auto renderType = [](mlir::Type type) {
+    if (!type)
+      return std::string();
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    type.print(stream);
+    return stream.str();
+  };
+  auto renderMap = [](const mlir::AffineMap &map) {
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    map.print(stream);
+    return stream.str();
+  };
+
+  ConnectionSignature signature;
+  signature.kind = stringifyConnectionKind(connection.kind).str();
+  if (const WorkloadValue *value = workload.findValue(connection.value))
+    signature.valueType = renderType(value->type);
+
+  // Endpoint roles: a swapped producer/consumer assignment is different work.
+  if (connection.producerPort)
+    signature.producerEndpoint =
+        "producer{" + canonicalPortRefString(*connection.producerPort) + "}";
+  std::vector<std::string> consumers;
+  for (const PortRef &port : connection.consumerPorts)
+    consumers.push_back("consumer{" + canonicalPortRefString(port) + "}");
+  llvm::sort(consumers);
+  signature.consumerEndpoints = llvm::join(consumers, ",");
+
+  // The ordered route and the links it crosses.
+  std::vector<std::string> nodes(connection.memoryRoute.begin(),
+                                 connection.memoryRoute.end());
+  std::vector<std::string> links;
+  for (size_t hop = 1; hop < connection.memoryRoute.size(); ++hop)
+    for (const machine::LinkEdge &edge : machine.links)
+      if (edge.source == connection.memoryRoute[hop - 1] &&
+          edge.destination == connection.memoryRoute[hop]) {
+        links.push_back(edge.id);
+        break;
+      }
+  signature.route = llvm::join(nodes, ">");
+  signature.links = llvm::join(links, ">");
+  signature.engines = llvm::join(connection.transferEngines, ">");
+
+  // The concrete affine relations on both sides, plus the transform's maps.
+  std::string maps = "producer=";
+  maps += connection.producerMap ? renderMap(*connection.producerMap)
+                                 : std::string("<null>");
+  std::vector<std::string> consumerMaps;
+  for (const mlir::AffineMap &map : connection.consumerMaps)
+    consumerMaps.push_back(renderMap(map));
+  llvm::sort(consumerMaps);
+  maps += ";consumers=";
+  maps += llvm::join(consumerMaps, ",");
+  if (connection.transform) {
+    maps += ";transform_src=";
+    maps += connection.transform->srcMap
+                ? renderMap(connection.transform->srcMap)
+                : std::string("<null>");
+    maps += ";transform_dst=";
+    maps += connection.transform->dstMap
+                ? renderMap(connection.transform->dstMap)
+                : std::string("<null>");
+  }
+  signature.maps = maps;
+
+  // The concrete parameters: the transform's layout families and, for a gather,
+  // its declared semantics and axis (execution-affecting content the canonical
+  // connection string already folds).
+  std::string parameters;
+  if (connection.transform) {
+    parameters = connection.transform->srcLayout + "->" +
+                 connection.transform->dstLayout;
+  }
+  if (connection.gatherSemantics) {
+    if (!parameters.empty())
+      parameters += ";";
+    parameters += "gather=";
+    parameters += stringifyGatherSemantics(*connection.gatherSemantics);
+    if (connection.concatAxis)
+      parameters += ":axis=" + std::to_string(*connection.concatAxis);
+  }
+  signature.parameters = parameters;
+
+  std::string storage;
+  if (!connection.memoryRoute.empty())
+    storage = connection.memoryRoute.back();
+  storage += "#";
+  storage += std::to_string(connection.cost.localBytes);
+  signature.storage = storage;
+  return signature;
 }
 
 } // namespace mlir::llk::mapping

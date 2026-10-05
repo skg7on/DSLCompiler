@@ -33,6 +33,7 @@
 
 #include "LLK/Mapping/CoveringSearch.h"
 
+#include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/Routing.h"
@@ -359,77 +360,6 @@ std::string placementIdentity(const CandidateInstance &instance) {
     text += llvm::join(sortedPortMemories(instance.portMemoryBindings), ",");
   }
   return text;
-}
-
-/// The measurement identity of one synthesized connection (task B8): the
-/// ordered route, the links it crosses, the engines it uses, its endpoint
-/// occurrences with explicit roles, the concrete maps it applies, and the
-/// storage it resolves to. Built from the same facts the search decided, so a
-/// provider's measurement is only reused for the connection it was taken on.
-ConnectionSignature
-connectionSignatureFor(const ConnectionPlan &connection,
-                       const WorkloadGraph &workload,
-                       const machine::MachineModel &machine) {
-  ConnectionSignature signature;
-  signature.kind = stringifyConnectionKind(connection.kind).str();
-  if (const WorkloadValue *value = workload.findValue(connection.value))
-    signature.valueType = renderedType(value->type);
-  if (connection.producerPort)
-    signature.producerEndpoint =
-        "producer{" + canonicalPortRefString(*connection.producerPort) + "}";
-  std::vector<std::string> consumers;
-  for (const PortRef &port : connection.consumerPorts)
-    consumers.push_back("consumer{" + canonicalPortRefString(port) + "}");
-  llvm::sort(consumers);
-  signature.consumerEndpoints = llvm::join(consumers, ",");
-  std::vector<std::string> nodes;
-  std::vector<std::string> links;
-  for (const MemoryNodeId &node : connection.memoryRoute)
-    nodes.push_back(node);
-  for (size_t hop = 1; hop < connection.memoryRoute.size(); ++hop)
-    for (const machine::LinkEdge &edge : machine.links)
-      if (edge.source == connection.memoryRoute[hop - 1] &&
-          edge.destination == connection.memoryRoute[hop]) {
-        links.push_back(edge.id);
-        break;
-      }
-  signature.route = llvm::join(nodes, ">");
-  signature.links = llvm::join(links, ">");
-  signature.engines = llvm::join(connection.transferEngines, ">");
-  auto renderMap = [](const mlir::AffineMap &map) {
-    std::string text;
-    llvm::raw_string_ostream stream(text);
-    map.print(stream);
-    return stream.str();
-  };
-  std::string maps;
-  if (connection.transform) {
-    maps = "src=";
-    maps += connection.transform->srcMap
-                ? renderMap(connection.transform->srcMap)
-                : std::string("<null>");
-    maps += ";dst=";
-    maps += connection.transform->dstMap
-                ? renderMap(connection.transform->dstMap)
-                : std::string("<null>");
-  } else if (connection.producerMap) {
-    maps = "producer=" + renderMap(*connection.producerMap);
-  }
-  signature.maps = maps;
-  std::string parameters;
-  if (connection.transform) {
-    parameters = connection.transform->srcLayout;
-    parameters += "->";
-    parameters += connection.transform->dstLayout;
-  }
-  signature.parameters = parameters;
-  std::string storage;
-  if (!connection.memoryRoute.empty())
-    storage = connection.memoryRoute.back();
-  storage += "#";
-  storage += std::to_string(connection.cost.localBytes);
-  signature.storage = storage;
-  return signature;
 }
 
 /// Canonical placement order (design §22.1): the executor id, then the sorted
@@ -2046,7 +1976,30 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                  return lhs.id < rhs.id;
                });
 
+    // The final candidate score comes from the *shared* resource scheduler
+    // (task B8), not the additive accumulation: the plan's normalized events
+    // are scheduled exactly as the performance model schedules the kernel, so a
+    // candidate is ranked by the overlapped latency it would actually run.
+    // The optimistic additive accumulation stays separately named.
+    plan.accumulatedCost = partial.cost;
     plan.totalCost = partial.cost;
+    llvm::Expected<PlanEventDAG> planEvents = buildPlanEvents(plan, machine);
+    if (planEvents) {
+      llvm::Expected<Cost> scheduled = schedulePlanEvents(*planEvents, machine);
+      if (scheduled) {
+        plan.totalCost = *scheduled;
+      } else {
+        llvm::consumeError(scheduled.takeError());
+        plan.diagnostics.storageNotes.push_back(
+            "plan score: the shared schedule could not score this plan; the "
+            "additive accumulation is reported instead");
+      }
+    } else {
+      llvm::consumeError(planEvents.takeError());
+      plan.diagnostics.storageNotes.push_back(
+          "plan score: the plan's events could not be built; the additive "
+          "accumulation is reported instead");
+    }
     plan.diagnostics.searchTruncated = result.searchTruncated;
     // Record the search point this plan came from before its content id is
     // folded, so two plans differing only by their binding do not collide.

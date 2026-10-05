@@ -999,6 +999,56 @@ TEST(L1ResourceDag, SelectedPlanEventsMatchItsMaterializedKernel) {
   }
 }
 
+// The plan's compute-cycle input is the search's rule-local estimate, while the
+// materialized kernel charges the machine's elementwise formula. The two agree
+// on kind/resource/work/bytes, and on the transform/transfer/synchronization
+// cycles they share one estimate for; the compute *cycle* is intentionally
+// different because a plan does not carry the operation kind the machine would
+// need (mma vs vector). This test pins the divergence so it is not accidental.
+TEST(L1ResourceDag, PlanComputeCyclesUseTheRuleEstimate) {
+  auto parsed = parseKernel(R"mlir(
+module {
+  micro.kernel @one_vector {
+    %t = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  auto kernelDag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(kernelDag))
+      << llvm::toString(kernelDag.takeError());
+  ASSERT_EQ(kernelDag->events.size(), 1u);
+
+  mapping::CoveringPlan plan;
+  mapping::PlanPlacement placement;
+  placement.node = 0;
+  placement.instance = 100;
+  placement.executor = "worker.0";
+  placement.cost.latencyCycles = 5.0;
+  placement.workItems = 64;
+  plan.placements.push_back(placement);
+  plan.steps = {mapping::PlanStep{0, mapping::PlanStepKind::Compute, 0, 0}};
+
+  llvm::Expected<mapping::PlanEventDAG> planDag =
+      mapping::buildPlanEvents(plan, model);
+  ASSERT_TRUE(static_cast<bool>(planDag))
+      << llvm::toString(planDag.takeError());
+  ASSERT_EQ(planDag->events.size(), 1u);
+
+  mapping::PlanCostEvent normalized = normalizedPlanEvent(kernelDag->events[0]);
+  EXPECT_EQ(planDag->events[0].event.kind, normalized.event.kind);
+  EXPECT_EQ(planDag->events[0].event.resource, normalized.event.resource);
+  EXPECT_EQ(planDag->events[0].workItems, normalized.workItems);
+  EXPECT_EQ(planDag->events[0].bytes, normalized.bytes);
+  // The rule-local estimate ...
+  EXPECT_DOUBLE_EQ(planDag->events[0].event.cost.latencyCycles, 5.0);
+  // ... versus the machine's elementwise formula (64 elements / 8 lanes).
+  EXPECT_DOUBLE_EQ(normalized.event.cost.latencyCycles, 8.0);
+}
+
 // Normalized plan events are scheduled by the *same* resource scheduler the
 // performance evaluator uses: resource multiplicity overlaps independent work.
 TEST(L1ResourceDag, PlanEventsShareThePerformanceScheduler) {

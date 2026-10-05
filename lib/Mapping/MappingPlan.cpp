@@ -516,4 +516,17 @@ PlanId computePlanId(const CoveringPlan &plan) {
   return stableHash(canonicalPlanString(plan));
 }
 
+std::string transformExecutorFor(const CoveringPlan &plan,
+                                 const PlanConnection &connection) {
+  for (const PlanPlacement &placement : plan.placements)
+    for (InstanceId consumer : connection.consumers)
+      if (placement.instance == consumer)
+        return placement.executor;
+  if (connection.producerPort)
+    for (const PlanPlacement &placement : plan.placements)
+      if (placement.node == connection.producerPort->node)
+        return placement.executor;
+  return {};
+}
+
 } // namespace mlir::llk::mapping
