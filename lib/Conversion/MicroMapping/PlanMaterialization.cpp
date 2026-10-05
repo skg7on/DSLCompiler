@@ -144,6 +144,23 @@ llvm::StringRef unmaterializedKindReason(ConnectionKind kind) {
 /// True when `type` is a `!micro.tile`.
 bool isTileType(mlir::Type type) { return llvm::isa<micro::TileType>(type); }
 
+/// True for the zero-cost logical ops a consumer may read a value through.
+bool isTransparentOp(mlir::Operation *op) {
+  llvm::StringRef name = op->getName().getStringRef();
+  return name == "micro.tile_view" || name == "micro.tile_partition";
+}
+
+/// Resolves `value` through the transparent logical ops to the value it
+/// ultimately reads.
+mlir::Value resolveThroughTransparent(mlir::Value value) {
+  while (mlir::Operation *defining = value.getDefiningOp()) {
+    if (!isTransparentOp(defining) || defining->getNumOperands() == 0)
+      break;
+    value = defining->getOperand(0);
+  }
+  return value;
+}
+
 /// The operation whose `micro.mapping` records source node `node`, or null.
 /// Endpoints name source-graph node ids; the persisted stamp is what ties a
 /// materialized op back to the node it covers, so resolving through it keeps
@@ -181,6 +198,9 @@ private:
     WorkloadValueId value = 0;
     llvm::SmallVector<MemoryNodeId> route;
     std::string transform;
+    /// The value the movement read: what a recorded consumer must currently
+    /// read (directly or through a transparent view) for the rewire to apply.
+    mlir::Value source;
     mlir::Value result;
     mlir::Attribute dstMemory;
     llvm::SmallVector<PortRef> consumers;
@@ -377,6 +397,7 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       chain.value = connection.value;
       chain.route = connection.route;
       chain.transform = transform;
+      chain.source = input;
       chain.result =
           emitTransform(builder, producer, input, *connection.transform);
       chain.dstMemory = dstMemory;
@@ -527,6 +548,7 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
     chain.value = connection.value;
     chain.route = connection.route;
     chain.transform = transform;
+    chain.source = value;
     chain.result = produced;
     chain.dstMemory = dstMemory;
     chain.consumers = std::move(consumers);
@@ -546,11 +568,37 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
         consumer = binding.opFor(ref.node);
       mlir::OpOperand *operand =
           consumer ? operandForPort(consumer, ref.index) : nullptr;
+      // A recorded endpoint must currently read this connection's source value
+      // (directly or through a transparent view), or the association is stale
+      // and redirecting it would corrupt unrelated data. A second endpoint
+      // served by the same transparent view is already rewired to the movement
+      // result, which is equally valid.
+      if (operand) {
+        mlir::Value current = resolveThroughTransparent(operand->get());
+        if (current == chain.result)
+          continue;
+        if (current != chain.source) {
+          bound.unmaterialized.push_back(
+              "value " + std::to_string(chain.value) + ": " +
+              kNoConsumerReason.str() + " (node " + std::to_string(ref.node) +
+              ", input " + std::to_string(ref.index) + ")");
+          continue;
+        }
+      }
       if (!operand) {
         bound.unmaterialized.push_back(
             "value " + std::to_string(chain.value) + ": " +
             kNoConsumerReason.str() + " (node " + std::to_string(ref.node) +
             ", input " + std::to_string(ref.index) + ")");
+        continue;
+      }
+      // A consumer reading through a transparent logical op keeps its own
+      // (source-typed) operand: feed the movement's result into the view,
+      // preserving the consumer's logical type so the source identity is
+      // unchanged. Otherwise rewire the operand to the movement result.
+      if (mlir::Operation *view = operand->get().getDefiningOp();
+          view && isTransparentOp(view)) {
+        view->setOperand(0, chain.result);
         continue;
       }
       mlir::Value replacement = retypeForConsumer(

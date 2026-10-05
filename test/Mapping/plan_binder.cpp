@@ -4,6 +4,7 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/PlanBinder.h"
+#include "LLK/Mapping/PlanReport.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
 #include "MicroMappingCommon.h"
@@ -2902,4 +2903,60 @@ module {
   ASSERT_FALSE(bool(executable));
   std::string text = llvm::toString(executable.takeError());
   EXPECT_NE(text.find("missing_static_fact"), std::string::npos) << text;
+}
+
+// Tile memory is source-semantic: `micro.tile_alloc`/`micro.tile_view` declare
+// it, and design §10.2 uses it to decide whether an edge is a Transfer at all.
+// Two kernels identical but for a declared tile memory must therefore have
+// different source-graph identities, and a plan/report bound for one must be
+// rejected against the other -- the same class the loop-multiplicity fix
+// closed.
+TEST(PlanBinder, AChangedTileMemoryChangesTheGraphHashAndRejectsReplay) {
+  // Identical to `kTileKernelOneConsumer` except the external tile is declared
+  // in L2 rather than SRAM.
+  constexpr llvm::StringLiteral kL2SourceKernel = R"mlir(
+module {
+  micro.kernel @tiled {
+    %a = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<l2>>
+    %r = micro.vector "add" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<l2>>, !micro.tile<8x8xf32, memory = #micro.memory<l2>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %m = micro.vector "mul" %r, %r : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+  Fixture a = makeTileFixture(kTileKernelOneConsumer);
+  Fixture b = makeTileFixture(kL2SourceKernel);
+  ASSERT_TRUE(a.module);
+  ASSERT_TRUE(b.module);
+  llvm::Expected<WorkloadGraph> graphA =
+      extractWorkloadGraph(findKernel(*a.module));
+  llvm::Expected<WorkloadGraph> graphB =
+      extractWorkloadGraph(findKernel(*b.module));
+  ASSERT_TRUE(bool(graphA)) << llvm::toString(graphA.takeError());
+  ASSERT_TRUE(bool(graphB)) << llvm::toString(graphB.takeError());
+  EXPECT_NE(computeSourceGraphHash(*graphA), computeSourceGraphHash(*graphB));
+
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "f32";
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(*graphA, **target, *a.context, layoutContext, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  std::string report = writePlanReport(*result, (*target)->machine(), **target,
+                                       options, /*moduleHash=*/0);
+
+  // The report bound for the SRAM kernel is rejected against the L2 kernel.
+  llvm::Expected<CoveringPlan> replayed =
+      readPlanReport(report, **target, *graphB);
+  EXPECT_FALSE(bool(replayed));
+
+  // The control: it replays against its own graph.
+  llvm::Expected<CoveringPlan> control =
+      readPlanReport(report, **target, *graphA);
+  EXPECT_TRUE(bool(control)) << llvm::toString(control.takeError());
 }

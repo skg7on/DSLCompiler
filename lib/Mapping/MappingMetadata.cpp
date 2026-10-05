@@ -69,34 +69,10 @@ std::string printedType(mlir::Type type) {
   return stream.str();
 }
 
-/// `printedType` with a tile's `memory = #micro.memory<...>` parameter removed.
-///
-/// A tile's memory is a *materialization* decision: the destination a selected
-/// movement lands the value in. The source-graph identity is defined over
-/// pre-materialization semantics, so it must be stable when a movement retypes
-/// a consumer's operand into the destination memory -- otherwise the graph hash
-/// would change the moment the plan binds, and a report could never replay onto
-/// the graph it was produced from. Stripping the memory (rather than the whole
-/// tile clause) keeps the shape, element type, layout and owner, which *are*
-/// source semantics. This is a string transform because the mapping library
-/// links no dialect and cannot name `!micro.tile`.
-std::string canonicalTypeString(mlir::Type type) {
-  std::string text = printedType(type);
-  if (!llvm::StringRef(text).starts_with("!micro.tile<"))
-    return text;
-  size_t key = text.find("memory = #micro.memory<");
-  if (key == std::string::npos)
-    return text;
-  size_t begin = key;
-  if (begin >= 2 && text.compare(begin - 2, 2, ", ") == 0)
-    begin -= 2;
-  else if (begin >= 1 && text[begin - 1] == ' ')
-    begin -= 1;
-  size_t end = text.find('>', key);
-  if (end == std::string::npos)
-    return text;
-  text.erase(begin, (end + 1) - begin);
-  return text;
+/// True when `type`'s printed form is a `!micro.tile`. A string test because
+/// the mapping library links no dialect and cannot name the generated type.
+bool isTileTypeString(mlir::Type type) {
+  return llvm::StringRef(printedType(type)).starts_with("!micro.tile<");
 }
 
 std::string printedAttribute(mlir::Attribute attribute) {
@@ -138,12 +114,12 @@ std::string structuralNodeKey(const WorkloadNode &node) {
   std::string key = node.opName;
   key += "|in:";
   for (const WorkloadPort &port : node.inputs) {
-    key += canonicalTypeString(port.type);
+    key += printedType(port.type);
     key += ',';
   }
   key += "|out:";
   for (const WorkloadPort &port : node.outputs) {
-    key += canonicalTypeString(port.type);
+    key += printedType(port.type);
     key += ',';
   }
   key += "|attr:";
@@ -207,17 +183,44 @@ SourceProjection buildSourceProjection(const WorkloadGraph &graph,
     return it == alias.end() ? value : it->second;
   };
 
-  llvm::SmallVector<const WorkloadNode *, 8> semantic;
-  for (const WorkloadNode &node : graph.getNodes())
-    if (!isBinderMovement(node))
-      semantic.push_back(&node);
+  // The pre-materialization type of a port whose value a binder movement
+  // retyped. A movement lands a value in a *different* destination memory, and
+  // the consumer's operand is retyped to match (`tile<dst>`); the source
+  // identity keeps the original memory, and the value the movement reads is the
+  // consumer's original source-memory tile -- so the resolved value's type is
+  // exactly the pre-materialization port type. A resolved value that is not a
+  // tile (a shaped value behind a transparent view) leaves the port type
+  // unchanged: it was never retyped. This restores the source type without
+  // erasing memory from the identity, so two kernels differing only in a
+  // declared tile memory still hash and order differently.
+  auto restoreType = [&](const WorkloadPort &port) -> mlir::Type {
+    if (!binding || !isTileTypeString(port.type))
+      return port.type;
+    WorkloadValueId resolved = resolve(port.value);
+    if (resolved == port.value)
+      return port.type;
+    const WorkloadValue *source = graph.findValue(resolved);
+    if (source && isTileTypeString(source->type))
+      return source->type;
+    return port.type;
+  };
+
+  llvm::SmallVector<WorkloadNode, 8> semantic;
+  for (const WorkloadNode &node : graph.getNodes()) {
+    if (isBinderMovement(node))
+      continue;
+    WorkloadNode copy = node;
+    for (WorkloadPort &port : copy.inputs)
+      port.type = restoreType(port);
+    semantic.push_back(std::move(copy));
+  }
 
   // Canonical source order: by structural key, preserving the graph's own order
   // for structurally identical nodes. The source graph's finalized order is the
   // same (key, program order) ordering, so projected ids equal source ids.
   llvm::stable_sort(semantic,
-                    [](const WorkloadNode *lhs, const WorkloadNode *rhs) {
-                      return structuralNodeKey(*lhs) < structuralNodeKey(*rhs);
+                    [](const WorkloadNode &lhs, const WorkloadNode &rhs) {
+                      return structuralNodeKey(lhs) < structuralNodeKey(rhs);
                     });
 
   SourceProjection projection;
@@ -236,26 +239,26 @@ SourceProjection buildSourceProjection(const WorkloadGraph &graph,
     return id;
   };
 
-  for (const WorkloadNode *node : semantic) {
-    WorkloadNode copy = *node;
+  for (const WorkloadNode &node : semantic) {
+    WorkloadNode copy = node;
     // Drop the program ordinal so the projection's canonical order depends only
     // on structural content, not on where the source sat in the materialized
     // kernel's program order.
     copy.sourceOrdinal = 0;
     copy.inputs.clear();
     copy.outputs.clear();
-    for (const WorkloadPort &port : node->inputs) {
+    for (const WorkloadPort &port : node.inputs) {
       WorkloadPort projected = port;
       projected.value = projectedValue(port.value);
       copy.inputs.push_back(projected);
     }
-    for (const WorkloadPort &port : node->outputs) {
+    for (const WorkloadPort &port : node.outputs) {
       WorkloadPort projected = port;
       projected.value = projectedValue(port.value);
       copy.outputs.push_back(projected);
     }
     if (binding) {
-      if (mlir::Operation *op = binding->opFor(node->id))
+      if (mlir::Operation *op = binding->opFor(node.id))
         projection.nodeOps[static_cast<WorkloadNodeId>(
             projection.graph.getNodes().size())] = op;
     }
@@ -300,7 +303,7 @@ std::string canonicalProjectedGraphString(const WorkloadGraph &graph) {
       record += "|in";
       record += std::to_string(index);
       record += "=";
-      record += canonicalTypeString(port.type);
+      record += printedType(port.type);
       record += "@";
       record += port.accessMap ? printedMap(*port.accessMap) : "-";
       record += "#";
@@ -311,7 +314,7 @@ std::string canonicalProjectedGraphString(const WorkloadGraph &graph) {
       record += "|out";
       record += std::to_string(index);
       record += "=";
-      record += canonicalTypeString(port.type);
+      record += printedType(port.type);
       record += "#";
       record += label(port.value);
     }
