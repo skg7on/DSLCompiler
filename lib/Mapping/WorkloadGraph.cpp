@@ -27,11 +27,35 @@ constexpr llvm::StringLiteral kNodeOps[] = {
 constexpr llvm::StringLiteral kTransparentOps[] = {"micro.tile_view",
                                                    "micro.tile_partition"};
 
+/// The identity rendering of a value type in the workload graph. A tile's
+/// `memory = #micro.memory<...>` clause is deliberately omitted: memory is a
+/// *materialization* decision (the destination a selected movement lands the
+/// value in), so the same workload must have the same graph identity whether or
+/// not a movement has retyped a consumer's operand into the destination memory.
+/// Keeping the memory would reorder nodes and shift their ids the moment a plan
+/// binds, which would break the source<->materialized correlation every content
+/// key exists to provide. This is a string transform because the mapping
+/// library links no dialect and cannot name `!micro.tile`.
 std::string typeString(Type type) {
   std::string text;
   llvm::raw_string_ostream stream(text);
   type.print(stream);
-  return stream.str();
+  std::string printed = stream.str();
+  if (!llvm::StringRef(printed).starts_with("!micro.tile<"))
+    return printed;
+  size_t key = printed.find("memory = #micro.memory<");
+  if (key == std::string::npos)
+    return printed;
+  size_t begin = key;
+  if (begin >= 2 && printed.compare(begin - 2, 2, ", ") == 0)
+    begin -= 2;
+  else if (begin >= 1 && printed[begin - 1] == ' ')
+    begin -= 1;
+  size_t end = printed.find('>', key);
+  if (end == std::string::npos)
+    return printed;
+  printed.erase(begin, (end + 1) - begin);
+  return printed;
 }
 
 std::string attributeString(Attribute attribute) {

@@ -40,6 +40,40 @@ struct BoundPlan {
   std::vector<std::string> unmaterialized;
 };
 
+/// Owns construction of the concrete operations a selected plan implies (design
+/// §18.2, "Materialization versus target readiness").
+///
+/// The mapping core is target-neutral and links no dialect; a plan's connection
+/// is a generic container (a rule id, a route of machine node ids, endpoint
+/// occurrences), and only a dialect-aware component can turn it into IR. This
+/// interface is that seam: `bindPlan` always persists the selected state as
+/// metadata, then -- when a materializer is supplied -- hands the cloned module
+/// to it to emit the movements, transforms, and endpoint rewiring the plan
+/// selects. The canonical implementation lives outside `lib/Mapping` (in
+/// `lib/Conversion/MicroMapping/PlanMaterialization.cpp`), so the mapping
+/// library never depends on the Micro dialect.
+///
+/// A materializer appends one stable reason per connection it cannot
+/// materialize to `BoundPlan::unmaterialized` (never silently dropping a
+/// selected decision) and rewires exactly the consumer endpoints a connection
+/// records -- not every use of a value. Callers that need code a backend may
+/// run pass `BindContract::Executable`, which turns the first such reason into
+/// an error.
+class PlanMaterializer {
+public:
+  virtual ~PlanMaterializer() = default;
+
+  /// Emits `plan`'s movements and transforms onto `module` (a private clone of
+  /// the source kernel already carrying the selected metadata) and rewires the
+  /// recorded consumer endpoints. Appends to `bound.unmaterialized` for any
+  /// connection it cannot materialize. `module` and `target` are the same
+  /// module and target `bindPlan` was called with.
+  virtual llvm::Error materialize(mlir::ModuleOp module,
+                                  const CoveringPlan &plan,
+                                  const MappingTarget &target,
+                                  BoundPlan &bound) = 0;
+};
+
 /// How strict binding is about execution-affecting decisions the binder cannot
 /// yet materialize (design §18.2). The distinction is the difference between a
 /// useful *analysis* artifact and something a backend may execute: a partial
@@ -66,28 +100,18 @@ enum class BindContract {
 /// Fails when the module has no `micro.kernel`, when a covered node is not in
 /// the kernel, or when the plan names a rule the target does not declare.
 ///
-/// Materialization (design §18.2): a selected connection that moves a value
-/// between two memories is emitted as one `micro.async_copy` + `micro.wait` per
-/// route hop, right after the producing operation. One chain is emitted per
-/// (value, route), and each chain rewires only the consumers its connection
-/// names -- so a value carried two ways gets two chains, and neither redirects
-/// the other's readers. A `Replicate` (a fan-out copy) is materialized the same
-/// way; a connection whose consumers are not recorded rewires nobody.
+/// The concrete operations a selected connection implies -- the copy chains
+/// that move a value between memories, the `micro.transform` that re-represents
+/// a layout, and the endpoint rewiring -- are constructed by a
+/// `PlanMaterializer`, not by this target-neutral function. The canonical
+/// implementation lives in the Micro mapping library; `lib/Mapping` never names
+/// a dialect operation.
 ///
-/// A layout conversion becomes one target-neutral `micro.transform`, which
-/// names the two layouts by their solved affine maps rather than by target ids
-/// (design §13.4 keeps target layout ids out of `#micro.layout`): a
-/// `LayoutTransform` connection emits it in place, and a
-/// `TransferAndTransform` connection emits its copies followed by it. Only
-/// `Reduce` (a gather) still has no Micro operation form and is reported.
-///
-/// A connection the binder cannot materialize is *reported*, not silently
-/// dropped: `BoundPlan::unmaterialized` names it and why. The remaining limit
-/// is deliberate: a `Reduce` (a gather) has no Micro operation form yet, so it
-/// is reported as `reduce_not_materialized`; every other connection kind is
-/// emitted. (A value whose type is not shaped has no generic copy form either
-/// -- `micro.tile_async_copy` needs a destination-memory-typed tile the binder
-/// cannot construct -- and such an entry names its own specific cause.)
+/// A connection a materializer cannot materialize is *reported*, not silently
+/// dropped: `BoundPlan::unmaterialized` names it and its stable reason. The
+/// remaining limit is deliberate: a `Reduce` (a gather) has no Micro operation
+/// form yet, so it is reported as `reduce_not_materialized`; every other kind
+/// is emitted when a materializer is supplied.
 ///
 /// `contract` decides what an unresolved decision means. Under
 /// `BindContract::Partial` (the default) the plan is bound with those
@@ -95,10 +119,21 @@ enum class BindContract {
 /// `BindContract::Executable` the same situation is an error naming every
 /// unresolved decision, so a caller that will hand the result to a backend
 /// cannot receive IR that omits part of the selected plan.
+///
+/// `materializer` (optional, and null by default) is the canonical
+/// construction path for the selected movements and transforms (see
+/// `PlanMaterializer`). When it is null the binding is *metadata-only*: the
+/// selected state is still persisted, but every connection that would need a
+/// new operation is reported in `BoundPlan::unmaterialized` with the reason
+/// `no_plan_materializer`, so a standalone mapping caller gets an honest
+/// partial plan rather than IR that silently omits the movement. Under
+/// `BindContract::Executable` a null materializer is therefore always an error
+/// -- a backend-facing caller must supply one.
 llvm::Expected<BoundPlan>
 bindPlan(mlir::ModuleOp source, const CoveringPlan &plan,
          const MappingTarget &target,
-         BindContract contract = BindContract::Partial);
+         BindContract contract = BindContract::Partial,
+         PlanMaterializer *materializer = nullptr);
 
 /// Layered verification of mapped Micro-IR (design §18.3), in order:
 ///

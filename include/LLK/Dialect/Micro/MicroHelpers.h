@@ -10,6 +10,7 @@
 #define LLK_DIALECT_MICRO_MICROHELPERS_H
 
 #include "LLK/Dialect/Micro/MicroEnums.h"
+#include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 
 #include <optional>
@@ -31,6 +32,21 @@ inline std::optional<DType> dtypeOfElementType(Type elementType) {
     return DType::i8;
   return std::nullopt;
 }
+
+/// Builds a materialized `!micro.tile` for `source` in the abstract memory
+/// space `memory` (a `#micro.memory<kind>` attribute), preserving the logical
+/// shape and element type.
+///
+/// `source` may be an existing tile -- whose layout and owner are carried over
+/// -- or a shaped value (tensor/vector/memref), which is given the destination
+/// memory with no layout or owner. This is the canonical adapter a materializer
+/// uses to retype a value into the memory a selected transfer lands it in.
+///
+/// Returns a null `Type` when `source` has no statically known shape, carries
+/// no supported Micro element type, or is not a shaped value or tile; or when
+/// `memory` is not a memory-space attribute. Declared here but defined in
+/// MicroOps.cpp, which has the generated tile and attribute classes.
+Type materializedTileType(Type source, Attribute memory);
 
 } // namespace mlir::micro
 

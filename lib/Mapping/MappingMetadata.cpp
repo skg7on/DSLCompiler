@@ -69,6 +69,36 @@ std::string printedType(mlir::Type type) {
   return stream.str();
 }
 
+/// `printedType` with a tile's `memory = #micro.memory<...>` parameter removed.
+///
+/// A tile's memory is a *materialization* decision: the destination a selected
+/// movement lands the value in. The source-graph identity is defined over
+/// pre-materialization semantics, so it must be stable when a movement retypes
+/// a consumer's operand into the destination memory -- otherwise the graph hash
+/// would change the moment the plan binds, and a report could never replay onto
+/// the graph it was produced from. Stripping the memory (rather than the whole
+/// tile clause) keeps the shape, element type, layout and owner, which *are*
+/// source semantics. This is a string transform because the mapping library
+/// links no dialect and cannot name `!micro.tile`.
+std::string canonicalTypeString(mlir::Type type) {
+  std::string text = printedType(type);
+  if (!llvm::StringRef(text).starts_with("!micro.tile<"))
+    return text;
+  size_t key = text.find("memory = #micro.memory<");
+  if (key == std::string::npos)
+    return text;
+  size_t begin = key;
+  if (begin >= 2 && text.compare(begin - 2, 2, ", ") == 0)
+    begin -= 2;
+  else if (begin >= 1 && text[begin - 1] == ' ')
+    begin -= 1;
+  size_t end = text.find('>', key);
+  if (end == std::string::npos)
+    return text;
+  text.erase(begin, (end + 1) - begin);
+  return text;
+}
+
 std::string printedAttribute(mlir::Attribute attribute) {
   std::string text;
   llvm::raw_string_ostream stream(text);
@@ -108,12 +138,12 @@ std::string structuralNodeKey(const WorkloadNode &node) {
   std::string key = node.opName;
   key += "|in:";
   for (const WorkloadPort &port : node.inputs) {
-    key += printedType(port.type);
+    key += canonicalTypeString(port.type);
     key += ',';
   }
   key += "|out:";
   for (const WorkloadPort &port : node.outputs) {
-    key += printedType(port.type);
+    key += canonicalTypeString(port.type);
     key += ',';
   }
   key += "|attr:";
@@ -270,7 +300,7 @@ std::string canonicalProjectedGraphString(const WorkloadGraph &graph) {
       record += "|in";
       record += std::to_string(index);
       record += "=";
-      record += printedType(port.type);
+      record += canonicalTypeString(port.type);
       record += "@";
       record += port.accessMap ? printedMap(*port.accessMap) : "-";
       record += "#";
@@ -281,7 +311,7 @@ std::string canonicalProjectedGraphString(const WorkloadGraph &graph) {
       record += "|out";
       record += std::to_string(index);
       record += "=";
-      record += printedType(port.type);
+      record += canonicalTypeString(port.type);
       record += "#";
       record += label(port.value);
     }

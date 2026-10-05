@@ -17,6 +17,8 @@
 #include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Perf/MicroDAG.h"
 
+#include "MicroMappingCommon.h"
+
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -216,8 +218,14 @@ TEST(RouteIdentity, BinderStampedCopiesChargeTheirOwnLinks) {
   const mapping::CoveringPlan &plan = result->plans.front();
   ASSERT_FALSE(plan.connectionPlans.empty());
 
+  // `bindPlan` is target-neutral and constructs no operations; the canonical
+  // Micro materializer supplies the stamped copies this test charges, exactly
+  // as the CLI does.
+  std::unique_ptr<mapping::PlanMaterializer> materializer =
+      mlir::llk::micro_mapping_detail::createCanonicalPlanMaterializer();
   llvm::Expected<mapping::BoundPlan> bound =
-      mapping::bindPlan(*module, plan, target);
+      mapping::bindPlan(*module, plan, target, mapping::BindContract::Partial,
+                        materializer.get());
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   for (const std::string &note : bound->unmaterialized)
     ADD_FAILURE() << note;

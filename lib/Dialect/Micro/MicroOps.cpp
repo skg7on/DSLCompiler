@@ -40,6 +40,47 @@ using namespace mlir;
 using namespace mlir::micro;
 
 //===----------------------------------------------------------------------===//
+// Canonical tile construction (MicroHelpers.h)
+//===----------------------------------------------------------------------===//
+
+Type mlir::micro::materializedTileType(Type source, Attribute memory) {
+  auto memoryAttr = dyn_cast<MemorySpaceAttr>(memory);
+  if (!memoryAttr)
+    return {};
+
+  ArrayRef<int64_t> shape;
+  Type elementType;
+  LayoutAttr layout;
+  OwnerAttr owner;
+  if (auto tile = dyn_cast<TileType>(source)) {
+    shape = tile.getShape();
+    elementType = tile.getElementType();
+    layout = tile.getLayout();
+    owner = tile.getOwner();
+  } else if (auto shaped = dyn_cast<ShapedType>(source)) {
+    // A shaped source must have a statically known image: a dynamic extent has
+    // no tile shape to materialize, so it is refused rather than guessed.
+    if (!shaped.hasStaticShape())
+      return {};
+    shape = shaped.getShape();
+    elementType = shaped.getElementType();
+  } else {
+    return {};
+  }
+
+  // A destination tile needs a concrete storage footprint, so every extent must
+  // be statically known; a dynamic extent has no byte size to reserve and is
+  // refused rather than guessed.
+  for (int64_t dim : shape)
+    if (ShapedType::isDynamic(dim))
+      return {};
+  if (!dtypeOfElementType(elementType))
+    return {};
+  return TileType::get(source.getContext(), shape, elementType, layout,
+                       memoryAttr, owner);
+}
+
+//===----------------------------------------------------------------------===//
 // Custom verifier for KernelOp.
 //===----------------------------------------------------------------------===//
 

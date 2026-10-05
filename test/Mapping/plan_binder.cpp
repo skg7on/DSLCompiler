@@ -6,8 +6,11 @@
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
+#include "MicroMappingCommon.h"
+
 #include "LLK/Dialect/Micro/MicroDialect.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -31,6 +34,19 @@ namespace avx2_mapping = mlir::llk::target::avx2;
 #endif
 
 namespace {
+
+/// Binds `plan` with the canonical Micro materializer, exactly as the CLI does
+/// (design §18.2): the target-neutral binder persists the selected state and
+/// this dialect-aware component constructs the movements and transforms. A
+/// fresh materializer per call keeps each test independent.
+llvm::Expected<BoundPlan>
+bindCanonical(ModuleOp module, const CoveringPlan &plan,
+              const MappingTarget &target,
+              BindContract contract = BindContract::Partial) {
+  std::unique_ptr<PlanMaterializer> materializer =
+      mlir::llk::micro_mapping_detail::createCanonicalPlanMaterializer();
+  return bindPlan(module, plan, target, contract, materializer.get());
+}
 
 /// A concrete kernel whose work is one copy into SRAM and one vector add.
 constexpr llvm::StringLiteral kKernel = R"mlir(
@@ -122,7 +138,7 @@ TEST(PlanBinder, MaterializesThePlanWithoutTouchingTheSource) {
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
 
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, *plan, *fixture.target);
+      bindCanonical(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   ASSERT_NE(bound->kernel, nullptr);
 
@@ -140,7 +156,7 @@ TEST(PlanBinder, AnnotatesEachCoveredOperationWithItsSelection) {
       selectPlan(*fixture.context, *fixture.module, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, *plan, *fixture.target);
+      bindCanonical(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   std::vector<std::string> rules;
@@ -162,7 +178,7 @@ TEST(PlanBinder, MappedIrVerifiesAndRoundTripsWithoutATargetPlugin) {
       selectPlan(*fixture.context, *fixture.module, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, *plan, *fixture.target);
+      bindCanonical(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   EXPECT_FALSE(
@@ -192,7 +208,7 @@ TEST(PlanBinder, PersistsTheSolvedLayoutParameters) {
       selectPlan(*fixture.context, *fixture.module, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, *plan, *fixture.target);
+      bindCanonical(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   bool sawSolvedWidth = false;
@@ -231,7 +247,7 @@ TEST(PlanBinder, RejectsTamperedSolvedVectorWidth) {
   ASSERT_TRUE(f.target);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   auto legal = verifyMappedMicroIR(*b->module, *f.target);
   ASSERT_FALSE(bool(legal)) << llvm::toString(std::move(legal));
@@ -276,7 +292,7 @@ TEST(PlanBinder, RejectsTamperedLayoutFamily) {
   ASSERT_TRUE(f.target);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
 
@@ -315,7 +331,7 @@ TEST(PlanBinder, MachineAwareVerificationRejectsAnUnknownExecutor) {
       selectPlan(*fixture.context, *fixture.module, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, *plan, *fixture.target);
+      bindCanonical(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   // Rewrite one mapping to name an executor the machine does not have.
@@ -614,7 +630,8 @@ TEST(PlanBinder, EmitsACopyAndWaitWhenTheValueMustMove) {
   const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
   const size_t waitsBefore = countOps(*fixture.module, "micro.wait");
 
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   for (const std::string &note : bound->unmaterialized)
@@ -625,8 +642,11 @@ TEST(PlanBinder, EmitsACopyAndWaitWhenTheValueMustMove) {
 
   // The mapped IR must satisfy both the dialect verifier and the mapping
   // checks: a copy that broke either is worse than no copy.
-  EXPECT_FALSE(
-      static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
+  {
+    llvm::Error verification = verifyMappedMicroIR(*bound->module, **target);
+    EXPECT_FALSE(static_cast<bool>(verification))
+        << llvm::toString(std::move(verification));
+  }
 
   // The source kernel is untouched.
   EXPECT_EQ(countOps(*fixture.module, "micro.async_copy"), copiesBefore);
@@ -643,7 +663,7 @@ TEST(PlanBinder, ReportsConnectionsItCannotMaterialize) {
       selectPlan(*fixture.context, *fixture.module, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, *plan, *fixture.target);
+      bindCanonical(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   EXPECT_TRUE(bound->unmaterialized.empty());
 }
@@ -685,7 +705,8 @@ TEST(PlanBinder, MaterializesALayoutTransformAsATransformOp) {
   const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
   const size_t transformsBefore = countOps(*fixture.module, "micro.transform");
 
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   for (const std::string &note : bound->unmaterialized)
     ADD_FAILURE() << note;
@@ -722,7 +743,8 @@ TEST(PlanBinder, MaterializesATransferAndTransformAsCopiesPlusATransform) {
 
   const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
 
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   EXPECT_TRUE(bound->unmaterialized.empty());
   EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore + hops);
@@ -752,13 +774,13 @@ TEST(PlanBinder, ExecutableContractRefusesAPlanThatOmitsADecision) {
 
   // The partial contract binds it and reports the omission.
   llvm::Expected<BoundPlan> partial =
-      bindPlan(*fixture.module, plan, *fixture.target);
+      bindCanonical(*fixture.module, plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(partial))
       << llvm::toString(partial.takeError());
   EXPECT_FALSE(partial->unmaterialized.empty());
 
   // The executable contract refuses it, naming the decision.
-  llvm::Expected<BoundPlan> executable = bindPlan(
+  llvm::Expected<BoundPlan> executable = bindCanonical(
       *fixture.module, plan, *fixture.target, BindContract::Executable);
   ASSERT_FALSE(static_cast<bool>(executable));
   std::string error = llvm::toString(executable.takeError());
@@ -785,7 +807,7 @@ TEST(PlanBinder, ReduceIsStillReportedBecauseItHasNoMicroOperationForm) {
   plan.connectionPlans.push_back(connection);
 
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, plan, *fixture.target);
+      bindCanonical(*fixture.module, plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   ASSERT_EQ(bound->unmaterialized.size(), 1u);
   EXPECT_EQ(bound->unmaterialized.front(), "value 9: reduce_not_materialized");
@@ -813,7 +835,8 @@ TEST(PlanBinder, MaterializesAReplicateConnectionAsACopyChain) {
   // does).
   const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
 
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   EXPECT_TRUE(bound->unmaterialized.empty());
   EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore + hops);
@@ -822,11 +845,11 @@ TEST(PlanBinder, MaterializesAReplicateConnectionAsACopyChain) {
 }
 
 TEST(PlanBinder, RewiresOnlyTheConsumersItsConnectionNames) {
-  // Rewiring is scoped to the connection's own consumers. A connection with no
-  // recorded consumers therefore emits its copy but redirects nobody -- the
-  // reader keeps reading the original value. (The old binder rewired *every*
-  // reader of the value, which is wrong as soon as two connections carry one
-  // value along different routes.)
+  // Rewiring is scoped to the connection's own recorded endpoints. A connection
+  // with no recorded endpoint therefore emits its copy but redirects nobody --
+  // the reader keeps reading the original value. (The old binder rewired
+  // *every* reader of the value, which is wrong as soon as two connections
+  // carry one value along different routes.)
   Fixture fixture = makeFixture();
   ASSERT_TRUE(fixture.module);
   llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
@@ -836,10 +859,13 @@ TEST(PlanBinder, RewiresOnlyTheConsumersItsConnectionNames) {
       selectPlan(*fixture.context, *fixture.module, **target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
   ASSERT_FALSE(plan->connectionPlans.empty());
-  for (PlanConnection &connection : plan->connectionPlans)
+  for (PlanConnection &connection : plan->connectionPlans) {
     connection.consumers.clear();
+    connection.consumerPorts.clear();
+  }
 
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   EXPECT_TRUE(bound->unmaterialized.empty());
 
@@ -877,13 +903,19 @@ TEST(PlanBinder, EmitsOneChainPerRouteAndSurvivesBoth) {
   PlanConnection duplicate = first;
   duplicate.id = first.id + 1;
   duplicate.route = (first.route == direct) ? staged : direct;
+  // The duplicate lands the value on a second route; it must not claim the
+  // first connection's endpoints, or both movements would fight to be what the
+  // same consumer reads. Endpoint rewiring is the authority, so it names none.
+  duplicate.consumerPorts.clear();
+  duplicate.consumers.clear();
   plan->connectionPlans.push_back(duplicate);
 
   const size_t expectedCopies =
       (first.route.size() - 1) + (duplicate.route.size() - 1);
   const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
 
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   EXPECT_TRUE(bound->unmaterialized.empty());
   EXPECT_EQ(countOps(*bound->module, "micro.async_copy"),
@@ -911,7 +943,8 @@ TEST(PlanBinder, MergesADuplicateValueConnectionWithTheSameRoute) {
   duplicate.id = first.id + 1;
   plan->connectionPlans.push_back(duplicate); // identical route
 
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   EXPECT_TRUE(bound->unmaterialized.empty());
 }
@@ -1067,7 +1100,8 @@ TEST(PlanBinder, EmitsOneCopyPerRouteHop) {
   const size_t copiesBefore = countOps(*fixture.module, "micro.async_copy");
   const size_t waitsBefore = countOps(*fixture.module, "micro.wait");
 
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   for (const std::string &note : bound->unmaterialized)
     ADD_FAILURE() << note;
@@ -1190,7 +1224,7 @@ TEST(PlanBinder, MappedFixtureVerifiesWithFullRuleLegality) {
       selectPlan(*fixture.context, *fixture.module, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, *plan, *fixture.target);
+      bindCanonical(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   EXPECT_FALSE(
@@ -1207,7 +1241,7 @@ TEST(PlanBinder, RejectsASelectedRuleWhosePredicateNoLongerMatches) {
   ASSERT_NE(f.target, nullptr);
   llvm::Expected<CoveringPlan> p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  llvm::Expected<BoundPlan> b = bindPlan(*f.module, *p, *f.target);
+  llvm::Expected<BoundPlan> b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   b->module->walk([&](Operation *op) {
     if (op->getName().getStringRef() == "micro.vector")
@@ -1230,7 +1264,7 @@ TEST(PlanBinder, RejectsAnExecutorOfTheWrongKind) {
       selectPlan(*fixture.context, *fixture.module, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, *plan, *fixture.target);
+      bindCanonical(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   rewriteRecordedExecutor(*bound->module, *fixture.context, "veng.0");
@@ -1255,7 +1289,7 @@ TEST(PlanBinder, RejectsAComputeRequirementTheExecutorCannotSupply) {
 
   llvm::Expected<CoveringPlan> plan = selectPlan(context, *module, **target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
-  llvm::Expected<BoundPlan> bound = bindPlan(*module, *plan, **target);
+  llvm::Expected<BoundPlan> bound = bindCanonical(*module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   // The search placed the vector on `worker.vec`, the only worker with a
@@ -1281,7 +1315,7 @@ TEST(PlanBinder, RejectsAMappedOperationThatIsNotAWorkloadNode) {
       selectPlan(*fixture.context, *fixture.module, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
   llvm::Expected<BoundPlan> bound =
-      bindPlan(*fixture.module, *plan, *fixture.target);
+      bindCanonical(*fixture.module, *plan, *fixture.target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
 
   bool stamped = false;
@@ -1359,7 +1393,7 @@ TEST(PlanBinder, ValueStampCannotExemptAnUnmappedComputeOperation) {
   ASSERT_TRUE(f.target);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   auto legal = verifyMappedMicroIR(*b->module, *f.target);
   ASSERT_FALSE(bool(legal)) << llvm::toString(std::move(legal));
@@ -1390,7 +1424,7 @@ TEST(PlanBinder, MaterializedMovementKeepsItsCompletenessExemption) {
   ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
   auto p = selectPlan(*f.context, *f.module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, **target);
+  auto b = bindCanonical(*f.module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   ASSERT_NE(materializedCopy(*b->module), nullptr);
   auto error = verifyMappedMicroIR(*b->module, **target);
@@ -1407,7 +1441,7 @@ TEST(PlanBinder, RejectsAMovementWhoseConnectionStampIsAbsent) {
   ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
   auto p = selectPlan(*f.context, *f.module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, **target);
+  auto b = bindCanonical(*f.module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   Operation *copy = materializedCopy(*b->module);
   ASSERT_NE(copy, nullptr);
@@ -1427,7 +1461,7 @@ TEST(PlanBinder, RejectsAMovementNamingAnUnknownConnection) {
   ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
   auto p = selectPlan(*f.context, *f.module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, **target);
+  auto b = bindCanonical(*f.module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   Operation *copy = materializedCopy(*b->module);
   ASSERT_NE(copy, nullptr);
@@ -1447,7 +1481,7 @@ TEST(PlanBinder, RejectsAMovementNamingAHopOutsideItsRoute) {
   ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
   auto p = selectPlan(*f.context, *f.module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, **target);
+  auto b = bindCanonical(*f.module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   Operation *copy = materializedCopy(*b->module);
   ASSERT_NE(copy, nullptr);
@@ -1468,7 +1502,7 @@ TEST(PlanBinder, RejectsAMovementWhoseDestinationDoesNotMatchItsRoute) {
   ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
   auto p = selectPlan(*f.context, *f.module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, **target);
+  auto b = bindCanonical(*f.module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   Operation *copy = materializedCopy(*b->module);
   ASSERT_NE(copy, nullptr);
@@ -1488,7 +1522,7 @@ TEST(PlanBinder, RejectsAMovementOnAnUnsupportedTransferEngine) {
   ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
   auto p = selectPlan(*f.context, *f.module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, **target);
+  auto b = bindCanonical(*f.module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   ASSERT_NE(materializedCopy(*b->module), nullptr);
   rewriteAllRouteEngines(b->kernel, *f.context, {"no_such_engine"});
@@ -1548,7 +1582,7 @@ TEST(PlanBinder, RoundTripsConnectionEndpointsAndResourceBindings) {
   auto p = selectPlan(*f.context, *f.module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
   ASSERT_FALSE(p->connectionPlans.empty());
-  auto b = bindPlan(*f.module, *p, **target);
+  auto b = bindCanonical(*f.module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
 
   auto decoded = decodeSelectedPlan(*b->module, **target);
@@ -1592,7 +1626,7 @@ TEST(PlanBinder, RoundTripsSolvedLayoutAssignmentsAndMaps) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
 
   auto decoded = decodeSelectedPlan(*b->module, *f.target);
@@ -1626,7 +1660,7 @@ TEST(PlanBinder, DecodeRejectsAChangedTarget) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
 
   llvm::Expected<std::unique_ptr<MappingTarget>> other = movementTarget();
@@ -1645,7 +1679,7 @@ TEST(PlanBinder, DecodeRejectsAChangedSourceGraph) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
 
   b->module->walk([&](Operation *op) {
@@ -1668,7 +1702,7 @@ TEST(PlanBinder, DecodeRejectsAMalformedEndpointIndex) {
   ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
   auto p = selectPlan(*f.context, *f.module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, **target);
+  auto b = bindCanonical(*f.module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
 
   rewriteFirstConsumerPortIndex(b->kernel, *f.context.get(), /*newIndex=*/99);
@@ -1684,7 +1718,7 @@ TEST(PlanBinder, DecodeRejectsAnUnsupportedSchemaVersion) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
 
   auto plan = b->kernel->getAttrOfType<DictionaryAttr>("micro.plan");
@@ -1714,7 +1748,7 @@ TEST(PlanBinder, RejectsADeletedLayoutContainer) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
 
@@ -1785,7 +1819,7 @@ TEST(PlanBinder, RejectsAMalformedLayoutEntryEndpoint) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
 
@@ -1811,7 +1845,7 @@ TEST(PlanBinder, RejectsATamperedLayoutEntryMap) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
 
@@ -1841,7 +1875,7 @@ TEST(PlanBinder, RejectsAConsumerEndpointThatDoesNotReadTheValue) {
   ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
   auto p = selectPlan(*f.context, *f.module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, **target);
+  auto b = bindCanonical(*f.module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   ASSERT_NE(materializedCopy(*b->module), nullptr);
   ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
@@ -1975,7 +2009,7 @@ TEST(PlanBinder, PersistsAndValidatesResolvedRuleParameters) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, *f.target)));
 
@@ -2043,7 +2077,7 @@ TEST(PlanBinder, RoundTripsStorageAndSynchronizationState) {
   step.requiresBarrier = true;
   plan.synchronization.push_back(step);
 
-  auto b = bindPlan(*f.module, plan, *f.target);
+  auto b = bindCanonical(*f.module, plan, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   auto decoded = decodeSelectedPlan(*b->module, *f.target);
   ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
@@ -2094,7 +2128,7 @@ llvm::Expected<BoundPlan> bindConvertKernel(MLIRContext &context,
   llvm::Expected<CoveringPlan> plan = selectPlan(context, *module, target);
   if (!plan)
     return plan.takeError();
-  return bindPlan(*module, *plan, target);
+  return bindCanonical(*module, *plan, target);
 }
 
 /// Removes `name` from the `micro.plan` dictionary on `kernel`.
@@ -2155,7 +2189,7 @@ TEST(PlanBinder, DeletingSchemaVersionDoesNotDisableGraphHashChecks) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
 
   eraseFromPlan(b->kernel, *f.context.get(), "schema_version");
@@ -2180,7 +2214,7 @@ TEST(PlanBinder, DecodeRejectsMissingLayoutEntries) {
   ASSERT_NE(f.target, nullptr);
   auto p = selectPlan(*f.context, *f.module, *f.target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*f.module, *p, *f.target);
+  auto b = bindCanonical(*f.module, *p, *f.target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
 
   eraseFromVectorMapping(*b->module, *f.context.get(), "layout_entries");
@@ -2260,7 +2294,7 @@ TEST(PlanBinder, RejectsAnEmptyRecordedAssignmentForAParametrizedRule) {
 
   auto p = selectPlan(context, *module, **target);
   ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
-  auto b = bindPlan(*module, *p, **target);
+  auto b = bindCanonical(*module, *p, **target);
   ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
   ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
 
@@ -2342,7 +2376,8 @@ TEST(PlanBinder, RoundTripsNamedPortMemoryBindings) {
   ASSERT_TRUE(sawPortBindings)
       << "the named-port rules must produce per-occurrence bindings";
 
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   llvm::Error verify = verifyMappedMicroIR(*bound->module, **target);
   EXPECT_FALSE(static_cast<bool>(verify)) << llvm::toString(std::move(verify));
@@ -2374,7 +2409,8 @@ TEST(PlanBinder, ReplayRejectsATamperedPortMemoryAssociation) {
   llvm::Expected<CoveringPlan> plan =
       selectPlan(*fixture.context, *fixture.module, **target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   ASSERT_FALSE(
       static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
@@ -2399,7 +2435,8 @@ TEST(PlanBinder, ReplayWithoutThePortAssociationIsRejected) {
   llvm::Expected<CoveringPlan> plan =
       selectPlan(*fixture.context, *fixture.module, **target);
   ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
-  llvm::Expected<BoundPlan> bound = bindPlan(*fixture.module, *plan, **target);
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
   ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
   ASSERT_FALSE(
       static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
@@ -2424,4 +2461,445 @@ TEST(PlanBinder, ReplayWithoutThePortAssociationIsRejected) {
   ASSERT_TRUE(static_cast<bool>(error));
   std::string text = llvm::toString(std::move(error));
   EXPECT_NE(text.find("no_memory_route"), std::string::npos) << text;
+}
+
+//===----------------------------------------------------------------------===//
+// Canonical materialization of tile movements (task B4)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A machine with SRAM, L2 (both in cluster.a) and DRAM (cluster.b), linked
+/// SRAM->L2 and SRAM->DRAM, so one SRAM value can be carried to two different
+/// destinations.
+constexpr llvm::StringLiteral kTileMachine = R"yaml(
+schema: llk.machine.v2
+target: tile
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.a
+    kind: cluster
+  - id: worker.a
+    kind: worker
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+  - id: worker.b
+    kind: worker
+    parent: cluster.b
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.a
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+  - id: l2.0
+    kind: l2
+    visible_from: cluster.b
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+  - id: dram.0
+    kind: dram
+    visible_from: cluster.b
+    capacity_bytes: 1073741824
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.a
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+transfer_engines:
+  - id: dma.a
+    kind: dma
+    attached_to: cluster.a
+    count: 1
+    max_outstanding: 1
+links:
+  - id: sram_to_l2.0
+    source: sram.0
+    destination: l2.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+  - id: sram_to_dram.0
+    source: sram.0
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+)yaml";
+
+/// One rule per vector variant, each binding a distinct memory: add in SRAM,
+/// mul in DRAM, sub in L2.
+constexpr llvm::StringLiteral kTileRules = R"llkmap(
+rule t.add {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory kind sram;
+  bundle "b.add";
+  emit "e1";
+  cost 1;
+}
+rule t.mul {
+  match micro.vector(op = "mul");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.mul";
+  emit "e1";
+  cost 1;
+}
+rule t.sub {
+  match micro.vector(op = "sub");
+  require executor kind worker;
+  require memory kind l2;
+  bundle "b.sub";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+llvm::Expected<std::unique_ptr<MappingTarget>> tileTarget() {
+  llvm::Expected<mlir::llk::machine::MachineModel> machine =
+      mlir::llk::machine::parseMachineModel(kTileMachine, "<test>");
+  if (!machine)
+    return machine.takeError();
+  llvm::Expected<LayoutRegistry> layouts = parseLayoutText("", "<test>");
+  if (!layouts)
+    return layouts.takeError();
+  llvm::Expected<RuleRegistry> rules = parseRuleText(kTileRules, "<test>");
+  if (!rules)
+    return rules.takeError();
+  return std::make_unique<FileMappingTarget>(
+      "tile", std::move(*machine), std::move(*layouts), std::move(*rules),
+      std::vector<std::string>{"e1"});
+}
+
+/// A `micro.vector`-only tile kernel: an external SRAM tile feeds an add whose
+/// tile result is consumed by `micro.vector`s the rules place in other
+/// memories, so the edge is a real tile movement.
+constexpr llvm::StringLiteral kTileKernel = R"mlir(
+module {
+  micro.kernel @tiled {
+    %a = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %m = micro.vector "mul" %r, %r : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %s = micro.vector "sub" %r, %r : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// The same kernel with one consumer, for the transform cases.
+constexpr llvm::StringLiteral kTileKernelOneConsumer = R"mlir(
+module {
+  micro.kernel @tiled {
+    %a = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %m = micro.vector "mul" %r, %r : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+Fixture makeTileFixture(llvm::StringRef kernel = kTileKernel) {
+  Fixture fixture;
+  fixture.context = std::make_unique<MLIRContext>();
+  fixture.context->getOrLoadDialect<micro::MicroDialect>();
+  fixture.context->getOrLoadDialect<tensor::TensorDialect>();
+  fixture.context->getOrLoadDialect<arith::ArithDialect>();
+  fixture.module = parseSourceString<ModuleOp>(kernel, fixture.context.get());
+  return fixture;
+}
+
+/// The printed form of `type`, for asserting a tile's memory.
+std::string typeText(Type type) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  type.print(stream);
+  return stream.str();
+}
+
+/// The `micro.vector` operation with attribute `op = opName`, or null. Node ids
+/// are content-canonical, so tests identify the consumer by what it is.
+Operation *vectorOp(ModuleOp module, llvm::StringRef opName) {
+  Operation *found = nullptr;
+  module->walk([&](Operation *op) {
+    if (found)
+      return;
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto name = op->getAttrOfType<StringAttr>("op");
+    if (name && name.getValue() == opName)
+      found = op;
+  });
+  return found;
+}
+
+/// The materialized tile copy in `module` (the one the materializer stamped).
+Operation *tileCopy(ModuleOp module) {
+  Operation *copy = nullptr;
+  module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.tile_async_copy" &&
+        op->hasAttr("micro.dst_node"))
+      copy = op;
+  });
+  return copy;
+}
+
+} // namespace
+
+// A tile-valued connection is materialized as a typed `micro.tile_async_copy`
+// whose result is the tile retyped into the destination memory, followed by its
+// `micro.wait`; the recorded consumer reads that result.
+TEST(PlanBinder, MaterializesATileMovementAsATypedTileAsyncCopy) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  EXPECT_TRUE(b->unmaterialized.empty());
+
+  Operation *copy = tileCopy(*b->module);
+  ASSERT_NE(copy, nullptr);
+  EXPECT_NE(typeText(copy->getResult(0).getType())
+                .find("memory = #micro.memory<dram>"),
+            std::string::npos);
+  EXPECT_EQ(countOps(*b->module, "micro.wait"), 1u);
+  // The mul consumer reads the destination-memory tile.
+  Operation *mul = vectorOp(*b->module, "mul");
+  ASSERT_NE(mul, nullptr);
+  EXPECT_EQ(mul->getOperand(0), copy->getResult(0));
+  {
+    llvm::Error verification = verifyMappedMicroIR(*b->module, **target);
+    EXPECT_FALSE(bool(verification)) << llvm::toString(std::move(verification));
+  }
+}
+
+// A5 carry-over: graph-level value equality is not enough. Pointing a consumer
+// back at the original value (same workload value, so the graph check still
+// passes) while `micro.routes` still records it must be rejected -- the
+// consumer no longer reads the materialized movement.
+TEST(PlanBinder, RejectsAConsumerThatDoesNotReadTheEmittedMovement) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  // Legal control: the materialized consumer reads the movement.
+  EXPECT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
+
+  Operation *copy = tileCopy(*b->module);
+  ASSERT_NE(copy, nullptr);
+  Operation *mul = vectorOp(*b->module, "mul");
+  ASSERT_NE(mul, nullptr);
+  Value original = copy->getOperand(0);
+  for (OpOperand &use : mul->getOpOperands())
+    use.set(original);
+
+  auto error = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("does not read the materialized movement"),
+            std::string::npos)
+      << text;
+}
+
+// One value with two consumers in different destinations gets one chain per
+// destination, and each consumer reads its own chain -- the endpoint-scoped
+// rewiring the instance projection cannot express.
+TEST(PlanBinder, MaterializesOneChainPerDestinationForAReusedValue) {
+  Fixture f = makeTileFixture(kTileKernel);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  EXPECT_TRUE(b->unmaterialized.empty());
+  EXPECT_EQ(countOps(*b->module, "micro.tile_async_copy"), 2u);
+  EXPECT_EQ(countOps(*b->module, "micro.wait"), 2u);
+
+  Operation *mul = vectorOp(*b->module, "mul");
+  Operation *sub = vectorOp(*b->module, "sub");
+  ASSERT_NE(mul, nullptr);
+  ASSERT_NE(sub, nullptr);
+  EXPECT_NE(typeText(mul->getOperand(0).getType())
+                .find("memory = #micro.memory<dram>"),
+            std::string::npos);
+  EXPECT_NE(
+      typeText(sub->getOperand(0).getType()).find("memory = #micro.memory<l2>"),
+      std::string::npos);
+  EXPECT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
+}
+
+// A tile LayoutTransform moves nothing and becomes one `micro.transform` on the
+// tile, re-representing it under the solved maps.
+TEST(PlanBinder, MaterializesATileLayoutTransformAsATransformOp) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_FALSE(p->connectionPlans.empty());
+
+  MLIRContext *context = f.context.get();
+  PlanConnection &connection = p->connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route.resize(1);
+  LayoutTransform transform;
+  transform.srcLayout = "t.plain";
+  transform.dstLayout = "t.blocked";
+  transform.srcMap = AffineMap::getMultiDimIdentityMap(2, context);
+  connection.transform = transform;
+
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  EXPECT_TRUE(b->unmaterialized.empty());
+  EXPECT_EQ(countOps(*b->module, "micro.transform"), 1u);
+  EXPECT_EQ(countOps(*b->module, "micro.tile_async_copy"), 0u);
+  EXPECT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
+}
+
+// A tile TransferAndTransform emits the typed tile copy and then the transform;
+// the consumer reads the transformed destination tile.
+TEST(PlanBinder, MaterializesATileTransferAndTransformAsCopyPlusTransform) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_FALSE(p->connectionPlans.empty());
+
+  MLIRContext *context = f.context.get();
+  PlanConnection &connection = p->connectionPlans.front();
+  connection.kind = ConnectionKind::TransferAndTransform;
+  LayoutTransform transform;
+  transform.srcLayout = "t.plain";
+  transform.dstLayout = "t.blocked";
+  transform.srcMap = AffineMap::getMultiDimIdentityMap(2, context);
+  connection.transform = transform;
+
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  EXPECT_TRUE(b->unmaterialized.empty());
+  EXPECT_EQ(countOps(*b->module, "micro.tile_async_copy"), 1u);
+  EXPECT_EQ(countOps(*b->module, "micro.transform"), 1u);
+  EXPECT_EQ(countOps(*b->module, "micro.wait"), 1u);
+  EXPECT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
+}
+
+// Without a materializer the binder is metadata-only: it still persists the
+// selection but reports every connection that would need a new operation with
+// the named `no_plan_materializer` reason, so a standalone caller gets an
+// honest partial plan rather than IR silently missing the movement.
+TEST(PlanBinder, WithoutAMaterializerThePlanIsBoundMetadataOnly) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_FALSE(b->unmaterialized.empty());
+  EXPECT_NE(b->unmaterialized.front().find("no_plan_materializer"),
+            std::string::npos)
+      << b->unmaterialized.front();
+  EXPECT_EQ(countOps(*b->module, "micro.tile_async_copy"), 0u);
+}
+
+// An Executable caller must supply the canonical materializer: without one the
+// plan cannot be made executable, so the binding is refused, naming the reason.
+TEST(PlanBinder, ExecutableWithoutAMaterializerIsRejected) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+
+  auto b = bindPlan(*f.module, *p, **target, BindContract::Executable);
+  ASSERT_FALSE(bool(b));
+  std::string text = llvm::toString(b.takeError());
+  EXPECT_NE(text.find("no_plan_materializer"), std::string::npos) << text;
+}
+
+// The positive control: with the canonical materializer the same plan is fully
+// executable.
+TEST(PlanBinder, ExecutableWithAMaterializerSucceeds) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+
+  auto b = bindCanonical(*f.module, *p, **target, BindContract::Executable);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  EXPECT_TRUE(b->unmaterialized.empty());
+}
+
+// A tile whose element type has no Micro dtype cannot be retyped into the
+// destination memory: the missing static fact is a named unresolved decision,
+// reported by the partial contract and refused by the executable one -- never a
+// silently wrong copy.
+TEST(PlanBinder, AMissingStaticFactIsANamedUnresolvedDecision) {
+  constexpr llvm::StringLiteral kDynamicKernel = R"mlir(
+module {
+  micro.kernel @tiled {
+    %c = arith.constant 8 : index
+    %e = tensor.empty(%c) : tensor<?x8xf32>
+    %a = micro.tile_view %e {shape = array<i64: -9223372036854775808, 8>} : tensor<?x8xf32> -> !micro.tile<?x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %a, %a : !micro.tile<?x8xf32, memory = #micro.memory<sram>>, !micro.tile<?x8xf32, memory = #micro.memory<sram>> -> !micro.tile<?x8xf32, memory = #micro.memory<sram>>
+    %m = micro.vector "mul" %r, %r : !micro.tile<?x8xf32, memory = #micro.memory<sram>>, !micro.tile<?x8xf32, memory = #micro.memory<sram>> -> !micro.tile<?x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+  Fixture f = makeTileFixture(kDynamicKernel);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+
+  auto partial = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(partial)) << llvm::toString(partial.takeError());
+  ASSERT_FALSE(partial->unmaterialized.empty());
+  EXPECT_NE(partial->unmaterialized.front().find("missing_static_fact"),
+            std::string::npos)
+      << partial->unmaterialized.front();
+
+  auto executable =
+      bindCanonical(*f.module, *p, **target, BindContract::Executable);
+  ASSERT_FALSE(bool(executable));
+  std::string text = llvm::toString(executable.takeError());
+  EXPECT_NE(text.find("missing_static_fact"), std::string::npos) << text;
 }

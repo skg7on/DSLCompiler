@@ -52,11 +52,16 @@ constexpr llvm::StringLiteral kDstNodeAttr = "micro.dst_node";
 constexpr llvm::StringLiteral kConnectionAttr = "micro.connection";
 constexpr llvm::StringLiteral kHopAttr = "micro.hop";
 
-/// The only Micro operation the binder emits to materialize a connection's
-/// movement. A completeness exemption is granted to exactly this operation, and
-/// only when its connection provenance resolves; no other op can claim it by
-/// carrying a movement stamp.
-constexpr llvm::StringLiteral kMaterializedMovementOp = "micro.async_copy";
+/// The Micro operations the canonical materializer emits to materialize a
+/// connection's movement: the generic `micro.async_copy` for a shaped value and
+/// `micro.tile_async_copy` for a tile. A completeness exemption is granted to
+/// exactly these operations, and only when their connection provenance
+/// resolves; no other op can claim it by carrying a movement stamp.
+llvm::StringRef materializedMovementOpName(llvm::StringRef name) {
+  if (name == "micro.async_copy" || name == "micro.tile_async_copy")
+    return name;
+  return {};
+}
 
 llvm::Error bindError(const std::string &message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
@@ -108,6 +113,42 @@ std::string kernelLabel(mlir::Operation *kernel) {
   if (auto symbol = kernel->getAttrOfType<mlir::StringAttr>("sym_name"))
     return ("'" + symbol.getValue() + "'").str();
   return "<unnamed>";
+}
+
+/// Resolves `value` through the transparent logical ops (`micro.tile_view`,
+/// `micro.tile_partition`) to the operation-produced value it ultimately reads.
+/// A5 accepts this indirection: a consumer reading the movement through a view
+/// still reads the movement.
+mlir::Value resolveThroughLogicalOps(mlir::Value value) {
+  while (mlir::Operation *defining = value.getDefiningOp()) {
+    llvm::StringRef name = defining->getName().getStringRef();
+    if ((name == "micro.tile_view" || name == "micro.tile_partition") &&
+        defining->getNumOperands() > 0) {
+      value = defining->getOperand(0);
+      continue;
+    }
+    break;
+  }
+  return value;
+}
+
+/// The operation in `kernel` whose `micro.mapping` records source node `node`,
+/// or null. Consumer endpoints name *source* node ids, and a mapped workload
+/// operation records the source node it covers, so this is the materialized
+/// consumer an endpoint resolves to.
+mlir::Operation *mappedOpForNode(mlir::Operation *kernel, uint64_t node) {
+  mlir::Operation *found = nullptr;
+  kernel->walk([&](mlir::Operation *op) {
+    if (found)
+      return;
+    auto mapping = op->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
+    if (!mapping)
+      return;
+    auto recorded = mapping.getAs<mlir::IntegerAttr>("node");
+    if (recorded && recorded.getValue().getZExtValue() == node)
+      found = op;
+  });
+  return found;
 }
 
 /// The printed form of a type, for the `element_type` a `LayoutContext` reads.
@@ -264,7 +305,7 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
   const bool claimsMovement =
       op->hasAttr(kValueAttr) || op->hasAttr(kConnectionAttr) ||
       op->hasAttr(kHopAttr) || op->hasAttr(kDstNodeAttr);
-  if (name != kMaterializedMovementOp || !claimsMovement)
+  if (materializedMovementOpName(name).empty() || !claimsMovement)
     return verifyError(DiagnosticCode::NoMatchingRule,
                        where + ": op '" + name.str() +
                            "' carries no micro.mapping");
@@ -388,8 +429,16 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
                        where + ": connection " + std::to_string(*connectionId) +
                            " hop " + std::to_string(*hop) +
                            " names a memory kind Micro cannot represent");
-  if (op->getAttr("src_memory") != expectedSrc ||
-      op->getAttr("dst_memory") != expectedDst)
+  // The generic copy carries both spaces as attributes. `micro.tile_async_copy`
+  // names only the destination, because a tile's source and result memories are
+  // part of their types; the dialect verifier already enforced that the result
+  // tile's memory equals `dst_memory`, so checking the destination here (plus
+  // the dialect verifier) fixes the landing memory without re-reading tiles.
+  const bool tileCopy = name == "micro.tile_async_copy";
+  const bool memoriesMatch =
+      op->getAttr("dst_memory") == expectedDst &&
+      (tileCopy || op->getAttr("src_memory") == expectedSrc);
+  if (!memoriesMatch)
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
                        where + ": op '" + name.str() +
                            "' declares memories that do not match "
@@ -444,7 +493,12 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
                        where + ": op '" + name.str() +
                            "' is not a well-formed movement");
-  if (op->getOperand(0).getType() != op->getResult(0).getType())
+  // A generic copy must be type-preserving. A tile copy's result is the tile
+  // retyped into the destination memory, so its operand and result differ by
+  // that memory -- the dialect verifier already proved the shapes, element
+  // types and destination memory agree, so this only distinguishes the two
+  // operation forms.
+  if (!tileCopy && op->getOperand(0).getType() != op->getResult(0).getType())
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
                        where + ": op '" + name.str() +
                            "' copies a value whose type differs from its "
@@ -531,6 +585,52 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
                   ": consumer_ports entry does not read the value "
                   "connection " +
                   std::to_string(*connectionId) + " carries");
+
+        // B4 strengthening of A5: the graph-level check above only proves the
+        // recorded endpoint reads the same *value*; it does not prove the
+        // consumer reads the emitted movement. Resolve the endpoint to its
+        // materialized consumer operation and require its operand -- through
+        // the transparent `micro.tile_view` the materializer inserts when a
+        // shaped movement feeds a tile consumer -- to be this movement's
+        // result. A consumer still reading the original value is spoofed
+        // provenance, not a complete binding.
+        mlir::Operation *consumer = mappedOpForNode(kernel, ref->node);
+        if (!consumer)
+          return verifyError(
+              DiagnosticCode::InvalidMappingMetadata,
+              where + ": consumer_ports entry names node " +
+                  std::to_string(ref->node) +
+                  ", but no mapped operation in the kernel records it");
+        if (ref->index >= consumer->getNumOperands())
+          return verifyError(
+              DiagnosticCode::InvalidMappingMetadata,
+              where + ": consumer_ports entry names input " +
+                  std::to_string(ref->index) + " of node " +
+                  std::to_string(ref->node) + ", which has only " +
+                  std::to_string(consumer->getNumOperands()) + " operand(s)");
+        mlir::Value read =
+            resolveThroughLogicalOps(consumer->getOperand(ref->index));
+        // The consumer must read a value this connection materialized: either
+        // this movement op itself, or -- for a transfer-and-transform, or a
+        // later route hop -- another operation stamped with the same
+        // `micro.connection` id. Anything else is the original value, so the
+        // consumer does not read the movement.
+        mlir::Operation *defining = read.getDefiningOp();
+        bool readsMovement = defining == op;
+        if (!readsMovement && defining) {
+          auto stamped =
+              defining->getAttrOfType<mlir::IntegerAttr>(kConnectionAttr);
+          readsMovement =
+              stamped && stamped.getValue().getZExtValue() == *connectionId;
+        }
+        if (!readsMovement)
+          return verifyError(
+              DiagnosticCode::InvalidMappingMetadata,
+              where + ": consumer_ports entry (node " +
+                  std::to_string(ref->node) + ", input " +
+                  std::to_string(ref->index) +
+                  ") does not read the materialized movement of connection " +
+                  std::to_string(*connectionId));
       }
     }
   }

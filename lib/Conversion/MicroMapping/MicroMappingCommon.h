@@ -43,6 +43,12 @@
 
 namespace mlir::llk::micro_mapping_detail {
 
+/// Creates the canonical plan materializer: the dialect-aware component that
+/// turns a selected plan's connections into Micro operations (design §18.2).
+/// Defined in PlanMaterialization.cpp, which lives beside this header so the
+/// target-neutral mapping library never depends on the Micro dialect.
+std::unique_ptr<mapping::PlanMaterializer> createCanonicalPlanMaterializer();
+
 /// The 2-D rank and element-type string the layout stage instantiates its
 /// declarations against, read off the workload graph rather than assumed: the
 /// first statically shaped value's rank and element type are what the rules and
@@ -534,8 +540,13 @@ inline llvm::Error bindPlanOntoModule(
     ModuleOp module, const mapping::CoveringPlan &plan,
     const mapping::MappingTarget &target,
     mapping::BindContract contract = mapping::BindContract::Partial) {
+  // The CLI is the component that owns the canonical Micro dialect, so it
+  // supplies the materializer: a `--micro-map` run materializes the selected
+  // connections, while a standalone mapping caller stays metadata-only.
+  std::unique_ptr<mapping::PlanMaterializer> materializer =
+      createCanonicalPlanMaterializer();
   llvm::Expected<mapping::BoundPlan> bound =
-      mapping::bindPlan(module, plan, target, contract);
+      mapping::bindPlan(module, plan, target, contract, materializer.get());
   if (!bound)
     return bound.takeError();
   for (const std::string &unmaterialized : bound->unmaterialized)
