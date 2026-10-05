@@ -116,6 +116,30 @@ func.func @test_tile_async_copy(%logical : !micro.tile<32x64xbf16>) {
   return
 }
 
+// A movement between two *distinct* concrete memories of one abstract space is
+// real work. Kind equality is not node identity, so the copy records the two
+// concrete node ids it moves between (`micro.src_node`/`micro.dst_node`). The
+// abstract memory kind stays `sram` on both the source and the result tile.
+// CHECK-LABEL: func.func @test_tile_async_copy_same_kind_distinct_nodes
+func.func @test_tile_async_copy_same_kind_distinct_nodes(%tile : !micro.tile<32x64xbf16, memory = #micro.memory<sram>>) {
+  // CHECK: micro.tile_async_copy %{{.*}} {dst_memory = #micro.memory<sram>, micro.dst_node = "sram.1", micro.src_node = "sram.0"} : !micro.tile<32x64xbf16, memory = #micro.memory<sram>> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>>, !micro.async_token
+  %dst, %tok = micro.tile_async_copy %tile {dst_memory = #micro.memory<sram>, micro.src_node = "sram.0", micro.dst_node = "sram.1"} : !micro.tile<32x64xbf16, memory = #micro.memory<sram>> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>>, !micro.async_token
+  return
+}
+
+//===----------------------------------------------------------------------===//
+// micro.async_copy — same-kind movement between distinct concrete nodes
+//===----------------------------------------------------------------------===//
+
+// A shaped value carries both spaces as attributes; a same-kind move carries
+// the source and destination node identities the same way.
+// CHECK-LABEL: func.func @test_async_copy_same_kind_distinct_nodes
+func.func @test_async_copy_same_kind_distinct_nodes(%t : tensor<8x8xf32>) {
+  // CHECK: micro.async_copy %{{.*}} {dst_memory = #micro.memory<sram>, micro.dst_node = "sram.1", micro.src_node = "sram.0", src_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  %r, %tok = micro.async_copy %t {src_memory = #micro.memory<sram>, dst_memory = #micro.memory<sram>, micro.src_node = "sram.0", micro.dst_node = "sram.1"} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  return
+}
+
 //===----------------------------------------------------------------------===//
 // micro.tile_store — write back to external memory
 //===----------------------------------------------------------------------===//

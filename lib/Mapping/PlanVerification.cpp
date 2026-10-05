@@ -48,6 +48,7 @@ constexpr llvm::StringLiteral kMappingAttr = "micro.mapping";
 constexpr llvm::StringLiteral kRoutesAttr = "micro.routes";
 
 constexpr llvm::StringLiteral kValueAttr = "micro.value";
+constexpr llvm::StringLiteral kSrcNodeAttr = "micro.src_node";
 constexpr llvm::StringLiteral kDstNodeAttr = "micro.dst_node";
 constexpr llvm::StringLiteral kConnectionAttr = "micro.connection";
 constexpr llvm::StringLiteral kHopAttr = "micro.hop";
@@ -83,8 +84,8 @@ WorkloadNode strippedWorkloadNode(const WorkloadNode &node) {
   bool stripped = false;
   for (mlir::NamedAttribute attribute : node.attributes) {
     llvm::StringRef name = attribute.getName().getValue();
-    if (name == kMappingAttr || name == kValueAttr || name == kDstNodeAttr ||
-        name == kConnectionAttr || name == kHopAttr) {
+    if (name == kMappingAttr || name == kValueAttr || name == kSrcNodeAttr ||
+        name == kDstNodeAttr || name == kConnectionAttr || name == kHopAttr) {
       stripped = true;
       continue;
     }
@@ -414,6 +415,25 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
             *dstNode + "', but connection " + std::to_string(*connectionId) +
             " hop " + std::to_string(*hop) + " lands in '" + toNode + "'");
 
+  // The source node identity is optional -- a movement written before B5, or a
+  // hand-written one, may omit it -- but when recorded it must be this hop's
+  // actual source. A same-kind movement always carries it: the structural
+  // verifier rejects one that does not.
+  if (mlir::Attribute rawSrcNode = op->getAttr(kSrcNodeAttr)) {
+    auto srcNode = mlir::dyn_cast<mlir::StringAttr>(rawSrcNode);
+    if (!srcNode)
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": op '" + name.str() +
+                             "' has a non-string micro.src_node");
+    if (srcNode.getValue() != fromNode)
+      return verifyError(
+          DiagnosticCode::InvalidMappingMetadata,
+          where + ": op '" + name.str() + "' records micro.src_node '" +
+              srcNode.getValue().str() + "', but connection " +
+              std::to_string(*connectionId) + " hop " + std::to_string(*hop) +
+              " starts in '" + fromNode + "'");
+  }
+
   const machine::MemoryNode *fromMemory = machine.findMemory(fromNode);
   const machine::MemoryNode *toMemory = machine.findMemory(toNode);
   if (!fromMemory || !toMemory)
@@ -487,6 +507,41 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
                          where + ": op '" + name.str() + "' hop '" + fromNode +
                              "' -> '" + toNode +
                              "' names no transfer engine its link offers");
+  }
+
+  // Source/destination kind equality is not node identity. A same-kind hop is
+  // legal only between two *distinct* concrete nodes, and only when the
+  // machine's own facts back the node identity: the link's transaction granule
+  // and the destination's alignment must admit the moving value. Kind equality
+  // alone grants nothing.
+  if (fromMemory->kind == toMemory->kind) {
+    if (fromNode == toNode)
+      return verifyError(
+          DiagnosticCode::InvalidMappingMetadata,
+          where + ": op '" + name.str() + "' hop '" + fromNode + "' -> '" +
+              toNode +
+              "' names one memory node: equal memory kinds are not node "
+              "identity");
+    TileFacts facts = tileFactsFor(op->getOperand(0).getType());
+    if (facts.known) {
+      if (link->transactionBytes == 0 ||
+          facts.bytes % link->transactionBytes != 0)
+        return verifyError(
+            DiagnosticCode::InvalidMappingMetadata,
+            where + ": op '" + name.str() + "' hop '" + fromNode + "' -> '" +
+                toNode + "' moves " + std::to_string(facts.bytes) +
+                " bytes, which do not tile into whole " +
+                std::to_string(link->transactionBytes) + "-byte transactions");
+      if (facts.alignment > 0 &&
+          toMemory->alignmentBytes % facts.alignment != 0)
+        return verifyError(
+            DiagnosticCode::InvalidMappingMetadata,
+            where + ": op '" + name.str() + "' hop '" + fromNode + "' -> '" +
+                toNode + "' needs " + std::to_string(facts.alignment) +
+                "-byte alignment, which memory '" + toNode + "' (" +
+                std::to_string(toMemory->alignmentBytes) +
+                " bytes) does not support");
+    }
   }
 
   if (op->getNumOperands() < 1 || op->getNumResults() < 1)

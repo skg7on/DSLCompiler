@@ -144,6 +144,14 @@ def Micro_TileAsyncCopyOp : Micro_Op<"tile_async_copy"> {
   let description = [{
         Moves a tile to a destination memory space asynchronously, returning
         a materialized tile and an async token for synchronization.
+
+        A machine may hold several concrete memories of one abstract kind
+        (`sram.0`, `sram.1`). Source/destination kind equality is not node
+        identity, so a same-kind move records the two concrete node ids it
+        crosses in `micro.src_node`/`micro.dst_node`; the structural verifier
+        checks those ids are distinct strings, and the machine-aware verifier
+        resolves them against the model's links, engines, and transaction and
+        alignment facts. A kind-differing move may record them too.
     }];
 
   let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$dst_memory,
@@ -355,6 +363,11 @@ def Micro_AsyncCopyOp : Micro_Op<"async_copy"> {
   let description = [{
         Moves a tensor between two memory spaces asynchronously, returning the
         materialized tensor and an async token for synchronization.
+
+        As with `micro.tile_async_copy`, a same-kind move between two distinct
+        concrete memory nodes records `micro.src_node`/`micro.dst_node` so the
+        movement is real work rather than collapsed on kind equality; a
+        kind-differing move may record them too.
     }];
 
   let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$src_memory,

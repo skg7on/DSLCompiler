@@ -64,6 +64,7 @@ using namespace mlir::llk::mapping;
 namespace {
 
 constexpr llvm::StringLiteral kValueAttr = "micro.value";
+constexpr llvm::StringLiteral kSrcNodeAttr = "micro.src_node";
 constexpr llvm::StringLiteral kDstNodeAttr = "micro.dst_node";
 constexpr llvm::StringLiteral kConnectionAttr = "micro.connection";
 constexpr llvm::StringLiteral kHopAttr = "micro.hop";
@@ -74,8 +75,8 @@ constexpr llvm::StringLiteral kHopAttr = "micro.hop";
 constexpr llvm::StringLiteral kReduceReason = "reduce_not_materialized";
 constexpr llvm::StringLiteral kHoplessRouteReason =
     "route_has_no_hop_to_materialize";
-constexpr llvm::StringLiteral kSameKindReason =
-    "route_endpoints_share_a_micro_memory_kind";
+constexpr llvm::StringLiteral kSameNodeReason =
+    "route_endpoints_name_the_same_memory_node";
 constexpr llvm::StringLiteral kNoProducerReason =
     "no_producing_operation_in_the_kernel";
 constexpr llvm::StringLiteral kUnknownMemoryReason =
@@ -93,7 +94,11 @@ mlir::IntegerAttr u64Attr(mlir::MLIRContext *context, uint64_t value) {
                                 static_cast<int64_t>(value));
 }
 
-/// The `#micro.memory<kind>` attribute a machine memory kind names.
+/// The `#micro.memory<kind>` attribute a machine memory kind names, or null
+/// when the kind is not a canonical Micro abstract space. An unknown target
+/// memory kind has no canonical abstract-space mapping, so the caller rejects
+/// it rather than inventing a dialect enum: a machine kind either spells a real
+/// `#micro.memory<...>` space, or an explicit mapping must be added.
 mlir::Attribute memoryAttrFor(mlir::MLIRContext *context,
                               llvm::StringRef kind) {
   return mlir::parseAttribute(("#micro.memory<" + kind + ">").str(), context);
@@ -433,12 +438,12 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       report(connection, kUnknownMemoryReason);
       continue;
     }
-    if (source->kind == destination->kind) {
-      // A route whose endpoints share an abstract memory space has nothing the
-      // generic copy can express: `micro.async_copy`/`micro.tile_async_copy`
-      // insist their two spaces differ. (Same-kind *distinct nodes* are the
-      // separate, later case B5 handles.)
-      report(connection, kSameKindReason);
+    if (source->id == destination->id) {
+      // The two endpoints are one concrete memory: whatever their kind, a route
+      // that lands where it started is not work. Two *distinct* nodes of one
+      // abstract kind are the case B5 makes legal; only node identity, never
+      // kind equality, decides.
+      report(connection, kSameNodeReason);
       continue;
     }
     mlir::Attribute dstMemory = memoryAttrFor(context, destination->kind);
@@ -459,7 +464,22 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
           machineModel.findMemory(connection.route[hop - 1]);
       const machine::MemoryNode *to =
           machineModel.findMemory(connection.route[hop]);
-      if (!from || !to || from->kind == to->kind) {
+      if (!from || !to || from->id == to->id) {
+        // A hop landing in the memory it started from is not a movement. A hop
+        // between two *distinct* concrete nodes is real work even when their
+        // abstract kinds are equal.
+        materialized = false;
+        break;
+      }
+      // A same-kind hop is carried only when the machine declares a link
+      // between the two concrete nodes. Whether that link is legal -- engine,
+      // transaction granule, alignment -- is the machine verifier's check; the
+      // materializer refuses to emit a movement no link backs.
+      const bool linked =
+          llvm::any_of(machineModel.links, [&](const machine::LinkEdge &edge) {
+            return edge.source == from->id && edge.destination == to->id;
+          });
+      if (!linked) {
         materialized = false;
         break;
       }
@@ -506,6 +526,11 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       // §12.4/§23.3) and the completeness verifier (A5): which connection this
       // hop belongs to, and the concrete memory node it lands in.
       copyState.addAttribute(kValueAttr, u64Attr(context, connection.value));
+      // The concrete node identity the hop crosses. Kind equality is not node
+      // identity, so both endpoints are recorded: a same-kind hop is real work
+      // exactly when `src_node` and `dst_node` name two distinct memories.
+      copyState.addAttribute(kSrcNodeAttr,
+                             mlir::StringAttr::get(context, from->id));
       copyState.addAttribute(kDstNodeAttr,
                              mlir::StringAttr::get(context, to->id));
       copyState.addAttribute(kConnectionAttr, u64Attr(context, connection.id));

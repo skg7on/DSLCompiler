@@ -205,6 +205,12 @@ private:
   const machine::MachineModel &machine;
   std::string kernelName;
   std::vector<PlannedRoute> routes;
+  /// Each declared route, by the connection id it was declared under. A stamped
+  /// copy records its connection id and hop index, so the perf model can charge
+  /// exactly that hop rather than a destination kind or the first link of the
+  /// endpoint-kind pair -- which is what keeps two movements between distinct
+  /// memories of one abstract kind apart.
+  llvm::DenseMap<uint64_t, size_t> routeForConnection;
   std::vector<bool> routeClaimed;
   /// The links each movement op resolved to, so unrolled iterations of the
   /// same op do not each consume a fresh route (an empty result is a
@@ -345,7 +351,11 @@ void DAGBuilder::loadRoutes(mlir::Operation *kernel) {
       continue;
     built.srcSpace = source->kind;
     built.dstSpace = destination->kind;
+    auto connectionId = route.getAs<mlir::IntegerAttr>("id");
     routes.push_back(std::move(built));
+    if (connectionId)
+      routeForConnection[static_cast<uint64_t>(
+          connectionId.getValue().getZExtValue())] = routes.size() - 1;
   }
   routeClaimed.assign(routes.size(), false);
 }
@@ -370,6 +380,27 @@ DAGBuilder::matchRoute(mlir::Operation &op, llvm::StringRef srcSpace,
     return memo->second;
 
   llvm::SmallVector<const machine::LinkEdge *, 4> charged;
+
+  // Most specific: the connection id and hop index the binder stamps on a
+  // per-hop copy. Together they name exactly one hop of exactly one route, so a
+  // movement between two distinct memories of one abstract kind -- which no
+  // destination *kind* and no first-link-of-the-kind-pair heuristic can tell
+  // apart -- is charged its own link.
+  if (auto connection = op.getAttrOfType<mlir::IntegerAttr>("micro.connection"))
+    if (auto hop = op.getAttrOfType<mlir::IntegerAttr>("micro.hop")) {
+      auto found =
+          routeForConnection.find(connection.getValue().getZExtValue());
+      if (found != routeForConnection.end()) {
+        const PlannedRoute &route = routes[found->second];
+        uint64_t index = hop.getValue().getZExtValue();
+        if (route.moves && index >= 1 && index <= route.hops.size()) {
+          charged.push_back(route.hops[index - 1]);
+          routeOfOp[&op] = charged;
+          return charged;
+        }
+      }
+    }
+
   auto stampNode = op.getAttrOfType<mlir::StringAttr>("micro.dst_node");
   auto stampValue = op.getAttrOfType<mlir::IntegerAttr>("micro.value");
   auto valueOf = [&](const PlannedRoute &route) {
@@ -1232,10 +1263,23 @@ llvm::Error DAGBuilder::requireMemory(mlir::Operation &op,
 llvm::Error DAGBuilder::requireReachable(mlir::Operation &op,
                                          llvm::StringRef src,
                                          llvm::StringRef dst) {
-  if (src == dst)
-    return invalid("kernel '" + kernelName +
-                   "': " + op.getName().getStringRef() +
-                   " copies from and to '" + src.str() + "'");
+  if (src == dst) {
+    // Equal abstract kinds are not the same concrete memory: the movement is
+    // real work only when the copy records two distinct concrete node ids.
+    // Without that node identity a same-space copy is a no-op and is rejected.
+    // (The machine verifier resolves the nodes, link and engine against the
+    // model; this is the perf model's own guard.)
+    auto srcNode = op.getAttrOfType<mlir::StringAttr>("micro.src_node");
+    auto dstNode = op.getAttrOfType<mlir::StringAttr>("micro.dst_node");
+    const bool distinctNodes =
+        srcNode && dstNode && !srcNode.getValue().empty() &&
+        !dstNode.getValue().empty() && srcNode.getValue() != dstNode.getValue();
+    if (!distinctNodes)
+      return invalid("kernel '" + kernelName +
+                     "': " + op.getName().getStringRef() +
+                     " copies from and to '" + src.str() + "'");
+    return llvm::Error::success();
+  }
 
   // A machine declares the copy paths it can perform. A pair it does not list
   // is still charged through both endpoints' latencies, but the gap is worth

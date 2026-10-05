@@ -253,6 +253,38 @@ LogicalResult TilePartitionOp::verify() {
   return success();
 }
 
+/// Validates a movement's concrete node identity (`micro.src_node` /
+/// `micro.dst_node`) as *attribute shape*: a recorded node id is a non-empty
+/// string. When the two abstract memories coincide, kind equality is not node
+/// identity, so a same-kind movement must record two *distinct* concrete node
+/// ids; the machine-aware verifier resolves those ids against the machine model
+/// (link, engine, transaction/alignment facts). A same-kind move with no node
+/// identity is rejected here, so `#micro.memory<sram>` -> `#micro.memory<sram>`
+/// can never pass as real work on kind equality alone.
+static LogicalResult verifyMovementNodeIdentity(Operation *op, bool sameSpace) {
+  Attribute src = op->getAttr("micro.src_node");
+  Attribute dst = op->getAttr("micro.dst_node");
+  if (src && !isa<StringAttr>(src))
+    return op->emitOpError() << "'micro.src_node' must be a string memory id";
+  if (dst && !isa<StringAttr>(dst))
+    return op->emitOpError() << "'micro.dst_node' must be a string memory id";
+  if (!sameSpace)
+    return success();
+
+  auto srcId = dyn_cast_or_null<StringAttr>(src);
+  auto dstId = dyn_cast_or_null<StringAttr>(dst);
+  if (!srcId || !dstId || srcId.getValue().empty() || dstId.getValue().empty())
+    return op->emitOpError()
+           << "source and destination memory must differ: a same-kind "
+              "movement requires distinct 'micro.src_node' and "
+              "'micro.dst_node'";
+  if (srcId.getValue() == dstId.getValue())
+    return op->emitOpError()
+           << "'micro.src_node' and 'micro.dst_node' must name distinct "
+              "concrete memories: equal memory kinds are not node identity";
+  return success();
+}
+
 LogicalResult TileAsyncCopyOp::verify() {
   auto sourceType = dyn_cast<TileType>(getSource().getType());
   if (!sourceType)
@@ -269,9 +301,14 @@ LogicalResult TileAsyncCopyOp::verify() {
   if (resultType.getMemory().getValue() != getDstMemory())
     return emitOpError("result tile memory must match destination memory");
 
-  if (sourceType.getMemory() &&
-      sourceType.getMemory().getValue() == getDstMemory())
-    return emitOpError("source and destination memory must differ");
+  // Source and destination *kinds* must differ, unless the op records two
+  // distinct concrete node ids: a machine may hold several memories of one
+  // abstract kind, and a move between two of them is real work even though the
+  // kinds are equal. Kind equality is not node identity.
+  const bool sameSpace = sourceType.getMemory() &&
+                         sourceType.getMemory().getValue() == getDstMemory();
+  if (failed(verifyMovementNodeIdentity(getOperation(), sameSpace)))
+    return failure();
 
   // The copy must preserve shape and element type.
   if (resultType.getShape() != sourceType.getShape())
@@ -533,8 +570,11 @@ LogicalResult AsyncCopyOp::verify() {
     return emitOpError("source and result must be shaped types");
   if (!isa<AsyncTokenType>(getToken().getType()))
     return emitOpError("token result must be an async token");
-  if (getSrcMemory() == getDstMemory())
-    return emitOpError("source and destination memory must differ");
+  // Same abstract kind is legal only between two distinct concrete nodes; see
+  // `verifyMovementNodeIdentity`.
+  if (failed(verifyMovementNodeIdentity(getOperation(),
+                                        getSrcMemory() == getDstMemory())))
+    return failure();
   return success();
 }
 

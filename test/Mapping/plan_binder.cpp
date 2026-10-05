@@ -2960,3 +2960,409 @@ module {
       readPlanReport(report, **target, *graphA);
   EXPECT_TRUE(bool(control)) << llvm::toString(control.takeError());
 }
+
+//===----------------------------------------------------------------------===//
+// Same-kind movement between distinct concrete memory nodes (task B5)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Two SRAM nodes of one abstract kind, each visible to its own executor, with
+/// a single legal link sram.0 -> sram.1. The add rule can only run on worker_a
+/// (which sees sram.0) and the mul rule only on worker_b (which sees sram.1),
+/// so the edge between them is a real same-kind transfer: kind equality no
+/// longer collapses it, because the two nodes are distinct concrete storage.
+constexpr llvm::StringLiteral kSameKindMachine = R"yaml(
+schema: llk.machine.v2
+target: same-kind
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.a
+    kind: cluster
+  - id: worker.a
+    kind: core
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+  - id: worker.b
+    kind: pe
+    parent: cluster.b
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.a
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+  - id: sram.1
+    kind: sram
+    visible_from: cluster.b
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 55
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.a
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+    issue_cycles: 1
+    latency_cycles: 1
+    supported_layouts: [row_major]
+transfer_engines:
+  - id: dma.a
+    kind: dma
+    attached_to: cluster.a
+    count: 1
+    max_outstanding: 1
+links:
+  - id: sram_to_sram.1
+    source: sram.0
+    destination: sram.1
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 55
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+)yaml";
+
+/// Both rules bind the *same* abstract kind (`sram`); only the executor each
+/// requires distinguishes the two concrete nodes. The executor kinds (`core`,
+/// `pe`) are valid owner kinds that the rule predicate can name.
+constexpr llvm::StringLiteral kSameKindRules = R"llkmap(
+rule t.add {
+  match micro.vector(op = "add");
+  require executor kind core;
+  require memory kind sram;
+  bundle "b.add";
+  emit "e1";
+  cost 1;
+}
+rule t.mul {
+  match micro.vector(op = "mul");
+  require executor kind pe;
+  require memory kind sram;
+  bundle "b.mul";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+llvm::Expected<std::unique_ptr<MappingTarget>>
+makeSameKindTarget(llvm::StringRef machineText, llvm::StringRef name) {
+  llvm::Expected<mlir::llk::machine::MachineModel> machine =
+      mlir::llk::machine::parseMachineModel(machineText, "<test>");
+  if (!machine)
+    return machine.takeError();
+  llvm::Expected<LayoutRegistry> layouts = parseLayoutText("", "<test>");
+  if (!layouts)
+    return layouts.takeError();
+  llvm::Expected<RuleRegistry> rules = parseRuleText(kSameKindRules, "<test>");
+  if (!rules)
+    return rules.takeError();
+  return std::make_unique<FileMappingTarget>(
+      name.str(), std::move(*machine), std::move(*layouts), std::move(*rules),
+      std::vector<std::string>{"e1"});
+}
+
+llvm::Expected<std::unique_ptr<MappingTarget>> sameKindTarget() {
+  return makeSameKindTarget(kSameKindMachine, "same-kind");
+}
+
+/// The same machine with a third SRAM node between the two, reachable only
+/// through `cluster.c`. No direct sram.0 -> sram.1 link exists, so the only
+/// route is two same-kind hops: sram.0 -> sram.2 -> sram.1.
+constexpr llvm::StringLiteral kSameKindStagedMachine = R"yaml(
+schema: llk.machine.v2
+target: same-kind-staged
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.a
+    kind: cluster
+  - id: worker.a
+    kind: core
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+  - id: worker.b
+    kind: pe
+    parent: cluster.b
+  - id: cluster.c
+    kind: cluster
+  - id: worker.c
+    kind: worker
+    parent: cluster.c
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.a
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+  - id: sram.2
+    kind: sram
+    visible_from: cluster.c
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+  - id: sram.1
+    kind: sram
+    visible_from: cluster.b
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 55
+compute:
+  - id: vpu
+    kind: vector_engine
+    attached_to: worker.a
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+    issue_cycles: 1
+    latency_cycles: 1
+    supported_layouts: [row_major]
+transfer_engines:
+  - id: dma.a
+    kind: dma
+    attached_to: cluster.a
+    count: 1
+    max_outstanding: 1
+  - id: dma.c
+    kind: dma
+    attached_to: cluster.c
+    count: 1
+    max_outstanding: 1
+links:
+  - id: sram.0_to_sram.2
+    source: sram.0
+    destination: sram.2
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 8
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+  - id: sram.2_to_sram.1
+    source: sram.2
+    destination: sram.1
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    transaction_bytes: 64
+    transfer_engines: [dma.c]
+)yaml";
+
+llvm::Expected<std::unique_ptr<MappingTarget>> sameKindStagedTarget() {
+  return makeSameKindTarget(kSameKindStagedMachine, "same-kind-staged");
+}
+
+/// Every stamped movement in `module`, in order, with its source and
+/// destination node ids.
+struct StampedHop {
+  std::string srcNode;
+  std::string dstNode;
+  uint64_t connection = 0;
+  uint64_t hop = 0;
+};
+
+std::vector<StampedHop> stampedHops(ModuleOp module) {
+  std::vector<StampedHop> hops;
+  module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.tile_async_copy")
+      return;
+    auto dst = op->getAttrOfType<StringAttr>("micro.dst_node");
+    auto src = op->getAttrOfType<StringAttr>("micro.src_node");
+    if (!dst || !src)
+      return;
+    StampedHop hook;
+    hook.srcNode = src.getValue().str();
+    hook.dstNode = dst.getValue().str();
+    if (auto connection = op->getAttrOfType<IntegerAttr>("micro.connection"))
+      hook.connection = connection.getValue().getZExtValue();
+    if (auto hop = op->getAttrOfType<IntegerAttr>("micro.hop"))
+      hook.hop = hop.getValue().getZExtValue();
+    hops.push_back(std::move(hook));
+  });
+  return hops;
+}
+
+} // namespace
+
+// A movement between two distinct concrete memories of one abstract kind is
+// real work. Kind equality must not collapse it: the copy records the two node
+// ids, so one SRAM value can move sram.0 -> sram.1 while both tile types stay
+// `memory = sram`.
+TEST(PlanBinder, MaterializesASameKindMovementBetweenDistinctNodes) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = sameKindTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_FALSE(p->connectionPlans.empty());
+  const PlanConnection &connection = p->connectionPlans.front();
+  ASSERT_EQ(connection.kind, ConnectionKind::Transfer);
+  EXPECT_EQ(connection.route,
+            (llvm::SmallVector<MemoryNodeId>{"sram.0", "sram.1"}));
+
+  const size_t copiesBefore = countOps(*f.module, "micro.tile_async_copy");
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  for (const std::string &note : b->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(b->unmaterialized.empty());
+  EXPECT_EQ(countOps(*b->module, "micro.tile_async_copy"), copiesBefore + 1);
+
+  std::vector<StampedHop> hops = stampedHops(*b->module);
+  ASSERT_EQ(hops.size(), 1u);
+  EXPECT_EQ(hops[0].srcNode, "sram.0");
+  EXPECT_EQ(hops[0].dstNode, "sram.1");
+  EXPECT_GT(hops[0].hop, 0u);
+  EXPECT_NE(hops[0].connection, 0u);
+
+  // Both tile types keep the abstract `sram` kind; only the node identity
+  // distinguishes them.
+  Operation *copy = tileCopy(*b->module);
+  ASSERT_NE(copy, nullptr);
+  EXPECT_NE(typeText(copy->getResult(0).getType())
+                .find("memory = #micro.memory<sram>"),
+            std::string::npos);
+
+  {
+    llvm::Error verification = verifyMappedMicroIR(*b->module, **target);
+    EXPECT_FALSE(bool(verification)) << llvm::toString(std::move(verification));
+  }
+}
+
+// The path is only real when the machine declares a link between the two
+// concrete nodes. A same-kind route with no such link must not be materialized
+// into an unverifiable copy.
+TEST(PlanBinder, RejectsASameKindMovementWithNoLink) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = sameKindTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_FALSE(p->connectionPlans.empty());
+
+  // The reverse of the only declared link: no sram.1 -> sram.0 hop exists.
+  p->connectionPlans.front().route = {"sram.1", "sram.0"};
+
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  EXPECT_FALSE(b->unmaterialized.empty());
+  llvm::Error error = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("has no link"),
+            std::string::npos);
+}
+
+// Two equal node ids are one concrete memory: a "movement" between them is not
+// work, even though their kind is the one a same-kind route names.
+TEST(PlanBinder, RejectsASameKindMovementBetweenOneNodeAndItself) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = sameKindTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_FALSE(p->connectionPlans.empty());
+
+  p->connectionPlans.front().route = {"sram.0", "sram.0"};
+
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  EXPECT_FALSE(b->unmaterialized.empty());
+  EXPECT_TRUE(stampedHops(*b->module).empty());
+}
+
+// A same-kind hop carried by a transfer engine the machine does not declare is
+// not executable; the resolved route's engine set must be supported.
+TEST(PlanBinder, RejectsASameKindMovementOnAnUnsupportedEngine) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = sameKindTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_EQ(stampedHops(*b->module).size(), 1u);
+
+  rewriteAllRouteEngines(b->kernel, *f.context, {"no_such_engine"});
+  llvm::Error error = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("no_such_engine"), std::string::npos) << text;
+}
+
+// A copy whose recorded source node is not the resolved hop's source is not the
+// connection it names: the concrete node identity must match the route.
+TEST(PlanBinder, RejectsASameKindMovementWhoseSourceDoesNotMatchItsRoute) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = sameKindTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  Operation *copy = tileCopy(*b->module);
+  ASSERT_NE(copy, nullptr);
+  copy->setAttr("micro.src_node", StringAttr::get(f.context.get(), "sram.9"));
+  llvm::Error error = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("micro.src_node"),
+            std::string::npos);
+}
+
+// A two-hop route through same-kind adjacent memories must materialize one
+// correctly attributed copy per hop: sram.0 -> sram.2 -> sram.1.
+TEST(PlanBinder, MaterializesATwoHopRouteOfSameKindNodes) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      sameKindStagedTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_FALSE(p->connectionPlans.empty());
+  ASSERT_EQ(p->connectionPlans.front().kind, ConnectionKind::Transfer);
+  EXPECT_EQ(p->connectionPlans.front().route,
+            (llvm::SmallVector<MemoryNodeId>{"sram.0", "sram.2", "sram.1"}));
+
+  const size_t copiesBefore = countOps(*f.module, "micro.tile_async_copy");
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  for (const std::string &note : b->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(b->unmaterialized.empty());
+  EXPECT_EQ(countOps(*b->module, "micro.tile_async_copy"), copiesBefore + 2);
+
+  std::vector<StampedHop> hops = stampedHops(*b->module);
+  ASSERT_EQ(hops.size(), 2u);
+  EXPECT_EQ(hops[0].srcNode, "sram.0");
+  EXPECT_EQ(hops[0].dstNode, "sram.2");
+  EXPECT_EQ(hops[0].hop, 1u);
+  EXPECT_EQ(hops[1].srcNode, "sram.2");
+  EXPECT_EQ(hops[1].dstNode, "sram.1");
+  EXPECT_EQ(hops[1].hop, 2u);
+
+  {
+    llvm::Error verification = verifyMappedMicroIR(*b->module, **target);
+    EXPECT_FALSE(bool(verification)) << llvm::toString(std::move(verification));
+  }
+}
