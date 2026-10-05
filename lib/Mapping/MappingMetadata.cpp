@@ -921,6 +921,24 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
       storageIds.push_back(u64Attr(context, id));
     attributes.emplace_back(mlir::StringAttr::get(context, "storage_ids"),
                             mlir::ArrayAttr::get(context, storageIds));
+    // A gather's declared semantics, axis and producer occurrences (task B6).
+    // Absent for every non-gather connection, so a plan with none encodes the
+    // same route it always did.
+    if (connection.gatherSemantics)
+      attributes.emplace_back(
+          mlir::StringAttr::get(context, "gather_semantics"),
+          mlir::StringAttr::get(
+              context, stringifyGatherSemantics(*connection.gatherSemantics)));
+    if (connection.concatAxis)
+      attributes.emplace_back(mlir::StringAttr::get(context, "concat_axis"),
+                              u64Attr(context, *connection.concatAxis));
+    if (!connection.producerPorts.empty()) {
+      llvm::SmallVector<mlir::Attribute> producerPorts;
+      for (const PortRef &port : connection.producerPorts)
+        producerPorts.push_back(metadataPortRefAttr(context, port));
+      attributes.emplace_back(mlir::StringAttr::get(context, "producer_ports"),
+                              mlir::ArrayAttr::get(context, producerPorts));
+    }
     if (connection.transform) {
       llvm::SmallVector<mlir::NamedAttribute> transform;
       transform.emplace_back(
@@ -1503,6 +1521,36 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
           if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(id))
             connection.storageIds.push_back(
                 static_cast<uint64_t>(integer.getInt()));
+      // The gather's declared semantics, axis and producer occurrences (task
+      // B6). A recorded semantics that is not one of the three known words is
+      // rejected rather than silently downgrading the connection to a
+      // semantics-less Partial gather.
+      if (mlir::Attribute rawSemantics = route.get("gather_semantics")) {
+        auto text = mlir::dyn_cast<mlir::StringAttr>(rawSemantics);
+        if (!text)
+          return metadataError("micro.routes gather_semantics is not a string");
+        std::optional<GatherSemantics> semantics =
+            symbolizeGatherSemantics(text.getValue());
+        if (!semantics)
+          return metadataError("micro.routes: unknown gather semantics '" +
+                               text.getValue().str() + "'");
+        connection.gatherSemantics = *semantics;
+      }
+      if (auto axis = route.getAs<mlir::IntegerAttr>("concat_axis"))
+        connection.concatAxis =
+            static_cast<uint64_t>(axis.getValue().getZExtValue());
+      if (auto producerPorts = route.getAs<mlir::ArrayAttr>("producer_ports"))
+        for (mlir::Attribute port : producerPorts) {
+          llvm::Expected<PortRef> ref =
+              readMetadataPortRef(port, "producer_ports", where);
+          if (!ref)
+            return ref.takeError();
+          if (!lookupPort(sourceGraph, *ref))
+            return metadataError(
+                "micro.routes producer_ports entry does not resolve in the "
+                "source graph");
+          connection.producerPorts.push_back(*ref);
+        }
       if (auto transform = route.getAs<mlir::DictionaryAttr>("transform")) {
         LayoutTransform layoutTransform;
         if (auto src = transform.getAs<mlir::StringAttr>("src"))

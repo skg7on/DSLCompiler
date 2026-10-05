@@ -75,6 +75,8 @@ constexpr llvm::StringLiteral kHopAttr = "micro.hop";
 constexpr llvm::StringLiteral kReduceReason = "reduce_not_materialized";
 constexpr llvm::StringLiteral kFeedUnresolvedReason =
     "gather_feed_endpoint_unresolved";
+constexpr llvm::StringLiteral kGatherFeedMismatchReason =
+    "gather_feed_types_incompatible";
 constexpr llvm::StringLiteral kHoplessRouteReason =
     "route_has_no_hop_to_materialize";
 constexpr llvm::StringLiteral kSameNodeReason =
@@ -341,6 +343,15 @@ mlir::Type gatherResultType(llvm::ArrayRef<mlir::Value> feeds,
       return {};
     shape = read->first;
     elementType = read->second;
+    // Sum/Max combine like-for-like operands: every feed must state the same
+    // shape and element type as the first, or the emitted gather would violate
+    // its own verifier. Refused here rather than emitted and caught later.
+    for (size_t i = 1; i < feeds.size(); ++i) {
+      std::optional<ShapeAndElement> other =
+          shapeAndElement(feeds[i].getType());
+      if (!other || other->second != elementType || other->first != shape)
+        return {};
+    }
   }
 
   mlir::MLIRContext *context = feeds.front().getContext();
@@ -655,8 +666,10 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
           gatherResultType(stagedFeeds, *connection.gatherSemantics,
                            connection.concatAxis, stageMemory);
       if (!resultType) {
-        report(connection, (kMissingFactReason.str() +
-                            ": cannot construct the gathered result type"));
+        report(connection, concat
+                               ? (kMissingFactReason.str() +
+                                  ": cannot construct the gathered result type")
+                               : kGatherFeedMismatchReason.str());
         continue;
       }
 

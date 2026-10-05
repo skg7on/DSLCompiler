@@ -390,6 +390,17 @@ std::string canonicalConnectionString(const ConnectionPlan &connection) {
   out += "|transform=";
   out +=
       connection.transform ? transformString(*connection.transform) : "<null>";
+  // A gather's declared semantics and axis are execution-affecting content, so
+  // they join the id -- but only when present, so a connection that carries no
+  // gather semantics keeps the byte-identical id it had before (task B6).
+  if (connection.gatherSemantics) {
+    out += "|gather=";
+    out += stringifyGatherSemantics(*connection.gatherSemantics);
+    if (connection.concatAxis) {
+      out += ":axis=";
+      out += std::to_string(*connection.concatAxis);
+    }
+  }
   out += "|cost=";
   out += canonicalCostString(connection.cost);
   return out;
@@ -438,6 +449,23 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
     llvm::sort(engines);
     text += joinStrings(
         std::vector<std::string>(engines.begin(), engines.end()), ",");
+    // A gather's semantics/axis and its (order-bearing) producer occurrences
+    // are execution-affecting, so they join the plan id too -- gated on
+    // presence, so a plan with no gather connection keeps its id unchanged
+    // (task B6).
+    if (connection.gatherSemantics) {
+      text += ":gather=";
+      text += stringifyGatherSemantics(*connection.gatherSemantics);
+      if (connection.concatAxis)
+        text += ":axis=" + std::to_string(*connection.concatAxis);
+    }
+    if (!connection.producerPorts.empty()) {
+      std::vector<std::string> producerPorts;
+      producerPorts.reserve(connection.producerPorts.size());
+      for (const PortRef &port : connection.producerPorts)
+        producerPorts.push_back(canonicalPortRefString(port));
+      text += ":producerPorts=" + joinStrings(producerPorts, ",");
+    }
     connectionPlans.push_back(std::move(text));
   }
   llvm::sort(connectionPlans);

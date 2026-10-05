@@ -3623,6 +3623,126 @@ TEST(PlanBinder, MissingGatherSemanticsRejectsExecutableBinding) {
       std::string::npos);
 }
 
+// A gather's declared semantics and axis are execution-affecting content, so
+// they join the connection id: two connections differing only in what their
+// combination means must not collapse to one id.
+TEST(PlanBinder, GatherSemanticsJoinsTheConnectionIdentity) {
+  ConnectionPlan base;
+  base.value = 3;
+  base.kind = ConnectionKind::Reduce;
+  base.memoryRoute = {"sram.0", "l2.0"};
+
+  ConnectionPlan sum = base;
+  sum.gatherSemantics = GatherSemantics::Sum;
+  ConnectionPlan max = base;
+  max.gatherSemantics = GatherSemantics::Max;
+  ConnectionPlan concat = base;
+  concat.gatherSemantics = GatherSemantics::Concatenate;
+  concat.concatAxis = 1;
+
+  EXPECT_NE(computeConnectionId(base), computeConnectionId(sum));
+  EXPECT_NE(computeConnectionId(sum), computeConnectionId(max));
+  EXPECT_NE(computeConnectionId(sum), computeConnectionId(concat));
+  EXPECT_NE(computeConnectionId(max), computeConnectionId(concat));
+
+  // The axis is identity-bearing too: two concatenations along different axes
+  // are different work.
+  ConnectionPlan concatAxis0 = concat;
+  concatAxis0.concatAxis = 0;
+  EXPECT_NE(computeConnectionId(concat), computeConnectionId(concatAxis0));
+}
+
+// A gather's semantics, axis and producer occurrences survive the schema-v2
+// round trip, and a tampered recorded semantics is rejected -- not silently
+// downgraded to a semantics-less Partial gather.
+TEST(PlanBinder, RoundTripsAndValidatesGatherSemantics) {
+  Fixture f = makeTileFixture(kGatherKernel);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  WorkloadGraphBinding binding;
+  llvm::Expected<WorkloadGraph> graph =
+      extractWorkloadGraph(findKernel(*f.module), &binding);
+  ASSERT_TRUE(bool(graph)) << llvm::toString(graph.takeError());
+  std::optional<WorkloadNodeId> consumer = vectorNodeId(*graph, "mul");
+  ASSERT_TRUE(consumer.has_value());
+
+  CoveringPlan plan =
+      buildGatherPlan(*f.module, "add", "max", GatherSemantics::Concatenate,
+                      uint64_t{0}, consumer);
+  ASSERT_FALSE(plan.connectionPlans.empty());
+  ASSERT_FALSE(plan.connectionPlans.front().producerPorts.empty());
+
+  auto b = bindCanonical(*f.module, plan, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*b->module, **target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  const PlanConnection *reduce = nullptr;
+  for (const PlanConnection &connection : decoded->connectionPlans)
+    if (connection.kind == ConnectionKind::Reduce)
+      reduce = &connection;
+  ASSERT_NE(reduce, nullptr);
+  ASSERT_TRUE(reduce->gatherSemantics.has_value());
+  EXPECT_EQ(*reduce->gatherSemantics, GatherSemantics::Concatenate);
+  ASSERT_TRUE(reduce->concatAxis.has_value());
+  EXPECT_EQ(*reduce->concatAxis, 0u);
+  EXPECT_EQ(reduce->producerPorts, plan.connectionPlans.front().producerPorts);
+
+  // Tamper the recorded semantics: an unknown word must be rejected on decode,
+  // not silently dropped.
+  Operation *kernel = findKernel(*b->module);
+  auto routes = kernel->getAttrOfType<ArrayAttr>("micro.routes");
+  ASSERT_TRUE(routes);
+  llvm::SmallVector<Attribute> updated;
+  bool tampered = false;
+  for (Attribute element : routes) {
+    auto dict = cast<DictionaryAttr>(element);
+    if (dict.get("gather_semantics")) {
+      NamedAttrList attributes(dict);
+      attributes.set("gather_semantics",
+                     StringAttr::get(f.context.get(), "bogus"));
+      updated.push_back(attributes.getDictionary(f.context.get()));
+      tampered = true;
+    } else {
+      updated.push_back(element);
+    }
+  }
+  ASSERT_TRUE(tampered);
+  kernel->setAttr("micro.routes", ArrayAttr::get(f.context.get(), updated));
+  llvm::Expected<CoveringPlan> rejected =
+      decodeSelectedPlan(*b->module, **target);
+  EXPECT_FALSE(bool(rejected));
+}
+
+// Sum/Max require compatible element types/shapes. A Sum over feeds of
+// different extents is not materializable, so it is refused with a stable
+// reason rather than emitting a gather that violates its own verifier.
+TEST(PlanBinder, SumGatherWithMismatchedFeedShapesIsRejected) {
+  Fixture f = makeTileFixture(kConcatKernel); // producers are 8x8 and 8x4
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  CoveringPlan plan =
+      buildGatherPlan(*f.module, "add", "max", GatherSemantics::Sum,
+                      std::nullopt, std::nullopt);
+  llvm::Expected<BoundPlan> partial = bindCanonical(*f.module, plan, **target);
+  ASSERT_TRUE(bool(partial)) << llvm::toString(partial.takeError());
+  ASSERT_EQ(partial->unmaterialized.size(), 1u);
+  EXPECT_NE(
+      partial->unmaterialized.front().find("gather_feed_types_incompatible"),
+      std::string::npos)
+      << partial->unmaterialized.front();
+  EXPECT_EQ(gatherOp(*partial->module), nullptr);
+
+  llvm::Expected<BoundPlan> executable =
+      bindCanonical(*f.module, plan, **target, BindContract::Executable);
+  ASSERT_FALSE(bool(executable));
+}
+
 //===----------------------------------------------------------------------===//
 // Synchronization decisions drive waits and barriers (task B6)
 //===----------------------------------------------------------------------===//
