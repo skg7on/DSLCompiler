@@ -14,7 +14,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -2245,18 +2248,17 @@ TEST(CoveringSearch, GatherSumsTheProducerFeeds) {
                    3.0 + 2.0 * kFanTransferCycles);
 }
 
-// Exact mode does not branch over a gather feed's legal alternatives; it keeps
-// only the locally cheapest per producer. That is a choice collapse, not a cap,
-// so it must disclose itself -- `connectionChoicesUnexplored` set and the
-// stable notice filed -- while every cap remains lifted (`searchTruncated`
-// clear). Before the fix the gather path reported neither.
-TEST(CoveringSearch, GatherExactChoicesAreDisclosed) {
+// Exact mode now branches over a gather feed's legal alternatives (task B7), so
+// it no longer collapses the choice: `connectionChoicesUnexplored` stays clear
+// and no notice is filed, because there is no explicit policy collapsing
+// alternatives. Every cap remains lifted (`searchTruncated` clear), so the
+// result is genuinely the joint search it claims to be.
+TEST(CoveringSearch, GatherExactBranchesOverFeedAlternatives) {
   mlir::MLIRContext context;
   WorkloadGraph graph = fanInGraph(context);
   MachineModel machine = fanMachine();
-  // A second parallel dram.0 -> acc.0 route. The original (latency 10) stays
-  // cheaper than the copy (latency 20), so each feed has two legal alternatives
-  // and exact mode keeps one without branching over them.
+  // A second parallel dram.0 -> acc.0 route, so each feed has two legal
+  // alternatives for exact mode to branch over.
   LinkEdge second = machine.links.front();
   second.id = "second_route";
   second.latencyCycles = 20;
@@ -2272,19 +2274,11 @@ TEST(CoveringSearch, GatherExactChoicesAreDisclosed) {
   llvm::Expected<MappingSearchResult> result = search.search();
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   ASSERT_FALSE(result->plans.empty());
-  EXPECT_TRUE(result->connectionChoicesUnexplored);
+  EXPECT_FALSE(result->connectionChoicesUnexplored);
   EXPECT_FALSE(result->searchTruncated);
-  EXPECT_TRUE(
+  EXPECT_FALSE(
       hasDiagnostic(*result, DiagnosticCode::ConnectionChoiceUnexplored));
   EXPECT_FALSE(hasDiagnostic(*result, DiagnosticCode::SearchTruncated));
-  // The disclosure is a single stable notice, however many feeds collapsed it:
-  // `report` deduplicates on (code, message), so the distinct-notice list does
-  // not grow per producer or per branch.
-  size_t notices = 0;
-  for (const Diagnostic &diagnostic : result->frontier.diagnostics)
-    if (diagnostic.code == DiagnosticCode::ConnectionChoiceUnexplored)
-      ++notices;
-  EXPECT_EQ(notices, 1u);
 }
 
 // Control: a gather whose every feed has exactly one legal route collapses no
@@ -2469,12 +2463,12 @@ TEST(CoveringSearch, StagingMemoryWithRoomAdmitsTheConnection) {
   EXPECT_FALSE(result->plans.empty());
 }
 
-// Issue #109 defect 3: exact mode implies an exhaustive joint search, but each
-// connection's alternative is chosen locally -- only the cheapest is taken.
-// When more than one alternative exists the search now *says so*, rather than
-// letting exact mode's name imply a completeness it does not have. Two routes
-// (a direct hop and a staged one) make the choice observable.
-TEST(CoveringSearch, ExactModeReportsUnexploredConnectionChoices) {
+// Issue #109 defect 3 is closed by task B7: exact mode branches over a
+// connection's legal alternatives instead of taking only the locally cheapest,
+// so it no longer files the pre-B7 "unexplored choice" notice. Two routes (a
+// direct hop and a staged one) make the branching observable, and the search
+// still finds a plan with every cap lifted.
+TEST(CoveringSearch, ExactModeBranchesOverConnectionAlternatives) {
   mlir::MLIRContext context;
   context.getOrLoadDialect<mlir::micro::MicroDialect>();
   mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
@@ -2506,8 +2500,9 @@ TEST(CoveringSearch, ExactModeReportsUnexploredConnectionChoices) {
   llvm::Expected<MappingSearchResult> result = search.search();
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   ASSERT_FALSE(result->plans.empty());
-  EXPECT_TRUE(result->connectionChoicesUnexplored);
-  EXPECT_TRUE(
+  EXPECT_FALSE(result->connectionChoicesUnexplored);
+  EXPECT_FALSE(result->searchTruncated);
+  EXPECT_FALSE(
       hasDiagnostic(*result, DiagnosticCode::ConnectionChoiceUnexplored));
 }
 
@@ -4579,4 +4574,310 @@ TEST(CoveringSearch, ChargesThePhysicalLayoutImageNotLogicalElements) {
   ASSERT_TRUE(static_cast<bool>(admitted))
       << llvm::toString(admitted.takeError());
   EXPECT_FALSE(admitted->plans.empty());
+}
+
+//===----------------------------------------------------------------------===//
+// Joint connection branching (task B7)
+//===----------------------------------------------------------------------===//
+
+/// `twoDestinationHopMachine` plus a dear *direct* route to each consumer.
+/// Every consumer's cheapest route stages through `stage.0`; taking both fills
+/// it past its 5000-byte capacity, so a feasible covering must send at least
+/// one consumer over its dearer direct route -- which no locally-cheapest
+/// greedy pick finds.
+MachineModel sharedStagingFanOutMachine() {
+  MachineModel model = twoDestinationHopMachine();
+  auto link = [](llvm::StringRef id, llvm::StringRef source,
+                 llvm::StringRef destination, double latency) {
+    LinkEdge edge;
+    edge.id = id.str();
+    edge.source = source.str();
+    edge.destination = destination.str();
+    edge.bandwidthBytesPerCycle = 32;
+    edge.latencyCycles = latency;
+    edge.transactionBytes = 64;
+    edge.transferEngines = {"dma.0"};
+    return edge;
+  };
+  model.links.push_back(link("dram_direct_acc.0", "dram.0", "acc.0", 1000));
+  model.links.push_back(link("dram_direct_aux.0", "dram.0", "aux.0", 1000));
+  return model;
+}
+
+/// The three 1-cycle rules of `kTwoConsumerRules` (one producer, two
+/// consumers).
+constexpr double kFanOutInstanceCycles = 3.0;
+
+/// The dear direct hop's transfer cycles: its latency plus the untyped value's
+/// 4096 bytes at the link's 32 bytes/cycle.
+constexpr double kDirectHopCycles = 1000.0 + 4096.0 / 32.0;
+
+TEST(CoveringSearch, ExactBranchesOverFanOutRoutesToFitSharedStaging) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoConsumerGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sharedStagingFanOutMachine(), kTwoConsumerRules);
+  ASSERT_NE(target, nullptr);
+
+  // Premise: one staged 4096-byte copy fits `stage.0`, two do not.
+  const MemoryNode *stage = target->machine().findMemory("stage.0");
+  ASSERT_NE(stage, nullptr);
+  ASSERT_GE(stage->capacityBytes, 4096u);
+  ASSERT_LT(stage->capacityBytes, 2u * 4096u);
+
+  // The independent brute-force oracle: each consumer chooses its staged
+  // (cheap, one 4096-byte tile live on `stage.0`) or direct (dear, nothing
+  // staged) route, and the combination is legal iff the summed staged bytes
+  // fit. This is the `route_oracle` of the task brief, over the two groups.
+  struct Route {
+    double cost;
+    uint64_t liveBytes;
+  };
+  const std::vector<Route> routes = {
+      {2.0 * kFanTransferCycles, 4096u}, // dram -> stage -> {acc,aux}
+      {kDirectHopCycles, 0u},            // dram -> {acc,aux}
+  };
+  double oracleBest = std::numeric_limits<double>::infinity();
+  for (const Route &first : routes)
+    for (const Route &second : routes)
+      if (first.liveBytes + second.liveBytes <= stage->capacityBytes)
+        oracleBest = std::min(oracleBest, first.cost + second.cost);
+  ASSERT_TRUE(std::isfinite(oracleBest));
+  // Guard the premise: both-staged is infeasible, so the oracle optimum is one
+  // dear direct route and not the locally-cheapest pair.
+  EXPECT_DOUBLE_EQ(oracleBest, kFanTransferCycles * 2.0 + kDirectHopCycles);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_FALSE(result->searchTruncated);
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles,
+                   kFanOutInstanceCycles + oracleBest);
+  // Two symmetric combinations tie at the optimum; the emitted order breaks the
+  // tie on the exposed plan id, so the smaller id ranks first.
+  ASSERT_GE(result->plans.size(), 2u);
+  EXPECT_DOUBLE_EQ(result->plans[1].totalCost.latencyCycles,
+                   kFanOutInstanceCycles + oracleBest);
+  EXPECT_LT(result->plans[0].id, result->plans[1].id);
+
+  // The optimum is strictly dearer than the locally-cheapest pair, so the
+  // search provably did not collapse to it: the both-staged combination does
+  // not fit.
+  EXPECT_GT(result->plans[0].totalCost.latencyCycles,
+            kFanOutInstanceCycles + 2.0 * kFanTransferCycles);
+
+  // Deterministic mode branches over the same alternatives, so it returns the
+  // same feasible covering rather than rejecting the graph -- all three modes
+  // share the joint enumeration, and differ only in traversal.
+  MappingSearchOptions deterministic;
+  deterministic.mode = SearchMode::Deterministic;
+  CoveringSearch deterministicSearch(graph, *target, context, LayoutContext{},
+                                     deterministic);
+  llvm::Expected<MappingSearchResult> deterministicResult =
+      deterministicSearch.search();
+  ASSERT_TRUE(static_cast<bool>(deterministicResult))
+      << llvm::toString(deterministicResult.takeError());
+  ASSERT_FALSE(deterministicResult->plans.empty());
+  EXPECT_DOUBLE_EQ(deterministicResult->plans[0].totalCost.latencyCycles,
+                   kFanOutInstanceCycles + oracleBest);
+}
+
+// The same joint search is insertion-order and repetition independent: two runs
+// over one graph, and a run over an equivalently-built graph, agree on the
+// emitted plan ids. (The fan-out's two symmetric optima are a stable tie, so a
+// nondeterministic product would expose itself here.)
+TEST(CoveringSearch, JointConnectionSearchIsDeterministic) {
+  mlir::MLIRContext context;
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sharedStagingFanOutMachine(), kTwoConsumerRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+
+  auto ids = [&](const WorkloadGraph &runGraph) {
+    CoveringSearch search(runGraph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    EXPECT_TRUE(static_cast<bool>(result));
+    std::vector<PlanId> planIds;
+    if (result)
+      for (const CoveringPlan &plan : result->plans)
+        planIds.push_back(plan.id);
+    return planIds;
+  };
+
+  WorkloadGraph graph = twoConsumerGraph(context);
+  std::vector<PlanId> first = ids(graph);
+  std::vector<PlanId> second = ids(graph);
+  // A second, freshly-built graph with the same logical content.
+  std::vector<PlanId> rebuilt = ids(twoConsumerGraph(context));
+  ASSERT_FALSE(first.empty());
+  EXPECT_EQ(first, second) << "repeated runs differ";
+  EXPECT_EQ(first, rebuilt) << "an equivalent graph built afresh differs";
+}
+
+// The connection-choice cap is a cap, not a choice collapse: reaching it
+// reports truncation and never sets the pre-B7 "unexplored choice" notice.
+TEST(CoveringSearch, ConnectionChoiceCapReportsTruncationNotACollapse) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoConsumerGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sharedStagingFanOutMachine(), kTwoConsumerRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.maxConnectionCombinations = 1; // the product has four combinations
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->searchTruncated);
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::SearchTruncated));
+  // The cap names itself, so a reader can tell it apart from the route cap.
+  bool namedCap = false;
+  for (const Diagnostic &diagnostic : result->frontier.diagnostics)
+    if (diagnostic.message.find("maxConnectionCombinations") !=
+        std::string::npos)
+      namedCap = true;
+  EXPECT_TRUE(namedCap);
+  // A cap is not a collapse.
+  EXPECT_FALSE(result->connectionChoicesUnexplored);
+  EXPECT_FALSE(
+      hasDiagnostic(*result, DiagnosticCode::ConnectionChoiceUnexplored));
+  // The one combination examined is legal (best-first), so a plan is still
+  // produced -- but the search honestly reports that more remained.
+  EXPECT_FALSE(result->plans.empty());
+}
+
+//===----------------------------------------------------------------------===//
+// A search-selected gather declares its semantics (B6 carry-over)
+//===----------------------------------------------------------------------===//
+
+/// The multi-producer value's consumer declared as a `micro.gather`, in the
+/// dialect's own vocabulary: `kind` names the combination and `axis` is the
+/// concatenation axis.
+mlir::DictionaryAttr gatherConsumerAttributes(mlir::MLIRContext &context,
+                                              llvm::StringRef kind,
+                                              std::optional<int64_t> axis) {
+  std::vector<mlir::NamedAttribute> attributes{
+      mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
+                           mlir::StringAttr::get(&context, "consume")),
+      mlir::NamedAttribute(mlir::StringAttr::get(&context, "kind"),
+                           mlir::StringAttr::get(&context, kind))};
+  if (axis)
+    attributes.push_back(mlir::NamedAttribute(
+        mlir::StringAttr::get(&context, "axis"),
+        mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), *axis)));
+  return mlir::DictionaryAttr::get(&context, attributes);
+}
+
+/// `fanInGraph` with the consumer declaring a gather combination, so the search
+/// can select a real gather rather than only a hand-built connection.
+WorkloadGraph declaredGatherGraph(mlir::MLIRContext &context,
+                                  llvm::StringRef kind,
+                                  std::optional<int64_t> axis) {
+  WorkloadGraph graph;
+  WorkloadValueId in1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in1", /*external=*/true});
+  WorkloadValueId in2 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in2", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+  WorkloadValueId out =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+
+  auto producer = [&](WorkloadValueId input, unsigned ordinal) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.attributes = vectorAttributes(context, "produce");
+    node.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
+    node.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  producer(in1, 0);
+  producer(in2, 1);
+
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.sourceOrdinal = 2;
+  consumer.attributes = gatherConsumerAttributes(context, kind, axis);
+  consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{out, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+TEST(CoveringSearch, SearchSelectedPlanDeclaresASumGather) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(context, "sum", std::nullopt);
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  const PlanConnection &connection = plan.connectionPlans[0];
+  EXPECT_EQ(connection.kind, ConnectionKind::Reduce);
+  // The plan states what its reduce *means*, not only that it combines several
+  // producers -- the B6 carry-over is closed.
+  ASSERT_TRUE(connection.gatherSemantics.has_value());
+  EXPECT_EQ(*connection.gatherSemantics, GatherSemantics::Sum);
+  EXPECT_FALSE(connection.concatAxis.has_value());
+  // Both producer occurrences travel with the connection.
+  EXPECT_EQ(connection.producerPorts.size(), 2u);
+  for (const PortRef &port : connection.producerPorts)
+    EXPECT_EQ(port.direction, PortDirection::Output);
+}
+
+TEST(CoveringSearch, SearchSelectedPlanDeclaresAConcatGatherWithItsAxis) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(context, "concat", 0);
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  const PlanConnection &connection = result->plans[0].connectionPlans[0];
+  ASSERT_TRUE(connection.gatherSemantics.has_value());
+  EXPECT_EQ(*connection.gatherSemantics, GatherSemantics::Concatenate);
+  ASSERT_TRUE(connection.concatAxis.has_value());
+  EXPECT_EQ(*connection.concatAxis, 0u);
+  EXPECT_EQ(connection.producerPorts.size(), 2u);
+}
+
+// A reduce whose consumer declares no combination keeps B6's rule: no semantics
+// is inferred from the producer count, so the plan carries none.
+TEST(CoveringSearch, AnUndeclaredGatherCarriesNoSemantics) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanInGraph(context); // consumer declares no `kind`
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_EQ(result->plans[0].connectionPlans.size(), 1u);
+  EXPECT_EQ(result->plans[0].connectionPlans[0].kind, ConnectionKind::Reduce);
+  EXPECT_FALSE(result->plans[0].connectionPlans[0].gatherSemantics.has_value());
 }

@@ -60,6 +60,11 @@ struct MappingSearchOptions {
   unsigned maxCandidatesPerNode = 64;
   unsigned maxInstancesPerCandidate = 64;
   unsigned maxRoutesPerConnection = 8;
+  /// Upper bound on the joint connection combinations one placement may branch
+  /// into (task B7). Exact explores every combination within this cap; reaching
+  /// it is a *cap*, reported through `searchTruncated`, and never conflated
+  /// with the solver-undecided status.
+  unsigned maxConnectionCombinations = 64;
   uint64_t memoryBudgetBytes = 512ULL << 20;
   bool enableLatencyCache = true;
   bool enableSymmetryReduction = true;
@@ -109,14 +114,16 @@ struct MappingSearchResult {
   std::vector<CoveringPlan> plans;
   /// True when any cap ended the search early.
   bool searchTruncated = false;
-  /// True when the search picked each connection's locally cheapest alternative
-  /// instead of branching over the alternatives the topology offered (set in
-  /// exact mode; the beam and deterministic modes are heuristic by contract).
-  /// The result is then not an exhaustive joint placement/route search: a
-  /// covering rejected here may still be feasible through a more expensive
-  /// route combination. Distinct from `searchTruncated` -- this holds with
-  /// every cap lifted -- and reported with
-  /// `DiagnosticCode::ConnectionChoiceUnexplored`.
+  /// True when the search collapsed a connection's alternatives to its locally
+  /// cheapest instead of branching over them, so the result is not an
+  /// exhaustive joint placement/route search. Since task B7 every mode branches
+  /// over the joint connection combinations within the reported caps, so the
+  /// search itself no longer sets this -- a full search is never a collapse. It
+  /// is retained because it is part of the result's public shape (a report, or
+  /// a caller that deliberately collapses, still records it) and because
+  /// `DiagnosticCode::ConnectionChoiceUnexplored` remains the stable notice a
+  /// collapse is reported with. A *cap* is reported separately through
+  /// `searchTruncated` and never as a collapse.
   bool connectionChoicesUnexplored = false;
   FailureFrontier frontier;
   /// Partial plans the search expanded, for diagnostics.

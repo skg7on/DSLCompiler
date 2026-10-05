@@ -50,7 +50,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -727,6 +729,182 @@ TEST(MappingProperties, SearchReturnsPlansInDeterministicRankedOrder) {
           << "the first plan is beaten on cost by a later one";
 
     // Re-running the same search reproduces the same ordered ids.
+    MappingSearchResult again = runSearch(graph, *target, context, options);
+    EXPECT_EQ(planIds(result), planIds(again));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Property 6 (task B7): exact joint connection branching agrees with a
+// brute-force route oracle.
+//
+// One producer on `dram.0` fans out to two consumers on `acc.0`/`aux.0`. Each
+// consumer's cheap route stages a 4096-byte tile through the shared `stage.0`,
+// and its dear direct route stages nothing. With `stage.0`'s capacity as the
+// free variable, the legal joint combinations are exactly the product the
+// brief's `route_oracle` enumerates: a combination is legal iff the summed
+// staged bytes fit, and its cost is the summed route costs plus the three
+// 1-cycle instances. Exact search must match the oracle's optimum, so a locally
+// cheapest pick can no longer masquerade as the joint result.
+//===----------------------------------------------------------------------===//
+
+/// One producer and two consumers, the consumers' memories distinct so the
+/// value is a genuine fan-out (two destination groups).
+WorkloadGraph branchFanOutGraph(MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, Type(), "in", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, Type(), "mid", /*external=*/false});
+  WorkloadValueId out1 =
+      graph.addValue(WorkloadValue{0, Type(), "o1", /*external=*/false});
+  WorkloadValueId out2 =
+      graph.addValue(WorkloadValue{0, Type(), "o2", /*external=*/false});
+
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.sourceOrdinal = 0;
+  producer.attributes = vectorAttributes(context, "produce");
+  producer.inputs.push_back(WorkloadPort{input, Type(), std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, Type(), std::nullopt});
+  graph.addNode(std::move(producer));
+
+  auto consumer = [&](llvm::StringRef op, unsigned ordinal,
+                      WorkloadValueId output) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.attributes = vectorAttributes(context, op);
+    node.inputs.push_back(WorkloadPort{middle, Type(), std::nullopt});
+    node.outputs.push_back(WorkloadPort{output, Type(), std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  consumer("consume_a", 1, out1);
+  consumer("consume_b", 2, out2);
+
+  graph.finalize();
+  return graph;
+}
+
+constexpr llvm::StringLiteral kBranchRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume_a {
+  match micro.vector(op = "consume_a");
+  require executor kind worker;
+  require memory kind acc;
+  bundle "b.consume_a";
+  emit "e1";
+  cost 1;
+}
+rule r.consume_b {
+  match micro.vector(op = "consume_b");
+  require executor kind worker;
+  require memory kind aux;
+  bundle "b.consume_b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The fan-out machine with `stage.0`'s capacity as the free variable. Each
+/// consumer has a cheap two-hop route through `stage.0` and a dear direct
+/// route.
+MachineModel stagedFanOutMachine(uint64_t stageCapacity) {
+  MachineModel model;
+  model.target = "fuzz-branch";
+  model.executors = {executor("e0", "worker"), executor("e1", "worker")};
+
+  MemoryNode dram = memoryNode("dram.0", "dram");
+  dram.capacityBytes = 1u << 30;
+  MemoryNode stage = memoryNode("stage.0", "sram");
+  stage.capacityBytes = stageCapacity;
+  MemoryNode acc = memoryNode("acc.0", "acc");
+  acc.visibleFrom = "e1";
+  MemoryNode aux = memoryNode("aux.0", "aux");
+  aux.visibleFrom = "e1";
+  model.memories = {dram, stage, acc, aux};
+
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+
+  model.links = {linkEdge("dram_to_stage.0", "dram.0", "stage.0"),
+                 linkEdge("stage_to_acc.0", "stage.0", "acc.0"),
+                 linkEdge("stage_to_aux.0", "stage.0", "aux.0")};
+  LinkEdge accDirect = linkEdge("dram_to_acc.0", "dram.0", "acc.0");
+  accDirect.latencyCycles = 1000;
+  LinkEdge auxDirect = linkEdge("dram_to_aux.0", "dram.0", "aux.0");
+  auxDirect.latencyCycles = 1000;
+  model.links.push_back(accDirect);
+  model.links.push_back(auxDirect);
+  return model;
+}
+
+TEST(MappingProperties, ExactJointConnectionsMatchTheRouteOracle) {
+  Rng rng(kSeed ^ 0x08);
+  const uint64_t tile = 4096;
+  const double oneHop = 10.0 + static_cast<double>(tile) / 32.0;
+  const double staged = 2.0 * oneHop; // dram -> stage -> destination
+  const double direct = 1000.0 + static_cast<double>(tile) / 32.0;
+  const double instances = 3.0; // three 1-cycle rules
+
+  // Capacities covering all three regimes: no staged copy fits, exactly one
+  // fits, both fit.
+  const std::array<uint64_t, 6> capacities = {2048, 4096,  5000,
+                                              8192, 12288, 1u << 20};
+
+  for (unsigned draw = 0; draw < 24; ++draw) {
+    uint64_t capacity = capacities[rng.below(capacities.size())];
+    MLIRContext context;
+    WorkloadGraph graph = branchFanOutGraph(context);
+    std::unique_ptr<MappingTarget> target =
+        targetWith(stagedFanOutMachine(capacity), kBranchRules);
+    ASSERT_NE(target, nullptr);
+
+    // The brute-force oracle over the two groups.
+    double oracleBest = std::numeric_limits<double>::infinity();
+    for (int first = 0; first < 2; ++first)
+      for (int second = 0; second < 2; ++second) {
+        double cost = (first ? direct : staged) + (second ? direct : staged);
+        uint64_t live = (first ? 0u : tile) + (second ? 0u : tile);
+        if (live <= capacity)
+          oracleBest = std::min(oracleBest, cost);
+      }
+    ASSERT_TRUE(std::isfinite(oracleBest));
+
+    MappingSearchOptions options;
+    options.mode = SearchMode::Exact;
+    options.topK = 8;
+    MappingSearchResult result = runSearch(graph, *target, context, options);
+    ASSERT_FALSE(result.plans.empty())
+        << "exact found no covering for capacity " << capacity;
+    EXPECT_DOUBLE_EQ(result.plans[0].totalCost.latencyCycles,
+                     instances + oracleBest)
+        << "capacity " << capacity;
+    // Exact is exhaustive within the caps, so it must not claim truncation.
+    EXPECT_FALSE(result.searchTruncated) << "capacity " << capacity;
+
+    // Deterministic and beam reuse the same joint enumeration, so neither may
+    // return a covering dearer than the oracle optimum.
+    MappingSearchOptions deterministic = options;
+    deterministic.mode = SearchMode::Deterministic;
+    MappingSearchResult greedy =
+        runSearch(graph, *target, context, deterministic);
+    ASSERT_FALSE(greedy.plans.empty()) << "capacity " << capacity;
+    EXPECT_DOUBLE_EQ(greedy.plans[0].totalCost.latencyCycles,
+                     instances + oracleBest)
+        << "capacity " << capacity;
+
+    // Re-running reproduces the same ranked ids.
     MappingSearchResult again = runSearch(graph, *target, context, options);
     EXPECT_EQ(planIds(result), planIds(again));
   }

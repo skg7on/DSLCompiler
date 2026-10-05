@@ -10,6 +10,16 @@
 // immediately tests every edge whose other end is already chosen, so a branch
 // dies at the first pair that cannot be connected rather than at completion.
 //
+// A placement is extended into *every* legal joint connection combination,
+// bounded by `maxConnectionCombinations` (task B7): each connection decision's
+// alternatives are synthesized against the occupancy the earlier decisions
+// reached, tried best-first under the declared objective, and a branch whose
+// memories cannot hold the combination is rejected. Exact explores all of them
+// within the caps; deterministic returns the first complete legal covering; the
+// beam ranks the bounded states by the objective. A cap is reported
+// (`searchTruncated`) and never read as the complete product, and a
+// solver-undecided status stays separate.
+//
 // The bound used for ordering and pruning is accumulated cost plus, for each
 // uncovered node, the componentwise best still reachable -- the
 // measured-or-static `entry.cost`, never the stale static estimate -- and its
@@ -531,6 +541,8 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   placementOptions.reduceSymmetry = options_.enableSymmetryReduction;
   placementOptions.maxInstances = options_.maxInstancesPerCandidate;
   placementOptions.maxRoutesPerConnection = options_.maxRoutesPerConnection;
+  placementOptions.maxConnectionCombinations =
+      options_.maxConnectionCombinations;
 
   std::vector<NodeTable> tables;
   for (const WorkloadNode *node : ordered) {
@@ -741,15 +753,305 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   TopologyService topology(machine,
                            RouteOptions{options_.maxRoutesPerConnection, 4});
   std::vector<ConnectionPlan> pool;
+  // The producer occurrences each gather connection combines, keyed by
+  // the connection id it was synthesized under: `ConnectionPlan` names its
+  // producers by instance id, so the occurrences travel alongside to the
+  // plan projection (task B7's carry-over).
+  llvm::DenseMap<ConnectionId, llvm::SmallVector<PortRef>> gatherProducerPorts;
   // The extend lambda answers "is this branch legal", so an error is recorded
   // here and surfaced once the search returns.
   llvm::Error pendingError = llvm::Error::success();
 
-  // Extends `partial` with `instance` for `nodeIndex`, synthesizing every value
-  // whose endpoints are all chosen now. Returns false when the branch is
-  // illegal or over budget.
-  auto extend = [&](Partial &partial, size_t nodeIndex,
-                    const InstanceEntry &entry) -> bool {
+  // --- joint connection choices (task B7) ------------------------------
+  //
+  // A placement no longer collapses each connection to its locally cheapest
+  // alternative. Every legal joint combination of the connections a placement
+  // completes becomes its own state, within explicitly reported caps: exact
+  // explores all of them (up to the caps); deterministic returns the first
+  // complete legal covering, best-first, so the greedy one when it is feasible;
+  // and the beam ranks the bounded states by the declared objective. A cap is
+  // not a collapse: a capped result is reported through `searchTruncated` and
+  // is never read as the complete product, and a solver-undecided status stays
+  // separate.
+  struct ConnectionRealization {
+    std::vector<ConnectionPlan> plans;
+    /// The value whose live range the choice's `liveBytes` are charged to.
+    WorkloadValueId liveValue = 0;
+    /// Bytes charged to a value's live range (a transfer destination).
+    std::vector<std::pair<MemoryNodeId, uint64_t>> liveBytes;
+    /// Persistent staged bytes (a replica's hops, a gather's intermediate).
+    std::vector<std::pair<MemoryNodeId, uint64_t>> stagedBytes;
+  };
+  using Decision = std::vector<ConnectionRealization>;
+
+  auto realizationCost = [](const ConnectionRealization &realization) {
+    Cost total;
+    for (const ConnectionPlan &plan : realization.plans)
+      total = addCost(total, plan.cost);
+    return total;
+  };
+  // Best-first under the declared objective. A stable sort keeps the first
+  // alternative on an exact cost tie -- the same tie-break `pickBest` used --
+  // so the first combination enumerated is the locally-best one, which is what
+  // keeps deterministic mode's first complete covering the greedy one.
+  auto sortDecision = [&](Decision &decision) {
+    llvm::stable_sort(decision, [&](const ConnectionRealization &lhs,
+                                    const ConnectionRealization &rhs) {
+      return costLess(realizationCost(lhs), realizationCost(rhs),
+                      options_.objective);
+    });
+  };
+
+  auto reportTruncation = [&](bool truncated) {
+    if (!truncated)
+      return;
+    result.searchTruncated = true;
+    report(DiagnosticCode::SearchTruncated,
+           "route cap reached (maxRoutesPerConnection=" +
+               std::to_string(options_.maxRoutesPerConnection) + ")");
+  };
+  auto incompatible = [&](const std::string &message) {
+    ++result.frontier.incompatibleInstancePairs;
+    report(DiagnosticCode::NoMemoryRoute, message);
+  };
+
+  // The explicit gather combination a multi-producer value's consumer declares,
+  // in `micro.gather`'s own vocabulary: a string `kind` (`sum`|`max`|`concat`)
+  // and, for a concatenation, an integer `axis`. Nothing is inferred from the
+  // producer count, so a consumer that declares none yields no semantics and
+  // the `Reduce` stays unmaterializable (task B6's rule). The declaration is
+  // what makes a real gather -- not only a hand-built connection -- selectable.
+  auto declaredGather =
+      [&](const WorkloadNode &node) -> std::optional<GatherSemantics> {
+    if (!node.attributes)
+      return std::nullopt;
+    if (auto kind = node.attributes.getAs<mlir::StringAttr>("kind"))
+      return symbolizeGatherSemantics(kind.getValue());
+    return std::nullopt;
+  };
+  auto declaredConcatAxis =
+      [&](const WorkloadNode &node) -> std::optional<uint64_t> {
+    if (!node.attributes)
+      return std::nullopt;
+    if (auto axis = node.attributes.getAs<mlir::IntegerAttr>("axis"))
+      return static_cast<uint64_t>(axis.getInt());
+    return std::nullopt;
+  };
+
+  // The connection facts §10.2 compares, gathered from one producer/consumer
+  // pair's ports. The state supplies the live bytes a route must not overfill.
+  auto makeRequest =
+      [&](const Partial &state, const CandidateInstance &producer,
+          const CandidateInstance &consumer, const ValueEndpoint *producerEnd,
+          const ValueEndpoint *consumerEnd,
+          WorkloadValueId value) -> ConnectionRequest {
+    ConnectionRequest request;
+    request.producer = producer.id;
+    request.consumer = consumer.id;
+    request.value = value;
+    request.producerMemory = primaryMemory(machine, producer);
+    request.consumerMemory = primaryMemory(machine, consumer);
+    const WorkloadPort *producerPort =
+        producerEnd ? producerEnd->port : nullptr;
+    const WorkloadPort *consumerPort =
+        consumerEnd ? consumerEnd->port : nullptr;
+    // The endpoint occurrences, validated against the finalized graph so only
+    // real ports reach the connection's identity.
+    auto refFor = [&](const ValueEndpoint *endpoint,
+                      PortDirection direction) -> std::optional<PortRef> {
+      if (!endpoint)
+        return std::nullopt;
+      PortRef ref{tables[endpoint->node].node, direction, endpoint->index};
+      if (!lookupPort(workload_, ref))
+        return std::nullopt;
+      return ref;
+    };
+    request.producerPort = refFor(producerEnd, PortDirection::Output);
+    request.consumerPort = refFor(consumerEnd, PortDirection::Input);
+    // The layout each endpoint solved for *its own occurrence*, so two
+    // operand uses of one value keep their distinct obligations and a pair
+    // that differs becomes a transform rather than an unattributed direct
+    // connection (§15.2). Without the occurrence the lookup would give up on
+    // a value with two solved classes and the transform would be
+    // unreachable.
+    if (request.producerPort)
+      request.producerLayout =
+          boundLayoutForPort(producer, *request.producerPort);
+    if (request.consumerPort)
+      request.consumerLayout =
+          boundLayoutForPort(consumer, *request.consumerPort);
+    // The concrete parameterization each endpoint solved, so a pair that
+    // agrees on the class but not on its parameters is a transform rather
+    // than a direct connection.
+    if (request.producerPort)
+      if (const SolvedLayout *solved =
+              boundSolvedLayoutForPort(producer, *request.producerPort)) {
+        request.producerLayoutParameters = solved->parameters;
+        request.producerLayoutMap = solved->map;
+      }
+    if (request.consumerPort)
+      if (const SolvedLayout *solved =
+              boundSolvedLayoutForPort(consumer, *request.consumerPort)) {
+        request.consumerLayoutParameters = solved->parameters;
+        request.consumerLayoutMap = solved->map;
+      }
+    const TileFacts facts = factsForValue(value);
+    request.bytes = facts.bytes;
+    request.alignmentBytes = facts.alignment;
+    if (const WorkloadValue *moved = workload_.findValue(value))
+      request.elementType = moved->type;
+    if (consumerPort)
+      request.consumerType = consumerPort->type;
+    if (producerPort)
+      request.producerMap = producerPort->accessMap;
+    if (consumerPort)
+      request.consumerMap = consumerPort->accessMap;
+    if (ExecutorId executor = producer.executorBindings.lookup("executor");
+        !executor.empty())
+      request.producerExecutor = executor;
+    if (ExecutorId executor = consumer.executorBindings.lookup("executor");
+        !executor.empty())
+      request.consumerExecutor = executor;
+    // The partial plan's live bytes per memory, so a route that stages
+    // through an already-occupied intermediate is rejected (§12.2's
+    // intermediate capacity *and liveness*). The router only looks entries up
+    // by node id and never iterates the map, so it cannot perturb
+    // determinism. The pair's own memories are harmless to include: a route
+    // never re-enters its source, and its destination is exempt.
+    request.intermediateOccupancy = state.memoryBytes;
+    return request;
+  };
+
+  // What makes two consumer *uses* interchangeable: same destination memory,
+  // same solved representation (family and parameters), same executor, and the
+  // same port type and affine relation (§10.2). Two occurrences that agree on
+  // all of these can be served by one connection; a difference in any is a
+  // different obligation. The key is exactly what `makeRequest` reads from a
+  // use, so every member of a group is equivalent to its representative.
+  struct ConsumerUseKey {
+    MemoryNodeId memory;
+    std::optional<LayoutId> layout;
+    std::string layoutParameters;
+    ExecutorId executor;
+    mlir::Type portType;
+    std::optional<mlir::AffineMap> portMap;
+    bool operator==(const ConsumerUseKey &other) const {
+      return memory == other.memory && layout == other.layout &&
+             layoutParameters == other.layoutParameters &&
+             executor == other.executor && portType == other.portType &&
+             portMap == other.portMap;
+    }
+  };
+  auto useKeyFor = [&](const Partial &state, const ValueEndpoint &consumerEnd) {
+    ConsumerUseKey key;
+    const CandidateInstance &consumer = *state.chosen[consumerEnd.node];
+    key.memory = primaryMemory(machine, consumer);
+    PortRef ref{tables[consumerEnd.node].node, PortDirection::Input,
+                consumerEnd.index};
+    if (lookupPort(workload_, ref)) {
+      key.layout = boundLayoutForPort(consumer, ref);
+      if (const SolvedLayout *solved = boundSolvedLayoutForPort(consumer, ref))
+        key.layoutParameters = canonicalSearchValueString(solved->parameters);
+    }
+    key.executor = consumer.executorBindings.lookup("executor");
+    if (consumerEnd.port) {
+      key.portType = consumerEnd.port->type;
+      key.portMap = consumerEnd.port->accessMap;
+    }
+    return key;
+  };
+  auto addToUseGroup =
+      [&](std::vector<std::vector<const ValueEndpoint *>> &groups,
+          std::vector<ConsumerUseKey> &keys, const ConsumerUseKey &key,
+          const ValueEndpoint &consumerEnd) {
+        size_t group = 0;
+        for (; group < keys.size(); ++group)
+          if (keys[group] == key)
+            break;
+        if (group == keys.size()) {
+          keys.push_back(key);
+          groups.emplace_back();
+        }
+        groups[group].push_back(&consumerEnd);
+      };
+  // The `PortRef`s of one use group, in group order, validated against the
+  // finalized graph so only real occurrences reach a connection.
+  auto groupPorts = [&](llvm::ArrayRef<const ValueEndpoint *> endpoints) {
+    llvm::SmallVector<PortRef> ports;
+    for (const ValueEndpoint *endpoint : endpoints) {
+      PortRef ref{tables[endpoint->node].node, PortDirection::Input,
+                  endpoint->index};
+      if (lookupPort(workload_, ref))
+        ports.push_back(ref);
+    }
+    return ports;
+  };
+
+  // §9.3: no memory's own capacity may be exceeded (per-node), on top of the
+  // global byte ceiling (whole plan). Keys are walked sorted: which memory is
+  // inspected first decides whether an unknown binding is reported as an error
+  // or an over-capacity one merely rejects the branch, so `StringMap` iteration
+  // order must not reach that decision (design §22.1).
+  auto capacityOk = [&](const Partial &state) -> bool {
+    uint64_t totalBytes = 0;
+    for (llvm::StringRef key : sortedKeys(state.memoryBytes)) {
+      uint64_t bytes = state.memoryBytes.lookup(key);
+      totalBytes += bytes;
+      const MemoryNode *memory = machine.findMemory(key);
+      if (!memory) {
+        // Defensive: an id no machine node names cannot be checked. Surface it
+        // as an error rather than silently treating it as unlimited.
+        if (!pendingError)
+          pendingError = llvm::createStringError(
+              llvm::inconvertibleErrorCode(),
+              "covering search: plan binds unknown memory '" + key.str() + "'");
+        return false;
+      }
+      if (bytes > memory->capacityBytes) {
+        ++result.frontier.plansRejectedByCapacity;
+        report(DiagnosticCode::MemoryCapacityExceeded,
+               "memory '" + key.str() + "' over capacity (" +
+                   std::to_string(memory->capacityBytes) + " bytes)");
+        return false;
+      }
+    }
+    if (totalBytes > options_.memoryBudgetBytes) {
+      ++result.frontier.plansRejectedByCapacity;
+      report(DiagnosticCode::MemoryCapacityExceeded,
+             "plan byte total exceeds the global budget (" +
+                 std::to_string(options_.memoryBudgetBytes) + " bytes)");
+      return false;
+    }
+    return true;
+  };
+
+  // The values whose last consumer this placement completes have now run:
+  // release the bytes they were charged. Releasing after the capacity check
+  // keeps a consumer and the value it reads charged together for the placement.
+  auto releaseCompleted = [&](Partial &state,
+                              llvm::ArrayRef<size_t> completedLinks) {
+    for (size_t index : completedLinks) {
+      auto charges = state.liveValueCharges.find(valueLinks[index].value);
+      if (charges == state.liveValueCharges.end())
+        continue;
+      for (const auto &charge : charges->second) {
+        uint64_t &held = state.memoryBytes[charge.first];
+        // Subtract exactly what was charged. The charge can never exceed what
+        // the memory still holds -- every release is a charge made earlier and
+        // not yet released -- so `held >= charge.second` holds.
+        assert(held >= charge.second &&
+               "live-value release exceeds the memory's charged bytes");
+        held -= charge.second;
+      }
+      state.liveValueCharges.erase(charges);
+    }
+  };
+
+  // Places `instance` for `nodeIndex` on `partial`, applying the instance's own
+  // storage charges. Returns false when the memory association is ambiguous and
+  // cannot be proven within capacity.
+  auto placeInstance = [&](Partial &partial, size_t nodeIndex,
+                           const InstanceEntry &entry) -> bool {
     const CandidateInstance &instance = entry.instance;
     partial.chosen[nodeIndex] = &instance;
     ++partial.covered;
@@ -921,326 +1223,52 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         node = usage.first().str(); // no binding recorded: charge the raw key
       partial.memoryBytes[node] += usage.second;
     }
+    return true;
+  };
 
-    Cost cost = partial.cost;
-    cost = addCost(cost, entry.cost);
+  // The structural decision points this placement completes: which connection
+  // to make, never how. `specAlternatives` turns one back into its legal
+  // realizations against whatever occupancy the prefix has already reached, so
+  // the router sees the same intermediate liveness it did when each connection
+  // was chosen greedily -- a route another decision has filled is still
+  // rejected.
+  enum class DecisionKind { PlainUseGroup, FanOutGroup, GatherGroup };
+  struct DecisionSpec {
+    DecisionKind kind = DecisionKind::PlainUseGroup;
+    size_t link = 0;
+    /// A plain use-group's occurrences, or a fan-out's every consumer, or one
+    /// gather's destination-group members.
+    std::vector<const ValueEndpoint *> endpoints;
+  };
 
-    // The connection facts §10.2 compares, gathered from one producer/consumer
-    // pair's ports.
-    auto makeRequest = [&](const CandidateInstance &producer,
-                           const CandidateInstance &consumer,
-                           const ValueEndpoint *producerEnd,
-                           const ValueEndpoint *consumerEnd,
-                           WorkloadValueId value) {
-      ConnectionRequest request;
-      request.producer = producer.id;
-      request.consumer = consumer.id;
-      request.value = value;
-      request.producerMemory = primaryMemory(machine, producer);
-      request.consumerMemory = primaryMemory(machine, consumer);
-      const WorkloadPort *producerPort =
-          producerEnd ? producerEnd->port : nullptr;
-      const WorkloadPort *consumerPort =
-          consumerEnd ? consumerEnd->port : nullptr;
-      // The endpoint occurrences, validated against the finalized graph so only
-      // real ports reach the connection's identity.
-      auto refFor = [&](const ValueEndpoint *endpoint,
-                        PortDirection direction) -> std::optional<PortRef> {
-        if (!endpoint)
-          return std::nullopt;
-        PortRef ref{tables[endpoint->node].node, direction, endpoint->index};
-        if (!lookupPort(workload_, ref))
-          return std::nullopt;
-        return ref;
-      };
-      request.producerPort = refFor(producerEnd, PortDirection::Output);
-      request.consumerPort = refFor(consumerEnd, PortDirection::Input);
-      // The layout each endpoint solved for *its own occurrence*, so two
-      // operand uses of one value keep their distinct obligations and a pair
-      // that differs becomes a transform rather than an unattributed direct
-      // connection (§15.2). Without the occurrence the lookup would give up on
-      // a value with two solved classes and the transform would be
-      // unreachable.
-      if (request.producerPort)
-        request.producerLayout =
-            boundLayoutForPort(producer, *request.producerPort);
-      if (request.consumerPort)
-        request.consumerLayout =
-            boundLayoutForPort(consumer, *request.consumerPort);
-      // The concrete parameterization each endpoint solved, so a pair that
-      // agrees on the class but not on its parameters is a transform rather
-      // than a direct connection.
-      if (request.producerPort)
-        if (const SolvedLayout *solved =
-                boundSolvedLayoutForPort(producer, *request.producerPort)) {
-          request.producerLayoutParameters = solved->parameters;
-          request.producerLayoutMap = solved->map;
-        }
-      if (request.consumerPort)
-        if (const SolvedLayout *solved =
-                boundSolvedLayoutForPort(consumer, *request.consumerPort)) {
-          request.consumerLayoutParameters = solved->parameters;
-          request.consumerLayoutMap = solved->map;
-        }
-      const TileFacts facts = factsForValue(value);
-      request.bytes = facts.bytes;
-      request.alignmentBytes = facts.alignment;
-      if (const WorkloadValue *moved = workload_.findValue(value))
-        request.elementType = moved->type;
-      if (consumerPort)
-        request.consumerType = consumerPort->type;
-      if (producerPort)
-        request.producerMap = producerPort->accessMap;
-      if (consumerPort)
-        request.consumerMap = consumerPort->accessMap;
-      if (ExecutorId executor = producer.executorBindings.lookup("executor");
-          !executor.empty())
-        request.producerExecutor = executor;
-      if (ExecutorId executor = consumer.executorBindings.lookup("executor");
-          !executor.empty())
-        request.consumerExecutor = executor;
-      // The partial plan's live bytes per memory, so a route that stages
-      // through an already-occupied intermediate is rejected (§12.2's
-      // intermediate capacity *and liveness*). The router only looks entries up
-      // by node id and never iterates the map, so it cannot perturb
-      // determinism. The pair's own memories are harmless to include: a route
-      // never re-enters its source, and its destination is exempt.
-      request.intermediateOccupancy = partial.memoryBytes;
-      return request;
-    };
-    // The alternative the declared objective prefers. `min_element` keeps the
-    // first on an exact tie, the stable deterministic tie-break.
-    auto pickBest = [&](llvm::ArrayRef<ConnectionPlan> alternatives)
-        -> const ConnectionPlan * {
-      if (alternatives.empty())
-        return nullptr;
-      return &*llvm::min_element(alternatives, [&](const ConnectionPlan &lhs,
-                                                   const ConnectionPlan &rhs) {
-        return costLess(lhs.cost, rhs.cost, options_.objective);
-      });
-    };
-    auto reportTruncation = [&](bool truncated) {
-      if (!truncated)
-        return;
-      result.searchTruncated = true;
-      report(DiagnosticCode::SearchTruncated,
-             "route cap reached (maxRoutesPerConnection=" +
-                 std::to_string(options_.maxRoutesPerConnection) + ")");
-    };
-    auto incompatible = [&](const std::string &message) {
-      ++result.frontier.incompatibleInstancePairs;
-      report(DiagnosticCode::NoMemoryRoute, message);
-    };
-    // The single place an exact-mode *choice collapse* is disclosed: when a
-    // local decision has several legal alternatives, the search keeps only the
-    // locally cheapest instead of branching over them. That is a restriction,
-    // not a cap -- two individually cheapest routes can jointly exceed a shared
-    // intermediate's capacity while more expensive direct routes would fit, so
-    // a covering can be missed with no `searchTruncated` to explain it. Every
-    // such collapse (plain edge, fan-out destination group, gather feed) routes
-    // through here, so the flag and the stable §22.3 notice are decided in one
-    // place, and a site that collapsed nothing cannot set either. `report`
-    // deduplicates on (code, message), so a collapse repeated across branches
-    // is one notice.
-    auto discloseCollapsedChoice = [&](std::string detail) {
-      if (options_.mode != SearchMode::Exact)
-        return;
-      result.connectionChoicesUnexplored = true;
-      report(DiagnosticCode::ConnectionChoiceUnexplored, std::move(detail));
-    };
-
-    // Connections are staged locally and committed to the pool only after the
-    // capacity check, so a rejected branch leaves no partial state behind.
-    std::vector<ConnectionPlan> staged;
-    // Bytes a connection adds beyond the instances' own tiles: a replicated
-    // copy and a gather's intermediate tile are extra objects in memory, so
-    // they are charged. A plain single-consumer `Transfer` is deliberately not
-    // charged here: its destination tile is the consumer instance's own tile,
-    // already counted through that instance's memory binding.
-    //
-    // Unlike the materialized values above, these bytes do *not* expire with
-    // their value: the live range of a copy or gather intermediate is simply
-    // not modelled yet, so it is charged for the whole partial plan. That is
-    // the conservative direction -- an intermediate is assumed live from the
-    // moment its copy is staged until the plan ends.
-    llvm::StringMap<uint64_t> stagedBytes; // memory -> replica/gather bytes
-
-    // Synthesizes one connection, staging the chosen alternative. When
-    // `consumerPorts` is given the chosen plan serves every one of those
-    // occurrences -- a single instance using the value through several equal
-    // operand ports shares one connection, whose endpoint list names them all.
-    auto connect = [&](const ConnectionRequest &request,
-                       llvm::ArrayRef<PortRef> consumerPorts = {}) -> bool {
-      bool connectionTruncated = false;
-      llvm::Expected<std::vector<ConnectionPlan>> alternatives =
-          synthesizeConnections(request, machine, topology, placementOptions,
-                                &connectionTruncated);
-      if (alternatives)
-        result.routeCount += alternatives->size();
-      reportTruncation(connectionTruncated);
-      if (!alternatives) {
-        // A malformed connection request: it fails this branch, and the closest
-        // §22.3 code is the one that names a connection that cannot be built.
-        report(DiagnosticCode::NoMemoryRoute,
-               "connection " + request.producerMemory + " -> " +
-                   request.consumerMemory + ": " +
-                   llvm::toString(alternatives.takeError()));
-        return false;
-      }
-      if (alternatives->empty()) {
-        incompatible("connection " + request.producerMemory + " -> " +
-                     request.consumerMemory + ": no legal route");
-        return false;
-      }
-      // Several legal ways to connect this pair, but only the locally cheapest
-      // is taken. In exact mode -- which otherwise implies an exhaustive joint
-      // search -- that is a restriction, not a cap: two individually cheapest
-      // routes through a shared intermediate can jointly exceed its capacity
-      // while more expensive direct routes would fit, so a feasible covering
-      // can be missed with no `searchTruncated` to explain it. Report it
-      // explicitly rather than implying exhaustiveness.
-      if (alternatives->size() > 1)
-        discloseCollapsedChoice("connection " + request.producerMemory +
-                                " -> " + request.consumerMemory +
-                                ": chose the cheapest of " +
-                                std::to_string(alternatives->size()) +
-                                " alternatives without branching over them");
-      staged.push_back(*pickBest(*alternatives));
-      if (!consumerPorts.empty()) {
-        staged.back().consumerPorts.assign(consumerPorts.begin(),
-                                           consumerPorts.end());
-        // `consumerPorts` is part of the canonical string, so the id is
-        // recomputed for the shared plan.
-        staged.back().id = computeConnectionId(staged.back());
-      }
-      cost = addCost(cost, staged.back().cost);
-      // §9.3: a plain movement fills a destination buffer in the consumer's
-      // memory -- the consumer's *input*, not its output tile (which the
-      // consumer instance charges through its own memory binding). The two
-      // sizes differ whenever the value is narrowed or reduced, so the
-      // transferred bytes are charged here rather than assumed away as the
-      // already-counted consumer tile. `Direct` and `LayoutTransform` move
-      // nothing and charge nothing. The charge is a live range under the value,
-      // so the capacity check below sees it and the link loop releases it in
-      // the same placement: a transfer destination exists only while its
-      // consumer runs. No aliasing with the consumer's own tile is assumed --
-      // the model establishes none, and a lower charge is the unsafe direction.
-      const ConnectionPlan &chosen = staged.back();
-      if (chosen.kind == ConnectionKind::Transfer ||
-          chosen.kind == ConnectionKind::TransferAndTransform) {
-        const MemoryNodeId destination = chosen.memoryRoute.empty()
-                                             ? request.consumerMemory
-                                             : chosen.memoryRoute.back();
-        partial.memoryBytes[destination] += request.bytes;
-        partial.liveValueCharges[request.value].push_back(
-            {destination, request.bytes});
-      }
-      return true;
-    };
-
-    // Values whose last endpoint this placement completes. Their bytes are
-    // released only after the capacity check below, so a consumer and the value
-    // it reads stay charged together while it is placed.
-    std::vector<size_t> completedLinks;
-
+  // Builds the structural decision list for the value links this placement
+  // completes. Occupancy-independent, so it is computed once per placement; the
+  // *alternatives* of each decision are synthesized per prefix by
+  // `specAlternatives`.
+  auto buildDecisionSpecs = [&](Partial &base, size_t nodeIndex,
+                                std::vector<DecisionSpec> &specs,
+                                std::vector<size_t> &completedLinks) {
     for (size_t index = 0; index < valueLinks.size(); ++index) {
       const ValueLink &link = valueLinks[index];
-      if (partial.linked[index])
+      if (base.linked[index])
         continue;
       if (!valueInvolves(link, nodeIndex))
         continue;
       bool complete = true;
       for (const ValueEndpoint &producer : link.producers)
-        complete &= partial.chosen[producer.node] != nullptr;
+        complete &= base.chosen[producer.node] != nullptr;
       for (const ValueEndpoint &consumer : link.consumers)
-        complete &= partial.chosen[consumer.node] != nullptr;
+        complete &= base.chosen[consumer.node] != nullptr;
       if (!complete)
         continue;
-      partial.linked[index] = 1;
+      base.linked[index] = 1;
+      // A zero-element value (a static 0 dimension) moves no bytes: it needs no
+      // route, layout transform, or staging.
+      if (factsForValue(link.value).bytes == 0)
+        continue;
       completedLinks.push_back(index);
 
-      // The size of the value this link moves, derived once and shared by the
-      // requests, the replica staging, and the gather's intermediate tile.
-      const TileFacts linkFacts = factsForValue(link.value);
-
-      // A zero-element value (a static 0 dimension) moves no bytes: it needs no
-      // route, layout transform, or staging, and synthesizing a connection for
-      // it would only trip the "bytes must be positive" rule. Budget it as
-      // free, matching the zero capacity it is charged. The Micro tile verifier
-      // rejects a 0 dimension, so this is reachable only through a modelled
-      // tensor/memref/vector value type.
-      if (linkFacts.bytes == 0)
-        continue;
-
-      // What makes two consumer *uses* interchangeable: same destination
-      // memory, same solved representation (family and parameters), same
-      // executor, and the same port type and affine relation (§10.2). Two
-      // occurrences that agree on all of these can be served by one
-      // connection; a difference in any is a different obligation. The key is
-      // exactly what `makeRequest` reads from a use, so every member of a group
-      // is equivalent to its representative by construction.
-      struct ConsumerUseKey {
-        MemoryNodeId memory;
-        std::optional<LayoutId> layout;
-        std::string layoutParameters;
-        ExecutorId executor;
-        mlir::Type portType;
-        std::optional<mlir::AffineMap> portMap;
-        bool operator==(const ConsumerUseKey &other) const {
-          return memory == other.memory && layout == other.layout &&
-                 layoutParameters == other.layoutParameters &&
-                 executor == other.executor && portType == other.portType &&
-                 portMap == other.portMap;
-        }
-      };
-      auto useKeyFor = [&](const ValueEndpoint &consumerEnd) {
-        ConsumerUseKey key;
-        const CandidateInstance &consumer = *partial.chosen[consumerEnd.node];
-        key.memory = primaryMemory(machine, consumer);
-        PortRef ref{tables[consumerEnd.node].node, PortDirection::Input,
-                    consumerEnd.index};
-        if (lookupPort(workload_, ref)) {
-          key.layout = boundLayoutForPort(consumer, ref);
-          if (const SolvedLayout *solved =
-                  boundSolvedLayoutForPort(consumer, ref))
-            key.layoutParameters =
-                canonicalSearchValueString(solved->parameters);
-        }
-        key.executor = consumer.executorBindings.lookup("executor");
-        if (consumerEnd.port) {
-          key.portType = consumerEnd.port->type;
-          key.portMap = consumerEnd.port->accessMap;
-        }
-        return key;
-      };
-      // The occurrences of one group's value, in the order they were seen.
-      auto addToUseGroup =
-          [&](std::vector<std::vector<const ValueEndpoint *>> &groups,
-              std::vector<ConsumerUseKey> &keys,
-              const ValueEndpoint &consumerEnd) {
-            ConsumerUseKey key = useKeyFor(consumerEnd);
-            size_t group = 0;
-            for (; group < keys.size(); ++group)
-              if (keys[group] == key)
-                break;
-            if (group == keys.size()) {
-              keys.push_back(std::move(key));
-              groups.emplace_back();
-            }
-            groups[group].push_back(&consumerEnd);
-          };
-
       if (link.producers.size() == 1) {
-        const ValueEndpoint &producerEnd = link.producers[0];
-        const CandidateInstance &producer = *partial.chosen[producerEnd.node];
-
-        // One consumer *node* using the value through several operand ports is
-        // not a fan-out: the uses belong to one instance. Group them by the
-        // representation they need and synthesize one connection per group --
-        // equal uses share it, incompatible uses (a plain and a blocked
-        // operand, say) get their own. This is the path that keeps per-use
-        // layout obligations; without it the two uses collapsed into one
-        // request.
         bool distinctConsumerNodes = false;
         for (size_t i = 1; i < link.consumers.size(); ++i)
           if (link.consumers[i].node != link.consumers[0].node) {
@@ -1248,236 +1276,341 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             break;
           }
         if (!distinctConsumerNodes) {
+          // One consumer node using the value through several operand ports:
+          // one decision per representation group.
           std::vector<ConsumerUseKey> useKeys;
           std::vector<std::vector<const ValueEndpoint *>> useGroups;
           for (const ValueEndpoint &consumerEnd : link.consumers)
-            addToUseGroup(useGroups, useKeys, consumerEnd);
+            addToUseGroup(useGroups, useKeys, useKeyFor(base, consumerEnd),
+                          consumerEnd);
           for (const std::vector<const ValueEndpoint *> &group : useGroups) {
-            const ValueEndpoint &consumerEnd = *group.front();
-            const CandidateInstance &consumer =
-                *partial.chosen[consumerEnd.node];
-            ConnectionRequest request = makeRequest(
-                producer, consumer, &producerEnd, &consumerEnd, link.value);
-            llvm::SmallVector<PortRef> consumerPorts;
-            for (const ValueEndpoint *endpoint : group) {
-              PortRef ref{tables[endpoint->node].node, PortDirection::Input,
-                          endpoint->index};
-              if (lookupPort(workload_, ref))
-                consumerPorts.push_back(ref);
-            }
-            if (!connect(request, consumerPorts))
-              return false;
+            DecisionSpec spec;
+            spec.kind = DecisionKind::PlainUseGroup;
+            spec.link = index;
+            spec.endpoints = group;
+            specs.push_back(std::move(spec));
           }
           continue;
         }
-
-        // Fan-out (design §15.3). Each consumer is described by its own
-        // request, so the shared-read decision and every §10.2 check see that
-        // consumer's real element type, affine relation, and executor.
-        std::vector<ConnectionRequest> consumerRequests;
+        DecisionSpec spec;
+        spec.kind = DecisionKind::FanOutGroup;
+        spec.link = index;
         for (const ValueEndpoint &consumerEnd : link.consumers)
-          consumerRequests.push_back(
-              makeRequest(producer, *partial.chosen[consumerEnd.node],
-                          &producerEnd, &consumerEnd, link.value));
-        bool fanOutTruncated = false;
-        bool fanOutChoseAmongAlternatives = false;
-        llvm::Expected<std::vector<ConnectionPlan>> alternatives =
-            synthesizeFanOut(consumerRequests.front(), consumerRequests,
-                             machine, topology, placementOptions,
-                             &fanOutTruncated, options_.objective,
-                             &fanOutChoseAmongAlternatives);
-        if (fanOutChoseAmongAlternatives)
-          discloseCollapsedChoice(
-              "fan-out from " + consumerRequests.front().producerMemory +
-              ": chose the cheapest alternative per destination group "
-              "without branching over them");
-        if (alternatives)
-          result.routeCount += alternatives->size();
-        reportTruncation(fanOutTruncated);
-        if (!alternatives) {
-          report(DiagnosticCode::NoMemoryRoute,
-                 "fan-out " + consumerRequests.front().producerMemory + ": " +
-                     llvm::toString(alternatives.takeError()));
-          return false;
-        }
-        if (alternatives->empty()) {
-          incompatible("fan-out " + consumerRequests.front().producerMemory +
-                       ": no legal route");
-          return false;
-        }
-        // `synthesizeFanOut` has already selected the shapes: one shared read,
-        // or one copy per destination memory (plus any in-place group reads).
-        for (const ConnectionPlan &plan : *alternatives) {
-          staged.push_back(plan);
-          cost = addCost(cost, staged.back().cost);
-          // A copy occupies every memory after its source: its destination and
-          // any staging hop it passes through. The copy is one replica of the
-          // moved value, so the value's own derived bytes size it.
-          if (staged.back().kind == ConnectionKind::Replicate) {
-            for (size_t hop = 1; hop < staged.back().memoryRoute.size(); ++hop)
-              stagedBytes[staged.back().memoryRoute[hop]] += linkFacts.bytes;
-          }
-        }
+          spec.endpoints.push_back(&consumerEnd);
+        specs.push_back(std::move(spec));
         continue;
       }
 
-      // Fan-in (design §15.3): several producers feed one value. Consumers
-      // sharing a destination memory *and* the same required representation are
-      // served by one gather, so the feeds and the intermediate tile are
-      // counted once per representation, not once per consumer. Grouping by
-      // memory alone validated the feeds against one representative and then
-      // attached every consumer to the result, so a second consumer with a
-      // different element type, affine relation, layout or executor was never
-      // checked. `ConsumerUseKey` names exactly what `makeRequest` reads, so
-      // every member of a group is equivalent to its representative by
-      // construction.
-      std::vector<InstanceId> producerIds;
-      for (const ValueEndpoint &producerEnd : link.producers)
-        producerIds.push_back(partial.chosen[producerEnd.node]->id);
-      llvm::sort(producerIds);
-
+      // Fan-in: one decision per destination group, so a group's feeds are
+      // chosen jointly against the prefix's occupancy.
       std::vector<ConsumerUseKey> gatherKeys;
       std::vector<std::vector<const ValueEndpoint *>> gatherGroups;
       for (const ValueEndpoint &consumerEnd : link.consumers)
-        addToUseGroup(gatherGroups, gatherKeys, consumerEnd);
+        addToUseGroup(gatherGroups, gatherKeys, useKeyFor(base, consumerEnd),
+                      consumerEnd);
+      for (const std::vector<const ValueEndpoint *> &group : gatherGroups) {
+        DecisionSpec spec;
+        spec.kind = DecisionKind::GatherGroup;
+        spec.link = index;
+        spec.endpoints = group;
+        specs.push_back(std::move(spec));
+      }
+    }
+  };
 
-      for (size_t group = 0; group < gatherGroups.size(); ++group) {
-        MemoryNodeId consumerMemory = gatherKeys[group].memory;
-        const std::vector<const ValueEndpoint *> &groupEndpoints =
-            gatherGroups[group];
-        const ValueEndpoint &representative = *groupEndpoints.front();
-        const CandidateInstance &consumer =
-            *partial.chosen[representative.node];
-        std::vector<InstanceId> consumerIds;
-        llvm::SmallVector<PortRef> consumerPorts;
-        for (const ValueEndpoint *endpoint : groupEndpoints) {
-          consumerIds.push_back(partial.chosen[endpoint->node]->id);
-          PortRef ref{tables[endpoint->node].node, PortDirection::Input,
-                      endpoint->index};
-          if (lookupPort(workload_, ref))
-            consumerPorts.push_back(ref);
+  // The legal realizations of one decision, synthesized against `state` so the
+  // router's occupancy is the prefix's. Empty means the decision cannot be
+  // realized (already reported), which kills the prefix.
+  auto specAlternatives =
+      [&](const DecisionSpec &spec,
+          const Partial &state) -> std::vector<ConnectionRealization> {
+    const ValueLink &link = valueLinks[spec.link];
+    const TileFacts linkFacts = factsForValue(link.value);
+    std::vector<ConnectionRealization> out;
+
+    if (spec.kind == DecisionKind::PlainUseGroup) {
+      const ValueEndpoint &producerEnd = link.producers[0];
+      const CandidateInstance &producer = *state.chosen[producerEnd.node];
+      const ValueEndpoint &front = *spec.endpoints.front();
+      ConnectionRequest request =
+          makeRequest(state, producer, *state.chosen[front.node], &producerEnd,
+                      &front, link.value);
+      llvm::Expected<ConnectionChoiceSet> choices = enumerateConnectionChoices(
+          llvm::ArrayRef<ConnectionRequest>(&request, 1), target_,
+          placementOptions);
+      if (!choices) {
+        report(DiagnosticCode::NoMemoryRoute,
+               "connection " + request.producerMemory + " -> " +
+                   request.consumerMemory + ": " +
+                   llvm::toString(choices.takeError()));
+        return out;
+      }
+      reportTruncation(choices->truncated);
+      if (choices->combinations.empty()) {
+        incompatible("connection " + request.producerMemory + " -> " +
+                     request.consumerMemory + ": no legal route");
+        return out;
+      }
+      result.routeCount += choices->combinations.size();
+      llvm::SmallVector<PortRef> ports = groupPorts(spec.endpoints);
+      for (const std::vector<ConnectionPlan> &combination :
+           choices->combinations) {
+        ConnectionPlan plan = combination.front();
+        if (!ports.empty()) {
+          // The connection serves every use of the group, so the endpoint list
+          // names them all and the id is recomputed from it.
+          plan.consumerPorts.assign(ports.begin(), ports.end());
+          plan.id = computeConnectionId(plan);
         }
-        llvm::sort(consumerIds);
-
-        Cost feedCost;
-        std::vector<ExecutorId> engines;
-        for (const ValueEndpoint &producerEnd : link.producers) {
-          ConnectionRequest request =
-              makeRequest(*partial.chosen[producerEnd.node], consumer,
-                          &producerEnd, &representative, link.value);
-          bool feedTruncated = false;
-          llvm::Expected<std::vector<ConnectionPlan>> alternatives =
-              synthesizeConnections(request, machine, topology,
-                                    placementOptions, &feedTruncated);
-          if (alternatives)
-            result.routeCount += alternatives->size();
-          reportTruncation(feedTruncated);
-          if (!alternatives) {
-            report(DiagnosticCode::NoMemoryRoute,
-                   "gather: " + llvm::toString(alternatives.takeError()));
-            return false;
-          }
-          if (alternatives->empty()) {
-            incompatible("gather: a producer has no legal route");
-            return false;
-          }
-          if (alternatives->size() > 1)
-            discloseCollapsedChoice(
-                "gather into " + consumerMemory + ": chose the cheapest of " +
-                std::to_string(alternatives->size()) +
-                " producer feed alternatives without branching over them");
-          const ConnectionPlan *best = pickBest(*alternatives);
-          feedCost = addCost(feedCost, best->cost);
-          for (const ExecutorId &engine : best->transferEngines)
-            if (!llvm::is_contained(engines, engine))
-              engines.push_back(engine);
+        ConnectionRealization realization;
+        realization.liveValue = link.value;
+        // §9.3: a plain movement fills a destination buffer in the consumer's
+        // memory. `Direct` and `LayoutTransform` move nothing and charge
+        // nothing.
+        if (plan.kind == ConnectionKind::Transfer ||
+            plan.kind == ConnectionKind::TransferAndTransform) {
+          const MemoryNodeId destination = plan.memoryRoute.empty()
+                                               ? request.consumerMemory
+                                               : plan.memoryRoute.back();
+          realization.liveBytes.push_back({destination, request.bytes});
         }
-        ConnectionPlan reduce = synthesizeFanIn(
-            producerIds, consumerIds, link.value, consumerMemory,
-            linkFacts.bytes, feedCost, consumerPorts);
-        reduce.transferEngines.assign(engines.begin(), engines.end());
-        staged.push_back(std::move(reduce));
-        cost = addCost(cost, staged.back().cost);
-        // The gather stages its reduced intermediate tile on the consumer.
-        stagedBytes[consumerMemory] += linkFacts.bytes;
+        realization.plans.push_back(std::move(plan));
+        out.push_back(std::move(realization));
       }
+      return out;
     }
 
-    // §9.3: no memory's own capacity may be exceeded (per-node), on top of the
-    // global byte ceiling (whole plan). Replicated copies and gathered
-    // intermediate tiles are charged to the memory that holds them alongside
-    // the instances' own bytes. Keys are walked sorted: which memory is
-    // inspected first decides whether an unknown binding is reported as an
-    // error or an over-capacity one merely rejects the branch, so `StringMap`
-    // iteration order must not reach that decision (design §22.1).
-    for (const auto &entry : stagedBytes)
-      partial.memoryBytes[entry.first()] += entry.second;
-    uint64_t totalBytes = 0;
-    for (llvm::StringRef key : sortedKeys(partial.memoryBytes)) {
-      uint64_t bytes = partial.memoryBytes.lookup(key);
-      totalBytes += bytes;
-      const MemoryNode *memory = machine.findMemory(key);
-      if (!memory) {
-        // Defensive: an id no machine node names cannot be checked. Surface it
-        // as an error rather than silently treating it as unlimited.
-        if (!pendingError)
-          pendingError = llvm::createStringError(
-              llvm::inconvertibleErrorCode(),
-              "covering search: plan binds unknown memory '" + key.str() + "'");
-        return false;
+    if (spec.kind == DecisionKind::FanOutGroup) {
+      const ValueEndpoint &producerEnd = link.producers[0];
+      const CandidateInstance &producer = *state.chosen[producerEnd.node];
+      std::vector<ConnectionRequest> consumerRequests;
+      for (const ValueEndpoint *endpoint : spec.endpoints)
+        consumerRequests.push_back(
+            makeRequest(state, producer, *state.chosen[endpoint->node],
+                        &producerEnd, endpoint, link.value));
+      bool fanOutTruncated = false;
+      llvm::Expected<std::vector<std::vector<ConnectionPlan>>> groups =
+          enumerateFanOutAlternatives(consumerRequests.front(),
+                                      consumerRequests, machine, topology,
+                                      placementOptions, &fanOutTruncated);
+      reportTruncation(fanOutTruncated);
+      if (!groups) {
+        report(DiagnosticCode::NoMemoryRoute,
+               "fan-out " + consumerRequests.front().producerMemory + ": " +
+                   llvm::toString(groups.takeError()));
+        return out;
       }
-      if (bytes > memory->capacityBytes) {
-        ++result.frontier.plansRejectedByCapacity;
-        report(DiagnosticCode::MemoryCapacityExceeded,
-               "memory '" + key.str() + "' over capacity (" +
-                   std::to_string(memory->capacityBytes) + " bytes)");
-        return false;
+      for (const std::vector<ConnectionPlan> &groupAlternatives : *groups)
+        if (groupAlternatives.empty()) {
+          incompatible("fan-out " + consumerRequests.front().producerMemory +
+                       ": no legal route");
+          return out;
+        }
+      // The joint product over the fan-out's destination groups, bounded by the
+      // connection-choice cap.
+      std::vector<size_t> pick(groups->size(), 0);
+      for (;;) {
+        if (out.size() >= placementOptions.maxConnectionCombinations) {
+          result.searchTruncated = true;
+          report(
+              DiagnosticCode::SearchTruncated,
+              "connection choice cap reached (maxConnectionCombinations=" +
+                  std::to_string(placementOptions.maxConnectionCombinations) +
+                  ")");
+          break;
+        }
+        ConnectionRealization realization;
+        for (size_t group = 0; group < groups->size(); ++group) {
+          const ConnectionPlan &plan = (*groups)[group][pick[group]];
+          realization.plans.push_back(plan);
+          // A copy occupies every memory after its source: its destination and
+          // any staging hop it passes through.
+          if (plan.kind == ConnectionKind::Replicate)
+            for (size_t hop = 1; hop < plan.memoryRoute.size(); ++hop)
+              realization.stagedBytes.push_back(
+                  {plan.memoryRoute[hop], linkFacts.bytes});
+        }
+        out.push_back(std::move(realization));
+        bool advanced = false;
+        for (size_t dimension = pick.size(); dimension-- > 0;) {
+          if (++pick[dimension] < (*groups)[dimension].size()) {
+            advanced = true;
+            break;
+          }
+          pick[dimension] = 0;
+        }
+        if (!advanced)
+          break;
       }
-    }
-    if (totalBytes > options_.memoryBudgetBytes) {
-      ++result.frontier.plansRejectedByCapacity;
-      report(DiagnosticCode::MemoryCapacityExceeded,
-             "plan byte total exceeds the global budget (" +
-                 std::to_string(options_.memoryBudgetBytes) + " bytes)");
-      return false;
+      return out;
     }
 
-    // The branch fits, so the values whose last consumer this placement is have
-    // now run: release the bytes they were charged. Releasing *after* the
-    // capacity check keeps a consumer and the value it reads charged together
-    // for the placement -- an operation reads its inputs and writes its outputs
-    // in the same step, so they genuinely overlap. Where the graph fixes no
-    // order, staying conservative is the rule (ruling R2): only a value whose
-    // last consumer is placed expires, and its bytes are charged the whole time
-    // every endpoint is still live.
-    for (size_t index : completedLinks) {
-      auto charges = partial.liveValueCharges.find(valueLinks[index].value);
-      if (charges == partial.liveValueCharges.end())
-        continue;
-      for (const auto &charge : charges->second) {
-        uint64_t &held = partial.memoryBytes[charge.first];
-        // Subtract exactly what was charged. The charge can never exceed what
-        // the memory still holds -- every release is a charge made earlier and
-        // not yet released -- so `held >= charge.second` holds; `min` only
-        // keeps a future accounting bug from underflowing instead of failing
-        // loudly, and never masks drift by clamping a correct value.
-        assert(held >= charge.second &&
-               "live-value release exceeds the memory's charged bytes");
-        held -= charge.second;
+    // Gather: one destination group's feeds, chosen jointly.
+    const ValueEndpoint &representative = *spec.endpoints.front();
+    const CandidateInstance &consumer = *state.chosen[representative.node];
+    const MemoryNodeId consumerMemory = primaryMemory(machine, consumer);
+    std::vector<InstanceId> consumerIds;
+    llvm::SmallVector<PortRef> consumerPorts;
+    for (const ValueEndpoint *endpoint : spec.endpoints) {
+      consumerIds.push_back(state.chosen[endpoint->node]->id);
+      PortRef ref{tables[endpoint->node].node, PortDirection::Input,
+                  endpoint->index};
+      if (lookupPort(workload_, ref))
+        consumerPorts.push_back(ref);
+    }
+    llvm::sort(consumerIds);
+
+    std::vector<InstanceId> producerIds;
+    llvm::SmallVector<PortRef> producerPorts;
+    for (const ValueEndpoint &producerEnd : link.producers) {
+      producerIds.push_back(state.chosen[producerEnd.node]->id);
+      PortRef ref{tables[producerEnd.node].node, PortDirection::Output,
+                  producerEnd.index};
+      if (lookupPort(workload_, ref))
+        producerPorts.push_back(ref);
+    }
+    llvm::sort(producerIds);
+
+    // The combination the gather performs: declared by the consumer, never
+    // inferred from the producer count.
+    const WorkloadNode &consumerNode = *tables[representative.node].workload;
+    std::optional<GatherSemantics> semantics = declaredGather(consumerNode);
+    std::optional<uint64_t> concatAxis =
+        semantics && *semantics == GatherSemantics::Concatenate
+            ? declaredConcatAxis(consumerNode)
+            : std::nullopt;
+
+    std::vector<ConnectionRequest> feedRequests;
+    for (const ValueEndpoint &producerEnd : link.producers)
+      feedRequests.push_back(makeRequest(state, *state.chosen[producerEnd.node],
+                                         consumer, &producerEnd,
+                                         &representative, link.value));
+    llvm::Expected<ConnectionChoiceSet> choices =
+        enumerateConnectionChoices(feedRequests, target_, placementOptions);
+    if (!choices) {
+      report(DiagnosticCode::NoMemoryRoute,
+             "gather: " + llvm::toString(choices.takeError()));
+      return out;
+    }
+    reportTruncation(choices->truncated);
+    if (choices->combinations.empty()) {
+      incompatible("gather: a producer has no legal route");
+      return out;
+    }
+    result.routeCount += choices->combinations.size();
+    for (const std::vector<ConnectionPlan> &combination :
+         choices->combinations) {
+      Cost feedCost;
+      std::vector<ExecutorId> engines;
+      for (const ConnectionPlan &feed : combination) {
+        feedCost = addCost(feedCost, feed.cost);
+        for (const ExecutorId &engine : feed.transferEngines)
+          if (!llvm::is_contained(engines, engine))
+            engines.push_back(engine);
       }
-      partial.liveValueCharges.erase(charges);
+      ConnectionPlan reduce = synthesizeFanIn(
+          producerIds, consumerIds, link.value, consumerMemory, linkFacts.bytes,
+          feedCost, consumerPorts, semantics, concatAxis);
+      reduce.transferEngines.assign(engines.begin(), engines.end());
+      // The producer occurrences the gather combines travel to the plan
+      // projection, which carries them on `PlanConnection::producerPorts`.
+      gatherProducerPorts[reduce.id] = producerPorts;
+      ConnectionRealization realization;
+      realization.plans.push_back(std::move(reduce));
+      // The gather stages its reduced intermediate tile on the consumer.
+      realization.stagedBytes.push_back({consumerMemory, linkFacts.bytes});
+      out.push_back(std::move(realization));
     }
+    return out;
+  };
 
-    // The branch is legal: publish its connections to the shared pool.
-    for (ConnectionPlan &plan : staged) {
-      pool.push_back(std::move(plan));
-      partial.connections.push_back(pool.size() - 1);
+  // Applies one chosen realization to `state` and stages its plans.
+  auto applyRealization = [&](Partial &state,
+                              std::vector<ConnectionPlan> &staged,
+                              const ConnectionRealization &realization) {
+    for (const ConnectionPlan &plan : realization.plans) {
+      staged.push_back(plan);
+      state.cost = addCost(state.cost, plan.cost);
     }
+    for (const auto &charge : realization.liveBytes) {
+      state.memoryBytes[charge.first] += charge.second;
+      state.liveValueCharges[realization.liveValue].push_back(charge);
+    }
+    for (const auto &charge : realization.stagedBytes)
+      state.memoryBytes[charge.first] += charge.second;
+  };
 
-    partial.cost = cost;
-    partial.id = partialId(partial.chosen);
-    result.expandedStates++;
-    return true;
+  // Every legal joint extension of `parent` by `instance`: one state per
+  // connection combination within the cap, in deterministic order. An empty
+  // result means the placement admits no legal covering.
+  auto extendStates = [&](const Partial &parent, size_t nodeIndex,
+                          const InstanceEntry &entry) -> std::vector<Partial> {
+    std::vector<Partial> out;
+    Partial base = parent;
+    if (!placeInstance(base, nodeIndex, entry))
+      return out;
+    base.cost = addCost(base.cost, entry.cost);
+
+    std::vector<DecisionSpec> specs;
+    std::vector<size_t> completedLinks;
+    buildDecisionSpecs(base, nodeIndex, specs, completedLinks);
+
+    const unsigned cap = options_.maxConnectionCombinations;
+    uint64_t examined = 0;
+    bool capped = false;
+
+    // Depth-first over the decisions, each decision's alternatives synthesized
+    // against the prefix's occupancy and tried best-first, so the first
+    // complete covering is the locally-best one. The cap bounds the leaves
+    // examined and is reported; a capped run is never read as the complete
+    // product.
+    std::function<void(size_t, const Partial &,
+                       const std::vector<ConnectionPlan> &)>
+        step = [&](size_t decision, const Partial &state,
+                   const std::vector<ConnectionPlan> &staged) {
+          if (capped)
+            return;
+          if (decision == specs.size()) {
+            if (examined == cap) {
+              capped = true;
+              return;
+            }
+            ++examined;
+            Partial finalState = state;
+            if (!capacityOk(finalState))
+              return;
+            releaseCompleted(finalState, completedLinks);
+            // The branch is legal: publish its connections to the shared pool.
+            for (const ConnectionPlan &plan : staged) {
+              pool.push_back(plan);
+              finalState.connections.push_back(pool.size() - 1);
+            }
+            finalState.id = partialId(finalState.chosen);
+            ++result.expandedStates;
+            out.push_back(std::move(finalState));
+            return;
+          }
+          std::vector<ConnectionRealization> alternatives =
+              specAlternatives(specs[decision], state);
+          sortDecision(alternatives);
+          for (const ConnectionRealization &realization : alternatives) {
+            if (capped)
+              return;
+            Partial next = state;
+            std::vector<ConnectionPlan> nextStaged = staged;
+            applyRealization(next, nextStaged, realization);
+            step(decision + 1, next, nextStaged);
+          }
+        };
+    step(0, base, {});
+
+    if (capped) {
+      result.searchTruncated = true;
+      report(DiagnosticCode::SearchTruncated,
+             "connection choice cap reached (maxConnectionCombinations=" +
+                 std::to_string(cap) + ")");
+    }
+    return out;
   };
 
   // Optimistic completion cost: accumulated cost plus, for every uncovered
@@ -1532,10 +1665,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         if (!node)
           continue;
         for (const InstanceEntry &entry : tables[*node].instances) {
-          Partial branch = partial;
-          if (extend(branch, *node, entry)) {
-            branch.lowerBound = boundCost(branch);
-            next.push_back(std::move(branch));
+          std::vector<Partial> states = extendStates(partial, *node, entry);
+          for (Partial &state : states) {
+            state.lowerBound = boundCost(state);
+            next.push_back(std::move(state));
           }
         }
       }
@@ -1599,43 +1732,46 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       for (const InstanceEntry &entry : tables[*node].instances) {
         if (stop)
           return;
-        Partial branch = partial;
-        if (!extend(branch, *node, entry))
-          continue;
-        // Bound-based pruning is sound only for a minimize objective. The bound
-        // omits connection costs (a connection is synthesized only once both
-        // endpoints are chosen), and that term is non-negative: for minimize an
-        // omitted term can only raise a completion, so the bound stays at or
-        // below it; for maximize the same omission makes the bound too small,
-        // and a branch whose real completion would be largest can look poor.
-        // Maximize therefore explores fully -- the caps (topK, instance,
-        // candidate, and route caps) still bound the run and report
-        // `searchTruncated`, so it never silently returns a non-best plan.
-        if (exact && options_.objective.minimize) {
-          branch.lowerBound = boundCost(branch);
-          if (bestCosts.size() >= options_.topK &&
-              !boundIsBetterThan(branch.lowerBound, bestCosts.back(),
-                                 options_.objective)) {
-            // A full top-K list makes this prune exact for a *strictly better*
-            // cost: it cannot drop a completion strictly cheaper than the worst
-            // kept plan. On an exact cost *tie* it is not exact -- the bound
-            // compares against `bestCosts.back()`, which is cost-only, while
-            // the final top-K trim keys on `(cost, plan.id)`, so a tie can
-            // prune a plan whose smaller id the trim would have kept. Either
-            // way the space was not exhausted, and the caller is told so
-            // (`searchTruncated`).
-            result.searchTruncated = true;
-            report(DiagnosticCode::SearchTruncated,
-                   "exact search pruned by the top-K bound (topK=" +
-                       std::to_string(options_.topK) + ")");
-            continue;
+        std::vector<Partial> states = extendStates(partial, *node, entry);
+        for (Partial &branch : states) {
+          if (stop)
+            return;
+          // Bound-based pruning is sound only for a minimize objective. The
+          // bound omits connection costs (a connection is synthesized only once
+          // both endpoints are chosen), and that term is non-negative: for
+          // minimize an omitted term can only raise a completion, so the bound
+          // stays at or below it; for maximize the same omission makes the
+          // bound too small, and a branch whose real completion would be
+          // largest can look poor. Maximize therefore explores fully -- the
+          // caps (topK, instance, candidate, route, and connection caps) still
+          // bound the run and report `searchTruncated`, so it never silently
+          // returns a non-best plan.
+          if (exact && options_.objective.minimize) {
+            branch.lowerBound = boundCost(branch);
+            if (bestCosts.size() >= options_.topK &&
+                !boundIsBetterThan(branch.lowerBound, bestCosts.back(),
+                                   options_.objective)) {
+              // A full top-K list makes this prune exact for a *strictly
+              // better* cost: it cannot drop a completion strictly cheaper than
+              // the worst kept plan. On an exact cost *tie* it is not exact --
+              // the bound compares against `bestCosts.back()`, which is
+              // cost-only, while the final top-K trim keys on `(cost,
+              // plan.id)`, so a tie can prune a plan whose smaller id the trim
+              // would have kept. Either way the space was not exhausted, and
+              // the caller is told so (`searchTruncated`).
+              result.searchTruncated = true;
+              report(DiagnosticCode::SearchTruncated,
+                     "exact search pruned by the top-K bound (topK=" +
+                         std::to_string(options_.topK) + ")");
+              continue;
+            }
           }
-        }
-        visit(branch, stop);
-        if (!exact && !complete.empty()) {
-          // Deterministic mode is defined as the first legal plan.
-          stop = true;
-          return;
+          visit(branch, stop);
+          if (!exact && !complete.empty()) {
+            // Deterministic mode is defined as the first legal plan.
+            stop = true;
+            return;
+          }
         }
       }
     };
@@ -1737,6 +1873,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // `consumers` instance projection cannot tell two operand uses of one
       // value apart, so this is what names the use a rewire must target.
       detail.producerPort = connection.producerPort;
+      // The declared gather combination and the producer occurrences it
+      // combines travel with the connection, so a selected plan states what
+      // its reduce *means* rather than only that it combines several
+      // producers (task B7 closes B6's carry-over).
+      detail.gatherSemantics = connection.gatherSemantics;
+      detail.concatAxis = connection.concatAxis;
+      detail.producerPorts = gatherProducerPorts.lookup(connection.id);
       detail.consumerPorts.assign(connection.consumerPorts.begin(),
                                   connection.consumerPorts.end());
       llvm::sort(detail.consumerPorts,

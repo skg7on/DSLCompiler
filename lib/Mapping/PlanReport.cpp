@@ -174,6 +174,8 @@ std::string writePlanReport(const MappingSearchResult &result,
                      static_cast<uint64_t>(options.maxInstancesPerCandidate));
       json.attribute("maxRoutesPerConnection",
                      static_cast<uint64_t>(options.maxRoutesPerConnection));
+      json.attribute("maxConnectionCombinations",
+                     static_cast<uint64_t>(options.maxConnectionCombinations));
       json.attribute("memoryBudgetBytes", options.memoryBudgetBytes);
       json.attribute("enableLatencyCache", options.enableLatencyCache);
       json.attribute("enableSymmetryReduction",
@@ -463,6 +465,28 @@ std::string writePlanReport(const MappingSearchResult &result,
                   json.attribute("index", static_cast<uint64_t>(port.index));
                 });
             });
+            // The explicit combination a reduce performs and the producer
+            // occurrences it combines (task B6/B7), so a report states what a
+            // gather *means* rather than only that it combines producers.
+            if (connection.gatherSemantics)
+              json.attribute(
+                  "gatherSemantics",
+                  stringifyGatherSemantics(*connection.gatherSemantics));
+            if (connection.concatAxis)
+              json.attribute("concatAxis",
+                             static_cast<uint64_t>(*connection.concatAxis));
+            if (!connection.producerPorts.empty())
+              json.attributeArray("producerPorts", [&] {
+                for (const PortRef &port : connection.producerPorts)
+                  json.object([&] {
+                    json.attribute("node", static_cast<uint64_t>(port.node));
+                    json.attribute("direction",
+                                   port.direction == PortDirection::Input
+                                       ? "input"
+                                       : "output");
+                    json.attribute("index", static_cast<uint64_t>(port.index));
+                  });
+              });
             if (connection.transform) {
               json.attributeObject("transform", [&] {
                 json.attribute("src", connection.transform->srcLayout);
