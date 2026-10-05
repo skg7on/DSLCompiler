@@ -4486,3 +4486,97 @@ TEST(MappingDiagnostics, DistinctFailuresCarryDistinctCodes) {
               againResult->frontier.diagnostics[index].message);
   }
 }
+
+//===----------------------------------------------------------------------===//
+// Physical (layout-image) capacity charging (task B3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A blocked layout whose physical image rounds the padded second dimension up
+/// to a whole block.
+constexpr llvm::StringLiteral kPaddedLayout = R"llkmap(
+layout t.block(int VW) {
+  param VW in [4..4];
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap";
+
+/// One `micro.vector` whose `result` carries `tile` in `t.block`. The rule
+/// names the output port, so the solved layout is attributable to the crossing
+/// value.
+constexpr llvm::StringLiteral kPaddedRule = R"llkmap(
+rule r.pad {
+  match micro.vector();
+  require executor kind worker;
+  require memory kind sram;
+  require layout result satisfies t.block;
+  input "operand0";
+  output "result";
+  bundle "b.pad";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// `searchMachine` with sram declaring `t.block` and holding `capacity` bytes.
+MachineModel paddedLayoutMachine(uint64_t capacity) {
+  MachineModel model = searchMachine();
+  for (MemoryNode &memory : model.memories) {
+    if (memory.kind == "sram") {
+      memory.supportedLayouts = {"t.block"};
+      memory.capacityBytes = capacity;
+    }
+  }
+  return model;
+}
+
+/// One node `in -> out` over an 8x6xf32 tile: 192 logical bytes, but the
+/// blocked map's physical image is 8*2*4 = 64 elements = 256 bytes.
+WorkloadGraph raggedTileGraph(mlir::MLIRContext &context, mlir::Type tile) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, tile, "in", /*external=*/true});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, tile, "out", /*external=*/false});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context, "add");
+  node.inputs.push_back(WorkloadPort{input, tile, std::nullopt});
+  node.outputs.push_back(WorkloadPort{output, tile, std::nullopt});
+  graph.addNode(std::move(node));
+  graph.finalize();
+  return graph;
+}
+
+} // namespace
+
+TEST(CoveringSearch, ChargesThePhysicalLayoutImageNotLogicalElements) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x6xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = raggedTileGraph(context, tile);
+
+  // 200 bytes admits the 192 logical bytes but not the 256-byte physical image,
+  // so a plan that fits the padded layout does not exist.
+  std::unique_ptr<MappingTarget> tight =
+      targetWithLayouts(paddedLayoutMachine(200), kPaddedRule, kPaddedLayout);
+  ASSERT_NE(tight, nullptr);
+  CoveringSearch tightSearch(graph, *tight, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> rejected = tightSearch.search();
+  ASSERT_TRUE(static_cast<bool>(rejected))
+      << llvm::toString(rejected.takeError());
+  EXPECT_TRUE(rejected->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*rejected, DiagnosticCode::MemoryCapacityExceeded));
+
+  // The same rule admits the plan once the memory holds the physical image.
+  std::unique_ptr<MappingTarget> roomy =
+      targetWithLayouts(paddedLayoutMachine(256), kPaddedRule, kPaddedLayout);
+  ASSERT_NE(roomy, nullptr);
+  CoveringSearch roomySearch(graph, *roomy, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> admitted = roomySearch.search();
+  ASSERT_TRUE(static_cast<bool>(admitted))
+      << llvm::toString(admitted.takeError());
+  EXPECT_FALSE(admitted->plans.empty());
+}

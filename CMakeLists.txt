@@ -292,6 +292,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/StableHash.cpp
     lib/Mapping/Diagnostics.cpp
     lib/Mapping/TileFacts.cpp
+    lib/Mapping/StoragePlan.cpp
     lib/Mapping/CostModel.cpp
     lib/Mapping/CostEvent.cpp
     lib/Mapping/LatencyProvider.cpp
@@ -844,6 +845,7 @@ add_llk_mapping_test(MappingRulesTest test/Mapping/mapping_rules.cpp)
 add_llk_mapping_test(MappingPlacementTest test/Mapping/placement.cpp)
 add_llk_mapping_test(MappingConnectionsTest test/Mapping/connections.cpp)
 add_llk_mapping_test(MappingCoveringSearchTest test/Mapping/covering_search.cpp)
+add_llk_mapping_test(MappingStoragePlanTest test/Mapping/storage_plan.cpp)
 add_llk_mapping_test(MappingAvx2TargetTest test/Mapping/avx2_target.cpp)
 add_llk_mapping_test(MappingGenericAcceleratorTargetTest test/Mapping/generic_accelerator_target.cpp)
 add_llk_mapping_test(MappingPlanBinderTest test/Mapping/plan_binder.cpp)

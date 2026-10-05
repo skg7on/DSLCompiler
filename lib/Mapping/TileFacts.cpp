@@ -7,6 +7,7 @@
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/BuiltinTypes.h"
 
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <string>
@@ -93,7 +94,17 @@ TileFacts tileFactsFor(mlir::Type valueType) {
   std::optional<uint64_t> width = elementByteWidth(shaped.getElementType());
   if (!width || *width == 0)
     return facts;
-  facts.bytes = shaped.getNumElements() * *width;
+  int64_t elements = shaped.getNumElements();
+  if (elements < 0)
+    return facts;
+  // Checked: a shape whose byte count does not fit is reported unknown rather
+  // than wrapping to a small, wrong size. An unknown footprint is not a smaller
+  // one. LLVM's `MathExtras` overflow helpers are signed-only, so the builtin
+  // is used directly.
+  uint64_t bytes = 0;
+  if (__builtin_mul_overflow(static_cast<uint64_t>(elements), *width, &bytes))
+    return facts;
+  facts.bytes = bytes;
   facts.alignment = *width;
   facts.known = true;
   return facts;

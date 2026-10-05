@@ -27,6 +27,7 @@
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/Routing.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Mapping/TileFacts.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -467,6 +468,57 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return kUnknownValueBytes;
   };
 
+  // The physical bytes an output occurrence occupies once the instance's solved
+  // layout is applied: the bounding image of its layout map, not its logical
+  // element count, so a padded or blocked image cannot slip under a capacity
+  // check. A value the instance solved no layout for is charged its logical
+  // image; a footprint that cannot be derived is *reported* and charged the
+  // conservative fallback, never zero and never a logical lower bound.
+  auto physicalBytesForOutput = [&](const CandidateInstance &instance,
+                                    const WorkloadNode &node,
+                                    unsigned index) -> uint64_t {
+    const WorkloadPort &port = node.outputs[index];
+    const WorkloadValue *value = workload_.findValue(port.value);
+    if (!value)
+      return factsForValue(port.value).bytes;
+    std::vector<std::string> keys;
+    for (const auto &entry : instance.layoutSolutions)
+      keys.push_back(entry.first().str());
+    llvm::sort(keys);
+    const PortRef ref{node.id, PortDirection::Output, index};
+    mlir::AffineMap map;
+    for (const std::string &key : keys) {
+      const SolvedLayout &solution = instance.layoutSolutions.lookup(key);
+      if (solution.port && *solution.port == ref) {
+        map = solution.map;
+        break;
+      }
+    }
+    if (!map) {
+      for (const std::string &key : keys) {
+        const SolvedLayout &solution = instance.layoutSolutions.lookup(key);
+        if (solution.portValue >= 0 &&
+            static_cast<WorkloadValueId>(solution.portValue) == port.value) {
+          map = solution.map;
+          break;
+        }
+      }
+    }
+    if (!map)
+      return factsForValue(port.value).bytes;
+    mlir::Type type = port.type ? port.type : value->type;
+    llvm::Expected<PhysicalFootprint> footprint =
+        physicalFootprintFor(type, map, {});
+    if (footprint)
+      return footprint->bytes;
+    report(DiagnosticCode::AssumedValueSize,
+           "value " + std::to_string(port.value) + " ('" + value->name +
+               "'): unsupported footprint: " +
+               llvm::toString(footprint.takeError()) + "; assuming " +
+               std::to_string(kUnknownValueBytes) + " bytes");
+    return kUnknownValueBytes;
+  };
+
   // --- node tables -----------------------------------------------------
   std::vector<const WorkloadNode *> ordered;
   for (const WorkloadNode &node : workload_.getNodes())
@@ -774,7 +826,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             return false;
           }
           const uint64_t bytes =
-              factsForValue(workload.outputs[index].value).bytes;
+              physicalBytesForOutput(instance, workload, index);
           partial.memoryBytes[*memory] += bytes;
           partial.liveValueCharges[workload.outputs[index].value].push_back(
               {*memory, bytes});
@@ -790,8 +842,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           if (!llvm::is_contained(memories, binding.memory))
             memories.push_back(binding.memory);
         if (memories.size() == 1) {
-          for (const WorkloadPort &output : workload.outputs) {
-            const uint64_t bytes = factsForValue(output.value).bytes;
+          for (uint32_t index = 0; index < workload.outputs.size(); ++index) {
+            const WorkloadPort &output = workload.outputs[index];
+            const uint64_t bytes =
+                physicalBytesForOutput(instance, workload, index);
             partial.memoryBytes[memories.front()] += bytes;
             partial.liveValueCharges[output.value].push_back(
                 {memories.front(), bytes});
@@ -809,7 +863,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           return false;
         } else {
           const WorkloadValueId first = workload.outputs.front().value;
-          const uint64_t bytes = factsForValue(first).bytes;
+          const uint64_t bytes = physicalBytesForOutput(instance, workload, 0);
           for (const MemoryNodeId &memory : memories) {
             partial.memoryBytes[memory] += bytes;
             partial.liveValueCharges[first].push_back({memory, bytes});
@@ -825,8 +879,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           partial.memoryBytes[binding.second] += bytes;
       } else if (instance.memoryBindings.size() == 1) {
         const MemoryNodeId memory = instance.memoryBindings.begin()->second;
-        for (const WorkloadPort &output : workload.outputs) {
-          const uint64_t bytes = factsForValue(output.value).bytes;
+        for (uint32_t index = 0; index < workload.outputs.size(); ++index) {
+          const WorkloadPort &output = workload.outputs[index];
+          const uint64_t bytes =
+              physicalBytesForOutput(instance, workload, index);
           partial.memoryBytes[memory] += bytes;
           partial.liveValueCharges[output.value].push_back({memory, bytes});
         }
@@ -852,7 +908,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         return false;
       } else {
         const WorkloadValueId first = workload.outputs.front().value;
-        const uint64_t bytes = factsForValue(first).bytes;
+        const uint64_t bytes = physicalBytesForOutput(instance, workload, 0);
         for (const auto &binding : instance.memoryBindings) {
           partial.memoryBytes[binding.second] += bytes;
           partial.liveValueCharges[first].push_back({binding.second, bytes});

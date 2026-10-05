@@ -1,5 +1,6 @@
 //===- tile_facts.cpp - Derived tile bytes and alignment ------------------===//
 
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Mapping/TileFacts.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
@@ -8,9 +9,13 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
 
+#include "llvm/Support/Error.h"
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
+#include <string>
 
 using namespace mlir::llk::mapping;
 
@@ -87,4 +92,121 @@ TEST(TileFacts, HandlesUnitAndRankZeroShapes) {
   EXPECT_TRUE(scalar.known);
   EXPECT_EQ(scalar.bytes, 4u);
   EXPECT_EQ(scalar.alignment, 4u);
+}
+
+TEST(TileFacts, RejectsANonRepresentableByteCount) {
+  mlir::MLIRContext context;
+  // 2^31 * 2^31 elements of f32 is 2^64 bytes, which is not representable in
+  // uint64_t. The count is reported unknown rather than wrapping to a small,
+  // wrong size.
+  mlir::Type huge = mlir::RankedTensorType::get(
+      {int64_t{1} << 31, int64_t{1} << 31}, mlir::Float32Type::get(&context));
+  EXPECT_FALSE(tileFactsFor(huge).known);
+}
+
+//===----------------------------------------------------------------------===//
+// Physical footprint under a layout map
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A layout map over a rank-2 index space: `(m, n) -> ...`.
+mlir::AffineMap map2(mlir::MLIRContext &context, unsigned dims,
+                     llvm::ArrayRef<mlir::AffineExpr> results) {
+  return mlir::AffineMap::get(dims, 0, results, &context);
+}
+
+} // namespace
+
+TEST(StorageFootprint, PlainValueIsItsLogicalImage) {
+  mlir::MLIRContext context;
+  // 8x8xf32 = 64 elements * 4 bytes = 256, no map, no padding.
+  auto footprint =
+      physicalFootprintFor(tileType(context, "8x8xf32"), mlir::AffineMap(), {});
+  ASSERT_TRUE(bool(footprint)) << llvm::toString(footprint.takeError());
+  EXPECT_EQ(footprint->bytes, 256u);
+  EXPECT_TRUE(footprint->known);
+}
+
+TEST(StorageFootprint, ABlockedMapWithARaggedExtentPadsTheImage) {
+  mlir::MLIRContext context;
+  // `(m, n) -> (m, floordiv(n, 4), mod(n, 4))` over an 8x6 index space has
+  // physical extents (8, 2, 4) = 64 elements = 256 bytes, larger than the
+  // 8*6*4 = 192 logical bytes, because the second dimension rounds up to a
+  // whole block.
+  mlir::AffineExpr m = mlir::getAffineDimExpr(0, &context);
+  mlir::AffineExpr n = mlir::getAffineDimExpr(1, &context);
+  mlir::AffineExpr vw = mlir::getAffineConstantExpr(4, &context);
+  mlir::AffineMap blocked = map2(context, 2, {m, n.floorDiv(vw), n % vw});
+  auto footprint =
+      physicalFootprintFor(tileType(context, "8x6xf32"), blocked, {});
+  ASSERT_TRUE(bool(footprint)) << llvm::toString(footprint.takeError());
+  EXPECT_EQ(footprint->bytes, 256u);
+}
+
+TEST(StorageFootprint, DeclaredPaddingEnlargesTheImage) {
+  mlir::MLIRContext context;
+  // One extra element of padding on each physical dimension: (8+1)*(8+1)*4.
+  auto footprint = physicalFootprintFor(tileType(context, "8x8xf32"),
+                                        mlir::AffineMap(), {1, 1});
+  ASSERT_FALSE(bool(footprint));
+  // Padding is only meaningful alongside a physical map, so the bare form is
+  // rejected rather than silently ignored.
+  EXPECT_NE(llvm::toString(footprint.takeError()).find("padding"),
+            std::string::npos);
+
+  mlir::AffineExpr m = mlir::getAffineDimExpr(0, &context);
+  mlir::AffineExpr n = mlir::getAffineDimExpr(1, &context);
+  mlir::AffineMap identity = map2(context, 2, {m, n});
+  auto padded =
+      physicalFootprintFor(tileType(context, "8x8xf32"), identity, {1, 1});
+  ASSERT_TRUE(bool(padded)) << llvm::toString(padded.takeError());
+  EXPECT_EQ(padded->bytes, 9u * 9u * 4u);
+}
+
+TEST(StorageFootprint, AnAffineStrideMapReportsItsBoundingImage) {
+  mlir::MLIRContext context;
+  // `(m, n) -> (m, n * 2)` over 4x4 has physical extents (4, 7) = 28 elements,
+  // so the stride's holes are charged, not ignored.
+  mlir::AffineExpr m = mlir::getAffineDimExpr(0, &context);
+  mlir::AffineExpr n = mlir::getAffineDimExpr(1, &context);
+  mlir::AffineMap strided =
+      map2(context, 2, {m, n * mlir::getAffineConstantExpr(2, &context)});
+  auto footprint =
+      physicalFootprintFor(tileType(context, "4x4xf32"), strided, {});
+  ASSERT_TRUE(bool(footprint)) << llvm::toString(footprint.takeError());
+  EXPECT_EQ(footprint->bytes, 28u * 4u);
+}
+
+TEST(StorageFootprint, ADynamicValueIsRejectedNotZeros) {
+  mlir::MLIRContext context;
+  mlir::Type dynamic = mlir::RankedTensorType::get(
+      {mlir::ShapedType::kDynamic, 8}, mlir::Float32Type::get(&context));
+  auto footprint = physicalFootprintFor(dynamic, mlir::AffineMap(), {});
+  ASSERT_FALSE(bool(footprint));
+  EXPECT_NE(llvm::toString(footprint.takeError()).find("unsupported footprint"),
+            std::string::npos);
+}
+
+TEST(StorageFootprint, AMismatchedMapRankIsRejected) {
+  mlir::MLIRContext context;
+  mlir::AffineExpr m = mlir::getAffineDimExpr(0, &context);
+  // A rank-1 map applied to a rank-2 value states no index relation.
+  mlir::AffineMap oneDim = map2(context, 1, {m});
+  auto footprint =
+      physicalFootprintFor(tileType(context, "8x8xf32"), oneDim, {});
+  EXPECT_FALSE(bool(footprint));
+}
+
+TEST(StorageFootprint, AnOverflowingImageIsRejected) {
+  mlir::MLIRContext context;
+  mlir::AffineExpr m = mlir::getAffineDimExpr(0, &context);
+  mlir::AffineExpr n = mlir::getAffineDimExpr(1, &context);
+  // A stride so large the bounding image's byte count overflows uint64:
+  // 8 * (7 * 2^57 + 1) * 4 bytes exceeds 2^64.
+  mlir::AffineMap huge =
+      map2(context, 2,
+           {m, n * mlir::getAffineConstantExpr(int64_t{1} << 57, &context)});
+  auto footprint = physicalFootprintFor(tileType(context, "8x8xf32"), huge, {});
+  EXPECT_FALSE(bool(footprint));
 }
