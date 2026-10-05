@@ -599,10 +599,30 @@ bool planMetadataIsSchemaV2(mlir::DictionaryAttr plan) {
     if (version.getInt() >= 2)
       return true;
   for (llvm::StringRef name : {"graph_hash", "target_hash", "machine_hash",
-                               "layout_hash", "rule_hash"})
+                               "layout_hash", "rule_hash", "materialized"})
     if (plan.get(name))
       return true;
   return false;
+}
+
+bool kernelMetadataIsSchemaV2(mlir::Operation *kernel) {
+  if (!kernel)
+    return false;
+  if (planMetadataIsSchemaV2(
+          kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr)))
+    return true;
+  bool v2 = false;
+  kernel->walk([&](mlir::Operation *op) {
+    if (v2)
+      return;
+    auto mapping = op->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
+    if (!mapping)
+      return;
+    if (mapping.get("rule_parameters") || mapping.get("layout_entries") ||
+        mapping.get("no_layout"))
+      v2 = true;
+  });
+  return v2;
 }
 
 //===----------------------------------------------------------------------===//
@@ -891,34 +911,21 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
   if (!planAttr)
     return metadataError("the kernel is not mapped: it has no micro.plan");
 
-  bool schemaDeclared = false;
   uint64_t schemaVersion = 1;
   if (auto version = planAttr.getAs<mlir::IntegerAttr>("schema_version")) {
     if (version.getInt() < 0)
       return metadataError("micro.plan schema_version is negative");
     schemaVersion = static_cast<uint64_t>(version.getInt());
-    schemaDeclared = true;
   }
   if (schemaVersion > kSupportedMappingMetadataVersion)
     return metadataError("micro.plan records unsupported schema version " +
                          std::to_string(schemaVersion) +
                          "; this reader understands at most " +
                          std::to_string(kSupportedMappingMetadataVersion));
-  // A v2-only field implies v2 even when `schema_version` is missing, so
-  // deleting the version stamp cannot silently downgrade the binding to v1. A
-  // binding that *declares* an old version but records v2 fields is a tampered
-  // stamp and is rejected.
-  bool hasV2Fields = false;
-  for (llvm::StringRef name : {"graph_hash", "target_hash", "machine_hash",
-                               "layout_hash", "rule_hash"})
-    if (planAttr.get(name)) {
-      hasV2Fields = true;
-      break;
-    }
-  if (schemaDeclared && schemaVersion < 2 && hasV2Fields)
-    return metadataError(
-        "micro.plan declares schema_version < 2 but records v2 fields");
-  const bool v2 = (schemaDeclared && schemaVersion >= 2) || hasV2Fields;
+  // v2 is inferred from any v2-only field -- on the kernel's `micro.plan` or on
+  // any mapped operation -- so deleting `schema_version` (and even the hash
+  // fields) cannot silently downgrade the binding to v1.
+  const bool v2 = kernelMetadataIsSchemaV2(kernel);
   if (v2)
     schemaVersion = kMappingMetadataVersion;
 

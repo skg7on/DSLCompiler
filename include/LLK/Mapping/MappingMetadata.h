@@ -158,9 +158,17 @@ llvm::Expected<SearchValue> readMetadataSearchValue(mlir::Attribute raw,
 /// True when a `micro.plan` dictionary denotes a schema-v2 (or newer) binding.
 /// A binding is v2 when it declares `schema_version >= 2` *or* records any
 /// v2-only field (`graph_hash`, `target_hash`, `machine_hash`, `layout_hash`,
-/// `rule_hash`). Deleting `schema_version` therefore cannot silently downgrade
-/// a v2 binding to v1 and re-open the layout/hash bypasses.
+/// `rule_hash`, `materialized`). Deleting `schema_version` therefore cannot
+/// silently downgrade a v2 binding to v1 and re-open the layout/hash bypasses.
 bool planMetadataIsSchemaV2(mlir::DictionaryAttr plan);
+
+/// True when a `micro.kernel`'s metadata denotes a schema-v2 binding: its
+/// `micro.plan` is v2 (see `planMetadataIsSchemaV2`), or any mapped operation
+/// under it records a v2-only `micro.mapping` field (`rule_parameters`,
+/// `layout_entries`, or `no_layout`). `layout_parameters` is deliberately *not*
+/// a marker: the pre-v2 binder also wrote it, so it cannot distinguish the two
+/// schemas.
+bool kernelMetadataIsSchemaV2(mlir::Operation *kernel);
 
 } // namespace mlir::llk::mapping
 

@@ -520,8 +520,7 @@ bool kernelUsesSchemaV2(mlir::Operation *op) {
   mlir::Operation *kernel = enclosingKernel(op);
   if (!kernel)
     return false;
-  return planMetadataIsSchemaV2(
-      kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr));
+  return kernelMetadataIsSchemaV2(kernel);
 }
 
 } // namespace
@@ -756,6 +755,20 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       failMetadata(bindError(
           where + ": micro.mapping records no 'rule_parameters' for a v2 "
                   "binding"));
+      return;
+    }
+    // An *empty* recorded assignment must not downgrade a parametrized rule to
+    // generation's existential fallback: for a v2 binding whose rule derives a
+    // parameter, the derivation is required, so an empty map is a missing
+    // assignment rather than a rule with nothing to record. (A rule whose
+    // constraints reference no declared parameter may still record an empty
+    // map.)
+    if (schemaV2 && selection.parameters.empty() &&
+        ruleDerivesParameters(*rule)) {
+      fail(DiagnosticCode::NoMatchingRule,
+           where + ": rule '" + *ruleId +
+               "' requires a recorded parameter assignment, but the mapping "
+               "records none");
       return;
     }
     if (llvm::Error error =
@@ -1200,7 +1213,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       return;
     // v2 is inferred from any v2-only field too, so deleting `schema_version`
     // cannot disable these content-hash checks.
-    if (!planMetadataIsSchemaV2(plan))
+    if (!kernelMetadataIsSchemaV2(kernel))
       return;
     const std::string where = "kernel " + kernelLabel(kernel);
     llvm::Expected<std::string> graphHash =

@@ -223,6 +223,15 @@ llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
                                 const RecordedRuleSelection &selection,
                                 llvm::StringRef where);
 
+/// True when `rule`'s `require` constraints reference at least one of its own
+/// declared parameters, so a recorded assignment cannot legitimately be empty
+/// (the derivation must be recorded, since verification cannot reconstruct the
+/// value the plan used). A rule whose constraints reference no declared
+/// parameter may record an empty assignment and fall back to generation's
+/// existential check. Used to keep a schema-v2 binding with an empty recorded
+/// assignment from silently downgrading to that fallback.
+bool ruleDerivesParameters(const RuleDef &rule);
+
 /// Bridges a matched rule onto the workload node it covers: the result is the
 /// unplaced `MappingCandidate` the placement engine consumes. Rule ports are
 /// wired positionally to the node's inputs and then its outputs.

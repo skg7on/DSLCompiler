@@ -1508,6 +1508,17 @@ recordedParameterProblem(const RuleDef &rule, const WorkloadNode &node,
 
 } // namespace
 
+bool ruleDerivesParameters(const RuleDef &rule) {
+  llvm::StringSet<> referenced;
+  llvm::StringSet<> bound; // no quantifier is in scope at the top level
+  for (const ExprPtr &constraint : rule.constraints)
+    collectIdentifiers(*constraint, referenced, bound);
+  for (const LayoutParam &param : rule.params)
+    if (referenced.contains(param.name))
+      return true;
+  return false;
+}
+
 llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
                                 const machine::MachineModel &machine,
                                 const RecordedRuleSelection &selection,

@@ -2145,3 +2145,104 @@ TEST(PlanBinder, DecodeRejectsMissingLayoutEntries) {
   auto decoded = decodeSelectedPlan(*b->module, *f.target);
   ASSERT_FALSE(bool(decoded));
 }
+
+//===----------------------------------------------------------------------===//
+// Fix round 2 — N-1: an empty recorded assignment must not downgrade a
+// parametrized rule to generation's existential fallback
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A machine with a single `worker` executor, sufficient for the custom rule.
+constexpr llvm::StringLiteral kParamMachine = R"yaml(
+schema: llk.machine.v2
+target: param
+clock_hz: 1000000000
+worker_threads: 1
+executors:
+  - id: worker.0
+    kind: worker
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: worker.0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+)yaml";
+
+/// A rule whose `require` constraint references its declared parameter `VW` but
+/// does not depend on the layout context, so a forged *empty* recorded
+/// assignment still satisfies the existential fallback (the hole N-1 closes).
+constexpr llvm::StringLiteral kParamRules = R"llkmap(
+rule p.vector {
+  match micro.vector(op = "add");
+  param VW in [4..8];
+  require VW % 4 == 0;
+  require executor kind worker;
+  bundle "p.vector";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+llvm::Expected<std::unique_ptr<MappingTarget>> parameterizedTarget() {
+  llvm::Expected<mlir::llk::machine::MachineModel> machine =
+      mlir::llk::machine::parseMachineModel(kParamMachine, "<test>");
+  if (!machine)
+    return machine.takeError();
+  llvm::Expected<LayoutRegistry> layouts = parseLayoutText("", "<test>");
+  if (!layouts)
+    return layouts.takeError();
+  llvm::Expected<RuleRegistry> rules = parseRuleText(kParamRules, "<test>");
+  if (!rules)
+    return rules.takeError();
+  return std::make_unique<FileMappingTarget>(
+      "param", std::move(*machine), std::move(*layouts), std::move(*rules),
+      std::vector<std::string>{"e1"});
+}
+
+} // namespace
+
+TEST(PlanBinder, RejectsAnEmptyRecordedAssignmentForAParametrizedRule) {
+  MLIRContext context;
+  context.getOrLoadDialect<micro::MicroDialect>();
+  context.getOrLoadDialect<tensor::TensorDialect>();
+  OwningOpRef<ModuleOp> module =
+      parseSourceString<ModuleOp>(kVectorOnlyKernel, &context);
+  ASSERT_TRUE(module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = parameterizedTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  auto p = selectPlan(context, *module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
+
+  // The rule derives `VW`, so the binding records a non-empty assignment.
+  bool recorded = false;
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping)
+      return;
+    auto parameters = mapping.getAs<DictionaryAttr>("rule_parameters");
+    if (parameters && !parameters.empty())
+      recorded = true;
+    // Forge an empty assignment, which is *present* but records nothing.
+    NamedAttrList updated(mapping);
+    updated.set("rule_parameters", DictionaryAttr::get(&context, {}));
+    op->setAttr("micro.mapping", updated.getDictionary(&context));
+  });
+  ASSERT_TRUE(recorded);
+
+  auto error = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(error))
+      << "an empty recorded assignment must not downgrade a parametrized rule";
+  EXPECT_NE(llvm::toString(std::move(error)).find("recorded parameter"),
+            std::string::npos);
+}
