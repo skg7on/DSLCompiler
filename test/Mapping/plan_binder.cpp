@@ -3366,3 +3366,348 @@ TEST(PlanBinder, MaterializesATwoHopRouteOfSameKindNodes) {
     EXPECT_FALSE(bool(verification)) << llvm::toString(std::move(verification));
   }
 }
+
+//===----------------------------------------------------------------------===//
+// Explicit gather semantics and synchronization (task B6)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Two distinct producers feeding one consumer, so a gather can combine them.
+/// The producers differ in their vector op, so extraction keeps them as two
+/// nodes rather than folding identical content together.
+constexpr llvm::StringLiteral kGatherKernel = R"mlir(
+module {
+  micro.kernel @gather {
+    %a = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %p1 = micro.vector "add" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %p2 = micro.vector "max" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %c = micro.vector "mul" %p1, %p2 : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// Producers of different extents, for the concatenation control (8 + 4 = 12
+/// along the concatenated axis).
+constexpr llvm::StringLiteral kConcatKernel = R"mlir(
+module {
+  micro.kernel @concat {
+    %a = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %b = micro.tile_alloc : !micro.tile<8x4xf32, memory = #micro.memory<sram>>
+    %p1 = micro.vector "add" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %p2 = micro.vector "max" %b, %b : !micro.tile<8x4xf32, memory = #micro.memory<sram>>, !micro.tile<8x4xf32, memory = #micro.memory<sram>> -> !micro.tile<8x4xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// The id of the `micro.vector` node whose `op` attribute is `vecOp`, or
+/// nullopt. Node ids are content-canonical, so the test identifies a node by
+/// what it is rather than by position.
+std::optional<WorkloadNodeId> vectorNodeId(const WorkloadGraph &graph,
+                                           llvm::StringRef vecOp) {
+  for (const WorkloadNode &node : graph.getNodes()) {
+    if (node.opName != "micro.vector")
+      continue;
+    auto attr = node.attributes ? node.attributes.getAs<StringAttr>("op")
+                                : StringAttr();
+    if (attr && attr.getValue() == vecOp)
+      return node.id;
+  }
+  return std::nullopt;
+}
+
+/// The `micro.gather` in `module`, or null.
+Operation *gatherOp(ModuleOp module) {
+  Operation *found = nullptr;
+  module->walk([&](Operation *op) {
+    if (!found && op->getName().getStringRef() == "micro.gather")
+      found = op;
+  });
+  return found;
+}
+
+/// Builds a hand-built gather plan over `module`'s kernel: the two named
+/// producer vector ops feed one gather with `semantics`, staged along the
+/// SRAM -> L2 route, and (optionally) a named consumer reads the result.
+CoveringPlan buildGatherPlan(ModuleOp module, llvm::StringRef producerA,
+                             llvm::StringRef producerB,
+                             GatherSemantics semantics,
+                             std::optional<uint64_t> concatAxis,
+                             std::optional<WorkloadNodeId> consumerNode) {
+  WorkloadGraphBinding binding;
+  llvm::Expected<WorkloadGraph> graph =
+      extractWorkloadGraph(findKernel(module), &binding);
+  EXPECT_TRUE(static_cast<bool>(graph));
+  if (!graph)
+    return CoveringPlan{};
+
+  std::optional<WorkloadNodeId> a = vectorNodeId(*graph, producerA);
+  std::optional<WorkloadNodeId> b = vectorNodeId(*graph, producerB);
+  EXPECT_TRUE(a.has_value());
+  EXPECT_TRUE(b.has_value());
+  if (!a || !b)
+    return CoveringPlan{};
+
+  CoveringPlan plan;
+  plan.id = 77;
+  PlanConnection connection;
+  connection.id = 7;
+  connection.kind = ConnectionKind::Reduce;
+  connection.value = graph->findNode(*a)->outputs.front().value;
+  connection.gatherSemantics = semantics;
+  connection.concatAxis = concatAxis;
+  connection.route = llvm::SmallVector<MemoryNodeId>{"sram.0", "l2.0"};
+  connection.producerPorts = {PortRef{*a, PortDirection::Output, 0},
+                              PortRef{*b, PortDirection::Output, 0}};
+  if (consumerNode)
+    connection.consumerPorts = {
+        PortRef{*consumerNode, PortDirection::Input, 0}};
+  plan.connectionPlans.push_back(std::move(connection));
+  return plan;
+}
+
+} // namespace
+
+// A multi-producer connection with declared Sum semantics materializes a
+// `micro.gather` whose operands are the staged feeds and whose result the
+// recorded consumer reads. Nothing is inferred from the producer count.
+TEST(PlanBinder, MaterializesAGatherUnderItsDeclaredSemantics) {
+  Fixture f = makeTileFixture(kGatherKernel);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  WorkloadGraphBinding binding;
+  llvm::Expected<WorkloadGraph> graph =
+      extractWorkloadGraph(findKernel(*f.module), &binding);
+  ASSERT_TRUE(bool(graph)) << llvm::toString(graph.takeError());
+  std::optional<WorkloadNodeId> consumer = vectorNodeId(*graph, "mul");
+  ASSERT_TRUE(consumer.has_value());
+
+  CoveringPlan plan = buildGatherPlan(
+      *f.module, "add", "max", GatherSemantics::Sum, std::nullopt, consumer);
+  ASSERT_FALSE(plan.connectionPlans.empty());
+
+  const size_t copiesBefore = countOps(*f.module, "micro.tile_async_copy");
+  llvm::Expected<BoundPlan> b = bindCanonical(*f.module, plan, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  for (const std::string &note : b->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(b->unmaterialized.empty());
+
+  Operation *gather = gatherOp(*b->module);
+  ASSERT_NE(gather, nullptr);
+  auto kind = gather->getAttrOfType<StringAttr>("kind");
+  ASSERT_TRUE(kind);
+  EXPECT_EQ(kind.getValue(), "sum");
+  EXPECT_EQ(gather->getNumOperands(), 2u);
+  EXPECT_FALSE(gather->hasAttr("axis"));
+
+  // Each feed is staged over the selected route: two copies and two waits.
+  EXPECT_EQ(countOps(*b->module, "micro.tile_async_copy"), copiesBefore + 2);
+  EXPECT_EQ(countOps(*b->module, "micro.wait"), 2u);
+
+  // The consumer reads the gathered result.
+  Operation *mul = vectorOp(*b->module, "mul");
+  ASSERT_NE(mul, nullptr);
+  EXPECT_EQ(mul->getOperand(0), gather->getResult(0));
+}
+
+// The Max control: the same shape-compatible gather under a different declared
+// semantics emits a `max` gather, not a sum.
+TEST(PlanBinder, MaterializesAMaxGatherUnderItsSemantics) {
+  Fixture f = makeTileFixture(kGatherKernel);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  WorkloadGraphBinding binding;
+  llvm::Expected<WorkloadGraph> graph =
+      extractWorkloadGraph(findKernel(*f.module), &binding);
+  ASSERT_TRUE(bool(graph)) << llvm::toString(graph.takeError());
+  std::optional<WorkloadNodeId> consumer = vectorNodeId(*graph, "mul");
+  ASSERT_TRUE(consumer.has_value());
+
+  CoveringPlan plan = buildGatherPlan(
+      *f.module, "add", "max", GatherSemantics::Max, std::nullopt, consumer);
+  llvm::Expected<BoundPlan> b = bindCanonical(*f.module, plan, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  EXPECT_TRUE(b->unmaterialized.empty());
+
+  Operation *gather = gatherOp(*b->module);
+  ASSERT_NE(gather, nullptr);
+  EXPECT_EQ(gather->getAttrOfType<StringAttr>("kind").getValue(), "max");
+}
+
+// The Concatenate control: the result extent along the named axis is exactly
+// the sum of the input extents (8 + 4 = 12), and every other extent matches.
+TEST(PlanBinder, MaterializesAConcatGatherWithTheExactResultingExtent) {
+  Fixture f = makeTileFixture(kConcatKernel);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  CoveringPlan plan =
+      buildGatherPlan(*f.module, "add", "max", GatherSemantics::Concatenate,
+                      uint64_t{1}, std::nullopt);
+  llvm::Expected<BoundPlan> b = bindCanonical(*f.module, plan, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  for (const std::string &note : b->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(b->unmaterialized.empty());
+
+  Operation *gather = gatherOp(*b->module);
+  ASSERT_NE(gather, nullptr);
+  EXPECT_EQ(gather->getAttrOfType<StringAttr>("kind").getValue(), "concat");
+  auto axis = gather->getAttrOfType<IntegerAttr>("axis");
+  ASSERT_TRUE(axis);
+  EXPECT_EQ(axis.getInt(), 1);
+  // The concatenated tile is 8x(8+4) in the staging memory.
+  EXPECT_NE(typeText(gather->getResult(0).getType()).find("8x12xf32"),
+            std::string::npos)
+      << typeText(gather->getResult(0).getType());
+}
+
+// A `Concatenate` without an axis cannot state its resulting extent, so it is
+// not materialized: the partial contract reports it and the executable one
+// refuses. Nothing is guessed.
+TEST(PlanBinder, AConcatGatherWithoutAnAxisIsRejected) {
+  Fixture f = makeTileFixture(kConcatKernel);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  CoveringPlan plan =
+      buildGatherPlan(*f.module, "add", "max", GatherSemantics::Concatenate,
+                      std::nullopt, std::nullopt);
+  llvm::Expected<BoundPlan> partial = bindCanonical(*f.module, plan, **target);
+  ASSERT_TRUE(bool(partial)) << llvm::toString(partial.takeError());
+  ASSERT_FALSE(partial->unmaterialized.empty());
+  EXPECT_EQ(gatherOp(*partial->module), nullptr);
+
+  llvm::Expected<BoundPlan> executable =
+      bindCanonical(*f.module, plan, **target, BindContract::Executable);
+  ASSERT_FALSE(bool(executable));
+}
+
+// A multi-producer connection with no declared semantics stays Partial-only
+// under the stable `reduce_not_materialized` reason, and an executable contract
+// refuses it: a topology alone is not arithmetic.
+TEST(PlanBinder, MissingGatherSemanticsRejectsExecutableBinding) {
+  Fixture f = makeTileFixture(kGatherKernel);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  CoveringPlan plan =
+      buildGatherPlan(*f.module, "add", "max", GatherSemantics::Sum,
+                      std::nullopt, std::nullopt);
+  ASSERT_FALSE(plan.connectionPlans.empty());
+  plan.connectionPlans.front().gatherSemantics.reset(); // no declared semantics
+
+  llvm::Expected<BoundPlan> partial = bindCanonical(*f.module, plan, **target);
+  ASSERT_TRUE(bool(partial)) << llvm::toString(partial.takeError());
+  ASSERT_EQ(partial->unmaterialized.size(), 1u);
+  EXPECT_NE(partial->unmaterialized.front().find("reduce_not_materialized"),
+            std::string::npos)
+      << partial->unmaterialized.front();
+  EXPECT_EQ(gatherOp(*partial->module), nullptr);
+
+  llvm::Expected<BoundPlan> executable =
+      bindCanonical(*f.module, plan, **target, BindContract::Executable);
+  ASSERT_FALSE(bool(executable));
+  EXPECT_NE(
+      llvm::toString(executable.takeError()).find("reduce_not_materialized"),
+      std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Synchronization decisions drive waits and barriers (task B6)
+//===----------------------------------------------------------------------===//
+
+// A plan whose synchronization requires a barrier emits one, over the tokens of
+// the movement it orders; verification accepts it because the required
+// synchronization is represented.
+TEST(PlanBinder, AParallelEngineMovementEmitsABarrier) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_FALSE(p->connectionPlans.empty());
+
+  // The plan decides the movement must be barrier-synchronized.
+  p->synchronization.clear();
+  SynchronizationStep step;
+  step.id = 0;
+  step.waitsFor = {p->connectionPlans.front().id};
+  step.requiresBarrier = true;
+  p->synchronization.push_back(step);
+
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  for (const std::string &note : b->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(b->unmaterialized.empty());
+  EXPECT_EQ(countOps(*b->module, "micro.barrier"), 1u);
+  EXPECT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
+}
+
+// The same plan without the required barrier no longer represents the
+// synchronization it recorded, so verification rejects it: a required decision
+// cannot be silently dropped.
+TEST(PlanBinder, ARequiredBarrierMustBeRepresented) {
+  Fixture f = makeTileFixture(kTileKernelOneConsumer);
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_FALSE(p->connectionPlans.empty());
+
+  p->synchronization.clear();
+  SynchronizationStep step;
+  step.id = 0;
+  step.waitsFor = {p->connectionPlans.front().id};
+  step.requiresBarrier = true;
+  p->synchronization.push_back(step);
+
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  ASSERT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
+
+  Operation *barrier = nullptr;
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.barrier")
+      barrier = op;
+  });
+  ASSERT_NE(barrier, nullptr);
+  barrier->erase();
+
+  auto error = verifyMappedMicroIR(*b->module, **target);
+  ASSERT_TRUE(bool(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("does not express"),
+            std::string::npos);
+}
+
+// Two independent movements that share no dependency record no barrier, so none
+// is emitted: synchronization is added only where the plan requires it.
+TEST(PlanBinder, IndependentCopiesReceiveNoBarrier) {
+  Fixture f = makeTileFixture(kTileKernel); // add -> mul and add -> sub
+  ASSERT_TRUE(f.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = tileTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  ASSERT_GE(p->connectionPlans.size(), 2u);
+  p->synchronization.clear();
+
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  EXPECT_TRUE(b->unmaterialized.empty());
+  EXPECT_EQ(countOps(*b->module, "micro.barrier"), 0u);
+  EXPECT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
+}

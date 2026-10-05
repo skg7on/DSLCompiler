@@ -73,6 +73,8 @@ constexpr llvm::StringLiteral kHopAttr = "micro.hop";
 /// They are part of the report contract, so they are named constants rather
 /// than free-form prose.
 constexpr llvm::StringLiteral kReduceReason = "reduce_not_materialized";
+constexpr llvm::StringLiteral kFeedUnresolvedReason =
+    "gather_feed_endpoint_unresolved";
 constexpr llvm::StringLiteral kHoplessRouteReason =
     "route_has_no_hop_to_materialize";
 constexpr llvm::StringLiteral kSameNodeReason =
@@ -206,6 +208,10 @@ private:
     /// The value the movement read: what a recorded consumer must currently
     /// read (directly or through a transparent view) for the rewire to apply.
     mlir::Value source;
+    /// Additional values a recorded consumer may currently read instead of
+    /// `source`. A gather combines several feeds, so its consumers may read any
+    /// one of them before being rewired to the gathered result.
+    llvm::SmallVector<mlir::Value, 2> altSources;
     mlir::Value result;
     mlir::Attribute dstMemory;
     llvm::SmallVector<PortRef> consumers;
@@ -273,6 +279,81 @@ mlir::Value retypeForConsumer(mlir::OpBuilder &builder, mlir::Value produced,
     return builder.create(state)->getResult(0);
   }
   return {};
+}
+
+/// The result type of a `micro.gather` over `feeds`: for `Concatenate` the
+/// shapes joined along `axis` (every other extent must already agree), for
+/// Sum/Max the feed type unchanged. A tile result is retyped into `memory`;
+/// null when the inputs do not state a statically known, consistent image (the
+/// caller then reports the missing fact rather than emitting a mistyped op).
+mlir::Type gatherResultType(llvm::ArrayRef<mlir::Value> feeds,
+                            GatherSemantics semantics,
+                            std::optional<uint64_t> axis,
+                            mlir::Attribute memory) {
+  if (feeds.empty())
+    return {};
+  using ShapeAndElement = std::pair<llvm::SmallVector<int64_t, 4>, mlir::Type>;
+  auto shapeAndElement = [](mlir::Type type) -> std::optional<ShapeAndElement> {
+    if (auto shaped = llvm::dyn_cast<mlir::ShapedType>(type))
+      return std::make_pair(
+          llvm::SmallVector<int64_t, 4>(shaped.getShape().begin(),
+                                        shaped.getShape().end()),
+          shaped.getElementType());
+    if (auto tile = llvm::dyn_cast<micro::TileType>(type))
+      return std::make_pair(llvm::SmallVector<int64_t, 4>(
+                                tile.getShape().begin(), tile.getShape().end()),
+                            tile.getElementType());
+    return std::nullopt;
+  };
+
+  llvm::SmallVector<int64_t, 4> shape;
+  mlir::Type elementType;
+  if (semantics == GatherSemantics::Concatenate) {
+    if (!axis)
+      return {};
+    for (size_t i = 0; i < feeds.size(); ++i) {
+      std::optional<ShapeAndElement> read = shapeAndElement(feeds[i].getType());
+      if (!read)
+        return {};
+      if (*axis >= read->first.size())
+        return {};
+      for (int64_t extent : read->first)
+        if (ShapedType::isDynamic(extent))
+          return {};
+      if (i == 0) {
+        shape = read->first;
+        elementType = read->second;
+        shape[*axis] = 0;
+      } else if (read->second != elementType ||
+                 read->first.size() != shape.size()) {
+        return {};
+      } else {
+        for (unsigned dim = 0; dim < shape.size(); ++dim)
+          if (dim != *axis && read->first[dim] != shape[dim])
+            return {};
+      }
+      shape[*axis] += read->first[*axis];
+    }
+  } else {
+    std::optional<ShapeAndElement> read =
+        shapeAndElement(feeds.front().getType());
+    if (!read)
+      return {};
+    shape = read->first;
+    elementType = read->second;
+  }
+
+  mlir::MLIRContext *context = feeds.front().getContext();
+  if (auto firstTile =
+          llvm::dyn_cast<micro::TileType>(feeds.front().getType())) {
+    auto memoryAttr = llvm::dyn_cast_or_null<micro::MemorySpaceAttr>(memory);
+    return micro::TileType::get(
+        context, shape, elementType, firstTile.getLayout(),
+        memoryAttr ? memoryAttr : firstTile.getMemory(), firstTile.getOwner());
+  }
+  // A shaped value names no memory in its type: the staging memory is carried
+  // by the copies that produced its operands, not by the gather's result type.
+  return mlir::RankedTensorType::get(shape, elementType);
 }
 
 llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
@@ -344,12 +425,278 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
                                    ": " + reason.str());
   };
 
+  // Barrier requirements the selected plan recorded, by connection id (task
+  // B6). A barrier is emitted only where the plan's synchronization asks for
+  // one, so two independent movements that share no dependency carry none
+  // between them.
+  llvm::DenseMap<uint64_t, char> barrierFor;
+  for (const SynchronizationStep &step : plan.synchronization) {
+    if (!step.requiresBarrier)
+      continue;
+    for (ConnectionId waited : step.waitsFor)
+      barrierFor[waited] = 1;
+  }
+
+  auto emitBarrier = [&](mlir::Operation *anchor,
+                         llvm::ArrayRef<mlir::Value> tokens,
+                         ConnectionId connectionId) {
+    if (!anchor || tokens.empty())
+      return;
+    builder.setInsertionPointAfter(anchor);
+    mlir::OperationState state(anchor->getLoc(), "micro.barrier");
+    state.addOperands(tokens);
+    state.addAttribute("scope",
+                       mlir::StringAttr::get(
+                           context, micro::stringifyBarrierScope(
+                                        micro::BarrierScope::executor_group)));
+    // Which planned synchronization this barrier represents, so verification
+    // can prove the required synchronization is present rather than any
+    // barrier.
+    state.addAttribute(kConnectionAttr, u64Attr(context, connectionId));
+    builder.create(state);
+  };
+
+  // Emits one awaited copy per route hop, landing `value` in the route's final
+  // memory. Returns the final result, or null (with `reason` set) when a hop
+  // names memories the machine cannot carry data between. Every copy's token is
+  // appended to `tokens`, so a barrier can cover exactly this movement.
+  auto emitChain = [&](mlir::Value value, mlir::Operation *producer,
+                       const llvm::SmallVector<MemoryNodeId> &route,
+                       WorkloadValueId connectionValue,
+                       ConnectionId connectionId,
+                       llvm::SmallVectorImpl<mlir::Value> &tokens,
+                       std::string &reason) -> mlir::Value {
+    if (!producer || !value) {
+      reason = kNoProducerReason.str();
+      return {};
+    }
+    if (route.size() < 2) {
+      reason = kHoplessRouteReason.str();
+      return {};
+    }
+    builder.setInsertionPointAfter(producer);
+    mlir::Value current = value;
+    mlir::Operation *lastCopy = nullptr;
+    for (size_t hop = 1; hop < route.size(); ++hop) {
+      const machine::MemoryNode *from = machineModel.findMemory(route[hop - 1]);
+      const machine::MemoryNode *to = machineModel.findMemory(route[hop]);
+      if (!from || !to || from->id == to->id) {
+        reason = "a route hop names memories the machine cannot carry data "
+                 "between";
+        return {};
+      }
+      // A same-kind hop is carried only when the machine declares a link
+      // between the two concrete nodes. Whether that link is legal -- engine,
+      // transaction granule, alignment -- is the machine verifier's check; the
+      // materializer refuses to emit a movement no link backs.
+      const bool linked =
+          llvm::any_of(machineModel.links, [&](const machine::LinkEdge &edge) {
+            return edge.source == from->id && edge.destination == to->id;
+          });
+      if (!linked) {
+        reason = "a route hop names memories the machine cannot carry data "
+                 "between";
+        return {};
+      }
+      mlir::Attribute hopSrc = memoryAttrFor(context, from->kind);
+      mlir::Attribute hopDst = memoryAttrFor(context, to->kind);
+      if (!hopSrc || !hopDst) {
+        reason = "a route hop names memories the machine cannot carry data "
+                 "between";
+        return {};
+      }
+
+      mlir::Type resultType = current.getType();
+      const bool tileHop = isTileType(current.getType());
+      if (tileHop) {
+        // A tile carries its memory in the type, so the copy's result is the
+        // tile retyped into the hop's destination memory.
+        mlir::Type dstTile =
+            micro::materializedTileType(current.getType(), hopDst);
+        if (!dstTile) {
+          reason = (kMissingFactReason.str() +
+                    ": cannot construct a destination tile for the moved "
+                    "value");
+          return {};
+        }
+        resultType = dstTile;
+      }
+      mlir::OperationState copyState(producer->getLoc(),
+                                     tileHop ? "micro.tile_async_copy"
+                                             : "micro.async_copy");
+      if (tileHop) {
+        copyState.addOperands(current);
+        copyState.addTypes({resultType, tokenType});
+        copyState.addAttribute("dst_memory", hopDst);
+      } else {
+        // A shaped value keeps the generic copy: its type does not name a
+        // memory, so the source and destination are carried by attributes.
+        copyState.addOperands(current);
+        copyState.addTypes({resultType, tokenType});
+        copyState.addAttribute("src_memory", hopSrc);
+        copyState.addAttribute("dst_memory", hopDst);
+      }
+      // Target-neutral identity for the performance model (design
+      // §12.4/§23.3) and the completeness verifier (A5): which connection this
+      // hop belongs to, and the concrete memory node it lands in.
+      copyState.addAttribute(kValueAttr, u64Attr(context, connectionValue));
+      // The concrete node identity the hop crosses. Kind equality is not node
+      // identity, so both endpoints are recorded: a same-kind hop is real work
+      // exactly when `src_node` and `dst_node` name two distinct memories.
+      copyState.addAttribute(kSrcNodeAttr,
+                             mlir::StringAttr::get(context, from->id));
+      copyState.addAttribute(kDstNodeAttr,
+                             mlir::StringAttr::get(context, to->id));
+      copyState.addAttribute(kConnectionAttr, u64Attr(context, connectionId));
+      copyState.addAttribute(kHopAttr, u64Attr(context, hop));
+      mlir::Operation *copy = builder.create(copyState);
+
+      mlir::OperationState waitState(producer->getLoc(), "micro.wait");
+      waitState.addOperands(copy->getResult(1));
+      builder.create(waitState);
+
+      tokens.push_back(copy->getResult(1));
+      lastCopy = copy;
+      current = copy->getResult(0);
+    }
+    if (!lastCopy) {
+      reason = kHoplessRouteReason.str();
+      return {};
+    }
+    return lastCopy->getResult(0);
+  };
+
   std::vector<Chain> chains;
 
   for (const PlanConnection &connection : plan.connectionPlans) {
     // A `Direct` connection is materialized by construction.
     if (connection.kind == ConnectionKind::Direct)
       continue;
+
+    // The endpoint occurrences this connection serves, copied onto the chain.
+    llvm::SmallVector<PortRef> consumers(connection.consumerPorts.begin(),
+                                         connection.consumerPorts.end());
+    const std::string transform = transformIdentity(connection);
+
+    // --- gather (Reduce): explicit semantics, feeds, staging, tokens --------
+    //
+    // Nothing is inferred from the producer count: a `Reduce` without declared
+    // semantics stays Partial-only under the same `reduce_not_materialized`
+    // reason it always had. With semantics, each recorded feed occurrence is
+    // staged (when a route moves it) and combined by one `micro.gather`.
+    if (connection.kind == ConnectionKind::Reduce) {
+      if (!connection.gatherSemantics) {
+        report(connection, kReduceReason);
+        continue;
+      }
+      const bool concat =
+          *connection.gatherSemantics == GatherSemantics::Concatenate;
+      if (concat && !connection.concatAxis) {
+        report(connection, "concat gather has no axis");
+        continue;
+      }
+      if (!concat && connection.concatAxis) {
+        report(connection, "sum and max gather must not carry an axis");
+        continue;
+      }
+
+      llvm::SmallVector<mlir::Value> feeds;
+      llvm::SmallVector<mlir::Operation *> feedProducers;
+      bool resolved = true;
+      for (const PortRef &ref : connection.producerPorts) {
+        mlir::Operation *op = materializedOpForNode(kernel, ref.node);
+        if (!op)
+          op = binding.opFor(ref.node);
+        if (!op || ref.index >= op->getNumResults()) {
+          resolved = false;
+          break;
+        }
+        feeds.push_back(op->getResult(ref.index));
+        feedProducers.push_back(op);
+      }
+      if (!resolved || feeds.size() < 2) {
+        report(connection, kFeedUnresolvedReason);
+        continue;
+      }
+
+      // The staging memory is the route's destination. A feed already there
+      // needs no copy; a feed elsewhere is staged along the recorded route,
+      // each hop followed by its wait.
+      const bool staged = connection.route.size() >= 2;
+      llvm::SmallVector<mlir::Value> stagedFeeds;
+      llvm::SmallVector<mlir::Value> tokens;
+      std::string reason;
+      bool ok = true;
+      for (size_t i = 0; i < feeds.size(); ++i) {
+        if (!staged) {
+          stagedFeeds.push_back(feeds[i]);
+          continue;
+        }
+        mlir::Value moved =
+            emitChain(feeds[i], feedProducers[i], connection.route,
+                      connection.value, connection.id, tokens, reason);
+        if (!moved) {
+          ok = false;
+          break;
+        }
+        stagedFeeds.push_back(moved);
+      }
+      if (!ok) {
+        report(connection, reason);
+        continue;
+      }
+
+      mlir::Attribute stageMemory;
+      if (staged)
+        if (const machine::MemoryNode *dst =
+                machineModel.findMemory(connection.route.back()))
+          stageMemory = memoryAttrFor(context, dst->kind);
+      mlir::Type resultType =
+          gatherResultType(stagedFeeds, *connection.gatherSemantics,
+                           connection.concatAxis, stageMemory);
+      if (!resultType) {
+        report(connection, (kMissingFactReason.str() +
+                            ": cannot construct the gathered result type"));
+        continue;
+      }
+
+      // The gather and its barrier are anchored after the last feed producer.
+      // Every feed is in that producer's block, so a region boundary is never
+      // crossed silently: a feed from another region has no SSA path here and
+      // its copy would not dominate the gather.
+      mlir::Operation *anchor = feedProducers.back();
+      builder.setInsertionPointAfter(anchor);
+      mlir::OperationState gatherState(anchor->getLoc(), "micro.gather");
+      gatherState.addOperands(stagedFeeds);
+      gatherState.addTypes({resultType});
+      gatherState.addAttribute(
+          "kind",
+          mlir::StringAttr::get(
+              context, stringifyGatherSemantics(*connection.gatherSemantics)));
+      if (connection.concatAxis)
+        gatherState.addAttribute("axis",
+                                 u64Attr(context, *connection.concatAxis));
+      gatherState.addAttribute(kValueAttr, u64Attr(context, connection.value));
+      gatherState.addAttribute(kConnectionAttr,
+                               u64Attr(context, connection.id));
+      mlir::Operation *gather = builder.create(gatherState);
+
+      if (barrierFor.count(connection.id))
+        emitBarrier(gather, tokens, connection.id);
+
+      Chain chain;
+      chain.value = connection.value;
+      chain.route = connection.route;
+      chain.transform = transform;
+      chain.source = feeds.front();
+      for (size_t i = 1; i < feeds.size(); ++i)
+        chain.altSources.push_back(feeds[i]);
+      chain.result = gather->getResult(0);
+      chain.dstMemory = stageMemory;
+      chain.consumers = std::move(consumers);
+      chains.push_back(std::move(chain));
+      continue;
+    }
 
     if (connection.kind != ConnectionKind::Transfer &&
         connection.kind != ConnectionKind::TransferAndTransform &&
@@ -358,11 +705,6 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       report(connection, unmaterializedKindReason(connection.kind));
       continue;
     }
-
-    // The endpoint occurrences this connection serves, copied onto the chain.
-    llvm::SmallVector<PortRef> consumers(connection.consumerPorts.begin(),
-                                         connection.consumerPorts.end());
-    const std::string transform = transformIdentity(connection);
 
     // An already-emitted chain for this (value, route, transform) serves this
     // connection too -- it lands the value in the same memory under the same
@@ -455,107 +797,21 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
     // One copy per hop, chained: the value moves to the first staging memory,
     // then on, until it reaches the consumer's. Each hop is followed by its own
     // wait; the intermediate value *is* the staging storage.
-    builder.setInsertionPointAfter(producer);
-    mlir::Value current = value;
-    mlir::Operation *lastCopy = nullptr;
-    bool materialized = true;
-    for (size_t hop = 1; hop < connection.route.size(); ++hop) {
-      const machine::MemoryNode *from =
-          machineModel.findMemory(connection.route[hop - 1]);
-      const machine::MemoryNode *to =
-          machineModel.findMemory(connection.route[hop]);
-      if (!from || !to || from->id == to->id) {
-        // A hop landing in the memory it started from is not a movement. A hop
-        // between two *distinct* concrete nodes is real work even when their
-        // abstract kinds are equal.
-        materialized = false;
-        break;
-      }
-      // A same-kind hop is carried only when the machine declares a link
-      // between the two concrete nodes. Whether that link is legal -- engine,
-      // transaction granule, alignment -- is the machine verifier's check; the
-      // materializer refuses to emit a movement no link backs.
-      const bool linked =
-          llvm::any_of(machineModel.links, [&](const machine::LinkEdge &edge) {
-            return edge.source == from->id && edge.destination == to->id;
-          });
-      if (!linked) {
-        materialized = false;
-        break;
-      }
-      mlir::Attribute hopSrc = memoryAttrFor(context, from->kind);
-      mlir::Attribute hopDst = memoryAttrFor(context, to->kind);
-      if (!hopSrc || !hopDst) {
-        materialized = false;
-        break;
-      }
-
-      mlir::Type resultType = current.getType();
-      const bool tileHop = isTileType(current.getType());
-      if (tileHop) {
-        // A tile carries its memory in the type, so the copy's result is the
-        // tile retyped into the hop's destination memory.
-        mlir::Type dstTile =
-            micro::materializedTileType(current.getType(), hopDst);
-        if (!dstTile) {
-          materialized = false;
-          bound.unmaterialized.push_back(
-              "value " + std::to_string(connection.value) + ": " +
-              kMissingFactReason.str() +
-              ": cannot construct a destination tile for the moved value");
-          break;
-        }
-        resultType = dstTile;
-      }
-      mlir::OperationState copyState(producer->getLoc(),
-                                     tileHop ? "micro.tile_async_copy"
-                                             : "micro.async_copy");
-      if (tileHop) {
-        copyState.addOperands(current);
-        copyState.addTypes({resultType, tokenType});
-        copyState.addAttribute("dst_memory", hopDst);
-      } else {
-        // A shaped value keeps the generic copy: its type does not name a
-        // memory, so the source and destination are carried by attributes.
-        copyState.addOperands(current);
-        copyState.addTypes({resultType, tokenType});
-        copyState.addAttribute("src_memory", hopSrc);
-        copyState.addAttribute("dst_memory", hopDst);
-      }
-      // Target-neutral identity for the performance model (design
-      // §12.4/§23.3) and the completeness verifier (A5): which connection this
-      // hop belongs to, and the concrete memory node it lands in.
-      copyState.addAttribute(kValueAttr, u64Attr(context, connection.value));
-      // The concrete node identity the hop crosses. Kind equality is not node
-      // identity, so both endpoints are recorded: a same-kind hop is real work
-      // exactly when `src_node` and `dst_node` name two distinct memories.
-      copyState.addAttribute(kSrcNodeAttr,
-                             mlir::StringAttr::get(context, from->id));
-      copyState.addAttribute(kDstNodeAttr,
-                             mlir::StringAttr::get(context, to->id));
-      copyState.addAttribute(kConnectionAttr, u64Attr(context, connection.id));
-      copyState.addAttribute(kHopAttr, u64Attr(context, hop));
-      mlir::Operation *copy = builder.create(copyState);
-
-      mlir::OperationState waitState(producer->getLoc(), "micro.wait");
-      waitState.addOperands(copy->getResult(1));
-      builder.create(waitState);
-
-      lastCopy = copy;
-      current = copy->getResult(0);
-    }
-
-    if (!materialized || !lastCopy) {
-      report(
-          connection,
-          "a route hop names memories the machine cannot carry data between");
+    llvm::SmallVector<mlir::Value> tokens;
+    std::string reason;
+    mlir::Value moved =
+        emitChain(value, producer, connection.route, connection.value,
+                  connection.id, tokens, reason);
+    if (!moved) {
+      report(connection, reason);
       continue;
     }
+    mlir::Operation *lastCopy = moved.getDefiningOp();
 
     // A transfer-and-transform moved the value; the conversion itself is the
     // same target-neutral `micro.transform`, emitted after the movement so the
     // consumer reads the layout it requires.
-    mlir::Value produced = lastCopy->getResult(0);
+    mlir::Value produced = moved;
     if (connection.kind == ConnectionKind::TransferAndTransform) {
       if (!connection.transform) {
         report(connection, "transfer-and-transform carries no maps to emit");
@@ -568,6 +824,11 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
         transformOp->setAttr(kConnectionAttr, u64Attr(context, connection.id));
       }
     }
+
+    // A movement the plan's synchronization marks as needing a barrier gets one
+    // over the tokens it produced; a movement that does not gets none.
+    if (barrierFor.count(connection.id))
+      emitBarrier(produced.getDefiningOp(), tokens, connection.id);
 
     Chain chain;
     chain.value = connection.value;
@@ -602,7 +863,12 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
         mlir::Value current = resolveThroughTransparent(operand->get());
         if (current == chain.result)
           continue;
-        if (current != chain.source) {
+        // A gather combines several feeds, so its consumer may currently read
+        // any one of them; a movement has the single source.
+        bool readsSource = current == chain.source;
+        for (const mlir::Value &alt : chain.altSources)
+          readsSource |= current == alt;
+        if (!readsSource) {
           bound.unmaterialized.push_back(
               "value " + std::to_string(chain.value) + ": " +
               kNoConsumerReason.str() + " (node " + std::to_string(ref.node) +

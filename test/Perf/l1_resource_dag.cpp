@@ -857,4 +857,76 @@ TEST(L1ResourceDag, AMappedOpChargesTheEngineItsExecutorOwns) {
   EXPECT_EQ(dagB->events[0].resourceName, "vpu.b");
 }
 
+//===----------------------------------------------------------------------===//
+// Gather and barrier (task B6)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Two producer tiles combined by an explicit `sum` gather, followed by a
+/// collective barrier. Neither op may fall through the zero-cost path: the
+/// gather is compute and the barrier is synchronization.
+constexpr const char *kGatherBarrierKernel = R"MLIR(
+module {
+  micro.kernel @gather_barrier {
+    %a = micro.tile_alloc : !micro.tile<8xf32, memory = #micro.memory<sram>>
+    %b = micro.tile_alloc : !micro.tile<8xf32, memory = #micro.memory<sram>>
+    %g = micro.gather %a, %b kind = "sum" : !micro.tile<8xf32, memory = #micro.memory<sram>>, !micro.tile<8xf32, memory = #micro.memory<sram>> -> !micro.tile<8xf32, memory = #micro.memory<sram>>
+    micro.barrier scope = "executor_group"
+    micro.yield
+  }
+}
+)MLIR";
+
+} // namespace
+
+TEST(L1ResourceDag, GatherIsComputeAndBarrierIsSynchronization) {
+  auto parsed = parseKernel(kGatherBarrierKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 2u);
+
+  // The gather is charged as compute on the vector engine, over its elements.
+  const MicroEvent &gather = dag->events[0];
+  EXPECT_EQ(gather.kind, EventKind::Reduce);
+  EXPECT_EQ(gather.costKind, mapping::CostEventKind::Compute);
+  EXPECT_EQ(gather.resource, ResourceKind::VectorEngine);
+  EXPECT_EQ(gather.workItems, 8u);
+
+  // The barrier is its own synchronization event, charged the machine's
+  // barrier cost -- not free program order and not a DMA transfer.
+  const MicroEvent &barrier = dag->events[1];
+  EXPECT_EQ(barrier.kind, EventKind::Barrier);
+  EXPECT_EQ(barrier.costKind, mapping::CostEventKind::Synchronization);
+  EXPECT_EQ(barrier.resource, ResourceKind::Sync);
+  EXPECT_EQ(barrier.minCycles, model.sync.barrierCycles);
+}
+
+TEST(L1ResourceDag, BarrierDependsOnTheTokensItCovers) {
+  auto parsed = parseKernel(R"MLIR(
+module {
+  micro.kernel @barrier_on_copy {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.barrier %tok scope = "executor_group"
+    micro.yield
+  }
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 2u);
+  EXPECT_EQ(dag->events[0].kind, EventKind::AsyncCopy);
+  ASSERT_EQ(dag->events[1].kind, EventKind::Barrier);
+  // The barrier waits on the token the copy produced.
+  ASSERT_EQ(dag->events[1].deps.size(), 1u);
+  EXPECT_EQ(dag->events[1].deps[0], dag->events[0].id);
+}
+
 } // namespace mlir::llk::perf

@@ -445,9 +445,101 @@ LogicalResult ReduceOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
-// Concrete loop/sync op verifiers and parsers
+// Gather and barrier verifiers
 //===----------------------------------------------------------------------===//
 
+/// The static shape and element type a value states, whether it is a
+/// `!micro.tile` or a plain shaped type. A gather may combine either, so both
+/// are read here; a value that is neither is refused by the caller.
+static std::optional<std::pair<llvm::ArrayRef<int64_t>, Type>>
+gatherShapeAndElement(Type type) {
+  if (auto shaped = dyn_cast<ShapedType>(type))
+    return std::make_pair(shaped.getShape(), shaped.getElementType());
+  if (auto tile = dyn_cast<TileType>(type))
+    return std::make_pair(tile.getShape(), tile.getElementType());
+  return std::nullopt;
+}
+
+LogicalResult GatherOp::verify() {
+  std::optional<GatherKind> kind = symbolizeGatherKind(getKind());
+  if (!kind)
+    return emitOpError("unknown gather kind '")
+           << getKind() << "' (expected sum, max, or concat)";
+
+  // A gather combines producers; fewer than two is not a gather.
+  if (getInputs().size() < 2)
+    return emitOpError("gather requires at least two inputs");
+
+  auto result = gatherShapeAndElement(getResult().getType());
+  if (!result)
+    return emitOpError("gather result must be a tile or shaped type");
+
+  SmallVector<llvm::ArrayRef<int64_t>> shapes;
+  for (Value input : getInputs()) {
+    auto shapeAndElement = gatherShapeAndElement(input.getType());
+    if (!shapeAndElement)
+      return emitOpError("gather inputs must be tile or shaped types");
+    if (shapeAndElement->second != result->second)
+      return emitOpError("gather input and result element types must match");
+    shapes.push_back(shapeAndElement->first);
+  }
+
+  if (*kind == GatherKind::concat) {
+    std::optional<int64_t> axis = getAxis();
+    if (!axis)
+      return emitOpError("concat gather requires an axis");
+    if (*axis < 0 || static_cast<uint64_t>(*axis) >= result->first.size())
+      return emitOpError("concat axis must be within the result rank");
+    unsigned position = static_cast<unsigned>(*axis);
+    // Every non-axis extent must match the result and be statically known; the
+    // axis extent must be exactly the sum of the inputs' extents. An unknown
+    // extent has no exact resulting extent, so it is refused rather than
+    // guessed.
+    int64_t axisExtent = 0;
+    for (llvm::ArrayRef<int64_t> shape : shapes) {
+      if (shape.size() != result->first.size())
+        return emitOpError("concat input and result ranks must match");
+      for (unsigned dim = 0; dim < shape.size(); ++dim) {
+        if (dim == position)
+          continue;
+        if (ShapedType::isDynamic(shape[dim]) ||
+            ShapedType::isDynamic(result->first[dim]) ||
+            shape[dim] != result->first[dim])
+          return emitOpError(
+              "concat gather requires every non-axis extent to match exactly");
+      }
+      if (ShapedType::isDynamic(shape[position]))
+        return emitOpError(
+            "concat gather requires statically known input extents");
+      axisExtent += shape[position];
+    }
+    if (ShapedType::isDynamic(result->first[position]) ||
+        axisExtent != result->first[position])
+      return emitOpError("concat result extent along the axis must equal the "
+                         "sum of the input extents");
+    return success();
+  }
+
+  // Sum and Max combine like-for-like operands and must not carry an axis.
+  if (getAxis())
+    return emitOpError("sum and max gather must not carry an axis");
+  for (llvm::ArrayRef<int64_t> shape : shapes)
+    if (shape != result->first)
+      return emitOpError(
+          "sum and max gather inputs and result must have the same shape");
+  return success();
+}
+
+LogicalResult BarrierOp::verify() {
+  if (!symbolizeBarrierScope(getScope()))
+    return emitOpError("unknown barrier scope '")
+           << getScope() << "' (expected executor_group)";
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Concrete loop/sync op verifiers and parsers
+//===----------------------------------------------------------------------===//
 /// Verifies a loop step is positive when statically known.
 static LogicalResult verifyStaticPositiveStep(Operation *op, Value step) {
   if (auto constantOp = step.getDefiningOp<arith::ConstantOp>()) {

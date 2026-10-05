@@ -993,6 +993,45 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     return llvm::Error::success();
   }
 
+  if (auto gather = llvm::dyn_cast<micro::GatherOp>(op)) {
+    // A gather combines several producer values, so it is real compute work on
+    // the engine the plan selected -- charged like the reduction it performs,
+    // never folded into the zero-cost path. Its semantics must be one the model
+    // understands; an undeclared or unknown kind is rejected rather than
+    // charged some invented cost.
+    if (!micro::symbolizeGatherKind(gather.getKind()))
+      return invalid("kernel '" + kernelName +
+                     "' uses micro.gather: unknown "
+                     "gather kind '" +
+                     gather.getKind().str() + "'");
+    std::string reason;
+    const machine::ComputeNode *engine =
+        pickVectorEngine(reason, mappedExecutor(op));
+    if (!engine)
+      return invalid("kernel '" + kernelName +
+                     "' uses micro.gather: " + reason);
+
+    TileInfo resultInfo = describeType(gather.getResult().getType());
+    MicroEvent event;
+    event.kind = EventKind::Reduce;
+    event.resource = ResourceKind::VectorEngine;
+    event.resourceName = engine->id;
+    event.workItems = resultInfo.elements();
+    event.minCycles =
+        vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
+    event.sourceOpName = op.getName().getStringRef().str();
+    event.tileShape = shapeString(resultInfo.shape);
+    event.tileLayout = resultInfo.layout;
+    event.tileMemory = resultInfo.memory;
+    event.tileOwner = resultInfo.owner;
+    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
+
+    uint32_t id =
+        addEvent(std::move(event), state, producerDeps(gather.getInputs()));
+    producers[gather.getResult()] = id;
+    return llvm::Error::success();
+  }
+
   if (auto transform = llvm::dyn_cast<micro::TransformOp>(op)) {
     // A conversion is real work: it runs on a compute capability like the other
     // mapped elementwise work, and its selected resource is the executor the
@@ -1071,6 +1110,27 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.minCycles = machine.sync.waitCycles;
     event.sourceOpName = op.getName().getStringRef().str();
     addEvent(std::move(event), state, producerDeps(wait.getTokens()));
+    return llvm::Error::success();
+  }
+
+  if (auto barrier = llvm::dyn_cast<micro::BarrierOp>(op)) {
+    // A barrier is charged as synchronization, not as free program order. Its
+    // scope must be one the dialect and the machine can express; an unknown
+    // scope is rejected rather than silently treated as a full-machine fence.
+    if (!micro::symbolizeBarrierScope(barrier.getScope()))
+      return invalid("kernel '" + kernelName +
+                     "' uses micro.barrier: unknown "
+                     "barrier scope '" +
+                     barrier.getScope().str() + "'");
+    MicroEvent event;
+    event.kind = EventKind::Barrier;
+    event.resource = ResourceKind::Sync;
+    event.resourceName = "sync";
+    event.minCycles = machine.sync.barrierCycles;
+    event.sourceOpName = op.getName().getStringRef().str();
+    // A barrier depends on every token it covers, so the work it orders cannot
+    // be scheduled as if the barrier were absent.
+    addEvent(std::move(event), state, producerDeps(barrier.getTokens()));
     return llvm::Error::success();
   }
 

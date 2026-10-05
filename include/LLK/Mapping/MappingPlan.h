@@ -33,6 +33,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -320,6 +321,35 @@ enum class ConnectionKind {
 llvm::StringRef stringifyConnectionKind(ConnectionKind kind);
 std::optional<ConnectionKind> symbolizeConnectionKind(llvm::StringRef text);
 
+/// The explicit combination a multi-producer (`Reduce`) connection performs
+/// (task B6). Nothing is inferred from topology: a connection that gathers
+/// several producers and declares no semantics cannot be materialized, and the
+/// stable reason names that. The table is hand-written here rather than in a
+/// `.td` enum because the target-neutral mapping core links no dialect, and the
+/// same three words are the Micro `micro.gather` kinds.
+enum class GatherSemantics { Sum, Max, Concatenate };
+
+inline llvm::StringRef stringifyGatherSemantics(GatherSemantics semantics) {
+  switch (semantics) {
+  case GatherSemantics::Sum:
+    return "sum";
+  case GatherSemantics::Max:
+    return "max";
+  case GatherSemantics::Concatenate:
+    return "concat";
+  }
+  return "";
+}
+
+inline std::optional<GatherSemantics>
+symbolizeGatherSemantics(llvm::StringRef text) {
+  return llvm::StringSwitch<std::optional<GatherSemantics>>(text)
+      .Case("sum", GatherSemantics::Sum)
+      .Case("max", GatherSemantics::Max)
+      .Case("concat", GatherSemantics::Concatenate)
+      .Default(std::nullopt);
+}
+
 /// How one value reaches one or more consumers.
 struct ConnectionPlan {
   ConnectionId id = 0;
@@ -337,6 +367,14 @@ struct ConnectionPlan {
   /// The several producers a `Reduce` gathers; empty for every other kind,
   /// where `producer` is the single source.
   llvm::SmallVector<InstanceId> producers;
+  /// The explicit combination semantics of a `Reduce` (gather). Unset for every
+  /// other kind and for a multi-producer connection that has not declared what
+  /// its combination means -- which is exactly the connection that cannot be
+  /// materialized (task B6). Nothing is inferred from the producer count.
+  std::optional<GatherSemantics> gatherSemantics;
+  /// The axis a `Concatenate` gather joins along. Set exactly when the
+  /// semantics is `Concatenate`; a `Sum`/`Max` gather carries no axis.
+  std::optional<uint64_t> concatAxis;
   WorkloadValueId value = 0;
   ConnectionKind kind = ConnectionKind::Direct;
   llvm::SmallVector<MemoryNodeId> memoryRoute;
@@ -404,6 +442,17 @@ struct PlanConnection {
   /// as two connections carry one value along different routes. Empty for a
   /// plan built without consumer associations.
   llvm::SmallVector<InstanceId> consumers;
+  /// The explicit combination semantics of a `Reduce` (gather) connection and
+  /// the axis a `Concatenate` joins along, copied from the `ConnectionPlan`.
+  /// Unset for every non-gather connection and for a multi-producer connection
+  /// whose semantics were never declared -- the case that stays Partial-only
+  /// with a stable reason instead of being materialized as an assumed sum.
+  std::optional<GatherSemantics> gatherSemantics;
+  std::optional<uint64_t> concatAxis;
+  /// The producer-side value occurrences a gather combines, in the order a
+  /// `Concatenate` joins them. Empty for every non-gather connection; the
+  /// single `producerPort` above remains the one producer of a movement.
+  llvm::SmallVector<PortRef> producerPorts;
   /// The producer-side result occurrence this connection reads and the
   /// consumer-side operand occurrences it serves, copied from the
   /// `ConnectionPlan`. The `consumers` instance list above is a compatibility

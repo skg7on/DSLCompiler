@@ -222,3 +222,52 @@ func.func @test_tile_reduce(%scores : !micro.tile<32x64xf32>) {
   %p = micro.reduce "product" %scores {axis = 0 : i64} : !micro.tile<32x64xf32> -> !micro.tile<64xf32>
   return
 }
+
+//===----------------------------------------------------------------------===//
+// micro.gather — combine several producers under explicit semantics
+//===----------------------------------------------------------------------===//
+
+// The combination is explicit and round-trips: `sum` and `max` combine
+// like-for-like shape/type, and carry no axis.
+// CHECK-LABEL: func.func @test_gather_sum
+func.func @test_gather_sum(%a : !micro.tile<32x64xf32>, %b : !micro.tile<32x64xf32>) {
+  // CHECK: micro.gather %{{.*}}, %{{.*}} kind = "sum" : !micro.tile<32x64xf32>, !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  %r = micro.gather %a, %b kind = "sum" : !micro.tile<32x64xf32>, !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @test_gather_max
+func.func @test_gather_max(%a : !micro.tile<32x64xf32>, %b : !micro.tile<32x64xf32>) {
+  // CHECK: micro.gather %{{.*}}, %{{.*}} kind = "max" : !micro.tile<32x64xf32>, !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  %r = micro.gather %a, %b kind = "max" : !micro.tile<32x64xf32>, !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  return
+}
+
+// A concatenation names the axis and produces exactly the summed extent along
+// it, with every other extent matching.
+// CHECK-LABEL: func.func @test_gather_concat
+func.func @test_gather_concat(%a : !micro.tile<32x64xf32>, %b : !micro.tile<32x32xf32>) {
+  // CHECK: micro.gather %{{.*}}, %{{.*}} kind = "concat" axis = 1 : !micro.tile<32x64xf32>, !micro.tile<32x32xf32> -> !micro.tile<32x96xf32>
+  %r = micro.gather %a, %b kind = "concat" axis = 1 : !micro.tile<32x64xf32>, !micro.tile<32x32xf32> -> !micro.tile<32x96xf32>
+  return
+}
+
+//===----------------------------------------------------------------------===//
+// micro.barrier — executor-group barrier over dependency tokens
+//===----------------------------------------------------------------------===//
+
+// CHECK-LABEL: func.func @test_barrier
+func.func @test_barrier(%tok : !micro.async_token) {
+  // CHECK: micro.barrier %{{.*}} scope = "executor_group"
+  micro.barrier %tok scope = "executor_group"
+  return
+}
+
+// A collective barrier carries no token: the group itself is the dependency.
+// CHECK-LABEL: func.func @test_barrier_collective
+func.func @test_barrier_collective() {
+  // CHECK: micro.barrier scope = "executor_group"
+  micro.barrier scope = "executor_group"
+  return
+}
+

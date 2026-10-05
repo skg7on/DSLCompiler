@@ -765,6 +765,65 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       }
     }
 
+    // Task B6: a fully materialized plan that records a synchronization
+    // requiring a barrier must have that barrier represented in the IR. A
+    // required barrier the kernel does not express is synchronization the
+    // binding silently dropped, so it is rejected rather than passed. An
+    // unmaterialized (partial) plan is exempt: it is honestly reporting what it
+    // could not build.
+    const bool fullyMaterialized = [&] {
+      if (auto materialized = plan.getAs<mlir::BoolAttr>("materialized"))
+        return materialized.getValue();
+      return true;
+    }();
+    if (fullyMaterialized) {
+      if (mlir::Attribute rawSync = plan.get("synchronization")) {
+        auto sync = mlir::dyn_cast<mlir::ArrayAttr>(rawSync);
+        if (!sync) {
+          failMetadata(bindError(
+              where + ": micro.plan 'synchronization' is not an array"));
+          return;
+        }
+        for (mlir::Attribute element : sync) {
+          auto entry = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+          if (!entry) {
+            failMetadata(
+                bindError(where + ": micro.plan synchronization entry is not a "
+                                  "dictionary"));
+            return;
+          }
+          auto barrier = entry.getAs<mlir::BoolAttr>("requires_barrier");
+          if (!barrier || !barrier.getValue())
+            continue;
+          llvm::SmallVector<uint64_t, 2> waited;
+          if (auto waits = entry.getAs<mlir::ArrayAttr>("waits_for"))
+            for (mlir::Attribute id : waits)
+              if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(id))
+                waited.push_back(integer.getValue().getZExtValue());
+          bool represented = false;
+          kernel->walk([&](mlir::Operation *op) {
+            if (represented || op->getName().getStringRef() != "micro.barrier")
+              return;
+            if (waited.empty()) {
+              represented = true;
+              return;
+            }
+            if (auto stamped =
+                    op->getAttrOfType<mlir::IntegerAttr>(kConnectionAttr))
+              represented =
+                  llvm::is_contained(waited, stamped.getValue().getZExtValue());
+          });
+          if (!represented) {
+            fail(DiagnosticCode::InvalidMappingMetadata,
+                 where +
+                     ": the plan requires synchronization the kernel does not "
+                     "express (no micro.barrier for the waited connection)");
+            return;
+          }
+        }
+      }
+    }
+
     kernel->walk([&](mlir::Operation *op) {
       if (failure)
         return;

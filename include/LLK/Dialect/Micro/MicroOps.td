@@ -262,6 +262,63 @@ def Micro_ReduceOp : Micro_Op<"reduce"> {
 }
 
 //===----------------------------------------------------------------------===//
+// micro.gather — combine several producers under explicit semantics
+//===----------------------------------------------------------------------===//
+
+def Micro_GatherOp : Micro_Op<"gather"> {
+  let summary = "Combine several producer values under declared semantics";
+  let description = [{
+        Gathers two or more producer values into one result under an explicit
+        combination semantics, named by `kind`:
+
+          sum     elementwise sum; every input and the result share one shape
+                  and element type
+          max     elementwise maximum; same shape/type requirement as sum
+          concat  concatenation along `axis`; the result's extent along that
+                  axis is exactly the sum of the inputs' extents, and every
+                  other extent matches
+
+        The semantics are never inferred from how many producers feed the
+        value: a gather states what the combination *means*, and a connection
+        that does not declare one is not materialized. `axis` is required for
+        `concat` and rejected for `sum`/`max`.
+    }];
+
+  let arguments = (ins Variadic<AnyType>:$inputs, StrAttr:$kind,
+      OptionalAttr<I64Attr>:$axis);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = [{
+        $inputs `kind` `=` $kind (`axis` `=` $axis^)? attr-dict
+        `:` type($inputs) `->` type($result)
+    }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.barrier — executor-group barrier over dependency tokens
+//===----------------------------------------------------------------------===//
+
+def Micro_BarrierOp : Micro_Op<"barrier"> {
+  let summary = "Executor-group barrier over dependency tokens";
+  let description = [{
+        Blocks its scope until every dependency token has completed. The scope
+        is generic (`executor_group`): a barrier names the executor group whose
+        work must agree, not a concrete target resource. It is emitted only
+        where the selected plan's synchronization requires one; two independent
+        movements that share no dependency carry no barrier between them.
+    }];
+
+  let arguments = (ins Variadic<Micro_AsyncToken>:$tokens, StrAttr:$scope);
+
+  let assemblyFormat = "$tokens `scope` `=` $scope attr-dict";
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // micro.for — temporal loop
 //===----------------------------------------------------------------------===//
 
