@@ -3,6 +3,7 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CostModel.h"
+#include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/WorkloadGraph.h"
@@ -487,6 +488,38 @@ TEST(CostEvent, PlanEventsNormalizeAGather) {
   EXPECT_EQ(dag->events[0].event.resource, "vpu");
   EXPECT_EQ(dag->events[0].workItems, 8u);
   EXPECT_DOUBLE_EQ(dag->events[0].event.cost.latencyCycles, 1.0);
+}
+
+// A plan scored before storage finalization gets a synthesized step DAG. Its
+// dependency edges must be real: the movement follows the producer's compute
+// and the consumer follows the movement -- a step-id collision once made both
+// edges vanish, so every event started at t=0.
+TEST(CostEvent, SynthesizedStepsKeepTheirDependencyEdges) {
+  CoveringPlan plan = twoHopPlan();
+  plan.steps.clear();
+  plan.stepEdges.clear();
+
+  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, planEventMachine());
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 6u);
+
+  // The first transfer hop (event 2) follows the producer's compute (event 0).
+  ASSERT_EQ(dag->events[2].event.kind, CostEventKind::TransferHop);
+  EXPECT_EQ(dag->events[2].deps, (std::vector<uint32_t>{0}));
+  // The consumer's compute (event 1) follows the movement's last wait (5).
+  ASSERT_EQ(dag->events[1].event.kind, CostEventKind::Compute);
+  EXPECT_EQ(dag->events[1].deps, (std::vector<uint32_t>{5}));
+
+  // Scheduling confirms it: no event starts before an event it depends on has
+  // finished, so the movement is not charged as if it began at zero.
+  EventScheduleResult schedule =
+      scheduleNormalizedEvents(dag->events, planEventMachine());
+  for (const ScheduledEvent &event : schedule.entries)
+    for (uint32_t dep : dag->events[event.id].deps)
+      EXPECT_LE(schedule.entries[dep].finish, event.start) << event.id;
+  // The consumer cannot start before the producer's compute and both hops.
+  EXPECT_GE(schedule.entries[1].start, schedule.entries[5].finish);
+  EXPECT_GT(schedule.entries[1].start, 0u);
 }
 
 TEST(CostEvent, PlanEventsRejectAnUnknownStrictFact) {

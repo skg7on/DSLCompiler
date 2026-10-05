@@ -516,6 +516,16 @@ PlanId computePlanId(const CoveringPlan &plan) {
   return stableHash(canonicalPlanString(plan));
 }
 
+llvm::StringRef stringifyPlanScoreSource(PlanScoreSource source) {
+  switch (source) {
+  case PlanScoreSource::Accumulation:
+    return "accumulation";
+  case PlanScoreSource::Schedule:
+    return "schedule";
+  }
+  return "accumulation";
+}
+
 std::string transformExecutorFor(const CoveringPlan &plan,
                                  const PlanConnection &connection) {
   for (const PlanPlacement &placement : plan.placements)

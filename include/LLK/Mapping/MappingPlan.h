@@ -498,6 +498,14 @@ struct PlanConnection {
   mlir::Type valueType;
 };
 
+/// Where a plan's final score came from (task B8). A score is only a schedule
+/// when the plan's normalized events could be built; when an unknown strict
+/// fact prevents that, the additive accumulation is reported *as* the
+/// accumulation, never presented as a scheduled latency.
+enum class PlanScoreSource { Accumulation, Schedule };
+
+llvm::StringRef stringifyPlanScoreSource(PlanScoreSource source);
+
 /// A complete executable proposal covering every required node.
 struct CoveringPlan {
   PlanId id = 0;
@@ -537,6 +545,9 @@ struct CoveringPlan {
   /// named so it is never confused with the scheduled final score. Excluded
   /// from `canonicalPlanString`: it is a search-internal quantity, not content.
   Cost accumulatedCost;
+  /// Whether `totalCost` is the shared schedule's latency or the accumulation
+  /// fallback. A reader must not treat an `Accumulation` score as scheduled.
+  PlanScoreSource scoreSource = PlanScoreSource::Accumulation;
   PlanDiagnostics diagnostics;
 
   // --- persisted selected state (schema v2, task B1) ------------------------

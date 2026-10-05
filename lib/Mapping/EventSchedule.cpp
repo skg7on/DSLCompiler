@@ -93,9 +93,14 @@ scheduleNormalizedEvents(llvm::ArrayRef<PlanCostEvent> events,
   std::vector<uint32_t> remaining(count, 0);
   std::vector<std::vector<uint32_t>> dependents(count);
 
+  // A dependency is honored whatever its id order. A plan's normalized events
+  // can list a producer after its consumer (a synthesized step DAG is ordered
+  // by covered node, not by emission), so the scheduler must not assume an edge
+  // points backward -- silently dropping a forward edge would schedule the
+  // dependent at zero and corrupt the score.
   for (size_t id = 0; id < count; ++id) {
     for (uint32_t dep : events[id].deps) {
-      if (dep >= id)
+      if (dep == id || dep >= count)
         continue;
       ++remaining[id];
       dependents[dep].push_back(static_cast<uint32_t>(id));
@@ -137,7 +142,7 @@ scheduleNormalizedEvents(llvm::ArrayRef<PlanCostEvent> events,
 
     uint64_t earliest = 0;
     for (uint32_t dep : event.deps)
-      if (dep < id)
+      if (dep != id && dep < count)
         earliest = std::max(earliest, finish[dep]);
 
     // Both the resource slot and the owner slot must be free at the same time.

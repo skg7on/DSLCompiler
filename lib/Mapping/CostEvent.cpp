@@ -185,7 +185,7 @@ buildPlanEvents(const CoveringPlan &plan,
       // A `Direct` connection materializes nothing, so it gets no step.
       if (connection->kind == ConnectionKind::Direct)
         continue;
-      PlanStepId movement = next;
+      PlanStepId movement = next++;
       synthesizedSteps.push_back(
           PlanStep{movement, PlanStepKind::Movement, 0, connection->id});
       PlanStepId sync = next++;

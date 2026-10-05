@@ -96,8 +96,9 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine);
 /// the performance evaluator uses (task B8): events share a resource pool by
 /// resource name, deps are respected, and the returned `Cost` carries the
 /// overlapped critical-path latency plus the schedule's byte total. Defined in
-/// `lib/Perf/MicroCostModel.cpp`, the translation unit that owns the scheduler,
-/// so the plan score and the perf prediction cannot be two different schedules.
+/// `lib/Mapping/EventSchedule.cpp`, the translation unit that owns the shared
+/// scheduler, so the plan score and the perf prediction cannot be two different
+/// schedules.
 ///
 /// A plan event whose resource the machine does not model is scheduled on the
 /// machine's default pool for its kind rather than rejected: the schedule is a

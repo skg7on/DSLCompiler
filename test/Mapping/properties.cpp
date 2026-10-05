@@ -917,6 +917,57 @@ TEST(MappingProperties, ExactJointConnectionsMatchTheRouteOracle) {
 // overlapped latency, not the additive sum of the rule and route costs.
 //===----------------------------------------------------------------------===//
 
+/// The plan-search machine with one vector engine, so a computed plan can be
+/// scored by the shared schedule.
+MachineModel scoredPlanMachine() {
+  MachineModel model = planMachine();
+  ComputeNode vpu;
+  vpu.id = "vpu";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "e0";
+  vpu.lanes["f32"] = 8;
+  vpu.issueCycles = 1;
+  model.computes = {vpu};
+  return model;
+}
+
+TEST(MappingProperties, UnschedulablePlanScoreIsNamedNotSilentlyScheduled) {
+  Rng rng(kSeed ^ 0x0B);
+  MLIRContext context;
+  LogicalGraph logical = randomChain(2);
+  WorkloadGraph graph =
+      materialize(context, logical, identityOrder(logical.valueNames.size()),
+                  identityOrder(logical.nodes.size()));
+
+  // A machine with no compute node: the plan's events cannot be built, so the
+  // score is explicitly the accumulation, never presented as scheduled.
+  std::unique_ptr<MappingTarget> unschedulable =
+      targetWith(planMachine(), kTwoRules);
+  ASSERT_NE(unschedulable, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  MappingSearchResult fallback =
+      runSearch(graph, *unschedulable, context, options);
+  ASSERT_FALSE(fallback.plans.empty());
+  for (const CoveringPlan &plan : fallback.plans) {
+    EXPECT_EQ(plan.scoreSource, PlanScoreSource::Accumulation);
+    bool named = false;
+    for (const std::string &note : plan.diagnostics.storageNotes)
+      named |= note.find("not scheduled") != std::string::npos;
+    EXPECT_TRUE(named) << "the fallback is not named";
+  }
+
+  // With a compute node the same plan is scored by the shared schedule.
+  std::unique_ptr<MappingTarget> schedulable =
+      targetWith(scoredPlanMachine(), kTwoRules);
+  ASSERT_NE(schedulable, nullptr);
+  MappingSearchResult scheduled =
+      runSearch(graph, *schedulable, context, options);
+  ASSERT_FALSE(scheduled.plans.empty());
+  EXPECT_EQ(scheduled.plans[0].scoreSource, PlanScoreSource::Schedule);
+}
+
 /// The staged fan-out machine with a second DMA engine and a vector engine on
 /// each executor, so its two independent customer transfers can overlap and a
 /// normalized plan event can name a compute resource.
@@ -954,6 +1005,7 @@ TEST(MappingProperties, FinalScoreComesFromTheSharedSchedule) {
     MappingSearchResult result = runSearch(graph, *target, context, options);
     ASSERT_FALSE(result.plans.empty());
     const CoveringPlan &plan = result.plans[0];
+    EXPECT_EQ(plan.scoreSource, PlanScoreSource::Schedule);
 
     // The final score is what the shared scheduler produces, so two independent
     // transfers on the machine's two engines overlap: the score is strictly

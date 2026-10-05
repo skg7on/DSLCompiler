@@ -1988,17 +1988,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       llvm::Expected<Cost> scheduled = schedulePlanEvents(*planEvents, machine);
       if (scheduled) {
         plan.totalCost = *scheduled;
+        plan.scoreSource = PlanScoreSource::Schedule;
       } else {
-        llvm::consumeError(scheduled.takeError());
         plan.diagnostics.storageNotes.push_back(
-            "plan score: the shared schedule could not score this plan; the "
-            "additive accumulation is reported instead");
+            "plan score: accumulation reported, not scheduled (the shared "
+            "schedule failed: " +
+            llvm::toString(scheduled.takeError()) + ")");
       }
     } else {
-      llvm::consumeError(planEvents.takeError());
       plan.diagnostics.storageNotes.push_back(
-          "plan score: the plan's events could not be built; the additive "
-          "accumulation is reported instead");
+          "plan score: accumulation reported, not scheduled (the plan's events "
+          "could not be built: " +
+          llvm::toString(planEvents.takeError()) + ")");
     }
     plan.diagnostics.searchTruncated = result.searchTruncated;
     // Record the search point this plan came from before its content id is
