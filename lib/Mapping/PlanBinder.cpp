@@ -16,6 +16,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -98,6 +99,8 @@ std::string transformIdentity(const PlanConnection &connection) {
   text += mapText(connection.transform->srcMap);
   text += ":dst=";
   text += mapText(connection.transform->dstMap);
+  text += ":memory=" + connection.transform->memoryNode;
+  text += ":compute=" + connection.transform->computeResource;
   return text;
 }
 
@@ -223,6 +226,18 @@ std::string printedTypeOf(mlir::Type type) {
   return stream.str();
 }
 
+/// PortRef input indices exclude scheduling tokens, just like extraction.
+mlir::OpOperand *inputOperandFor(mlir::Operation *op, uint64_t index) {
+  uint64_t port = 0;
+  for (mlir::OpOperand &operand : op->getOpOperands()) {
+    if (printedTypeOf(operand.get().getType()) == "!micro.async_token")
+      continue;
+    if (port++ == index)
+      return &operand;
+  }
+  return nullptr;
+}
+
 /// The layout class a `layout_parameters` key names. Placement keys a class
 /// required by several ports as `class#<index>` so each occurrence keeps its
 /// own assignment, so the disambiguating suffix is stripped before the
@@ -253,7 +268,7 @@ LayoutValue layoutValueOf(mlir::Attribute attribute) {
 /// expose.
 LayoutContext layoutContextForRule(const RuleDef &rule,
                                    const WorkloadNode &node,
-                                   llvm::StringRef layoutId,
+                                   const RuleLayoutRequirement &requirement,
                                    const LayoutContext &fallback) {
   LayoutContext context = fallback;
   size_t inputIndex = 0;
@@ -271,13 +286,7 @@ LayoutContext layoutContextForRule(const RuleDef &rule,
     }
     if (!nodePort)
       continue;
-    bool required = false;
-    for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)
-      if (requirement.layoutId == layoutId && requirement.port == port.name) {
-        required = true;
-        break;
-      }
-    if (!required)
+    if (requirement.port != port.name)
       continue;
     if (mlir::Type element = elementTypeOf(nodePort->type))
       context.elementType = printedTypeOf(element);
@@ -387,7 +396,7 @@ llvm::Expected<uint64_t> movementUintAttr(mlir::Operation *op,
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
                        prefix + ": '" + name.str() + "' is missing");
   auto integer = mlir::dyn_cast<mlir::IntegerAttr>(raw);
-  if (!integer)
+  if (!integer || integer.getValue().getActiveBits() > 64)
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
                        prefix + ": '" + name.str() + "' is not an integer");
   return integer.getValue().getZExtValue();
@@ -648,19 +657,96 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
                        where + ": op '" + name.str() +
                            "' copies a value whose type differs from its "
                            "result");
-  // Actual SSA provenance: the copy must read kernel work -- a mapped op, or
-  // another materialized hop of the same chain -- never an arbitrary value.
-  mlir::Operation *producer = op->getOperand(0).getDefiningOp();
+  // Compare the actual operand with the original result identity, not just
+  // two bookkeeping integers. Later hops must read their immediate predecessor.
+  mlir::Value source = op->getOperand(0);
+  while (auto *logical = source.getDefiningOp()) {
+    if (!isTransparentWorkloadOp(logical->getName()) ||
+        logical->getNumOperands() == 0)
+      break;
+    source = logical->getOperand(0);
+  }
+  mlir::Operation *producer = source.getDefiningOp();
   if (!producer || enclosingKernel(producer) != kernel)
-    return verifyError(
-        DiagnosticCode::InvalidMappingMetadata,
-        where + ": op '" + name.str() +
-            "' reads a value no operation in its kernel defines");
-  if (!producer->getAttr(kMappingAttr) && !producer->hasAttr(kConnectionAttr))
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
-                       where + ": op '" + name.str() +
-                           "' reads a value that no mapped or materialized "
-                           "operation produces");
+                       where + ": movement has no kernel producer");
+  if (*hop == 1) {
+    auto mapping = producer->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
+    auto outputs = mapping
+                       ? mapping.getAs<mlir::DictionaryAttr>("output_values")
+                       : mlir::DictionaryAttr{};
+    auto result = mlir::dyn_cast<mlir::OpResult>(source);
+    auto id = outputs && result ? outputs.getAs<mlir::IntegerAttr>(
+                                      std::to_string(result.getResultNumber()))
+                                : mlir::IntegerAttr{};
+    if (!id || id.getValue().getActiveBits() > 64 ||
+        id.getValue().getZExtValue() != *value)
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": movement source is not its recorded value");
+  } else {
+    auto predecessorConnection =
+        producer->getAttrOfType<mlir::IntegerAttr>(kConnectionAttr);
+    auto predecessorHop = producer->getAttrOfType<mlir::IntegerAttr>(kHopAttr);
+    auto predecessorValue =
+        producer->getAttrOfType<mlir::IntegerAttr>(kValueAttr);
+    if (producer->getName().getStringRef() != kMaterializedMovementOp ||
+        source != producer->getResult(0) || !predecessorConnection ||
+        !predecessorHop || !predecessorValue ||
+        predecessorConnection.getValue().getActiveBits() > 64 ||
+        predecessorHop.getValue().getActiveBits() > 64 ||
+        predecessorValue.getValue().getActiveBits() > 64 ||
+        predecessorConnection.getValue().getZExtValue() != *connectionId ||
+        predecessorHop.getValue().getZExtValue() != *hop - 1 ||
+        predecessorValue.getValue().getZExtValue() != *value)
+      return verifyError(
+          DiagnosticCode::InvalidMappingMetadata,
+          where + ": movement does not read the preceding connection hop");
+  }
+  if (*hop + 1 == nodes->size()) {
+    auto ports = route.getAs<mlir::ArrayAttr>("consumer_ports");
+    if (!ports || ports.empty())
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": movement records no consumer endpoints");
+    for (mlir::Attribute attr : ports) {
+      auto port = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+      auto node =
+          port ? port.getAs<mlir::IntegerAttr>("node") : mlir::IntegerAttr{};
+      auto index =
+          port ? port.getAs<mlir::IntegerAttr>("index") : mlir::IntegerAttr{};
+      if (!node || !index || node.getValue().getActiveBits() > 64 ||
+          index.getValue().getActiveBits() > 64)
+        return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                           where + ": malformed consumer endpoint");
+      mlir::Operation *consumer = nullptr;
+      kernel->walk([&](mlir::Operation *candidate) {
+        auto mapping =
+            candidate->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
+        auto candidateNode = mapping ? mapping.getAs<mlir::IntegerAttr>("node")
+                                     : mlir::IntegerAttr{};
+        if (candidateNode && candidateNode == node)
+          consumer = candidate;
+      });
+      mlir::OpOperand *operand =
+          consumer ? inputOperandFor(consumer, index.getValue().getZExtValue())
+                   : nullptr;
+      if (!operand)
+        return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                           where +
+                               ": selected consumer endpoint does not exist");
+      mlir::Value read = operand->get();
+      while (auto *logical = read.getDefiningOp()) {
+        if ((!isTransparentWorkloadOp(logical->getName()) &&
+             logical->getName().getStringRef() != "micro.transform") ||
+            logical->getNumOperands() == 0)
+          break;
+        read = logical->getOperand(0);
+      }
+      if (read != op->getResult(0))
+        return verifyError(
+            DiagnosticCode::InvalidMappingMetadata,
+            where + ": selected consumer does not read its movement");
+    }
+  }
 
   // Selected consumers: the connection's consumer set is generic metadata too,
   // so its shape is validated here with the same checked reads as every other
@@ -730,6 +816,18 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       layouts[entry.first()] = entry.second;
 
     llvm::SmallVector<mlir::NamedAttribute> attributes;
+    attributes.emplace_back(mlir::StringAttr::get(context, "node"),
+                            u64Attr(context, placement.node));
+    llvm::SmallVector<mlir::NamedAttribute> outputValues;
+    for (const auto &entry : binding.values)
+      if (auto result = mlir::dyn_cast<mlir::OpResult>(entry.second))
+        if (result.getOwner() == op)
+          outputValues.emplace_back(
+              mlir::StringAttr::get(context,
+                                    std::to_string(result.getResultNumber())),
+              u64Attr(context, entry.first));
+    attributes.emplace_back(mlir::StringAttr::get(context, "output_values"),
+                            mlir::DictionaryAttr::get(context, outputValues));
     attributes.emplace_back(mlir::StringAttr::get(context, "rule"),
                             mlir::StringAttr::get(context, placement.rule));
     attributes.emplace_back(
@@ -796,6 +894,17 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       consumers.push_back(u64Attr(context, consumer));
     attributes.emplace_back(mlir::StringAttr::get(context, "consumers"),
                             mlir::ArrayAttr::get(context, consumers));
+    llvm::SmallVector<mlir::Attribute> consumerPorts;
+    for (const PortRef &port : connection.consumerPorts) {
+      llvm::SmallVector<mlir::NamedAttribute> fields;
+      fields.emplace_back(mlir::StringAttr::get(context, "node"),
+                          u64Attr(context, port.node));
+      fields.emplace_back(mlir::StringAttr::get(context, "index"),
+                          u64Attr(context, port.index));
+      consumerPorts.push_back(mlir::DictionaryAttr::get(context, fields));
+    }
+    attributes.emplace_back(mlir::StringAttr::get(context, "consumer_ports"),
+                            mlir::ArrayAttr::get(context, consumerPorts));
     if (connection.transform) {
       llvm::SmallVector<mlir::NamedAttribute> transform;
       transform.emplace_back(
@@ -804,6 +913,15 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       transform.emplace_back(
           mlir::StringAttr::get(context, "dst"),
           mlir::StringAttr::get(context, connection.transform->dstLayout));
+      if (!connection.transform->computeResource.empty())
+        transform.emplace_back(
+            mlir::StringAttr::get(context, "compute"),
+            mlir::StringAttr::get(context,
+                                  connection.transform->computeResource));
+      if (!connection.transform->memoryNode.empty())
+        transform.emplace_back(
+            mlir::StringAttr::get(context, "memory"),
+            mlir::StringAttr::get(context, connection.transform->memoryNode));
       attributes.emplace_back(mlir::StringAttr::get(context, "transform"),
                               mlir::DictionaryAttr::get(context, transform));
     }
@@ -848,6 +966,7 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     /// transform's result when the connection carries one.
     mlir::Value result;
     llvm::SmallVector<mlir::Operation *, 4> consumers;
+    llvm::SmallVector<PortRef> consumerPorts;
   };
   std::vector<MaterializedChain> chains;
 
@@ -868,12 +987,40 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
   // `transform.srcMap` is written through `transform.dstMap`. The operation
   // names the layouts by their index relation, never by a target-owned id, so
   // it stays generic (design §13.4).
-  auto emitTransform = [&](mlir::Operation *anchor, mlir::Value input,
-                           const LayoutTransform &transform) -> mlir::Value {
+  auto emitTransform =
+      [&](mlir::Operation *anchor, mlir::Value input,
+          const LayoutTransform &transform,
+          llvm::StringRef memoryNode) -> llvm::Expected<mlir::Value> {
+    std::string memory =
+        transform.memoryNode.empty() ? memoryNode.str() : transform.memoryNode;
+    if (memory != memoryNode)
+      return bindError(
+          "bindPlan: transform placement is not at its materialized memory");
+    std::string resource = transform.computeResource;
+    if (resource.empty()) {
+      auto selected = selectTransformResource(machineModel, memory);
+      if (!selected)
+        return selected.takeError();
+      resource = *selected;
+    }
+    TransformCostInput facts;
+    facts.inputType = input.getType();
+    facts.outputType = input.getType();
+    facts.srcMap = transform.srcMap;
+    facts.dstMap = transform.dstMap;
+    facts.memoryNode = memory;
+    facts.computeResource = resource;
+    auto cost = estimateTransformCost(facts, machineModel);
+    if (!cost)
+      return cost.takeError();
     builder.setInsertionPointAfter(anchor);
     mlir::OperationState state(anchor->getLoc(), "micro.transform");
     state.addOperands(input);
     state.addTypes({input.getType()});
+    state.addAttribute("micro.compute_resource",
+                       mlir::StringAttr::get(context, resource));
+    state.addAttribute("micro.memory_node",
+                       mlir::StringAttr::get(context, memory));
     if (transform.srcMap)
       state.addAttribute("src_map", mlir::AffineMapAttr::get(transform.srcMap));
     if (transform.dstMap)
@@ -923,6 +1070,9 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       for (mlir::Operation *op : consumers)
         if (!llvm::is_contained(existing->consumers, op))
           existing->consumers.push_back(op);
+      for (const PortRef &port : connection.consumerPorts)
+        if (!llvm::is_contained(existing->consumerPorts, port))
+          existing->consumerPorts.push_back(port);
       continue;
     }
 
@@ -955,8 +1105,19 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
       chain.value = connection.value;
       chain.route = connection.route;
       chain.transform = transform;
-      chain.result = emitTransform(producer, input, *connection.transform);
+      if (connection.route.empty()) {
+        bound.unmaterialized.push_back("layout transform records no memory");
+        continue;
+      }
+      auto result = emitTransform(producer, input, *connection.transform,
+                                  connection.route.front());
+      if (!result) {
+        bound.unmaterialized.push_back(llvm::toString(result.takeError()));
+        continue;
+      }
+      chain.result = *result;
       chain.consumers = std::move(consumers);
+      chain.consumerPorts = connection.consumerPorts;
       chains.push_back(std::move(chain));
       continue;
     }
@@ -1097,7 +1258,13 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
             ": transfer-and-transform carries no maps to emit");
         continue;
       }
-      produced = emitTransform(lastCopy, produced, *connection.transform);
+      auto result = emitTransform(lastCopy, produced, *connection.transform,
+                                  connection.route.back());
+      if (!result) {
+        bound.unmaterialized.push_back(llvm::toString(result.takeError()));
+        continue;
+      }
+      produced = *result;
     }
 
     // Record the chain; its consumers are rewired once every chain is emitted,
@@ -1108,20 +1275,52 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     chain.transform = transform;
     chain.result = produced;
     chain.consumers = std::move(consumers);
+    chain.consumerPorts = connection.consumerPorts;
     chains.push_back(std::move(chain));
   }
 
-  // Rewire each chain's own consumers to what it produced. Only these
-  // operations are touched: a reader the plan placed on another route keeps
-  // reading what that route produced.
+  // Rebuild logical operand paths per use: changing a shared view in place
+  // would also redirect consumers assigned to a different connection.
+  std::function<mlir::Value(mlir::Value, mlir::Value, mlir::Value)> rewire =
+      [&](mlir::Value operand, mlir::Value original,
+          mlir::Value replacement) -> mlir::Value {
+    if (operand == original)
+      return replacement;
+    mlir::Operation *logical = operand.getDefiningOp();
+    if (!logical || !isTransparentWorkloadOp(logical->getName()) ||
+        logical->getNumOperands() == 0)
+      return operand;
+    mlir::Value source = rewire(logical->getOperand(0), original, replacement);
+    if (source == logical->getOperand(0))
+      return operand;
+    auto result = mlir::cast<mlir::OpResult>(operand);
+    mlir::Operation *clone = builder.clone(*logical);
+    clone->setOperand(0, source);
+    return clone->getResult(result.getResultNumber());
+  };
   for (const MaterializedChain &chain : chains) {
     mlir::Value original = binding.valueFor(chain.value);
     if (!original || !chain.result)
       continue;
-    for (mlir::Operation *consumer : chain.consumers)
+    if (!chain.consumerPorts.empty()) {
+      for (const PortRef &port : chain.consumerPorts) {
+        mlir::Operation *consumer = binding.opFor(port.node);
+        // Compatibility projections must agree with the explicit endpoint.
+        if (!consumer || !llvm::is_contained(chain.consumers, consumer))
+          continue;
+        mlir::OpOperand *use = inputOperandFor(consumer, port.index);
+        if (!use)
+          return bindError("bindPlan: selected consumer port does not exist");
+        builder.setInsertionPoint(consumer);
+        use->set(rewire(use->get(), original, chain.result));
+      }
+      continue;
+    }
+    for (mlir::Operation *consumer : chain.consumers) {
+      builder.setInsertionPoint(consumer);
       for (mlir::OpOperand &use : consumer->getOpOperands())
-        if (use.get() == original)
-          use.set(chain.result);
+        use.set(rewire(use.get(), original, chain.result));
+    }
   }
 
   // An executable contract refuses a plan it could not fully materialize: the
@@ -1207,6 +1406,35 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         return;
       }
 
+    llvm::DenseMap<uint64_t, mlir::Operation *> mappedNodes;
+    llvm::DenseMap<uint64_t, mlir::Operation *> mappedValues;
+    kernel->walk([&](mlir::Operation *op) {
+      if (failure)
+        return;
+      auto mapping = op->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
+      if (!mapping)
+        return;
+      if (mlir::Attribute raw = mapping.get("node")) {
+        auto node = mlir::dyn_cast<mlir::IntegerAttr>(raw);
+        if (!node || node.getValue().getActiveBits() > 64 ||
+            !mappedNodes.try_emplace(node.getValue().getZExtValue(), op).second)
+          fail(DiagnosticCode::InvalidMappingMetadata,
+               where +
+                   ": duplicate or malformed original workload node identity");
+      }
+      if (auto outputs = mapping.getAs<mlir::DictionaryAttr>("output_values"))
+        for (mlir::NamedAttribute output : outputs) {
+          auto id = mlir::dyn_cast<mlir::IntegerAttr>(output.getValue());
+          if (!id || id.getValue().getActiveBits() > 64 ||
+              !mappedValues.try_emplace(id.getValue().getZExtValue(), op)
+                   .second) {
+            fail(DiagnosticCode::InvalidMappingMetadata,
+                 where + ": duplicate or malformed original workload value "
+                         "identity");
+            return;
+          }
+        }
+    });
     kernel->walk([&](mlir::Operation *op) {
       if (failure)
         return;
@@ -1494,6 +1722,12 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
           return;
         }
     }
+    if (!rule->layoutRequirements.empty() &&
+        !mapping.get("layout_parameters")) {
+      fail(DiagnosticCode::NoLegalLayout,
+           where + ": selected rule requires solved layout assignments");
+      return;
+    }
     if (mlir::Attribute rawLayoutParameters =
             mapping.get("layout_parameters")) {
       auto byClass = mlir::dyn_cast<mlir::DictionaryAttr>(rawLayoutParameters);
@@ -1526,18 +1760,19 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       // assignment must be a complete, legal, in-domain instantiation of that
       // declaration. The values are never re-chosen: a tampered width is
       // rejected, not quietly replaced by the legal one (issue #67, stage A).
-      for (const RuleLayoutRequirement &requirement :
-           rule->layoutRequirements) {
-        bool recorded =
-            llvm::any_of(byClass, [&](const mlir::NamedAttribute &entry) {
-              return baseLayoutClass(entry.getName().getValue()) ==
-                     requirement.layoutId;
-            });
-        if (!recorded) {
+      llvm::StringMap<unsigned> counts;
+      for (const auto &requirement : rule->layoutRequirements)
+        ++counts[requirement.layoutId];
+      llvm::StringMap<const RuleLayoutRequirement *> expected;
+      for (size_t index = 0; index < rule->layoutRequirements.size(); ++index) {
+        const auto &requirement = rule->layoutRequirements[index];
+        std::string key = requirement.layoutId;
+        if (counts[key] > 1)
+          key += "#" + std::to_string(index);
+        expected[key] = &requirement;
+        if (!byClass.get(key)) {
           fail(DiagnosticCode::NoLegalLayout,
-               where + ": rule '" + *ruleId + "' requires layout '" +
-                   requirement.layoutId +
-                   "', which the mapping records no assignment for");
+               where + ": missing solved layout assignment for '" + key + "'");
           return;
         }
       }
@@ -1546,15 +1781,12 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
           return;
         llvm::StringRef layoutClass =
             baseLayoutClass(entry.getName().getValue());
-        bool required =
-            llvm::any_of(rule->layoutRequirements,
-                         [&](const RuleLayoutRequirement &requirement) {
-                           return requirement.layoutId == layoutClass;
-                         });
-        if (!required) {
+        const RuleLayoutRequirement *requirement =
+            expected.lookup(entry.getName().getValue());
+        if (!requirement) {
           fail(DiagnosticCode::NoLegalLayout,
-               where + ": rule '" + *ruleId + "' does not require layout '" +
-                   layoutClass.str() + "', which the mapping records");
+               where + ": unexpected solved layout assignment '" +
+                   entry.getName().str() + "'");
           return;
         }
         const LayoutDef *def = target.layouts().find(layoutClass);
@@ -1569,7 +1801,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
           recordedValues[parameter.getName()] =
               layoutValueOf(parameter.getValue());
         LayoutContext portContext = layoutContextForRule(
-            *rule, *lookup.node, layoutClass, LayoutContext{});
+            *rule, *lookup.node, *requirement, LayoutContext{});
         // A phase-2 binding records parameters, not maps: the map is a pure
         // function of the declaration and these values, so none is recorded
         // and `verifySolvedLayout` rebuilds it from the confirmed assignment.

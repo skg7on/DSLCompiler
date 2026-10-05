@@ -281,6 +281,20 @@ std::string canonicalCostString(const Cost &cost) {
   return out;
 }
 
+llvm::Expected<std::string>
+selectTransformResource(const machine::MachineModel &machine,
+                        llvm::StringRef memoryNode) {
+  if (!machine.findMemory(memoryNode))
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "layout transform memory is not modeled");
+  for (const auto *engine : machine.computesOfKind("vector_engine"))
+    if (machine.isVisible(memoryNode, engine->attachedTo))
+      return engine->id;
+  return llvm::createStringError(
+      llvm::inconvertibleErrorCode(),
+      "no vector resource can access layout transform memory");
+}
+
 llvm::Expected<Cost>
 estimateTransformCost(const TransformCostInput &input,
                       const machine::MachineModel &machine) {
@@ -335,6 +349,14 @@ estimateTransformCost(const TransformCostInput &input,
                 llvm::Twine(input.memoryNode) +
                 "' is not modeled by machine '" + llvm::Twine(machine.target) +
                 "'");
+
+  if (engine->kind != "vector_engine")
+    return fail("layout transform compute resource is not a vector engine");
+  const auto *memory = machine.findMemory(input.memoryNode);
+  if (!memory)
+    memory = machine.findMemoryOfKind(input.memoryNode);
+  if (memory && !machine.isVisible(memory->id, engine->attachedTo))
+    return fail("layout transform compute resource cannot access its memory");
 
   Cost cost;
   cost.localBytes = bytes;

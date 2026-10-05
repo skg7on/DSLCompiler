@@ -84,25 +84,29 @@ WorkloadGraph twoNodeGraph(mlir::MLIRContext &context,
                            llvm::StringRef producerOp = "add",
                            llvm::StringRef consumerOp = "add") {
   WorkloadGraph graph;
+  mlir::Type type;
+  if (producerOp == "produce" || consumerOp == "consume")
+    type =
+        mlir::RankedTensorType::get({32, 32}, mlir::Float32Type::get(&context));
   WorkloadValueId input =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
+      graph.addValue(WorkloadValue{0, type, "in", /*external=*/true});
   WorkloadValueId middle =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+      graph.addValue(WorkloadValue{0, type, "mid", /*external=*/false});
   WorkloadValueId output =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+      graph.addValue(WorkloadValue{0, type, "out", /*external=*/false});
 
   WorkloadNode producer;
   producer.opName = "micro.vector";
   producer.attributes = vectorAttributes(context, producerOp);
-  producer.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
-  producer.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  producer.inputs.push_back(WorkloadPort{input, type, std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, type, std::nullopt});
   graph.addNode(std::move(producer));
 
   WorkloadNode consumer;
   consumer.opName = "micro.vector";
   consumer.attributes = vectorAttributes(context, consumerOp);
-  consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
-  consumer.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
+  consumer.inputs.push_back(WorkloadPort{middle, type, std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{output, type, std::nullopt});
   graph.addNode(std::move(consumer));
 
   graph.finalize();
@@ -573,6 +577,13 @@ MachineModel transformMachine() {
   for (MemoryNode &memory : model.memories)
     if (memory.kind == "sram")
       memory.supportedLayouts = {"t.plain", "t.blocked"};
+  ComputeNode vector;
+  vector.id = "vpu";
+  vector.kind = "vector_engine";
+  vector.attachedTo = "e0";
+  vector.elementTypes = {"f32"};
+  vector.lanes["f32"] = 8;
+  model.computes.push_back(vector);
   return model;
 }
 
@@ -669,26 +680,28 @@ rule r.consume {
 /// they carry one SSA value.
 WorkloadGraph repeatedOperandGraph(mlir::MLIRContext &context) {
   WorkloadGraph graph;
+  mlir::Type type =
+      mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
   WorkloadValueId input =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
+      graph.addValue(WorkloadValue{0, type, "in", /*external=*/true});
   WorkloadValueId middle =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+      graph.addValue(WorkloadValue{0, type, "mid", /*external=*/false});
   WorkloadValueId output =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+      graph.addValue(WorkloadValue{0, type, "out", /*external=*/false});
 
   WorkloadNode producer;
   producer.opName = "micro.vector";
   producer.attributes = vectorAttributes(context, "produce");
-  producer.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
-  producer.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  producer.inputs.push_back(WorkloadPort{input, type, std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, type, std::nullopt});
   graph.addNode(std::move(producer));
 
   WorkloadNode consumer;
   consumer.opName = "micro.vector";
   consumer.attributes = vectorAttributes(context, "consume");
-  consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
-  consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
-  consumer.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
+  consumer.inputs.push_back(WorkloadPort{middle, type, std::nullopt});
+  consumer.inputs.push_back(WorkloadPort{middle, type, std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{output, type, std::nullopt});
   graph.addNode(std::move(consumer));
 
   graph.finalize();
@@ -1938,6 +1951,7 @@ TEST(CoveringSearch, DifferingBoundLayoutsSelectTheTransformFromTheSearch) {
   EXPECT_EQ(connection.kind, ConnectionKind::LayoutTransform);
   EXPECT_EQ(connection.route, (llvm::SmallVector<MemoryNodeId>{"sram.0"}));
   ASSERT_TRUE(connection.transform.has_value());
+  EXPECT_GT(plan.totalCost.latencyCycles, 2.0);
   EXPECT_EQ(connection.transform->srcLayout, "t.plain");
   EXPECT_EQ(connection.transform->dstLayout, "t.blocked");
 
@@ -3651,21 +3665,13 @@ TEST(CoveringSearch, ABoundLayoutSelectsAmongTheLayoutsARuleOffers) {
   MappingSearchOptions options;
   options.mode = SearchMode::Deterministic;
 
-  // (c) No binding: both declared layouts are materialized, as before. The
-  // plan is still found (the two layouts for one value are unattributable to
-  // an edge, which only costs the transform alternative, not the plan).
+  // No binding leaves conflicting requirements on one endpoint. Reject the
+  // candidate instead of treating both requirements as absent.
   {
     CoveringSearch search(graph, *target, context, LayoutContext{}, options);
-    llvm::Expected<MappingSearchResult> result = search.search();
-    ASSERT_TRUE(static_cast<bool>(result))
-        << llvm::toString(result.takeError());
-    ASSERT_FALSE(result->plans.empty());
-    ASSERT_FALSE(result->plans[0].placements.empty());
-    for (const PlanPlacement &placement : result->plans[0].placements) {
-      EXPECT_EQ(placement.layouts.size(), 2u);
-      EXPECT_NE(placement.layouts.find("t.plain"), placement.layouts.end());
-      EXPECT_NE(placement.layouts.find("t.blocked"), placement.layouts.end());
-    }
+    auto result = search.search();
+    ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+    EXPECT_TRUE(result->plans.empty());
   }
 
   // (a) The binding names `t.blocked`: that layout is selected and `t.plain`,
@@ -3975,4 +3981,23 @@ TEST(MappingDiagnostics, DistinctFailuresCarryDistinctCodes) {
     EXPECT_EQ(result->frontier.diagnostics[index].message,
               againResult->frontier.diagnostics[index].message);
   }
+}
+
+TEST(CoveringSearch, RejectsConflictingRequirementsOnOneEndpoint) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = repeatedOperandGraph(context);
+  std::string rules = kRepeatedConflictRules.str();
+  auto pos = rules.find("require layout operand1 satisfies t.blocked;");
+  ASSERT_NE(pos, std::string::npos);
+  rules.replace(
+      pos, std::string("require layout operand1 satisfies t.blocked;").size(),
+      "require layout operand0 satisfies t.blocked;");
+  auto target = targetWithLayouts(transformMachine(), rules, kTwoLayouts);
+  ASSERT_TRUE(target);
+  CoveringSearch search(graph, *target, context, LayoutContext{});
+  auto result = search.search();
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty())
+      << "conflicting endpoint requirements produced " << result->plans.size()
+      << " plans";
 }

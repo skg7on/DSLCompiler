@@ -842,9 +842,21 @@ LogicalResult SearchSpaceOp::verify() {
     if (auto constraint = dyn_cast<ConstraintOp>(op)) {
       for (Attribute param : constraint.getParams()) {
         StringRef name = cast<StringAttr>(param).getValue();
-        if (!params.count(name))
+        if (params.count(name))
+          continue;
+        unsigned matches = 0;
+        for (const auto &entry : params) {
+          auto role = entry.second->getAttrOfType<StringAttr>("role");
+          if (role && role.getValue() == name)
+            ++matches;
+        }
+        if (matches == 0)
           return constraint.emitOpError(
                      "constraint references unknown parameter '")
+                 << name << "'";
+        if (matches > 1)
+          return constraint.emitOpError(
+                     "constraint references ambiguous role '")
                  << name << "'";
       }
       continue;

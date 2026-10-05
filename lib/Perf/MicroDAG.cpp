@@ -963,12 +963,16 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
   }
 
   if (auto transform = llvm::dyn_cast<micro::TransformOp>(op)) {
-    // A conversion is real work: it runs on a compute capability like the other
-    // mapped elementwise work, and its selected resource is the executor the
-    // plan stamped when the op carries one.
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickVectorEngine(reason, mappedExecutor(op));
+    const machine::ComputeNode *engine = nullptr;
+    if (mlir::Attribute raw = op.getAttr("micro.compute_resource")) {
+      auto resource = mlir::dyn_cast<mlir::StringAttr>(raw);
+      engine = resource ? machine.findCompute(resource.getValue()) : nullptr;
+      if (!engine || engine->kind != "vector_engine")
+        return invalid("micro.transform selects an invalid vector resource");
+    } else {
+      engine = pickVectorEngine(reason, mappedExecutor(op));
+    }
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.transform: " + reason);
@@ -981,6 +985,13 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     std::string sourceMemory = memoryOf(transform.getSource());
     std::string destination =
         resultInfo.memory.empty() ? sourceMemory : resultInfo.memory;
+
+    if (mlir::Attribute raw = op.getAttr("micro.memory_node")) {
+      auto memory = mlir::dyn_cast<mlir::StringAttr>(raw);
+      if (!memory)
+        return invalid("micro.transform memory node is not a string");
+      destination = memory.getValue().str();
+    }
 
     // The one shared estimate the planner and the simulator both charge. An
     // unknown resource or footprint comes back as an error, never a silent

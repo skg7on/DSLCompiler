@@ -1,0 +1,25 @@
+Running main() from /Users/skg7on/Workspace/Projects/DSLCompiler/.claude/worktrees/pr114-review/third_party/googletest/googletest/src/gtest_main.cc
+Note: Google Test filter = Review114.*
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Review114
+[ RUN      ] Review114.ConflictingRequirementsOnOneEndpointMustReject
+/Users/skg7on/Workspace/Projects/DSLCompiler/.claude/worktrees/pr114-review/test/Mapping/covering_search.cpp:3993: Failure
+Value of: result->plans.empty()
+  Actual: false
+Expected: true
+conflicting endpoint requirements produced 1 plans
+
+connection=direct endpoints=2
+[  FAILED  ] Review114.ConflictingRequirementsOnOneEndpointMustReject (0 ms)
+[----------] 1 test from Review114 (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (0 ms total)
+[  PASSED  ] 0 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] Review114.ConflictingRequirementsOnOneEndpointMustReject
+
+ 1 FAILED TEST
+
+Exit code: 1

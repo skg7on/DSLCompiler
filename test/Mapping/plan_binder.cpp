@@ -410,6 +410,12 @@ compute:
     element_types: [f32]
     shapes: [[8]]
     lanes: {f32: 8}
+  - id: vpu.b
+    kind: vector_engine
+    attached_to: worker.b
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
 transfer_engines:
   - id: dma.a
     kind: dma
@@ -650,6 +656,10 @@ TEST(PlanBinder, MaterializesALayoutTransformAsATransformOp) {
   // A transform-only connection emits no copy, and exactly one transform.
   EXPECT_EQ(countOps(*bound->module, "micro.async_copy"), copiesBefore);
   EXPECT_EQ(countOps(*bound->module, "micro.transform"), transformsBefore + 1);
+  bound->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.transform")
+      EXPECT_TRUE(op->getAttrOfType<StringAttr>("micro.compute_resource"));
+  });
   EXPECT_FALSE(
       static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
 }
@@ -834,6 +844,11 @@ TEST(PlanBinder, EmitsOneChainPerRouteAndSurvivesBoth) {
   PlanConnection duplicate = first;
   duplicate.id = first.id + 1;
   duplicate.route = (first.route == direct) ? staged : direct;
+  // The two routes serve distinct operand occurrences. One endpoint cannot
+  // simultaneously read two different materialized chains.
+  ASSERT_EQ(first.consumerPorts.size(), 2u);
+  duplicate.consumerPorts.erase(duplicate.consumerPorts.begin());
+  plan->connectionPlans.front().consumerPorts.pop_back();
   plan->connectionPlans.push_back(duplicate);
 
   const size_t expectedCopies =
@@ -1456,4 +1471,78 @@ TEST(PlanBinder, RejectsAMovementOnAnUnsupportedTransferEngine) {
   std::string text = llvm::toString(std::move(e));
   EXPECT_NE(text.find("invalid_mapping_metadata"), std::string::npos) << text;
   EXPECT_NE(text.find("no_such_engine"), std::string::npos) << text;
+}
+
+TEST(PlanBinder, RejectsMissingLayoutAssignments) {
+  auto f = makeFixture();
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    ASSERT_TRUE(mapping.get("layout_parameters"));
+    NamedAttrList attrs(mapping);
+    attrs.erase("layout_parameters");
+    op->setAttr("micro.mapping", attrs.getDictionary(f.context.get()));
+  });
+  auto e = verifyMappedMicroIR(*b->module, *f.target);
+  EXPECT_TRUE(bool(e));
+  llvm::consumeError(std::move(e));
+}
+TEST(PlanBinder, RejectsMovementReadingAnotherMappedValue) {
+  auto f = makeFixture();
+  auto target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  Operation *copy = materializedCopy(*b->module);
+  ASSERT_TRUE(copy);
+  Operation *original = copy->getOperand(0).getDefiningOp();
+  ASSERT_TRUE(original);
+  ASSERT_TRUE(original->getAttr("micro.mapping"));
+  Operation *other = original->clone();
+  // Give the other producer a distinct, internally consistent identity. This
+  // exercises source/result validation rather than duplicate-node detection.
+  auto mapping = other->getAttrOfType<DictionaryAttr>("micro.mapping");
+  NamedAttrList attrs(mapping);
+  attrs.set("node",
+            IntegerAttr::get(IntegerType::get(f.context.get(), 64), 999));
+  NamedAttrList outputs;
+  outputs.set("0",
+              IntegerAttr::get(IntegerType::get(f.context.get(), 64), 999));
+  attrs.set("output_values", outputs.getDictionary(f.context.get()));
+  other->setAttr("micro.mapping", attrs.getDictionary(f.context.get()));
+  original->getBlock()->getOperations().insert(original->getIterator(), other);
+  copy->setOperand(0, other->getResult(0));
+  auto e = verifyMappedMicroIR(*b->module, **target);
+  EXPECT_TRUE(bool(e));
+  llvm::consumeError(std::move(e));
+}
+
+TEST(PlanBinder, RejectsMovementDisconnectedFromSelectedConsumer) {
+  auto f = makeFixture();
+  auto target = movementTarget();
+  ASSERT_TRUE(bool(target));
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p));
+  auto b = bindPlan(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b));
+  Operation *copy = materializedCopy(*b->module);
+  ASSERT_TRUE(copy);
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    Operation *view = op->getOperand(0).getDefiningOp()->clone();
+    op->getBlock()->getOperations().insert(op->getIterator(), view);
+    view->setOperand(0, copy->getOperand(0));
+    op->setOperand(0, view->getResult(0));
+  });
+  auto e = verifyMappedMicroIR(*b->module, **target);
+  EXPECT_TRUE(bool(e));
+  llvm::consumeError(std::move(e));
 }

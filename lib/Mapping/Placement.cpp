@@ -299,6 +299,21 @@ enumeratePlacements(const MappingCandidate &candidate,
     solvedSolutions.push_back(solved->solutions.front());
   }
 
+  // Requirements are conjunctive. An unresolved disagreement must never
+  // become an unconstrained endpoint in connection synthesis.
+  for (size_t i = 0; i < candidate.layoutRequirements.size(); ++i)
+    for (size_t j = 0; j < i; ++j) {
+      const auto &lhs = candidate.layoutRequirements[i];
+      const auto &rhs = candidate.layoutRequirements[j];
+      if (lhs.port && rhs.port && *lhs.port == *rhs.port &&
+          (lhs.layoutClass != rhs.layoutClass ||
+           solvedSolutions[i].values != solvedSolutions[j].values ||
+           solvedSolutions[i].map != solvedSolutions[j].map)) {
+        reportFailure(PlacementFailure::NoLegalLayout);
+        return std::vector<CandidateInstance>{};
+      }
+    }
+
   // How many requirements share each layout class. One class may be required by
   // more than one port of the same candidate (the same blocked layout on two
   // operands, say), and each requirement has its own port association and its
@@ -547,6 +562,33 @@ synthesizeConnections(const ConnectionRequest &request,
       plan.consumerPorts.push_back(*request.consumerPort);
   };
 
+  auto chargeTransform = [&](ConnectionPlan &plan) -> llvm::Error {
+    if (!plan.transform)
+      return llvm::Error::success();
+    auto &transform = *plan.transform;
+    transform.memoryNode = plan.memoryRoute.back();
+    auto resource = selectTransformResource(machine, transform.memoryNode);
+    if (!resource)
+      return resource.takeError();
+    transform.computeResource = *resource;
+    TransformCostInput input;
+    input.inputType = request.elementType;
+    input.outputType = request.consumerType;
+    if (auto tensor = tileAsTensor(input.inputType))
+      input.inputType = tensor;
+    if (auto tensor = tileAsTensor(input.outputType))
+      input.outputType = tensor;
+    input.srcMap = transform.srcMap;
+    input.dstMap = transform.dstMap;
+    input.memoryNode = transform.memoryNode;
+    input.computeResource = transform.computeResource;
+    auto cost = estimateTransformCost(input, machine);
+    if (!cost)
+      return cost.takeError();
+    plan.cost = addCost(plan.cost, *cost);
+    return llvm::Error::success();
+  };
+
   // Alternative 1: a direct connection -- nothing is moved and nothing is
   // transformed. §10.2 defines direct compatibility by element type, logical
   // tile shape, memory *visibility*, and affine index relation, so the two
@@ -588,7 +630,8 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.kind = ConnectionKind::LayoutTransform;
     plan.memoryRoute.push_back(request.producerMemory);
     plan.transform = transformOf();
-    plan.cost.localBytes = request.bytes;
+    if (auto error = chargeTransform(plan))
+      return std::move(error);
     assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
@@ -641,7 +684,7 @@ synthesizeConnections(const ConnectionRequest &request,
     (memoryRoute.hopCount() == 1 ? directRoutes : multiHopRoutes)
         .push_back(&memoryRoute);
 
-  auto emitRoute = [&](const MemoryRoute &memoryRoute) {
+  auto emitRoute = [&](const MemoryRoute &memoryRoute) -> llvm::Error {
     if (transformRequired) {
       // A transform that no hop can carry makes this route no alternative at
       // all: the value cannot be held in either layout regime along it. The
@@ -654,7 +697,7 @@ synthesizeConnections(const ConnectionRequest &request,
       // must be added to `ConnectionPlan`, before it can place the transform.
       if (!legalTransformHop(memoryRoute.nodes, machine,
                              *request.producerLayout, *request.consumerLayout))
-        return;
+        return llvm::Error::success();
     }
     ConnectionPlan plan;
     plan.producer = request.producer;
@@ -666,14 +709,19 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.transferEngines = memoryRoute.transferEngines;
     plan.transform = transformOf();
     plan.cost = memoryRoute.cost;
+    if (auto error = chargeTransform(plan))
+      return error;
     assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
+    return llvm::Error::success();
   };
   for (const MemoryRoute *memoryRoute : directRoutes)
-    emitRoute(*memoryRoute);
+    if (auto error = emitRoute(*memoryRoute))
+      return std::move(error);
   for (const MemoryRoute *memoryRoute : multiHopRoutes)
-    emitRoute(*memoryRoute);
+    if (auto error = emitRoute(*memoryRoute))
+      return std::move(error);
   return plans;
 }
 
