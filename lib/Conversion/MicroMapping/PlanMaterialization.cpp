@@ -233,8 +233,16 @@ mlir::OpOperand *operandForPort(mlir::Operation *consumer, uint32_t index) {
 /// `transform.srcMap` is written through `transform.dstMap`. The operation
 /// names the layouts by their index relation, never by a target-owned id
 /// (design §13.4).
+///
+/// `executor` is the plan-selected resource the conversion runs on; it is
+/// stamped as `micro.engine` so the performance model charges that executor's
+/// engine rather than the machine's declaration-order default (task B8,
+/// closing A9's parked finding). `micro.mapping` is deliberately not reused: a
+/// conversion is not a covered workload node, so it has no rule or node to
+/// record and would fail mapping verification.
 mlir::Value emitTransform(mlir::OpBuilder &builder, mlir::Operation *anchor,
-                          mlir::Value input, const LayoutTransform &transform) {
+                          mlir::Value input, const LayoutTransform &transform,
+                          llvm::StringRef executor) {
   builder.setInsertionPointAfter(anchor);
   mlir::OperationState state(anchor->getLoc(), "micro.transform");
   state.addOperands(input);
@@ -243,6 +251,9 @@ mlir::Value emitTransform(mlir::OpBuilder &builder, mlir::Operation *anchor,
     state.addAttribute("src_map", mlir::AffineMapAttr::get(transform.srcMap));
   if (transform.dstMap)
     state.addAttribute("dst_map", mlir::AffineMapAttr::get(transform.dstMap));
+  if (!executor.empty())
+    state.addAttribute("micro.engine",
+                       mlir::StringAttr::get(builder.getContext(), executor));
   return builder.create(state)->getResult(0);
 }
 
@@ -434,6 +445,23 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
   auto report = [&](const PlanConnection &connection, llvm::StringRef reason) {
     bound.unmaterialized.push_back("value " + std::to_string(connection.value) +
                                    ": " + reason.str());
+  };
+
+  // The plan-selected executor a conversion runs on: the connection's first
+  // consumer placement's, else the producer placement's. The same rule the
+  // normalized plan events use (task B8), so the stamped resource and the
+  // plan's event name the same pool and the perf charge cannot disagree.
+  auto transformExecutorFor =
+      [&](const PlanConnection &connection) -> std::string {
+    for (const PlanPlacement &placement : plan.placements)
+      for (InstanceId consumer : connection.consumers)
+        if (placement.instance == consumer)
+          return placement.executor;
+    if (connection.producerPort)
+      for (const PlanPlacement &placement : plan.placements)
+        if (placement.node == connection.producerPort->node)
+          return placement.executor;
+    return {};
   };
 
   // Barrier requirements the selected plan recorded, by connection id (task
@@ -759,7 +787,8 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       chain.transform = transform;
       chain.source = input;
       chain.result =
-          emitTransform(builder, producer, input, *connection.transform);
+          emitTransform(builder, producer, input, *connection.transform,
+                        transformExecutorFor(connection));
       chain.dstMemory = dstMemory;
       chain.consumers = std::move(consumers);
       chains.push_back(std::move(chain));
@@ -831,7 +860,8 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
         continue;
       }
       produced =
-          emitTransform(builder, lastCopy, produced, *connection.transform);
+          emitTransform(builder, lastCopy, produced, *connection.transform,
+                        transformExecutorFor(connection));
       if (mlir::Operation *transformOp = produced.getDefiningOp()) {
         transformOp->setAttr(kValueAttr, u64Attr(context, connection.value));
         transformOp->setAttr(kConnectionAttr, u64Attr(context, connection.id));

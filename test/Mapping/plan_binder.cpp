@@ -719,6 +719,66 @@ TEST(PlanBinder, MaterializesALayoutTransformAsATransformOp) {
       static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
 }
 
+// Task B8 (closes A9's parked finding): the emitted `micro.transform` carries
+// the plan-selected resource as `micro.engine`, so the performance model
+// charges that executor's vector unit instead of the machine's default.
+TEST(PlanBinder, StampsTheSelectedResourceOnATransform) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+
+  mlir::MLIRContext *context = fixture.context.get();
+  PlanConnection &connection = plan->connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route.resize(1);
+  LayoutTransform transform;
+  transform.srcLayout = "t.plain";
+  transform.dstLayout = "t.blocked";
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  transform.dstMap = mlir::AffineMap::get(
+      2, 0,
+      {mlir::getAffineDimExpr(0, context), mlir::getAffineDimExpr(1, context)},
+      context);
+  connection.transform = transform;
+
+  // The executor the binder should choose: the connection's first consumer
+  // placement, else its producer placement.
+  std::string expected;
+  {
+    std::string consumer;
+    for (const PlanPlacement &placement : plan->placements)
+      for (InstanceId consumerId : connection.consumers)
+        if (placement.instance == consumerId && consumer.empty())
+          consumer = placement.executor;
+    expected = consumer;
+    if (expected.empty() && connection.producerPort)
+      for (const PlanPlacement &placement : plan->placements)
+        if (placement.node == connection.producerPort->node)
+          expected = placement.executor;
+  }
+  ASSERT_FALSE(expected.empty());
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  mlir::Operation *transformOp = nullptr;
+  bound->module->walk([&](mlir::Operation *op) {
+    if (!transformOp && op->getName().getStringRef() == "micro.transform")
+      transformOp = op;
+  });
+  ASSERT_NE(transformOp, nullptr);
+  auto engine = transformOp->getAttrOfType<mlir::StringAttr>("micro.engine");
+  ASSERT_TRUE(engine) << "the transform carries no selected resource";
+  EXPECT_EQ(engine.getValue(), expected);
+}
+
 // A `TransferAndTransform` moves the value *and* converts it: the copies land
 // it in the consumer's memory and one `micro.transform` re-represents it there.
 TEST(PlanBinder, MaterializesATransferAndTransformAsCopiesPlusATransform) {

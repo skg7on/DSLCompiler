@@ -426,6 +426,15 @@ struct PlanPlacement {
   /// attribute a storage decision to the occurrence that owns it. Sorted by
   /// port.
   std::vector<PortMemoryBinding> portMemoryBindings;
+  /// The selected instance's measured-or-static cost (task B8), copied from the
+  /// search entry so a plan's normalized event stream can charge this node the
+  /// *same* estimate the search ranked it on rather than re-deriving one. A
+  /// derived execution fact: deliberately excluded from `canonicalPlanString`,
+  /// so adding it does not change any plan id.
+  Cost cost;
+  /// The node's output element count (MACs for a matrix op), copied from the
+  /// extraction facts. Excluded from `canonicalPlanString`, like `cost`.
+  uint64_t workItems = 0;
 };
 
 /// One selected connection, with the route it takes.
@@ -475,6 +484,18 @@ struct PlanConnection {
   /// by `StorageAllocation::id`. B1 persists the ids; B3 populates them. Empty
   /// for a plan built before storage planning.
   llvm::SmallVector<uint64_t> storageIds;
+  /// The connection's synthesized cost (task B8): the transfer estimate the
+  /// route carried, or the shared transform estimate for a conversion. A
+  /// derived execution fact, deliberately excluded from `canonicalPlanString`
+  /// (the connection's own id already folds its kind, route, engines and
+  /// transform, so the cost adds no identity a reader could not re-derive).
+  Cost cost;
+  /// The carried value's element count, for the normalized event stream.
+  uint64_t workItems = 0;
+  /// The carried value's type, so a normalized transform event can be charged
+  /// from the shared conversion estimate exactly as the materialized kernel's
+  /// is. A derived execution fact, excluded from `canonicalPlanString`.
+  mlir::Type valueType;
 };
 
 /// A complete executable proposal covering every required node.
@@ -495,7 +516,10 @@ struct CoveringPlan {
   /// each connection runs. Placements are ordered by their (executor, memory,
   /// layout) binding tuple, then node / instance id (design §22.1);
   /// `connectionPlans` by connection id.
-  llvm::SmallVector<PlanPlacement> placements;
+  /// Explicit inline capacity: `PlanPlacement` carries the selected bundle,
+  /// bindings and now its measured cost, so the default inlined-element
+  /// heuristic would not apply.
+  llvm::SmallVector<PlanPlacement, 1> placements;
   /// Explicit inline capacity: `PlanConnection` is large (it carries its route,
   /// engines, transform, and consumers), so the default inlined-element
   /// heuristic would not apply.

@@ -3,6 +3,8 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CostModel.h"
+#include "LLK/Mapping/LatencyProvider.h"
+#include "LLK/Mapping/MappingPlan.h"
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
@@ -47,6 +49,116 @@ mlir::AffineMap transposeMap(mlir::MLIRContext *context) {
   return mlir::AffineMap::getPermutationMap(llvm::ArrayRef<unsigned>{1u, 0u},
                                             context);
 }
+
+/// A machine with one worker/vector engine, one DMA engine, and a
+/// `dram.0 -> l2.0 -> sram.0` hierarchy, so a two-hop movement and a layout
+/// conversion can both be normalized.
+mlir::llk::machine::MachineModel planEventMachine() {
+  using namespace mlir::llk::machine;
+  MachineModel machine;
+  machine.target = "plan-events";
+  machine.workerThreads = 1;
+  machine.sync.waitCycles = 1;
+  machine.sync.barrierCycles = 3;
+
+  ExecutorNode worker;
+  worker.id = "w0";
+  worker.kind = "worker";
+  machine.executors.push_back(worker);
+
+  ComputeNode vpu;
+  vpu.id = "vpu";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "w0";
+  vpu.lanes["f32"] = 8;
+  vpu.issueCycles = 1;
+  machine.computes.push_back(vpu);
+
+  for (const auto &[id, kind] :
+       {std::pair<const char *, const char *>{"d0", "dram"},
+        {"l0", "l2"},
+        {"s0", "sram"}}) {
+    MemoryNode memory;
+    memory.id = id;
+    memory.kind = kind;
+    machine.memories.push_back(memory);
+  }
+
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  machine.transferEngines.push_back(dma);
+
+  LinkEdge first;
+  first.id = "d0_l0";
+  first.source = "d0";
+  first.destination = "l0";
+  first.latencyCycles = 10;
+  first.bandwidthBytesPerCycle = 8;
+  first.transferEngines = {"dma.0"};
+  machine.links.push_back(first);
+
+  LinkEdge second = first;
+  second.id = "l0_s0";
+  second.source = "l0";
+  second.destination = "s0";
+  second.latencyCycles = 20;
+  machine.links.push_back(second);
+  return machine;
+}
+
+/// A two-node plan: node 0 feeds node 1 through a two-hop transfer connection.
+CoveringPlan twoHopPlan() {
+  CoveringPlan plan;
+  PlanPlacement producer;
+  producer.node = 0;
+  producer.instance = 100;
+  producer.executor = "w0";
+  producer.cost.latencyCycles = 8;
+  producer.workItems = 16;
+  plan.placements.push_back(producer);
+
+  PlanPlacement consumer;
+  consumer.node = 1;
+  consumer.instance = 101;
+  consumer.executor = "w0";
+  consumer.cost.latencyCycles = 4;
+  consumer.workItems = 16;
+  plan.placements.push_back(consumer);
+
+  PlanConnection connection;
+  connection.id = 500;
+  connection.value = 7;
+  connection.kind = ConnectionKind::Transfer;
+  connection.route = {"d0", "l0", "s0"};
+  connection.engines = {"dma.0"};
+  connection.cost.localBytes = 64;
+  connection.workItems = 16;
+  connection.consumers = {101};
+  connection.producerPort = PortRef{0, PortDirection::Output, 0};
+  plan.connectionPlans.push_back(connection);
+
+  plan.steps = {PlanStep{0, PlanStepKind::Compute, 0, 0},
+                PlanStep{1, PlanStepKind::Movement, 0, 500},
+                PlanStep{2, PlanStepKind::Synchronization, 0, 500},
+                PlanStep{3, PlanStepKind::Compute, 1, 0}};
+  plan.stepEdges = {PlanStepEdge{0, 1}, PlanStepEdge{1, 2}, PlanStepEdge{2, 3}};
+  return plan;
+}
+
+/// A provider that implements only the operation lookup, so the default
+/// nullopt connection overload is the one exercised.
+class OperationOnlyProvider : public LatencyProvider {
+public:
+  // A derived class that overrides one `lookupCycles` overload hides the other,
+  // so a provider written before connections existed must bring the default
+  // connection overload back into scope to keep it reachable.
+  using LatencyProvider::lookupCycles;
+  std::optional<double> lookupCycles(const OperationSignature &,
+                                     const TargetContext &) const override {
+    return std::nullopt;
+  }
+};
 } // namespace
 
 TEST(CostModel, AddsDimensionwise) {
@@ -279,4 +391,183 @@ TEST(CostModel, TransformCostRejectsUnknownResourcesAndFootprints) {
   EXPECT_FALSE(static_cast<bool>(unknownFootprint));
   if (!unknownFootprint)
     llvm::consumeError(unknownFootprint.takeError());
+}
+
+//===----------------------------------------------------------------------===//
+// Task B8: normalized plan events
+//===----------------------------------------------------------------------===//
+
+TEST(CostEvent, PlanEventsNormalizeSelectedWork) {
+  CoveringPlan plan = twoHopPlan();
+  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, planEventMachine());
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 6u);
+
+  const CostEventKind kinds[] = {
+      CostEventKind::Compute,         CostEventKind::TransferHop,
+      CostEventKind::Synchronization, CostEventKind::TransferHop,
+      CostEventKind::Synchronization, CostEventKind::Compute};
+  const char *resources[] = {"vpu", "dma.0", "sync", "dma.0", "sync", "vpu"};
+  const uint64_t bytes[] = {0, 64, 0, 64, 0, 0};
+  const uint64_t work[] = {16, 16, 0, 16, 0, 16};
+  // Hop 1: 10 + ceil(64/8); hop 2: 20 + ceil(64/8); waits: one cycle each.
+  const double cycles[] = {8, 18, 1, 28, 1, 4};
+  for (size_t i = 0; i < dag->events.size(); ++i) {
+    EXPECT_EQ(dag->events[i].event.kind, kinds[i]) << i;
+    EXPECT_EQ(dag->events[i].event.resource, resources[i]) << i;
+    EXPECT_EQ(dag->events[i].bytes, bytes[i]) << i;
+    EXPECT_EQ(dag->events[i].workItems, work[i]) << i;
+    EXPECT_DOUBLE_EQ(dag->events[i].event.cost.latencyCycles, cycles[i]) << i;
+  }
+  // First hop follows the producer's compute; the consumer follows the wait.
+  EXPECT_EQ(dag->events[1].deps, (std::vector<uint32_t>{0}));
+  EXPECT_EQ(dag->events[5].deps, (std::vector<uint32_t>{4}));
+}
+
+TEST(CostEvent, LayoutTransformEventUsesTheSharedEstimate) {
+  mlir::MLIRContext context;
+  CoveringPlan plan = twoHopPlan();
+  PlanConnection &connection = plan.connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route = {"s0"};
+  connection.valueType =
+      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context));
+  LayoutTransform transform;
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, &context);
+  transform.dstMap = transposeMap(&context);
+  connection.transform = transform;
+  // The producer also runs on the same executor, so the transform resolves to
+  // the shared estimate's default vector engine.
+  plan.placements[0].executor = "w0";
+
+  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, planEventMachine());
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 3u);
+  const PlanCostEvent &transformEvent = dag->events[1];
+  EXPECT_EQ(transformEvent.event.kind, CostEventKind::Transform);
+  EXPECT_EQ(transformEvent.event.resource, "vpu");
+  EXPECT_EQ(transformEvent.bytes, 64u);
+  // 16 elements over 8 f32 lanes: 2 one-cycle issues.
+  EXPECT_DOUBLE_EQ(transformEvent.event.cost.latencyCycles, 2.0);
+}
+
+TEST(CostEvent, PlanEventsNormalizeAGather) {
+  mlir::MLIRContext context;
+  CoveringPlan plan;
+  PlanPlacement consumer;
+  consumer.node = 1;
+  consumer.instance = 101;
+  consumer.executor = "w0";
+  consumer.cost.latencyCycles = 1;
+  consumer.workItems = 8;
+  plan.placements.push_back(consumer);
+
+  PlanConnection gather;
+  gather.id = 600;
+  gather.value = 9;
+  gather.kind = ConnectionKind::Reduce;
+  gather.gatherSemantics = GatherSemantics::Sum;
+  gather.workItems = 8;
+  gather.valueType =
+      mlir::RankedTensorType::get({8}, mlir::Float32Type::get(&context));
+  gather.producerPorts = {PortRef{0, PortDirection::Output, 0},
+                          PortRef{1, PortDirection::Output, 0}};
+  plan.connectionPlans.push_back(gather);
+  plan.steps = {PlanStep{0, PlanStepKind::Movement, 0, 600},
+                PlanStep{1, PlanStepKind::Synchronization, 0, 600},
+                PlanStep{2, PlanStepKind::Compute, 1, 0}};
+
+  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, planEventMachine());
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  // The gather is compute on the selected vector engine; 8 f32 elements over 8
+  // lanes is one issue.
+  ASSERT_FALSE(dag->events.empty());
+  EXPECT_EQ(dag->events[0].event.kind, CostEventKind::Compute);
+  EXPECT_EQ(dag->events[0].event.resource, "vpu");
+  EXPECT_EQ(dag->events[0].workItems, 8u);
+  EXPECT_DOUBLE_EQ(dag->events[0].event.cost.latencyCycles, 1.0);
+}
+
+TEST(CostEvent, PlanEventsRejectAnUnknownStrictFact) {
+  CoveringPlan plan = twoHopPlan();
+  plan.steps.clear();
+  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, planEventMachine());
+  EXPECT_FALSE(static_cast<bool>(dag));
+  if (!dag)
+    llvm::consumeError(dag.takeError());
+
+  CoveringPlan missingRoute = twoHopPlan();
+  missingRoute.connectionPlans.front().route = {"d0", "s0"};
+  llvm::Expected<PlanEventDAG> unrouted =
+      buildPlanEvents(missingRoute, planEventMachine());
+  EXPECT_FALSE(static_cast<bool>(unrouted));
+  if (!unrouted)
+    llvm::consumeError(unrouted.takeError());
+}
+
+//===----------------------------------------------------------------------===//
+// Task B8: connection measurement identity
+//===----------------------------------------------------------------------===//
+
+TEST(CostEvent, ConnectionSignatureDistinguishesEveryDecision) {
+  ConnectionSignature base;
+  base.kind = "transfer";
+  base.valueType = "tensor<4x4xf32>";
+  base.producerEndpoint = "producer{0.0}";
+  base.consumerEndpoints = "consumer{1.0}";
+  base.route = "d0>l0>s0";
+  base.links = "d0_l0>l0_s0";
+  base.engines = "dma.0";
+  base.maps = "producer=(d0,d1)->(d0,d1)";
+  base.parameters = "row_major->blocked";
+  base.storage = "s0#64";
+  const std::string reference = base.canonicalString();
+
+  struct Mutation {
+    const char *name;
+    std::string ConnectionSignature::*field;
+  };
+  const Mutation mutations[] = {
+      {"kind", &ConnectionSignature::kind},
+      {"valueType", &ConnectionSignature::valueType},
+      {"producerEndpoint", &ConnectionSignature::producerEndpoint},
+      {"consumerEndpoints", &ConnectionSignature::consumerEndpoints},
+      {"route", &ConnectionSignature::route},
+      {"links", &ConnectionSignature::links},
+      {"engines", &ConnectionSignature::engines},
+      {"maps", &ConnectionSignature::maps},
+      {"parameters", &ConnectionSignature::parameters},
+      {"storage", &ConnectionSignature::storage},
+  };
+  for (const Mutation &mutation : mutations) {
+    ConnectionSignature changed = base;
+    changed.*(mutation.field) += "#changed";
+    EXPECT_NE(changed.canonicalString(), reference) << mutation.name;
+  }
+
+  // Swapping the two roles must not collide: the endpoint fields carry an
+  // explicit role, so a moved producer/consumer assignment is different work.
+  ConnectionSignature swapped = base;
+  swapped.producerEndpoint = base.consumerEndpoints;
+  swapped.consumerEndpoints = base.producerEndpoint;
+  EXPECT_NE(swapped.canonicalString(), reference);
+}
+
+TEST(CostEvent, ConnectionSignatureIsNotAmbiguousConcatenation) {
+  // Two different connection descriptions whose fields, naively concatenated,
+  // would produce the same bytes. The length-delimited rendering must keep them
+  // apart.
+  ConnectionSignature first;
+  first.kind = "transfer|value_type=x";
+  first.valueType = "y";
+  ConnectionSignature second;
+  second.kind = "transfer";
+  second.valueType = "x|value_type=y";
+  EXPECT_NE(first.canonicalString(), second.canonicalString());
+
+  // A provider that implements only the operation lookup misses a connection
+  // through the default overload -- a miss is not a legality verdict.
+  OperationOnlyProvider provider;
+  TargetContext context{"target", "machine", "rules", "layouts"};
+  EXPECT_FALSE(provider.lookupCycles(first, context).has_value());
 }

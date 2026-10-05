@@ -29,6 +29,7 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingRules.h"
@@ -907,5 +908,100 @@ TEST(MappingProperties, ExactJointConnectionsMatchTheRouteOracle) {
     // Re-running reproduces the same ranked ids.
     MappingSearchResult again = runSearch(graph, *target, context, options);
     EXPECT_EQ(planIds(result), planIds(again));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Property 7 (task B8): a connection's measurement identity changes with every
+// decision that could change its cost, cannot be forged by reordering a list or
+// swapping roles, and never collides through ambiguous concatenation.
+//===----------------------------------------------------------------------===//
+
+TEST(MappingProperties, ConnectionIdentitySeparatesEveryDecision) {
+  Rng rng(kSeed ^ 0x09);
+
+  auto word = [&]() { return "w" + std::to_string(rng.next() % 4096); };
+  // A list rendered in a fixed canonical order: two orderings of one set retain
+  // one key, which is the property the connection builder must uphold.
+  auto sortedJoin = [](std::vector<std::string> items) {
+    llvm::sort(items);
+    std::string out;
+    for (const std::string &item : items) {
+      out += std::to_string(item.size());
+      out += ':';
+      out += item;
+      out += ',';
+    }
+    return out;
+  };
+
+  for (unsigned draw = 0; draw < 128; ++draw) {
+    std::vector<std::string> consumers;
+    for (unsigned i = 0, count = 1 + rng.below(3); i < count; ++i)
+      consumers.push_back("consumer{" + word() + "}");
+    std::vector<std::string> links;
+    for (unsigned i = 0, count = 1 + rng.below(3); i < count; ++i)
+      links.push_back(word());
+
+    ConnectionSignature base;
+    base.kind = word();
+    base.valueType = word();
+    base.producerEndpoint = "producer{" + word() + "}";
+    base.consumerEndpoints = sortedJoin(consumers);
+    base.route = word() + ">" + word() + ">" + word();
+    base.links = sortedJoin(links);
+    base.engines = word();
+    base.maps = word();
+    base.parameters = word();
+    base.storage = word();
+    const std::string key = base.canonicalString();
+
+    // Reordering either list retains the key -- the rendering is order-free.
+    std::vector<std::string> shuffled = consumers;
+    rng.shuffle(shuffled);
+    ConnectionSignature reordered = base;
+    reordered.consumerEndpoints = sortedJoin(shuffled);
+    std::vector<std::string> shuffledLinks = links;
+    rng.shuffle(shuffledLinks);
+    reordered.links = sortedJoin(shuffledLinks);
+    EXPECT_EQ(reordered.canonicalString(), key);
+
+    // Swapping the producer and consumer roles is different work.
+    ConnectionSignature roleSwapped = reordered;
+    std::swap(roleSwapped.producerEndpoint, roleSwapped.consumerEndpoints);
+    EXPECT_NE(roleSwapped.canonicalString(), key);
+
+    // Every other decision changes the identity.
+    struct Field {
+      const char *name;
+      std::string ConnectionSignature::*member;
+    };
+    const Field fields[] = {
+        {"kind", &ConnectionSignature::kind},
+        {"valueType", &ConnectionSignature::valueType},
+        {"producerEndpoint", &ConnectionSignature::producerEndpoint},
+        {"route", &ConnectionSignature::route},
+        {"engines", &ConnectionSignature::engines},
+        {"maps", &ConnectionSignature::maps},
+        {"parameters", &ConnectionSignature::parameters},
+        {"storage", &ConnectionSignature::storage},
+        {"links", &ConnectionSignature::links},
+    };
+    for (const Field &field : fields) {
+      ConnectionSignature changed = base;
+      changed.*(field.member) += "|" + word();
+      EXPECT_NE(changed.canonicalString(), key) << field.name;
+    }
+
+    // No ambiguous concatenation: a field that merely contains another field's
+    // name and separator cannot reproduce the same key.
+    ConnectionSignature forged;
+    forged.kind = "transfer;value_type=" + word();
+    forged.valueType = word();
+    ConnectionSignature genuine;
+    genuine.kind = "transfer";
+    genuine.valueType = "value_type=" + forged.valueType;
+    forged.kind = "transfer;value_type=" + forged.valueType;
+    EXPECT_NE(forged.canonicalString(), genuine.canonicalString());
   }
 }

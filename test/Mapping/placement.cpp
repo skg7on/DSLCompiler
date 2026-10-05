@@ -2,6 +2,9 @@
 
 #include "LLK/Mapping/Placement.h"
 
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/MLIRContext.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
@@ -879,4 +882,116 @@ TEST(Placement, ComputeUtilizationStaysZeroWithoutSyncFacts) {
       << llvm::toString(instances.takeError());
   ASSERT_FALSE(instances->empty());
   EXPECT_DOUBLE_EQ(instances->front().localCost.computeUtilization, 0.0);
+}
+
+//===----------------------------------------------------------------------===//
+// Task B8 (closes A9's parked finding): a layout-transform connection is costed
+// from the shared `estimateTransformCost`, so the planner and the performance
+// DAG cannot disagree or double-count.
+//===---------------------------------------------------------------------===//
+
+/// One worker with a vector engine that sees a single SRAM able to hold both
+/// layouts, so a layout difference becomes an in-place transform.
+MachineModel transformConnectionMachine() {
+  MachineModel model;
+  model.target = "transform-connection";
+  model.workerThreads = 1;
+  model.sync.waitCycles = 1;
+  model.sync.barrierCycles = 1;
+  model.executors = {{"core.0", "worker", std::nullopt, {}, 1, {}}};
+
+  ComputeNode vpu;
+  vpu.id = "vpu";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "core.0";
+  vpu.lanes["f32"] = 8;
+  vpu.issueCycles = 1;
+  model.computes.push_back(vpu);
+
+  MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "core.0";
+  sram.capacityBytes = 1u << 20;
+  sram.alignmentBytes = 64;
+  sram.supportedLayouts = {"row_major", "blocked"};
+  model.memories.push_back(sram);
+  return model;
+}
+
+TEST(Placement, LayoutTransformChargesTheSharedEstimate) {
+  mlir::MLIRContext context;
+  MachineModel machine = transformConnectionMachine();
+  TopologyService topology(machine);
+  auto type =
+      mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
+
+  ConnectionRequest request;
+  request.producer = 1;
+  request.consumer = 2;
+  request.value = 0;
+  request.producerMemory = "sram.0";
+  request.consumerMemory = "sram.0";
+  request.producerLayout = "row_major";
+  request.consumerLayout = "blocked";
+  request.producerLayoutMap =
+      mlir::AffineMap::getMultiDimIdentityMap(2, &context);
+  request.consumerLayoutMap = mlir::AffineMap::getPermutationMap(
+      llvm::ArrayRef<unsigned>{1u, 0u}, &context);
+  request.elementType = type;
+  request.consumerType = type;
+  request.producerExecutor = "core.0";
+  request.consumerExecutor = "core.0";
+  request.bytes = 256;
+  request.alignmentBytes = 64;
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology, {});
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  const ConnectionPlan &plan = plans->front();
+  EXPECT_EQ(plan.kind, ConnectionKind::LayoutTransform);
+
+  // The cost is exactly the shared estimate for the selected resource.
+  TransformCostInput input;
+  input.inputType = type;
+  input.outputType = type;
+  input.srcMap = request.producerLayoutMap;
+  input.dstMap = request.consumerLayoutMap;
+  input.memoryNode = "sram.0";
+  input.computeResource = "vpu";
+  llvm::Expected<Cost> shared = estimateTransformCost(input, machine);
+  ASSERT_TRUE(static_cast<bool>(shared)) << llvm::toString(shared.takeError());
+  EXPECT_DOUBLE_EQ(plan.cost.latencyCycles, shared->latencyCycles);
+  EXPECT_EQ(plan.cost.localBytes, shared->localBytes);
+  // 64 f32 elements over 8 lanes: 8 one-cycle issues.
+  EXPECT_DOUBLE_EQ(plan.cost.latencyCycles, 8.0);
+  EXPECT_EQ(plan.cost.localBytes, 256u);
+}
+
+// A hand-built request that states no measurable footprint keeps its recorded
+// byte charge rather than an invented zero: the estimator is only authoritative
+// when it can actually measure.
+TEST(Placement, LayoutTransformWithoutFootprintKeepsItsBytes) {
+  mlir::MLIRContext context;
+  MachineModel machine = transformConnectionMachine();
+  TopologyService topology(machine);
+
+  ConnectionRequest request;
+  request.producer = 1;
+  request.consumer = 2;
+  request.value = 0;
+  request.producerMemory = "sram.0";
+  request.consumerMemory = "sram.0";
+  request.producerLayout = "row_major";
+  request.consumerLayout = "blocked";
+  request.bytes = 128;
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology, {});
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  EXPECT_EQ(plans->front().kind, ConnectionKind::LayoutTransform);
+  EXPECT_DOUBLE_EQ(plans->front().cost.latencyCycles, 0.0);
+  EXPECT_EQ(plans->front().cost.localBytes, 128u);
 }

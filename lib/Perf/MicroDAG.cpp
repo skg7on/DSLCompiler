@@ -99,6 +99,17 @@ llvm::StringRef mappedExecutor(mlir::Operation &op) {
   return {};
 }
 
+/// The executor a materialized `micro.transform` selected: stamped as
+/// `micro.engine` by the binder (task B8), because a conversion is not a
+/// covered workload node and carries no `micro.mapping`. A hand-written or
+/// older kernel without the stamp falls back to `micro.mapping` exactly as a
+/// compute op does.
+llvm::StringRef transformExecutor(mlir::Operation &op) {
+  if (auto engine = op.getAttrOfType<mlir::StringAttr>("micro.engine"))
+    return engine.getValue();
+  return mappedExecutor(op);
+}
+
 class DAGBuilder {
 public:
   DAGBuilder(const machine::MachineModel &machine, llvm::StringRef kernelName)
@@ -520,14 +531,9 @@ uint64_t DAGBuilder::vectorCycles(const machine::ComputeNode *engine,
                                   uint64_t elements) const {
   if (!engine)
     return elements;
-  // A dtype the engine does not declare is issued one element at a time. That
-  // is slower than the hardware, never faster, so it cannot hide a bottleneck.
-  int64_t lanes = 1;
-  auto it = engine->lanes.find(dtype.str());
-  if (it != engine->lanes.end() && it->second > 0)
-    lanes = it->second;
-  uint64_t issues = llvm::divideCeil(elements, static_cast<uint64_t>(lanes));
-  return issues * std::max<uint64_t>(1, engine->issueCycles);
+  // The one shared elementwise-issue formula (task B8), so a normalized plan
+  // event and this DAG's event charge an elementwise pass identically.
+  return mapping::elementwiseCycles(*engine, dtype, elements);
 }
 
 uint64_t DAGBuilder::mmaCycles(const machine::ComputeNode &engine,
@@ -1035,10 +1041,11 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
   if (auto transform = llvm::dyn_cast<micro::TransformOp>(op)) {
     // A conversion is real work: it runs on a compute capability like the other
     // mapped elementwise work, and its selected resource is the executor the
-    // plan stamped when the op carries one.
+    // plan stamped on it (`micro.engine`, task B8) -- the same one the planner
+    // charged -- falling back to `micro.mapping` and then the machine default.
     std::string reason;
     const machine::ComputeNode *engine =
-        pickVectorEngine(reason, mappedExecutor(op));
+        pickVectorEngine(reason, transformExecutor(op));
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.transform: " + reason);
@@ -1435,6 +1442,17 @@ llvm::StringRef stringifyEventKind(EventKind kind) {
     return "barrier";
   }
   return "unknown";
+}
+
+mapping::PlanCostEvent normalizedPlanEvent(const MicroEvent &event) {
+  // The single shared construction point, so this view and a plan-derived event
+  // cannot differ in their normalized fields (task B8). The event's own
+  // `resourceName` is the machine resource both paths name.
+  std::vector<uint32_t> deps(event.deps.begin(), event.deps.end());
+  return mapping::makePlanCostEvent(
+      costEventKindOf(event.kind), event.resourceName,
+      static_cast<double>(event.minCycles), event.workItems, event.bytes,
+      std::move(deps));
 }
 
 mapping::CostEventKind costEventKindOf(EventKind kind) {

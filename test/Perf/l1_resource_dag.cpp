@@ -17,6 +17,8 @@
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Machine/MachineModelLoader.h"
+#include "LLK/Mapping/CostEvent.h"
+#include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Perf/MicroCostModel.h"
 #include "LLK/Perf/MicroDAG.h"
 
@@ -927,6 +929,142 @@ module {
   // The barrier waits on the token the copy produced.
   ASSERT_EQ(dag->events[1].deps.size(), 1u);
   EXPECT_EQ(dag->events[1].deps[0], dag->events[0].id);
+}
+
+//===----------------------------------------------------------------------===//
+// Task B8: selected-plan and materialized event parity
+//===----------------------------------------------------------------------===//
+
+/// A two-hop movement (dram.0 -> l2.0 -> sram.0), one awaited copy per hop --
+/// exactly the shape the binder materializes for a routed `Transfer`: the plan
+/// routes and the per-hop stamps travel with the copies.
+constexpr llvm::StringLiteral kTwoHopKernel = R"mlir(
+module {
+  micro.kernel @two_hop attributes {micro.routes = [{value = 7 : i64, kind = "transfer", route = ["dram.0", "l2.0", "sram.0"], id = 500 : i64}]} {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t1, %tok1 = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<l2>, micro.value = 7 : i64, micro.dst_node = "l2.0", micro.connection = 500 : i64, micro.hop = 1 : i64} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.wait %tok1
+    %t2, %tok2 = micro.async_copy %t1 {src_memory = #micro.memory<l2>, dst_memory = #micro.memory<sram>, micro.value = 7 : i64, micro.dst_node = "sram.0", micro.connection = 500 : i64, micro.hop = 2 : i64} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.wait %tok2
+    micro.yield
+  }
+}
+)mlir";
+
+// A selected plan and its materialized kernel account for the same normalized
+// events: kind, resource, work, bytes, latency and dependency edges agree. The
+// plan path builds the stream from the plan's step DAG; the perf path builds it
+// from the emitted IR and normalizes it through the same construction.
+TEST(L1ResourceDag, SelectedPlanEventsMatchItsMaterializedKernel) {
+  auto parsed = parseKernel(kTwoHopKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+
+  auto kernelDag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(kernelDag))
+      << llvm::toString(kernelDag.takeError());
+
+  mapping::CoveringPlan plan;
+  mapping::PlanConnection connection;
+  connection.id = 500;
+  connection.value = 7;
+  connection.kind = mapping::ConnectionKind::Transfer;
+  connection.route = {"dram.0", "l2.0", "sram.0"};
+  connection.engines = {"dma.0"};
+  connection.cost.localBytes = 256;
+  connection.workItems = 64;
+  plan.connectionPlans.push_back(connection);
+  plan.steps = {
+      mapping::PlanStep{0, mapping::PlanStepKind::Movement, 0, 500},
+      mapping::PlanStep{1, mapping::PlanStepKind::Synchronization, 0, 500}};
+
+  llvm::Expected<mapping::PlanEventDAG> planDag =
+      mapping::buildPlanEvents(plan, model);
+  ASSERT_TRUE(static_cast<bool>(planDag))
+      << llvm::toString(planDag.takeError());
+  ASSERT_EQ(planDag->events.size(), kernelDag->events.size());
+
+  for (size_t i = 0; i < planDag->events.size(); ++i) {
+    mapping::PlanCostEvent normalized =
+        normalizedPlanEvent(kernelDag->events[i]);
+    EXPECT_EQ(planDag->events[i].event.kind, normalized.event.kind) << i;
+    EXPECT_EQ(planDag->events[i].event.resource, normalized.event.resource)
+        << i;
+    EXPECT_EQ(planDag->events[i].workItems, normalized.workItems) << i;
+    EXPECT_EQ(planDag->events[i].bytes, normalized.bytes) << i;
+    EXPECT_DOUBLE_EQ(planDag->events[i].event.cost.latencyCycles,
+                     normalized.event.cost.latencyCycles)
+        << i;
+    EXPECT_EQ(planDag->events[i].deps, normalized.deps) << i;
+  }
+}
+
+// Normalized plan events are scheduled by the *same* resource scheduler the
+// performance evaluator uses: resource multiplicity overlaps independent work.
+TEST(L1ResourceDag, PlanEventsShareThePerformanceScheduler) {
+  mapping::PlanEventDAG dag;
+  dag.events.push_back(mapping::makePlanCostEvent(
+      mapping::CostEventKind::TransferHop, "dma.0", 10.0, 64, 64));
+  dag.events.push_back(mapping::makePlanCostEvent(
+      mapping::CostEventKind::TransferHop, "dma.0", 10.0, 64, 64));
+
+  machine::MachineModel serial = parseMachine(testMachine(1, 1, 1));
+  machine::MachineModel parallel = parseMachine(testMachine(2, 1, 1));
+
+  llvm::Expected<mapping::Cost> serialCost =
+      mapping::schedulePlanEvents(dag, serial);
+  llvm::Expected<mapping::Cost> parallelCost =
+      mapping::schedulePlanEvents(dag, parallel);
+  ASSERT_TRUE(static_cast<bool>(serialCost))
+      << llvm::toString(serialCost.takeError());
+  ASSERT_TRUE(static_cast<bool>(parallelCost))
+      << llvm::toString(parallelCost.takeError());
+
+  // One engine serializes the two independent hops; two run them at once.
+  EXPECT_DOUBLE_EQ(serialCost->latencyCycles, 20.0);
+  EXPECT_DOUBLE_EQ(parallelCost->latencyCycles, 10.0);
+  EXPECT_EQ(serialCost->localBytes, 128u);
+}
+
+// The binder stamps the plan-selected executor on an emitted `micro.transform`
+// as `micro.engine`; the perf model charges that engine's vector unit rather
+// than the machine's declaration-order default.
+TEST(L1ResourceDag, TransformChargesItsSelectedEngine) {
+  machine::MachineModel model = parseMachine(kTwoEngineMachine);
+
+  auto selected = parseKernel(R"mlir(
+module {
+  micro.kernel @selected {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %t = micro.transform %a {src_map = affine_map<(d0,d1)->(d0,d1)>, dst_map = affine_map<(d0,d1)->(d1,d0)>, micro.engine = "worker.1"} : tensor<8x8xf32> -> tensor<8x8xf32>
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(selected);
+  auto selectedDag = buildMicroDAG(selected->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(selectedDag))
+      << llvm::toString(selectedDag.takeError());
+  ASSERT_EQ(selectedDag->events.size(), 1u);
+  EXPECT_EQ(selectedDag->events[0].kind, EventKind::Transform);
+  EXPECT_EQ(selectedDag->events[0].resourceName, "vpu.b");
+
+  // Without the stamp the machine's first engine of the class is the default.
+  auto unstamped = parseKernel(R"mlir(
+module {
+  micro.kernel @unstamped {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %t = micro.transform %a {src_map = affine_map<(d0,d1)->(d0,d1)>, dst_map = affine_map<(d0,d1)->(d1,d0)>} : tensor<8x8xf32> -> tensor<8x8xf32>
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(unstamped);
+  auto unstampedDag = buildMicroDAG(unstamped->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(unstampedDag))
+      << llvm::toString(unstampedDag.takeError());
+  ASSERT_EQ(unstampedDag->events.size(), 1u);
+  EXPECT_EQ(unstampedDag->events[0].resourceName, "vpu.a");
 }
 
 } // namespace mlir::llk::perf

@@ -175,6 +175,13 @@ struct PlannedRoute {
 llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
                                        const machine::MachineModel &machine);
 
+/// The normalized view of one DAG event (task B8): the same
+/// `mapping::PlanCostEvent` shape `buildPlanEvents` produces, so a plan's
+/// selected-plan event stream and its materialized kernel's event stream are
+/// directly comparable kind for kind, resource for resource, work and byte for
+/// work and byte.
+mapping::PlanCostEvent normalizedPlanEvent(const MicroEvent &event);
+
 /// Locates the `micro.kernel` to simulate anywhere under `root`: the one named
 /// `symbol`, or the only one present when `symbol` is empty. Fails when the
 /// name matches nothing or when the choice is ambiguous, so a multi-kernel file

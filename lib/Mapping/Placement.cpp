@@ -203,6 +203,61 @@ bool sameLayoutParameters(const llvm::StringMap<SearchValue> &lhs,
   return true;
 }
 
+/// The compute resource a layout conversion runs on: the consumer executor's
+/// vector engine when one is known, else the producer's, else empty (the
+/// machine's declared default). Resolving it here means the planner charges the
+/// same resource the binder stamps on the emitted `micro.transform` and the
+/// performance DAG then resolves, so the two cannot disagree about the cost of
+/// a conversion (task B8).
+std::string transformResourceFor(const ConnectionRequest &request,
+                                 const MachineModel &machine) {
+  auto vectorEngineOf =
+      [&](const std::optional<ExecutorId> &executor) -> std::string {
+    if (!executor)
+      return {};
+    for (const ComputeNode *node : machine.computesFor(*executor))
+      if (node->kind == "vector_engine")
+        return node->id;
+    return {};
+  };
+  if (std::string engine = vectorEngineOf(request.consumerExecutor);
+      !engine.empty())
+    return engine;
+  if (std::string engine = vectorEngineOf(request.producerExecutor);
+      !engine.empty())
+    return engine;
+  return {};
+}
+
+/// The shared estimate of one connection's layout conversion (task B8). The
+/// conversion's types are unwrapped to the shaped type they describe, and the
+/// selected compute resource is resolved from the endpoint executors, so this
+/// is the *same* estimate the performance DAG's `micro.transform` handler
+/// charges. A request that states no measurable footprint (a hand-built pair
+/// with no types) falls back to its recorded byte count -- exactly the cost it
+/// had before, never a double count, and never a silently invented zero.
+Cost transformCostFor(const ConnectionRequest &request,
+                      const MachineModel &machine) {
+  TransformCostInput input;
+  input.inputType = tileAsTensor(request.elementType);
+  if (!input.inputType)
+    input.inputType = request.elementType;
+  input.outputType = tileAsTensor(request.consumerType);
+  if (!input.outputType)
+    input.outputType = request.consumerType;
+  input.srcMap = request.producerLayoutMap;
+  input.dstMap = request.consumerLayoutMap;
+  input.memoryNode = request.producerMemory;
+  input.computeResource = transformResourceFor(request, machine);
+  llvm::Expected<Cost> cost = estimateTransformCost(input, machine);
+  if (cost)
+    return *cost;
+  llvm::consumeError(cost.takeError());
+  Cost fallback;
+  fallback.localBytes = request.bytes;
+  return fallback;
+}
+
 } // namespace
 
 bool portsDirectCompatible(const ConnectionRequest &request,
@@ -611,7 +666,11 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.kind = ConnectionKind::LayoutTransform;
     plan.memoryRoute.push_back(request.producerMemory);
     plan.transform = transformOf();
-    plan.cost.localBytes = request.bytes;
+    // The conversion's cost is the *shared* transform estimate, not an ad-hoc
+    // local byte charge: the same estimator the performance DAG charges, so the
+    // planner cannot double-count or disagree with perf (task B8, closing A9's
+    // parked finding).
+    plan.cost = transformCostFor(request, machine);
     assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
@@ -689,6 +748,15 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.transferEngines = memoryRoute.transferEngines;
     plan.transform = transformOf();
     plan.cost = memoryRoute.cost;
+    if (transformRequired) {
+      // The movement and the conversion are both real work the materialized
+      // kernel charges; the conversion's arithmetic is added here from the same
+      // shared estimate, while its bytes are already the route's (adding them
+      // would double-count the one value's traffic).
+      Cost conversion = transformCostFor(request, machine);
+      plan.cost.latencyCycles += conversion.latencyCycles;
+      plan.cost.computeUtilization += conversion.computeUtilization;
+    }
     assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));

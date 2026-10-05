@@ -33,7 +33,18 @@ namespace mlir::llk::mapping {
 
 /// Bumped whenever a static estimate would mean something different, so a
 /// measurement taken under an older model is not silently reused.
-inline constexpr uint64_t kCostModelVersion = 1;
+///
+/// Version 2 (task B8) adds endpoint *roles* to the keys and renders every key
+/// length-delimited, so a field that merely contains a separator can no longer
+/// make two different pieces of work collide. A measurement taken under the
+/// ambiguous version-1 key is therefore not reused.
+inline constexpr uint64_t kCostModelVersion = 2;
+
+/// Bumped independently of `kCostModelVersion` whenever a *connection*
+/// measurement's identity changes. A connection's key gained ordered
+/// node/link/engine paths, concrete maps/parameters and storage rendering in
+/// version 2 (task B8).
+inline constexpr uint64_t kConnectionKeyVersion = 2;
 
 /// What work is being looked up. Every field is part of the cache key; an
 /// empty field means "not modelled", never "any".
@@ -75,9 +86,58 @@ struct OperationSignature {
 
 /// The target a measurement belongs to: a measurement from another machine, or
 /// from the same machine before its profile changed, is not this measurement.
+///
+/// The machine hash alone is not the whole target identity (task B8): the rule
+/// library and the layout library are target content too, and a change to
+/// either changes what a piece of work *means*. Both hashes default to 0, so a
+/// caller that only knows the machine keeps source compatibility; a non-zero
+/// hash is required before a measurement can be reused.
 struct TargetContext {
   std::string target;
   std::string machineHash;
+  std::string ruleHash;
+  std::string layoutHash;
+};
+
+/// One connection decision's complete measurement identity (task B8): what kind
+/// of connection it is, the value it carries, its endpoint *roles*, its ordered
+/// node/link/engine path, the concrete layout maps and parameters it applies,
+/// the storage it resolves to, and the connection-key version. The mapping
+/// search and the performance evaluator describe the same movement through this
+/// one shape, so a measured cost is only reused for the connection it was taken
+/// on.
+///
+/// Every field is a canonical, length-delimited rendering (`<len>:<bytes>`), so
+/// two descriptions collide only when they are the same description -- swapping
+/// a producer's and a consumer's role, or merely reordering a list, cannot
+/// produce the same key.
+struct ConnectionSignature {
+  /// `stringifyConnectionKind` of the connection.
+  std::string kind;
+  /// Canonical rendering of the carried value's type.
+  std::string valueType;
+  /// The producer-side endpoint, prefixed with its `producer` role.
+  std::string producerEndpoint;
+  /// The consumer-side endpoints, each prefixed with its `consumer` role and
+  /// rendered sorted.
+  std::string consumerEndpoints;
+  /// The ordered route as concrete memory *node* ids, `a>link>b>link>c` form.
+  std::string route;
+  /// The ordered link ids the route crosses.
+  std::string links;
+  /// The ordered transfer engine ids the route uses.
+  std::string engines;
+  /// The concrete source/destination affine maps the connection applies.
+  std::string maps;
+  /// The concrete layout and bundle parameters the connection resolved.
+  std::string parameters;
+  /// The storage the connection resolves to (memory plus allocation bytes).
+  std::string storage;
+  uint64_t keyVersion = kConnectionKeyVersion;
+
+  /// Canonical, length-delimited rendering, so two lookups that describe the
+  /// same connection produce the same key and no two different connections do.
+  std::string canonicalString() const;
 };
 
 /// An optional source of measured or calibrated cycle counts.
@@ -90,6 +150,24 @@ public:
   virtual std::optional<double>
   lookupCycles(const OperationSignature &signature,
                const TargetContext &context) const = 0;
+
+  /// The measured cycles for a connection, or nullopt when there is no entry.
+  ///
+  /// Nullopt is *not* a legality verdict and does not change which connections
+  /// are legal: a miss leaves the static estimate in place, and a hit only
+  /// replaces that estimate with a calibrated number (task B8). The default
+  /// implementation always misses, so a provider written before connections
+  /// existed keeps its exact behaviour.
+  ///
+  /// A subclass that overrides one overload hides the other, so it must bring
+  /// the other into scope with `using LatencyProvider::lookupCycles;`.
+  virtual std::optional<double>
+  lookupCycles(const ConnectionSignature &signature,
+               const TargetContext &context) const {
+    (void)signature;
+    (void)context;
+    return std::nullopt;
+  }
 };
 
 } // namespace mlir::llk::mapping

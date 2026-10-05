@@ -2,35 +2,60 @@
 
 #include "LLK/Mapping/LatencyProvider.h"
 
+#include <string>
+
 namespace mlir::llk::mapping {
 
+namespace {
+
+/// Appends one field length-delimited. `out` already holds a `name` label, so
+/// the caller names the field first and this writes `<len>:<bytes>`. A field
+/// whose bytes contain the separator, a `|`, or a newline therefore cannot be
+/// confused with a field boundary: the reader counts bytes, never scans for a
+/// delimiter (task B8).
+void appendField(std::string &out, llvm::StringRef name,
+                 llvm::StringRef value) {
+  out += name.str();
+  out += '=';
+  out += std::to_string(value.size());
+  out += ':';
+  out.append(value.begin(), value.end());
+  out += ';';
+}
+
+} // namespace
+
 std::string OperationSignature::canonicalString() const {
-  std::string out = "operation=";
-  out += operation;
-  out += "|operand_types=";
-  out += operandTypes;
-  out += "|result_types=";
-  out += resultTypes;
-  out += "|attributes=";
-  out += attributes;
-  out += "|rule=";
-  out += rule;
-  out += "|rule_version=";
-  out += std::to_string(ruleVersion);
-  out += "|bundle=";
-  out += bundle;
-  out += "|bundle_parameters=";
-  out += bundleParameters;
-  out += "|layout=";
-  out += layout;
-  out += "|placement_class=";
-  out += placementClass;
-  out += "|placement=";
-  out += placement;
-  out += "|route=";
-  out += routeClass;
-  out += "|cost_model=";
-  out += std::to_string(costModelVersion);
+  std::string out;
+  appendField(out, "operation", operation);
+  appendField(out, "operand_types", operandTypes);
+  appendField(out, "result_types", resultTypes);
+  appendField(out, "attributes", attributes);
+  appendField(out, "rule", rule);
+  appendField(out, "rule_version", std::to_string(ruleVersion));
+  appendField(out, "bundle", bundle);
+  appendField(out, "bundle_parameters", bundleParameters);
+  appendField(out, "layout", layout);
+  appendField(out, "placement_class", placementClass);
+  appendField(out, "placement", placement);
+  appendField(out, "route", routeClass);
+  appendField(out, "cost_model", std::to_string(costModelVersion));
+  return out;
+}
+
+std::string ConnectionSignature::canonicalString() const {
+  std::string out;
+  appendField(out, "kind", kind);
+  appendField(out, "value_type", valueType);
+  appendField(out, "producer", producerEndpoint);
+  appendField(out, "consumers", consumerEndpoints);
+  appendField(out, "route", route);
+  appendField(out, "links", links);
+  appendField(out, "engines", engines);
+  appendField(out, "maps", maps);
+  appendField(out, "parameters", parameters);
+  appendField(out, "storage", storage);
+  appendField(out, "key_version", std::to_string(keyVersion));
   return out;
 }
 

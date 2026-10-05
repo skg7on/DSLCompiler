@@ -441,3 +441,71 @@ std::vector<std::string> checkCapacity(const MicroDAG &dag,
 }
 
 } // namespace mlir::llk::perf
+
+//===----------------------------------------------------------------------===//
+// Normalized plan-event scheduling (task B8)
+//===----------------------------------------------------------------------===//
+
+namespace mlir::llk::mapping {
+
+llvm::Expected<Cost> schedulePlanEvents(const PlanEventDAG &dag,
+                                        const machine::MachineModel &machine) {
+  // A normalized plan event becomes the *same* `MicroEvent` a materialized
+  // kernel produces, so it is scheduled by the one list scheduler rather than a
+  // second heuristic that could rank candidates differently from the perf
+  // prediction.
+  perf::MicroDAG micro;
+  micro.events.reserve(dag.events.size());
+  uint64_t totalBytes = 0;
+  for (const PlanCostEvent &planEvent : dag.events) {
+    const CostEvent &source = planEvent.event;
+    perf::MicroEvent event;
+    event.id = static_cast<uint32_t>(micro.events.size());
+    switch (source.kind) {
+    case CostEventKind::Compute: {
+      const machine::ComputeNode *engine = machine.findCompute(source.resource);
+      const bool matrix = engine && engine->kind == "matrix_engine";
+      event.resource = matrix ? perf::ResourceKind::MatrixEngine
+                              : perf::ResourceKind::VectorEngine;
+      event.kind = matrix ? perf::EventKind::Mma : perf::EventKind::Vector;
+      break;
+    }
+    case CostEventKind::TransferHop:
+      event.resource = perf::ResourceKind::Dma;
+      event.kind = perf::EventKind::AsyncCopy;
+      break;
+    case CostEventKind::Transform:
+      event.resource = perf::ResourceKind::VectorEngine;
+      event.kind = perf::EventKind::Transform;
+      break;
+    case CostEventKind::Synchronization:
+    case CostEventKind::Capacity:
+      event.resource = perf::ResourceKind::Sync;
+      event.kind = perf::EventKind::Wait;
+      break;
+    }
+    event.resourceName = source.resource;
+    event.workItems = planEvent.workItems;
+    event.bytes = planEvent.bytes;
+    // Round up so a fractional estimate is never under-charged.
+    event.minCycles =
+        static_cast<uint64_t>(std::ceil(source.cost.latencyCycles));
+    event.deps = planEvent.deps;
+    event.costKind = source.kind;
+    totalBytes += planEvent.bytes;
+    micro.events.push_back(std::move(event));
+  }
+
+  perf::L1Report report = perf::scheduleL1(micro, machine);
+
+  Cost cost;
+  cost.latencyCycles = static_cast<double>(report.predictedCycles);
+  cost.localBytes = totalBytes;
+  // The two utilization dimensions follow the aggregate convention `Cost`
+  // documents: each is a summed load factor over one shared window.
+  cost.computeUtilization = report.matrixUtilization + report.vectorUtilization;
+  cost.transferUtilization = report.dmaUtilization;
+  return cost;
+}
+
+} // namespace mlir::llk::mapping

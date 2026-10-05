@@ -30,6 +30,7 @@
 
 namespace mlir::llk::machine {
 struct MachineModel;
+struct ComputeNode;
 } // namespace mlir::llk::machine
 
 namespace mlir::llk::mapping {
@@ -185,6 +186,25 @@ objectiveOrderFromMicro(llvm::StringRef metric, bool minimize,
 /// Fixed-format rendering of every dimension, byte-stable across runs and
 /// platforms so it can key hashes and reports.
 std::string canonicalCostString(const Cost &cost);
+
+/// The machine spelling of an element type (`f32`, `bf16`, `i8`), or empty when
+/// the type has no width a transform could move. The single shared rendering,
+/// so the planner, the performance DAG and the transform estimate all name a
+/// dtype the same way (task B8 folds A9's deferred DRY).
+std::string elementTypeName(mlir::Type type);
+
+/// Bytes of one element, or nullopt for an element type with no width. The
+/// companion of `elementTypeName`, shared for the same reason.
+std::optional<unsigned> elementByteWidth(mlir::Type type);
+
+/// The issue cycles one elementwise pass over `elements` takes on `engine`:
+/// `ceil(elements / lanes[dtype]) x issueCycles`, with a one-element-per-issue
+/// fallback for a dtype the engine does not declare -- slower than the
+/// hardware, never faster. The one formula both the performance DAG and the
+/// normalized plan events charge an elementwise (vector or reduce) event, so
+/// the two cannot drift.
+uint64_t elementwiseCycles(const machine::ComputeNode &engine,
+                           llvm::StringRef dtype, uint64_t elements);
 
 /// The static facts one layout conversion is costed from: the value's type on
 /// each side, the logical-to-physical affine map of the layout on each side,

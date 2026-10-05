@@ -361,6 +361,77 @@ std::string placementIdentity(const CandidateInstance &instance) {
   return text;
 }
 
+/// The measurement identity of one synthesized connection (task B8): the
+/// ordered route, the links it crosses, the engines it uses, its endpoint
+/// occurrences with explicit roles, the concrete maps it applies, and the
+/// storage it resolves to. Built from the same facts the search decided, so a
+/// provider's measurement is only reused for the connection it was taken on.
+ConnectionSignature
+connectionSignatureFor(const ConnectionPlan &connection,
+                       const WorkloadGraph &workload,
+                       const machine::MachineModel &machine) {
+  ConnectionSignature signature;
+  signature.kind = stringifyConnectionKind(connection.kind).str();
+  if (const WorkloadValue *value = workload.findValue(connection.value))
+    signature.valueType = renderedType(value->type);
+  if (connection.producerPort)
+    signature.producerEndpoint =
+        "producer{" + canonicalPortRefString(*connection.producerPort) + "}";
+  std::vector<std::string> consumers;
+  for (const PortRef &port : connection.consumerPorts)
+    consumers.push_back("consumer{" + canonicalPortRefString(port) + "}");
+  llvm::sort(consumers);
+  signature.consumerEndpoints = llvm::join(consumers, ",");
+  std::vector<std::string> nodes;
+  std::vector<std::string> links;
+  for (const MemoryNodeId &node : connection.memoryRoute)
+    nodes.push_back(node);
+  for (size_t hop = 1; hop < connection.memoryRoute.size(); ++hop)
+    for (const machine::LinkEdge &edge : machine.links)
+      if (edge.source == connection.memoryRoute[hop - 1] &&
+          edge.destination == connection.memoryRoute[hop]) {
+        links.push_back(edge.id);
+        break;
+      }
+  signature.route = llvm::join(nodes, ">");
+  signature.links = llvm::join(links, ">");
+  signature.engines = llvm::join(connection.transferEngines, ">");
+  auto renderMap = [](const mlir::AffineMap &map) {
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    map.print(stream);
+    return stream.str();
+  };
+  std::string maps;
+  if (connection.transform) {
+    maps = "src=";
+    maps += connection.transform->srcMap
+                ? renderMap(connection.transform->srcMap)
+                : std::string("<null>");
+    maps += ";dst=";
+    maps += connection.transform->dstMap
+                ? renderMap(connection.transform->dstMap)
+                : std::string("<null>");
+  } else if (connection.producerMap) {
+    maps = "producer=" + renderMap(*connection.producerMap);
+  }
+  signature.maps = maps;
+  std::string parameters;
+  if (connection.transform) {
+    parameters = connection.transform->srcLayout;
+    parameters += "->";
+    parameters += connection.transform->dstLayout;
+  }
+  signature.parameters = parameters;
+  std::string storage;
+  if (!connection.memoryRoute.empty())
+    storage = connection.memoryRoute.back();
+  storage += "#";
+  storage += std::to_string(connection.cost.localBytes);
+  signature.storage = storage;
+  return signature;
+}
+
 /// Canonical placement order (design §22.1): the executor id, then the sorted
 /// memory bindings, then the sorted layout bindings. Node and instance ids
 /// break a tie so the order over a complete plan is total.
@@ -462,6 +533,24 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     facts.bytes = kUnknownValueBytes;
     facts.alignment = kUnknownAlignment;
     return facts;
+  };
+
+  // The element count a value's type states, so a normalized plan event can
+  // report the same work-item count the materialized kernel does (task B8). A
+  // type whose element width or static size is unknown yields 0 -- the value's
+  // size is a separate, reported fallback, never a fabricated element count.
+  auto elementsForValue = [&](WorkloadValueId value) -> uint64_t {
+    const WorkloadValue *moved = workload_.findValue(value);
+    if (!moved || !moved->type)
+      return 0;
+    mlir::Type elementType = elementTypeOf(moved->type);
+    if (!elementType)
+      return 0;
+    std::optional<unsigned> width = elementByteWidth(elementType);
+    if (!width || *width == 0)
+      return 0;
+    TileFacts facts = tileFactsFor(moved->type);
+    return facts.known ? facts.bytes / *width : 0;
   };
 
   // The byte count for a node with no output to size: its first input's tile,
@@ -656,8 +745,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                     entry.instance.executorBindings.lookup("executor")))
               signature.placementClass = executor->kind;
             signature.placement = placementIdentity(entry.instance);
-            TargetContext context{target_.name().str(),
-                                  hexId(machine.contentHash)};
+            // The target identity is more than the machine (task B8): a change
+            // to the rule or layout library changes what a measurement means,
+            // so both content hashes join the context.
+            TargetContext context{
+                target_.name().str(), hexId(machine.contentHash),
+                hexId(target_.rules().computeContentHash()),
+                hexId(target_.layouts().computeContentHash())};
             if (std::optional<double> measured =
                     provider->lookupCycles(signature, context))
               entry.cost.latencyCycles = *measured;
@@ -1545,12 +1639,31 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   };
 
   // Applies one chosen realization to `state` and stages its plans.
+  //
+  // A connection a provider has measured is charged its calibrated cycles
+  // instead of the static estimate (task B8). The lookup changes only cost,
+  // never which connections are legal: a miss leaves the static estimate, and
+  // the branch decision was already made.
+  const LatencyProvider *connectionProvider =
+      options_.enableLatencyCache ? target_.latencyProvider() : nullptr;
+  TargetContext connectionContext{
+      target_.name().str(), hexId(machine.contentHash),
+      hexId(target_.rules().computeContentHash()),
+      hexId(target_.layouts().computeContentHash())};
   auto applyRealization = [&](Partial &state,
                               std::vector<ConnectionPlan> &staged,
                               const ConnectionRealization &realization) {
     for (const ConnectionPlan &plan : realization.plans) {
-      staged.push_back(plan);
-      state.cost = addCost(state.cost, plan.cost);
+      ConnectionPlan effective = plan;
+      if (connectionProvider) {
+        ConnectionSignature signature =
+            connectionSignatureFor(effective, workload_, machine);
+        if (std::optional<double> measured =
+                connectionProvider->lookupCycles(signature, connectionContext))
+          effective.cost.latencyCycles = *measured;
+      }
+      staged.push_back(effective);
+      state.cost = addCost(state.cost, effective.cost);
     }
     for (const auto &charge : realization.liveBytes) {
       state.memoryBytes[charge.first] += charge.second;
@@ -1859,6 +1972,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           // the selected plan records *which* assignment generation solved and
           // verification can validate it rather than re-deriving one.
           placement.resolvedParameters = entry.resolvedParameters;
+          // The selected instance's measured-or-static cost and its node's
+          // output element count travel with the placement too (task B8), so a
+          // normalized plan event charges this node the same estimate the
+          // search ranked it on rather than re-deriving one.
+          placement.cost = entry.cost;
+          if (const WorkloadNode *node = tables[index].workload)
+            if (!node->outputs.empty())
+              placement.workItems = elementsForValue(node->outputs[0].value);
           break;
         }
       }
@@ -1893,6 +2014,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // `consumers` instance projection cannot tell two operand uses of one
       // value apart, so this is what names the use a rewire must target.
       detail.producerPort = connection.producerPort;
+      // The synthesized cost, the carried value's element count and its type
+      // travel with the connection (task B8), so a normalized plan event
+      // charges the same movement the search ranked and can re-derive the same
+      // transform estimate the materialized kernel uses.
+      detail.cost = connection.cost;
+      detail.workItems = elementsForValue(connection.value);
+      if (const WorkloadValue *moved = workload_.findValue(connection.value))
+        detail.valueType = moved->type;
       // The declared gather combination and the producer occurrences it
       // combines travel with the connection, so a selected plan states what
       // its reduce *means* rather than only that it combines several
