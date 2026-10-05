@@ -94,26 +94,6 @@ void setBindings(
   candidate->setAttr("bindings", builder.getDictionaryAttr(named));
 }
 
-/// Replaces the first `micro.constraint`'s `params` with `names`, bypassing the
-/// dialect verifier (which requires parameter names). This is the unverified
-/// state the loader must still resolve: a reference by declared role.
-void setConstraintParams(mlir::ModuleOp module, mlir::MLIRContext *context,
-                         llvm::ArrayRef<llvm::StringRef> names) {
-  mlir::Operation *constraint = nullptr;
-  module.walk([&](mlir::Operation *op) {
-    if (!constraint && op->getName().getStringRef() == "micro.constraint")
-      constraint = op;
-  });
-  if (!constraint) {
-    ADD_FAILURE() << "the fixture declares no micro.constraint";
-    return;
-  }
-  llvm::SmallVector<mlir::Attribute, 2> params;
-  for (llvm::StringRef name : names)
-    params.push_back(mlir::StringAttr::get(context, name));
-  constraint->setAttr("params", mlir::ArrayAttr::get(context, params));
-}
-
 std::unique_ptr<Parsed> parseFixture() {
   std::string error;
   auto source = llvm::MemoryBuffer::getFile(
@@ -683,9 +663,7 @@ module {
 )mlir";
 
 /// A space whose layout parameter declares a role (`operand0`). The constraint
-/// names the parameter itself so the module verifies; the test then rewrites
-/// the reference to the role, the unverified state the loader must still
-/// resolve (the dialect requires constraint params to name parameters).
+/// references that role directly, exercising the verified-IR loader path.
 constexpr llvm::StringLiteral kRoleReferencedLayoutSpace = R"mlir(
 module {
   micro.kernel @plain {
@@ -694,7 +672,7 @@ module {
   }
   micro.search_space @space attributes {workload = "plain"} {
     micro.param "lhs_layout" {kind = "layout", role = "operand0", choices = ["row_major", "blocked"]}
-    micro.constraint "layout_supported" {params = ["lhs_layout"]}
+    micro.constraint "layout_supported" {params = ["operand0"]}
     micro.candidate @ok {bindings = {lhs_layout = "row_major"}}
     micro.candidate @bad {bindings = {lhs_layout = "blocked"}}
   }
@@ -869,9 +847,8 @@ TEST(SearchBindingLoader, TailConstraintWithoutOriginalDimensionsIsRejected) {
 TEST(SearchBindingLoader, ResolvedRoleReferenceIsEvaluated) {
   auto parsed = parse(kRoleReferencedLayoutSpace);
   ASSERT_TRUE(parsed);
-  // The dialect requires constraint params to name parameters, so the role
-  // reference is the unverified state the loader must still resolve.
-  setConstraintParams(*parsed->module, parsed->context.get(), {"operand0"});
+  // This role reference parsed through ordinary verified IR, without mutation.
+  EXPECT_TRUE(mlir::succeeded(mlir::verify(*parsed->module)));
   llvm::Expected<mlir::llk::machine::MachineModel> machine = vectorMachine();
   ASSERT_TRUE(static_cast<bool>(machine))
       << llvm::toString(machine.takeError());

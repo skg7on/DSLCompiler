@@ -213,6 +213,11 @@ struct TransformCostInput {
 /// re-representation: it is modeled as zero *arithmetic* while still
 /// materializing its output bytes. Every other conversion is charged the
 /// capability's issue cost.
+/// First declared vector capability that can access the transform memory.
+llvm::Expected<std::string>
+selectTransformResource(const machine::MachineModel &,
+                        llvm::StringRef memoryNode);
+
 llvm::Expected<Cost>
 estimateTransformCost(const TransformCostInput &input,
                       const machine::MachineModel &machine);

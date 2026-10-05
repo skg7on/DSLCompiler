@@ -75,6 +75,10 @@ std::string transformString(const LayoutTransform &transform) {
   out += mapString(transform.srcMap);
   out += ":dst=";
   out += mapString(transform.dstMap);
+  if (!transform.memoryNode.empty())
+    out += ":memory=" + transform.memoryNode;
+  if (!transform.computeResource.empty())
+    out += ":compute=" + transform.computeResource;
   return out;
 }
 
