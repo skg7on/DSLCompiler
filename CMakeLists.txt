@@ -395,6 +395,10 @@ target_compile_options(LLKRuntime PRIVATE -fno-rtti -fno-exceptions)
 # helper, which only closes over MLIR's own components.
 target_link_libraries(LLKRuntime PUBLIC mlir_c_runner_utils)
 mlir_target_link_libraries(LLKRuntime PUBLIC
+    # `createLowerAffinePass` lives here. It reaches the binary through MLIR's
+    # dylib in a shared-MLIR build, so a local build links it by accident; a
+    # static-MLIR build needs it named, exactly like the rest of this list.
+    MLIRAffineToStandard
     MLIRExecutionEngine
     MLIRArithToLLVM
     MLIRControlFlowToLLVM
