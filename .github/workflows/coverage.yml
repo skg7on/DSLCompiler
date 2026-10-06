@@ -136,8 +136,23 @@ jobs:
           data = {'schemaVersion': 1, 'label': 'coverage', 'message': f'{p:.1f}%', 'color': color}
           json.dump(data, open('badges/coverage.json', 'w'))
           "
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add badges/coverage.json
-          git diff --staged --quiet || git commit -m "ci: update coverage badge [skip ci]"
-          git push
+          # Keep generated badge commits off main so its tip retains CI checks.
+          BADGE_DIR=$(mktemp -d)
+          BADGE_REF=$(git ls-remote --heads origin refs/heads/badges)
+          if [ -n "$BADGE_REF" ]; then
+            git fetch origin refs/heads/badges
+            git worktree add --detach "$BADGE_DIR" FETCH_HEAD
+          else
+            git worktree add --detach "$BADGE_DIR" HEAD
+            git -C "$BADGE_DIR" checkout --orphan coverage-badges
+            git -C "$BADGE_DIR" rm -rf .
+          fi
+          mkdir -p "$BADGE_DIR/badges"
+          cp badges/coverage.json "$BADGE_DIR/badges/coverage.json"
+          git -C "$BADGE_DIR" config user.name "github-actions[bot]"
+          git -C "$BADGE_DIR" config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C "$BADGE_DIR" add badges/coverage.json
+          if ! git -C "$BADGE_DIR" diff --staged --quiet; then
+            git -C "$BADGE_DIR" commit -m "ci: update coverage badge"
+            git -C "$BADGE_DIR" push origin HEAD:refs/heads/badges
+          fi

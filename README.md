@@ -1,7 +1,7 @@
 # DSLCompiler - MLIR-Based DNN Micro-IR for AI Chipset Evaluation
 
 [![CI](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml/badge.svg)](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/skg7on/DSLCompiler/main/badges/coverage.json)](https://github.com/skg7on/DSLCompiler/actions/workflows/coverage.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/skg7on/DSLCompiler/badges/badges/coverage.json)](https://github.com/skg7on/DSLCompiler/actions/workflows/coverage.yml)
 
 DSLCompiler is an out-of-tree [MLIR](https://mlir.llvm.org/) compiler project centered on a low-level canonical DNN Micro-IR. The main goal is to represent how neural-network kernels execute on real or proposed AI chipsets, then use that representation to evaluate performance, compare hardware targets, drive auto-optimization, and eventually lower into target-specific backends.
 
