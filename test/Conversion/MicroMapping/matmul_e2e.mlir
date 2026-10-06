@@ -71,3 +71,8 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // TRAVERSE: tensor.insert_slice
 // TRAVERSE: return
 // TRAVERSE-NOT: micro.
+
+// The numeric half of this chain's acceptance is
+// test/Execution/mapped_acceptance.cpp: it exports the same LLK source, maps
+// it against the shipped AVX2 target and *invokes* the result, checking every
+// element. This file asserts the IR; that one asserts the answer.
