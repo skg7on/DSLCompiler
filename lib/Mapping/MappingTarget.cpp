@@ -137,6 +137,44 @@ std::unique_ptr<TargetEmitter> FileMappingTarget::createEmitter() const {
   return createEmitter(emitterKeys_.front());
 }
 
+namespace {
+
+/// The registered target packages, keyed by the name a caller selects them by.
+/// A function-local static, so registration order across translation units
+/// cannot change what a lookup sees.
+llvm::StringMap<MappingTargetFactory> &targetFactories() {
+  static llvm::StringMap<MappingTargetFactory> factories;
+  return factories;
+}
+
+} // namespace
+
+void registerMappingTarget(llvm::StringRef name, MappingTargetFactory factory) {
+  targetFactories()[name] = factory;
+}
+
+bool isRegisteredMappingTarget(llvm::StringRef name) {
+  return targetFactories().count(name) != 0;
+}
+
+llvm::Expected<std::unique_ptr<MappingTarget>>
+createRegisteredMappingTarget(llvm::StringRef name,
+                              llvm::StringRef configurationRoot) {
+  auto it = targetFactories().find(name);
+  if (it == targetFactories().end()) {
+    std::string known;
+    for (const auto &entry : targetFactories()) {
+      if (!known.empty())
+        known += ", ";
+      known += entry.first().str();
+    }
+    return targetError(
+        "no mapping target is registered under '" + name.str() + "'" +
+        (known.empty() ? "; none is registered" : "; registered: " + known));
+  }
+  return it->second(configurationRoot);
+}
+
 llvm::Error verifyMappingTarget(const MappingTarget &target) {
   const MachineModel &machine = target.machine();
   auto resolver = [&](llvm::StringRef callee, llvm::StringRef subject) {

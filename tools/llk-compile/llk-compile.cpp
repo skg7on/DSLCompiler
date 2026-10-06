@@ -10,11 +10,17 @@
 
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
+#include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/TritonToLLK/GridToForall.h"
 #include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
+#include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/MappingTarget.h"
+#include "LLK/Mapping/PlanReport.h"
+#include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Runtime/JitCache.h"
+#include "LLK/Target/MappingTargets.h"
 #include "LLK/Transforms/ForallToLLRT.h"
 #include "LLK/Transforms/FuseDoubleContraction.h"
 #include "LLK/Transforms/LinearizeForall.h"
@@ -92,6 +98,51 @@ static cl::opt<std::string> emitMode(
              "fully lowered module), micro (print concrete Micro-IR), or "
              "micro-search (print the tile search space)"),
     cl::init("llvm"));
+
+// ---------------------------------------------------------------------------
+// Mapping (issue #67 stage C5)
+// ---------------------------------------------------------------------------
+//
+// Setting `--mapping-target` takes a different contract from the legacy
+// pipeline: the user names the target, the schedule comes from a search over
+// the kernel's workload graph, and the code that runs is the target's. Leaving
+// it empty leaves the legacy path byte-for-byte what it was.
+
+static cl::opt<std::string> mappingTargetName(
+    "mapping-target",
+    cl::desc("Map and compile through this target package (for example "
+             "x86-avx2). Empty keeps the legacy pipeline."),
+    cl::init(""));
+
+static cl::opt<std::string> mappingRoot(
+    "mapping-root",
+    cl::desc("Configuration root the target package loads its machine profile "
+             "and its layout and rule files from"),
+    cl::init("."));
+
+static cl::opt<std::string>
+    mappingMode("mapping-mode",
+                cl::desc("Search mode: deterministic, beam, or exact"),
+                cl::init("beam"));
+
+static cl::opt<std::string> mappingStop(
+    "mapping-stop",
+    cl::desc("Where the mapping path stops: mapped-micro (the bound plan), "
+             "target-lowered (after the target's emitters), lowered (Linalg "
+             "and loops), or executable (the default)"),
+    cl::init("executable"));
+
+static cl::opt<std::string> mappingEntry(
+    "mapping-entry",
+    cl::desc("Kernel symbol to compile. Empty uses the module's single "
+             "micro.kernel."),
+    cl::init(""));
+
+static cl::opt<std::string> mappingPlanReport(
+    "plan-report",
+    cl::desc("Replay the frozen selection in this plan report instead of "
+             "searching. The report's graph and target hashes must match."),
+    cl::init(""));
 
 // ---------------------------------------------------------------------------
 // Pipeline
@@ -242,6 +293,211 @@ static mlir::LogicalResult runMicroSearchSpaceExport(mlir::ModuleOp module) {
 // Main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Mapping path (issue #67 stage C5)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string typeToString(mlir::Type type) {
+  std::string buffer;
+  llvm::raw_string_ostream stream(buffer);
+  type.print(stream);
+  return buffer;
+}
+
+std::optional<mlir::llk::mapping::SearchMode>
+parseSearchMode(llvm::StringRef name) {
+  if (name == "deterministic")
+    return mlir::llk::mapping::SearchMode::Deterministic;
+  if (name == "beam")
+    return mlir::llk::mapping::SearchMode::Beam;
+  if (name == "exact")
+    return mlir::llk::mapping::SearchMode::Exact;
+  return std::nullopt;
+}
+
+std::optional<llk::MappedStop> parseStop(llvm::StringRef name) {
+  if (name == "mapped-micro")
+    return llk::MappedStop::MappedMicro;
+  if (name == "target-lowered")
+    return llk::MappedStop::TargetLowered;
+  if (name == "lowered")
+    return llk::MappedStop::Lowered;
+  if (name == "executable")
+    return llk::MappedStop::Executable;
+  return std::nullopt;
+}
+
+} // namespace
+
+/// The mapping path: get a kernel, get a plan for it, compile that plan.
+///
+/// A plan comes from a search or from a frozen report, and this does not search
+/// for a *schedule* either -- turning an LLK/Linalg program into a concrete
+/// Micro kernel is the export's job, and it runs first when the input is not
+/// already Micro.
+static int runMappedCompilation(mlir::ModuleOp module,
+                                mlir::MLIRContext &context) {
+  mlir::llk::target::registerAllMappingTargets();
+
+  std::optional<llk::MappedStop> stop = parseStop(mappingStop);
+  if (!stop) {
+    llvm::errs() << "Unsupported --mapping-stop=" << mappingStop
+                 << "; expected mapped-micro, target-lowered, lowered, or "
+                    "executable\n";
+    return 1;
+  }
+
+  llvm::Expected<std::unique_ptr<mlir::llk::mapping::MappingTarget>> target =
+      mlir::llk::mapping::createRegisteredMappingTarget(mappingTargetName,
+                                                        mappingRoot);
+  if (!target) {
+    llvm::errs() << llvm::toString(target.takeError()) << "\n";
+    return 1;
+  }
+
+  auto findKernel = [&]() -> mlir::Operation * {
+    mlir::Operation *kernel = nullptr;
+    module->walk([&](mlir::Operation *op) {
+      if (!kernel && op->getName().getStringRef() == "micro.kernel")
+        kernel = op;
+    });
+    return kernel;
+  };
+
+  if (!findKernel()) {
+    if (mlir::failed(runMicroExport(module))) {
+      llvm::errs() << "Mapping needs a micro.kernel, and exporting one from "
+                      "this input failed\n";
+      return 1;
+    }
+    // The export leaves the semantic source function beside the kernel it
+    // produced: it is the reference the export was made from, and the legacy
+    // pipeline lowers it. This path compiles the *kernel*, so keeping the
+    // source would compile the program twice -- and its high-level ops have no
+    // lowering here.
+    llvm::SmallVector<mlir::Operation *> sourceFunctions;
+    module->walk([&](mlir::Operation *op) {
+      if (!mlir::isa<mlir::func::FuncOp>(op))
+        return;
+      bool semantic = false;
+      op->walk([&](mlir::Operation *inner) {
+        if (inner->getName().getStringRef().starts_with("llk."))
+          semantic = true;
+      });
+      if (semantic)
+        sourceFunctions.push_back(op);
+    });
+    for (mlir::Operation *op : sourceFunctions)
+      op->erase();
+  }
+  mlir::Operation *kernel = findKernel();
+  if (!kernel) {
+    llvm::errs() << "No micro.kernel to map\n";
+    return 1;
+  }
+
+  llvm::Expected<mlir::llk::mapping::WorkloadGraph> graph =
+      mlir::llk::mapping::extractWorkloadGraph(kernel);
+  if (!graph) {
+    llvm::errs() << llvm::toString(graph.takeError()) << "\n";
+    return 1;
+  }
+
+  std::optional<mlir::llk::mapping::CoveringPlan> selected;
+  if (!mappingPlanReport.empty()) {
+    // Replaying a frozen selection: the report is data, not code, so the hash
+    // checks below are what tie it to *this* graph and *this* target.
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+        llvm::MemoryBuffer::getFile(mappingPlanReport);
+    if (!buffer) {
+      llvm::errs() << "Cannot read plan report " << mappingPlanReport << "\n";
+      return 1;
+    }
+    llvm::Expected<mlir::llk::mapping::CoveringPlan> replayed =
+        mlir::llk::mapping::readPlanReport(buffer.get()->getBuffer(), **target,
+                                           *graph);
+    if (!replayed) {
+      llvm::errs() << llvm::toString(replayed.takeError()) << "\n";
+      return 1;
+    }
+    selected = std::move(*replayed);
+  } else {
+    std::optional<mlir::llk::mapping::SearchMode> mode =
+        parseSearchMode(mappingMode);
+    if (!mode) {
+      llvm::errs() << "Unsupported --mapping-mode=" << mappingMode
+                   << "; expected deterministic, beam, or exact\n";
+      return 1;
+    }
+    // The layout context comes from the kernel's own operands: solving a layout
+    // means reasoning about the element type the tile actually holds.
+    mlir::llk::mapping::LayoutContext layoutContext;
+    layoutContext.rank = 2;
+    layoutContext.elementType = "f32";
+    for (mlir::BlockArgument argument : kernel->getRegion(0).getArguments()) {
+      if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(argument.getType())) {
+        layoutContext.rank = shaped.getRank();
+        layoutContext.elementType = typeToString(shaped.getElementType());
+        break;
+      }
+    }
+
+    mlir::llk::mapping::MappingSearchOptions options;
+    options.mode = *mode;
+    mlir::llk::mapping::CoveringSearch search(*graph, **target, context,
+                                              layoutContext, options);
+    llvm::Expected<mlir::llk::mapping::MappingSearchResult> result =
+        search.search();
+    if (!result) {
+      llvm::errs() << llvm::toString(result.takeError()) << "\n";
+      return 1;
+    }
+    if (result->plans.empty()) {
+      llvm::errs()
+          << "The search found no complete plan for kernel '"
+          << kernel->getAttrOfType<mlir::StringAttr>("sym_name").getValue()
+          << "'\n";
+      return 1;
+    }
+    selected = result->plans.front();
+  }
+
+  llk::MappedCompileOptions options;
+  options.stop = *stop;
+  // The kernel this run mapped is the one to compile: `--mapping-entry` names a
+  // different one deliberately, and leaving it empty does not have to be an
+  // error here because the kernel symbol is right there.
+  options.entrySymbol = mappingEntry;
+  if (options.entrySymbol.empty())
+    options.entrySymbol =
+        kernel->getAttrOfType<mlir::StringAttr>("sym_name").getValue().str();
+  llvm::Expected<llk::MappedCompilation> compiled =
+      llk::compileMappedKernel(module, **target, *selected, options);
+  if (!compiled) {
+    llvm::errs() << llvm::toString(compiled.takeError()) << "\n";
+    return 1;
+  }
+
+  // What ran is reported next to what was selected: a run whose operations were
+  // all carried by the reference bridge has not exercised the target's code
+  // generation, and saying so is the difference between the two claims.
+  llvm::outs() << "mapping: target=" << mappingTargetName
+               << " target-lowered-ops=" << compiled->targetLowered
+               << " reference-lowered-ops=" << compiled->referenceLowered
+               << "\n";
+
+  if (compiled->stopped != llk::MappedStop::Executable) {
+    compiled->module->print(llvm::outs());
+    llvm::outs() << "\n";
+    return 0;
+  }
+
+  llvm::outs() << "Compilation successful\n";
+  return 0;
+}
+
 int main(int argc, char **argv) {
   llvm::InitLLVM y(argc, argv);
 
@@ -345,6 +601,12 @@ int main(int argc, char **argv) {
     llvm::errs() << "Failed to parse " << inputFile << "\n";
     return 1;
   }
+
+  // A named mapping target takes over before anything else: it has its own
+  // stopping points and its own contract, and leaving the option empty keeps
+  // the legacy path exactly as it was.
+  if (!mappingTargetName.empty())
+    return runMappedCompilation(*module, ctx);
 
   // Micro-IR export runs on its own and never reaches the JIT.
   if (emit == "micro" || emit == "micro-search") {

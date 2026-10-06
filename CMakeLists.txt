@@ -385,6 +385,15 @@ target_link_libraries(LLKRuntime PUBLIC
     LLVMOrcJIT
     ${LLVM_NATIVE_TARGET_LIBS}
 )
+# LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
+# not inherit those. Linking `llvm::Error` values through the ORC interfaces
+# needs the same flags, or the link fails on `typeinfo for llvm::ErrorInfoBase`.
+target_compile_options(LLKRuntime PRIVATE -fno-rtti -fno-exceptions)
+# MLIR's C runtime: a lowered `memref.copy` calls `memrefCopy`, which the
+# finalize pass emits as a call into the runtime rather than inlining. Every
+# consumer of this library needs it, so it is named outside the MLIR-target
+# helper, which only closes over MLIR's own components.
+target_link_libraries(LLKRuntime PUBLIC mlir_c_runner_utils)
 mlir_target_link_libraries(LLKRuntime PUBLIC
     MLIRExecutionEngine
     MLIRArithToLLVM
@@ -392,6 +401,7 @@ mlir_target_link_libraries(LLKRuntime PUBLIC
     MLIRFuncToLLVM
     MLIRMathToLLVM
     MLIRMemRefToLLVM
+    MLIRMemRefTransforms
     MLIRReconcileUnrealizedCasts
     MLIRSCFToControlFlow
     MLIRVectorToLLVMPass
@@ -439,6 +449,7 @@ target_include_directories(LLKTargetX86 PUBLIC
 # does not drag in MLIR; the lowering does, because a target lowerer rewrites
 # Micro operations and so is the layer that knows the dialect.
 add_library(LLKTargetMapping STATIC
+    lib/Target/MappingTargets.cpp
     lib/Target/X86/Mapping/AVX2MappingTarget.cpp
     lib/Target/X86/Mapping/AVX2BundleLowering.cpp
     lib/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.cpp
@@ -488,6 +499,33 @@ target_include_directories(LLKTargetAArch64 PUBLIC
 )
 
 # Library: Common utilities shared across all kernels
+# Library: the shared mapped-compilation path (issue #67, stage C5). The one
+# sequence from a selected plan to runnable code, taken by both the compiler and
+# the tuner so a schedule's provenance does not depend on which tool asked for
+# it. Kept out of LLKMicroMapping because it reaches all the way to the JIT: a
+# caller that only wants to map a kernel should not link an execution engine.
+add_library(LLKMappedCompilation STATIC
+    lib/Conversion/MicroMapping/MappedCompilation.cpp
+)
+target_include_directories(LLKMappedCompilation PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+# The canonical plan materializer lives beside the source file; the include is
+# private because it is an implementation detail of the Micro mapping library.
+target_include_directories(LLKMappedCompilation PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+)
+target_link_libraries(LLKMappedCompilation PUBLIC
+    LLKMicroMapping LLKMicroToLinalg LLKRuntime LLKMapping LLKTargetMapping
+)
+# LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
+# not inherit those. Match the toolchain, exactly as LLKMapping does.
+target_compile_options(LLKMappedCompilation PRIVATE -fno-rtti -fno-exceptions)
+mlir_target_link_libraries(LLKMappedCompilation PUBLIC
+    MLIRBufferizationTransforms MLIRLinalgTransforms MLIRPass MLIRIR
+)
+
 add_mlir_library(LLKCommon
     lib/Transforms/Common/TilingUtils.cpp
     lib/Transforms/Common/VectorizationUtils.cpp
@@ -656,7 +694,7 @@ target_link_libraries(llk-opt PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContr
 
 # Tool: llk-compile
 add_llvm_executable(llk-compile tools/llk-compile/llk-compile.cpp)
-target_link_libraries(llk-compile PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection LLKToMicro TritonToLLKPasses LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+target_link_libraries(llk-compile PRIVATE mlir_c_runner_utils LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKScratchAnalysis LLKLinearizeForall LLKSerialParallelDispatch LLKForallToLLRT LLKShapeSpecialization LLKScheduleSelection LLKToMicro LLKMappedCompilation LLKTargetMapping LLKMapping LLKRuntime TritonToLLKPasses ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: llk-bench (benchmarking harness)
 add_llvm_executable(llk-bench tools/llk-bench/llk-bench.cpp)
@@ -874,7 +912,18 @@ target_compile_definitions(MappingPlanBinderTest PRIVATE
     LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
     LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME MappingPlanBinderTest COMMAND MappingPlanBinderTest)
-add_llk_mapping_test(MappingE2EWorkflowTest test/Mapping/e2e_workflow.cpp)
+# The workflow test also compiles a mapped kernel to a runnable executable
+# (stage C5), so it links the shared mapped-compilation library rather than the
+# mapping test helper alone.
+add_llvm_executable(MappingE2EWorkflowTest test/Mapping/e2e_workflow.cpp)
+target_link_libraries(MappingE2EWorkflowTest PRIVATE
+    LLKMappedCompilation LLKMicroToLinalg LLKMapping LLKTargetMapping MicroDialect
+    GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(MappingE2EWorkflowTest PRIVATE
+    LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping"
+    LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME MappingE2EWorkflowTest COMMAND MappingE2EWorkflowTest)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
 add_llk_mapping_test(MappingPropertiesTest test/Mapping/properties.cpp)
@@ -1105,6 +1154,30 @@ if(LLK_BUILD_TOOLS)
   # `tensor.insert_slice` threaded through the spatial loops -- with no residual
   # micro operation for a backend to trip over. Traversal is what this proves;
   # numerical correctness is C4/C8's.
+  # Stage C5: the shared mapped-compilation path, taken by the compiler. A
+  # plan is searched, bound, verified, handed to the target's own emitters where
+  # they implement it, lowered, bufferized and JIT-compiled -- and the compiler
+  # reports what ran next to what was selected, so "the target lowered this"
+  # and "the reference bridge carried it" stay separate claims.
+  add_test(NAME MicroMappingCompileMatmulToExecutable
+      COMMAND sh -c "$<TARGET_FILE:llk-compile> --mapping-target=x86-avx2 --mapping-root=${CMAKE_SOURCE_DIR} --mapping-mode=exact ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | grep -q 'Compilation successful'"
+  )
+  add_test(NAME MicroMappingCompileSwiGLUToExecutable
+      COMMAND sh -c "$<TARGET_FILE:llk-compile> --mapping-target=x86-avx2 --mapping-root=${CMAKE_SOURCE_DIR} --mapping-mode=exact ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/swiglu_e2e.mlir | grep -q 'Compilation successful'"
+  )
+  # The inspection stops: a caller that wants the mapped or target-lowered IR
+  # has no business running a JIT to get it.
+  add_test(NAME MicroMappingCompileStopsAtMappedMicro
+      COMMAND sh -c "$<TARGET_FILE:llk-compile> --mapping-target=x86-avx2 --mapping-root=${CMAKE_SOURCE_DIR} --mapping-mode=exact --mapping-stop=mapped-micro ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | grep -q 'micro.kernel'"
+  )
+  add_test(NAME MicroMappingCompileStopsAtTargetLowered
+      COMMAND sh -c "$<TARGET_FILE:llk-compile> --mapping-target=x86-avx2 --mapping-root=${CMAKE_SOURCE_DIR} --mapping-mode=exact --mapping-stop=target-lowered ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | grep -q 'micro.kernel'"
+  )
+  # A target nobody registered is a diagnostic naming the ones that are, not a
+  # silent fallback to a different backend.
+  add_test(NAME MicroMappingCompileRejectsUnknownTarget
+      COMMAND sh -c "$<TARGET_FILE:llk-compile> --mapping-target=not-a-target --mapping-root=${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir 2>&1 | grep -q 'no mapping target is registered'"
+  )
   add_test(NAME MicroMappingMatmulTraverses
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | $<TARGET_FILE:llk-opt> --micro-to-linalg | ${FILECHECK_BIN} --check-prefix=TRAVERSE ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir"
   )

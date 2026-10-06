@@ -76,32 +76,58 @@ bool hasArithmeticPath(mlir::Type elementType) {
   return elementType.isF32() || elementType.isBF16();
 }
 
-/// The physical vector width a bundle selected.
-///
-/// The rule's `param VW` is persisted onto the bundle as an integer attribute,
-/// so the width is read back from the *selected* plan rather than re-derived.
-/// A bundle that omits it, or carries a width this backend cannot emit, did not
-/// select a complete implementation.
-llvm::Expected<int64_t>
-resolveVectorWidth(const mapping::TargetBundle &bundle) {
-  if (!bundle.parameters)
-    return avx2Error(
-        "bundle '" + bundle.name +
-        "' carries no parameters, so no vector width was selected");
-  mlir::Attribute raw = bundle.parameters.get("VW");
-  if (!raw)
-    return avx2Error("bundle '" + bundle.name +
-                     "' declares no 'VW' parameter, so no vector width was "
-                     "selected");
+/// Checks a candidate width and returns it, or reports why this backend cannot
+/// emit it.
+llvm::Expected<int64_t> checkVectorWidth(mlir::Attribute raw,
+                                         llvm::StringRef source) {
   auto width = mlir::dyn_cast<mlir::IntegerAttr>(raw);
   if (!width)
-    return avx2Error("bundle parameter 'VW' is not an integer");
+    return avx2Error(
+        ("vector width from " + source + " is not an integer").str());
   int64_t value = width.getInt();
   if (value < 1 || value > 16 ||
       !llvm::isPowerOf2_64(static_cast<uint64_t>(value)))
     return avx2Error("vector width " + std::to_string(value) +
                      " is not a power of two in [1, 16]");
   return value;
+}
+
+/// The physical vector width the selected implementation uses.
+///
+/// The width is a property of the *layout* the search solved: the rule requires
+/// its operand to satisfy a layout whose `VW` parameter the solver fixed, and
+/// the binder persists that solution on the operation. Reading it from there is
+/// what makes the lowering follow the selection -- a bundle that happened to
+/// carry a width of its own would otherwise override the solved layout.
+///
+/// A bundle that does carry `VW` is still honoured, because that is the shape a
+/// bundle with parameters has; the layout solution is the fallback that the
+/// real pipeline always takes.
+llvm::Expected<int64_t> resolveVectorWidth(const mapping::TargetBundle &bundle,
+                                           mlir::Operation *op) {
+  if (bundle.parameters)
+    if (mlir::Attribute raw = bundle.parameters.get("VW"))
+      return checkVectorWidth(raw, "bundle '" + bundle.name + "'");
+
+  auto mapping = op->getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
+  auto solutions =
+      mapping ? mapping.getAs<mlir::DictionaryAttr>("layout_parameters")
+              : mlir::DictionaryAttr();
+  if (solutions) {
+    // Layout ids are sorted on write, so the first solution that carries a
+    // width is a deterministic choice rather than an arbitrary one.
+    for (mlir::NamedAttribute entry : solutions) {
+      auto solution = mlir::dyn_cast<mlir::DictionaryAttr>(entry.getValue());
+      if (!solution)
+        continue;
+      if (mlir::Attribute raw = solution.get("VW"))
+        return checkVectorWidth(raw, "layout '" + entry.getName().str() + "'");
+    }
+  }
+
+  return avx2Error(
+      "no vector width was selected: bundle '" + bundle.name +
+      "' carries none and the operation records no solved layout that has one");
 }
 
 /// The emitter a `MappingTarget` hands out for one key. It is the declared
@@ -112,6 +138,11 @@ class AVX2Emitter : public mapping::DeclaredTargetEmitter {
 public:
   AVX2Emitter(std::string key, std::vector<std::string> declaredKeys)
       : DeclaredTargetEmitter(std::move(key), std::move(declaredKeys)) {}
+
+  /// Only the arithmetic family has a lowering here; the movement and
+  /// contraction keys are declared because rules emit them, and the reference
+  /// bridge carries those until this target implements them.
+  bool hasLowering() const override { return isArithmeticKey(key()); }
 
   llvm::Error lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
                     const mapping::TargetBundle &bundle,
@@ -139,7 +170,10 @@ llvm::Error AVX2Emitter::lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
                      "' has no lowering implementation for its covered "
                      "operations yet");
 
-  llvm::Expected<int64_t> vectorWidth = resolveVectorWidth(bundle);
+  // The selected width is a property of the operation's solved layout, so it
+  // is read from the operation rather than guessed from the bundle name.
+  llvm::Expected<int64_t> vectorWidth =
+      resolveVectorWidth(bundle, coveredOps.front());
   if (!vectorWidth)
     return vectorWidth.takeError();
 

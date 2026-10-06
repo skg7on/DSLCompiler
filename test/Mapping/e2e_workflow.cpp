@@ -7,9 +7,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanBinder.h"
+#include "LLK/Runtime/MappedExecutable.h"
 #include "LLK/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
@@ -26,6 +28,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace mlir;
 using namespace mlir::llk::mapping;
@@ -199,4 +202,185 @@ TEST(E2EWorkflow, RepeatedRunsProduceIdenticalPlansAndIr) {
 
   EXPECT_EQ(a->search.plans.front().id, b->search.plans.front().id);
   EXPECT_EQ(a->mappedText, b->mappedText);
+}
+
+//===----------------------------------------------------------------------===//
+// Stage C5: the chain runs to code
+//===----------------------------------------------------------------------===//
+//
+// The chain above stops at mapped Micro-IR. These tests take the same plan all
+// the way to a JIT-compiled program and run it, which is the only way to tell
+// whether a selected schedule means anything.
+
+namespace {
+
+/// The same shape of work, but with the explicit signature the lowering bridge
+/// requires: a staged copy and a vector add, producing the add's result.
+///
+/// The result is `v + v` where `v` is a view of the copied input, so a caller
+/// that fills the input with 1.0 reads back 2.0 in every element -- an answer
+/// that depends on the copy actually having happened.
+constexpr llvm::StringLiteral kLowerableKernel = R"mlir(
+module {
+  micro.kernel @lowerable(%ext: tensor<8x8xf32>) -> tensor<8x8xf32> {
+    %t, %tok = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    %v = micro.tile_view %t {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %v, %v : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<acc>>
+    micro.yield %r : !micro.tile<8x8xf32, memory = #micro.memory<acc>>
+  }
+}
+)mlir";
+
+/// Searches `module` for a plan on `target`, which is the schedule-
+/// instantiation half the caller owns.
+llvm::Expected<CoveringPlan> planFor(MLIRContext &context, ModuleOp module,
+                                     MappingTarget &target) {
+  Operation *kernel = nullptr;
+  module->walk([&](Operation *op) {
+    if (!kernel && op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+  });
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel);
+  if (!graph)
+    return graph.takeError();
+
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "f32";
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(*graph, target, context, layoutContext, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  if (!result)
+    return result.takeError();
+  if (result->plans.empty())
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the search produced no plan");
+  return result->plans.front();
+}
+
+} // namespace
+
+TEST(E2EWorkflow, CompilesAMappedKernelToARunnableExecutable) {
+  Parsed parsed = parseKernel(kLowerableKernel);
+  ASSERT_TRUE(parsed.module);
+
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      planFor(*parsed.context, *parsed.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+
+  ::llk::MappedCompileOptions options;
+  options.entrySymbol = "lowerable";
+  llvm::Expected<::llk::MappedCompilation> compiled =
+      ::llk::compileMappedKernel(*parsed.module, **target, *plan, options);
+  ASSERT_TRUE(static_cast<bool>(compiled))
+      << llvm::toString(compiled.takeError());
+
+  EXPECT_EQ(compiled->stopped, ::llk::MappedStop::Executable);
+  ASSERT_TRUE(compiled->executable);
+  ASSERT_EQ(compiled->executable->abi().inputs.size(), 1u);
+  ASSERT_EQ(compiled->executable->abi().outputs.size(), 1u);
+  EXPECT_EQ(compiled->executable->abi().inputs[0].shape,
+            (std::vector<int64_t>{8, 8}));
+
+  // The vector add is the one operation the AVX2 package lowers itself; the
+  // staged copy is carried by the reference bridge. Reporting the two apart is
+  // what keeps "the target ran this" from being claimed for both.
+  EXPECT_GE(compiled->targetLowered, 1u);
+  EXPECT_GE(compiled->referenceLowered, 1u);
+
+  // The source module is untouched: binding clones.
+  EXPECT_FALSE(parsed.kernel->hasAttr("micro.plan"));
+
+  std::vector<float> input(64, 1.0f);
+  std::vector<float> output(64, -1.0f);
+  MemRef2D in{input.data(), input.data(), 0, 8, 8, 8, 1};
+  MemRef2D out{output.data(), output.data(), 0, 8, 8, 8, 1};
+  llvm::Error error = compiled->executable->invoke({&in}, {&out});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+
+  // v + v over an input of ones is two everywhere -- and it is only two if the
+  // staged copy actually delivered the input to the add.
+  for (size_t i = 0; i < output.size(); ++i)
+    EXPECT_EQ(output[i], 2.0f) << "element " << i;
+}
+
+TEST(E2EWorkflow, StopsBeforeExecutingWhenAsked) {
+  Parsed parsed = parseKernel(kLowerableKernel);
+  ASSERT_TRUE(parsed.module);
+
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      planFor(*parsed.context, *parsed.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+
+  // Mapped Micro: the selected state is recorded and no target has touched the
+  // operations yet.
+  {
+    ::llk::MappedCompileOptions options;
+    options.stop = ::llk::MappedStop::MappedMicro;
+    llvm::Expected<::llk::MappedCompilation> compiled =
+        ::llk::compileMappedKernel(*parsed.module, **target, *plan, options);
+    ASSERT_TRUE(static_cast<bool>(compiled))
+        << llvm::toString(compiled.takeError());
+    EXPECT_EQ(compiled->stopped, ::llk::MappedStop::MappedMicro);
+    EXPECT_TRUE(compiled->module);
+    EXPECT_FALSE(compiled->executable);
+    EXPECT_TRUE(compiled->module
+                    ->walk([](Operation *op) {
+                      return op->hasAttr("micro.plan") ? WalkResult::interrupt()
+                                                       : WalkResult::advance();
+                    })
+                    .wasInterrupted());
+  }
+
+  // Target-lowered: the AVX2 emitters have rewritten the operations they
+  // implement, which for the vector family means the result tile carries the
+  // physical vector width the bundle selected.
+  {
+    ::llk::MappedCompileOptions options;
+    options.stop = ::llk::MappedStop::TargetLowered;
+    llvm::Expected<::llk::MappedCompilation> compiled =
+        ::llk::compileMappedKernel(*parsed.module, **target, *plan, options);
+    ASSERT_TRUE(static_cast<bool>(compiled))
+        << llvm::toString(compiled.takeError());
+    EXPECT_EQ(compiled->stopped, ::llk::MappedStop::TargetLowered);
+    EXPECT_EQ(compiled->targetLowered, 1u);
+
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    compiled->module->print(stream);
+    EXPECT_NE(text.find("vectorized"), std::string::npos) << text;
+  }
+}
+
+TEST(E2EWorkflow, RefusesToCompileWhenThePlanIsNotExecutable) {
+  Parsed parsed = parseKernel(kLowerableKernel);
+  ASSERT_TRUE(parsed.module);
+
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      planFor(*parsed.context, *parsed.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+
+  // Compiling to an executable needs the entry symbol, and does not guess one:
+  // a lowered module may hold both the source function and the kernel that
+  // replaced it.
+  ::llk::MappedCompileOptions options;
+  options.entrySymbol = "";
+  llvm::Expected<::llk::MappedCompilation> compiled =
+      ::llk::compileMappedKernel(*parsed.module, **target, *plan, options);
+  ASSERT_FALSE(static_cast<bool>(compiled));
+  EXPECT_NE(llvm::toString(compiled.takeError()).find("entry symbol"),
+            std::string::npos);
 }
