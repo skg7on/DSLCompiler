@@ -15,6 +15,7 @@
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/CallInterfaces.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
 // Attribute class declarations.
@@ -688,6 +689,110 @@ static LogicalResult verifyStaticPositiveStep(Operation *op, Value step) {
   return success();
 }
 
+/// Parses the optional `iter_args(%carried = %init, ...) -> (types)` clause.
+///
+/// `regionArgs` already holds the induction variable, so a carried value's
+/// block argument follows the ones before it. A loop that declares no
+/// `iter_args` carries nothing, which is legal and simply parses to nothing.
+static ParseResult
+parseLoopCarriedValues(OpAsmParser &parser, OperationState &result,
+                       SmallVectorImpl<OpAsmParser::Argument> &regionArgs) {
+  if (failed(parser.parseOptionalKeyword("iter_args")))
+    return success();
+  if (parser.parseLParen())
+    return failure();
+
+  SmallVector<OpAsmParser::UnresolvedOperand> inits;
+  do {
+    OpAsmParser::Argument carried;
+    OpAsmParser::UnresolvedOperand init;
+    if (parser.parseOperand(carried.ssaName) || parser.parseEqual() ||
+        parser.parseOperand(init))
+      return failure();
+    regionArgs.push_back(carried);
+    inits.push_back(init);
+  } while (succeeded(parser.parseOptionalComma()));
+  if (parser.parseRParen())
+    return failure();
+
+  // The declared types are the carried values' types, and they are also the
+  // loop's result types: what an iteration yields is what the loop hands back.
+  SmallVector<Type> carriedTypes;
+  if (parser.parseArrow() || parser.parseLParen() ||
+      parser.parseTypeList(carriedTypes) || parser.parseRParen())
+    return failure();
+  result.addTypes(carriedTypes);
+
+  for (unsigned i = 0, e = inits.size(); i < e; ++i) {
+    regionArgs[i + 1].type = carriedTypes[i];
+    if (parser.resolveOperand(inits[i], carriedTypes[i], result.operands))
+      return failure();
+  }
+  return success();
+}
+
+/// Prints the `iter_args(...) -> (...)` clause, if the loop carries anything.
+static void printLoopCarriedValues(OpAsmPrinter &printer, OperandRange initArgs,
+                                   Block::BlockArgListType regionIterArgs,
+                                   TypeRange resultTypes) {
+  if (initArgs.empty())
+    return;
+  printer << " iter_args(";
+  llvm::interleaveComma(
+      llvm::zip(regionIterArgs, initArgs), printer, [&](auto pair) {
+        printer << std::get<0>(pair) << " = " << std::get<1>(pair);
+      });
+  printer << ") -> (";
+  llvm::interleaveComma(resultTypes, printer);
+  printer << ")";
+}
+
+/// Verifies the loop-carried contract both loop ops share: as many block
+/// arguments as values passed in, matching types end to end, and a terminator
+/// that yields one value per hole.
+template <typename LoopOp>
+static LogicalResult verifyLoopCarriedValues(LoopOp op) {
+  Block &entry = op.getBody().front();
+  auto regionIterArgs = entry.getArguments().drop_front();
+  auto initArgs = op.getInitArgs();
+  auto results = op.getResults();
+
+  if (regionIterArgs.size() != initArgs.size())
+    return op.emitOpError() << "body has " << regionIterArgs.size()
+                            << " loop-carried block argument(s) but the loop "
+                               "passes in "
+                            << initArgs.size();
+  if (results.size() != initArgs.size())
+    return op.emitOpError() << "loop has " << results.size()
+                            << " result(s) but carries " << initArgs.size();
+  for (unsigned i = 0, e = initArgs.size(); i < e; ++i) {
+    if (regionIterArgs[i].getType() != initArgs[i].getType())
+      return op.emitOpError()
+             << "loop-carried block argument #" << i << " has type "
+             << regionIterArgs[i].getType() << " but the loop passes in "
+             << initArgs[i].getType();
+    if (results[i].getType() != initArgs[i].getType())
+      return op.emitOpError()
+             << "result #" << i << " has type " << results[i].getType()
+             << " but the loop carries " << initArgs[i].getType();
+  }
+
+  auto yield = dyn_cast<YieldOp>(entry.getTerminator());
+  if (!yield)
+    return op.emitOpError("body must terminate with micro.yield");
+  if (yield.getNumOperands() != initArgs.size())
+    return op.emitOpError()
+           << "body yields " << yield.getNumOperands()
+           << " value(s) but the loop carries " << initArgs.size();
+  for (unsigned i = 0, e = initArgs.size(); i < e; ++i)
+    if (yield.getOperand(i).getType() != initArgs[i].getType())
+      return op.emitOpError()
+             << "yielded value #" << i << " has type "
+             << yield.getOperand(i).getType() << " but the loop carries "
+             << initArgs[i].getType();
+  return success();
+}
+
 ParseResult ForOp::parse(OpAsmParser &parser, OperationState &result) {
   auto &builder = parser.getBuilder();
 
@@ -702,31 +807,40 @@ ParseResult ForOp::parse(OpAsmParser &parser, OperationState &result) {
     return failure();
 
   inductionVariable.type = builder.getIndexType();
-  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
-
-  Region *body = result.addRegion();
-  if (parser.parseRegion(*body, regionArgs))
-    return failure();
-  ForOp::ensureTerminator(*body, builder, result.location);
-
   Type indexType = builder.getIndexType();
   if (parser.resolveOperand(lb, indexType, result.operands) ||
       parser.resolveOperand(ub, indexType, result.operands) ||
       parser.resolveOperand(step, indexType, result.operands))
     return failure();
 
+  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
+  if (parseLoopCarriedValues(parser, result, regionArgs))
+    return failure();
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, regionArgs))
+    return failure();
+  ForOp::ensureTerminator(*body, builder, result.location);
+
   return success();
 }
 
 void ForOp::print(OpAsmPrinter &printer) {
   printer << ' ' << getInductionVar() << " = " << getLowerBound() << " to "
-          << getUpperBound() << " step " << getStep() << ' ';
+          << getUpperBound() << " step " << getStep();
+  printLoopCarriedValues(printer, getInitArgs(), getRegionIterArgs(),
+                         getResults().getTypes());
+  printer << ' ';
+  // A loop that carries nothing keeps its bare, implicit terminator out of the
+  // printed form, exactly as before the carried-value contract existed.
   printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
-                      /*printBlockTerminators=*/false);
+                      /*printBlockTerminators=*/!getInitArgs().empty());
 }
 
 LogicalResult ForOp::verify() {
-  return verifyStaticPositiveStep(*this, getStep());
+  if (failed(verifyStaticPositiveStep(getOperation(), getStep())))
+    return failure();
+  return verifyLoopCarriedValues(*this);
 }
 
 ParseResult SpatialForOp::parse(OpAsmParser &parser, OperationState &result) {
@@ -748,18 +862,20 @@ ParseResult SpatialForOp::parse(OpAsmParser &parser, OperationState &result) {
   result.getOrAddProperties<SpatialForOp::Properties>().map = mapAttr;
 
   inductionVariable.type = builder.getIndexType();
-  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
-
-  Region *body = result.addRegion();
-  if (parser.parseRegion(*body, regionArgs))
-    return failure();
-  SpatialForOp::ensureTerminator(*body, builder, result.location);
-
   Type indexType = builder.getIndexType();
   if (parser.resolveOperand(lb, indexType, result.operands) ||
       parser.resolveOperand(ub, indexType, result.operands) ||
       parser.resolveOperand(step, indexType, result.operands))
     return failure();
+
+  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
+  if (parseLoopCarriedValues(parser, result, regionArgs))
+    return failure();
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, regionArgs))
+    return failure();
+  SpatialForOp::ensureTerminator(*body, builder, result.location);
 
   return success();
 }
@@ -767,13 +883,18 @@ ParseResult SpatialForOp::parse(OpAsmParser &parser, OperationState &result) {
 void SpatialForOp::print(OpAsmPrinter &printer) {
   printer << ' ' << getInductionVar() << " = " << getLowerBound() << " to "
           << getUpperBound() << " step " << getStep()
-          << " map = " << getMapAttr() << ' ';
+          << " map = " << getMapAttr();
+  printLoopCarriedValues(printer, getInitArgs(), getRegionIterArgs(),
+                         getResults().getTypes());
+  printer << ' ';
   printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
-                      /*printBlockTerminators=*/false);
+                      /*printBlockTerminators=*/!getInitArgs().empty());
 }
 
 LogicalResult SpatialForOp::verify() {
-  return verifyStaticPositiveStep(*this, getStep());
+  if (failed(verifyStaticPositiveStep(getOperation(), getStep())))
+    return failure();
+  return verifyLoopCarriedValues(*this);
 }
 
 LogicalResult PipelineOp::verify() {

@@ -359,10 +359,30 @@ def Micro_ForOp : Micro_Op<"for", [SingleBlockImplicitTerminator<"YieldOp">]> {
   let summary = "Temporal loop";
   let description = [{
         A temporal loop over an index induction variable with lower bound,
-        upper bound, and step. Modeled after scf.for; no iter_args in the MVP.
+        upper bound, and step, modeled after `scf.for`.
+
+        A loop may carry values across iterations. They are declared with
+        `iter_args`, and each iteration's `micro.yield` carries the value the
+        next iteration receives:
+
+        ```mlir
+        %acc = micro.for %k = %c0 to %K step %BK iter_args(%carried = %init) -> (!micro.tile<8x32xf32>) {
+          %next = micro.mma %a, %b, %carried
+          micro.yield %next : !micro.tile<8x32xf32>
+        }
+        ```
+
+        The loop's results are what the final iteration yielded. A loop with no
+        `iter_args` carries nothing: it has no results and its terminator is a
+        bare `micro.yield`. Deciding *which* values a loop carries is a
+        semantics question, not a scheduling one -- a lowerer that invented
+        them would be guessing what the program means.
     }];
 
-  let arguments = (ins Index:$lower_bound, Index:$upper_bound, Index:$step);
+  let arguments = (ins Index:$lower_bound, Index:$upper_bound, Index:$step,
+      Variadic<AnyType>:$initArgs);
+
+  let results = (outs Variadic<AnyType>:$results);
 
   let regions = (region SizedRegion<1>:$body);
 
@@ -370,8 +390,13 @@ def Micro_ForOp : Micro_Op<"for", [SingleBlockImplicitTerminator<"YieldOp">]> {
   let hasVerifier = 1;
 
   let extraClassDeclaration = [{
+        /// The induction variable is the first block argument; the carried
+        /// values follow it, in `iter_args` order.
         BlockArgument getInductionVar() {
           return getBody().front().getArgument(0);
+        }
+        ::llvm::MutableArrayRef<::mlir::BlockArgument> getRegionIterArgs() {
+          return getBody().front().getArguments().drop_front();
         }
     }];
 }
@@ -385,11 +410,21 @@ def Micro_SpatialForOp
   let summary = "Spatial loop over machine resources";
   let description = [{
         A spatial loop mapping iterations over machine resources via a
-        #micro.map target. Modeled after micro.for with an additional map.
+        #micro.map target. Modeled after micro.for with an additional map, and
+        the same loop-carried value contract:
+
+        ```mlir
+        %acc = micro.spatial_for %i = %c0 to %M step %BM map = #micro.map<worker>
+            iter_args(%carried = %init) -> (!micro.tile<8x32xf32>) {
+          micro.yield %carried : !micro.tile<8x32xf32>
+        }
+        ```
     }];
 
   let arguments = (ins Index:$lower_bound, Index:$upper_bound, Index:$step,
-      Micro_MappingTargetAttr:$map);
+      Micro_MappingTargetAttr:$map, Variadic<AnyType>:$initArgs);
+
+  let results = (outs Variadic<AnyType>:$results);
 
   let regions = (region SizedRegion<1>:$body);
 
@@ -399,6 +434,9 @@ def Micro_SpatialForOp
   let extraClassDeclaration = [{
         BlockArgument getInductionVar() {
           return getBody().front().getArgument(0);
+        }
+        ::llvm::MutableArrayRef<::mlir::BlockArgument> getRegionIterArgs() {
+          return getBody().front().getArguments().drop_front();
         }
     }];
 }

@@ -484,8 +484,8 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
         arith::ConstantIndexOp::create(builder, loc, extent).getResult();
     Value by = arith::ConstantIndexOp::create(builder, loc, step).getResult();
     auto loop = micro::SpatialForOp::create(
-        builder, loc, lower, upper, by,
-        micro::MappingTargetAttr::get(ctx, *target));
+        builder, loc, TypeRange{}, lower, upper, by,
+        micro::MappingTargetAttr::get(ctx, *target), ValueRange{});
     return startRegionBody(builder, loop.getBody(), loc,
                            TypeRange{IndexType::get(ctx)})
         ->getArgument(0);
@@ -509,7 +509,8 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   Value kUpper =
       arith::ConstantIndexOp::create(builder, loc, shape.K).getResult();
   Value kStep = arith::ConstantIndexOp::create(builder, loc, BK).getResult();
-  auto kLoop = micro::ForOp::create(builder, loc, kLower, kUpper, kStep);
+  auto kLoop = micro::ForOp::create(builder, loc, TypeRange{}, kLower, kUpper,
+                                    kStep, ValueRange{});
   BlockArgument bk = startRegionBody(builder, kLoop.getBody(), loc,
                                      TypeRange{IndexType::get(ctx)})
                          ->getArgument(0);

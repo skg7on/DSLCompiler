@@ -164,3 +164,37 @@ func.func @kernel_captures_an_outer_value(%x: tensor<8x8xf32>) {
   }
   return
 }
+
+// -----
+
+// A loop that carries a value must yield one every iteration: the block
+// argument the body receives is the previous iteration's yield, so declaring a
+// carried value and yielding nothing would leave it undefined.
+func.func @loop_carried_value_not_yielded() {
+  %c0 = arith.constant 0 : index
+  %c64 = arith.constant 64 : index
+  %c32 = arith.constant 32 : index
+  %init = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>>
+  // expected-error @+1 {{body yields 0 value(s) but the loop carries 1}}
+  %acc = micro.for %k = %c0 to %c64 step %c32 iter_args(%carried = %init) -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>>) {
+    micro.yield
+  }
+  return
+}
+
+// -----
+
+// The yielded value must have the carried type: the loop's result is the last
+// yield, so a different type hands the next iteration the wrong thing.
+func.func @loop_yields_the_wrong_type() {
+  %c0 = arith.constant 0 : index
+  %c64 = arith.constant 64 : index
+  %c32 = arith.constant 32 : index
+  %init = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>>
+  %other = micro.tile_alloc : !micro.tile<8x64xf32, memory = #micro.memory<acc>>
+  // expected-error @+1 {{yielded value #0 has type}}
+  %acc = micro.for %k = %c0 to %c64 step %c32 iter_args(%carried = %init) -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>>) {
+    micro.yield %other : !micro.tile<8x64xf32, memory = #micro.memory<acc>>
+  }
+  return
+}
