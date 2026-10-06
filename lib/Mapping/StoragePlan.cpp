@@ -516,6 +516,10 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
 
   for (WorkloadNodeId nodeId : topo) {
     const WorkloadNode *node = graph.findNode(nodeId);
+    if (!node)
+      return storageError("storage plan: the plan references node '" +
+                          std::to_string(nodeId) +
+                          "', which is not in the workload graph");
     llvm::SmallSet<WorkloadValueId, 8> seenValues;
     for (const WorkloadPort &input : node->inputs) {
       if (!seenValues.insert(input.value).second)
@@ -703,6 +707,10 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
 
   for (WorkloadNodeId nodeId : topo) {
     const WorkloadNode *node = graph.findNode(nodeId);
+    if (!node)
+      return storageError("storage plan: the plan references node '" +
+                          std::to_string(nodeId) +
+                          "', which is not in the workload graph");
     const PlanPlacement *placement = placementFor.lookup(nodeId);
 
     // Execution multiplicity: how many times this node runs, recovered during
@@ -833,9 +841,6 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
           "storage plan: memory '" + entry.first + "' over capacity (peak " +
           std::to_string(entry.second) + " bytes live, " +
           std::to_string(memory->capacityBytes) + " byte capacity)");
-  }
-  for (const auto &entry : *peak) {
-    const machine::MemoryNode *memory = machine.findMemory(entry.first);
     notes.push_back("storage plan: memory '" + entry.first + "' peak " +
                     std::to_string(entry.second) + " bytes of " +
                     std::to_string(memory->capacityBytes));
