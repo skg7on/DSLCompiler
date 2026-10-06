@@ -204,19 +204,35 @@ def Micro_TileAsyncCopyOp : Micro_Op<"tile_async_copy"> {
 // micro.tile_store — write back to external memory
 //===----------------------------------------------------------------------===//
 
-def Micro_TileStoreOp : Micro_Op<"tile_store"> {
-  let summary = "Store a tile to a destination memory space";
+def Micro_TileStoreOp : Micro_Op<"tile_store", [AttrSizedOperandSegments]> {
+  let summary = "Store a tile into a destination";
   let description = [{
-        Stores a materialized tile to an external or previously allocated
-        destination memory space.
+        Stores a materialized tile.
+
+        Without a destination this is a terminal write to a memory space: it has
+        no result, and what it wrote is observable only through the memory it
+        landed in. That is the form an analysis fixture uses.
+
+        With `into` the store is a value: the result is the destination with
+        `source` written at `offsets`. A tile program that writes an output tile
+        by tile needs exactly that -- an SSA destination is only updated if the
+        updated destination is what the enclosing loop carries, and a write with
+        no result would leave the loop nothing to thread:
+
+        ```mlir
+        %out1 = micro.tile_store %tile into %out0[%bm, %bn] {dst_memory = #micro.memory<dram>}
+            : !micro.tile<8x32xbf16, memory = #micro.memory<acc>>
+            , !micro.tile<16x64xbf16, memory = #micro.memory<dram>>
+            -> !micro.tile<16x64xbf16, memory = #micro.memory<dram>>
+        ```
     }];
 
-  let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$dst_memory);
+  let arguments = (ins AnyType:$source, Optional<AnyType>:$destination,
+      Variadic<Index>:$offsets, Micro_MemorySpaceAttr:$dst_memory);
 
-  let assemblyFormat = [{
-        $source attr-dict
-        `:` type($source)
-    }];
+  let results = (outs Optional<AnyType>:$result);
+
+  let hasCustomAssemblyFormat = 1;
 
   let hasVerifier = 1;
 }

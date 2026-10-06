@@ -72,6 +72,51 @@ module {
     %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<acc>>
     micro.yield
   }
+
+  // A window that starts somewhere other than the origin is a slice, not the
+  // source: its offsets and declared shape become the offset and size vectors,
+  // so the elements the program asked for are the elements that are read.
+  // CHECK-LABEL: func.func @windowed_view(%arg0: tensor<8x8xf32>)
+  micro.kernel @windowed_view(%a: tensor<8x8xf32>) {
+    %one = arith.constant 1 : index
+    %z = arith.constant 0 : index
+    // CHECK: tensor.extract_slice %arg0[%{{.*}}, %{{.*}}] [7, 8] [1, 1] : tensor<8x8xf32> to tensor<7x8xf32>
+    %v = micro.tile_view %a[%one, %z] {shape = array<i64: 7, 8>} : tensor<8x8xf32> -> !micro.tile<7x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+
+  // An offset the pattern cannot fold is not turned into a zero either: it
+  // stays a dynamic slice offset, so whatever the source holds at the runtime
+  // origin is what is read.
+  // CHECK-LABEL: func.func @dynamic_window_view(%arg0: tensor<8x8xf32>, %arg1: index)
+  micro.kernel @dynamic_window_view(%a: tensor<8x8xf32>, %d: index) {
+    // CHECK: tensor.extract_slice %arg0[%arg1, %arg1] [7, 7] [1, 1] : tensor<8x8xf32> to tensor<7x7xf32>
+    %v = micro.tile_view %a[%d, %d] {shape = array<i64: 7, 7>} : tensor<8x8xf32> -> !micro.tile<7x7xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+
+  // A reduction starts at its neutral element and folds along one axis, so the
+  // first value reduced is also the answer.
+  // CHECK-LABEL: func.func @sum_reduction(%arg0: tensor<8x8xf32>)
+  micro.kernel @sum_reduction(%a: tensor<8x8xf32>) -> tensor<8xf32> {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    // CHECK: arith.constant 0.000000e+00 : f32
+    // CHECK: linalg.reduce
+    // CHECK: arith.addf
+    %r = micro.reduce "sum" %ta {axis = 1 : i64} : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8xf32, memory = #micro.memory<acc>>
+    micro.yield %r : !micro.tile<8xf32, memory = #micro.memory<acc>>
+  }
+
+  // A max reduction starts at the negative extreme for the same reason, and
+  // combines with the value-preserving maximum rather than the signed one.
+  // CHECK-LABEL: func.func @max_reduction(%arg0: tensor<8x8xf32>)
+  micro.kernel @max_reduction(%a: tensor<8x8xf32>) -> tensor<8xf32> {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    // CHECK: linalg.reduce
+    // CHECK: arith.maxnumf
+    %r = micro.reduce "max" %ta {axis = 1 : i64} : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8xf32, memory = #micro.memory<acc>>
+    micro.yield %r : !micro.tile<8xf32, memory = #micro.memory<acc>>
+  }
 }
 
 // CHECK-NOT: micro.

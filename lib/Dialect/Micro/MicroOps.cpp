@@ -461,6 +461,81 @@ LogicalResult TileAsyncCopyOp::verify() {
   return success();
 }
 
+ParseResult TileStoreOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto &builder = parser.getBuilder();
+
+  OpAsmParser::UnresolvedOperand source;
+  if (parser.parseOperand(source))
+    return failure();
+
+  // Optional `into %dst[%i, %j]`: the value-producing form. Without it the
+  // store stays a terminal write and carries no result.
+  OpAsmParser::UnresolvedOperand destination;
+  bool hasDestination = false;
+  SmallVector<OpAsmParser::UnresolvedOperand> offsets;
+  if (succeeded(parser.parseOptionalKeyword("into"))) {
+    hasDestination = true;
+    if (parser.parseOperand(destination) || parser.parseLSquare())
+      return failure();
+    if (failed(parser.parseOptionalRSquare())) {
+      do {
+        OpAsmParser::UnresolvedOperand offset;
+        if (parser.parseOperand(offset))
+          return failure();
+        offsets.push_back(offset);
+      } while (succeeded(parser.parseOptionalComma()));
+      if (parser.parseRSquare())
+        return failure();
+    }
+  }
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  Type sourceType;
+  if (parser.parseColonType(sourceType))
+    return failure();
+  if (parser.resolveOperand(source, sourceType, result.operands))
+    return failure();
+
+  if (hasDestination) {
+    Type destinationType, resultType;
+    if (parser.parseComma() || parser.parseType(destinationType) ||
+        parser.parseArrow() || parser.parseType(resultType))
+      return failure();
+    result.addTypes(resultType);
+    if (parser.resolveOperand(destination, destinationType, result.operands))
+      return failure();
+    for (OpAsmParser::UnresolvedOperand offset : offsets)
+      if (parser.resolveOperand(offset, builder.getIndexType(),
+                                result.operands))
+        return failure();
+  }
+
+  // The op has two variadic operand groups, so the split between them has to
+  // be recorded: no destination and no offsets is the terminal form.
+  result.getOrAddProperties<TileStoreOp::Properties>().operandSegmentSizes = {
+      1, hasDestination ? 1 : 0, static_cast<int32_t>(offsets.size())};
+  return success();
+}
+
+void TileStoreOp::print(OpAsmPrinter &printer) {
+  printer << ' ' << getSource();
+  if (getDestination()) {
+    printer << " into " << getDestination() << '[';
+    llvm::interleaveComma(getOffsets(), printer);
+    printer << ']';
+  }
+  // The operand-segment split is bookkeeping the parser recomputes, so it is
+  // kept out of the printed form.
+  printer.printOptionalAttrDict((*this)->getAttrs(),
+                                /*elidedAttrs=*/{"operandSegmentSizes"});
+  printer << " : " << getSource().getType();
+  if (getDestination())
+    printer << ", " << getDestination().getType() << " -> "
+            << getResult().getType();
+}
+
 LogicalResult TileStoreOp::verify() {
   auto sourceType = dyn_cast<TileType>(getSource().getType());
   if (!sourceType)
@@ -469,6 +544,27 @@ LogicalResult TileStoreOp::verify() {
     return emitOpError("stored tile must have a memory space");
   if (sourceType.getMemory().getValue() == getDstMemory())
     return emitOpError("source and destination memory must differ");
+
+  // A terminal write has no destination and no result; a value-producing one
+  // has both, and the result is the destination it updated.
+  if (!getDestination()) {
+    if (getNumResults() != 0)
+      return emitOpError("a terminal tile_store has no result");
+    if (!getOffsets().empty())
+      return emitOpError("a terminal tile_store has no offsets");
+    return success();
+  }
+
+  auto destinationType = dyn_cast<TileType>(getDestination().getType());
+  if (!destinationType)
+    return emitOpError("destination must be a tile type");
+  if (getNumResults() != 1)
+    return emitOpError("a tile_store with a destination produces the updated "
+                       "destination as its result");
+  if (getResult().getType() != getDestination().getType())
+    return emitOpError("result must have the destination's type");
+  if (getOffsets().size() != destinationType.getShape().size())
+    return emitOpError("offsets must name one index per destination dimension");
   return success();
 }
 

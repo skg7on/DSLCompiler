@@ -37,7 +37,7 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK-LABEL: func.func @swiglu
 // CHECK: llk.fused_swiglu
 
-// CHECK: micro.kernel @fused_swiglu_M16_N64_K64(%[[X:.*]]: tensor<16x64xbf16>, %[[WG:.*]]: tensor<64x64xbf16>, %[[WU:.*]]: tensor<64x64xbf16>) attributes {
+// CHECK: micro.kernel @fused_swiglu_M16_N64_K64(%[[X:.*]]: tensor<16x64xbf16>, %[[WG:.*]]: tensor<64x64xbf16>, %[[WU:.*]]: tensor<64x64xbf16>) -> tensor<16x64xbf16> attributes {
 // CHECK-SAME: fragment_shape = array<i64: 8, 16, 32>
 // CHECK-SAME: memory_path = "dram:sram:acc"
 // CHECK-SAME: mma_shape = array<i64: 16, 16, 32>
@@ -53,8 +53,11 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK-NOT: tensor.empty
 
 // One spatial loop per tiled output axis, mapped onto machine resources.
-// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> {
-// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<lane> {
+// The output is threaded through both spatial loops, so the write-back of one
+// tile is carried to the next.
+// CHECK: %[[OUT_ALLOC:.*]] = micro.tile_alloc : !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
+// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> iter_args(%{{.*}} = %[[OUT_ALLOC]]) -> (!micro.tile<16x64xbf16, memory = #micro.memory<sram>>) {
+// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<lane> iter_args(%{{.*}} = %{{.*}}) -> (!micro.tile<16x64xbf16, memory = #micro.memory<sram>>) {
 
 // Two accumulators, one per projection.
 // CHECK: %[[GATE_ACC:.*]] = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
@@ -100,7 +103,8 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: %[[GATE:.*]] = micro.vector "silu" %[[LOOP]]#0 {math_mode = "bounded_fast"}
 // CHECK: %[[MUL:.*]] = micro.vector "mul" %[[GATE]], %[[LOOP]]#1
 // CHECK: %[[OUT:.*]] = micro.vector "convert" %[[MUL]] : {{.*}} -> !micro.tile<8x32xbf16, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
-// CHECK: micro.tile_store %[[OUT]] {dst_memory = #micro.memory<dram>}
+// CHECK: %[[WRITTEN:.*]] = micro.tile_store %[[OUT]] into %{{.*}}[%{{.*}}, %{{.*}}] {dst_memory = #micro.memory<sram>} : {{.*}} -> !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
+// CHECK: micro.yield %[[WRITTEN]] : !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
 
 // The kernel contains no high-level LLK semantics.
 // CHECK-NOT: llk.

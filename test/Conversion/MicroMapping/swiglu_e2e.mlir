@@ -37,7 +37,7 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: llk.fused_swiglu
 
 // The mapper binds a complete plan onto the lowering-produced kernel.
-// CHECK: micro.kernel @fused_swiglu_M16_N64_K64(%{{.*}}: tensor<16x64xbf16>, %{{.*}}: tensor<64x64xbf16>, %{{.*}}: tensor<64x64xbf16>) attributes {
+// CHECK: micro.kernel @fused_swiglu_M16_N64_K64(%{{.*}}: tensor<16x64xbf16>, %{{.*}}: tensor<64x64xbf16>, %{{.*}}: tensor<64x64xbf16>) -> tensor<16x64xbf16> attributes {
 // CHECK-SAME: micro.plan
 
 // Staged copies carry their placement, bound by their own rule.
@@ -64,3 +64,18 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // The write back carries a placement too.
 // CHECK: micro.tile_store
 // CHECK-SAME: rule = "avx2.tile_store"
+
+//===----------------------------------------------------------------------===//
+// Stage C3: the whole conversion traverses
+//===----------------------------------------------------------------------===//
+//
+// Same traversal contract as the GEMM fixture, with the fused activation in the
+// epilogue: two accumulators thread the K loop, and the write-back threads the
+// spatial loops.
+// TRAVERSE-LABEL: func.func @fused_swiglu_M16_N64_K64
+// TRAVERSE: scf.for
+// TRAVERSE: linalg.matmul
+// TRAVERSE: linalg.generic
+// TRAVERSE: tensor.insert_slice
+// TRAVERSE: return
+// TRAVERSE-NOT: micro.

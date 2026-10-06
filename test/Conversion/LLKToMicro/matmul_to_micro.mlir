@@ -22,7 +22,7 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 
 // The kernel names its two operands in its signature -- the block arguments
 // the body reads -- so no entry tensor is guessed to be external.
-// CHECK: micro.kernel @matmul_M16_N64_K64(%[[A:.*]]: tensor<16x64xbf16>, %[[B:.*]]: tensor<64x64xbf16>) attributes {
+// CHECK: micro.kernel @matmul_M16_N64_K64(%[[A:.*]]: tensor<16x64xbf16>, %[[B:.*]]: tensor<64x64xbf16>) -> tensor<16x64xbf16> attributes {
 // CHECK-SAME: fragment_shape = array<i64: 8, 16, 32>
 // CHECK-SAME: memory_path = "dram:sram:acc"
 // CHECK-SAME: mma_shape = array<i64: 16, 16, 32>
@@ -36,8 +36,12 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // Two operands, not three: A and B, both declared rather than materialized.
 // CHECK-NOT: tensor.empty
 
-// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> {
-// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<lane> {
+// The output is threaded through both spatial loops: each pass hands the
+// partially written output to the next, which is the only way an SSA
+// destination stays updated.
+// CHECK: %[[OUT_ALLOC:.*]] = micro.tile_alloc : !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
+// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> iter_args(%{{.*}} = %[[OUT_ALLOC]]) -> (!micro.tile<16x64xbf16, memory = #micro.memory<sram>>) {
+// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<lane> iter_args(%{{.*}} = %{{.*}}) -> (!micro.tile<16x64xbf16, memory = #micro.memory<sram>>) {
 
 // One accumulator, in acc memory.
 // CHECK: %[[ACC:.*]] = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
@@ -75,6 +79,12 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // loop's *result*, which is what proves the accumulator was threaded: reading
 // the allocation would mean nothing ever wrote it.
 // CHECK: %[[OUT:.*]] = micro.vector "convert" %[[LOOP]] : {{.*}} -> !micro.tile<8x32xbf16, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
-// CHECK: micro.tile_store %[[OUT]] {dst_memory = #micro.memory<dram>}
+
+// The write-back produces the updated output and hands it on, so the kernel's
+// declared result is a value the whole nest threads rather than a side effect
+// nothing could observe.
+// CHECK: %[[WRITTEN:.*]] = micro.tile_store %[[OUT]] into %{{.*}}[%{{.*}}, %{{.*}}] {dst_memory = #micro.memory<sram>} : {{.*}} -> !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
+// CHECK: micro.yield %[[WRITTEN]] : !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
+// CHECK: micro.yield %{{.*}} : !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
 
 // CHECK-NOT: llk.

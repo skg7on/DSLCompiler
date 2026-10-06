@@ -623,7 +623,8 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   }
 
   micro::TileStoreOp::create(
-      builder, loc, epilogue,
+      builder, loc, /*result=*/Type(), epilogue, /*destination=*/Value(),
+      /*offsets=*/ValueRange{},
       micro::MemorySpaceAttr::get(ctx, micro::MemorySpace::dram));
 
   builder.setInsertionPointToEnd(module.getBody());
