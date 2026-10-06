@@ -386,7 +386,7 @@ TEST(CandidateBinding, BindsLayoutMemoryAndOwnerIntoTileMetadata) {
       if (tile.getMemory().getValue() == micro::MemorySpace::acc) {
         sawAccumulator = true;
         EXPECT_EQ(tile.getShape(), (ArrayRef<int64_t>{8, 64}));
-        EXPECT_EQ(tile.getOwner().getValue(), micro::Owner::worker);
+        EXPECT_EQ(tile.getOwner().getSymbol().str(), "worker");
         EXPECT_FALSE(tile.getLayout());
       }
       if (tile.getMemory().getValue() == micro::MemorySpace::sram) {
@@ -409,7 +409,7 @@ TEST(CandidateBinding, BindsLayoutMemoryAndOwnerIntoTileMetadata) {
     partitions.push_back(std::vector<int64_t>(partition.getShape().begin(),
                                               partition.getShape().end()));
     ASSERT_TRUE(partition.getOwner().has_value());
-    EXPECT_EQ(*partition.getOwner(), micro::Owner::vector_engine);
+    EXPECT_EQ(partition.getOwner()->getSymbol().str(), "vector_engine");
   });
   EXPECT_EQ(partitions,
             (std::vector<std::vector<int64_t>>{{8, 32}, {32, 16}, {32, 16}}));

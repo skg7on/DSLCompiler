@@ -207,6 +207,81 @@ LogicalResult LayoutAttr::verify(function_ref<InFlightDiagnostic()> emitError,
 }
 
 //===----------------------------------------------------------------------===//
+// Owner and mapping-target attribute parse/print/verify
+//===----------------------------------------------------------------------===//
+
+// A tile's owner and a spatial loop's axis are both open symbols: the canonical
+// dialect records the spelling a target will resolve, and deliberately does not
+// check it against a fixed list. The verifier's only job is the *structural*
+// claim any spelling must satisfy, which is that it is a present, non-empty
+// identifier -- a target's vocabulary reaches a concrete class through its own
+// machine model, not through this dialect.
+
+/// Parses the symbol inside `#micro.owner<...>` / `#micro.map<...>`. A bare
+/// identifier is the legacy form, so it is accepted directly; a quoted string
+/// is accepted too so a spelling that is not a bare identifier (a coordinate
+/// axis such as `cluster.x`) stays writable.
+static ParseResult parseOwnerSymbol(AsmParser &parser, StringAttr &symbol) {
+  std::string text;
+  if (succeeded(parser.parseOptionalString(&text))) {
+    symbol = StringAttr::get(parser.getContext(), text);
+    return success();
+  }
+  StringRef keyword;
+  if (parser.parseKeyword(&keyword))
+    return failure();
+  symbol = StringAttr::get(parser.getContext(), keyword);
+  return success();
+}
+
+Attribute OwnerAttr::parse(AsmParser &parser, Type) {
+  if (parser.parseLess())
+    return {};
+  StringAttr symbol;
+  if (parseOwnerSymbol(parser, symbol) || parser.parseGreater())
+    return {};
+  return OwnerAttr::get(parser.getContext(), symbol);
+}
+
+void OwnerAttr::print(AsmPrinter &printer) const {
+  printer << "<";
+  // Bare when the spelling is a bare identifier, quoted otherwise, so the
+  // printed form always parses back.
+  printer.printKeywordOrString(getSymbol().getValue());
+  printer << ">";
+}
+
+Attribute MappingTargetAttr::parse(AsmParser &parser, Type) {
+  if (parser.parseLess())
+    return {};
+  StringAttr symbol;
+  if (parseOwnerSymbol(parser, symbol) || parser.parseGreater())
+    return {};
+  return MappingTargetAttr::get(parser.getContext(), symbol);
+}
+
+void MappingTargetAttr::print(AsmPrinter &printer) const {
+  printer << "<";
+  printer.printKeywordOrString(getSymbol().getValue());
+  printer << ">";
+}
+
+LogicalResult OwnerAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                StringAttr symbol) {
+  if (!symbol || symbol.getValue().empty())
+    return emitError() << "owner symbol must not be empty";
+  return success();
+}
+
+LogicalResult
+MappingTargetAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                          StringAttr symbol) {
+  if (!symbol || symbol.getValue().empty())
+    return emitError() << "mapping target symbol must not be empty";
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // TileType custom parse/print/verify
 //===----------------------------------------------------------------------===//
 

@@ -151,6 +151,10 @@ std::string renderCompute(const ComputeNode &node) {
   out += node.id;
   out += "|kind=";
   out += node.kind;
+  out += "|refines=";
+  std::vector<std::string> refines(node.refines);
+  llvm::sort(refines);
+  out += joinStrings(refines, ",");
   out += "|attached_to=";
   out += node.attachedTo;
   out += "|element_types=";
@@ -194,6 +198,10 @@ std::string renderTransferEngine(const TransferEngineNode &node) {
   out += node.id;
   out += "|kind=";
   out += node.kind;
+  out += "|refines=";
+  std::vector<std::string> refines(node.refines);
+  llvm::sort(refines);
+  out += joinStrings(refines, ",");
   out += "|attached_to=";
   out += node.attachedTo;
   out += "|count=";
@@ -295,6 +303,45 @@ bool MachineModel::ownerMatches(llvm::StringRef ownerKind,
     return false;
   return executor->kind == ownerKind ||
          llvm::is_contained(executor->refines, ownerKind);
+}
+
+std::optional<std::string>
+MachineModel::ownerClass(llvm::StringRef spelling) const {
+  // An abstract class spelled directly is its own class.
+  if (std::optional<micro::Owner> abstract = micro::symbolizeOwner(spelling))
+    return micro::stringifyOwner(*abstract).str();
+
+  // Otherwise the spelling is a target label, and the model's own nodes are the
+  // alias table: whichever node declares that kind also declares, through
+  // `refines`, the abstract class(es) it denotes. Every declaration must agree;
+  // a disagreement is ambiguity, and ambiguity is not a class. A kind no node
+  // declares, or one declared without a refinement, is simply unknown.
+  std::optional<std::string> resolved;
+  bool conflicting = false;
+  auto consider = [&](const std::vector<std::string> &refines) {
+    for (const std::string &refined : refines) {
+      std::optional<micro::Owner> cls = micro::symbolizeOwner(refined);
+      if (!cls)
+        continue;
+      std::string name = micro::stringifyOwner(*cls).str();
+      if (resolved && *resolved != name)
+        conflicting = true;
+      else if (!resolved)
+        resolved = name;
+    }
+  };
+  for (const ExecutorNode &node : executors)
+    if (node.kind == spelling)
+      consider(node.refines);
+  for (const ComputeNode &node : computes)
+    if (node.kind == spelling)
+      consider(node.refines);
+  for (const TransferEngineNode &node : transferEngines)
+    if (node.kind == spelling)
+      consider(node.refines);
+  if (conflicting)
+    return std::nullopt;
+  return resolved;
 }
 
 bool MachineModel::isVisible(llvm::StringRef memoryId,
@@ -421,34 +468,34 @@ llvm::Error invalid(const std::string &message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
 }
 
-bool isKnownOwnerKind(llvm::StringRef kind) {
-  return micro::symbolizeOwner(kind).has_value();
+/// Any spelling the model can name as an owner kind: an abstract Micro class,
+/// or a target label one of the model's own nodes declares through `refines`.
+/// This is where the canonical dialect's open symbol becomes a class -- the
+/// dialect never interprets it, and the model does.
+bool isKnownOwnerKind(const MachineModel &model, llvm::StringRef kind) {
+  return model.ownerClass(kind).has_value();
 }
 
 bool isKnownMemoryKind(llvm::StringRef kind) {
   return micro::symbolizeMemorySpace(kind).has_value();
 }
 
-/// Compute capabilities and transfer resources are `micro::Owner` vocabulary
-/// (design §11.5): a kernel maps onto a `matrix_engine` or `vector_engine`
-/// owner, and a `dma` owner moves its data. The subset a machine may declare is
-/// written with the enum's own enumerators, so a rename in MicroEnums.h breaks
-/// this code at compile time instead of letting a string list drift. Execution
-/// scopes such as `core` are also owners, but they are not capabilities a
-/// machine attaches, so they are excluded here.
-bool isComputeOwner(micro::Owner owner) {
-  return owner == micro::Owner::matrix_engine ||
-         owner == micro::Owner::vector_engine;
+/// Compute capabilities and transfer resources are a subset of the owner
+/// classes (design §11.5): a kernel maps onto a `matrix` or `vector` engine,
+/// and a `transfer` engine moves its data. The subset is named with the enum's
+/// own stringifiers, so a rename in MicroEnums.h breaks this code at compile
+/// time instead of letting a string list drift. Execution scopes such as a
+/// group or a worker are also owners, but they are not capabilities a machine
+/// attaches, so they are excluded here.
+bool isKnownComputeKind(const MachineModel &model, llvm::StringRef kind) {
+  std::optional<std::string> cls = model.ownerClass(kind);
+  return cls && (*cls == micro::stringifyOwner(micro::Owner::matrix) ||
+                 *cls == micro::stringifyOwner(micro::Owner::vector));
 }
 
-bool isKnownComputeKind(llvm::StringRef kind) {
-  std::optional<micro::Owner> owner = micro::symbolizeOwner(kind);
-  return owner && isComputeOwner(*owner);
-}
-
-bool isKnownTransferKind(llvm::StringRef kind) {
-  std::optional<micro::Owner> owner = micro::symbolizeOwner(kind);
-  return owner && *owner == micro::Owner::dma;
+bool isKnownTransferKind(const MachineModel &model, llvm::StringRef kind) {
+  std::optional<std::string> cls = model.ownerClass(kind);
+  return cls && *cls == micro::stringifyOwner(micro::Owner::transfer);
 }
 
 } // namespace
@@ -502,12 +549,16 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
   for (size_t i = 0; i < model.executors.size(); ++i) {
     const ExecutorNode &executor = model.executors[i];
     std::string path = "executors[" + std::to_string(i) + "]";
-    if (!isKnownOwnerKind(executor.kind))
+    if (!isKnownOwnerKind(model, executor.kind))
       return invalid(path + ".kind: unknown owner kind '" + executor.kind +
-                     "'");
+                     "' (an abstract class, or a label the profile refines)");
+    // A refinement names the abstract class this label denotes. Requiring the
+    // abstract spelling here keeps the alias table flat -- a target label never
+    // refines another target label -- so resolution cannot cycle.
     for (const std::string &refined : executor.refines)
-      if (!isKnownOwnerKind(refined))
-        return invalid(path + ".refines: unknown owner kind '" + refined + "'");
+      if (!micro::symbolizeOwner(refined))
+        return invalid(path + ".refines: '" + refined +
+                       "' is not an abstract owner class");
     if (executor.concurrency == 0)
       return invalid(path + ".concurrency: must be positive");
     if (executor.parent && !model.findExecutor(*executor.parent))
@@ -573,9 +624,14 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
   for (size_t i = 0; i < model.computes.size(); ++i) {
     const ComputeNode &compute = model.computes[i];
     std::string path = "compute[" + std::to_string(i) + "]";
-    if (!isKnownComputeKind(compute.kind))
+    if (!isKnownComputeKind(model, compute.kind))
       return invalid(path + ".kind: unknown capability kind '" + compute.kind +
-                     "'");
+                     "' (a matrix/vector class, or a label the profile "
+                     "refines to one)");
+    for (const std::string &refined : compute.refines)
+      if (!micro::symbolizeOwner(refined))
+        return invalid(path + ".refines: '" + refined +
+                       "' is not an abstract owner class");
     if (!model.findExecutor(compute.attachedTo))
       return invalid(path + ".attached_to: unknown executor '" +
                      compute.attachedTo + "'");
@@ -603,9 +659,14 @@ llvm::Error verifyMachineModel(const MachineModel &model) {
   for (size_t i = 0; i < model.transferEngines.size(); ++i) {
     const TransferEngineNode &engine = model.transferEngines[i];
     std::string path = "transfer_engines[" + std::to_string(i) + "]";
-    if (!isKnownTransferKind(engine.kind))
+    if (!isKnownTransferKind(model, engine.kind))
       return invalid(path + ".kind: unknown transfer kind '" + engine.kind +
-                     "'");
+                     "' (a transfer class, or a label the profile refines to "
+                     "one)");
+    for (const std::string &refined : engine.refines)
+      if (!micro::symbolizeOwner(refined))
+        return invalid(path + ".refines: '" + refined +
+                       "' is not an abstract owner class");
     if (!model.findExecutor(engine.attachedTo))
       return invalid(path + ".attached_to: unknown executor '" +
                      engine.attachedTo + "'");

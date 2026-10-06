@@ -496,6 +496,8 @@ bool Loader::parseCompute(Node *node, size_t index, ComputeNode &out) {
           sawKind = true;
           return readText(value, path + ".kind", out.kind);
         }
+        if (key == "refines")
+          return readStringList(value, path + ".refines", out.refines);
         if (key == "attached_to") {
           sawAttachedTo = true;
           return readText(value, path + ".attached_to", out.attachedTo);
@@ -559,6 +561,8 @@ bool Loader::parseTransferEngine(Node *node, size_t index,
           sawKind = true;
           return readText(value, path + ".kind", out.kind);
         }
+        if (key == "refines")
+          return readStringList(value, path + ".refines", out.refines);
         if (key == "attached_to") {
           sawAttachedTo = true;
           return readText(value, path + ".attached_to", out.attachedTo);

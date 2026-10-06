@@ -46,6 +46,21 @@ func.func @test_owner() attributes {
   return
 }
 
+// The owner is an *open* symbol: a spelling the dialect does not recognize is
+// unresolved analysis data, not a parse error, and it round-trips verbatim.
+// Whether `warp` names a class is the owning target's machine model's answer.
+// CHECK-LABEL: func.func @test_owner_open_symbol
+// CHECK: #micro.owner<warp>
+// CHECK: #micro.owner<"worker/lane">
+func.func @test_owner_open_symbol() attributes {
+  owners = [
+    #micro.owner<warp>,
+    #micro.owner<"worker/lane">
+  ]
+} {
+  return
+}
+
 //===----------------------------------------------------------------------===//
 // !micro.tile type (minimal and full)
 //===----------------------------------------------------------------------===//

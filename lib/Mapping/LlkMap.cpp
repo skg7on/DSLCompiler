@@ -730,11 +730,13 @@ evalQuantifier(const Expr &expr, const llvm::StringMap<LayoutValue> &bindings,
       if (machine.ownerMatches(kind->text, executor.id))
         domain.push_back(executor.id);
     // A kind with no matching executor is an unknown fact, never a silently
-    // empty set. Distinguish a kind outside the vocabulary from a valid owner
-    // kind the profile simply does not populate: the first is a typo, the
-    // second a machine limitation.
+    // empty set. Distinguish a kind the model cannot name at all (a typo) from
+    // a valid owner kind the profile simply does not populate (a machine
+    // limitation). A kind is known when the model's own alias data resolves it
+    // -- an abstract class, or a label its executors/compute/transfer nodes
+    // declare -- not merely when it is one of the abstract spellings.
     if (domain.empty()) {
-      if (!mlir::micro::symbolizeOwner(kind->text))
+      if (!machine.ownerClass(kind->text))
         return evalError("unknown executor kind '" + kind->text + "'");
       return evalError("the machine offers no executors of kind '" +
                        kind->text + "'");

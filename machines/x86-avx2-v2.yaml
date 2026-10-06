@@ -32,8 +32,14 @@ sync:
   wait_cycles: 0
 
 executors:
+  # Each label refines the abstract owner class it denotes: `cluster` is a
+  # cooperating group, `lane` and this profile's `worker` are both one worker,
+  # and `vector_engine` is the vector engine. `worker` is already the abstract
+  # spelling, so it refines nothing. The kernel writes these labels as owner
+  # *symbols*; this table is what turns a symbol into a class (design §11.5).
   - id: cluster.0
     kind: cluster
+    refines: [group]
     concurrency: 1
   - id: worker.0
     kind: worker
@@ -41,10 +47,12 @@ executors:
     concurrency: 8
   - id: lane.0
     kind: lane
+    refines: [worker]
     parent: worker.0
     concurrency: 8
   - id: veng.0
     kind: vector_engine
+    refines: [vector]
     parent: lane.0
     concurrency: 8
 
@@ -90,6 +98,7 @@ compute:
   # abstract owner of that kind, and an owner path through it, still resolve.
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.0
     element_types: [f32, bf16, i8]
     supported_layouts: [row_major, vectorized]
@@ -100,6 +109,7 @@ compute:
     concurrency: 8
   - id: mxu
     kind: matrix_engine
+    refines: [matrix]
     attached_to: worker.0
     element_types: [f32, bf16]
     accumulator_dtypes: [f32]
@@ -113,6 +123,7 @@ compute:
 transfer_engines:
   - id: dma.0
     kind: dma
+    refines: [transfer]
     attached_to: worker.0
     count: 1
     max_outstanding: 1

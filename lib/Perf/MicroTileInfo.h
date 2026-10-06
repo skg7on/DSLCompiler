@@ -100,7 +100,9 @@ inline TileInfo describeType(mlir::Type type) {
     if (auto memory = tile.getMemory())
       info.memory = micro::stringifyMemorySpace(memory.getValue()).str();
     if (auto owner = tile.getOwner())
-      info.owner = micro::stringifyOwner(owner.getValue()).str();
+      // The owner is an open symbol now: the spelling the IR carries is exactly
+      // the string a target resolves, so it is recorded verbatim.
+      info.owner = owner.getSymbol().str();
     return info;
   }
   if (auto shaped = mlir::dyn_cast<ShapedType>(type)) {

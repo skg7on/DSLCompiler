@@ -46,41 +46,46 @@ def Micro_MemorySpaceAttr :
 }
 
 //===----------------------------------------------------------------------===//
-// Mapping target enum attribute
+// Mapping target attribute
 //===----------------------------------------------------------------------===//
 
-def Micro_ClusterX : I32EnumAttrCase<"cluster_x", 0, "cluster_x">;
-def Micro_ClusterY : I32EnumAttrCase<"cluster_y", 1, "cluster_y">;
-def Micro_CoreX : I32EnumAttrCase<"core_x", 2, "core_x">;
-def Micro_CoreY : I32EnumAttrCase<"core_y", 3, "core_y">;
-def Micro_PEX : I32EnumAttrCase<"pe_x", 4, "pe_x">;
-def Micro_PEY : I32EnumAttrCase<"pe_y", 5, "pe_y">;
-def Micro_Lane : I32EnumAttrCase<"lane", 6, "lane">;
-def Micro_Worker : I32EnumAttrCase<"worker", 7, "worker">;
-def Micro_MatrixEngine : I32EnumAttrCase<"matrix_engine", 8, "matrix_engine">;
-def Micro_VectorEngine : I32EnumAttrCase<"vector_engine", 9, "vector_engine">;
-def Micro_DMA : I32EnumAttrCase<"dma", 10, "dma">;
+// Where a spatial loop's iterations *may* be placed is, like a tile's owner, a
+// **symbol** and not an enumeration. The canonical dialect knows that a spatial
+// axis has a name the owning target resolves -- a thread-pool worker, a SIMD
+// unit, a systolic array, an x/y coordinate axis -- and nothing about which
+// names any particular machine uses. A profile that distributes its iterations
+// over its own executor names says so in its own machine model, which maps those
+// labels onto the abstract owner classes; naming them here would put one
+// backend's spatial vocabulary in the canonical IR, the same boundary §13.4
+// draws for layouts and §5.4 for policy.
+//
+// Keeping the attribute open also keeps legacy text parseable: a spatial loop
+// written with a target's spelling still reads as *unresolved analysis data*,
+// and only target execution requires it to be normalized.
+def Micro_MappingTargetAttr : AttrDef<Micro_Dialect, "MappingTarget"> {
+    let mnemonic = "map";
+    let summary = "The resource a spatial loop is placed on, as a target-neutral symbol";
+    let description = [{
+        Names the spatial axis a loop's iterations may be distributed over. The
+        spelling is a symbol the owning target resolves: the dialect verifies
+        that it is present and well-formed, never that it is one of a fixed set.
+    }];
 
-def Micro_MappingTarget : I32EnumAttr<"MappingTarget", "Mapping target", [
-    Micro_ClusterX,
-    Micro_ClusterY,
-    Micro_CoreX,
-    Micro_CoreY,
-    Micro_PEX,
-    Micro_PEY,
-    Micro_Lane,
-    Micro_Worker,
-    Micro_MatrixEngine,
-    Micro_VectorEngine,
-    Micro_DMA
-]> {
-    let cppNamespace = "::mlir::micro";
-    let genSpecializedAttr = 0;
-}
+    let parameters = (ins "::mlir::StringAttr":$symbol);
 
-def Micro_MappingTargetAttr :
-    EnumAttr<Micro_Dialect, Micro_MappingTarget, "map"> {
-    let assemblyFormat = "`<` $value `>`";
+    // A bare identifier (`#micro.owner<worker>`), not a quoted string: the
+    // spelling is a symbol the target resolves, and legacy text already writes
+    // it unquoted. A quoted string is also accepted, so a spelling that is not
+    // a bare identifier (a coordinate axis such as `cluster.x`) stays writable.
+    let hasCustomAssemblyFormat = 1;
+
+    let genVerifyDecl = 1;
+
+    let builders = [
+        AttrBuilder<(ins "::llvm::StringRef":$symbol), [{
+          return $_get($_ctxt, ::mlir::StringAttr::get($_ctxt, symbol));
+        }]>
+    ];
 }
 
 //===----------------------------------------------------------------------===//
@@ -110,43 +115,46 @@ def Micro_DTypeAttr :
 }
 
 //===----------------------------------------------------------------------===//
-// Owner enum attribute
+// Owner attribute
 //===----------------------------------------------------------------------===//
 
-def Micro_OwnerCluster : I32EnumAttrCase<"cluster", 0, "cluster">;
-def Micro_OwnerCore : I32EnumAttrCase<"core", 1, "core">;
-def Micro_OwnerWarp : I32EnumAttrCase<"warp", 2, "warp">;
-def Micro_OwnerWave : I32EnumAttrCase<"wave", 3, "wave">;
-def Micro_OwnerSubgroup : I32EnumAttrCase<"subgroup", 4, "subgroup">;
-def Micro_OwnerPeGroup : I32EnumAttrCase<"pe_group", 5, "pe_group">;
-def Micro_OwnerPE : I32EnumAttrCase<"pe", 6, "pe">;
-def Micro_OwnerLane : I32EnumAttrCase<"lane", 7, "lane">;
-def Micro_OwnerWorker : I32EnumAttrCase<"worker", 8, "worker">;
-def Micro_OwnerMatrixEngine : I32EnumAttrCase<"matrix_engine", 9, "matrix_engine">;
-def Micro_OwnerVectorEngine : I32EnumAttrCase<"vector_engine", 10, "vector_engine">;
-def Micro_OwnerDMA : I32EnumAttrCase<"dma", 11, "dma">;
+// A tile's owner is a **symbol**, not an enumeration. The canonical dialect
+// knows the abstract classes a tile can belong to -- a group of workers, one
+// worker, the vector engine, the matrix engine, the movement engine -- and
+// nothing about how any particular machine spells them. A profile that calls
+// its finest execution unit and its collaborating set whatever words it likes
+// says so in its own machine model, which maps those labels onto the abstract
+// classes; naming them here would put one backend's hierarchy in the canonical
+// IR, which is the same boundary §13.4 draws for layouts and §5.4 for target
+// policy.
+//
+// Keeping the attribute open also keeps legacy text parseable: a kernel written
+// with a target's spelling still reads as *unresolved analysis data*, and only
+// target execution requires it to be normalized.
+def Micro_OwnerAttr : AttrDef<Micro_Dialect, "Owner"> {
+    let mnemonic = "owner";
+    let summary = "The owner a tile belongs to, as a target-neutral symbol";
+    let description = [{
+        Names the resource scope a tile is owned by. The spelling is a symbol
+        the owning target resolves: the dialect verifies that it is present and
+        well-formed, never that it is one of a fixed set.
+    }];
 
-def Micro_Owner : I32EnumAttr<"Owner", "Owner resource scope", [
-    Micro_OwnerCluster,
-    Micro_OwnerCore,
-    Micro_OwnerWarp,
-    Micro_OwnerWave,
-    Micro_OwnerSubgroup,
-    Micro_OwnerPeGroup,
-    Micro_OwnerPE,
-    Micro_OwnerLane,
-    Micro_OwnerWorker,
-    Micro_OwnerMatrixEngine,
-    Micro_OwnerVectorEngine,
-    Micro_OwnerDMA
-]> {
-    let cppNamespace = "::mlir::micro";
-    let genSpecializedAttr = 0;
-}
+    let parameters = (ins "::mlir::StringAttr":$symbol);
 
-def Micro_OwnerAttr :
-    EnumAttr<Micro_Dialect, Micro_Owner, "owner"> {
-    let assemblyFormat = "`<` $value `>`";
+    // A bare identifier (`#micro.owner<worker>`), not a quoted string: the
+    // spelling is a symbol the target resolves, and legacy text already writes
+    // it unquoted. A quoted string is also accepted, so a spelling that is not
+    // a bare identifier (a coordinate axis such as `cluster.x`) stays writable.
+    let hasCustomAssemblyFormat = 1;
+
+    let genVerifyDecl = 1;
+
+    let builders = [
+        AttrBuilder<(ins "::llvm::StringRef":$symbol), [{
+          return $_get($_ctxt, ::mlir::StringAttr::get($_ctxt, symbol));
+        }]>
+    ];
 }
 
 //===----------------------------------------------------------------------===//

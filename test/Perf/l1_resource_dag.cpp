@@ -80,14 +80,15 @@ std::unique_ptr<Parsed> parseKernel(llvm::StringRef source,
 /// what the scheduler's slot arithmetic reads.
 std::string testMachine(unsigned dmaEngines, unsigned workers,
                         unsigned matrixEngines) {
-  std::string yaml = "schema: llk.machine.v2\n"
-                     "target: test-machine\n"
-                     "clock_hz: 1000000000\n"
-                     "worker_threads: " +
-                     std::to_string(workers) +
-                     "\nsync:\n  barrier_cycles: 1\n  wait_cycles: 0\n"
-                     "executors:\n"
-                     "  - id: cluster.0\n    kind: cluster\n";
+  std::string yaml =
+      "schema: llk.machine.v2\n"
+      "target: test-machine\n"
+      "clock_hz: 1000000000\n"
+      "worker_threads: " +
+      std::to_string(workers) +
+      "\nsync:\n  barrier_cycles: 1\n  wait_cycles: 0\n"
+      "executors:\n"
+      "  - id: cluster.0\n    kind: cluster\n    refines: [group]\n";
   for (unsigned i = 0; i < workers; ++i)
     yaml += "  - id: worker." + std::to_string(i) +
             "\n    kind: worker\n    parent: cluster.0\n";
@@ -110,14 +111,16 @@ std::string testMachine(unsigned dmaEngines, unsigned workers,
   // `matrix_engines: count: N` is one engine *class*, and a schedule that
   // names it must share all N slots rather than get one.
   yaml += "compute:\n";
-  yaml += "  - id: mxu\n    kind: matrix_engine\n    attached_to: worker.0\n"
+  yaml += "  - id: mxu\n    kind: matrix_engine\n    refines: [matrix]\n"
+          "    attached_to: worker.0\n"
           "    element_types: [f32, bf16]\n    accumulator_dtypes: [f32]\n"
           "    shapes: [[1, 1, 1]]\n    issue_cycles: 1\n"
           "    latency_cycles: 1\n    throughput_per_cycle: 1\n"
           "    concurrency: " +
           std::to_string(matrixEngines) +
           "\n    supported_layouts: [row_major]\n";
-  yaml += "  - id: vpu\n    kind: vector_engine\n    attached_to: worker.0\n"
+  yaml += "  - id: vpu\n    kind: vector_engine\n    refines: [vector]\n"
+          "    attached_to: worker.0\n"
           "    element_types: [f32, bf16]\n    shapes: [[8]]\n"
           "    lanes: {f32: 8, bf16: 16}\n    issue_cycles: 1\n"
           "    latency_cycles: 1\n    supported_layouts: [row_major]\n";
@@ -125,7 +128,8 @@ std::string testMachine(unsigned dmaEngines, unsigned workers,
   yaml += "transfer_engines:\n";
   for (unsigned i = 0; i < dmaEngines; ++i)
     yaml += "  - id: dma." + std::to_string(i) +
-            "\n    kind: dma\n    attached_to: cluster.0\n"
+            "\n    kind: dma\n    refines: [transfer]\n"
+            "    attached_to: cluster.0\n"
             "    count: 1\n    max_outstanding: 1\n";
 
   yaml += "links:\n";
@@ -647,6 +651,7 @@ worker_threads: 1
 executors:
   - id: cluster.0
     kind: cluster
+    refines: [group]
 memories:
   - id: dram.0
     kind: dram
@@ -683,6 +688,7 @@ memories:
 transfer_engines:
   - id: dma.0
     kind: dma
+    refines: [transfer]
     attached_to: cluster.0
     count: 1
     max_outstanding: 1
@@ -817,11 +823,13 @@ worker_threads: 2
 executors:
   - id: cluster.0
     kind: cluster
+    refines: [group]
   - id: worker.0
     kind: worker
     parent: cluster.0
   - id: cluster.1
     kind: cluster
+    refines: [group]
   - id: worker.1
     kind: worker
     parent: cluster.1
@@ -837,6 +845,7 @@ memories:
 compute:
   - id: vpu.a
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.0
     element_types: [f32]
     shapes: [[8]]
@@ -846,6 +855,7 @@ compute:
     supported_layouts: [row_major]
   - id: vpu.b
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.1
     element_types: [f32]
     shapes: [[8]]

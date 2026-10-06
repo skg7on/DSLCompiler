@@ -174,6 +174,12 @@ struct MemoryNode {
 struct ComputeNode {
   std::string id;
   std::string kind;
+  /// Abstract owner classes this capability's `kind` denotes, the same alias
+  /// mechanism an executor uses: a target may spell its vector unit
+  /// `vector_engine` and declare `refines: [vector]`, and the normalized model
+  /// then reads the capability as a `vector` engine. A kind that is already an
+  /// abstract class needs no entry. Empty means the target declared nothing.
+  std::vector<std::string> refines{};
   std::string attachedTo;
   std::vector<std::string> elementTypes;
   std::vector<std::string> supportedLayouts;
@@ -206,6 +212,10 @@ struct ComputeNode {
 struct TransferEngineNode {
   std::string id;
   std::string kind;
+  /// Abstract owner classes this engine's `kind` denotes, exactly as
+  /// `ComputeNode::refines`: a target spells its movement engine `dma` and
+  /// declares `refines: [transfer]`. Empty means the target declared nothing.
+  std::vector<std::string> refines{};
   std::string attachedTo;
   uint32_t count = 1;
   uint32_t maxOutstanding = 1;
@@ -284,6 +294,18 @@ struct MachineModel {
   /// `ownerKind`, or it declares `ownerKind` in `refines`.
   bool ownerMatches(llvm::StringRef ownerKind,
                     llvm::StringRef executorId) const;
+
+  /// The abstract Micro owner class a spelling denotes, resolved through this
+  /// model's own alias data -- the `refines` declarations on its executors,
+  /// compute capabilities and transfer engines. A spelling that is already an
+  /// abstract class (`worker`, `vector`, ...) resolves to itself; a target's
+  /// own label (`lane`, `vector_engine`, `pe`, ...) resolves through the node
+  /// that declares it. Nullopt means the model does not know the spelling, or
+  /// two nodes declare it with conflicting classes (ambiguous). This is the
+  /// "target data maps accepted spellings to abstract classes" boundary: the
+  /// canonical dialect records a symbol and never checks it, and the model is
+  /// where a symbol becomes a class.
+  std::optional<std::string> ownerClass(llvm::StringRef spelling) const;
 
   /// True when `executorId` can address `memoryId` (design §11.2 `dominates`).
   bool isVisible(llvm::StringRef memoryId, llvm::StringRef executorId) const;

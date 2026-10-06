@@ -42,6 +42,7 @@ executors:
     refines: [worker]
   - id: pe_group.0
     kind: pe_group
+    refines: [group]
     parent: core.0
     coordinates: [0, 0]
     concurrency: 1
@@ -89,6 +90,7 @@ memories:
 compute:
   - id: mxu.0
     kind: matrix_engine
+    refines: [matrix]
     attached_to: pe.0
     element_types: [bf16, f16, i8]
     accumulator_dtypes: [f32, i32]
@@ -99,6 +101,7 @@ compute:
     supported_layouts: [row_major, blocked]
   - id: vpu.0
     kind: vector_engine
+    refines: [vector]
     attached_to: pe.0
     element_types: [f32, f16]
     shapes: [[64]]
@@ -111,6 +114,7 @@ compute:
 transfer_engines:
   - id: dma.0
     kind: dma
+    refines: [transfer]
     attached_to: core.0
     count: 4
     max_outstanding: 16

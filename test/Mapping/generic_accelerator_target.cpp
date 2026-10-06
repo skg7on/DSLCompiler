@@ -1,5 +1,7 @@
 //===- generic_accelerator_target.cpp - second target (D7) ---------------===//
 
+#include "LLK/Dialect/Micro/MicroEnums.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.h"
 
@@ -204,12 +206,12 @@ TEST(GenericAcceleratorTarget, TargetVocabularyStaysOutOfGenericMicroOds) {
       "avx2", "nvidia", "ampere", "sm80", "ttgir",    "npu",  "accel",
       "mxu",  "vpu",    "warp",   "wave", "subgroup", "lane", "pe_group",
   };
-  // Debt, not policy: generic Micro already ships warp-class owner names
-  // (Owner::warp, wave, subgroup, pe_group, pe, lane). Tracked so the debt is
-  // visible; a NEW leak fails, and removing one fails until this set shrinks.
-  const std::set<std::string> kKnownGenericLeaks = {
-      "warp", "wave", "subgroup", "pe_group", "lane",
-  };
+  // Empty by construction now: the closed owner enumeration that used to ship
+  // warp-class names (warp, wave, subgroup, pe, pe_group, lane) is gone -- the
+  // dialect keeps only the abstract classes group/worker/vector/matrix/transfer
+  // -- and the spatial axis is an open symbol. A target word here would be a
+  // genuine leak, so the tracked debt is retired rather than reduced.
+  const std::set<std::string> kKnownGenericLeaks = {};
 
   std::set<std::string> found;
   for (const std::string &file : files) {
@@ -223,8 +225,8 @@ TEST(GenericAcceleratorTarget, TargetVocabularyStaysOutOfGenericMicroOds) {
         found.insert(word);
   }
   EXPECT_EQ(found, kKnownGenericLeaks)
-      << "generic Micro leaks changed; update kKnownGenericLeaks only when the "
-         "dialect genuinely changed";
+      << "a target word reached the canonical Micro ODS; the generic dialect "
+         "must name only abstract owner classes";
 }
 
 TEST(GenericAcceleratorTarget, DoesNotClaimAnExecutableBackend) {
@@ -265,4 +267,61 @@ TEST(GenericAcceleratorTarget, DoesNotClaimAnExecutableBackend) {
         std::string::npos)
         << key.str();
   }
+}
+
+//===----------------------------------------------------------------------===//
+// C9: two targets, one abstract owner vocabulary
+//===----------------------------------------------------------------------===//
+
+/// The same abstract classes serve two machines whose hierarchies and widths
+/// have nothing in common. Each profile spells its execution units its own way
+/// and declares, in its own data, what those spellings refine; the canonical
+/// dialect knows none of those words. This is the neutrality claim C9 makes:
+/// generic group/worker/vector/matrix/transfer ownership is enough, and no new
+/// ODS enum is needed to describe a second target.
+TEST(GenericAcceleratorTarget, OwnerVocabularyIsTargetDataNotAnOdsEnum) {
+  auto read = [](llvm::StringRef file) -> std::optional<std::string> {
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+        llvm::MemoryBuffer::getFile(std::string(LLK_SOURCE_DIR) + "/machines/" +
+                                    file);
+    if (!buffer)
+      return std::nullopt;
+    return buffer.get()->getBuffer().str();
+  };
+
+  std::optional<std::string> cpuText = read("x86-avx2-v2.yaml");
+  std::optional<std::string> accelText = read("generic-ai-accel-v2.yaml");
+  ASSERT_TRUE(cpuText) << "the AVX2 profile must ship with the sources";
+  ASSERT_TRUE(accelText)
+      << "the accelerator profile must ship with the sources";
+
+  llvm::Expected<mlir::llk::machine::MachineModel> cpu =
+      mlir::llk::machine::parseMachineModel(*cpuText, "x86-avx2-v2.yaml");
+  ASSERT_TRUE(static_cast<bool>(cpu)) << llvm::toString(cpu.takeError());
+  llvm::Expected<mlir::llk::machine::MachineModel> accel =
+      mlir::llk::machine::parseMachineModel(*accelText,
+                                            "generic-ai-accel-v2.yaml");
+  ASSERT_TRUE(static_cast<bool>(accel)) << llvm::toString(accel.takeError());
+
+  // Both identify a worker, but through their own labels: the CPU's finer unit
+  // is a `lane`, the accelerator's is a `core` or a `pe`.
+  EXPECT_EQ(cpu->ownerClass("lane"), std::optional<std::string>("worker"));
+  EXPECT_EQ(cpu->ownerClass("vector_engine"),
+            std::optional<std::string>("vector"));
+  EXPECT_EQ(accel->ownerClass("core"), std::optional<std::string>("worker"));
+  EXPECT_EQ(accel->ownerClass("pe"), std::optional<std::string>("worker"));
+  EXPECT_EQ(accel->ownerClass("pe_group"), std::optional<std::string>("group"));
+
+  // The vocabulary is per target: `group` is a class both machines know,
+  // `lane` is the CPU's own word and unknown to the accelerator.
+  EXPECT_EQ(accel->ownerClass("worker"), std::optional<std::string>("worker"));
+  EXPECT_FALSE(accel->ownerClass("lane").has_value());
+
+  // And the dialect knows *none* of those labels -- only the abstract classes
+  // are ODS vocabulary, which is exactly the boundary C9 restores.
+  EXPECT_FALSE(mlir::micro::symbolizeOwner("lane").has_value());
+  EXPECT_FALSE(mlir::micro::symbolizeOwner("pe_group").has_value());
+  EXPECT_FALSE(mlir::micro::symbolizeOwner("vector_engine").has_value());
+  EXPECT_TRUE(mlir::micro::symbolizeOwner("worker").has_value());
+  EXPECT_TRUE(mlir::micro::symbolizeOwner("vector").has_value());
 }

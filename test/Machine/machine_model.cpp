@@ -39,6 +39,7 @@ MachineModel twoCoreMachine() {
       {"sram.0", "sram", "core.0", 1u << 15, 64, {"row_major", "blocked"}, 8u}};
   model.computes = {{"avx2.0",
                      "vector_engine",
+                     {"vector"},
                      "core.0",
                      {"f32"},
                      {"row_major", "vectorized"},
@@ -48,7 +49,7 @@ MachineModel twoCoreMachine() {
                      5,
                      16.0,
                      1}};
-  model.transferEngines = {{"dma.0", "dma", "core.0", 1, 8}};
+  model.transferEngines = {{"dma.0", "dma", {"transfer"}, "core.0", 1, 8}};
   model.links = {
       {"dram_to_sram.0", "dram.0", "sram.0", 32.0, 20, 64, {"dma.0"}, 1}};
   return model;
@@ -132,25 +133,37 @@ TEST(MachineModel, VerifyRejectsDuplicateIds) {
 
 TEST(MachineModel, VerifyRejectsUnknownExecutorKind) {
   MachineModel model = twoCoreMachine();
+  // A target label is known only through its own refinement. `warp_group` with
+  // no refinement is undeclared, and an undeclared spelling is rejected rather
+  // than silently accepted.
   model.executors[1].kind = "warp_group";
+  model.executors[1].refines.clear();
   EXPECT_FALSE(verifies(model));
 }
 
 TEST(MachineModel, VerifyRejectsUnknownComputeKind) {
   MachineModel model = twoCoreMachine();
-  model.computes[0].kind = "tensor_core"; // not Micro owner vocabulary
+  // A compute kind is a *target label* resolved through its own refinement. An
+  // undeclared spelling -- one with no refinement to a matrix/vector class --
+  // is rejected rather than accepted as some unknown capability.
+  model.computes[0].kind = "tensor_core";
+  model.computes[0].refines.clear();
   EXPECT_FALSE(verifies(model));
 }
 
 TEST(MachineModel, VerifyRejectsUnknownTransferKind) {
   MachineModel model = twoCoreMachine();
   model.transferEngines[0].kind = "pcie";
+  model.transferEngines[0].refines.clear();
   EXPECT_FALSE(verifies(model));
 }
 
 TEST(MachineModel, VerifyAcceptsMatrixEngineComputeKind) {
   MachineModel model = twoCoreMachine();
-  model.computes[0].kind = "matrix_engine"; // a Micro owner capability
+  // `matrix_engine` is a target label; the profile's own data declares the
+  // abstract class it denotes, and the alias is what makes it a capability.
+  model.computes[0].kind = "matrix_engine";
+  model.computes[0].refines = {"matrix"};
   EXPECT_TRUE(verifies(model));
 }
 
@@ -434,4 +447,50 @@ TEST(MachineModel, SchedulingAndDirectionalitySymbolizeRoundTrip) {
   EXPECT_FALSE(symbolizeLinkDirectionality("omni").has_value());
   EXPECT_EQ(stringifyLinkDirectionality(LinkDirectionality::Bidirectional),
             "bidirectional");
+}
+
+//===----------------------------------------------------------------------===//
+// C9: the generic owner vocabulary is target data, not an ODS enumeration
+//===----------------------------------------------------------------------===//
+
+TEST(MachineModel, OwnerClassResolvesTargetLabelsThroughRefines) {
+  // A target's own labels reach the abstract classes only through the model's
+  // `refines` data. Nothing in the dialect knows `lane` or `vector_engine`.
+  MachineModel model = twoCoreMachine();
+  model.executors.push_back(
+      {"lane.0", "lane", std::nullopt, {}, 8, {"worker"}});
+  model.computes[0].refines = {"vector"};
+
+  EXPECT_EQ(model.ownerClass("worker"), std::optional<std::string>("worker"));
+  EXPECT_EQ(model.ownerClass("lane"), std::optional<std::string>("worker"));
+  EXPECT_EQ(model.ownerClass("core"), std::optional<std::string>("worker"));
+  EXPECT_EQ(model.ownerClass("vector_engine"),
+            std::optional<std::string>("vector"));
+  // A spelling the model never declares is unknown, not silently a class.
+  EXPECT_FALSE(model.ownerClass("warp").has_value());
+  EXPECT_FALSE(model.ownerClass("not_a_kind").has_value());
+}
+
+TEST(MachineModel, OwnerClassTreatsConflictingAliasesAsAmbiguous) {
+  // Two executors spell the same label but refine different classes: the model
+  // cannot say which class `hybrid` denotes, so it says none.
+  MachineModel model = twoCoreMachine();
+  model.executors.push_back(
+      {"hybrid.a", "hybrid", std::nullopt, {}, 1, {"worker"}});
+  model.executors.push_back(
+      {"hybrid.b", "hybrid", std::nullopt, {}, 1, {"group"}});
+  EXPECT_FALSE(model.ownerClass("hybrid").has_value());
+}
+
+TEST(MachineModel, LegacyOwnerLabelResolvesOnlyWithAnExplicitAlias) {
+  // A legacy owner label is unresolved analysis data until a profile declares
+  // it: without an alias it is unknown, and with one it denotes a class.
+  MachineModel absent = twoCoreMachine();
+  EXPECT_FALSE(absent.ownerClass("warp").has_value());
+
+  MachineModel present = twoCoreMachine();
+  present.executors[1].kind = "warp";
+  present.executors[1].refines = {"worker"};
+  EXPECT_EQ(present.ownerClass("warp"), std::optional<std::string>("worker"));
+  EXPECT_TRUE(verifies(present));
 }
