@@ -126,3 +126,27 @@ rule avx2.tile_store v1 {
   emit "avx2_tile_store";
   cost 2;
 }
+
+// The SwiGLU epilogue's shape, implemented as one unit: a convert feeding a
+// SiLU feeding the gating multiply. A graph rule matches a *subgraph*, so the
+// three operations are placed and emitted together -- the intermediate tiles
+// never cross a rule boundary, which is what makes the fused implementation a
+// different program from three separate ones rather than a relabelling of them.
+rule avx2.fused_convert_silu_mul v1 {
+  match graph {
+    node cv: micro.vector(op = "convert");
+    node act: micro.vector(op = "silu");
+    node gate: micro.vector(op = "mul");
+    edge cv.result -> act.operand0;
+    edge act.result -> gate.operand0;
+  }
+  param VW in [4..8];
+  require executor kind worker;
+  require compute kind vector_engine;
+  input "cv.operand0";
+  input "gate.operand1";
+  output "gate.result";
+  bundle "avx2.fused.convert_silu_mul";
+  emit "avx2_fused_convert_silu_mul";
+  cost 3;
+}

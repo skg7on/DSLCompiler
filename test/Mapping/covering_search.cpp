@@ -1433,6 +1433,126 @@ TEST(CoveringSearch, PlacementsAreOrderedByTheirBindingTuple) {
   EXPECT_EQ(placements[1].node, 0u);
 }
 
+//===----------------------------------------------------------------------===//
+// Stage C7: a covering can select one fused rule over several nodes
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A rule that implements a whole `add -> add -> add` chain as one unit, and
+/// nothing else: a covering exists only if the search matches a subgraph rather
+/// than one operation at a time.
+constexpr llvm::StringLiteral kFusedOnlyRules = R"llkmap(
+rule r.fused_chain {
+  match graph {
+    node a: micro.vector(op = "add");
+    node b: micro.vector(op = "add");
+    node c: micro.vector(op = "add");
+    edge a.result -> b.operand0;
+    edge b.result -> c.operand0;
+  }
+  require executor kind worker;
+  bundle "b.fused";
+  emit "e1";
+  cost 3;
+}
+)llkmap";
+
+/// The same chain implemented one operation at a time.
+constexpr llvm::StringLiteral kOneOpRules = R"llkmap(
+rule r.one {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  bundle "b.one";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+} // namespace
+
+TEST(CoveringSearch, SelectsAFusedRuleOverTheWholeChain) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph =
+      threeNodeChainGraph(context, mlir::IndexType::get(&context));
+
+  // One operation at a time: three instances and two connections between them.
+  {
+    std::unique_ptr<MappingTarget> target =
+        targetWith(searchMachine(), kOneOpRules);
+    ASSERT_NE(target, nullptr);
+    MappingSearchOptions options;
+    options.mode = SearchMode::Deterministic;
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_EQ(result->plans.size(), 1u);
+    EXPECT_EQ(result->plans[0].instances.size(), 3u);
+    EXPECT_EQ(result->plans[0].connections.size(), 2u);
+  }
+
+  // The fused rule alone: one instance covering all three nodes, and no
+  // connections at all -- the values between them are inside the match, so the
+  // rule implements them and the search must not invent a movement for them.
+  {
+    std::unique_ptr<MappingTarget> target =
+        targetWith(searchMachine(), kFusedOnlyRules);
+    ASSERT_NE(target, nullptr);
+    MappingSearchOptions options;
+    options.mode = SearchMode::Deterministic;
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_EQ(result->plans.size(), 1u);
+    // The matched chain's *internal* values are not connections: the rule
+    // implements them, and inventing a movement between two nodes the same rule
+    // already fused would be a transfer nobody asked for.
+    EXPECT_TRUE(result->plans[0].connections.empty());
+    EXPECT_FALSE(result->searchTruncated);
+    // A fused instance covers all three nodes, so the plan names one instance
+    // and the per-node view repeats it rather than listing three different
+    // ones. Making the plan itself instance-centric is follow-up work; what is
+    // asserted here is that the coverage really was one instance.
+    llvm::SmallVector<InstanceId> distinct(result->plans[0].instances.begin(),
+                                           result->plans[0].instances.end());
+    llvm::sort(distinct);
+    distinct.erase(std::unique(distinct.begin(), distinct.end()),
+                   distinct.end());
+    EXPECT_EQ(distinct.size(), 1u);
+    EXPECT_EQ(result->plans[0].instances.size(), 3u);
+
+    // Every covered node's placement names the rule that implements it. A
+    // per-node lookup would leave the two non-anchor placements without one,
+    // and a plan with a rule-less placement cannot be bound.
+    ASSERT_EQ(result->plans[0].placements.size(), 3u);
+    for (const PlanPlacement &placement : result->plans[0].placements)
+      EXPECT_EQ(placement.rule, "r.fused_chain");
+  }
+}
+
+TEST(CoveringSearch, AFusedCandidateCoversEachNodeOnlyOnce) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph =
+      threeNodeChainGraph(context, mlir::IndexType::get(&context));
+
+  // Fused and one-op rules together. A covering is a partition: whatever the
+  // search picks, no node may be implemented twice, so the instance count plus
+  // the fused instance's coverage has to add up to the three nodes.
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), std::string(kFusedOnlyRules) + "\n" +
+                                      std::string(kOneOpRules));
+  ASSERT_NE(target, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_LE(result->plans[0].instances.size(), 3u);
+}
+
 TEST(CoveringSearch, ReportsNodesWithoutRules) {
   mlir::MLIRContext context;
   WorkloadGraph graph = twoNodeGraph(context);

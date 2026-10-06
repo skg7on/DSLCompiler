@@ -506,6 +506,72 @@ TEST(Avx2Target, RejectsBundlesItCannotLowerAndLeavesTheIrAlone) {
             std::string::npos);
 }
 
+/// A kernel whose epilogue is the shape the fused rule implements: a convert
+/// feeding a SiLU feeding the gating multiply.
+constexpr llvm::StringLiteral kFusedVectorKernel = R"mlir(
+module {
+  micro.kernel @fused {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t = micro.tile_view %ext {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %c = micro.vector "convert" %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %s = micro.vector "silu" %c : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %m = micro.vector "mul" %s, %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+TEST(Avx2Target, LowersAWholeFusedGroupInOneBundle) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  mlir::MLIRContext context;
+  context.loadDialect<mlir::micro::MicroDialect, mlir::tensor::TensorDialect>();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kFusedVectorKernel, &context);
+  ASSERT_TRUE(module);
+
+  // The bundle a fused rule emits: the group's own emitter key, and the vector
+  // width the rule solved.
+  TargetBundle fused;
+  fused.name = "avx2.fused.convert_silu_mul";
+  fused.emitterKey = "avx2_fused_convert_silu_mul";
+  fused.parameters = mlir::DictionaryAttr::get(
+      &context,
+      {mlir::NamedAttribute(
+          mlir::StringAttr::get(&context, "VW"),
+          mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), 8))});
+
+  std::unique_ptr<TargetEmitter> emitter =
+      (*target)->createEmitter("avx2_fused_convert_silu_mul");
+  ASSERT_TRUE(emitter);
+
+  llvm::SmallVector<mlir::Operation *> covered = coveredVectorOps(*module);
+  ASSERT_EQ(covered.size(), 3u) << "the group is all three epilogue ops";
+
+  TargetLoweringContext lowering{(*target)->machine(), {}, {}};
+  mlir::IRRewriter rewriter(&context);
+  llvm::Error error = emitter->lower(covered, fused, lowering, rewriter);
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+
+  // Every operation the group covers carries the target's physical decision. A
+  // fused bundle that rewrote only its anchor would leave the rest of the match
+  // at the reference layout, which is a different program from the one the plan
+  // selected.
+  // Counting *result* annotations rather than every mention: a rewritten value
+  // that feeds another rewritten op shows its layout on both sides, so the raw
+  // occurrence count measures shared operands as well as rewritten results.
+  std::string text = print(*module);
+  const std::string marker =
+      "-> !micro.tile<8x8xf32, layout = #micro.layout<vectorized";
+  size_t rewritten = 0;
+  for (size_t at = text.find(marker); at != std::string::npos;
+       at = text.find(marker, at + 1))
+    ++rewritten;
+  EXPECT_EQ(rewritten, 3u) << text;
+  EXPECT_NE(text.find("vector = 8"), std::string::npos) << text;
+}
+
 TEST(Avx2Target, ReportsEmitterKeysItHasNoLoweringFor) {
   llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
   ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());

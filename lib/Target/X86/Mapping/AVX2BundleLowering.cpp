@@ -68,6 +68,15 @@ bool isArithmeticKey(llvm::StringRef key) {
          key == "avx2_vector_silu" || key == "avx2_vector_mul";
 }
 
+/// The emitter whose bundle is a *group*: one rule implementing a whole matched
+/// subgraph. Its lowering applies the same target-owned physical decision to
+/// every operation the group covers, which is why it takes the whole covered
+/// array rather than one operation -- a fused bundle that rewrote only its
+/// anchor would leave the rest of the match at the reference layout.
+bool isFusedKey(llvm::StringRef key) {
+  return key == "avx2_fused_convert_silu_mul";
+}
+
 /// The element types the AVX2 arithmetic emitters implement. A target's rules
 /// are dtype-parameterized, so a bundle can name an element type this backend
 /// has no vector path for -- that is a target-readiness failure, not a parse
@@ -142,7 +151,9 @@ public:
   /// Only the arithmetic family has a lowering here; the movement and
   /// contraction keys are declared because rules emit them, and the reference
   /// bridge carries those until this target implements them.
-  bool hasLowering() const override { return isArithmeticKey(key()); }
+  bool hasLowering() const override {
+    return isArithmeticKey(key()) || isFusedKey(key());
+  }
 
   llvm::Error lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
                     const mapping::TargetBundle &bundle,
@@ -165,7 +176,7 @@ llvm::Error AVX2Emitter::lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
   if (coveredOps.empty())
     return avx2Error("no covered operations to lower");
 
-  if (!isArithmeticKey(key()))
+  if (!isArithmeticKey(key()) && !isFusedKey(key()))
     return avx2Error("emitter '" + key().str() +
                      "' has no lowering implementation for its covered "
                      "operations yet");

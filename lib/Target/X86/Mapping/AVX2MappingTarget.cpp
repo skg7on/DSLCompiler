@@ -65,7 +65,7 @@ llvm::ArrayRef<llvm::StringLiteral> emitterKeys() {
       "avx2_vector_silu", "avx2_vector_mul",
       "avx2_mma",         "avx2_reduce",
       "avx2_copy",        "avx2_tile_copy",
-      "avx2_tile_store"};
+      "avx2_tile_store",  "avx2_fused_convert_silu_mul"};
   return kKeys;
 }
 

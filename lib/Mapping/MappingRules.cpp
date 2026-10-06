@@ -102,6 +102,9 @@ public:
 private:
   bool parseRule(RuleDef &out);
   bool parseMatch(RuleDef &out);
+  bool parseGraphMatch(RuleDef &out);
+  bool parsePatternNode(RulePattern &pattern);
+  bool parsePatternEdge(RulePattern &pattern);
   bool parsePredicate(RulePredicate &out);
   bool parsePredicateValue(LayoutValue &out, PredicateValueKind expected);
   bool parseAffineMapSpec(AffineMapSpec &out);
@@ -204,6 +207,13 @@ bool RuleParser::parseMatch(RuleDef &out) {
   if (!out.matchOp.empty())
     return failAt(current(), "duplicate match clause");
   advance(); // 'match'
+
+  // `match graph { ... }` is the fused form. The single-operation syntax is
+  // untouched, so every existing rule keeps parsing to exactly what it did.
+  if (current().kind == LlkMapToken::Kind::Identifier &&
+      current().text == "graph")
+    return parseGraphMatch(out);
+
   std::string operation;
   if (!expectIdentifier("a Micro operation", operation))
     return false;
@@ -229,6 +239,160 @@ bool RuleParser::parseMatch(RuleDef &out) {
   if (!expectPunct(")"))
     return false;
   return expectPunct(";");
+}
+
+/// `match graph { node X: micro.vector(op = "convert"); edge X.result ->
+/// Y.operand0; }`
+///
+/// The first declared node is the **anchor**: matches are enumerated by trying
+/// it at each graph node in canonical order, so the order of matches is a
+/// property of the rule and the graph rather than of a traversal.
+bool RuleParser::parseGraphMatch(RuleDef &out) {
+  advance(); // 'graph'
+  if (!expectPunct("{"))
+    return false;
+
+  RulePattern pattern;
+  while (!isPunct("}")) {
+    if (atEnd())
+      return failAt(current(), "expected '}' to close the match graph");
+    if (current().kind != LlkMapToken::Kind::Identifier)
+      return failAt(current(), "expected 'node' or 'edge'");
+    std::string keyword = current().text;
+    if (keyword == "node") {
+      if (!parsePatternNode(pattern))
+        return false;
+    } else if (keyword == "edge") {
+      if (!parsePatternEdge(pattern))
+        return false;
+    } else {
+      return failAt(current(),
+                    "expected 'node' or 'edge', found '" + keyword + "'");
+    }
+  }
+  // No trailing `;`: the braces delimit the statement, and requiring one would
+  // be a second way to write the same thing.
+  advance(); // '}'
+
+  if (pattern.nodes.empty())
+    return failAt(current(), "a match graph needs at least one node");
+
+  // Every edge endpoint names a node the graph declared. Checked after the
+  // whole graph, so declaration order does not matter -- a forward reference to
+  // a node declared below is as valid as one above.
+  for (const RulePatternEdge &edge : pattern.edges) {
+    if (!pattern.findNode(edge.producer))
+      return failAt(current(),
+                    "edge names undeclared node '" + edge.producer + "'");
+    if (!pattern.findNode(edge.consumer))
+      return failAt(current(),
+                    "edge names undeclared node '" + edge.consumer + "'");
+  }
+
+  out.matchOp = pattern.nodes.front().op;
+  out.pattern = std::move(pattern);
+  return true;
+}
+
+/// `node NAME: micro.vector(op = "convert", ...);`
+bool RuleParser::parsePatternNode(RulePattern &pattern) {
+  advance(); // 'node'
+  std::string name;
+  if (!expectIdentifier("a node name", name))
+    return false;
+  for (const RulePatternNode &existing : pattern.nodes)
+    if (existing.name == name)
+      return failAt(current(),
+                    "duplicate node name '" + name + "' in the match graph");
+  if (!expectPunct(":"))
+    return false;
+
+  RulePatternNode node;
+  node.name = std::move(name);
+  if (!expectIdentifier("a Micro operation", node.op))
+    return false;
+  if (!isWorkloadNodeOp(node.op))
+    return failAt(current(), "unknown Micro operation '" + node.op + "'");
+
+  if (!expectPunct("("))
+    return false;
+  if (!isPunct(")")) {
+    while (true) {
+      RulePredicate predicate;
+      if (!parsePredicate(predicate))
+        return false;
+      node.predicates.push_back(std::move(predicate));
+      if (isPunct(",")) {
+        advance();
+        continue;
+      }
+      break;
+    }
+  }
+  if (!expectPunct(")"))
+    return false;
+  if (!expectPunct(";"))
+    return false;
+
+  pattern.nodes.push_back(std::move(node));
+  return true;
+}
+
+/// `edge PRODUCER.resultK -> CONSUMER.operandK;`
+///
+/// The index may be omitted: `X.result` is the first result and `Y.operand` the
+/// first operand, because most patterns touch exactly one of each and writing
+/// the zero every time would be noise.
+bool RuleParser::parsePatternEdge(RulePattern &pattern) {
+  advance(); // 'edge'
+
+  // `cv.result` is one token: a dot is an identifier character here, because
+  // rule and layout ids are dotted. The endpoint is split rather than lexed
+  // apart.
+  auto parseEndpoint = [&](std::string &name, uint32_t &index,
+                           llvm::StringRef prefix) -> bool {
+    std::string endpoint;
+    if (!expectIdentifier("a node and its occurrence", endpoint))
+      return false;
+    size_t dot = endpoint.rfind('.');
+    if (dot == std::string::npos)
+      return failAt(current(), "expected 'NODE." + prefix.str() +
+                                   "' or 'NODE." + prefix.str() +
+                                   "K', found '" + endpoint + "'");
+    llvm::StringRef occurrence = llvm::StringRef(endpoint).drop_front(dot + 1);
+    name = endpoint.substr(0, dot);
+    if (name.empty() || !occurrence.starts_with(prefix))
+      return failAt(current(), "expected 'NODE." + prefix.str() +
+                                   "' or 'NODE." + prefix.str() +
+                                   "K', found '" + endpoint + "'");
+    llvm::StringRef digits = occurrence.drop_front(prefix.size());
+    uint64_t value = 0;
+    if (!digits.empty() && digits.getAsInteger(10, value))
+      return failAt(current(),
+                    "expected an occurrence index in '" + endpoint + "'");
+    index = static_cast<uint32_t>(value);
+    return true;
+  };
+
+  RulePatternEdge edge;
+  if (!parseEndpoint(edge.producer, edge.resultIndex, "result"))
+    return false;
+  if (!expectPunct("->"))
+    return false;
+  if (!parseEndpoint(edge.consumer, edge.operandIndex, "operand"))
+    return false;
+  if (!expectPunct(";"))
+    return false;
+
+  for (const RulePatternEdge &existing : pattern.edges)
+    if (existing.producer == edge.producer &&
+        existing.resultIndex == edge.resultIndex &&
+        existing.consumer == edge.consumer &&
+        existing.operandIndex == edge.operandIndex)
+      return failAt(current(), "duplicate edge in the match graph");
+
+  pattern.edges.push_back(std::move(edge));
+  return true;
 }
 
 bool RuleParser::parsePredicateValue(LayoutValue &out,
@@ -605,6 +769,13 @@ const LayoutParam *RuleDef::findParam(llvm::StringRef name) const {
   return nullptr;
 }
 
+const RulePatternNode *RulePattern::findNode(llvm::StringRef name) const {
+  for (const RulePatternNode &node : nodes)
+    if (node.name == name)
+      return &node;
+  return nullptr;
+}
+
 namespace {
 
 llvm::StringRef predicateKindName(RulePredicateKind kind) {
@@ -640,7 +811,7 @@ std::string canonicalRuleDefString(const RuleDef &def) {
   field("version", std::to_string(def.version));
   field("match", def.matchOp);
 
-  for (const RulePredicate &predicate : def.predicates) {
+  auto predicateText = [](const RulePredicate &predicate) {
     std::string text = predicateKindName(predicate.kind).str();
     text += ' ';
     text += predicate.attribute;
@@ -654,7 +825,25 @@ std::string canonicalRuleDefString(const RuleDef &def) {
     text += " value=" + canonicalValueString(predicate.value);
     if (predicate.accessMap)
       text += " map=" + canonicalAffineMapSpecString(*predicate.accessMap);
-    field("predicate", text);
+    return text;
+  };
+  for (const RulePredicate &predicate : def.predicates)
+    field("predicate", predicateText(predicate));
+
+  // A graph rule's pattern is part of what the rule *is*, so it is part of the
+  // hash: two rule libraries that differ only in a pattern are different
+  // libraries, and a report that named one would be wrong about the other.
+  if (def.pattern) {
+    for (const RulePatternNode &node : def.pattern->nodes) {
+      field("pattern.node", node.name);
+      field("pattern.op", node.op);
+      for (const RulePredicate &predicate : node.predicates)
+        field("pattern.predicate", predicateText(predicate));
+    }
+    for (const RulePatternEdge &edge : def.pattern->edges)
+      field("pattern.edge",
+            edge.producer + "." + std::to_string(edge.resultIndex) + "->" +
+                edge.consumer + "." + std::to_string(edge.operandIndex));
   }
   for (const LayoutParam &param : def.params)
     field("param", param.name + (param.symbolic ? ":symbolic" : ":integer"));
@@ -745,13 +934,32 @@ std::string printRule(const RuleDef &def) {
   std::string out =
       "rule " + def.id + " v" + std::to_string(def.version) + " {\n";
 
-  out += "  match " + def.matchOp + "(";
-  for (size_t index = 0; index < def.predicates.size(); ++index) {
-    if (index)
-      out += ", ";
-    out += printPredicate(def.predicates[index]);
+  if (def.pattern) {
+    out += "  match graph {\n";
+    for (const RulePatternNode &node : def.pattern->nodes) {
+      out += "    node " + node.name + ": " + node.op + "(";
+      for (size_t index = 0; index < node.predicates.size(); ++index) {
+        if (index)
+          out += ", ";
+        out += printPredicate(node.predicates[index]);
+      }
+      out += ");\n";
+    }
+    for (const RulePatternEdge &edge : def.pattern->edges) {
+      out += "    edge " + edge.producer + ".result" +
+             std::to_string(edge.resultIndex) + " -> " + edge.consumer +
+             ".operand" + std::to_string(edge.operandIndex) + ";\n";
+    }
+    out += "  }\n";
+  } else {
+    out += "  match " + def.matchOp + "(";
+    for (size_t index = 0; index < def.predicates.size(); ++index) {
+      if (index)
+        out += ", ";
+      out += printPredicate(def.predicates[index]);
+    }
+    out += ");\n";
   }
-  out += ");\n";
 
   // A rule declares a parameter through its `param ... in ...` statement, so
   // emit them in `params` order to keep that order on re-parse.
@@ -988,6 +1196,11 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
                                         const RuleRegistry &rules) {
   std::vector<const RuleDef *> matches;
   for (const RuleDef &rule : rules.all()) {
+    // A graph rule matches a whole subgraph, never one operation. Offering it
+    // here would place it on a single node while its pattern claimed three --
+    // the very overlap a covering has to refuse.
+    if (rule.pattern)
+      continue;
     if (rule.matchOp != node.opName)
       continue;
     bool matched = true;
@@ -1006,6 +1219,271 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
   llvm::sort(matches, [](const RuleDef *lhs, const RuleDef *rhs) {
     return lhs->id < rhs->id;
   });
+  return matches;
+}
+
+//===----------------------------------------------------------------------===//
+// Bounded graph-pattern matching
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The most graph nodes one pattern may bind, so a pathological rule cannot
+/// make matching unbounded.
+constexpr size_t kMaxPatternNodes = 64;
+
+/// True when the value at `producer`'s `resultIndex`-th result is the value at
+/// `consumer`'s `operandIndex`-th operand.
+///
+/// The check is on *occurrences*, not on values: two operands that happen to
+/// hold the same value are still two different ports, and an edge that named
+/// one of them does not name the other.
+bool edgeHolds(const WorkloadNode &producer, const WorkloadNode &consumer,
+               const RulePatternEdge &edge) {
+  if (edge.resultIndex >= producer.outputs.size())
+    return false;
+  if (edge.operandIndex >= consumer.inputs.size())
+    return false;
+  return producer.outputs[edge.resultIndex].value ==
+         consumer.inputs[edge.operandIndex].value;
+}
+
+/// Binds `pattern`'s nodes to graph nodes, in the pattern's declaration order.
+///
+/// Binding in declaration order is what makes the *order of matches* a property
+/// of the rule, and the final all-edges check is what makes it correct even
+/// when an edge names a node declared later -- an edge is a statement about the
+/// matched subgraph, not about the order the rule happened to write it in.
+class PatternMatcher {
+public:
+  PatternMatcher(const WorkloadGraph &graph, const RulePattern &pattern,
+                 uint64_t budget)
+      : pattern_(pattern), budget_(budget) {
+    nodes_.reserve(graph.getNodes().size());
+    for (const WorkloadNode &node : graph.getNodes())
+      nodes_.push_back(&node);
+    // Canonical node order: matches are enumerated by trying the anchor at each
+    // node in this order, so the graph's insertion order never reaches a match.
+    llvm::sort(nodes_, [](const WorkloadNode *lhs, const WorkloadNode *rhs) {
+      return lhs->id < rhs->id;
+    });
+  }
+
+  /// Every match, up to the budget. Sets `truncated` when the budget was
+  /// reached with more combinations left untried.
+  std::vector<RulePatternMatch> run(const RuleDef &rule, bool *truncated) {
+    rule_ = &rule;
+    bound_.assign(pattern_.nodes.size(), nullptr);
+    truncated_ = false;
+
+    const RulePatternNode &anchor = pattern_.nodes.front();
+    for (const WorkloadNode *candidate : nodes_) {
+      if (truncated_)
+        break;
+      if (candidate->opName != anchor.op)
+        continue;
+      if (!predicatesHold(anchor, *candidate))
+        continue;
+      if (used_.count(candidate->id))
+        continue;
+      bound_[0] = candidate;
+      used_.insert(candidate->id);
+      recurse(1);
+      used_.erase(candidate->id);
+      bound_[0] = nullptr;
+    }
+
+    if (truncated)
+      *truncated = truncated_;
+    return std::move(matches_);
+  }
+
+private:
+  bool predicatesHold(const RulePatternNode &node,
+                      const WorkloadNode &candidate) const {
+    for (const RulePredicate &predicate : node.predicates)
+      if (!predicateMatches(predicate, candidate))
+        return false;
+    return true;
+  }
+
+  /// The edges between `index` and the nodes already bound must hold for
+  /// `candidate` to be a legal binding. Edges to nodes not yet bound are left
+  /// to the final check.
+  bool partialEdgesHold(size_t index, const WorkloadNode &candidate) const {
+    const std::string &name = pattern_.nodes[index].name;
+    for (const RulePatternEdge &edge : pattern_.edges) {
+      const WorkloadNode *other = nullptr;
+      bool candidateIsConsumer = false;
+      if (edge.consumer == name) {
+        const RulePatternNode *producerNode = pattern_.findNode(edge.producer);
+        if (!producerNode)
+          continue;
+        size_t producerIndex =
+            static_cast<size_t>(producerNode - pattern_.nodes.data());
+        if (producerIndex >= index || !bound_[producerIndex])
+          continue;
+        other = bound_[producerIndex];
+        candidateIsConsumer = true;
+      } else if (edge.producer == name) {
+        const RulePatternNode *consumerNode = pattern_.findNode(edge.consumer);
+        if (!consumerNode)
+          continue;
+        size_t consumerIndex =
+            static_cast<size_t>(consumerNode - pattern_.nodes.data());
+        if (consumerIndex >= index || !bound_[consumerIndex])
+          continue;
+        other = bound_[consumerIndex];
+      } else {
+        continue;
+      }
+
+      // `edgeHolds` takes (producer, consumer, edge), so the candidate goes
+      // first exactly when it is the producer.
+      bool holds = candidateIsConsumer ? edgeHolds(*other, candidate, edge)
+                                       : edgeHolds(candidate, *other, edge);
+      if (!holds)
+        return false;
+    }
+    return true;
+  }
+
+  void recurse(size_t index) {
+    if (truncated_)
+      return;
+    if (index == pattern_.nodes.size()) {
+      recordMatch();
+      return;
+    }
+    const RulePatternNode &node = pattern_.nodes[index];
+    for (const WorkloadNode *candidate : nodes_) {
+      if (truncated_)
+        return;
+      if (candidate->opName != node.op)
+        continue;
+      if (!predicatesHold(node, *candidate))
+        continue;
+      if (used_.count(candidate->id))
+        continue;
+      if (!partialEdgesHold(index, *candidate))
+        continue;
+      bound_[index] = candidate;
+      used_.insert(candidate->id);
+      recurse(index + 1);
+      used_.erase(candidate->id);
+      bound_[index] = nullptr;
+    }
+  }
+
+  void recordMatch() {
+    // Every edge, now that both endpoints are bound.
+    for (const RulePatternEdge &edge : pattern_.edges) {
+      const RulePatternNode *producerNode = pattern_.findNode(edge.producer);
+      const RulePatternNode *consumerNode = pattern_.findNode(edge.consumer);
+      if (!producerNode || !consumerNode)
+        return;
+      size_t producerIndex =
+          static_cast<size_t>(producerNode - pattern_.nodes.data());
+      size_t consumerIndex =
+          static_cast<size_t>(consumerNode - pattern_.nodes.data());
+      if (!edgeHolds(*bound_[producerIndex], *bound_[consumerIndex], edge))
+        return;
+    }
+
+    if (matches_.size() >= budget_) {
+      truncated_ = true;
+      return;
+    }
+
+    RulePatternMatch match;
+    match.rule = rule_;
+    for (const WorkloadNode *node : bound_)
+      match.coveredNodes.push_back(node->id);
+
+    // The boundary: every operand and result occurrence of a matched node that
+    // is not an endpoint of an internal edge. Those are what the rest of the
+    // program attaches to; an occurrence inside the match is the rule's own.
+    for (size_t i = 0; i < pattern_.nodes.size(); ++i) {
+      const std::string &name = pattern_.nodes[i].name;
+      const WorkloadNode &node = *bound_[i];
+      for (uint32_t operand = 0;
+           operand < static_cast<uint32_t>(node.inputs.size()); ++operand) {
+        bool internal = false;
+        for (const RulePatternEdge &edge : pattern_.edges)
+          if (edge.consumer == name && edge.operandIndex == operand) {
+            internal = true;
+            break;
+          }
+        if (!internal)
+          match.boundary.push_back(
+              PortRef{node.id, PortDirection::Input, operand});
+      }
+      for (uint32_t result = 0;
+           result < static_cast<uint32_t>(node.outputs.size()); ++result) {
+        bool internal = false;
+        for (const RulePatternEdge &edge : pattern_.edges)
+          if (edge.producer == name && edge.resultIndex == result) {
+            internal = true;
+            break;
+          }
+        if (!internal)
+          match.boundary.push_back(
+              PortRef{node.id, PortDirection::Output, result});
+      }
+    }
+    // Canonical boundary order, so two matches of one subgraph are comparable
+    // whatever order the pattern happened to walk them in.
+    llvm::sort(match.boundary, [](const PortRef &lhs, const PortRef &rhs) {
+      if (lhs.node != rhs.node)
+        return lhs.node < rhs.node;
+      if (lhs.direction != rhs.direction)
+        return lhs.direction < rhs.direction;
+      return lhs.index < rhs.index;
+    });
+
+    matches_.push_back(std::move(match));
+  }
+
+  const RulePattern &pattern_;
+  const RuleDef *rule_ = nullptr;
+  uint64_t budget_ = 0;
+  std::vector<const WorkloadNode *> nodes_;
+  std::vector<const WorkloadNode *> bound_;
+  llvm::SmallDenseSet<WorkloadNodeId, 16> used_;
+  std::vector<RulePatternMatch> matches_;
+  bool truncated_ = false;
+};
+
+} // namespace
+
+std::vector<RulePatternMatch> matchRulePatterns(const WorkloadGraph &graph,
+                                                const RuleRegistry &rules,
+                                                uint64_t maxMatches,
+                                                bool *truncated) {
+  std::vector<RulePatternMatch> matches;
+  if (truncated)
+    *truncated = false;
+  if (maxMatches == 0)
+    return matches;
+
+  for (const RuleDef &rule : rules.all()) {
+    if (!rule.pattern)
+      continue;
+    if (rule.pattern->nodes.size() > kMaxPatternNodes)
+      continue;
+    // One rule's matches are found together so the budget is shared across the
+    // rule library: a cap that reset per rule would not cap anything.
+    bool ruleTruncated = false;
+    PatternMatcher matcher(graph, *rule.pattern, maxMatches - matches.size());
+    std::vector<RulePatternMatch> found = matcher.run(rule, &ruleTruncated);
+    for (RulePatternMatch &match : found)
+      matches.push_back(std::move(match));
+    if (ruleTruncated) {
+      if (truncated)
+        *truncated = true;
+      break;
+    }
+  }
   return matches;
 }
 
@@ -1879,6 +2357,69 @@ llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
   }
 
   return llvm::Error::success();
+}
+
+std::optional<MappingCandidate> toFusedMappingCandidate(
+    const RuleDef &rule, const RulePatternMatch &match,
+    const WorkloadGraph &graph, const machine::MachineModel &machine,
+    const LayoutContext &context, std::string *reason, bool *truncated,
+    const llvm::StringMap<SearchValue> *pinned,
+    const llvm::StringMap<std::string> *boundLayouts,
+    const BoundAxes *boundAxes) {
+  if (!rule.pattern || match.coveredNodes.size() != rule.pattern->nodes.size())
+    return std::nullopt;
+
+  // The rule's parameters and layout roles are solved against the **anchor**:
+  // it is the operation the rule reasons about, and the matcher already checked
+  // that every other matched node satisfies its own predicates and edges. What
+  // the pattern adds is the coverage, not a second parameter space.
+  const WorkloadNode *anchor = graph.findNode(match.coveredNodes.front());
+  if (!anchor)
+    return std::nullopt;
+  std::optional<MappingCandidate> candidate =
+      toMappingCandidate(rule, *anchor, machine, context, reason, truncated,
+                         pinned, boundLayouts, boundAxes);
+  if (!candidate)
+    return std::nullopt;
+
+  candidate->coveredNodes.assign(match.coveredNodes.begin(),
+                                 match.coveredNodes.end());
+
+  // The boundary replaces the anchor's own ports. A boundary occurrence is
+  // named after the pattern node that owns it, so a rule that declares a
+  // memory or layout requirement can name `cv.operand0` and mean exactly that
+  // occurrence -- one node's `operand0` and another's are different ports, and
+  // a name that could not tell them apart would let a requirement resolve to
+  // the wrong one.
+  candidate->ports.clear();
+  for (const PortRef &ref : match.boundary) {
+    const WorkloadNode *node = graph.findNode(ref.node);
+    if (!node)
+      return std::nullopt;
+
+    size_t patternIndex = 0;
+    for (size_t i = 0; i < match.coveredNodes.size(); ++i)
+      if (match.coveredNodes[i] == ref.node)
+        patternIndex = i;
+    const std::string &nodeName = rule.pattern->nodes[patternIndex].name;
+
+    PortSpec spec;
+    spec.isInput = ref.direction == PortDirection::Input;
+    spec.port = ref;
+    if (spec.isInput) {
+      if (ref.index >= node->inputs.size())
+        return std::nullopt;
+      spec.value = node->inputs[ref.index].value;
+      spec.name = nodeName + ".operand" + std::to_string(ref.index);
+    } else {
+      if (ref.index >= node->outputs.size())
+        return std::nullopt;
+      spec.value = node->outputs[ref.index].value;
+      spec.name = nodeName + ".result" + std::to_string(ref.index);
+    }
+    candidate->ports.push_back(std::move(spec));
+  }
+  return candidate;
 }
 
 } // namespace mlir::llk::mapping
