@@ -26,6 +26,7 @@
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
@@ -183,6 +184,26 @@ mlir::LogicalResult lowerToBackendForm(mlir::ModuleOp module) {
 llvm::Expected<MappedCompilation>
 finishCompilation(MappedCompilation compilation,
                   const MappedCompileOptions &options) {
+  // A source that came from the LLK export carries the semantic function
+  // beside the kernel it produced. Only the kernel is compiled: the semantic
+  // source is the reference the export was made from, and its high-level ops
+  // have no lowering on this path -- leaving it in would fail the bufferization
+  // for a function nobody asked to run.
+  llvm::SmallVector<mlir::Operation *> semanticSources;
+  compilation.module->walk([&](mlir::Operation *op) {
+    if (!mlir::isa<mlir::func::FuncOp>(op))
+      return;
+    bool semantic = false;
+    op->walk([&](mlir::Operation *inner) {
+      if (inner->getName().getStringRef().starts_with("llk."))
+        semantic = true;
+    });
+    if (semantic)
+      semanticSources.push_back(op);
+  });
+  for (mlir::Operation *op : semanticSources)
+    op->erase();
+
   if (mlir::failed(lowerToBackendForm(*compilation.module)))
     return compileError(
         "lowering the mapped kernel to Linalg and loops failed");

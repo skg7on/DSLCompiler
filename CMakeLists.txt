@@ -749,6 +749,20 @@ add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
 # descriptor pointers, and its result checked element by element -- which is
 # what pins the kernel ABI (the declared inputs become parameters and the
 # declared result a caller-owned output buffer).
+# MappedAcceptance: stage C8's numeric chains. The compiler-generated matmul
+# and SwiGLU are exported, mapped against the shipped AVX2 target, compiled and
+# *invoked*, with every element of every result checked. Host-portable: the
+# exported program is Linalg/SCF/memref and the JIT compiles it for whatever
+# machine is running, so what is checked here is the program, not the
+# instruction set -- AVX2 instruction emission needs an AVX2 runner.
+add_llvm_executable(MappedAcceptance test/Execution/mapped_acceptance.cpp)
+target_link_libraries(MappedAcceptance PRIVATE
+    LLKMappedCompilation LLKToMicro LLKMicroToLinalg LLKMapping LLKTargetMapping
+    MicroDialect LLKDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(MappedAcceptance PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME MappedAcceptance COMMAND MappedAcceptance)
+
 add_llvm_executable(MicroKernelExecution test/Execution/micro_kernel_execution.cpp)
 target_link_libraries(MicroKernelExecution PRIVATE
     LLKMicroToLinalg LLKTransforms LLKRuntime GTest::gtest_main
@@ -1162,6 +1176,16 @@ if(LLK_BUILD_TOOLS)
   # `tensor.insert_slice` threaded through the spatial loops -- with no residual
   # micro operation for a backend to trip over. Traversal is what this proves;
   # numerical correctness is C4/C8's.
+  # Stage C8: the design's acceptance chains, driven through the tools' public
+  # flags only. Whether a schedule round-trips, whether a plan report is
+  # byte-identical across two searches, whether the performance model accepts
+  # what the mapper wrote -- none of that is visible from inside one process,
+  # which is why this is a runner and not a unit test.
+  add_test(NAME MicroMappingAcceptancePipeline
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/acceptance_pipeline.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> $<TARGET_FILE:micro-perf>
+          ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/AcceptancePipeline
+  )
   # Stage C5: the shared mapped-compilation path, taken by the compiler. A
   # plan is searched, bound, verified, handed to the target's own emitters where
   # they implement it, lowered, bufferized and JIT-compiled -- and the compiler

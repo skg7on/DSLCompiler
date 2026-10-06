@@ -164,6 +164,41 @@ and `micro-perf` charges it **hop by hop** rather than endpoint to endpoint.
    memories (and that the executor can see them), layouts, route hops, emitters;
 3. the target emitter validates its own bundle before lowering.
 
+## Acceptance chains
+
+The design's acceptance criteria are checked two ways, and the split matters
+because they answer different questions.
+
+**Execution.** `test/Execution/mapped_acceptance.cpp` exports the compiler-
+generated matmul and SwiGLU, maps them against the shipped AVX2 target,
+compiles the selected plan and **invokes it**, checking every element of every
+result. This is what a passing build means by "it works": a mapped program that
+runs and computes the right numbers.
+
+These chains are host-portable. The exported program is Linalg, SCF and memref
+and the JIT compiles it for whatever machine is running, so the numbers are the
+same on arm64 and on x86. What it does *not* establish is that AVX2
+instructions were emitted -- that needs an AVX2 runner, and no test here
+pretends a portable run is evidence about an instruction set.
+
+**Pipelines.** `test/Conversion/MicroMapping/acceptance_pipeline.py` drives the
+tools through their public flags only, and asserts the things that are invisible
+from inside one process:
+
+- the export and the search round-trip;
+- the mapped IR carries `micro.plan`, `micro.mapping` and `micro.routes`;
+- the plan report is the versioned schema and names the machine, layout, rule
+  and target content hashes it searched;
+- two runs produce **byte-identical** report and IR;
+- `--micro-verify-mapping` accepts what the mapper wrote;
+- the performance model produces events for it.
+
+Its chains are `vector-add`, `staged-gemm`, `fused-swiglu` and `second-target`
+(the same concrete kernel mapped on the generic accelerator). The
+compiler-generated chains are AVX2-only, because the exported program uses the
+tile-level ops that only the AVX2 rule set covers; the accelerator's rules
+describe the tensor-level movement and vector family.
+
 ## Where to go deeper
 
 - tile model, ops, and verifier rules: `docs/design/m9-micro-ir-core-concepts.md`
