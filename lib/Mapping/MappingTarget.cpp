@@ -79,38 +79,38 @@ std::optional<std::string> resolveMachineQuery(const MachineModel &machine,
 /// bundle as target semantics (design §14.3): the bundle's key is compared as
 /// an opaque string, and a parameter is checked only for the integer/string
 /// *shape* the rule parser types bundle parameters with -- never for meaning.
-class DeclaredEmitter : public TargetEmitter {
+class DeclaredEmitter : public DeclaredTargetEmitter {
 public:
-  DeclaredEmitter(std::string key, std::vector<std::string> declaredKeys)
-      : key_(std::move(key)), declaredKeys_(std::move(declaredKeys)) {}
-
-  llvm::StringRef key() const override { return key_; }
-
-  llvm::Error verify(const TargetBundle &bundle) const override {
-    if (!llvm::is_contained(declaredKeys_, bundle.emitterKey))
-      return targetError("bundle names emitter '" + bundle.emitterKey +
-                         "', which this target does not declare");
-    if (bundle.emitterKey != key_)
-      return targetError("bundle names emitter '" + bundle.emitterKey +
-                         "', but this emitter handles '" + key_ + "'");
-    // A rule with no bundle parameters yields a null DictionaryAttr (see
-    // buildBundleParameters), so there is nothing to walk rather than an empty
-    // walk -- iterating a null attribute would dereference a null impl.
-    if (bundle.parameters)
-      for (mlir::NamedAttribute entry : bundle.parameters)
-        if (!mlir::isa<mlir::IntegerAttr>(entry.getValue()) &&
-            !mlir::isa<mlir::StringAttr>(entry.getValue()))
-          return targetError("bundle parameter '" + entry.getName().str() +
-                             "' is not an integer or string value");
-    return llvm::Error::success();
-  }
-
-private:
-  std::string key_;
-  std::vector<std::string> declaredKeys_;
+  using DeclaredTargetEmitter::DeclaredTargetEmitter;
 };
 
 } // namespace
+
+/// The shape check every emitter shares. It lives here rather than on
+/// `TargetEmitter` because only this -- not lowering -- is what a
+/// configuration-only target can honestly promise.
+DeclaredTargetEmitter::DeclaredTargetEmitter(
+    std::string key, std::vector<std::string> declaredKeys)
+    : key_(std::move(key)), declaredKeys_(std::move(declaredKeys)) {}
+
+llvm::Error DeclaredTargetEmitter::verify(const TargetBundle &bundle) const {
+  if (!llvm::is_contained(declaredKeys_, bundle.emitterKey))
+    return targetError("bundle names emitter '" + bundle.emitterKey +
+                       "', which this target does not declare");
+  if (bundle.emitterKey != key_)
+    return targetError("bundle names emitter '" + bundle.emitterKey +
+                       "', but this emitter handles '" + key_ + "'");
+  // A rule with no bundle parameters yields a null DictionaryAttr (see
+  // buildBundleParameters), so there is nothing to walk rather than an empty
+  // walk -- iterating a null attribute would dereference a null impl.
+  if (bundle.parameters)
+    for (mlir::NamedAttribute entry : bundle.parameters)
+      if (!mlir::isa<mlir::IntegerAttr>(entry.getValue()) &&
+          !mlir::isa<mlir::StringAttr>(entry.getValue()))
+        return targetError("bundle parameter '" + entry.getName().str() +
+                           "' is not an integer or string value");
+  return llvm::Error::success();
+}
 
 FileMappingTarget::FileMappingTarget(std::string name, MachineModel machine,
                                      LayoutRegistry layouts, RuleRegistry rules,

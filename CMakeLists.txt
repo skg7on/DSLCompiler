@@ -431,18 +431,21 @@ target_include_directories(LLKTargetX86 PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
 
-# Library: target mapping packages (issue #67, workstream D7). Each target owns
-# its configuration paths and emitter keys; generic mapping code sees only the
+# Library: target mapping packages (issue #67, workstreams D7 and C2). Each
+# target owns its configuration paths, emitter keys, and -- since C2 -- the
+# lowering of a selected bundle. Generic mapping code sees only the
 # MappingTarget interface. Kept out of LLKTargetX86 so CPU feature detection
-# does not drag in MLIR.
+# does not drag in MLIR; the lowering does, because a target lowerer rewrites
+# Micro operations and so is the layer that knows the dialect.
 add_library(LLKTargetMapping STATIC
     lib/Target/X86/Mapping/AVX2MappingTarget.cpp
+    lib/Target/X86/Mapping/AVX2BundleLowering.cpp
     lib/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.cpp
 )
 target_include_directories(LLKTargetMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
-target_link_libraries(LLKTargetMapping PUBLIC LLKMapping LLKMachine)
+target_link_libraries(LLKTargetMapping PUBLIC LLKMapping LLKMachine MicroDialect)
 target_compile_options(LLKTargetMapping PRIVATE -fno-rtti -fno-exceptions)
 
 # Library: mapping passes (design §21). The `--micro-map` and

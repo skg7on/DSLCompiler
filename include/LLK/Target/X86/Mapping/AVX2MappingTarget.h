@@ -30,10 +30,16 @@ namespace mlir::llk::target::avx2 {
 /// this set is rejected when the target loads.
 llvm::ArrayRef<llvm::StringLiteral> emitterKeys();
 
+/// Creates the AVX2 emitter for `key`, which must be one `emitterKeys()` names.
+/// The emitter carries this plugin's lowering, so a bundle handed to it is
+/// lowered as AVX2 rather than rejected as unsupported.
+std::unique_ptr<mapping::TargetEmitter> createAVX2Emitter(llvm::StringRef key);
+
 /// Loads the AVX2 mapping target from a configuration root, which must contain
 /// `machines/x86-avx2-v2.yaml`, `mapping/x86-avx2/layouts.llkmap`, and
 /// `mapping/x86-avx2/rules.llkmap`. The target is verified before it is
-/// returned.
+/// returned, and its emitters are the AVX2 plugin's own rather than the
+/// configuration-only default.
 llvm::Expected<std::unique_ptr<mapping::MappingTarget>>
 createMappingTarget(llvm::StringRef configurationRoot);
 

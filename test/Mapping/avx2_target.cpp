@@ -11,6 +11,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/Parser/Parser.h"
 
 #include "llvm/Support/Error.h"
@@ -345,4 +346,191 @@ TEST(Avx2Target, MapsAVectorNodeEndToEnd) {
   EXPECT_EQ(result->plans[0].instances.size(), 1u);
   EXPECT_TRUE(result->plans[0].connections.empty());
   EXPECT_FALSE(result->searchTruncated);
+}
+
+//===----------------------------------------------------------------------===//
+// C2: a selected bundle lowers into AVX2 code
+//===----------------------------------------------------------------------===//
+//
+// Verifying that a bundle is well-formed and lowering it to an implementation
+// are different promises: a rule file can declare an emitter key it has no
+// code for. These tests pin the second promise -- a selected bundle on its own
+// changes the code this target emits.
+
+namespace {
+
+/// A kernel with one `micro.vector(op = "add")`: the shape a selected
+/// `avx2.vector_add` candidate covers.
+constexpr llvm::StringLiteral kVectorAddKernel = R"mlir(
+module {
+  micro.kernel @vector_add {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %t = micro.tile_view %ext {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// The same kernel over `i8`, which this backend has no arithmetic path for.
+constexpr llvm::StringLiteral kUnsupportedDtypeKernel = R"mlir(
+module {
+  micro.kernel @vector_add_i8 {
+    %ext = tensor.empty() : tensor<8x8xi8>
+    %t = micro.tile_view %ext {shape = array<i64: 8, 8>} : tensor<8x8xi8> -> !micro.tile<8x8xi8, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t : !micro.tile<8x8xi8, memory = #micro.memory<sram>>, !micro.tile<8x8xi8, memory = #micro.memory<sram>> -> !micro.tile<8x8xi8, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// A bundle for `avx2_vector_add` as the search persists it: the emitter key,
+/// and the `VW` the rule's `param` solved.
+TargetBundle vectorAddBundle(mlir::MLIRContext &context, int64_t vectorWidth) {
+  TargetBundle bundle;
+  bundle.name = "avx2.vector.add.f32";
+  bundle.emitterKey = "avx2_vector_add";
+  bundle.parameters = mlir::DictionaryAttr::get(
+      &context, {mlir::NamedAttribute(
+                    mlir::StringAttr::get(&context, "VW"),
+                    mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64),
+                                           vectorWidth))});
+  return bundle;
+}
+
+/// The `micro.vector` operations of `module` -- what a selected candidate
+/// covers. Found by name so the test needs no Micro op class, the same way
+/// generic mapping code never sees one.
+llvm::SmallVector<mlir::Operation *> coveredVectorOps(mlir::ModuleOp module) {
+  llvm::SmallVector<mlir::Operation *> covered;
+  module.walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef() == "micro.vector")
+      covered.push_back(op);
+  });
+  return covered;
+}
+
+std::string print(mlir::ModuleOp module) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  module.print(stream);
+  return text;
+}
+
+} // namespace
+
+TEST(Avx2Target, LowersTheSelectedVectorWidthIntoTheTileLayout) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  mlir::MLIRContext context;
+  context.loadDialect<mlir::micro::MicroDialect, mlir::tensor::TensorDialect>();
+
+  auto lowerWithWidth = [&](int64_t width) -> std::string {
+    mlir::OwningOpRef<mlir::ModuleOp> module =
+        mlir::parseSourceString<mlir::ModuleOp>(kVectorAddKernel, &context);
+    EXPECT_TRUE(module);
+    TargetLoweringContext lowering{(*target)->machine(), {}, {}};
+    mlir::IRRewriter rewriter(&context);
+    std::unique_ptr<TargetEmitter> emitter =
+        (*target)->createEmitter("avx2_vector_add");
+    EXPECT_TRUE(emitter);
+    llvm::Error error =
+        emitter->lower(coveredVectorOps(*module),
+                       vectorAddBundle(context, width), lowering, rewriter);
+    EXPECT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+    return print(*module);
+  };
+
+  std::string narrow = lowerWithWidth(4);
+  std::string wide = lowerWithWidth(8);
+
+  // The bundle decides the physical implementation: two widths, two programs.
+  EXPECT_NE(narrow.find("vector = 4"), std::string::npos) << narrow;
+  EXPECT_EQ(narrow.find("vector = 8"), std::string::npos) << narrow;
+  EXPECT_NE(wide.find("vector = 8"), std::string::npos) << wide;
+  EXPECT_NE(narrow, wide);
+}
+
+TEST(Avx2Target, RejectsBundlesItCannotLowerAndLeavesTheIrAlone) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  mlir::MLIRContext context;
+  context.loadDialect<mlir::micro::MicroDialect, mlir::tensor::TensorDialect>();
+
+  std::unique_ptr<TargetEmitter> emitter =
+      (*target)->createEmitter("avx2_vector_add");
+  ASSERT_TRUE(emitter);
+
+  auto refusal = [&](llvm::StringRef source,
+                     const TargetBundle &bundle) -> std::string {
+    mlir::OwningOpRef<mlir::ModuleOp> module =
+        mlir::parseSourceString<mlir::ModuleOp>(source, &context);
+    EXPECT_TRUE(module);
+    std::string before = print(*module);
+    TargetLoweringContext lowering{(*target)->machine(), {}, {}};
+    mlir::IRRewriter rewriter(&context);
+    llvm::Error error =
+        emitter->lower(coveredVectorOps(*module), bundle, lowering, rewriter);
+    EXPECT_TRUE(static_cast<bool>(error))
+        << "lowering was expected to be refused";
+    std::string message = llvm::toString(std::move(error));
+    // A refused bundle must not have rewritten anything: the contract is
+    // validated before the first write.
+    EXPECT_EQ(print(*module), before);
+    return message;
+  };
+
+  // A bundle naming an emitter this target does not declare.
+  TargetBundle unknown = vectorAddBundle(context, 8);
+  unknown.emitterKey = "avx2_missing";
+  EXPECT_NE(refusal(kVectorAddKernel, unknown).find("does not declare"),
+            std::string::npos);
+
+  // A parameter of the wrong type: the width is a number, not a word.
+  TargetBundle mistyped = vectorAddBundle(context, 8);
+  mistyped.parameters = mlir::DictionaryAttr::get(
+      &context,
+      {mlir::NamedAttribute(mlir::StringAttr::get(&context, "VW"),
+                            mlir::StringAttr::get(&context, "eight"))});
+  EXPECT_NE(refusal(kVectorAddKernel, mistyped).find("not an integer"),
+            std::string::npos);
+
+  // A width this backend cannot emit.
+  TargetBundle odd = vectorAddBundle(context, 3);
+  EXPECT_NE(refusal(kVectorAddKernel, odd).find("power of two"),
+            std::string::npos);
+
+  // A dtype with no arithmetic path.
+  EXPECT_NE(refusal(kUnsupportedDtypeKernel, vectorAddBundle(context, 8))
+                .find("no AVX2 arithmetic implementation"),
+            std::string::npos);
+}
+
+TEST(Avx2Target, ReportsEmitterKeysItHasNoLoweringFor) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  mlir::MLIRContext context;
+  context.loadDialect<mlir::micro::MicroDialect, mlir::tensor::TensorDialect>();
+
+  // `avx2_mma` is declared and its bundles verify; that is not the same as
+  // having an implementation, and the emitter says so rather than pretending.
+  std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter("avx2_mma");
+  ASSERT_TRUE(emitter);
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kVectorAddKernel, &context);
+  ASSERT_TRUE(module);
+
+  TargetBundle bundle;
+  bundle.name = "avx2.mma.bf16";
+  bundle.emitterKey = "avx2_mma";
+  EXPECT_FALSE(static_cast<bool>(emitter->verify(bundle)));
+
+  TargetLoweringContext lowering{(*target)->machine(), {}, {}};
+  mlir::IRRewriter rewriter(&context);
+  llvm::Error error =
+      emitter->lower(coveredVectorOps(*module), bundle, lowering, rewriter);
+  ASSERT_TRUE(static_cast<bool>(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("no lowering implementation"),
+            std::string::npos);
 }

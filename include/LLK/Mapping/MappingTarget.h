@@ -20,6 +20,7 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
+#include "LLK/Mapping/MappingLowering.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingRules.h"
 
@@ -30,13 +31,17 @@
 #include <string>
 #include <vector>
 
+namespace mlir {
+class Operation;
+class RewriterBase;
+} // namespace mlir
+
 namespace mlir::llk::mapping {
 
 /// A target plugin's code emitter. It is opaque to the mapping core: generic
 /// code selects a bundle and hands it to the plugin emitter, which decides
-/// whether the bundle is complete enough to lower (design §18.3, phase 3). The
-/// interface deliberately stops at that boundary -- it exposes no lowering or
-/// LIR API, because emission to machine code is a plugin concern.
+/// whether the bundle is complete enough to lower and then lowers it (design
+/// §18.3, phase 3).
 ///
 /// An emitter instance handles exactly one emitter key, the one it was created
 /// for. `verify` is pure and may be called repeatedly.
@@ -54,6 +59,51 @@ public:
   /// handles, or when a bundle parameter is not the integer/string shape the
   /// plugin contract permits.
   virtual llvm::Error verify(const TargetBundle &bundle) const = 0;
+
+  /// Lowers the covered operation group according to `bundle`.
+  ///
+  /// `coveredOps` are the operations the selected candidate covers, and the
+  /// emitter replaces them with the implementation the bundle names. It must
+  /// validate the whole bundle and the selected port/resource/layout contract
+  /// *before* rewriting anything, so a rejected bundle leaves `coveredOps`
+  /// untouched rather than half-rewritten.
+  ///
+  /// The default rejects. Declaring an emitter key is not implementing one,
+  /// and a lowering hook that quietly did nothing would let a rule file
+  /// impersonate a backend: a target opts in by overriding this. That is what
+  /// keeps "the bundle is well-formed" and "this target can execute it"
+  /// separate questions (§18.3, §22.3).
+  virtual llvm::Error lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
+                            const TargetBundle &bundle,
+                            const TargetLoweringContext &context,
+                            mlir::RewriterBase &rewriter) const {
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "target_lowering_unsupported: emitter '" +
+                                       key().str() +
+                                       "' has no lowering implementation");
+  }
+};
+
+/// The part of an emitter that is the same for every target: it handles one
+/// key out of the set its target declared, and it checks that a bundle is
+/// well-formed *as an opaque value* -- the key is declared and matches, and
+/// every parameter is the integer/string shape the rule parser types bundle
+/// parameters with, never a meaning.
+///
+/// A target's real emitters derive from this and override `lower`; the
+/// default emitter a `FileMappingTarget` hands out is this class unchanged, so
+/// a configuration-only target keeps rejecting lowering explicitly.
+class DeclaredTargetEmitter : public TargetEmitter {
+public:
+  DeclaredTargetEmitter(std::string key, std::vector<std::string> declaredKeys);
+
+  llvm::StringRef key() const override { return key_; }
+
+  llvm::Error verify(const TargetBundle &bundle) const override;
+
+private:
+  std::string key_;
+  std::vector<std::string> declaredKeys_;
 };
 
 /// The interface target-independent mapping code uses.
