@@ -368,6 +368,7 @@ mlir_target_link_libraries(LLKMicroToLinalg PUBLIC
 # Library: JIT cache runtime + weight packing
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
+    runtime/MappedExecutable.cpp
     runtime/PackedWeights.cpp
     runtime/ThreadPool.cpp
 )
@@ -702,9 +703,10 @@ target_link_libraries(SwiGLUVector PRIVATE LLKPasses LLKTransforms LLKRuntime GT
 add_test(NAME SwiGLUVector COMMAND SwiGLUVector)
 
 # MicroKernelExecution: the acceptance chain for the micro->Linalg bridge. A
-# `micro.kernel` is lowered, buffered, JIT-compiled and *called*, and its result
-# checked -- which is also what pins the kernel ABI (entry tensors become
-# parameters, the stored value becomes the bufferized out-parameter).
+# `micro.kernel` is lowered, buffered, JIT-compiled and *called* through
+# descriptor pointers, and its result checked element by element -- which is
+# what pins the kernel ABI (the declared inputs become parameters and the
+# declared result a caller-owned output buffer).
 add_llvm_executable(MicroKernelExecution test/Execution/micro_kernel_execution.cpp)
 target_link_libraries(MicroKernelExecution PRIVATE
     LLKMicroToLinalg LLKTransforms LLKRuntime GTest::gtest_main
