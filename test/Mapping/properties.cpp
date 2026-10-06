@@ -27,8 +27,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingRules.h"
@@ -50,7 +52,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -729,5 +733,391 @@ TEST(MappingProperties, SearchReturnsPlansInDeterministicRankedOrder) {
     // Re-running the same search reproduces the same ordered ids.
     MappingSearchResult again = runSearch(graph, *target, context, options);
     EXPECT_EQ(planIds(result), planIds(again));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Property 6 (task B7): exact joint connection branching agrees with a
+// brute-force route oracle.
+//
+// One producer on `dram.0` fans out to two consumers on `acc.0`/`aux.0`. Each
+// consumer's cheap route stages a 4096-byte tile through the shared `stage.0`,
+// and its dear direct route stages nothing. With `stage.0`'s capacity as the
+// free variable, the legal joint combinations are exactly the product the
+// brief's `route_oracle` enumerates: a combination is legal iff the summed
+// staged bytes fit, and its cost is the summed route costs plus the three
+// 1-cycle instances. Exact search must match the oracle's optimum, so a locally
+// cheapest pick can no longer masquerade as the joint result.
+//===----------------------------------------------------------------------===//
+
+/// One producer and two consumers, the consumers' memories distinct so the
+/// value is a genuine fan-out (two destination groups).
+WorkloadGraph branchFanOutGraph(MLIRContext &context) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, Type(), "in", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, Type(), "mid", /*external=*/false});
+  WorkloadValueId out1 =
+      graph.addValue(WorkloadValue{0, Type(), "o1", /*external=*/false});
+  WorkloadValueId out2 =
+      graph.addValue(WorkloadValue{0, Type(), "o2", /*external=*/false});
+
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.sourceOrdinal = 0;
+  producer.attributes = vectorAttributes(context, "produce");
+  producer.inputs.push_back(WorkloadPort{input, Type(), std::nullopt});
+  producer.outputs.push_back(WorkloadPort{middle, Type(), std::nullopt});
+  graph.addNode(std::move(producer));
+
+  auto consumer = [&](llvm::StringRef op, unsigned ordinal,
+                      WorkloadValueId output) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.attributes = vectorAttributes(context, op);
+    node.inputs.push_back(WorkloadPort{middle, Type(), std::nullopt});
+    node.outputs.push_back(WorkloadPort{output, Type(), std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  consumer("consume_a", 1, out1);
+  consumer("consume_b", 2, out2);
+
+  graph.finalize();
+  return graph;
+}
+
+constexpr llvm::StringLiteral kBranchRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.consume_a {
+  match micro.vector(op = "consume_a");
+  require executor kind worker;
+  require memory kind acc;
+  bundle "b.consume_a";
+  emit "e1";
+  cost 1;
+}
+rule r.consume_b {
+  match micro.vector(op = "consume_b");
+  require executor kind worker;
+  require memory kind aux;
+  bundle "b.consume_b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The fan-out machine with `stage.0`'s capacity as the free variable. Each
+/// consumer has a cheap two-hop route through `stage.0` and a dear direct
+/// route.
+MachineModel stagedFanOutMachine(uint64_t stageCapacity) {
+  MachineModel model;
+  model.target = "fuzz-branch";
+  model.executors = {executor("e0", "worker"), executor("e1", "worker")};
+
+  MemoryNode dram = memoryNode("dram.0", "dram");
+  dram.capacityBytes = 1u << 30;
+  MemoryNode stage = memoryNode("stage.0", "sram");
+  stage.capacityBytes = stageCapacity;
+  MemoryNode acc = memoryNode("acc.0", "acc");
+  acc.visibleFrom = "e1";
+  MemoryNode aux = memoryNode("aux.0", "aux");
+  aux.visibleFrom = "e1";
+  model.memories = {dram, stage, acc, aux};
+
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.attachedTo = "e0";
+  model.transferEngines = {dma};
+
+  model.links = {linkEdge("dram_to_stage.0", "dram.0", "stage.0"),
+                 linkEdge("stage_to_acc.0", "stage.0", "acc.0"),
+                 linkEdge("stage_to_aux.0", "stage.0", "aux.0")};
+  LinkEdge accDirect = linkEdge("dram_to_acc.0", "dram.0", "acc.0");
+  accDirect.latencyCycles = 1000;
+  LinkEdge auxDirect = linkEdge("dram_to_aux.0", "dram.0", "aux.0");
+  auxDirect.latencyCycles = 1000;
+  model.links.push_back(accDirect);
+  model.links.push_back(auxDirect);
+  return model;
+}
+
+TEST(MappingProperties, ExactJointConnectionsMatchTheRouteOracle) {
+  Rng rng(kSeed ^ 0x08);
+  const uint64_t tile = 4096;
+  const double oneHop = 10.0 + static_cast<double>(tile) / 32.0;
+  const double staged = 2.0 * oneHop; // dram -> stage -> destination
+  const double direct = 1000.0 + static_cast<double>(tile) / 32.0;
+  const double instances = 3.0; // three 1-cycle rules
+
+  // Capacities covering all three regimes: no staged copy fits, exactly one
+  // fits, both fit.
+  const std::array<uint64_t, 6> capacities = {2048, 4096,  5000,
+                                              8192, 12288, 1u << 20};
+
+  for (unsigned draw = 0; draw < 24; ++draw) {
+    uint64_t capacity = capacities[rng.below(capacities.size())];
+    MLIRContext context;
+    WorkloadGraph graph = branchFanOutGraph(context);
+    std::unique_ptr<MappingTarget> target =
+        targetWith(stagedFanOutMachine(capacity), kBranchRules);
+    ASSERT_NE(target, nullptr);
+
+    // The brute-force oracle over the two groups.
+    double oracleBest = std::numeric_limits<double>::infinity();
+    for (int first = 0; first < 2; ++first)
+      for (int second = 0; second < 2; ++second) {
+        double cost = (first ? direct : staged) + (second ? direct : staged);
+        uint64_t live = (first ? 0u : tile) + (second ? 0u : tile);
+        if (live <= capacity)
+          oracleBest = std::min(oracleBest, cost);
+      }
+    ASSERT_TRUE(std::isfinite(oracleBest));
+
+    MappingSearchOptions options;
+    options.mode = SearchMode::Exact;
+    options.topK = 8;
+    MappingSearchResult result = runSearch(graph, *target, context, options);
+    ASSERT_FALSE(result.plans.empty())
+        << "exact found no covering for capacity " << capacity;
+    EXPECT_DOUBLE_EQ(result.plans[0].totalCost.latencyCycles,
+                     instances + oracleBest)
+        << "capacity " << capacity;
+    // Exact is exhaustive within the caps, so it must not claim truncation.
+    EXPECT_FALSE(result.searchTruncated) << "capacity " << capacity;
+
+    // Deterministic and beam reuse the same joint enumeration, so neither may
+    // return a covering dearer than the oracle optimum.
+    MappingSearchOptions deterministic = options;
+    deterministic.mode = SearchMode::Deterministic;
+    MappingSearchResult greedy =
+        runSearch(graph, *target, context, deterministic);
+    ASSERT_FALSE(greedy.plans.empty()) << "capacity " << capacity;
+    EXPECT_DOUBLE_EQ(greedy.plans[0].totalCost.latencyCycles,
+                     instances + oracleBest)
+        << "capacity " << capacity;
+
+    // Re-running reproduces the same ranked ids.
+    MappingSearchResult again = runSearch(graph, *target, context, options);
+    EXPECT_EQ(planIds(result), planIds(again));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Property 8 (task B8): the final candidate score is the shared schedule's
+// overlapped latency, not the additive sum of the rule and route costs.
+//===----------------------------------------------------------------------===//
+
+/// The plan-search machine with one vector engine, so a computed plan can be
+/// scored by the shared schedule.
+MachineModel scoredPlanMachine() {
+  MachineModel model = planMachine();
+  ComputeNode vpu;
+  vpu.id = "vpu";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "e0";
+  vpu.lanes["f32"] = 8;
+  vpu.issueCycles = 1;
+  model.computes = {vpu};
+  return model;
+}
+
+TEST(MappingProperties, UnschedulablePlanScoreIsNamedNotSilentlyScheduled) {
+  Rng rng(kSeed ^ 0x0B);
+  MLIRContext context;
+  LogicalGraph logical = randomChain(2);
+  WorkloadGraph graph =
+      materialize(context, logical, identityOrder(logical.valueNames.size()),
+                  identityOrder(logical.nodes.size()));
+
+  // A machine with no compute node: the plan's events cannot be built, so the
+  // score is explicitly the accumulation, never presented as scheduled.
+  std::unique_ptr<MappingTarget> unschedulable =
+      targetWith(planMachine(), kTwoRules);
+  ASSERT_NE(unschedulable, nullptr);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  MappingSearchResult fallback =
+      runSearch(graph, *unschedulable, context, options);
+  ASSERT_FALSE(fallback.plans.empty());
+  for (const CoveringPlan &plan : fallback.plans) {
+    EXPECT_EQ(plan.scoreSource, PlanScoreSource::Accumulation);
+    bool named = false;
+    for (const std::string &note : plan.diagnostics.storageNotes)
+      named |= note.find("not scheduled") != std::string::npos;
+    EXPECT_TRUE(named) << "the fallback is not named";
+  }
+
+  // With a compute node the same plan is scored by the shared schedule.
+  std::unique_ptr<MappingTarget> schedulable =
+      targetWith(scoredPlanMachine(), kTwoRules);
+  ASSERT_NE(schedulable, nullptr);
+  MappingSearchResult scheduled =
+      runSearch(graph, *schedulable, context, options);
+  ASSERT_FALSE(scheduled.plans.empty());
+  EXPECT_EQ(scheduled.plans[0].scoreSource, PlanScoreSource::Schedule);
+}
+
+/// The staged fan-out machine with a second DMA engine and a vector engine on
+/// each executor, so its two independent customer transfers can overlap and a
+/// normalized plan event can name a compute resource.
+MachineModel twoEngineFanOutMachine(uint64_t stageCapacity) {
+  MachineModel model = stagedFanOutMachine(stageCapacity);
+  TransferEngineNode second;
+  second.id = "dma.1";
+  second.kind = "dma";
+  second.attachedTo = "e0";
+  model.transferEngines.push_back(second);
+  ComputeNode vpu0;
+  vpu0.id = "vpu.0";
+  vpu0.kind = "vector_engine";
+  vpu0.attachedTo = "e0";
+  vpu0.lanes["f32"] = 8;
+  vpu0.issueCycles = 1;
+  ComputeNode vpu1 = vpu0;
+  vpu1.id = "vpu.1";
+  vpu1.attachedTo = "e1";
+  model.computes = {vpu0, vpu1};
+  return model;
+}
+
+TEST(MappingProperties, FinalScoreComesFromTheSharedSchedule) {
+  Rng rng(kSeed ^ 0x0A);
+  for (unsigned draw = 0; draw < 12; ++draw) {
+    MLIRContext context;
+    WorkloadGraph graph = branchFanOutGraph(context);
+    std::unique_ptr<MappingTarget> target =
+        targetWith(twoEngineFanOutMachine(1u << 20), kBranchRules);
+    ASSERT_NE(target, nullptr);
+
+    MappingSearchOptions options;
+    options.mode = SearchMode::Deterministic;
+    MappingSearchResult result = runSearch(graph, *target, context, options);
+    ASSERT_FALSE(result.plans.empty());
+    const CoveringPlan &plan = result.plans[0];
+    EXPECT_EQ(plan.scoreSource, PlanScoreSource::Schedule);
+
+    // The final score is what the shared scheduler produces, so two independent
+    // transfers on the machine's two engines overlap: the score is strictly
+    // below the additive accumulation the search's optimistic model keeps.
+    EXPECT_LT(plan.totalCost.latencyCycles, plan.accumulatedCost.latencyCycles);
+    EXPECT_GT(plan.accumulatedCost.latencyCycles, 0.0);
+
+    // The score agrees with scheduling the plan's events independently: it is a
+    // schedule, not a sum.
+    llvm::Expected<PlanEventDAG> events =
+        buildPlanEvents(plan, target->machine());
+    ASSERT_TRUE(static_cast<bool>(events))
+        << llvm::toString(events.takeError());
+    llvm::Expected<Cost> scheduled =
+        schedulePlanEvents(*events, target->machine());
+    ASSERT_TRUE(static_cast<bool>(scheduled))
+        << llvm::toString(scheduled.takeError());
+    EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, scheduled->latencyCycles);
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Property 7 (task B8): a connection's measurement identity changes with every
+// decision that could change its cost, cannot be forged by reordering a list or
+// swapping roles, and never collides through ambiguous concatenation.
+//===----------------------------------------------------------------------===//
+
+TEST(MappingProperties, ConnectionIdentitySeparatesEveryDecision) {
+  Rng rng(kSeed ^ 0x09);
+
+  auto word = [&]() { return "w" + std::to_string(rng.next() % 4096); };
+  // A list rendered in a fixed canonical order: two orderings of one set retain
+  // one key, which is the property the connection builder must uphold.
+  auto sortedJoin = [](std::vector<std::string> items) {
+    llvm::sort(items);
+    std::string out;
+    for (const std::string &item : items) {
+      out += std::to_string(item.size());
+      out += ':';
+      out += item;
+      out += ',';
+    }
+    return out;
+  };
+
+  for (unsigned draw = 0; draw < 128; ++draw) {
+    std::vector<std::string> consumers;
+    for (unsigned i = 0, count = 1 + rng.below(3); i < count; ++i)
+      consumers.push_back("consumer{" + word() + "}");
+    std::vector<std::string> links;
+    for (unsigned i = 0, count = 1 + rng.below(3); i < count; ++i)
+      links.push_back(word());
+
+    ConnectionSignature base;
+    base.kind = word();
+    base.valueType = word();
+    base.producerEndpoint = "producer{" + word() + "}";
+    base.consumerEndpoints = sortedJoin(consumers);
+    base.route = word() + ">" + word() + ">" + word();
+    base.links = sortedJoin(links);
+    base.engines = word();
+    base.maps = word();
+    base.parameters = word();
+    base.storage = word();
+    const std::string key = base.canonicalString();
+
+    // Reordering either list retains the key -- the rendering is order-free.
+    std::vector<std::string> shuffled = consumers;
+    rng.shuffle(shuffled);
+    ConnectionSignature reordered = base;
+    reordered.consumerEndpoints = sortedJoin(shuffled);
+    std::vector<std::string> shuffledLinks = links;
+    rng.shuffle(shuffledLinks);
+    reordered.links = sortedJoin(shuffledLinks);
+    EXPECT_EQ(reordered.canonicalString(), key);
+
+    // Swapping the producer and consumer roles is different work.
+    ConnectionSignature roleSwapped = reordered;
+    std::swap(roleSwapped.producerEndpoint, roleSwapped.consumerEndpoints);
+    EXPECT_NE(roleSwapped.canonicalString(), key);
+
+    // Every other decision changes the identity.
+    struct Field {
+      const char *name;
+      std::string ConnectionSignature::*member;
+    };
+    const Field fields[] = {
+        {"kind", &ConnectionSignature::kind},
+        {"valueType", &ConnectionSignature::valueType},
+        {"producerEndpoint", &ConnectionSignature::producerEndpoint},
+        {"route", &ConnectionSignature::route},
+        {"engines", &ConnectionSignature::engines},
+        {"maps", &ConnectionSignature::maps},
+        {"parameters", &ConnectionSignature::parameters},
+        {"storage", &ConnectionSignature::storage},
+        {"links", &ConnectionSignature::links},
+    };
+    for (const Field &field : fields) {
+      ConnectionSignature changed = base;
+      changed.*(field.member) += "|" + word();
+      EXPECT_NE(changed.canonicalString(), key) << field.name;
+    }
+
+    // No ambiguous concatenation: a field that merely contains another field's
+    // name and separator cannot reproduce the same key.
+    ConnectionSignature forged;
+    forged.kind = "transfer;value_type=" + word();
+    forged.valueType = word();
+    ConnectionSignature genuine;
+    genuine.kind = "transfer";
+    genuine.valueType = "value_type=" + forged.valueType;
+    forged.kind = "transfer;value_type=" + forged.valueType;
+    EXPECT_NE(forged.canonicalString(), genuine.canonicalString());
   }
 }

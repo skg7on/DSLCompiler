@@ -33,6 +33,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSwitch.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -89,6 +90,13 @@ struct ExecutorRequirement {
 struct MemoryRequirement {
   std::string kind;
   uint64_t minBytes = 0;
+  /// The workload port occurrence this requirement governs, when the rule
+  /// named one (`require memory output "large" kind dram`). Unset for the
+  /// legacy bare form (`require memory kind sram`), which governs the whole
+  /// requirement kind rather than one port. A set port is what lets the search
+  /// charge a materialized output to the memory its own port selected instead
+  /// of replicating the first output across every binding.
+  std::optional<PortRef> port;
 };
 
 struct LayoutRequirement {
@@ -207,6 +215,16 @@ struct SolvedLayout {
   std::optional<PortRef> port;
 };
 
+/// A compute/memory assignment for one endpoint port (design §9.6): the memory
+/// node a named occurrence's value is bound to. Persisted with the selected
+/// state so a materializer can attribute a storage decision to the occurrence
+/// that owns it rather than to a whole instance.
+struct PortMemoryBinding {
+  PortRef port;
+  MemoryNodeId memory;
+  bool operator==(const PortMemoryBinding &) const = default;
+};
+
 /// One mapping candidate placed on concrete resources.
 struct CandidateInstance {
   InstanceId id = 0;
@@ -215,6 +233,10 @@ struct CandidateInstance {
   /// it off the placed instance rather than re-looking-up the rule.
   TargetBundle bundle;
   llvm::StringMap<ExecutorId> executorBindings;
+  /// Memory bindings of the legacy bare requirements, keyed by requirement
+  /// kind (`require memory kind sram`). A requirement that names a port records
+  /// a `PortMemoryBinding` instead, so this map stays byte-identical for the
+  /// rules that do not name ports.
   llvm::StringMap<MemoryNodeId> memoryBindings;
   llvm::StringMap<std::string> computeBindings;
   llvm::StringMap<LayoutId> layoutBindings;
@@ -222,8 +244,71 @@ struct CandidateInstance {
   /// (index-disambiguated when one class is required by several ports; see
   /// `SolvedLayout`). Empty when the candidate requires no layout.
   llvm::StringMap<SolvedLayout> layoutSolutions;
+  /// The memory each named endpoint occurrence is bound to, one entry per
+  /// requirement that named a port. Sorted by port. Unlike `memoryBindings`,
+  /// this is keyed by occurrence, so two same-kind requirements can select
+  /// different nodes. Part of the instance's canonical identity when non-empty
+  /// (a resolved memory assignment is execution-affecting), and empty for every
+  /// rule that declares no named-port requirement. An out-of-line container so
+  /// adding it does not push `PlanPlacement`/`CandidateInstance` past the
+  /// `SmallVector` element-size limit.
+  std::vector<PortMemoryBinding> portMemoryBindings;
   ResourceUsage resourceUsage;
   Cost localCost;
+};
+
+/// A scheduling step index. Concrete storage lifetimes are expressed in these
+/// (design §9.6); B1 persists them, B3 builds them.
+using PlanStepId = uint64_t;
+
+/// One concrete storage allocation the selected plan reserves: the workload
+/// value it holds, the memory it lives in, its footprint, an optional aliased
+/// allocation, and the step interval it is live over. All arithmetic over these
+/// fields is checked by their consumers; an unknown footprint is not zero.
+struct StorageAllocation {
+  uint64_t id = 0;
+  WorkloadValueId value = 0;
+  MemoryNodeId memory;
+  uint64_t bytes = 0;
+  std::optional<uint64_t> aliasOf;
+  PlanStepId beginStep = 0;
+  PlanStepId endStep = 0; // live through this step
+};
+
+/// One synchronization decision: a step that waits for a set of connections,
+/// precedes a set of endpoint occurrences, and may require a barrier.
+struct SynchronizationStep {
+  uint64_t id = 0;
+  std::vector<ConnectionId> waitsFor;
+  std::vector<PortRef> precedes;
+  bool requiresBarrier = false;
+};
+
+/// What a plan step does. `finalizeStoragePlan` builds a deterministic
+/// plan-step DAG: one `Compute` step per selected placement, one `Movement`
+/// step per materialized connection, and one `Synchronization` step per wait a
+/// movement implies.
+enum class PlanStepKind { Compute, Movement, Synchronization };
+
+llvm::StringRef stringifyPlanStepKind(PlanStepKind kind);
+std::optional<PlanStepKind> symbolizePlanStepKind(llvm::StringRef text);
+
+/// One node of the plan-step DAG (design §9.6). The `node` is set for a
+/// `Compute` step and the `connection` for a `Movement` or `Synchronization`
+/// step; the other is left 0. A storage allocation's `beginStep`/`endStep` and
+/// every dependency edge name these stable ids.
+struct PlanStep {
+  PlanStepId id = 0;
+  PlanStepKind kind = PlanStepKind::Compute;
+  WorkloadNodeId node = 0;
+  ConnectionId connection = 0;
+};
+
+/// A dependency edge in the plan-step DAG: `to` must follow `from`.
+struct PlanStepEdge {
+  PlanStepId from = 0;
+  PlanStepId to = 0;
+  bool operator==(const PlanStepEdge &) const = default;
 };
 
 enum class ConnectionKind {
@@ -237,6 +322,35 @@ enum class ConnectionKind {
 
 llvm::StringRef stringifyConnectionKind(ConnectionKind kind);
 std::optional<ConnectionKind> symbolizeConnectionKind(llvm::StringRef text);
+
+/// The explicit combination a multi-producer (`Reduce`) connection performs
+/// (task B6). Nothing is inferred from topology: a connection that gathers
+/// several producers and declares no semantics cannot be materialized, and the
+/// stable reason names that. The table is hand-written here rather than in a
+/// `.td` enum because the target-neutral mapping core links no dialect, and the
+/// same three words are the Micro `micro.gather` kinds.
+enum class GatherSemantics { Sum, Max, Concatenate };
+
+inline llvm::StringRef stringifyGatherSemantics(GatherSemantics semantics) {
+  switch (semantics) {
+  case GatherSemantics::Sum:
+    return "sum";
+  case GatherSemantics::Max:
+    return "max";
+  case GatherSemantics::Concatenate:
+    return "concat";
+  }
+  return "";
+}
+
+inline std::optional<GatherSemantics>
+symbolizeGatherSemantics(llvm::StringRef text) {
+  return llvm::StringSwitch<std::optional<GatherSemantics>>(text)
+      .Case("sum", GatherSemantics::Sum)
+      .Case("max", GatherSemantics::Max)
+      .Case("concat", GatherSemantics::Concatenate)
+      .Default(std::nullopt);
+}
 
 /// How one value reaches one or more consumers.
 struct ConnectionPlan {
@@ -255,6 +369,14 @@ struct ConnectionPlan {
   /// The several producers a `Reduce` gathers; empty for every other kind,
   /// where `producer` is the single source.
   llvm::SmallVector<InstanceId> producers;
+  /// The explicit combination semantics of a `Reduce` (gather). Unset for every
+  /// other kind and for a multi-producer connection that has not declared what
+  /// its combination means -- which is exactly the connection that cannot be
+  /// materialized (task B6). Nothing is inferred from the producer count.
+  std::optional<GatherSemantics> gatherSemantics;
+  /// The axis a `Concatenate` gather joins along. Set exactly when the
+  /// semantics is `Concatenate`; a `Sum`/`Max` gather carries no axis.
+  std::optional<uint64_t> concatAxis;
   WorkloadValueId value = 0;
   ConnectionKind kind = ConnectionKind::Direct;
   llvm::SmallVector<MemoryNodeId> memoryRoute;
@@ -271,6 +393,13 @@ struct PlanDiagnostics {
   std::vector<std::string> errors;
   std::vector<std::string> warnings;
   bool searchTruncated = false;
+  /// Informational notes a post-search stage emits -- storage finalization's
+  /// occupancy and analysis-fallback reports. Deliberately separate from
+  /// `warnings`: `canonicalPlanString` does not fold this field, so a staged
+  /// note never changes a plan id and finalization is idempotent. A caller that
+  /// recomputes `plan.id` after `finalizeStoragePlan` gets the same id it had
+  /// before.
+  std::vector<std::string> storageNotes;
 };
 
 /// One selected placement: which node an instance covers, and the target facts
@@ -287,6 +416,27 @@ struct PlanPlacement {
   /// The solved instantiation of each layout in `layouts`, so the selected
   /// plan states the parameterization it chose, not just the family name.
   llvm::StringMap<SolvedLayout> layoutSolutions;
+  /// The resolved values of the rule's own declared parameters (the ones its
+  /// `require` constraints derive), so the selected plan states the exact
+  /// assignment generation solved rather than leaving a reader to re-derive
+  /// one. Verification validates *this* assignment and never substitutes a
+  /// different legal one.
+  llvm::StringMap<SearchValue> resolvedParameters;
+  /// The memory bound to each named endpoint occurrence, copied from the
+  /// instance's `portMemoryBindings`. Empty for a placement whose rule declares
+  /// no named-port memory requirement; when set it lets a materializer
+  /// attribute a storage decision to the occurrence that owns it. Sorted by
+  /// port.
+  std::vector<PortMemoryBinding> portMemoryBindings;
+  /// The selected instance's measured-or-static cost (task B8), copied from the
+  /// search entry so a plan's normalized event stream can charge this node the
+  /// *same* estimate the search ranked it on rather than re-deriving one. A
+  /// derived execution fact: deliberately excluded from `canonicalPlanString`,
+  /// so adding it does not change any plan id.
+  Cost cost;
+  /// The node's output element count (MACs for a matrix op), copied from the
+  /// extraction facts. Excluded from `canonicalPlanString`, like `cost`.
+  uint64_t workItems = 0;
 };
 
 /// One selected connection, with the route it takes.
@@ -303,6 +453,17 @@ struct PlanConnection {
   /// as two connections carry one value along different routes. Empty for a
   /// plan built without consumer associations.
   llvm::SmallVector<InstanceId> consumers;
+  /// The explicit combination semantics of a `Reduce` (gather) connection and
+  /// the axis a `Concatenate` joins along, copied from the `ConnectionPlan`.
+  /// Unset for every non-gather connection and for a multi-producer connection
+  /// whose semantics were never declared -- the case that stays Partial-only
+  /// with a stable reason instead of being materialized as an assumed sum.
+  std::optional<GatherSemantics> gatherSemantics;
+  std::optional<uint64_t> concatAxis;
+  /// The producer-side value occurrences a gather combines, in the order a
+  /// `Concatenate` joins them. Empty for every non-gather connection; the
+  /// single `producerPort` above remains the one producer of a movement.
+  llvm::SmallVector<PortRef> producerPorts;
   /// The producer-side result occurrence this connection reads and the
   /// consumer-side operand occurrences it serves, copied from the
   /// `ConnectionPlan`. The `consumers` instance list above is a compatibility
@@ -321,7 +482,31 @@ struct PlanConnection {
   /// the later B1/B4 work. Until then they are recorded, not acted on.
   std::optional<PortRef> producerPort;
   llvm::SmallVector<PortRef> consumerPorts;
+  /// The storage allocations (design §9.6) this connection reads or writes,
+  /// by `StorageAllocation::id`. B1 persists the ids; B3 populates them. Empty
+  /// for a plan built before storage planning.
+  llvm::SmallVector<uint64_t> storageIds;
+  /// The connection's synthesized cost (task B8): the transfer estimate the
+  /// route carried, or the shared transform estimate for a conversion. A
+  /// derived execution fact, deliberately excluded from `canonicalPlanString`
+  /// (the connection's own id already folds its kind, route, engines and
+  /// transform, so the cost adds no identity a reader could not re-derive).
+  Cost cost;
+  /// The carried value's element count, for the normalized event stream.
+  uint64_t workItems = 0;
+  /// The carried value's type, so a normalized transform event can be charged
+  /// from the shared conversion estimate exactly as the materialized kernel's
+  /// is. A derived execution fact, excluded from `canonicalPlanString`.
+  mlir::Type valueType;
 };
+
+/// Where a plan's final score came from (task B8). A score is only a schedule
+/// when the plan's normalized events could be built; when an unknown strict
+/// fact prevents that, the additive accumulation is reported *as* the
+/// accumulation, never presented as a scheduled latency.
+enum class PlanScoreSource { Accumulation, Schedule };
+
+llvm::StringRef stringifyPlanScoreSource(PlanScoreSource source);
 
 /// A complete executable proposal covering every required node.
 struct CoveringPlan {
@@ -341,14 +526,71 @@ struct CoveringPlan {
   /// each connection runs. Placements are ordered by their (executor, memory,
   /// layout) binding tuple, then node / instance id (design §22.1);
   /// `connectionPlans` by connection id.
-  llvm::SmallVector<PlanPlacement> placements;
+  /// Explicit inline capacity: `PlanPlacement` carries the selected bundle,
+  /// bindings and now its measured cost, so the default inlined-element
+  /// heuristic would not apply.
+  llvm::SmallVector<PlanPlacement, 1> placements;
   /// Explicit inline capacity: `PlanConnection` is large (it carries its route,
   /// engines, transform, and consumers), so the default inlined-element
   /// heuristic would not apply.
   llvm::SmallVector<PlanConnection, 4> connectionPlans;
   llvm::StringMap<SearchValue> globalParameters;
+  /// The final candidate score (task B8): the overlapped latency the *shared*
+  /// resource scheduler produces from the plan's normalized events, not the
+  /// additive sum of rule and connection costs. It folds into
+  /// `canonicalPlanString`, so a plan's id reflects the score a reader ranks it
+  /// by. Falls back to `accumulatedCost` only when the plan's events cannot be
+  /// built (an unknown strict fact), which is reported.
   Cost totalCost;
+  /// The additive accumulation of rule-local and connection costs over the
+  /// whole plan -- the search's optimistic partial-cost model, kept separately
+  /// named so it is never confused with the scheduled final score. Excluded
+  /// from `canonicalPlanString`: it is a search-internal quantity, not content.
+  Cost accumulatedCost;
+  /// Whether `totalCost` is the shared schedule's latency or the accumulation
+  /// fallback. A reader must not treat an `Accumulation` score as scheduled.
+  PlanScoreSource scoreSource = PlanScoreSource::Accumulation;
   PlanDiagnostics diagnostics;
+
+  // --- persisted selected state (schema v2, task B1) ------------------------
+  //
+  // These are deliberately excluded from `canonicalPlanString`: they are
+  // provenance and persisted selection metadata, not fields that change a
+  // plan's content id. A plan decoded from metadata keeps the id it was encoded
+  // with.
+  //
+  // The metadata schema this plan was persisted under (0 when it was never
+  // persisted -- an in-memory search result).
+  uint64_t schemaVersion = 0;
+  /// True when every execution-affecting decision was materialized. A partial
+  /// plan (see `BindContract`) records `false`.
+  bool materialized = true;
+  /// Content hash of the canonical, pre-materialization source workload graph
+  /// (see `computeSourceGraphHash`): operand occurrences, types, access maps
+  /// and semantic attributes, with bookkeeping attributes omitted. Retained
+  /// when a materialized graph is validated through its recorded connection
+  /// provenance.
+  uint64_t graphHash = 0;
+  /// Content hash of the target: its name plus the machine, layout and rule
+  /// library hashes. A plan is only executable against the target it was bound
+  /// for.
+  uint64_t targetHash = 0;
+  uint64_t machineHash = 0;
+  uint64_t layoutHash = 0;
+  uint64_t ruleHash = 0;
+  /// Concrete storage allocations the plan reserves (design §9.6). B3 builds
+  /// these; B1 round-trips them.
+  std::vector<StorageAllocation> allocations;
+  /// Synchronization decisions the plan makes (design §9.6). B3 builds these;
+  /// B1 round-trips them.
+  std::vector<SynchronizationStep> synchronization;
+  /// The deterministic plan-step DAG `finalizeStoragePlan` built (design §9.6):
+  /// every step's kind and what it names, and the dependency edges between
+  /// them. B3 builds these; B4-B6 consume them to order materialization. Like
+  /// the allocations they annotate, they are deliberately excluded from
+  /// `canonicalPlanString`, so storage planning never changes a plan id.
+  std::vector<PlanStep> steps;
+  std::vector<PlanStepEdge> stepEdges;
 };
 
 /// Sorts and removes duplicates. Used to enforce the "sorted and unique"
@@ -362,6 +604,15 @@ CandidateId computeCandidateId(const MappingCandidate &candidate);
 InstanceId computeInstanceId(const CandidateInstance &instance);
 ConnectionId computeConnectionId(const ConnectionPlan &connection);
 PlanId computePlanId(const CoveringPlan &plan);
+
+/// The executor a connection's layout conversion runs on: the first consumer
+/// placement's, else the producer placement's. The *one* policy the normalized
+/// plan events and the canonical materializer share, so the executor a
+/// transform event names and the `micro.engine` the binder stamps cannot
+/// disagree (task B8). Empty only when neither endpoint resolves to a
+/// placement.
+std::string transformExecutorFor(const CoveringPlan &plan,
+                                 const PlanConnection &connection);
 
 std::string canonicalCandidateString(const MappingCandidate &candidate);
 std::string canonicalInstanceString(const CandidateInstance &instance);

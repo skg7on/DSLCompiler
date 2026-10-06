@@ -144,6 +144,14 @@ def Micro_TileAsyncCopyOp : Micro_Op<"tile_async_copy"> {
   let description = [{
         Moves a tile to a destination memory space asynchronously, returning
         a materialized tile and an async token for synchronization.
+
+        A machine may hold several concrete memories of one abstract kind
+        (`sram.0`, `sram.1`). Source/destination kind equality is not node
+        identity, so a same-kind move records the two concrete node ids it
+        crosses in `micro.src_node`/`micro.dst_node`; the structural verifier
+        checks those ids are distinct strings, and the machine-aware verifier
+        resolves them against the model's links, engines, and transaction and
+        alignment facts. A kind-differing move may record them too.
     }];
 
   let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$dst_memory,
@@ -254,6 +262,63 @@ def Micro_ReduceOp : Micro_Op<"reduce"> {
 }
 
 //===----------------------------------------------------------------------===//
+// micro.gather — combine several producers under explicit semantics
+//===----------------------------------------------------------------------===//
+
+def Micro_GatherOp : Micro_Op<"gather"> {
+  let summary = "Combine several producer values under declared semantics";
+  let description = [{
+        Gathers two or more producer values into one result under an explicit
+        combination semantics, named by `kind`:
+
+          sum     elementwise sum; every input and the result share one shape
+                  and element type
+          max     elementwise maximum; same shape/type requirement as sum
+          concat  concatenation along `axis`; the result's extent along that
+                  axis is exactly the sum of the inputs' extents, and every
+                  other extent matches
+
+        The semantics are never inferred from how many producers feed the
+        value: a gather states what the combination *means*, and a connection
+        that does not declare one is not materialized. `axis` is required for
+        `concat` and rejected for `sum`/`max`.
+    }];
+
+  let arguments = (ins Variadic<AnyType>:$inputs, StrAttr:$kind,
+      OptionalAttr<I64Attr>:$axis);
+
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = [{
+        $inputs `kind` `=` $kind (`axis` `=` $axis^)? attr-dict
+        `:` type($inputs) `->` type($result)
+    }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// micro.barrier — executor-group barrier over dependency tokens
+//===----------------------------------------------------------------------===//
+
+def Micro_BarrierOp : Micro_Op<"barrier"> {
+  let summary = "Executor-group barrier over dependency tokens";
+  let description = [{
+        Blocks its scope until every dependency token has completed. The scope
+        is generic (`executor_group`): a barrier names the executor group whose
+        work must agree, not a concrete target resource. It is emitted only
+        where the selected plan's synchronization requires one; two independent
+        movements that share no dependency carry no barrier between them.
+    }];
+
+  let arguments = (ins Variadic<Micro_AsyncToken>:$tokens, StrAttr:$scope);
+
+  let assemblyFormat = "$tokens `scope` `=` $scope attr-dict";
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // micro.for — temporal loop
 //===----------------------------------------------------------------------===//
 
@@ -355,6 +420,11 @@ def Micro_AsyncCopyOp : Micro_Op<"async_copy"> {
   let description = [{
         Moves a tensor between two memory spaces asynchronously, returning the
         materialized tensor and an async token for synchronization.
+
+        As with `micro.tile_async_copy`, a same-kind move between two distinct
+        concrete memory nodes records `micro.src_node`/`micro.dst_node` so the
+        movement is real work rather than collapsed on kind equality; a
+        kind-differing move may record them too.
     }];
 
   let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$src_memory,

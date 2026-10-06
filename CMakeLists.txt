@@ -292,8 +292,10 @@ add_library(LLKMapping STATIC
     lib/Mapping/StableHash.cpp
     lib/Mapping/Diagnostics.cpp
     lib/Mapping/TileFacts.cpp
+    lib/Mapping/StoragePlan.cpp
     lib/Mapping/CostModel.cpp
     lib/Mapping/CostEvent.cpp
+    lib/Mapping/EventSchedule.cpp
     lib/Mapping/LatencyProvider.cpp
     lib/Mapping/SearchBinding.cpp
     lib/Mapping/WorkloadGraph.cpp
@@ -305,6 +307,8 @@ add_library(LLKMapping STATIC
     lib/Mapping/Placement.cpp
     lib/Mapping/CoveringSearch.cpp
     lib/Mapping/PlanBinder.cpp
+    lib/Mapping/MappingMetadata.cpp
+    lib/Mapping/PlanVerification.cpp
     lib/Mapping/Routing.cpp
     lib/Mapping/PlanReport.cpp
 )
@@ -451,6 +455,7 @@ add_library(LLKMicroMapping STATIC
     lib/Conversion/MicroMapping/MicroBindPlanPass.cpp
     lib/Conversion/MicroMapping/MicroVerifyMappingPass.cpp
     lib/Conversion/MicroMapping/SearchBindingLoader.cpp
+    lib/Conversion/MicroMapping/PlanMaterialization.cpp
 )
 target_include_directories(LLKMicroMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -781,10 +786,14 @@ endfunction()
 add_llk_perf_test(L0StaticBoundTest test/Perf/l0_static_bound.cpp)
 add_llk_perf_test(L1ResourceDAGTest test/Perf/l1_resource_dag.cpp)
 
-# Binder -> perf route identity: builds a real plan, binds it, and charges the
-# bound kernel. Crosses the mapping/perf boundary, so it links LLKMapping too.
+# Binder -> perf route identity: builds a real plan, binds it through the
+# canonical PlanMaterializer (which stamps the copies the perf model charges),
+# and charges the bound kernel. Crosses the mapping/perf boundary, so it links
+# LLKMapping and the Micro mapping pass library that owns the materializer.
 add_llk_perf_test(RouteIdentityTest test/Perf/route_identity.cpp)
-target_link_libraries(RouteIdentityTest PRIVATE LLKMapping)
+target_link_libraries(RouteIdentityTest PRIVATE LLKMapping LLKMicroMapping)
+target_include_directories(RouteIdentityTest PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping)
 
 # Tuning-core tests (issue #49): the search-space loader, candidate
 # generation, and machine-aware legality. The loader test parses micro IR;
@@ -842,9 +851,24 @@ add_llk_mapping_test(MappingRulesTest test/Mapping/mapping_rules.cpp)
 add_llk_mapping_test(MappingPlacementTest test/Mapping/placement.cpp)
 add_llk_mapping_test(MappingConnectionsTest test/Mapping/connections.cpp)
 add_llk_mapping_test(MappingCoveringSearchTest test/Mapping/covering_search.cpp)
+add_llk_mapping_test(MappingStoragePlanTest test/Mapping/storage_plan.cpp)
 add_llk_mapping_test(MappingAvx2TargetTest test/Mapping/avx2_target.cpp)
 add_llk_mapping_test(MappingGenericAcceleratorTargetTest test/Mapping/generic_accelerator_target.cpp)
-add_llk_mapping_test(MappingPlanBinderTest test/Mapping/plan_binder.cpp)
+# MappingPlanBinderTest binds through the canonical PlanMaterializer, whose
+# construction lives in the Micro mapping pass library (LLKMicroMapping) -- the
+# target-neutral mapping core has no dialect, so the test reaches the factory
+# through MicroMappingCommon.h exactly as the CLI does.
+add_llvm_executable(MappingPlanBinderTest test/Mapping/plan_binder.cpp)
+target_link_libraries(MappingPlanBinderTest PRIVATE
+    LLKMapping LLKTargetMapping LLKMicroMapping MicroDialect GTest::gtest_main
+    ${LLK_MLIR_EXEC_LIBS})
+target_include_directories(MappingPlanBinderTest PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping)
+target_compile_definitions(MappingPlanBinderTest PRIVATE
+    LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping"
+    LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME MappingPlanBinderTest COMMAND MappingPlanBinderTest)
 add_llk_mapping_test(MappingE2EWorkflowTest test/Mapping/e2e_workflow.cpp)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
@@ -932,22 +956,49 @@ if(LLK_BUILD_TOOLS)
               ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/verify_mapping_invalid.mlir
   )
 
-  # MicroMappingUnmaterialized: a plan whose edge is an unmaterializable
-  # movement (see the fixture's rules file). The binder reports such a
-  # connection rather than dropping it silently; the pass must surface that
-  # report as a warning, so this pins the diagnostic. stderr is merged because
-  # the warning goes there while FileCheck reads stdout. Raw add_test because
+  # MicroMappingUnmaterialized: the canonical tile-transfer fixture is now a
+  # *materialized* plan (task B4): the CLI supplies the canonical
+  # PlanMaterializer, so the vector->tile-store edge becomes a typed
+  # `micro.tile_async_copy` + `micro.wait` into the store's memory, and the
+  # store's operand is rewired to the destination-memory tile. The fixture
+  # runs with require-executable=1, so a warning about an unmaterialized
+  # connection is itself a failure. stderr is merged because the pass's
+  # diagnostics go there while FileCheck reads stdout. Raw add_test because
   # add_llk_filecheck_test() pipes stdout only and cannot set --check-prefix.
   add_test(NAME MicroMappingUnmaterialized
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/probe_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=WARN ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir"
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/probe_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=MAP ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir"
   )
 
-  # MicroMappingRequireExecutable: the executable binding contract refuses the
-  # very plan MicroMappingUnmaterialized warns about and binds. A backend-facing
-  # run must fail rather than receive IR that omits a selected decision, so the
-  # pass exits non-zero and names the unresolved decision.
+  # MicroMappingRequireExecutable: the executable binding contract (design
+  # §18.2) is satisfied by the canonical materializer -- the same plan is now
+  # fully executable, so the backend-facing run succeeds and emits the
+  # materialized tile movement rather than refusing an omitted decision. A
+  # null materializer still fails Executable (covered by the unit tests in
+  # MappingPlanBinderTest), but the CLI always supplies one.
   add_test(NAME MicroMappingRequireExecutable
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/probe_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | grep -q 'not fully executable'"
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/probe_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | grep -q 'micro.tile_async_copy'"
+  )
+
+  # MicroMappingBarrier: the storage plan (task B3) is now run on the selected
+  # plan (task C1), so a movement that needs more than one transfer engine is
+  # barrier-synchronized and the canonical materializer emits a `micro.barrier`.
+  # The fixture routes SRAM -> L2 -> DRAM (two links, two engines) on
+  # barrier_machine.yaml, so `requiresBarrier` is set and the barrier is
+  # observable in the IR. Raw add_test because FileCheck needs --check-prefix and
+  # stderr must be merged (the pass's diagnostics go to stderr).
+  add_test(NAME MicroMappingBarrier
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=barrier machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/barrier_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/barrier_sync.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=MAP ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/barrier_sync.mlir"
+  )
+
+  # MicroMappingBarrierStorage: the reported and verified half of C1 -- the
+  # report's selectedState carries populated allocations, synchronization and the
+  # plan-step DAG, and B6's barrier verification fires (deleting the barrier
+  # makes verification fail). A script because it compares the IR, the report
+  # file, and two verification outcomes.
+  add_test(NAME MicroMappingBarrierStorage
+      COMMAND sh ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/barrier_storage.sh
+          $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/MicroMappingBarrierStorage
   )
 
   # MicroMappingReport: the `report=<path>` option's contract -- the report file

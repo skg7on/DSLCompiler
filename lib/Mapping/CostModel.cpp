@@ -64,11 +64,20 @@ machineSyncPeriodCycles(const machine::MachineModel &machine) {
   return static_cast<double>(cycles);
 }
 
-/// The machine spelling of an element type (`f32`, `bf16`, `i8`), or empty when
-/// the type has no width a transform could move. This mirrors the micro dtype
-/// vocabulary without depending on the dialect: the cost model sits below it,
-/// so it names element widths itself.
+/// A transform footprint must be a shaped value with static extents so the
+/// element count is a checked fact rather than a guess.
+mlir::ShapedType transformFootprintType(const TransformCostInput &input) {
+  for (mlir::Type candidate : {input.outputType, input.inputType})
+    if (candidate)
+      if (auto shaped = llvm::dyn_cast<mlir::ShapedType>(candidate))
+        return shaped;
+  return {};
+}
+} // namespace
+
 std::string elementTypeName(mlir::Type type) {
+  if (!type)
+    return {};
   if (auto floatType = llvm::dyn_cast<mlir::FloatType>(type)) {
     if (floatType.isF64())
       return "f64";
@@ -85,8 +94,9 @@ std::string elementTypeName(mlir::Type type) {
   return {};
 }
 
-/// Bytes of one element, or nullopt for an element type with no width.
 std::optional<unsigned> elementByteWidth(mlir::Type type) {
+  if (!type)
+    return std::nullopt;
   if (auto floatType = llvm::dyn_cast<mlir::FloatType>(type))
     return static_cast<unsigned>(llvm::divideCeil(floatType.getWidth(), 8u));
   if (auto intType = llvm::dyn_cast<mlir::IntegerType>(type))
@@ -94,16 +104,17 @@ std::optional<unsigned> elementByteWidth(mlir::Type type) {
   return std::nullopt;
 }
 
-/// A transform footprint must be a shaped value with static extents so the
-/// element count is a checked fact rather than a guess.
-mlir::ShapedType transformFootprintType(const TransformCostInput &input) {
-  for (mlir::Type candidate : {input.outputType, input.inputType})
-    if (candidate)
-      if (auto shaped = llvm::dyn_cast<mlir::ShapedType>(candidate))
-        return shaped;
-  return {};
+uint64_t elementwiseCycles(const machine::ComputeNode &engine,
+                           llvm::StringRef dtype, uint64_t elements) {
+  // A dtype the engine does not declare is issued one element at a time. That
+  // is slower than the hardware, never faster, so it cannot hide a bottleneck.
+  int64_t lanes = 1;
+  auto it = engine.lanes.find(dtype.str());
+  if (it != engine.lanes.end() && it->second > 0)
+    lanes = it->second;
+  uint64_t issues = llvm::divideCeil(elements, static_cast<uint64_t>(lanes));
+  return issues * std::max<uint64_t>(1, engine.issueCycles);
 }
-} // namespace
 
 llvm::StringRef stringifyCostMetric(CostMetric metric) {
   for (const MetricInfo &info : kMetrics)

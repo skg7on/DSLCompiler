@@ -37,7 +37,7 @@ domain    ::= "param" ident "in" ( "[" int ".." int "]" | "{" domain-literal (",
 require   ::= "require" expr ";"
             | "require" executor "kind" ident ";"
             | "require" compute  "kind" ident ";"
-            | "require" memory   "kind" ident ";"
+            | "require" memory   [ ( "input" | "output" ) string ] "kind" ident ";"
             | "require" "layout" ident "satisfies" id ";"
 port      ::= ( "input" | "output" ) string ";"
 bundle    ::= "bundle" string [ "{" bundle-param ("," bundle-param)* "}" ] ";"
@@ -107,11 +107,61 @@ rule avx2.vector_add v1 {
 | `param` | a tunable parameter; a `param` statement both declares and bounds it, so it must appear before its first use |
 | `require expr` | a constraint over parameters and machine facts |
 | `require <role> kind <k>` | an abstract capability requirement; `role` is `executor`, `compute`, or `memory` |
+| `require memory <dir> "<port>" kind <k>` | the named port's occurrence is materialized in a memory of kind `<k>` |
 | `require layout <port> satisfies <id>` | the value on `<port>` must satisfy that layout |
 | `input`/`output` | named boundary values, one declaration per name |
 | `bundle` | an opaque target-owned implementation name (exactly one), with optional typed parameters |
 | `emit` | an opaque emitter key, validated against the target's declared set (exactly one) |
 | `cost` | an optional static cost lower bound |
+
+## Named-port memory requirements
+
+A `memory` requirement may name the port it governs, so an operation with several
+outputs can place each in its own memory instead of leaving the output-to-memory
+association implicit:
+
+```text
+require memory output "small" kind sram;
+require memory output "large" kind dram;
+```
+
+The subject is resolved through the rule's declared ports (`output "small";`),
+then to the matched node's result occurrence by position — the same wiring a
+`layout` requirement uses. The requirement is charged to *that* occurrence:
+during capacity search, every output the operation writes must have exactly one
+selected memory, and the occurrence's own bytes are charged to it. A named-port
+association therefore supports a combination the legacy bare form cannot — a
+multi-output node with several memory bindings — because the graph now fixes
+which output goes where.
+
+The legacy bare `require memory kind sram` remains valid, but only where its role
+assignment is unique: it names no port, so placement binds one memory per *kind*
+and the search keeps the conservative rule that a node with several outputs and
+several bare bindings has no output-to-memory association and is rejected rather
+than admitted on an unsafe lower bound. A bare and a named requirement of the
+same kind, or one named port and kind twice, overlap ambiguously and are
+rejected at load time. A rule that mixes a bare requirement of one kind with a
+named requirement of another parses but is rejected at search time as an
+ambiguous association, since it leaves some occurrence's memory unfixed.
+`executor` and `compute` requirements may not name a port.
+
+## Bound search axes
+
+When a rule is matched at a bound search-space point (`micro.candidate`), the
+binding's `owner_mapping` and `memory_path` values are projected onto explicit
+requirements rather than recorded as provenance:
+
+- `owner_mapping` (`worker/vector_engine`) is a `/`-separated owner chain; its
+  outer component becomes an abstract executor requirement and any inner compute
+  kind a compute requirement, so the binding changes which executors and computes
+  placement may bind. A component the machine does not model, or one that
+  contradicts the rule's own executor/compute requirements, rejects the match.
+- `memory_path` (`dram:sram:acc`) is the set of allowed memory levels; a rule
+  whose memory requirement sits off the path is rejected, as is a path naming a
+  level the machine does not model.
+
+An unsupported bound axis is rejected explicitly (the node ends with no rule in
+effect); it is never silently ignored.
 
 ## Target bundles (design §14.3)
 
@@ -148,6 +198,11 @@ Parsing rejects, with a `file:line:column` diagnostic:
 - an `access_map` that references a dimension it did not declare, or that is
   not affine;
 - an identifier in a `require` that is neither a declared parameter nor a builtin;
+- a memory requirement whose `input`/`output` subject names a port that is not
+  declared, or is declared in the other direction, or a port subject on an
+  `executor` or `compute` requirement;
+- two `memory` requirements that overlap in role, kind, and port (the same named
+  port twice, or a bare and a named requirement of the same kind);
 - a malformed statement, missing `;`, or unterminated `{`.
 
 Cross-registry validation then rejects a rule that names an **unknown layout

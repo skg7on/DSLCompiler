@@ -14,7 +14,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1418,8 +1421,7 @@ TEST(CoveringSearch, PlacementsAreOrderedByTheirBindingTuple) {
   llvm::Expected<MappingSearchResult> result = search.search();
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   ASSERT_FALSE(result->plans.empty());
-  const llvm::SmallVector<PlanPlacement> &placements =
-      result->plans[0].placements;
+  llvm::ArrayRef<PlanPlacement> placements = result->plans[0].placements;
   ASSERT_EQ(placements.size(), 2u);
 
   // §22.1 orders placements by the (executor, memory, layout) binding tuple,
@@ -2259,18 +2261,17 @@ TEST(CoveringSearch, GatherSumsTheProducerFeeds) {
                    3.0 + 2.0 * kFanTransferCycles);
 }
 
-// Exact mode does not branch over a gather feed's legal alternatives; it keeps
-// only the locally cheapest per producer. That is a choice collapse, not a cap,
-// so it must disclose itself -- `connectionChoicesUnexplored` set and the
-// stable notice filed -- while every cap remains lifted (`searchTruncated`
-// clear). Before the fix the gather path reported neither.
-TEST(CoveringSearch, GatherExactChoicesAreDisclosed) {
+// Exact mode now branches over a gather feed's legal alternatives (task B7), so
+// it no longer collapses the choice: `connectionChoicesUnexplored` stays clear
+// and no notice is filed, because there is no explicit policy collapsing
+// alternatives. Every cap remains lifted (`searchTruncated` clear), so the
+// result is genuinely the joint search it claims to be.
+TEST(CoveringSearch, GatherExactBranchesOverFeedAlternatives) {
   mlir::MLIRContext context;
   WorkloadGraph graph = fanInGraph(context);
   MachineModel machine = fanMachine();
-  // A second parallel dram.0 -> acc.0 route. The original (latency 10) stays
-  // cheaper than the copy (latency 20), so each feed has two legal alternatives
-  // and exact mode keeps one without branching over them.
+  // A second parallel dram.0 -> acc.0 route, so each feed has two legal
+  // alternatives for exact mode to branch over.
   LinkEdge second = machine.links.front();
   second.id = "second_route";
   second.latencyCycles = 20;
@@ -2286,19 +2287,11 @@ TEST(CoveringSearch, GatherExactChoicesAreDisclosed) {
   llvm::Expected<MappingSearchResult> result = search.search();
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   ASSERT_FALSE(result->plans.empty());
-  EXPECT_TRUE(result->connectionChoicesUnexplored);
+  EXPECT_FALSE(result->connectionChoicesUnexplored);
   EXPECT_FALSE(result->searchTruncated);
-  EXPECT_TRUE(
+  EXPECT_FALSE(
       hasDiagnostic(*result, DiagnosticCode::ConnectionChoiceUnexplored));
   EXPECT_FALSE(hasDiagnostic(*result, DiagnosticCode::SearchTruncated));
-  // The disclosure is a single stable notice, however many feeds collapsed it:
-  // `report` deduplicates on (code, message), so the distinct-notice list does
-  // not grow per producer or per branch.
-  size_t notices = 0;
-  for (const Diagnostic &diagnostic : result->frontier.diagnostics)
-    if (diagnostic.code == DiagnosticCode::ConnectionChoiceUnexplored)
-      ++notices;
-  EXPECT_EQ(notices, 1u);
 }
 
 // Control: a gather whose every feed has exactly one legal route collapses no
@@ -2483,12 +2476,12 @@ TEST(CoveringSearch, StagingMemoryWithRoomAdmitsTheConnection) {
   EXPECT_FALSE(result->plans.empty());
 }
 
-// Issue #109 defect 3: exact mode implies an exhaustive joint search, but each
-// connection's alternative is chosen locally -- only the cheapest is taken.
-// When more than one alternative exists the search now *says so*, rather than
-// letting exact mode's name imply a completeness it does not have. Two routes
-// (a direct hop and a staged one) make the choice observable.
-TEST(CoveringSearch, ExactModeReportsUnexploredConnectionChoices) {
+// Issue #109 defect 3 is closed by task B7: exact mode branches over a
+// connection's legal alternatives instead of taking only the locally cheapest,
+// so it no longer files the pre-B7 "unexplored choice" notice. Two routes (a
+// direct hop and a staged one) make the branching observable, and the search
+// still finds a plan with every cap lifted.
+TEST(CoveringSearch, ExactModeBranchesOverConnectionAlternatives) {
   mlir::MLIRContext context;
   context.getOrLoadDialect<mlir::micro::MicroDialect>();
   mlir::Type tile = mlir::parseType("!micro.tile<8x32xf32>", &context);
@@ -2520,8 +2513,9 @@ TEST(CoveringSearch, ExactModeReportsUnexploredConnectionChoices) {
   llvm::Expected<MappingSearchResult> result = search.search();
   ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
   ASSERT_FALSE(result->plans.empty());
-  EXPECT_TRUE(result->connectionChoicesUnexplored);
-  EXPECT_TRUE(
+  EXPECT_FALSE(result->connectionChoicesUnexplored);
+  EXPECT_FALSE(result->searchTruncated);
+  EXPECT_FALSE(
       hasDiagnostic(*result, DiagnosticCode::ConnectionChoiceUnexplored));
 }
 
@@ -2791,6 +2785,317 @@ TEST(CoveringSearch, MultiOutputSingleMemoryRejectsAnOversizedLaterOutput) {
   EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
 }
 
+/// `searchMachine` with explicit sram and dram capacities, so a per-port
+/// capacity test can pin exactly what each bound output affords.
+MachineModel sizedMemoryMachine(uint64_t sramBytes, uint64_t dramBytes) {
+  MachineModel model = searchMachine();
+  for (MemoryNode &memory : model.memories)
+    memory.capacityBytes = memory.kind == "sram" ? sramBytes : dramBytes;
+  return model;
+}
+
+/// `searchMachine` with two visible sram nodes of different capacities, so two
+/// same-kind roles can be bound to different nodes.
+MachineModel twoSramMachine(uint64_t smallBytes, uint64_t largeBytes) {
+  MachineModel model;
+  model.target = "samekind";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}}};
+  MemoryNode small;
+  small.id = "sram.small";
+  small.kind = "sram";
+  small.visibleFrom = "e0";
+  small.capacityBytes = smallBytes;
+  MemoryNode large;
+  large.id = "sram.large";
+  large.kind = "sram";
+  large.visibleFrom = "e0";
+  large.capacityBytes = largeBytes;
+  model.memories = {small, large};
+  return model;
+}
+
+/// A rule that binds each of its two output ports to its own memory kind by
+/// name. The output-to-memory association is explicit, so the search charges
+/// each output to the memory its port selected rather than replicating the
+/// first output across every binding.
+constexpr llvm::StringLiteral kPortedMemoryRules = R"llkmap(
+rule r.ported {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory output "small" kind sram;
+  require memory output "large" kind dram;
+  output "small";
+  output "large";
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// The same two ports with their memory kinds swapped: the small output is
+/// bound to dram and the large one to sram.
+constexpr llvm::StringLiteral kSwappedMemoryRules = R"llkmap(
+rule r.swapped {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory output "small" kind dram;
+  require memory output "large" kind sram;
+  output "small";
+  output "large";
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Both output ports bound to the same memory kind, so the roles are
+/// distinguished by port, not by kind.
+constexpr llvm::StringLiteral kSameKindPortRules = R"llkmap(
+rule r.same_kind {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory output "small" kind sram;
+  require memory output "large" kind sram;
+  output "small";
+  output "large";
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// Finds the memory bound to an output port occurrence in a placement, or "".
+std::string placementMemoryForPort(const PlanPlacement &placement,
+                                   uint32_t index) {
+  for (const PortMemoryBinding &binding : placement.portMemoryBindings)
+    if (binding.port.direction == PortDirection::Output &&
+        binding.port.index == index)
+      return binding.memory;
+  return {};
+}
+
+// The worked example: a 4-byte output bound to a 1024-byte SRAM and a
+// 4096-byte output bound to an 8192-byte DRAM is legal, and each output is
+// charged to the memory its own port selected.
+TEST(CoveringSearch, ExplicitNamedPortMemoriesAreChargedPerPort) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(1024, 8192), kPortedMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_FALSE(result->plans[0].placements.empty());
+  const PlanPlacement &placement = result->plans[0].placements[0];
+  EXPECT_EQ(placementMemoryForPort(placement, 0), "sram.0");
+  EXPECT_EQ(placementMemoryForPort(placement, 1), "dram.0");
+}
+
+// Swapping which port gets which memory rejects: the 4096-byte output no longer
+// fits the 1024-byte SRAM it is now bound to. Charging each port to its own
+// memory is what makes this observable; the old first-output-only accounting
+// would have charged both ports the 4-byte first output and admitted it.
+TEST(CoveringSearch, SwappedNamedPortMemoriesAreRejected) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(1024, 8192), kSwappedMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+// Both memories too small for the large port rejects, even though they are
+// plentiful for the small one.
+TEST(CoveringSearch, NamedPortMemoryTooSmallRejects) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(1024, 1024), kPortedMemoryRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+// Both ports require the same memory kind, so they are distinguished by port
+// alone. A 4-byte output lands in the small sram and a 4096-byte output in the
+// large one; the kind-keyed binding map could not have told them apart.
+TEST(CoveringSearch, SameKindNamedPortsBindDifferentMemories) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = multiOutputGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(twoSramMachine(1024, 8192), kSameKindPortRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // At least one legal placement binds the large output to the large node and
+  // the small output to the small node.
+  bool sawSplit = false;
+  for (const CoveringPlan &plan : result->plans)
+    for (const PlanPlacement &placement : plan.placements)
+      sawSplit |= placementMemoryForPort(placement, 0) == "sram.small" &&
+                  placementMemoryForPort(placement, 1) == "sram.large";
+  EXPECT_TRUE(sawSplit);
+}
+
+/// One `micro.vector` node reading a `tile`-typed input and writing `output`,
+/// so a rule that names only the input still has an output to charge.
+WorkloadGraph oneInOneOutGraph(mlir::MLIRContext &context, mlir::Type input,
+                               mlir::Type output) {
+  WorkloadGraph graph;
+  WorkloadValueId in =
+      graph.addValue(WorkloadValue{0, input, "in", /*external=*/true});
+  WorkloadValueId out =
+      graph.addValue(WorkloadValue{0, output, "out", /*external=*/false});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context);
+  node.inputs.push_back(WorkloadPort{in, input, std::nullopt});
+  node.outputs.push_back(WorkloadPort{out, output, std::nullopt});
+  graph.addNode(std::move(node));
+  graph.finalize();
+  return graph;
+}
+
+/// A rule that names only its *input* port's memory. The node it covers still
+/// produces an output, which must be charged rather than left unchecked.
+constexpr llvm::StringLiteral kInputOnlyPortRule = R"llkmap(
+rule r.in_ported {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require memory input "operand0" kind sram;
+  input "operand0";
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+// A named-port requirement that names only an input must not silently exempt
+// the node's outputs from capacity: the 4096-byte output does not fit the
+// 1024-byte sram the rule binds, so the plan rejects. (An input's own bytes are
+// produced elsewhere; the output's are not.)
+TEST(CoveringSearch, InputOnlyNamedMemoryStillChargesTheOutput) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = oneInOneOutGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(1024, 1u << 30), kInputOnlyPortRule);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+// Control: the same input-only rule admits the plan once the bound memory holds
+// the output, proving the charge is real rather than a blanket rejection.
+TEST(CoveringSearch, InputOnlyNamedMemoryAdmitsWhenTheOutputFits) {
+  mlir::MLIRContext context;
+  mlir::Type small =
+      mlir::RankedTensorType::get({1}, mlir::Float32Type::get(&context));
+  mlir::Type large =
+      mlir::RankedTensorType::get({1024}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = oneInOneOutGraph(context, small, large);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sizedMemoryMachine(8192, 1u << 30), kInputOnlyPortRule);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
+/// One `micro.vector` node reading a single input and writing nothing: a sink.
+WorkloadGraph sinkGraph(mlir::MLIRContext &context, mlir::Type input) {
+  WorkloadGraph graph;
+  WorkloadValueId value =
+      graph.addValue(WorkloadValue{0, input, "in", /*external=*/true});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context);
+  node.inputs.push_back(WorkloadPort{value, input, std::nullopt});
+  graph.addNode(std::move(node));
+  graph.finalize();
+  return graph;
+}
+
+// A sink writes no output to attribute, so a single bare binding is charged the
+// first-input fallback and the plan is admitted when it fits. This is the
+// control that keeps the port-association change from rejecting every
+// outputless rule.
+TEST(CoveringSearch, OutputlessSinkWithOneBindingIsAdmitted) {
+  mlir::MLIRContext context;
+  mlir::Type tile =
+      mlir::RankedTensorType::get({8}, mlir::Float32Type::get(&context));
+  WorkloadGraph graph = sinkGraph(context, tile);
+
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty());
+}
+
 /// Two independent producer -> consumer pairs over `fanMachine`, each moving a
 /// `value`-sized tile from dram.0 into acc.0 and writing a 4-byte result. The
 /// pairs share no value, so the only thing linking them is the destination
@@ -3005,11 +3310,14 @@ TEST(CoveringSearch, AMeasurementChangesTheCostAndTheRanking) {
   ASSERT_FALSE(provider.lookups.empty());
   // The search fills the whole §17.4 key, not just the rule: the operation's
   // attributes and its placement class are part of what it asked about.
-  EXPECT_NE(provider.lookups.front().find("attributes={op = \"add\"}"),
+  EXPECT_NE(provider.lookups.front().find("attributes="), std::string::npos)
+      << provider.lookups.front();
+  EXPECT_NE(provider.lookups.front().find("{op = \"add\"}"), std::string::npos)
+      << provider.lookups.front();
+  EXPECT_NE(provider.lookups.front().find("placement_class="),
             std::string::npos)
       << provider.lookups.front();
-  EXPECT_NE(provider.lookups.front().find("placement_class=worker"),
-            std::string::npos)
+  EXPECT_NE(provider.lookups.front().find("worker"), std::string::npos)
       << provider.lookups.front();
 }
 
@@ -3034,9 +3342,10 @@ TEST(CoveringSearch, LatencyKeyCarriesTheOperationsTypesAndPlacement) {
   ASSERT_FALSE(provider.lookups.empty());
 
   const std::string &key = provider.lookups.front();
-  EXPECT_NE(key.find("result_types=tensor<1xf32>"), std::string::npos) << key;
-  EXPECT_NE(key.find("placement=executor=e0,memories=sram=sram.0"),
-            std::string::npos)
+  EXPECT_NE(key.find("result_types="), std::string::npos) << key;
+  EXPECT_NE(key.find("tensor<1xf32>"), std::string::npos) << key;
+  EXPECT_NE(key.find("placement="), std::string::npos) << key;
+  EXPECT_NE(key.find("executor=e0,memories=sram=sram.0"), std::string::npos)
       << key;
 }
 
@@ -3505,6 +3814,205 @@ TEST(CoveringSearch, NoBindingLeavesTheHashZeroAndThePlanIdUnchanged) {
 }
 
 //===----------------------------------------------------------------------===//
+// Bound owner_mapping / memory_path axes are projected, not ignored
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Two executors of different owner kinds, one visible memory system, so a
+/// bound `owner_mapping` axis can decide which executor a rule that names no
+/// owner of its own places on.
+MachineModel ownerMachine() {
+  MachineModel model;
+  model.target = "owner";
+  model.executors = {
+      {"cluster.0", "cluster", std::nullopt, {}, 1, {}},
+      {"w0", "worker", std::string("cluster.0"), {}, 1, {}},
+      {"v0", "vector_engine", std::string("cluster.0"), {}, 1, {}}};
+  MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "cluster.0";
+  sram.capacityBytes = 1u << 20;
+  MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "cluster.0";
+  dram.capacityBytes = 1u << 30;
+  model.memories = {sram, dram};
+  return model;
+}
+
+/// A rule that declares no owner of its own, so the only thing that can select
+/// an executor is the bound owner_mapping axis.
+constexpr llvm::StringLiteral kOwnerFreeRules = R"llkmap(
+rule r.free {
+  match micro.vector(op = "add");
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// A rule that pins the executor kind, so a contradictory bound owner rejects.
+constexpr llvm::StringLiteral kVectorOwnerRule = R"llkmap(
+rule r.vec {
+  match micro.vector(op = "add");
+  require executor kind vector_engine;
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+} // namespace
+
+// A bound owner_mapping projects onto an abstract executor requirement, so it
+// changes which executor the plan places on -- rather than being recorded as
+// provenance and ignored.
+TEST(CoveringSearch, ABoundOwnerMappingSelectsThePlacement) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(ownerMachine(), kOwnerFreeRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  auto searchWith = [&](llvm::StringRef owner) {
+    SearchBinding binding =
+        makeSearchBinding("c", values({{"owner_mapping", std::string(owner)}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          binding);
+    return search.search();
+  };
+
+  llvm::Expected<MappingSearchResult> worker = searchWith("worker");
+  ASSERT_TRUE(static_cast<bool>(worker)) << llvm::toString(worker.takeError());
+  ASSERT_FALSE(worker->plans.empty());
+  for (const PlanPlacement &placement : worker->plans[0].placements)
+    EXPECT_EQ(placement.executor, "w0");
+
+  llvm::Expected<MappingSearchResult> vector = searchWith("vector_engine");
+  ASSERT_TRUE(static_cast<bool>(vector)) << llvm::toString(vector.takeError());
+  ASSERT_FALSE(vector->plans.empty());
+  for (const PlanPlacement &placement : vector->plans[0].placements)
+    EXPECT_EQ(placement.executor, "v0");
+}
+
+// An owner_mapping naming an owner the machine does not model is rejected
+// explicitly: the node has no rule in effect rather than the value being
+// silently dropped.
+TEST(CoveringSearch, AnUnmodeledBoundOwnerMappingIsRejected) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(ownerMachine(), kOwnerFreeRules);
+  ASSERT_NE(target, nullptr);
+
+  SearchBinding binding =
+      makeSearchBinding("c", values({{"owner_mapping", std::string("pe")}}));
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                        binding);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
+}
+
+// A rule that requires a different executor kind than the bound owner is a
+// contradiction and rejects.
+TEST(CoveringSearch, AContradictoryBoundOwnerMappingIsRejected) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(ownerMachine(), kVectorOwnerRule);
+  ASSERT_NE(target, nullptr);
+
+  SearchBinding binding = makeSearchBinding(
+      "c", values({{"owner_mapping", std::string("worker")}}));
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                        binding);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::NoMatchingRule));
+}
+
+// A bound memory_path is the set of allowed memory kinds: a rule whose memory
+// requirement sits off the path rejects, one on the path is admitted, and a
+// path naming an unmodeled level rejects explicitly.
+TEST(CoveringSearch, ABoundMemoryPathGatesMemoryRequirements) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(searchMachine(), kRulesWithMemory);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+
+  auto searchWith = [&](llvm::StringRef path) {
+    SearchBinding binding =
+        makeSearchBinding("c", values({{"memory_path", std::string(path)}}));
+    CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                          binding);
+    return search.search();
+  };
+
+  // sram is off this path, so the requirement cannot be met.
+  llvm::Expected<MappingSearchResult> offPath = searchWith("dram");
+  ASSERT_TRUE(static_cast<bool>(offPath))
+      << llvm::toString(offPath.takeError());
+  EXPECT_TRUE(offPath->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*offPath, DiagnosticCode::NoMatchingRule));
+
+  // sram is on this path, so the rule places as before.
+  llvm::Expected<MappingSearchResult> onPath = searchWith("dram:sram");
+  ASSERT_TRUE(static_cast<bool>(onPath)) << llvm::toString(onPath.takeError());
+  EXPECT_FALSE(onPath->plans.empty());
+
+  // An unmodeled level is an unsupported axis, rejected rather than ignored.
+  llvm::Expected<MappingSearchResult> bogus = searchWith("dram:bogus");
+  ASSERT_TRUE(static_cast<bool>(bogus)) << llvm::toString(bogus.takeError());
+  EXPECT_TRUE(bogus->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*bogus, DiagnosticCode::NoMatchingRule));
+}
+
+// A kind-resolved axis is honoured however the space spelled its parameter: the
+// caller resolves the binding's axis by parameter *kind* (only it can see the
+// search space) and passes the value explicitly, so a binding keyed by an
+// arbitrary name -- here "owner" rather than "owner_mapping" -- is projected
+// rather than silently ignored.
+TEST(CoveringSearch, AKindResolvedOwnerAxisIsHonouredRegardlessOfItsName) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(ownerMachine(), kOwnerFreeRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  SearchBinding binding =
+      makeSearchBinding("c", values({{"owner", std::string("worker")}}));
+
+  BoundAxes axes;
+  axes.ownerMapping = "worker";
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options,
+                        binding, {}, axes);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  for (const PlanPlacement &placement : result->plans[0].placements)
+    EXPECT_EQ(placement.executor, "w0");
+}
+
+//===----------------------------------------------------------------------===//
 // A binding constrains rule parameter resolution (phase-4 T2)
 //===----------------------------------------------------------------------===//
 
@@ -3809,6 +4317,7 @@ TEST(MappingDiagnostics, EveryCodeRoundTripsThroughItsString) {
       DiagnosticCode::AssumedValueSize,
       DiagnosticCode::InvalidMappingMetadata,
       DiagnosticCode::ConnectionChoiceUnexplored,
+      DiagnosticCode::InvalidGatherDeclaration,
   };
   for (DiagnosticCode code : codes) {
     llvm::StringRef text = stringifyDiagnosticCode(code);
@@ -3981,6 +4490,569 @@ TEST(MappingDiagnostics, DistinctFailuresCarryDistinctCodes) {
     EXPECT_EQ(result->frontier.diagnostics[index].message,
               againResult->frontier.diagnostics[index].message);
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Physical (layout-image) capacity charging (task B3)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A blocked layout whose physical image rounds the padded second dimension up
+/// to a whole block.
+constexpr llvm::StringLiteral kPaddedLayout = R"llkmap(
+layout t.block(int VW) {
+  param VW in [4..4];
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}
+)llkmap";
+
+/// One `micro.vector` whose `result` carries `tile` in `t.block`. The rule
+/// names the output port, so the solved layout is attributable to the crossing
+/// value.
+constexpr llvm::StringLiteral kPaddedRule = R"llkmap(
+rule r.pad {
+  match micro.vector();
+  require executor kind worker;
+  require memory kind sram;
+  require layout result satisfies t.block;
+  input "operand0";
+  output "result";
+  bundle "b.pad";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// `searchMachine` with sram declaring `t.block` and holding `capacity` bytes.
+MachineModel paddedLayoutMachine(uint64_t capacity) {
+  MachineModel model = searchMachine();
+  for (MemoryNode &memory : model.memories) {
+    if (memory.kind == "sram") {
+      memory.supportedLayouts = {"t.block"};
+      memory.capacityBytes = capacity;
+    }
+  }
+  return model;
+}
+
+/// One node `in -> out` over an 8x6xf32 tile: 192 logical bytes, but the
+/// blocked map's physical image is 8*2*4 = 64 elements = 256 bytes.
+WorkloadGraph raggedTileGraph(mlir::MLIRContext &context, mlir::Type tile) {
+  WorkloadGraph graph;
+  WorkloadValueId input =
+      graph.addValue(WorkloadValue{0, tile, "in", /*external=*/true});
+  WorkloadValueId output =
+      graph.addValue(WorkloadValue{0, tile, "out", /*external=*/false});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.attributes = vectorAttributes(context, "add");
+  node.inputs.push_back(WorkloadPort{input, tile, std::nullopt});
+  node.outputs.push_back(WorkloadPort{output, tile, std::nullopt});
+  graph.addNode(std::move(node));
+  graph.finalize();
+  return graph;
+}
+
+} // namespace
+
+TEST(CoveringSearch, ChargesThePhysicalLayoutImageNotLogicalElements) {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::micro::MicroDialect>();
+  mlir::Type tile = mlir::parseType("!micro.tile<8x6xf32>", &context);
+  ASSERT_TRUE(static_cast<bool>(tile));
+  WorkloadGraph graph = raggedTileGraph(context, tile);
+
+  // 200 bytes admits the 192 logical bytes but not the 256-byte physical image,
+  // so a plan that fits the padded layout does not exist.
+  std::unique_ptr<MappingTarget> tight =
+      targetWithLayouts(paddedLayoutMachine(200), kPaddedRule, kPaddedLayout);
+  ASSERT_NE(tight, nullptr);
+  CoveringSearch tightSearch(graph, *tight, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> rejected = tightSearch.search();
+  ASSERT_TRUE(static_cast<bool>(rejected))
+      << llvm::toString(rejected.takeError());
+  EXPECT_TRUE(rejected->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*rejected, DiagnosticCode::MemoryCapacityExceeded));
+
+  // The same rule admits the plan once the memory holds the physical image.
+  std::unique_ptr<MappingTarget> roomy =
+      targetWithLayouts(paddedLayoutMachine(256), kPaddedRule, kPaddedLayout);
+  ASSERT_NE(roomy, nullptr);
+  CoveringSearch roomySearch(graph, *roomy, context, LayoutContext{});
+  llvm::Expected<MappingSearchResult> admitted = roomySearch.search();
+  ASSERT_TRUE(static_cast<bool>(admitted))
+      << llvm::toString(admitted.takeError());
+  EXPECT_FALSE(admitted->plans.empty());
+}
+
+//===----------------------------------------------------------------------===//
+// Joint connection branching (task B7)
+//===----------------------------------------------------------------------===//
+
+/// `twoDestinationHopMachine` plus a dear *direct* route to each consumer.
+/// Every consumer's cheapest route stages through `stage.0`; taking both fills
+/// it past its 5000-byte capacity, so a feasible covering must send at least
+/// one consumer over its dearer direct route -- which no locally-cheapest
+/// greedy pick finds.
+MachineModel sharedStagingFanOutMachine() {
+  MachineModel model = twoDestinationHopMachine();
+  auto link = [](llvm::StringRef id, llvm::StringRef source,
+                 llvm::StringRef destination, double latency) {
+    LinkEdge edge;
+    edge.id = id.str();
+    edge.source = source.str();
+    edge.destination = destination.str();
+    edge.bandwidthBytesPerCycle = 32;
+    edge.latencyCycles = latency;
+    edge.transactionBytes = 64;
+    edge.transferEngines = {"dma.0"};
+    return edge;
+  };
+  model.links.push_back(link("dram_direct_acc.0", "dram.0", "acc.0", 1000));
+  model.links.push_back(link("dram_direct_aux.0", "dram.0", "aux.0", 1000));
+  return model;
+}
+
+/// The three 1-cycle rules of `kTwoConsumerRules` (one producer, two
+/// consumers).
+constexpr double kFanOutInstanceCycles = 3.0;
+
+/// The dear direct hop's transfer cycles: its latency plus the untyped value's
+/// 4096 bytes at the link's 32 bytes/cycle.
+constexpr double kDirectHopCycles = 1000.0 + 4096.0 / 32.0;
+
+TEST(CoveringSearch, ExactBranchesOverFanOutRoutesToFitSharedStaging) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoConsumerGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sharedStagingFanOutMachine(), kTwoConsumerRules);
+  ASSERT_NE(target, nullptr);
+
+  // Premise: one staged 4096-byte copy fits `stage.0`, two do not.
+  const MemoryNode *stage = target->machine().findMemory("stage.0");
+  ASSERT_NE(stage, nullptr);
+  ASSERT_GE(stage->capacityBytes, 4096u);
+  ASSERT_LT(stage->capacityBytes, 2u * 4096u);
+
+  // The independent brute-force oracle: each consumer chooses its staged
+  // (cheap, one 4096-byte tile live on `stage.0`) or direct (dear, nothing
+  // staged) route, and the combination is legal iff the summed staged bytes
+  // fit. This is the `route_oracle` of the task brief, over the two groups.
+  struct Route {
+    double cost;
+    uint64_t liveBytes;
+  };
+  const std::vector<Route> routes = {
+      {2.0 * kFanTransferCycles, 4096u}, // dram -> stage -> {acc,aux}
+      {kDirectHopCycles, 0u},            // dram -> {acc,aux}
+  };
+  double oracleBest = std::numeric_limits<double>::infinity();
+  for (const Route &first : routes)
+    for (const Route &second : routes)
+      if (first.liveBytes + second.liveBytes <= stage->capacityBytes)
+        oracleBest = std::min(oracleBest, first.cost + second.cost);
+  ASSERT_TRUE(std::isfinite(oracleBest));
+  // Guard the premise: both-staged is infeasible, so the oracle optimum is one
+  // dear direct route and not the locally-cheapest pair.
+  EXPECT_DOUBLE_EQ(oracleBest, kFanTransferCycles * 2.0 + kDirectHopCycles);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  EXPECT_FALSE(result->searchTruncated);
+  EXPECT_DOUBLE_EQ(result->plans[0].totalCost.latencyCycles,
+                   kFanOutInstanceCycles + oracleBest);
+  // Two symmetric combinations tie at the optimum; the emitted order breaks the
+  // tie on the exposed plan id, so the smaller id ranks first.
+  ASSERT_GE(result->plans.size(), 2u);
+  EXPECT_DOUBLE_EQ(result->plans[1].totalCost.latencyCycles,
+                   kFanOutInstanceCycles + oracleBest);
+  EXPECT_LT(result->plans[0].id, result->plans[1].id);
+
+  // The optimum is strictly dearer than the locally-cheapest pair, so the
+  // search provably did not collapse to it: the both-staged combination does
+  // not fit.
+  EXPECT_GT(result->plans[0].totalCost.latencyCycles,
+            kFanOutInstanceCycles + 2.0 * kFanTransferCycles);
+
+  // Deterministic mode branches over the same alternatives, so it returns the
+  // same feasible covering rather than rejecting the graph -- all three modes
+  // share the joint enumeration, and differ only in traversal.
+  MappingSearchOptions deterministic;
+  deterministic.mode = SearchMode::Deterministic;
+  CoveringSearch deterministicSearch(graph, *target, context, LayoutContext{},
+                                     deterministic);
+  llvm::Expected<MappingSearchResult> deterministicResult =
+      deterministicSearch.search();
+  ASSERT_TRUE(static_cast<bool>(deterministicResult))
+      << llvm::toString(deterministicResult.takeError());
+  ASSERT_FALSE(deterministicResult->plans.empty());
+  EXPECT_DOUBLE_EQ(deterministicResult->plans[0].totalCost.latencyCycles,
+                   kFanOutInstanceCycles + oracleBest);
+}
+
+// The same joint search is insertion-order and repetition independent: two runs
+// over one graph, and a run over an equivalently-built graph, agree on the
+// emitted plan ids. (The fan-out's two symmetric optima are a stable tie, so a
+// nondeterministic product would expose itself here.)
+TEST(CoveringSearch, JointConnectionSearchIsDeterministic) {
+  mlir::MLIRContext context;
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sharedStagingFanOutMachine(), kTwoConsumerRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+
+  auto ids = [&](const WorkloadGraph &runGraph) {
+    CoveringSearch search(runGraph, *target, context, LayoutContext{}, options);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    EXPECT_TRUE(static_cast<bool>(result));
+    std::vector<PlanId> planIds;
+    if (result)
+      for (const CoveringPlan &plan : result->plans)
+        planIds.push_back(plan.id);
+    return planIds;
+  };
+
+  WorkloadGraph graph = twoConsumerGraph(context);
+  std::vector<PlanId> first = ids(graph);
+  std::vector<PlanId> second = ids(graph);
+  // A second, freshly-built graph with the same logical content.
+  std::vector<PlanId> rebuilt = ids(twoConsumerGraph(context));
+  ASSERT_FALSE(first.empty());
+  EXPECT_EQ(first, second) << "repeated runs differ";
+  EXPECT_EQ(first, rebuilt) << "an equivalent graph built afresh differs";
+}
+
+// The connection-choice cap is a cap, not a choice collapse: reaching it
+// reports truncation and never sets the pre-B7 "unexplored choice" notice.
+TEST(CoveringSearch, ConnectionChoiceCapReportsTruncationNotACollapse) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoConsumerGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sharedStagingFanOutMachine(), kTwoConsumerRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.maxConnectionCombinations = 1; // the product has four combinations
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->searchTruncated);
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::SearchTruncated));
+  // The cap names itself, so a reader can tell it apart from the route cap.
+  bool namedCap = false;
+  for (const Diagnostic &diagnostic : result->frontier.diagnostics)
+    if (diagnostic.message.find("maxConnectionCombinations") !=
+        std::string::npos)
+      namedCap = true;
+  EXPECT_TRUE(namedCap);
+  // A cap is not a collapse.
+  EXPECT_FALSE(result->connectionChoicesUnexplored);
+  EXPECT_FALSE(
+      hasDiagnostic(*result, DiagnosticCode::ConnectionChoiceUnexplored));
+  // The one combination examined is legal (best-first), so a plan is still
+  // produced -- but the search honestly reports that more remained.
+  EXPECT_FALSE(result->plans.empty());
+}
+
+//===----------------------------------------------------------------------===//
+// A search-selected gather declares its semantics (B6 carry-over)
+//===----------------------------------------------------------------------===//
+
+/// The namespaced keys a consumer uses to declare its gather combination. They
+/// are qualified because a workload node's attribute dictionary is its whole op
+/// attribute set (extraction copies `getAttrDictionary()`): a bare `axis` is a
+/// real attribute on `micro.reduce`, so an unqualified key would misread a
+/// reduction axis as a concatenation axis.
+constexpr llvm::StringLiteral kGatherKindAttr = "micro.gather_kind";
+constexpr llvm::StringLiteral kGatherAxisAttr = "micro.gather_axis";
+
+/// A consumer declaring a gather combination. `kindAttr`/`axisAttr` default to
+/// the namespaced keys; a control passes the bare `kind`/`axis` to prove they
+/// are ignored.
+mlir::DictionaryAttr
+gatherConsumerAttributes(mlir::MLIRContext &context, llvm::StringRef kind,
+                         std::optional<int64_t> axis,
+                         llvm::StringRef kindAttr = kGatherKindAttr,
+                         llvm::StringRef axisAttr = kGatherAxisAttr) {
+  std::vector<mlir::NamedAttribute> attributes{
+      mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
+                           mlir::StringAttr::get(&context, "consume")),
+      mlir::NamedAttribute(mlir::StringAttr::get(&context, kindAttr),
+                           mlir::StringAttr::get(&context, kind))};
+  if (axis)
+    attributes.push_back(mlir::NamedAttribute(
+        mlir::StringAttr::get(&context, axisAttr),
+        mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), *axis)));
+  return mlir::DictionaryAttr::get(&context, attributes);
+}
+
+/// `fanInGraph` with the consumer declaring a gather combination, so the search
+/// can select a real gather rather than only a hand-built connection.
+WorkloadGraph declaredGatherGraph(mlir::MLIRContext &context,
+                                  mlir::DictionaryAttr consumerAttributes,
+                                  llvm::StringRef consumerOp = "micro.vector") {
+  WorkloadGraph graph;
+  WorkloadValueId in1 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in1", /*external=*/true});
+  WorkloadValueId in2 =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "in2", /*external=*/true});
+  WorkloadValueId middle =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "mid", /*external=*/false});
+  WorkloadValueId out =
+      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
+
+  auto producer = [&](WorkloadValueId input, unsigned ordinal) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.attributes = vectorAttributes(context, "produce");
+    node.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
+    node.outputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  producer(in1, 0);
+  producer(in2, 1);
+
+  WorkloadNode consumer;
+  consumer.opName = consumerOp.str();
+  consumer.sourceOrdinal = 2;
+  consumer.attributes = consumerAttributes;
+  consumer.inputs.push_back(WorkloadPort{middle, mlir::Type(), std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{out, mlir::Type(), std::nullopt});
+  graph.addNode(std::move(consumer));
+
+  graph.finalize();
+  return graph;
+}
+
+TEST(CoveringSearch, SearchSelectedPlanDeclaresASumGather) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context, gatherConsumerAttributes(context, "sum", std::nullopt));
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  const CoveringPlan &plan = result->plans[0];
+  ASSERT_EQ(plan.connectionPlans.size(), 1u);
+  const PlanConnection &connection = plan.connectionPlans[0];
+  EXPECT_EQ(connection.kind, ConnectionKind::Reduce);
+  // The plan states what its reduce *means*, not only that it combines several
+  // producers -- the B6 carry-over is closed.
+  ASSERT_TRUE(connection.gatherSemantics.has_value());
+  EXPECT_EQ(*connection.gatherSemantics, GatherSemantics::Sum);
+  EXPECT_FALSE(connection.concatAxis.has_value());
+  // Both producer occurrences travel with the connection.
+  EXPECT_EQ(connection.producerPorts.size(), 2u);
+  for (const PortRef &port : connection.producerPorts)
+    EXPECT_EQ(port.direction, PortDirection::Output);
+}
+
+TEST(CoveringSearch, SearchSelectedPlanDeclaresAConcatGatherWithItsAxis) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context, gatherConsumerAttributes(context, "concat", 0));
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  const PlanConnection &connection = result->plans[0].connectionPlans[0];
+  ASSERT_TRUE(connection.gatherSemantics.has_value());
+  EXPECT_EQ(*connection.gatherSemantics, GatherSemantics::Concatenate);
+  ASSERT_TRUE(connection.concatAxis.has_value());
+  EXPECT_EQ(*connection.concatAxis, 0u);
+  EXPECT_EQ(connection.producerPorts.size(), 2u);
+}
+
+// A reduce whose consumer declares no combination keeps B6's rule: no semantics
+// is inferred from the producer count, so the plan carries none.
+TEST(CoveringSearch, AnUndeclaredGatherCarriesNoSemantics) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = fanInGraph(context); // consumer declares no `kind`
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_EQ(result->plans[0].connectionPlans.size(), 1u);
+  EXPECT_EQ(result->plans[0].connectionPlans[0].kind, ConnectionKind::Reduce);
+  EXPECT_FALSE(result->plans[0].connectionPlans[0].gatherSemantics.has_value());
+}
+
+// The declaration keys are namespaced, so another op's `kind`/`axis` is never
+// read as a gather. A bare `kind="concat"` plus a bare `axis` declares nothing.
+TEST(CoveringSearch, AnUnnamespacedGatherDeclarationIsIgnored) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context, gatherConsumerAttributes(context, "concat", 0, "kind", "axis"));
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_EQ(result->plans[0].connectionPlans.size(), 1u);
+  EXPECT_EQ(result->plans[0].connectionPlans[0].kind, ConnectionKind::Reduce);
+  EXPECT_FALSE(result->plans[0].connectionPlans[0].gatherSemantics.has_value());
+}
+
+// A `Concatenate` declares an axis or it is refused: `micro.gather` requires
+// one and guessing would materialize a different tile. A declaration whose axis
+// sits on a bare `axis` is not a namespaced axis, so the connection is refused
+// with a stable reason rather than silently reading the wrong key.
+TEST(CoveringSearch, AConcatGatherWithoutItsNamespacedAxisIsRejected) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context,
+      gatherConsumerAttributes(context, "concat", 0, kGatherKindAttr, "axis"));
+  std::unique_ptr<MappingTarget> target = targetWith(fanMachine(), kFanRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::InvalidGatherDeclaration));
+}
+
+/// A producer rule and a `micro.reduce` consumer rule, so a reduction consumer
+/// (which carries its own bare `axis`) can stand as a gather's consumer.
+constexpr llvm::StringLiteral kGatherReduceRules = R"llkmap(
+rule r.produce {
+  match micro.vector(op = "produce");
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.produce";
+  emit "e1";
+  cost 1;
+}
+rule r.reduce {
+  match micro.reduce(op = "sum");
+  require executor kind worker;
+  require memory kind acc;
+  bundle "b.reduce";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
+/// A `micro.reduce` consumer's attribute dictionary. `axis` is the reduction's
+/// own attribute (`MicroOps.td`'s `I64Attr:$axis`); `gatherKind`/`gatherAxis`
+/// are the namespaced gather declaration, added only when wanted.
+mlir::DictionaryAttr reductionConsumerAttributes(
+    mlir::MLIRContext &context, std::optional<int64_t> axis,
+    llvm::StringRef gatherKind, std::optional<int64_t> gatherAxis) {
+  std::vector<mlir::NamedAttribute> attributes{
+      mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
+                           mlir::StringAttr::get(&context, "sum"))};
+  if (axis)
+    attributes.push_back(mlir::NamedAttribute(
+        mlir::StringAttr::get(&context, "axis"),
+        mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), *axis)));
+  if (!gatherKind.empty())
+    attributes.push_back(
+        mlir::NamedAttribute(mlir::StringAttr::get(&context, kGatherKindAttr),
+                             mlir::StringAttr::get(&context, gatherKind)));
+  if (gatherAxis)
+    attributes.push_back(mlir::NamedAttribute(
+        mlir::StringAttr::get(&context, kGatherAxisAttr),
+        mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64),
+                               *gatherAxis)));
+  return mlir::DictionaryAttr::get(&context, attributes);
+}
+
+// A `micro.reduce` consumer's own `axis` is a reduction axis, not a gather
+// declaration: with no `micro.gather_kind` it is never misread as a concat.
+TEST(CoveringSearch, AReductionConsumersOwnAxisIsNotAGatherDeclaration) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context, reductionConsumerAttributes(context, 1, "", std::nullopt),
+      "micro.reduce");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(fanMachine(), kGatherReduceRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_EQ(result->plans[0].connectionPlans.size(), 1u);
+  EXPECT_EQ(result->plans[0].connectionPlans[0].kind, ConnectionKind::Reduce);
+  EXPECT_FALSE(result->plans[0].connectionPlans[0].gatherSemantics.has_value());
+  EXPECT_FALSE(result->plans[0].connectionPlans[0].concatAxis.has_value());
+}
+
+// The same reduction consumer *may* declare a gather, and then its declared
+// namespaced axis governs -- the reduction's own `axis` is still not consulted.
+TEST(CoveringSearch, AReductionConsumerMayDeclareAGatherWithItsOwnAxis) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = declaredGatherGraph(
+      context, reductionConsumerAttributes(context, 1, "concat", 0),
+      "micro.reduce");
+  std::unique_ptr<MappingTarget> target =
+      targetWith(fanMachine(), kGatherReduceRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const PlanConnection &connection = result->plans[0].connectionPlans[0];
+  ASSERT_TRUE(connection.gatherSemantics.has_value());
+  EXPECT_EQ(*connection.gatherSemantics, GatherSemantics::Concatenate);
+  ASSERT_TRUE(connection.concatAxis.has_value());
+  EXPECT_EQ(*connection.concatAxis, 0u); // not the reduction's bare axis=1
+}
+
+// §22.2: a fan-out's synthesized alternatives are tallied. Two destination
+// groups contribute two -- the figure the pre-B7 greedy synthesis reported.
+TEST(CoveringSearch, FanOutAlternativesAreCounted) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoConsumerGraph(context);
+  std::unique_ptr<MappingTarget> target =
+      targetWith(sharedStagingFanOutMachine(), kTwoConsumerRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_EQ(result->routeCount, 2u);
 }
 
 TEST(CoveringSearch, RejectsConflictingRequirementsOnOneEndpoint) {

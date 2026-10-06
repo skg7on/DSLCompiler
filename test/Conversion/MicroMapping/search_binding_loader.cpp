@@ -419,6 +419,71 @@ micro.search_space @space attributes {workload = "w"} {
   EXPECT_TRUE(layouts->empty());
 }
 
+TEST(SearchBindingLoader, LoadsOwnerAndMemoryPathAxesByKind) {
+  // The parameters are spelled "owner" and "mem", but declare the axis *kinds*,
+  // so resolving by kind honours them: the name is not a contract.
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "owner" {kind = "owner_mapping", choices = ["worker/vector_engine"]}
+  micro.param "mem" {kind = "memory_path", choices = ["dram:sram:acc"]}
+  micro.candidate @c {bindings = {owner = "worker/vector_engine", mem = "dram:sram:acc"}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto axes = loadBoundAxes(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(axes)) << llvm::toString(axes.takeError());
+  EXPECT_EQ(axes->ownerMapping, "worker/vector_engine");
+  EXPECT_EQ(axes->memoryPath, "dram:sram:acc");
+  EXPECT_FALSE(axes->empty());
+}
+
+TEST(SearchBindingLoader, TwoOwnerMappingParamsCannotBeResolved) {
+  // Two parameters of one axis kind: which one selects the axis is
+  // unanswerable, so it is reported rather than silently picking one -- a value
+  // the caller bound would otherwise be ignored.
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "a" {kind = "owner_mapping", choices = ["worker/lane"]}
+  micro.param "b" {kind = "owner_mapping", choices = ["worker/lane"]}
+  micro.candidate @c {bindings = {a = "worker/lane", b = "worker/lane"}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto axes = loadBoundAxes(parsed->module.get(), *binding);
+  std::string error = takeError(axes);
+  EXPECT_NE(error.find("more than one 'owner_mapping' parameter"),
+            std::string::npos)
+      << error;
+}
+
+TEST(SearchBindingLoader, NoAxisKindParameterLeavesAxesUnbound) {
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "VW" {kind = "integer", choices = [4 : i64, 8 : i64]}
+  micro.candidate @c {bindings = {VW = 8 : i64}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto axes = loadBoundAxes(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(axes)) << llvm::toString(axes.takeError());
+  EXPECT_TRUE(axes->empty());
+}
+
 TEST(SearchBindingLoader, RejectsABindingWhoseCandidateIsGone) {
   auto parsed = parseFixture();
   ASSERT_TRUE(parsed);
