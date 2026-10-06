@@ -2166,3 +2166,248 @@ TEST(RuleVerify, RejectsWhenNoAssignmentSatisfiesTheRule) {
                                  recordedOn("worker.0"));
   EXPECT_NE(error.find("no_matching_rule"), std::string::npos) << error;
 }
+
+//===----------------------------------------------------------------------===//
+// Stage C7: bounded graph-pattern rules
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The fused rule the plan names: a convert feeding a SiLU feeding the gating
+/// multiply, implemented as one unit.
+constexpr llvm::StringLiteral kFusedRule = R"llkmap(
+rule avx2.fused_convert_silu_mul v1 {
+  match graph {
+    node cv: micro.vector(op = "convert");
+    node act: micro.vector(op = "silu");
+    node gate: micro.vector(op = "mul");
+    edge cv.result -> act.operand0;
+    edge act.result -> gate.operand0;
+  }
+  input "cv.operand0";
+  input "gate.operand1";
+  output "gate.result";
+  bundle "avx2.fused.convert_silu_mul";
+  emit "avx2_vector_convert";
+  cost 3;
+}
+)llkmap";
+
+/// A chain of `count` vector nodes, each consuming the previous one's result,
+/// with the op of node `i` taken from `ops`. The first input and last output
+/// are external, so the chain is a connected subgraph with a two-port boundary.
+WorkloadGraph vectorChain(mlir::MLIRContext &context,
+                          llvm::ArrayRef<llvm::StringRef> ops,
+                          mlir::Type tile) {
+  WorkloadGraph graph;
+  WorkloadValueId current =
+      graph.addValue(WorkloadValue{0, tile, "in", /*external=*/true});
+  for (size_t index = 0; index < ops.size(); ++index) {
+    bool last = index + 1 == ops.size();
+    WorkloadValueId next = graph.addValue(
+        WorkloadValue{0, tile, last ? "out" : "v" + std::to_string(index),
+                      /*external=*/false});
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = static_cast<uint32_t>(index);
+    node.attributes = mlir::DictionaryAttr::get(
+        &context,
+        {mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
+                              mlir::StringAttr::get(&context, ops[index]))});
+    node.inputs.push_back(WorkloadPort{current, tile, std::nullopt});
+    node.outputs.push_back(WorkloadPort{next, tile, std::nullopt});
+    graph.addNode(std::move(node));
+    current = next;
+  }
+  graph.finalize();
+  return graph;
+}
+
+} // namespace
+
+TEST(GraphRule, RoundTripsTheDeclaredPattern) {
+  llvm::Expected<RuleRegistry> registry = parse(kFusedRule);
+  ASSERT_TRUE(bool(registry)) << llvm::toString(registry.takeError());
+  const RuleDef *rule = registry->find("avx2.fused_convert_silu_mul");
+  ASSERT_TRUE(rule);
+  ASSERT_TRUE(rule->pattern);
+  ASSERT_EQ(rule->pattern->nodes.size(), 3u);
+  ASSERT_EQ(rule->pattern->edges.size(), 2u);
+  // The anchor's operation is what a reader that only wants "where does this
+  // rule start" gets, whichever form the rule was written in.
+  EXPECT_EQ(rule->matchOp, "micro.vector");
+  EXPECT_EQ(rule->pattern->nodes.front().name, "cv");
+  EXPECT_EQ(rule->pattern->edges[0].producer, "cv");
+  EXPECT_EQ(rule->pattern->edges[0].resultIndex, 0u);
+  EXPECT_EQ(rule->pattern->edges[0].consumer, "act");
+  EXPECT_EQ(rule->pattern->edges[0].operandIndex, 0u);
+
+  // Printing is the round trip's other half: the graph form has to come back
+  // out the way it went in, or a rule read from a file would not survive being
+  // written to one.
+  std::string printed = printRule(*rule);
+  EXPECT_NE(printed.find("match graph {"), std::string::npos) << printed;
+  EXPECT_NE(printed.find("edge cv.result0 -> act.operand0;"), std::string::npos)
+      << printed;
+
+  llvm::Expected<RuleRegistry> reparsed = parse(printed);
+  ASSERT_TRUE(bool(reparsed)) << llvm::toString(reparsed.takeError()) << "\n"
+                              << printed;
+  const RuleDef *again = reparsed->find("avx2.fused_convert_silu_mul");
+  ASSERT_TRUE(again);
+  ASSERT_TRUE(again->pattern);
+  ASSERT_EQ(again->pattern->nodes.size(), 3u);
+  ASSERT_EQ(again->pattern->edges.size(), 2u);
+  EXPECT_EQ(printRule(*again), printed);
+}
+
+TEST(GraphRule, RejectsDuplicateNodeNames) {
+  EXPECT_FALSE(parses(R"llkmap(
+rule bad v1 {
+  match graph {
+    node cv: micro.vector(op = "convert");
+    node cv: micro.vector(op = "silu");
+  }
+  bundle "b";
+  emit "e";
+}
+)llkmap"));
+}
+
+TEST(GraphRule, RejectsEdgesNamingUndeclaredNodes) {
+  EXPECT_FALSE(parses(R"llkmap(
+rule bad v1 {
+  match graph {
+    node cv: micro.vector(op = "convert");
+    edge cv.result -> missing.operand0;
+  }
+  bundle "b";
+  emit "e";
+}
+)llkmap"));
+}
+
+TEST(GraphRule, RejectsADuplicateEdge) {
+  EXPECT_FALSE(parses(R"llkmap(
+rule bad v1 {
+  match graph {
+    node cv: micro.vector(op = "convert");
+    node act: micro.vector(op = "silu");
+    edge cv.result -> act.operand0;
+    edge cv.result -> act.operand0;
+  }
+  bundle "b";
+  emit "e";
+}
+)llkmap"));
+}
+
+TEST(GraphRule, MatchesAChainAndReportsItsBoundary) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(kFusedRule);
+  ASSERT_TRUE(bool(registry)) << llvm::toString(registry.takeError());
+
+  WorkloadGraph graph = vectorChain(context, {"convert", "silu", "mul"},
+                                    mlir::IndexType::get(&context));
+  std::vector<RulePatternMatch> matches = matchRulePatterns(graph, *registry);
+  ASSERT_EQ(matches.size(), 1u);
+  ASSERT_EQ(matches.front().coveredNodes.size(), 3u);
+
+  // The covered nodes are in the **pattern's** declaration order, not the
+  // graph's: `cv` first even though a finalized graph may order its nodes
+  // differently. Comparing by operation rather than by id is what keeps the
+  // assertion about the matcher rather than about graph numbering.
+  auto opOf = [&](WorkloadNodeId id) {
+    const WorkloadNode *node = graph.findNode(id);
+    return node->attributes.getAs<mlir::StringAttr>("op").getValue().str();
+  };
+  EXPECT_EQ(opOf(matches.front().coveredNodes[0]), "convert");
+  EXPECT_EQ(opOf(matches.front().coveredNodes[1]), "silu");
+  EXPECT_EQ(opOf(matches.front().coveredNodes[2]), "mul");
+
+  // The boundary is what leaves the match: the chain's entry operand and its
+  // final result. Each node here has one operand, so the two values *inside*
+  // the match are the rule's business and are not ports -- which is the whole
+  // point of computing the boundary from the edges rather than from every
+  // operand.
+  ASSERT_EQ(matches.front().boundary.size(), 2u);
+  unsigned inputs = 0, outputs = 0;
+  for (const PortRef &ref : matches.front().boundary) {
+    if (ref.direction == PortDirection::Input) {
+      ++inputs;
+      EXPECT_EQ(opOf(ref.node), "convert");
+      continue;
+    }
+    ++outputs;
+    // The only result that leaves the match is the last node's.
+    EXPECT_EQ(opOf(ref.node), "mul");
+  }
+  EXPECT_EQ(inputs, 1u);
+  EXPECT_EQ(outputs, 1u);
+}
+
+TEST(GraphRule, DoesNotMatchWhenAnEdgeDoesNotHold) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(kFusedRule);
+  ASSERT_TRUE(bool(registry)) << llvm::toString(registry.takeError());
+
+  // The operations are right and the order is right, but the chain is
+  // convert -> mul -> silu: the `act` node does not consume the `cv` node's
+  // result, so the pattern's first edge has nothing to bind to. A matcher that
+  // only checked the nodes would accept this.
+  WorkloadGraph graph = vectorChain(context, {"convert", "mul", "silu"},
+                                    mlir::IndexType::get(&context));
+  std::vector<RulePatternMatch> matches = matchRulePatterns(graph, *registry);
+  EXPECT_TRUE(matches.empty());
+}
+
+TEST(GraphRule, RejectsAnEdgeWhoseOccurrenceDoesNotExist) {
+  // The syntax is well-formed but `operand3` names an occurrence a one-operand
+  // operation cannot have; it is refused at match time rather than binding to
+  // whatever operand happens to be there.
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule bad v1 {
+  match graph {
+    node cv: micro.vector(op = "convert");
+    node act: micro.vector(op = "silu");
+    edge cv.result -> act.operand3;
+  }
+  bundle "b";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(bool(registry)) << llvm::toString(registry.takeError());
+
+  WorkloadGraph graph =
+      vectorChain(context, {"convert", "silu"}, mlir::IndexType::get(&context));
+  std::vector<RulePatternMatch> matches = matchRulePatterns(graph, *registry);
+  EXPECT_TRUE(matches.empty());
+}
+
+TEST(GraphRule, ReportsTheMatchCap) {
+  mlir::MLIRContext context;
+  llvm::Expected<RuleRegistry> registry = parse(R"llkmap(
+rule pair v1 {
+  match graph {
+    node a: micro.vector(op = "add");
+    node b: micro.vector(op = "add");
+    edge a.result -> b.operand0;
+  }
+  bundle "b";
+  emit "e";
+}
+)llkmap");
+  ASSERT_TRUE(bool(registry)) << llvm::toString(registry.takeError());
+
+  // Two overlapping pairs in a three-node chain, and a cap of one: the cap is
+  // *reported*, because an incomplete match set is an incomplete covering and
+  // presenting it as a smaller one would be a lie about what was searched.
+  WorkloadGraph graph = vectorChain(context, {"add", "add", "add"},
+                                    mlir::IndexType::get(&context));
+  bool truncated = false;
+  std::vector<RulePatternMatch> matches =
+      matchRulePatterns(graph, *registry, /*maxMatches=*/1, &truncated);
+  EXPECT_EQ(matches.size(), 1u);
+  EXPECT_TRUE(truncated);
+}

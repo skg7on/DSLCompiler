@@ -51,7 +51,7 @@ FIXTURE="$SRC/test/Conversion/MicroMapping/micro_map_candidate.mlir"
 # binds (see binding_layouts.llkmap).
 PROBE="target=probe machine=$SRC/machines/x86-avx2-v2.yaml layouts=$SRC/test/Conversion/MicroMapping/binding_layouts.llkmap rules=$SRC/test/Conversion/MicroMapping/binding_rules.llkmap emitters=binding_vector_add,binding_copy"
 # The shipped AVX2 target, whose layout ids are namespaced (`avx2.blocked_2d`).
-AVX2="target=x86-avx2 machine=$SRC/machines/x86-avx2-v2.yaml layouts=$SRC/mapping/x86-avx2/layouts.llkmap rules=$SRC/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store"
+AVX2="target=x86-avx2 machine=$SRC/machines/x86-avx2-v2.yaml layouts=$SRC/mapping/x86-avx2/layouts.llkmap rules=$SRC/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul"
 
 fail() {
   echo "micro_map_candidate.sh: $1" >&2

@@ -81,6 +81,11 @@ struct InstanceEntry {
   /// from the candidate so the selected plan can persist the assignment
   /// generation solved (task B1).
   llvm::StringMap<SearchValue> resolvedParameters;
+  /// The workload nodes this instance covers. One node for a one-op rule; the
+  /// whole match for a fused one. A covering is a *partition*: taking a fused
+  /// instance finishes every node it covers at once, and a node already covered
+  /// cannot be covered again.
+  std::vector<WorkloadNodeId> coveredNodes;
 };
 
 struct NodeTable {
@@ -563,6 +568,51 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   placementOptions.maxConnectionCombinations =
       options_.maxConnectionCombinations;
 
+  // The binding pointers are loop-invariant, so the fused matches -- which are
+  // found once for the whole graph -- can use them too.
+  const llvm::StringMap<SearchValue> *pinned =
+      binding_ ? &binding_->values : nullptr;
+  const llvm::StringMap<std::string> *boundLayouts =
+      boundLayouts_.empty() ? nullptr : &boundLayouts_;
+  const BoundAxes *boundAxes = boundAxes_.empty() ? nullptr : &boundAxes_;
+
+  // --- fused candidates ---------------------------------------------------
+  // A graph rule covers several nodes at once. Its candidate is registered
+  // under the *lowest-id* node it covers -- the one the search reaches first
+  // when none of the match is placed -- so it is offered exactly when the whole
+  // match is still free. A match whose lowest node is already covered cannot be
+  // taken, which `placeInstance` refuses rather than partially applying.
+  std::map<WorkloadNodeId, std::vector<MappingCandidate>> fusedByAnchor;
+  if (options_.maxFusedMatches != 0) {
+    bool patternTruncated = false;
+    std::vector<RulePatternMatch> patternMatches =
+        matchRulePatterns(workload_, target_.rules(), options_.maxFusedMatches,
+                          &patternTruncated);
+    if (patternTruncated) {
+      result.searchTruncated = true;
+      report(DiagnosticCode::SearchTruncated,
+             "fused pattern match cap reached (maxFusedMatches=" +
+                 std::to_string(options_.maxFusedMatches) + ")");
+    }
+    for (const RulePatternMatch &match : patternMatches) {
+      if (!match.rule)
+        continue;
+      WorkloadNodeId lowest = match.coveredNodes.front();
+      for (WorkloadNodeId id : match.coveredNodes)
+        lowest = std::min(lowest, id);
+      std::string reason;
+      std::optional<MappingCandidate> candidate = toFusedMappingCandidate(
+          *match.rule, match, workload_, machine, layoutContext_, &reason,
+          nullptr, pinned, boundLayouts, boundAxes);
+      if (!candidate) {
+        report(DiagnosticCode::NoMatchingRule,
+               "fused rule '" + match.rule->id + "' not applicable: " + reason);
+        continue;
+      }
+      fusedByAnchor[lowest].push_back(std::move(*candidate));
+    }
+  }
+
   std::vector<NodeTable> tables;
   for (const WorkloadNode *node : ordered) {
     NodeTable table;
@@ -589,22 +639,6 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     // the constraint search hit its cap the match was not proven false, so the
     // result is reported as truncated rather than silently treated as absent.
     bool producedCandidate = false;
-    // A binding is authoritative for the rule parameters it names: each rule
-    // resolves at that search-space point, so its pinned parameters take only
-    // the bound value. With no binding the pointer is null and resolution is
-    // exactly the pre-binding enumeration.
-    const llvm::StringMap<SearchValue> *pinned =
-        binding_ ? &binding_->values : nullptr;
-    // The layouts the binding resolves to, one per role, resolved from the
-    // space's `layout`-kind parameters by the caller. An empty map -- no
-    // binding, or a binding with no layout-kind parameter -- leaves layout
-    // selection unchanged.
-    const llvm::StringMap<std::string> *boundLayouts =
-        boundLayouts_.empty() ? nullptr : &boundLayouts_;
-    // The owner_mapping/memory_path axes, resolved by parameter *kind* by the
-    // caller, so a space that names the parameter differently is still
-    // honoured.
-    const BoundAxes *boundAxes = boundAxes_.empty() ? nullptr : &boundAxes_;
     for (const RuleDef *rule : matches) {
       std::string reason;
       bool truncated = false;
@@ -651,6 +685,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         InstanceEntry entry{std::move(instance), rule, {}, {}};
         entry.cost = entry.instance.localCost;
         entry.resolvedParameters = candidate->resolvedParameters;
+        entry.coveredNodes = {node->id};
         if (options_.enableLatencyCache) {
           if (const LatencyProvider *provider = target_.latencyProvider()) {
             OperationSignature signature;
@@ -700,6 +735,51 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
              "node " + std::to_string(node->id) + " ('" + node->opName +
                  "'): no rule satisfies its constraints");
     }
+    // Fused candidates whose lowest covered node is this one: this is the node
+    // the search reaches first while the whole match is still uncovered.
+    auto fused = fusedByAnchor.find(node->id);
+    if (fused != fusedByAnchor.end()) {
+      for (MappingCandidate &candidate : fused->second) {
+        PlacementFailure placementFailure = PlacementFailure::None;
+        bool placementTruncated = false;
+        llvm::Expected<std::vector<CandidateInstance>> instances =
+            enumeratePlacements(candidate, target_, context_, layoutContext_,
+                                placementOptions, &placementTruncated,
+                                &placementFailure);
+        if (!instances)
+          return instances.takeError();
+        result.instanceCount += instances->size();
+        if (placementTruncated) {
+          result.searchTruncated = true;
+          report(DiagnosticCode::SearchTruncated,
+                 "fused instance cap reached (maxInstancesPerCandidate=" +
+                     std::to_string(options_.maxInstancesPerCandidate) + ")");
+        }
+        if (instances->empty()) {
+          ++result.frontier.candidatesWithoutPlacement;
+          DiagnosticCode code = placementFailureCode(placementFailure);
+          report(code, "fused rule '" + candidate.rule +
+                           "' has no legal placement (" +
+                           stringifyDiagnosticCode(code).str() + ")");
+          continue;
+        }
+        // The rule definition the placement belongs to, so the binder can
+        // re-resolve it exactly as it does for a one-op candidate.
+        const RuleDef *ruleDef = target_.rules().find(candidate.rule);
+        if (!ruleDef)
+          continue;
+        ++result.candidateCount;
+        for (CandidateInstance &instance : *instances) {
+          InstanceEntry entry{std::move(instance), ruleDef, {}, {}};
+          entry.cost = entry.instance.localCost;
+          entry.resolvedParameters = candidate.resolvedParameters;
+          entry.coveredNodes.assign(candidate.coveredNodes.begin(),
+                                    candidate.coveredNodes.end());
+          table.instances.push_back(std::move(entry));
+        }
+      }
+    }
+
     tables.push_back(std::move(table));
   }
 
@@ -1080,11 +1160,37 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   // Places `instance` for `nodeIndex` on `partial`, applying the instance's own
   // storage charges. Returns false when the memory association is ambiguous and
   // cannot be proven within capacity.
+  // Node id -> table index, built once: placing an instance asks this for every
+  // node it covers, and that is the hottest loop in the search.
+  llvm::DenseMap<WorkloadNodeId, size_t> tableIndexByNode;
+  for (size_t index = 0; index < tables.size(); ++index)
+    tableIndexByNode[tables[index].node] = index;
+
   auto placeInstance = [&](Partial &partial, size_t nodeIndex,
                            const InstanceEntry &entry) -> bool {
     const CandidateInstance &instance = entry.instance;
-    partial.chosen[nodeIndex] = &instance;
-    ++partial.covered;
+
+    // A covering is a partition. A fused instance spans several nodes, so it
+    // can only be taken when none of them is covered yet -- otherwise the
+    // program would implement one node twice -- and taking it finishes all of
+    // them.
+    llvm::SmallVector<size_t, 4> coveredIndices;
+    coveredIndices.reserve(entry.coveredNodes.size());
+    for (WorkloadNodeId coveredId : entry.coveredNodes) {
+      auto found = tableIndexByNode.find(coveredId);
+      if (found == tableIndexByNode.end())
+        return false;
+      if (partial.chosen[found->second])
+        return false;
+      coveredIndices.push_back(found->second);
+    }
+    for (size_t index : coveredIndices)
+      partial.chosen[index] = &instance;
+    partial.covered += static_cast<unsigned>(coveredIndices.size());
+    // `nodeIndex` is where the instance was *offered*; for a one-op rule it is
+    // the only node, and for a fused one it is the lowest covered node, which
+    // is already in `coveredIndices`.
+    (void)nodeIndex;
     partial.executorSlots += instance.resourceUsage.executorSlots;
     if (partial.linked.size() != valueLinks.size())
       partial.linked.assign(valueLinks.size(), 0);
@@ -1291,6 +1397,28 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         complete &= base.chosen[consumer.node] != nullptr;
       if (!complete)
         continue;
+
+      // A link whose endpoints one instance covers is *inside* that instance:
+      // the rule implements it, and synthesizing a connection between two nodes
+      // the same rule already fused would invent a movement nobody asked for.
+      // A one-op instance is excluded by requiring more than one endpoint node,
+      // so a self-link still gets the connection it always did.
+      llvm::SmallDenseSet<WorkloadNodeId, 4> endpointNodes;
+      for (const ValueEndpoint &producer : link.producers)
+        endpointNodes.insert(producer.node);
+      for (const ValueEndpoint &consumer : link.consumers)
+        endpointNodes.insert(consumer.node);
+      if (endpointNodes.size() > 1) {
+        const CandidateInstance *owner = base.chosen[*endpointNodes.begin()];
+        bool internal = owner != nullptr;
+        for (WorkloadNodeId node : endpointNodes)
+          internal &= base.chosen[node] == owner;
+        if (internal) {
+          base.linked[index] = 1;
+          continue;
+        }
+      }
+
       base.linked[index] = 1;
       // A zero-element value (a static 0 dimension) moves no bytes: it needs no
       // route, layout transform, or staging.
@@ -1895,24 +2023,36 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // The bundle travels on the placed instance, so it reaches the plan
       // unchanged and generic code never re-reads the rule for it.
       placement.bundle = instance->bundle;
-      for (const InstanceEntry &entry : tables[index].instances) {
-        if (&entry.instance == instance) {
-          placement.rule = entry.rule->id;
-          // The resolved parameter assignment travels with the placement, so
-          // the selected plan records *which* assignment generation solved and
-          // verification can validate it rather than re-deriving one.
-          placement.resolvedParameters = entry.resolvedParameters;
-          // The selected instance's measured-or-static cost and its node's
-          // output element count travel with the placement too (task B8), so a
-          // normalized plan event charges this node the same estimate the
-          // search ranked it on rather than re-deriving one.
-          placement.cost = entry.cost;
-          if (const WorkloadNode *node = tables[index].workload)
-            if (!node->outputs.empty())
-              placement.workItems = elementsForValue(node->outputs[0].value);
+      // A fused instance is offered at the lowest node it covers, so its entry
+      // lives in *that* node's table -- but the instance covers several nodes,
+      // and its rule and parameters belong to every placement it produces. A
+      // per-node lookup would leave the non-anchor placements with no rule at
+      // all, which is a plan that cannot be bound.
+      const InstanceEntry *owner = nullptr;
+      for (const NodeTable &candidateTable : tables) {
+        for (const InstanceEntry &entry : candidateTable.instances)
+          if (&entry.instance == instance) {
+            owner = &entry;
+            break;
+          }
+        if (owner)
           break;
-        }
       }
+      if (owner) {
+        placement.rule = owner->rule->id;
+        // The resolved parameter assignment travels with the placement, so
+        // the selected plan records *which* assignment generation solved and
+        // verification can validate it rather than re-deriving one.
+        placement.resolvedParameters = owner->resolvedParameters;
+        // The selected instance's measured-or-static cost and its node's
+        // output element count travel with the placement too (task B8), so a
+        // normalized plan event charges this node the same estimate the
+        // search ranked it on rather than re-deriving one.
+        placement.cost = owner->cost;
+      }
+      if (const WorkloadNode *node = tables[index].workload)
+        if (!node->outputs.empty())
+          placement.workItems = elementsForValue(node->outputs[0].value);
       placement.executor = instance->executorBindings.lookup("executor");
       placement.memories = instance->memoryBindings;
       // The per-occurrence memory assignments travel with the placement, so a

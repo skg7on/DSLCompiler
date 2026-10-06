@@ -58,6 +58,10 @@ struct MappingSearchOptions {
   unsigned beamWidth = 64;
   unsigned topK = 8;
   unsigned maxCandidatesPerNode = 64;
+  /// The most fused graph-pattern matches enumerated for the whole graph. Zero
+  /// disables fused matching, so a search that never asked for it behaves
+  /// exactly as it did before patterns existed.
+  uint64_t maxFusedMatches = 256;
   unsigned maxInstancesPerCandidate = 64;
   unsigned maxRoutesPerConnection = 8;
   /// Upper bound on the joint connection combinations one placement may branch

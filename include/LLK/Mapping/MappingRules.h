@@ -112,11 +112,52 @@ struct RuleLayoutRequirement {
   std::string layoutId;
 };
 
+/// One formal node of a graph pattern: the name it is bound to within the
+/// rule, the Micro operation it matches, and the same predicates a one-op rule
+/// uses.
+struct RulePatternNode {
+  std::string name;
+  std::string op;
+  std::vector<RulePredicate> predicates;
+};
+
+/// One edge of a graph pattern: the `resultIndex`-th result of `producer`
+/// feeds the `operandIndex`-th operand of `consumer`.
+///
+/// The endpoints are *occurrences*, not values, so a pattern that names
+/// `operand0` and `operand1` of one consumer keeps them distinct even when both
+/// happen to be the same SSA value.
+struct RulePatternEdge {
+  std::string producer;
+  uint32_t resultIndex = 0;
+  std::string consumer;
+  uint32_t operandIndex = 0;
+};
+
+/// A bounded subgraph a rule implements as one unit.
+///
+/// Nodes are in declaration order and the first is the **anchor**: a match is
+/// enumerated by scanning the graph in canonical node order and trying the
+/// anchor at each node, so the order of matches depends on the graph and the
+/// rule, never on an iteration order.
+struct RulePattern {
+  std::vector<RulePatternNode> nodes;
+  std::vector<RulePatternEdge> edges;
+
+  const RulePatternNode *findNode(llvm::StringRef name) const;
+};
+
 struct RuleDef {
   std::string id;
   uint64_t version = 1;
-  /// The Micro operation this rule implements, e.g. `micro.vector`.
+  /// The Micro operation this rule implements, e.g. `micro.vector`. For a graph
+  /// rule it is the anchor node's operation, so a reader that only wants to
+  /// know "what does this rule start at" gets the same answer either way.
   std::string matchOp;
+  /// A bounded subgraph this rule implements as one unit, when it declares one.
+  /// A one-op rule leaves it unset. The two forms are exclusive: a rule either
+  /// matches one operation or a whole pattern, and never both.
+  std::optional<RulePattern> pattern;
   std::vector<RulePredicate> predicates;
   std::vector<LayoutParam> params;
   std::map<std::string, ParamDomain> domains;
@@ -190,6 +231,52 @@ bool predicateMatches(const RulePredicate &predicate, const WorkloadNode &node);
 /// matches every operation of its name.
 std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
                                         const RuleRegistry &rules);
+
+//===----------------------------------------------------------------------===//
+// Bounded graph-pattern matching (design §14.2)
+//===----------------------------------------------------------------------===//
+
+/// One match of a graph pattern against the workload graph: the rule, the graph
+/// node each pattern node bound to (in the pattern's declaration order), and
+/// the matched subgraph's external boundary.
+struct RulePatternMatch {
+  const RuleDef *rule = nullptr;
+  std::vector<WorkloadNodeId> coveredNodes;
+  /// The operand and result occurrences that leave the matched subgraph, in
+  /// canonical order. These are what the rest of the program attaches to; an
+  /// occurrence *inside* the match is the rule's own business.
+  std::vector<PortRef> boundary;
+};
+
+/// Every match of every graph rule against `graph`, in canonical order.
+///
+/// A match is enumerated by taking the rule's anchor node and trying it at each
+/// graph node in canonical order, so the match list depends on the graph and
+/// the rule and never on an iteration order. Two matches covering the same
+/// nodes with the same boundary are one match: a pattern whose nodes are
+/// interchangeable must not produce a duplicate covering.
+///
+/// Bounded: at most `maxMatches` are returned, and `truncated` reports whether
+/// the cap was reached, because an incomplete match set is an incomplete
+/// covering rather than a smaller one.
+std::vector<RulePatternMatch> matchRulePatterns(const WorkloadGraph &graph,
+                                                const RuleRegistry &rules,
+                                                uint64_t maxMatches = 256,
+                                                bool *truncated = nullptr);
+
+/// The candidate a fused match produces: the rule's bundle and emitter, the
+/// matched nodes as `coveredNodes`, and the boundary occurrences as its ports.
+///
+/// Returns nullopt when the rule's own constraints have no satisfying
+/// assignment at this match, exactly as a one-op rule does.
+std::optional<MappingCandidate> toFusedMappingCandidate(
+    const RuleDef &rule, const RulePatternMatch &match,
+    const WorkloadGraph &graph, const machine::MachineModel &machine,
+    const LayoutContext &context, std::string *reason = nullptr,
+    bool *truncated = nullptr,
+    const llvm::StringMap<SearchValue> *pinned = nullptr,
+    const llvm::StringMap<std::string> *boundLayouts = nullptr,
+    const BoundAxes *boundAxes = nullptr);
 
 //===----------------------------------------------------------------------===//
 // Re-verifying a recorded selection (design §18.3, phase 2)

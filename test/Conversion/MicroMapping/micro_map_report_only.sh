@@ -39,7 +39,7 @@ mkdir -p "$WORK"
 # The five required target keys plus a deterministic mode, so the selected plan
 # -- and therefore the report -- is reproducible. `report-only=1` is appended to
 # the same option string, exactly as `report=` is elsewhere.
-OPTIONS="target=x86-avx2 machine=$SRC/machines/x86-avx2-v2.yaml layouts=$SRC/mapping/x86-avx2/layouts.llkmap rules=$SRC/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=deterministic"
+OPTIONS="target=x86-avx2 machine=$SRC/machines/x86-avx2-v2.yaml layouts=$SRC/mapping/x86-avx2/layouts.llkmap rules=$SRC/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul mode=deterministic"
 KERNEL="$SRC/test/Conversion/MicroMapping/report_only_kernel.mlir"
 NO_PLAN="$SRC/test/Conversion/MicroMapping/report_only_no_plan.mlir"
 
