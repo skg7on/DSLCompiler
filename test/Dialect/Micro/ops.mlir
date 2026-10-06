@@ -191,3 +191,52 @@ func.func @test_kernel_legacy_form() {
   }
   return
 }
+
+//===----------------------------------------------------------------------===//
+// Loop-carried values
+//===----------------------------------------------------------------------===//
+
+// A loop may carry values across iterations: `iter_args` names them, the body
+// receives them as block arguments, and `micro.yield` hands the next iteration
+// its values. What the loop's result holds is what the last iteration yielded
+// -- the shape an accumulator needs, and the reason the contract exists.
+// CHECK-LABEL: func.func @test_loop_carried_values
+func.func @test_loop_carried_values() {
+  %c0 = arith.constant 0 : index
+  %c64 = arith.constant 64 : index
+  %c32 = arith.constant 32 : index
+  %init = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>>
+  // CHECK: micro.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%{{.*}} = %{{.*}}) -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>>)
+  // CHECK: micro.yield
+  %acc = micro.for %k = %c0 to %c64 step %c32 iter_args(%carried = %init) -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>>) {
+    micro.yield %carried : !micro.tile<8x32xf32, memory = #micro.memory<acc>>
+  }
+  return
+}
+
+// A spatial loop carries values on the same terms, after its `map`.
+// CHECK-LABEL: func.func @test_spatial_loop_carried_values
+func.func @test_spatial_loop_carried_values() {
+  %c0 = arith.constant 0 : index
+  %c16 = arith.constant 16 : index
+  %c8 = arith.constant 8 : index
+  %init = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>>
+  // CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> iter_args(%{{.*}} = %{{.*}}) -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>>)
+  %acc = micro.spatial_for %i = %c0 to %c16 step %c8 map = #micro.map<worker> iter_args(%carried = %init) -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>>) {
+    micro.yield %carried : !micro.tile<8x32xf32, memory = #micro.memory<acc>>
+  }
+  return
+}
+
+// A loop with no `iter_args` carries nothing and prints exactly as it did
+// before the contract existed: its implicit terminator stays implicit.
+// CHECK-LABEL: func.func @test_loop_without_carried_values
+func.func @test_loop_without_carried_values() {
+  %c0 = arith.constant 0 : index
+  %c64 = arith.constant 64 : index
+  %c32 = arith.constant 32 : index
+  // CHECK: micro.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} {
+  micro.for %k = %c0 to %c64 step %c32 {
+  }
+  return
+}

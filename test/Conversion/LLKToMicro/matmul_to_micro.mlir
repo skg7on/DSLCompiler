@@ -22,7 +22,7 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 
 // The kernel names its two operands in its signature -- the block arguments
 // the body reads -- so no entry tensor is guessed to be external.
-// CHECK: micro.kernel @matmul_M16_N64_K64(%[[A:.*]]: tensor<16x64xbf16>, %[[B:.*]]: tensor<64x64xbf16>) attributes {
+// CHECK: micro.kernel @matmul_M16_N64_K64(%[[A:.*]]: tensor<16x64xbf16>, %[[B:.*]]: tensor<64x64xbf16>) -> tensor<16x64xbf16> attributes {
 // CHECK-SAME: fragment_shape = array<i64: 8, 16, 32>
 // CHECK-SAME: memory_path = "dram:sram:acc"
 // CHECK-SAME: mma_shape = array<i64: 16, 16, 32>
@@ -36,14 +36,21 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // Two operands, not three: A and B, both declared rather than materialized.
 // CHECK-NOT: tensor.empty
 
-// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> {
-// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<lane> {
+// The output is threaded through both spatial loops: each pass hands the
+// partially written output to the next, which is the only way an SSA
+// destination stays updated.
+// CHECK: %[[OUT_ALLOC:.*]] = micro.tile_alloc : !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
+// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> iter_args(%{{.*}} = %[[OUT_ALLOC]]) -> (!micro.tile<16x64xbf16, memory = #micro.memory<sram>>) {
+// CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<lane> iter_args(%{{.*}} = %{{.*}}) -> (!micro.tile<16x64xbf16, memory = #micro.memory<sram>>) {
 
 // One accumulator, in acc memory.
 // CHECK: %[[ACC:.*]] = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
 
-// CHECK: micro.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK: micro.pipeline stages = 1 {
+// The K loop carries the accumulator: what an iteration computes is what the
+// next one accumulates into. The pipeline carries it too, because the MMA runs
+// inside the pipeline and the loop's terminator could not otherwise see it.
+// CHECK: %[[LOOP:.*]] = micro.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%[[CARRY:.*]] = %[[ACC]]) -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>) {
+// CHECK: %[[PIPED:.*]] = micro.pipeline stages = 1 -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>) {
 
 // Both operands are viewed logically and staged through SRAM.
 // CHECK: %[[AV:.*]] = micro.tile_view %[[A]]{{.*}} {layout = #micro.layout<row_major, vector = 8>, shape = array<i64: 8, 32>} : tensor<16x64xbf16> -> !micro.tile<8x32xbf16, layout = #micro.layout<row_major, vector = 8>, memory = #micro.memory<dram>>
@@ -55,14 +62,29 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // The left-hand tile is already fragment-sized (8x32), so only B is partitioned.
 // CHECK: micro.tile_partition %[[BT]] {owner = #micro.owner<vector_engine>, shape = array<i64: 32, 16>} : {{.*}} -> !micro.tile<32x16xbf16, {{.*}}owner = #micro.owner<vector_engine>>
 
-// Exactly one MMA inside the K loop.
-// CHECK: micro.mma %[[AT]], %[[BT]], %[[ACC]] {accumulator = #micro.dtype<f32>, input = #micro.dtype<bf16>, shape = array<i64: 8, 32, 32>}
+// Exactly one MMA inside the K loop, accumulating into the carried value
+// rather than into a constant allocation.
+// CHECK: %[[NEXT:.*]] = micro.mma %[[AT]], %[[BT]], %[[CARRY]] {accumulator = #micro.dtype<f32>, input = #micro.dtype<bf16>, shape = array<i64: 8, 32, 32>}
+
+// The carry is real at both levels: the pipeline yields what the MMA computed,
+// and the loop yields what the pipeline carried out.
+// CHECK: micro.yield %[[NEXT]] : !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
+// CHECK: micro.yield %[[PIPED]] : !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
+
 // CHECK-NOT: micro.mma
 // CHECK-NOT: micro.vector "silu"
 // CHECK-NOT: micro.vector "mul"
 
-// The epilogue is the narrowing conversion and the write back.
-// CHECK: %[[OUT:.*]] = micro.vector "convert" %[[ACC]] : {{.*}} -> !micro.tile<8x32xbf16, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
-// CHECK: micro.tile_store %[[OUT]] {dst_memory = #micro.memory<dram>}
+// The epilogue is the narrowing conversion and the write back. It reads the
+// loop's *result*, which is what proves the accumulator was threaded: reading
+// the allocation would mean nothing ever wrote it.
+// CHECK: %[[OUT:.*]] = micro.vector "convert" %[[LOOP]] : {{.*}} -> !micro.tile<8x32xbf16, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
+
+// The write-back produces the updated output and hands it on, so the kernel's
+// declared result is a value the whole nest threads rather than a side effect
+// nothing could observe.
+// CHECK: %[[WRITTEN:.*]] = micro.tile_store %[[OUT]] into %{{.*}}[%{{.*}}, %{{.*}}] {dst_memory = #micro.memory<sram>} : {{.*}} -> !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
+// CHECK: micro.yield %[[WRITTEN]] : !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
+// CHECK: micro.yield %{{.*}} : !micro.tile<16x64xbf16, memory = #micro.memory<sram>>
 
 // CHECK-NOT: llk.

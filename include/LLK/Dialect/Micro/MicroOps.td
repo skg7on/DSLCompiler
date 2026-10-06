@@ -204,19 +204,35 @@ def Micro_TileAsyncCopyOp : Micro_Op<"tile_async_copy"> {
 // micro.tile_store — write back to external memory
 //===----------------------------------------------------------------------===//
 
-def Micro_TileStoreOp : Micro_Op<"tile_store"> {
-  let summary = "Store a tile to a destination memory space";
+def Micro_TileStoreOp : Micro_Op<"tile_store", [AttrSizedOperandSegments]> {
+  let summary = "Store a tile into a destination";
   let description = [{
-        Stores a materialized tile to an external or previously allocated
-        destination memory space.
+        Stores a materialized tile.
+
+        Without a destination this is a terminal write to a memory space: it has
+        no result, and what it wrote is observable only through the memory it
+        landed in. That is the form an analysis fixture uses.
+
+        With `into` the store is a value: the result is the destination with
+        `source` written at `offsets`. A tile program that writes an output tile
+        by tile needs exactly that -- an SSA destination is only updated if the
+        updated destination is what the enclosing loop carries, and a write with
+        no result would leave the loop nothing to thread:
+
+        ```mlir
+        %out1 = micro.tile_store %tile into %out0[%bm, %bn] {dst_memory = #micro.memory<dram>}
+            : !micro.tile<8x32xbf16, memory = #micro.memory<acc>>
+            , !micro.tile<16x64xbf16, memory = #micro.memory<dram>>
+            -> !micro.tile<16x64xbf16, memory = #micro.memory<dram>>
+        ```
     }];
 
-  let arguments = (ins AnyType:$source, Micro_MemorySpaceAttr:$dst_memory);
+  let arguments = (ins AnyType:$source, Optional<AnyType>:$destination,
+      Variadic<Index>:$offsets, Micro_MemorySpaceAttr:$dst_memory);
 
-  let assemblyFormat = [{
-        $source attr-dict
-        `:` type($source)
-    }];
+  let results = (outs Optional<AnyType>:$result);
+
+  let hasCustomAssemblyFormat = 1;
 
   let hasVerifier = 1;
 }
@@ -359,10 +375,30 @@ def Micro_ForOp : Micro_Op<"for", [SingleBlockImplicitTerminator<"YieldOp">]> {
   let summary = "Temporal loop";
   let description = [{
         A temporal loop over an index induction variable with lower bound,
-        upper bound, and step. Modeled after scf.for; no iter_args in the MVP.
+        upper bound, and step, modeled after `scf.for`.
+
+        A loop may carry values across iterations. They are declared with
+        `iter_args`, and each iteration's `micro.yield` carries the value the
+        next iteration receives:
+
+        ```mlir
+        %acc = micro.for %k = %c0 to %K step %BK iter_args(%carried = %init) -> (!micro.tile<8x32xf32>) {
+          %next = micro.mma %a, %b, %carried
+          micro.yield %next : !micro.tile<8x32xf32>
+        }
+        ```
+
+        The loop's results are what the final iteration yielded. A loop with no
+        `iter_args` carries nothing: it has no results and its terminator is a
+        bare `micro.yield`. Deciding *which* values a loop carries is a
+        semantics question, not a scheduling one -- a lowerer that invented
+        them would be guessing what the program means.
     }];
 
-  let arguments = (ins Index:$lower_bound, Index:$upper_bound, Index:$step);
+  let arguments = (ins Index:$lower_bound, Index:$upper_bound, Index:$step,
+      Variadic<AnyType>:$initArgs);
+
+  let results = (outs Variadic<AnyType>:$results);
 
   let regions = (region SizedRegion<1>:$body);
 
@@ -370,8 +406,13 @@ def Micro_ForOp : Micro_Op<"for", [SingleBlockImplicitTerminator<"YieldOp">]> {
   let hasVerifier = 1;
 
   let extraClassDeclaration = [{
+        /// The induction variable is the first block argument; the carried
+        /// values follow it, in `iter_args` order.
         BlockArgument getInductionVar() {
           return getBody().front().getArgument(0);
+        }
+        ::llvm::MutableArrayRef<::mlir::BlockArgument> getRegionIterArgs() {
+          return getBody().front().getArguments().drop_front();
         }
     }];
 }
@@ -385,11 +426,21 @@ def Micro_SpatialForOp
   let summary = "Spatial loop over machine resources";
   let description = [{
         A spatial loop mapping iterations over machine resources via a
-        #micro.map target. Modeled after micro.for with an additional map.
+        #micro.map target. Modeled after micro.for with an additional map, and
+        the same loop-carried value contract:
+
+        ```mlir
+        %acc = micro.spatial_for %i = %c0 to %M step %BM map = #micro.map<worker>
+            iter_args(%carried = %init) -> (!micro.tile<8x32xf32>) {
+          micro.yield %carried : !micro.tile<8x32xf32>
+        }
+        ```
     }];
 
   let arguments = (ins Index:$lower_bound, Index:$upper_bound, Index:$step,
-      Micro_MappingTargetAttr:$map);
+      Micro_MappingTargetAttr:$map, Variadic<AnyType>:$initArgs);
+
+  let results = (outs Variadic<AnyType>:$results);
 
   let regions = (region SizedRegion<1>:$body);
 
@@ -399,6 +450,9 @@ def Micro_SpatialForOp
   let extraClassDeclaration = [{
         BlockArgument getInductionVar() {
           return getBody().front().getArgument(0);
+        }
+        ::llvm::MutableArrayRef<::mlir::BlockArgument> getRegionIterArgs() {
+          return getBody().front().getArguments().drop_front();
         }
     }];
 }
@@ -413,13 +467,31 @@ def Micro_PipelineOp
   let description = [{
         Marks pipeline overlap between data movement and compute. The stages
         attribute controls the number of pipeline stages.
+
+        A pipeline may carry values out of its body, on the same terms as a
+        loop: `micro.yield` names them and the pipeline's results are those
+        values. It needs this because the compute it overlaps with often
+        accumulates into something the staged movement produced, and the value
+        has to reach whatever comes after the pipeline:
+
+        ```mlir
+        %acc = micro.pipeline stages = 2 -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>>) {
+          %next = micro.mma %a, %b, %carried
+          micro.yield %next : !micro.tile<8x32xf32, memory = #micro.memory<acc>>
+        }
+        ```
+
+        With no results the pipeline carries nothing and prints without the
+        clause, which is the form every existing fixture uses.
     }];
 
   let arguments = (ins I64Attr:$stages);
 
+  let results = (outs Variadic<AnyType>:$results);
+
   let regions = (region SizedRegion<1>:$body);
 
-  let assemblyFormat = "`stages` `=` $stages attr-dict-with-keyword $body";
+  let hasCustomAssemblyFormat = 1;
 
   let hasVerifier = 1;
 }

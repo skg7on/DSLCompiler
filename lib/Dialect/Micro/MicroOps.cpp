@@ -15,6 +15,7 @@
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/CallInterfaces.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
 // Attribute class declarations.
@@ -460,6 +461,81 @@ LogicalResult TileAsyncCopyOp::verify() {
   return success();
 }
 
+ParseResult TileStoreOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto &builder = parser.getBuilder();
+
+  OpAsmParser::UnresolvedOperand source;
+  if (parser.parseOperand(source))
+    return failure();
+
+  // Optional `into %dst[%i, %j]`: the value-producing form. Without it the
+  // store stays a terminal write and carries no result.
+  OpAsmParser::UnresolvedOperand destination;
+  bool hasDestination = false;
+  SmallVector<OpAsmParser::UnresolvedOperand> offsets;
+  if (succeeded(parser.parseOptionalKeyword("into"))) {
+    hasDestination = true;
+    if (parser.parseOperand(destination) || parser.parseLSquare())
+      return failure();
+    if (failed(parser.parseOptionalRSquare())) {
+      do {
+        OpAsmParser::UnresolvedOperand offset;
+        if (parser.parseOperand(offset))
+          return failure();
+        offsets.push_back(offset);
+      } while (succeeded(parser.parseOptionalComma()));
+      if (parser.parseRSquare())
+        return failure();
+    }
+  }
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  Type sourceType;
+  if (parser.parseColonType(sourceType))
+    return failure();
+  if (parser.resolveOperand(source, sourceType, result.operands))
+    return failure();
+
+  if (hasDestination) {
+    Type destinationType, resultType;
+    if (parser.parseComma() || parser.parseType(destinationType) ||
+        parser.parseArrow() || parser.parseType(resultType))
+      return failure();
+    result.addTypes(resultType);
+    if (parser.resolveOperand(destination, destinationType, result.operands))
+      return failure();
+    for (OpAsmParser::UnresolvedOperand offset : offsets)
+      if (parser.resolveOperand(offset, builder.getIndexType(),
+                                result.operands))
+        return failure();
+  }
+
+  // The op has two variadic operand groups, so the split between them has to
+  // be recorded: no destination and no offsets is the terminal form.
+  result.getOrAddProperties<TileStoreOp::Properties>().operandSegmentSizes = {
+      1, hasDestination ? 1 : 0, static_cast<int32_t>(offsets.size())};
+  return success();
+}
+
+void TileStoreOp::print(OpAsmPrinter &printer) {
+  printer << ' ' << getSource();
+  if (getDestination()) {
+    printer << " into " << getDestination() << '[';
+    llvm::interleaveComma(getOffsets(), printer);
+    printer << ']';
+  }
+  // The operand-segment split is bookkeeping the parser recomputes, so it is
+  // kept out of the printed form.
+  printer.printOptionalAttrDict((*this)->getAttrs(),
+                                /*elidedAttrs=*/{"operandSegmentSizes"});
+  printer << " : " << getSource().getType();
+  if (getDestination())
+    printer << ", " << getDestination().getType() << " -> "
+            << getResult().getType();
+}
+
 LogicalResult TileStoreOp::verify() {
   auto sourceType = dyn_cast<TileType>(getSource().getType());
   if (!sourceType)
@@ -468,6 +544,27 @@ LogicalResult TileStoreOp::verify() {
     return emitOpError("stored tile must have a memory space");
   if (sourceType.getMemory().getValue() == getDstMemory())
     return emitOpError("source and destination memory must differ");
+
+  // A terminal write has no destination and no result; a value-producing one
+  // has both, and the result is the destination it updated.
+  if (!getDestination()) {
+    if (getNumResults() != 0)
+      return emitOpError("a terminal tile_store has no result");
+    if (!getOffsets().empty())
+      return emitOpError("a terminal tile_store has no offsets");
+    return success();
+  }
+
+  auto destinationType = dyn_cast<TileType>(getDestination().getType());
+  if (!destinationType)
+    return emitOpError("destination must be a tile type");
+  if (getNumResults() != 1)
+    return emitOpError("a tile_store with a destination produces the updated "
+                       "destination as its result");
+  if (getResult().getType() != getDestination().getType())
+    return emitOpError("result must have the destination's type");
+  if (getOffsets().size() != destinationType.getShape().size())
+    return emitOpError("offsets must name one index per destination dimension");
   return success();
 }
 
@@ -688,6 +785,110 @@ static LogicalResult verifyStaticPositiveStep(Operation *op, Value step) {
   return success();
 }
 
+/// Parses the optional `iter_args(%carried = %init, ...) -> (types)` clause.
+///
+/// `regionArgs` already holds the induction variable, so a carried value's
+/// block argument follows the ones before it. A loop that declares no
+/// `iter_args` carries nothing, which is legal and simply parses to nothing.
+static ParseResult
+parseLoopCarriedValues(OpAsmParser &parser, OperationState &result,
+                       SmallVectorImpl<OpAsmParser::Argument> &regionArgs) {
+  if (failed(parser.parseOptionalKeyword("iter_args")))
+    return success();
+  if (parser.parseLParen())
+    return failure();
+
+  SmallVector<OpAsmParser::UnresolvedOperand> inits;
+  do {
+    OpAsmParser::Argument carried;
+    OpAsmParser::UnresolvedOperand init;
+    if (parser.parseOperand(carried.ssaName) || parser.parseEqual() ||
+        parser.parseOperand(init))
+      return failure();
+    regionArgs.push_back(carried);
+    inits.push_back(init);
+  } while (succeeded(parser.parseOptionalComma()));
+  if (parser.parseRParen())
+    return failure();
+
+  // The declared types are the carried values' types, and they are also the
+  // loop's result types: what an iteration yields is what the loop hands back.
+  SmallVector<Type> carriedTypes;
+  if (parser.parseArrow() || parser.parseLParen() ||
+      parser.parseTypeList(carriedTypes) || parser.parseRParen())
+    return failure();
+  result.addTypes(carriedTypes);
+
+  for (unsigned i = 0, e = inits.size(); i < e; ++i) {
+    regionArgs[i + 1].type = carriedTypes[i];
+    if (parser.resolveOperand(inits[i], carriedTypes[i], result.operands))
+      return failure();
+  }
+  return success();
+}
+
+/// Prints the `iter_args(...) -> (...)` clause, if the loop carries anything.
+static void printLoopCarriedValues(OpAsmPrinter &printer, OperandRange initArgs,
+                                   Block::BlockArgListType regionIterArgs,
+                                   TypeRange resultTypes) {
+  if (initArgs.empty())
+    return;
+  printer << " iter_args(";
+  llvm::interleaveComma(
+      llvm::zip(regionIterArgs, initArgs), printer, [&](auto pair) {
+        printer << std::get<0>(pair) << " = " << std::get<1>(pair);
+      });
+  printer << ") -> (";
+  llvm::interleaveComma(resultTypes, printer);
+  printer << ")";
+}
+
+/// Verifies the loop-carried contract both loop ops share: as many block
+/// arguments as values passed in, matching types end to end, and a terminator
+/// that yields one value per hole.
+template <typename LoopOp>
+static LogicalResult verifyLoopCarriedValues(LoopOp op) {
+  Block &entry = op.getBody().front();
+  auto regionIterArgs = entry.getArguments().drop_front();
+  auto initArgs = op.getInitArgs();
+  auto results = op.getResults();
+
+  if (regionIterArgs.size() != initArgs.size())
+    return op.emitOpError() << "body has " << regionIterArgs.size()
+                            << " loop-carried block argument(s) but the loop "
+                               "passes in "
+                            << initArgs.size();
+  if (results.size() != initArgs.size())
+    return op.emitOpError() << "loop has " << results.size()
+                            << " result(s) but carries " << initArgs.size();
+  for (unsigned i = 0, e = initArgs.size(); i < e; ++i) {
+    if (regionIterArgs[i].getType() != initArgs[i].getType())
+      return op.emitOpError()
+             << "loop-carried block argument #" << i << " has type "
+             << regionIterArgs[i].getType() << " but the loop passes in "
+             << initArgs[i].getType();
+    if (results[i].getType() != initArgs[i].getType())
+      return op.emitOpError()
+             << "result #" << i << " has type " << results[i].getType()
+             << " but the loop carries " << initArgs[i].getType();
+  }
+
+  auto yield = dyn_cast<YieldOp>(entry.getTerminator());
+  if (!yield)
+    return op.emitOpError("body must terminate with micro.yield");
+  if (yield.getNumOperands() != initArgs.size())
+    return op.emitOpError()
+           << "body yields " << yield.getNumOperands()
+           << " value(s) but the loop carries " << initArgs.size();
+  for (unsigned i = 0, e = initArgs.size(); i < e; ++i)
+    if (yield.getOperand(i).getType() != initArgs[i].getType())
+      return op.emitOpError()
+             << "yielded value #" << i << " has type "
+             << yield.getOperand(i).getType() << " but the loop carries "
+             << initArgs[i].getType();
+  return success();
+}
+
 ParseResult ForOp::parse(OpAsmParser &parser, OperationState &result) {
   auto &builder = parser.getBuilder();
 
@@ -702,31 +903,40 @@ ParseResult ForOp::parse(OpAsmParser &parser, OperationState &result) {
     return failure();
 
   inductionVariable.type = builder.getIndexType();
-  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
-
-  Region *body = result.addRegion();
-  if (parser.parseRegion(*body, regionArgs))
-    return failure();
-  ForOp::ensureTerminator(*body, builder, result.location);
-
   Type indexType = builder.getIndexType();
   if (parser.resolveOperand(lb, indexType, result.operands) ||
       parser.resolveOperand(ub, indexType, result.operands) ||
       parser.resolveOperand(step, indexType, result.operands))
     return failure();
 
+  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
+  if (parseLoopCarriedValues(parser, result, regionArgs))
+    return failure();
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, regionArgs))
+    return failure();
+  ForOp::ensureTerminator(*body, builder, result.location);
+
   return success();
 }
 
 void ForOp::print(OpAsmPrinter &printer) {
   printer << ' ' << getInductionVar() << " = " << getLowerBound() << " to "
-          << getUpperBound() << " step " << getStep() << ' ';
+          << getUpperBound() << " step " << getStep();
+  printLoopCarriedValues(printer, getInitArgs(), getRegionIterArgs(),
+                         getResults().getTypes());
+  printer << ' ';
+  // A loop that carries nothing keeps its bare, implicit terminator out of the
+  // printed form, exactly as before the carried-value contract existed.
   printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
-                      /*printBlockTerminators=*/false);
+                      /*printBlockTerminators=*/!getInitArgs().empty());
 }
 
 LogicalResult ForOp::verify() {
-  return verifyStaticPositiveStep(*this, getStep());
+  if (failed(verifyStaticPositiveStep(getOperation(), getStep())))
+    return failure();
+  return verifyLoopCarriedValues(*this);
 }
 
 ParseResult SpatialForOp::parse(OpAsmParser &parser, OperationState &result) {
@@ -748,18 +958,20 @@ ParseResult SpatialForOp::parse(OpAsmParser &parser, OperationState &result) {
   result.getOrAddProperties<SpatialForOp::Properties>().map = mapAttr;
 
   inductionVariable.type = builder.getIndexType();
-  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
-
-  Region *body = result.addRegion();
-  if (parser.parseRegion(*body, regionArgs))
-    return failure();
-  SpatialForOp::ensureTerminator(*body, builder, result.location);
-
   Type indexType = builder.getIndexType();
   if (parser.resolveOperand(lb, indexType, result.operands) ||
       parser.resolveOperand(ub, indexType, result.operands) ||
       parser.resolveOperand(step, indexType, result.operands))
     return failure();
+
+  SmallVector<OpAsmParser::Argument> regionArgs{inductionVariable};
+  if (parseLoopCarriedValues(parser, result, regionArgs))
+    return failure();
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, regionArgs))
+    return failure();
+  SpatialForOp::ensureTerminator(*body, builder, result.location);
 
   return success();
 }
@@ -767,13 +979,61 @@ ParseResult SpatialForOp::parse(OpAsmParser &parser, OperationState &result) {
 void SpatialForOp::print(OpAsmPrinter &printer) {
   printer << ' ' << getInductionVar() << " = " << getLowerBound() << " to "
           << getUpperBound() << " step " << getStep()
-          << " map = " << getMapAttr() << ' ';
+          << " map = " << getMapAttr();
+  printLoopCarriedValues(printer, getInitArgs(), getRegionIterArgs(),
+                         getResults().getTypes());
+  printer << ' ';
   printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
-                      /*printBlockTerminators=*/false);
+                      /*printBlockTerminators=*/!getInitArgs().empty());
 }
 
 LogicalResult SpatialForOp::verify() {
-  return verifyStaticPositiveStep(*this, getStep());
+  if (failed(verifyStaticPositiveStep(getOperation(), getStep())))
+    return failure();
+  return verifyLoopCarriedValues(*this);
+}
+
+ParseResult PipelineOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto &builder = parser.getBuilder();
+
+  // `stages = N`
+  IntegerAttr stages;
+  if (parser.parseKeyword("stages") || parser.parseEqual() ||
+      parser.parseAttribute(stages, builder.getI64Type(), "stages",
+                            result.attributes))
+    return failure();
+
+  // An optional `-> (types)` clause: a pipeline that overlaps compute with the
+  // movement feeding it has to be able to hand the computed value back out.
+  if (succeeded(parser.parseOptionalArrow())) {
+    SmallVector<Type> resultTypes;
+    if (parser.parseLParen() || parser.parseTypeList(resultTypes) ||
+        parser.parseRParen())
+      return failure();
+    result.addTypes(resultTypes);
+  }
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body))
+    return failure();
+  PipelineOp::ensureTerminator(*body, builder, result.location);
+  return success();
+}
+
+void PipelineOp::print(OpAsmPrinter &printer) {
+  printer << " stages = " << getStages();
+  if (!getResults().empty()) {
+    printer << " -> (";
+    llvm::interleaveComma(getResults().getTypes(), printer);
+    printer << ")";
+  }
+  printer.printOptionalAttrDictWithKeyword((*this)->getAttrs(),
+                                           /*elidedAttrs=*/{"stages"});
+  printer << ' ';
+  // With nothing to carry, the implicit terminator stays implicit -- the form
+  // every existing fixture prints.
+  printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
+                      /*printBlockTerminators=*/!getResults().empty());
 }
 
 LogicalResult PipelineOp::verify() {
@@ -782,6 +1042,21 @@ LogicalResult PipelineOp::verify() {
   for (Operation &op : getBody().getOps())
     if (auto nested = dyn_cast<PipelineOp>(op))
       return nested.emitOpError("nested pipeline is not allowed");
+
+  // Whatever the pipeline claims to carry has to actually be yielded.
+  auto yield = dyn_cast<YieldOp>(getBody().front().getTerminator());
+  if (!yield)
+    return emitOpError("body must terminate with micro.yield");
+  if (yield.getNumOperands() != getResults().size())
+    return emitOpError() << "body yields " << yield.getNumOperands()
+                         << " value(s) but the pipeline has "
+                         << getResults().size() << " result(s)";
+  for (unsigned i = 0, e = getResults().size(); i < e; ++i)
+    if (yield.getOperand(i).getType() != getResults()[i].getType())
+      return emitOpError() << "yielded value #" << i << " has type "
+                           << yield.getOperand(i).getType()
+                           << " but the pipeline's result is "
+                           << getResults()[i].getType();
   return success();
 }
 

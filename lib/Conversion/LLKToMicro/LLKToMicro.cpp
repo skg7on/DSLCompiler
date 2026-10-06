@@ -474,22 +474,22 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   OpBuilder builder(ctx);
   builder.setInsertionPointToEnd(module.getBody());
 
-  // --- the kernel's explicit input contract ------------------------------
-  // The kernel reads its operands from outside, and naming them in its
-  // signature is what keeps an internal `tensor.empty` from being mistaken for
-  // a caller's buffer. Results are deliberately not declared here: this export
-  // writes each output tile through `micro.tile_store` from inside the spatial
-  // loops, so the output is not a value the kernel can yield. Turning that
-  // write into a declared, bufferized result is Stage C3's work.
+  // --- the kernel's explicit contract -------------------------------------
+  // The kernel reads its operands from outside and produces the output tensor.
+  // Naming both is what keeps an internal `tensor.empty` from being mistaken
+  // for a caller's buffer, and what gives the write-back somewhere to land: the
+  // output is threaded through the spatial nest and yielded.
   llvm::SmallVector<Type, 3> inputTypes{
       RankedTensorType::get({plan.M, plan.K}, plan.inputElemType)};
   for (size_t arm = 0; arm < (fused ? 2u : 1u); ++arm)
     inputTypes.push_back(
         RankedTensorType::get({plan.K, plan.N}, plan.inputElemType));
+  llvm::SmallVector<Type, 1> resultTypes{
+      RankedTensorType::get({plan.M, plan.N}, plan.outputElemType)};
 
   auto kernel = micro::KernelOp::create(
       builder, loc, symName,
-      TypeAttr::get(FunctionType::get(ctx, inputTypes, /*results=*/{})),
+      TypeAttr::get(FunctionType::get(ctx, inputTypes, resultTypes)),
       StringAttr::get(ctx, workload), StringAttr::get(ctx, target),
       /*candidate=*/StringAttr(),
       IntegerAttr::get(IntegerType::get(ctx, 64), mBucket));
@@ -572,23 +572,50 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   for (size_t arm = 0; arm < (fused ? 2u : 1u); ++arm)
     rhsTensors.push_back(kernelBody->getArgument(1 + arm));
 
+  // --- the output the kernel writes back ----------------------------------
+  // The kernel writes its output tile by tile from inside the spatial nest, so
+  // the output is a value the loops carry: an SSA destination is only updated
+  // if the updated destination is what the enclosing loop hands on. Without
+  // this the write-back would have nowhere to land.
+  // The output is accumulated in the staging level on the way out: a local
+  // allocation may not target dram, because a dram operand means a buffer that
+  // already belongs to a caller. What makes this the kernel's *external* output
+  // is the declared result, not the storage it was built in -- where it finally
+  // lands belongs to the ABI.
+  micro::MemorySpaceAttr outputSpace =
+      micro::MemorySpaceAttr::get(ctx, micro::MemorySpace::sram);
+  Type outputTileType = tile({plan.M, plan.N}, plan.outputElemType,
+                             /*tileLayout=*/micro::LayoutAttr(), outputSpace,
+                             /*owner=*/micro::OwnerAttr());
+  Value output =
+      micro::TileAllocOp::create(builder, loc, outputTileType).getResult();
+
   // --- spatial tiling ----------------------------------------------------
   auto openSpatialLoop = [&](int64_t extent, int64_t step,
-                             micro::MappingTarget target) -> BlockArgument {
+                             micro::MappingTarget target,
+                             ValueRange carried) -> micro::SpatialForOp {
     Value lower = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
     Value upper =
         arith::ConstantIndexOp::create(builder, loc, extent).getResult();
     Value by = arith::ConstantIndexOp::create(builder, loc, step).getResult();
-    auto loop =
-        micro::SpatialForOp::create(builder, loc, lower, upper, by,
-                                    micro::MappingTargetAttr::get(ctx, target));
-    return startRegionBody(builder, loop.getBody(), loc,
-                           TypeRange{IndexType::get(ctx)})
-        ->getArgument(0);
+    auto loop = micro::SpatialForOp::create(
+        builder, loc, carried.getTypes(), lower, upper, by,
+        micro::MappingTargetAttr::get(ctx, target), carried);
+    llvm::SmallVector<Type> bodyTypes{IndexType::get(ctx)};
+    bodyTypes.append(carried.getTypes().begin(), carried.getTypes().end());
+    startRegionBody(builder, loop.getBody(), loc, bodyTypes);
+    return loop;
   };
 
-  BlockArgument bm = openSpatialLoop(plan.M, plan.BM, plan.outerMap);
-  BlockArgument bn = openSpatialLoop(plan.N, plan.BN, plan.innerMap);
+  micro::SpatialForOp bmLoop =
+      openSpatialLoop(plan.M, plan.BM, plan.outerMap, ValueRange{output});
+  BlockArgument bm = bmLoop.getBody().front().getArgument(0);
+  Value bmCarried = bmLoop.getBody().front().getArgument(1);
+
+  micro::SpatialForOp bnLoop =
+      openSpatialLoop(plan.N, plan.BN, plan.innerMap, ValueRange{bmCarried});
+  BlockArgument bn = bnLoop.getBody().front().getArgument(0);
+  Value bnCarried = bnLoop.getBody().front().getArgument(1);
 
   // --- accumulators ------------------------------------------------------
   SmallVector<int64_t, 2> accExtent{plan.BM, plan.BN};
@@ -606,14 +633,26 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
       arith::ConstantIndexOp::create(builder, loc, plan.K).getResult();
   Value kStep =
       arith::ConstantIndexOp::create(builder, loc, plan.BK).getResult();
-  auto kLoop = micro::ForOp::create(builder, loc, kLower, kUpper, kStep);
-  BlockArgument bk = startRegionBody(builder, kLoop.getBody(), loc,
-                                     TypeRange{IndexType::get(ctx)})
-                         ->getArgument(0);
+  // The loop carries the accumulators. What an iteration computes is what the
+  // next iteration accumulates into, and what the last one left is the kernel's
+  // result. Without the carried values the MMA inside the loop would compute
+  // dead results while the epilogue read an allocation nothing ever wrote.
+  llvm::SmallVector<Type> carriedTypes(accumulators.size(), accTileType);
+  auto kLoop = micro::ForOp::create(builder, loc, carriedTypes, kLower, kUpper,
+                                    kStep, ValueRange(accumulators));
+  llvm::SmallVector<Type> kBodyTypes{IndexType::get(ctx)};
+  kBodyTypes.append(carriedTypes);
+  Block *kBody = startRegionBody(builder, kLoop.getBody(), loc, kBodyTypes);
+  BlockArgument bk = kBody->getArgument(0);
+  llvm::SmallVector<BlockArgument> carried;
+  for (size_t arm = 0; arm < accumulators.size(); ++arm)
+    carried.push_back(kBody->getArgument(arm + 1));
 
   // `micro.pipeline` goes inside the loop body: that is the position MicroDAG
-  // reads as software pipelining. With one stage the two spellings agree.
-  auto pipeline = micro::PipelineOp::create(builder, loc,
+  // reads as software pipelining. With one stage the two spellings agree. It
+  // carries the accumulators out of its own body, because the MMA it overlaps
+  // runs inside it and the loop above still has to hand the result on.
+  auto pipeline = micro::PipelineOp::create(builder, loc, carriedTypes,
                                             static_cast<uint64_t>(plan.stages));
   startRegionBody(builder, pipeline.getBody(), loc);
 
@@ -679,17 +718,43 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
           /*tail=*/BoolAttr());
 
   // --- MMA ---------------------------------------------------------------
+  // Each arm accumulates into the value the loop carried in, not into the
+  // original allocation: the carried value is this iteration's accumulator.
   DenseI64ArrayAttr mmaShape = DenseI64ArrayAttr::get(
       ctx, SmallVector<int64_t, 3>{plan.BM, plan.BN, plan.BK});
+  llvm::SmallVector<Value> nextAccumulators;
   for (size_t arm = 0; arm < rhsStaged.size(); ++arm)
-    micro::MmaOp::create(
-        builder, loc, accTileType, lhsStaged, rhsStaged[arm], accumulators[arm],
-        mmaShape,
-        micro::DTypeAttr::get(ctx,
-                              *micro::dtypeOfElementType(plan.inputElemType)),
-        micro::DTypeAttr::get(
-            ctx, *micro::dtypeOfElementType(plan.accumulatorElemType)),
-        /*engine=*/StringAttr());
+    nextAccumulators.push_back(
+        micro::MmaOp::create(
+            builder, loc, accTileType, lhsStaged, rhsStaged[arm], carried[arm],
+            mmaShape,
+            micro::DTypeAttr::get(
+                ctx, *micro::dtypeOfElementType(plan.inputElemType)),
+            micro::DTypeAttr::get(
+                ctx, *micro::dtypeOfElementType(plan.accumulatorElemType)),
+            /*engine=*/StringAttr())
+            .getResult());
+
+  // The pipeline hands the computed values out of its body, and the loop hands
+  // them to the next iteration. Both steps are what make the carry real rather
+  // than implied: the MMA runs inside the pipeline, so without the first the
+  // value would not be visible to the loop's own terminator at all.
+  if (auto terminator = dyn_cast<micro::YieldOp>(
+          pipeline.getBody().front().getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, nextAccumulators);
+    terminator.erase();
+  }
+  if (auto terminator = dyn_cast<micro::YieldOp>(kBody->getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, pipeline.getResults());
+    terminator.erase();
+  }
+
+  // Everything after the loop reads what the loop left, so the epilogue and the
+  // write-back see the accumulated result rather than the initial allocation.
+  for (size_t arm = 0; arm < accumulators.size(); ++arm)
+    accumulators[arm] = kLoop.getResults()[arm];
 
   // The epilogue belongs to the output tile, not to one K iteration.
   builder.setInsertionPoint(kLoop->getNextNode());
@@ -717,9 +782,33 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
                                        /*math_mode=*/StringAttr());
   }
 
-  micro::TileStoreOp::create(
-      builder, loc, epilogue,
-      micro::MemorySpaceAttr::get(ctx, micro::MemorySpace::dram));
+  // Writing the tile into the carried output is what updates it: the result is
+  // the destination with this tile written at the loop's own coordinates.
+  Value written =
+      micro::TileStoreOp::create(builder, loc, outputTileType, epilogue,
+                                 bnCarried, ValueRange{bm, bn}, outputSpace)
+          .getResult();
+
+  // The inner loop hands the updated output out, the outer loop carries it, and
+  // the kernel yields what the nest left behind. Each step is what makes the
+  // write-back a value rather than a side effect nothing can observe.
+  if (auto terminator =
+          dyn_cast<micro::YieldOp>(bnLoop.getBody().front().getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, ValueRange{written});
+    terminator.erase();
+  }
+  if (auto terminator =
+          dyn_cast<micro::YieldOp>(bmLoop.getBody().front().getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, bnLoop.getResults());
+    terminator.erase();
+  }
+  if (auto terminator = dyn_cast<micro::YieldOp>(kernelBody->getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, bmLoop.getResults());
+    terminator.erase();
+  }
 
   builder.setInsertionPointToEnd(module.getBody());
   symbols.insert(kernel);

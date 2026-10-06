@@ -1096,6 +1096,19 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME MicroMappingMatmulE2E
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | $<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=exact\" | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir"
   )
+  # MicroMappingMatmulTraverses / MicroMappingSwiGLUTraverses: the stage-C3
+  # acceptance. The same compiler-generated kernel that the mapping tests above
+  # map is now pushed through the whole bridge, and the conversion has to
+  # finish -- `scf.for`, `linalg.matmul`, and the write-back as an
+  # `tensor.insert_slice` threaded through the spatial loops -- with no residual
+  # micro operation for a backend to trip over. Traversal is what this proves;
+  # numerical correctness is C4/C8's.
+  add_test(NAME MicroMappingMatmulTraverses
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | $<TARGET_FILE:llk-opt> --micro-to-linalg | ${FILECHECK_BIN} --check-prefix=TRAVERSE ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir"
+  )
+  add_test(NAME MicroMappingSwiGLUTraverses
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/swiglu_e2e.mlir | $<TARGET_FILE:llk-opt> --micro-to-linalg | ${FILECHECK_BIN} --check-prefix=TRAVERSE ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/swiglu_e2e.mlir"
+  )
   add_test(NAME MicroMappingSwiGLUE2E
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/swiglu_e2e.mlir | $<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store mode=exact\" | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/swiglu_e2e.mlir"
   )

@@ -35,7 +35,7 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 
 // The mapper binds a complete plan onto the lowering-produced kernel: the
 // `micro.plan` marker appears, and no node is left with `no_matching_rule`.
-// CHECK: micro.kernel @matmul_M16_N64_K64(%{{.*}}: tensor<16x64xbf16>, %{{.*}}: tensor<64x64xbf16>) attributes {
+// CHECK: micro.kernel @matmul_M16_N64_K64(%{{.*}}: tensor<16x64xbf16>, %{{.*}}: tensor<64x64xbf16>) -> tensor<16x64xbf16> attributes {
 // CHECK-SAME: micro.plan
 
 // Staged copies carry their placement, bound by their own rule.
@@ -54,3 +54,20 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // The write back carries a placement too.
 // CHECK: micro.tile_store
 // CHECK-SAME: rule = "avx2.tile_store"
+
+//===----------------------------------------------------------------------===//
+// Stage C3: the whole conversion traverses
+//===----------------------------------------------------------------------===//
+//
+// This is the pipeline a compiler takes, and it has to finish: the spatial
+// loops become `scf.for` carrying the output, the contraction becomes a
+// `linalg.matmul` whose accumulator is the value the K loop threads, and the
+// write-back becomes an `tensor.insert_slice` into the carried output. Nothing
+// micro is left for a backend to trip over.
+// TRAVERSE-LABEL: func.func @matmul_M16_N64_K64
+// TRAVERSE: scf.for
+// TRAVERSE: tensor.extract_slice
+// TRAVERSE: linalg.matmul
+// TRAVERSE: tensor.insert_slice
+// TRAVERSE: return
+// TRAVERSE-NOT: micro.
