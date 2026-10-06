@@ -13,11 +13,13 @@
 
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
+#include "mlir/Transforms/Passes.h"
 
 #include "llvm/Config/llvm-config.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
@@ -132,6 +134,17 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   // Lower vector dialect ops to LLVM dialect (must run before SCF→CF
   // lowering because vector.mask may contain scf ops).
   pm.addPass(mlir::createConvertVectorToLLVMPass());
+  // Expand memref ops that carry layout metadata into explicit
+  // `extract_strided_metadata` arithmetic, before anything else looks at them.
+  // A windowed tile view lowers to a `memref.subview` whose offsets are affine
+  // expressions of the loop indices, and the memref conversion finalizes the
+  // metadata ops, not the structured ones.
+  pm.addPass(mlir::memref::createExpandStridedMetadataPass());
+  // Lower the affine dialect those offsets are expressed in. It has no LLVM
+  // form of its own, so without this an `affine.apply` survives -- consuming
+  // `index` values, which in turn keeps `i64 -> index` materializations alive
+  // all the way to LLVM translation, which refuses them.
+  pm.addPass(mlir::createLowerAffinePass());
   // Lower structured control flow (scf) to basic-block control flow (cf).
 #if LLVM_VERSION_MAJOR >= 21
   pm.addPass(mlir::createSCFToControlFlowPass());
@@ -148,6 +161,11 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   pm.addPass(mlir::createConvertFuncToLLVMPass());
   // Lower memref ops to LLVM dialect (finalizes the MemRef→LLVM conversion).
   pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+  // Drop the materializations the conversions inserted and then left unused --
+  // an `i64 -> index` cast with no users, typically, from lowering a loop's
+  // induction variable. Reconciliation only removes casts whose types agree, so
+  // without this one they survive to LLVM translation, which refuses them.
+  pm.addPass(mlir::createCanonicalizerPass());
   // Reconcile unrealized casts between conversion passes.
   pm.addPass(mlir::createReconcileUnrealizedCastsPass());
 }

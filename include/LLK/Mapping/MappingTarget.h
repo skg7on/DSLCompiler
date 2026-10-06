@@ -60,6 +60,15 @@ public:
   /// plugin contract permits.
   virtual llvm::Error verify(const TargetBundle &bundle) const = 0;
 
+  /// True when this emitter lowers the bundles it verifies.
+  ///
+  /// A target declares an emitter key because its rules emit it; it implements
+  /// lowering only for the keys it has code for. A caller that has to choose
+  /// between the target's own path and the reference bridge asks this, rather
+  /// than calling `lower` and reading the failure -- an error is a diagnostic,
+  /// not a capability query.
+  virtual bool hasLowering() const { return false; }
+
   /// Lowers the covered operation group according to `bundle`.
   ///
   /// `coveredOps` are the operations the selected candidate covers, and the
@@ -187,6 +196,41 @@ loadMappingTarget(llvm::StringRef name, llvm::StringRef machinePath,
 /// and every emitter key is declared. Returns the first violation, in rule
 /// order, so diagnostics are deterministic.
 llvm::Error verifyMappingTarget(const MappingTarget &target);
+
+/// A target package's entry point: given a configuration root, load and verify
+/// the target.
+///
+/// It returns the *plugin's* target, not a configuration-only one -- which is
+/// the whole point of going through it. A target that loads its files with the
+/// generic loader gets emitters that can verify a bundle and not lower it, so a
+/// pipeline that wants selected-bundle execution has to ask the package.
+using MappingTargetFactory = llvm::Expected<std::unique_ptr<MappingTarget>> (*)(
+    llvm::StringRef configurationRoot);
+
+/// Registers `factory` under `name`, so generic code can reach a target without
+/// naming it.
+///
+/// The plugin boundary needs this: a tool loads whatever target the user asked
+/// for by name, and the mapping core compares that name only as an opaque
+/// string. A tool's startup is the one place allowed to know which packages
+/// exist, exactly as it is for dialects and passes.
+///
+/// Registering the same name twice replaces the earlier factory; a name is an
+/// identity, and silently keeping both would make behaviour depend on
+/// initialisation order.
+void registerMappingTarget(llvm::StringRef name, MappingTargetFactory factory);
+
+/// True when a factory is registered under `name`.
+bool isRegisteredMappingTarget(llvm::StringRef name);
+
+/// Creates the target registered under `name`.
+///
+/// Fails when nothing is registered under it, naming the ones that are: a
+/// misspelt target is a diagnostic rather than a fallback to a different
+/// backend, which is what a silent default would amount to.
+llvm::Expected<std::unique_ptr<MappingTarget>>
+createRegisteredMappingTarget(llvm::StringRef name,
+                              llvm::StringRef configurationRoot);
 
 } // namespace mlir::llk::mapping
 

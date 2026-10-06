@@ -33,6 +33,10 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 
+#include "mlir/ExecutionEngine/CRunnerUtils.h"
+
+#include "llvm/ExecutionEngine/JITSymbol.h"
+#include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -302,6 +306,21 @@ createMappedExecutable(mlir::ModuleOp module, llvm::StringRef entrySymbol) {
       llvm::orc::LLJITBuilder().create();
   if (!jit)
     return jit.takeError();
+
+  // The lowered kernel calls the MLIR C runtime for its `memref.copy`, a call
+  // the finalize pass emits rather than inlining. That runtime is linked into
+  // this binary, so its address is handed to the JIT directly: relying on the
+  // dynamic loader to have kept a symbol nothing else references would work
+  // until the linker dropped the library, which is exactly what happened.
+  llvm::orc::SymbolMap runtimeSymbols;
+  runtimeSymbols[(*jit)->mangleAndIntern("memrefCopy")] =
+      llvm::orc::ExecutorSymbolDef(
+          llvm::orc::ExecutorAddr::fromPtr(&memrefCopy),
+          llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+  if (llvm::Error error = (*jit)->getMainJITDylib().define(
+          llvm::orc::absoluteSymbols(std::move(runtimeSymbols))))
+    return std::move(error);
+
   if (llvm::Error error = (*jit)->addIRModule(llvm::orc::ThreadSafeModule(
           std::move(llvmModule), std::move(llvmContext))))
     return std::move(error);
