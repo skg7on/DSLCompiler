@@ -266,6 +266,13 @@ Value buildElementwise(OpBuilder &builder, Location loc, ElementwiseKind kind,
 /// A materialized tile is a value with storage: in tensor land, that is an
 /// `tensor.empty` of the same shape, which bufferization turns into an
 /// allocation.
+///
+/// The reference form defines freshly allocated tile storage to be **zero**. A
+/// real allocation's contents are unconstrained, so no correct program may
+/// depend on them -- and an accumulator that started at whatever the allocator
+/// left would make every numeric check of a GEMM a coin toss rather than a
+/// measurement. Filling is what makes "the kernel computed this" a statement
+/// about the program instead of about the heap.
 struct TileAllocOpLowering : OpConversionPattern<micro::TileAllocOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
@@ -275,8 +282,14 @@ struct TileAllocOpLowering : OpConversionPattern<micro::TileAllocOp> {
         getTypeConverter()->convertType(op.getType()));
     if (!type)
       return rewriter.notifyMatchFailure(op, "not convertible to a tensor");
-    rewriter.replaceOpWithNewOp<tensor::EmptyOp>(op, type.getShape(),
-                                                 type.getElementType());
+    auto empty = tensor::EmptyOp::create(rewriter, op.getLoc(), type.getShape(),
+                                         type.getElementType());
+    auto zero = arith::ConstantOp::create(
+        rewriter, op.getLoc(), rewriter.getZeroAttr(type.getElementType()));
+    rewriter.replaceOp(op, linalg::FillOp::create(rewriter, op.getLoc(),
+                                                  ValueRange{zero},
+                                                  ValueRange{empty})
+                               .getResult(0));
     return success();
   }
 };

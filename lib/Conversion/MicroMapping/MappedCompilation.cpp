@@ -178,6 +178,40 @@ mlir::LogicalResult lowerToBackendForm(mlir::ModuleOp module) {
 
 } // namespace
 
+/// The tail every compilation shares: Linalg and loops, then the calling
+/// convention, then the code.
+llvm::Expected<MappedCompilation>
+finishCompilation(MappedCompilation compilation,
+                  const MappedCompileOptions &options) {
+  if (mlir::failed(lowerToBackendForm(*compilation.module)))
+    return compileError(
+        "lowering the mapped kernel to Linalg and loops failed");
+  compilation.stopped = MappedStop::Lowered;
+  if (options.stop == MappedStop::Lowered)
+    return compilation;
+
+  // The calling convention, and then the code. `createMappedExecutable` takes
+  // the module by value and keeps nothing from it, so the module this
+  // compilation held is handed over here.
+  //
+  // The entry symbol is required rather than guessed: after lowering a module
+  // may hold the source function and the kernel that replaced it, and picking
+  // one by position would compile a different program than the caller asked
+  // for.
+  if (options.entrySymbol.empty())
+    return compileError("compiling to an executable needs the entry symbol to "
+                        "name; a module may hold more than one function");
+
+  llvm::Expected<std::unique_ptr<MappedExecutable>> executable =
+      createMappedExecutable(*compilation.module, options.entrySymbol);
+  if (!executable)
+    return executable.takeError();
+  compilation.executable = std::move(*executable);
+  compilation.stopped = MappedStop::Executable;
+  compilation.module = nullptr;
+  return compilation;
+}
+
 llvm::Expected<MappedCompilation>
 compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
                     const mlir::llk::mapping::CoveringPlan &plan,
@@ -212,33 +246,21 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
   if (options.stop == MappedStop::TargetLowered)
     return compilation;
 
-  if (mlir::failed(lowerToBackendForm(*compilation.module)))
-    return compileError(
-        "lowering the mapped kernel to Linalg and loops failed");
-  compilation.stopped = MappedStop::Lowered;
-  if (options.stop == MappedStop::Lowered)
-    return compilation;
+  return finishCompilation(std::move(compilation), options);
+}
 
-  // The calling convention, and then the code. `createMappedExecutable` takes
-  // the module by value and keeps nothing from it, so the module this
-  // compilation held is handed over here.
-  //
-  // The entry symbol is required rather than guessed: after lowering a module
-  // may hold the source function and the kernel that replaced it, and picking
-  // one by position would compile a different program than the caller asked
-  // for.
-  if (options.entrySymbol.empty())
-    return compileError("compiling to an executable needs the entry symbol to "
-                        "name; a module may hold more than one function");
+llvm::Expected<MappedCompilation>
+compileConcreteMicroKernel(mlir::ModuleOp source,
+                           const MappedCompileOptions &options) {
+  if (options.stop == MappedStop::MappedMicro ||
+      options.stop == MappedStop::TargetLowered)
+    return compileError("a concrete Micro kernel has no plan to bind and no "
+                        "target to lower it against; ask for `lowered` or "
+                        "`executable`");
 
-  llvm::Expected<std::unique_ptr<MappedExecutable>> executable =
-      createMappedExecutable(*compilation.module, options.entrySymbol);
-  if (!executable)
-    return executable.takeError();
-  compilation.executable = std::move(*executable);
-  compilation.stopped = MappedStop::Executable;
-  compilation.module = nullptr;
-  return compilation;
+  MappedCompilation compilation;
+  compilation.module = source.clone();
+  return finishCompilation(std::move(compilation), options);
 }
 
 } // namespace llk
