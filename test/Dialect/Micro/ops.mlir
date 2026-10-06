@@ -132,3 +132,62 @@ func.func @test_nested_kernel() {
   }
   return
 }
+
+//===----------------------------------------------------------------------===//
+// micro.kernel -- the explicit argument and result contract (C1)
+//===----------------------------------------------------------------------===//
+
+// A kernel declares what it reads and what it produces. The signature is the
+// contract: the entry block arguments are the inputs and the yielded value is
+// the result. The yielded `!micro.tile` stands for the declared tensor because
+// their logical shape and element type agree -- memory space and layout are
+// placement facts, not part of the caller's ABI.
+// CHECK-LABEL: func.func @test_kernel_explicit_abi
+func.func @test_kernel_explicit_abi() {
+  // CHECK: micro.kernel @add(%{{.*}}: tensor<8x8xf32>, %{{.*}}: tensor<8x8xf32>) -> tensor<8x8xf32>
+  // CHECK: micro.yield
+  micro.kernel @add(%a: tensor<8x8xf32>, %b: tensor<8x8xf32>) -> tensor<8x8xf32> {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %tb = micro.tile_view %b {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %ta, %tb : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield %r : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+  return
+}
+
+// A kernel may declare several results; each yielded value is checked against
+// its own declared result, so a swapped pair is rejected.
+// CHECK-LABEL: func.func @test_kernel_multi_result
+func.func @test_kernel_multi_result() {
+  // CHECK: micro.kernel @two(%{{.*}}: tensor<8x8xf32>, %{{.*}}: tensor<8x4xf32>) -> (tensor<8x8xf32>, tensor<8x4xf32>)
+  micro.kernel @two(%a: tensor<8x8xf32>, %b: tensor<8x4xf32>) -> (tensor<8x8xf32>, tensor<8x4xf32>) {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %tb = micro.tile_view %b {shape = array<i64: 8, 4>} : tensor<8x4xf32> -> !micro.tile<8x4xf32, memory = #micro.memory<sram>>
+    micro.yield %ta, %tb : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x4xf32, memory = #micro.memory<sram>>
+  }
+  return
+}
+
+// A kernel with a signature and no results is legal: it is a sink whose output
+// is written by other means. Omitting the `->` is still the argumentless form
+// for the printer, so the signature keeps its parameter list.
+// CHECK-LABEL: func.func @test_kernel_no_results
+func.func @test_kernel_no_results() {
+  // CHECK: micro.kernel @sink(%{{.*}}: tensor<8x8xf32>) {
+  micro.kernel @sink(%a: tensor<8x8xf32>) {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  return
+}
+
+// The legacy argumentless form still parses and round-trips: it carries no
+// contract, so it stays usable for analysis and reference fixtures.
+// CHECK-LABEL: func.func @test_kernel_legacy_form
+func.func @test_kernel_legacy_form() {
+  // CHECK: micro.kernel @legacy {
+  micro.kernel @legacy {
+    micro.yield
+  }
+  return
+}

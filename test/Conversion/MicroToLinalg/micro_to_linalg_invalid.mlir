@@ -14,9 +14,7 @@
 // This chunk pins that for `micro.mma`, whose Linalg form
 // (`linalg.matmul` over the fragments) is a later slice.
 module {
-  micro.kernel @unsupported {
-    %a = tensor.empty() : tensor<8x8xf32>
-    %b = tensor.empty() : tensor<8x8xf32>
+  micro.kernel @unsupported(%a: tensor<8x8xf32>, %b: tensor<8x8xf32>) {
     %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     %tb = micro.tile_view %b {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     %acc = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<acc>>
@@ -33,8 +31,7 @@ module {
 // dropped and the reader would silently see the wrong elements. Slice support
 // is a later slice, so this fails loudly until then.
 module {
-  micro.kernel @offset_window {
-    %a = tensor.empty() : tensor<8x8xf32>
+  micro.kernel @offset_window(%a: tensor<8x8xf32>) {
     %one = arith.constant 1 : index
     %zero = arith.constant 0 : index
     // expected-error @+1 {{failed to legalize operation 'micro.tile_view'}}
@@ -50,11 +47,23 @@ module {
 // the source happens to hold at an unknown origin.
 module {
   func.func private @runtime_offset() -> index
-  micro.kernel @dynamic_window {
-    %a = tensor.empty() : tensor<8x8xf32>
+  micro.kernel @dynamic_window(%a: tensor<8x8xf32>) {
     %d = func.call @runtime_offset() : () -> index
     // expected-error @+1 {{failed to legalize operation 'micro.tile_view'}}
     %ta = micro.tile_view %a[%d, %d] {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+
+// -----
+
+// A kernel with no declared signature has no ABI to lower. Inferring one from
+// the entry tensors -- the pre-contract behaviour -- is exactly the ambiguity
+// the explicit signature removed, so the pass refuses instead of guessing.
+module {
+  // expected-error @+1 {{kernel has no explicit signature}}
+  micro.kernel @legacy {
+    %a = tensor.empty() : tensor<8x8xf32>
     micro.yield
   }
 }

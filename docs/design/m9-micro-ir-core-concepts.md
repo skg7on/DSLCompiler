@@ -177,6 +177,40 @@ Structure ops describe execution hierarchy and schedule organization.
 
 `micro.spatial_for` is spatial. Iterations are mapped onto hardware resources such as clusters, cores, PEs, lanes, or thread-pool workers.
 
+#### Kernel argument and result contract
+
+A concrete `micro.kernel` declares what it reads and what it produces in its
+signature:
+
+```mlir
+micro.kernel @add(%a: tensor<8x8xf32>, %b: tensor<8x8xf32>) -> tensor<8x8xf32> {
+  %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  %tb = micro.tile_view %b {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  %r = micro.vector "add" %ta, %tb : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  micro.yield %r : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+}
+```
+
+The signature is the contract, and nothing about the ABI is inferred from the
+body:
+
+- **Inputs** are the entry block arguments. A `tensor.empty` inside the body is
+  internal scratch; it is never guessed to be a caller's buffer.
+- **Results** are the values `micro.yield` carries. A yielded `!micro.tile`
+  satisfies a declared tensor result when their logical shape and element type
+  agree: memory space, layout, and owner are placement facts, not part of the
+  caller's ABI.
+- A kernel **without** a signature keeps the legacy argumentless form. It stays
+  parseable for analysis and reference fixtures but carries no contract, so it
+  cannot be lowered for execution. An inferred signature is not an interface:
+  migrate such a kernel before executing it.
+
+A kernel may declare no results (a sink) or several. The compiler-generated
+kernels emitted by `--llk-to-micro` currently declare their inputs and no
+results, because their output is written through `micro.tile_store` from inside
+the spatial loops and is therefore not a value the kernel can yield; giving
+those kernels a declared, bufferized result is Stage C3 work.
+
 ### 3.2 Memory
 
 ```text
@@ -559,6 +593,11 @@ Target lowering is future work. The first target can map concrete `micro` to the
 
 Concrete `micro.kernel` verifier:
 
+- a declared signature is a contract: the entry block arguments match its
+  declared inputs exactly, and `micro.yield` produces exactly its declared
+  results, compared on logical shape and element type (a yielded `!micro.tile`
+  satisfies a declared tensor result of the same shape and dtype)
+- a kernel without a signature carries no contract and is analysis-only
 - all search parameters are bound
 - every tile has known shape, dtype, layout, memory space, and owner when required by its kind
 - logical tile views are zero-cost and do not claim materialized storage

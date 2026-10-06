@@ -415,7 +415,8 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   builder.setInsertionPointToEnd(module.getBody());
 
   auto kernel = micro::KernelOp::create(
-      builder, loc, symName, StringAttr::get(ctx, space.workload),
+      builder, loc, symName, /*function_type=*/TypeAttr(),
+      StringAttr::get(ctx, space.workload),
       /*target=*/StringAttr(), StringAttr::get(ctx, candidate.id),
       IntegerAttr::get(IntegerType::get(ctx, 64), decisions.mBucket));
 

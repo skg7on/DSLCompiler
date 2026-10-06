@@ -20,7 +20,9 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // CHECK-LABEL: func.func @matmul
 // CHECK: llk.matmul
 
-// CHECK-LABEL: micro.kernel @matmul_M16_N64_K64 attributes {
+// The kernel names its two operands in its signature -- the block arguments
+// the body reads -- so no entry tensor is guessed to be external.
+// CHECK: micro.kernel @matmul_M16_N64_K64(%[[A:.*]]: tensor<16x64xbf16>, %[[B:.*]]: tensor<64x64xbf16>) attributes {
 // CHECK-SAME: fragment_shape = array<i64: 8, 16, 32>
 // CHECK-SAME: memory_path = "dram:sram:acc"
 // CHECK-SAME: mma_shape = array<i64: 16, 16, 32>
@@ -31,9 +33,7 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // CHECK-SAME: tile_layout = "row_major"
 // CHECK-SAME: workload = "matmul"
 
-// Two entry tensors, not three: A and B.
-// CHECK: %[[A:.*]] = tensor.empty() : tensor<16x64xbf16>
-// CHECK: %[[B:.*]] = tensor.empty() : tensor<64x64xbf16>
+// Two operands, not three: A and B, both declared rather than materialized.
 // CHECK-NOT: tensor.empty
 
 // CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> {
