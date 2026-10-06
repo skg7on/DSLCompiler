@@ -14,6 +14,7 @@
 #include "LLK/Runtime/KernelKey.h"
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/PassManager.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/Support/Error.h"
 
@@ -241,6 +242,14 @@ private:
   CacheLevel object_cache_;    // L3
   CacheLevel weight_cache_;    // L4
 };
+
+/// The progressive lowering from the dialects the micro bridge emits down to
+/// the LLVM dialect, ready for `translateModuleToLLVMIR`.
+///
+/// `JitCache` and `MappedExecutable` both compile micro kernels, and they have
+/// to compile them the same way: two pipelines would drift, and a kernel
+/// compiled through one would not be the kernel the other validated.
+void addKernelToLLVMPasses(mlir::PassManager &pm);
 
 } // namespace llk
 

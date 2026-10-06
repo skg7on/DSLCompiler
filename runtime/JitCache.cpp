@@ -128,7 +128,7 @@ std::string JitCache::weightKeyToString(const WeightKey &key) {
 // ---------------------------------------------------------------------------
 // Lowering pipeline: progressively lower MLIR dialects to LLVM dialect.
 // ---------------------------------------------------------------------------
-static void addLoweringPasses(mlir::PassManager &pm) {
+void addKernelToLLVMPasses(mlir::PassManager &pm) {
   // Lower vector dialect ops to LLVM dialect (must run before SCF→CF
   // lowering because vector.mask may contain scf ops).
   pm.addPass(mlir::createConvertVectorToLLVMPass());
@@ -196,7 +196,7 @@ JitCache::lookupOrCompile(const std::string &cache_key, mlir::ModuleOp module) {
 
   // Lower to LLVM dialect.
   mlir::PassManager pm(module->getContext());
-  addLoweringPasses(pm);
+  addKernelToLLVMPasses(pm);
   if (mlir::failed(pm.run(module)))
     return llvm::make_error<llvm::StringError>("Lowering passes failed",
                                                llvm::inconvertibleErrorCode());

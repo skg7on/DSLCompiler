@@ -39,6 +39,7 @@
 #include "LLK/Conversion/MicroToLinalg.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Runtime/JitCache.h"
+#include "LLK/Runtime/MappedExecutable.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
@@ -65,7 +66,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
+#include <vector>
 
 #if LLVM_VERSION_MAJOR >= 21
 using BufOpts = mlir::bufferization::OneShotBufferizePassOptions;
@@ -163,4 +166,226 @@ TEST(MicroKernelExecution, TheLoweredKernelReachesTheJit) {
     llvm::consumeError(symbol.takeError());
     GTEST_SKIP() << "JIT compilation not available";
   }
+}
+
+//===----------------------------------------------------------------------===//
+// C4: the mapped kernel is *called*
+//===----------------------------------------------------------------------===//
+//
+// Everything above stops at "it compiles". These tests run the lowered kernel
+// through descriptor pointers and check what it computed -- which is the only
+// thing that turns the calling convention into a claim rather than a hope. A
+// compilation or invocation failure is a test failure here, never a skip: an
+// ABI that is only exercised when it happens to work proves nothing.
+
+namespace {
+
+/// Lowers `kAddKernel` and compiles it for invocation. The MLIR context belongs
+/// to the caller; the executable owns its own JIT and translated module, so
+/// nothing here keeps a borrowed MLIR operation alive.
+std::unique_ptr<llk::MappedExecutable> compileAdd(mlir::MLIRContext &context) {
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kAddKernel, &context);
+  EXPECT_TRUE(module);
+  if (!module)
+    return nullptr;
+  EXPECT_TRUE(lowerToLoops(*module));
+
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      llk::createMappedExecutable(*module, "add");
+  if (!executable) {
+    ADD_FAILURE() << llvm::toString(executable.takeError());
+    return nullptr;
+  }
+  return std::move(*executable);
+}
+
+/// A[i] = i and B[i] = 1 give out[i] = i + 1 exactly, so every element of the
+/// result is checkable. The B storage can start at an offset, so a caller can
+/// hand over a window into a larger buffer instead of a fresh allocation.
+void fillInputs(std::vector<float> &a, std::vector<float> &bStorage,
+                size_t bBase) {
+  a.resize(64);
+  for (size_t i = 0; i < a.size(); ++i)
+    a[i] = float(i);
+  bStorage.assign(bBase + 64, -1.0f);
+  std::fill(bStorage.begin() + bBase, bStorage.end(), 1.0f);
+}
+
+/// Runs the add kernel over freshly filled inputs and returns what it wrote.
+std::vector<float> runAdd(llk::MappedExecutable &executable,
+                          std::vector<float> &aStorage,
+                          std::vector<float> &bStorage) {
+  std::vector<float> out(64, -1.0f);
+  MemRef2D da{aStorage.data(), aStorage.data(), 0, 8, 8, 8, 1};
+  MemRef2D db{bStorage.data(), bStorage.data(), 0, 8, 8, 8, 1};
+  MemRef2D dout{out.data(), out.data(), 0, 8, 8, 8, 1};
+  llvm::Error error = executable.invoke({&da, &db}, {&dout});
+  if (error) {
+    ADD_FAILURE() << llvm::toString(std::move(error));
+    return {};
+  }
+  return out;
+}
+
+} // namespace
+
+TEST(MicroKernelExecution, InvokesDescriptorPointersAndWritesEveryResult) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  std::unique_ptr<llk::MappedExecutable> executable = compileAdd(context);
+  ASSERT_TRUE(executable);
+
+  // The ABI is what the kernel declared, recorded before its types were erased
+  // into LLVM pointers.
+  ASSERT_EQ(executable->abi().inputs.size(), 2u);
+  ASSERT_EQ(executable->abi().outputs.size(), 1u);
+  EXPECT_EQ(executable->abi().inputs[0].shape, (std::vector<int64_t>{8, 8}));
+  EXPECT_EQ(executable->abi().inputs[0].elementType, "f32");
+  EXPECT_EQ(executable->abi().outputs[0].shape, (std::vector<int64_t>{8, 8}));
+
+  std::vector<float> a, b;
+  fillInputs(a, b, /*bBase=*/0);
+  std::vector<float> out = runAdd(*executable, a, b);
+  ASSERT_EQ(out.size(), 64u);
+  for (size_t i = 0; i < out.size(); ++i)
+    EXPECT_EQ(out[i], float(i + 1)) << "element " << i;
+}
+
+TEST(MicroKernelExecution, InvokesTheSameKernelRepeatedly) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  std::unique_ptr<llk::MappedExecutable> executable = compileAdd(context);
+  ASSERT_TRUE(executable);
+
+  std::vector<float> a, b;
+  fillInputs(a, b, /*bBase=*/0);
+  // The second invocation reuses the compiled code, so it also checks that the
+  // first call consumed nothing the executable still needs.
+  for (int round = 0; round < 2; ++round) {
+    std::vector<float> out = runAdd(*executable, a, b);
+    ASSERT_EQ(out.size(), 64u);
+    for (size_t i = 0; i < out.size(); ++i)
+      EXPECT_EQ(out[i], float(i + 1)) << "round " << round << " element " << i;
+  }
+}
+
+TEST(MicroKernelExecution, AcceptsABufferThatStartsInsideALargerAllocation) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  std::unique_ptr<llk::MappedExecutable> executable = compileAdd(context);
+  ASSERT_TRUE(executable);
+
+  // Writing into the middle of a buffer the caller owns is the normal case in a
+  // real program, and the descriptor's `aligned` pointer is how it is said.
+  std::vector<float> a;
+  std::vector<float> bStorage;
+  fillInputs(a, bStorage, /*bBase=*/8);
+
+  const size_t outBase = 16;
+  std::vector<float> outStorage(64 + 32, -2.0f);
+  MemRef2D da{a.data(), a.data(), 0, 8, 8, 8, 1};
+  MemRef2D db{bStorage.data(), bStorage.data() + 8, 0, 8, 8, 8, 1};
+  MemRef2D dout{outStorage.data(), outStorage.data() + outBase, 0, 8, 8, 8, 1};
+
+  llvm::Error error = executable->invoke({&da, &db}, {&dout});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+  for (size_t i = 0; i < 64; ++i)
+    EXPECT_EQ(outStorage[outBase + i], float(i + 1)) << "element " << i;
+  // Nothing outside the window was touched.
+  EXPECT_EQ(outStorage[outBase - 1], -2.0f);
+  EXPECT_EQ(outStorage[outBase + 64], -2.0f);
+}
+
+TEST(MicroKernelExecution, RefusesDescriptorsThatDisagreeWithTheAbi) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  std::unique_ptr<llk::MappedExecutable> executable = compileAdd(context);
+  ASSERT_TRUE(executable);
+
+  std::vector<float> a, b, out(64, -1.0f);
+  fillInputs(a, b, /*bBase=*/0);
+  MemRef2D da{a.data(), a.data(), 0, 8, 8, 8, 1};
+  MemRef2D db{b.data(), b.data(), 0, 8, 8, 8, 1};
+  MemRef2D dout{out.data(), out.data(), 0, 8, 8, 8, 1};
+
+  // Too few inputs: the kernel expects two, and calling it with one would pass
+  // whatever happened to be in the next register.
+  llvm::Error arity = executable->invoke({&da}, {&dout});
+  ASSERT_TRUE(static_cast<bool>(arity));
+  EXPECT_NE(llvm::toString(std::move(arity)).find("input"), std::string::npos);
+
+  // A descriptor of the wrong shape would make the kernel address memory the
+  // caller never offered.
+  MemRef2D wrongShape{out.data(), out.data(), 0, 4, 4, 4, 1};
+  llvm::Error shape = executable->invoke({&da, &db}, {&wrongShape});
+  ASSERT_TRUE(static_cast<bool>(shape));
+  EXPECT_NE(llvm::toString(std::move(shape)).find("compiled for"),
+            std::string::npos);
+
+  // A row-major kernel cannot honour a different stride, so it is refused
+  // rather than silently reading the wrong elements.
+  MemRef2D wrongStride{out.data(), out.data(), 0, 8, 8, 16, 2};
+  llvm::Error stride = executable->invoke({&da, &db}, {&wrongStride});
+  ASSERT_TRUE(static_cast<bool>(stride));
+  EXPECT_NE(llvm::toString(std::move(stride)).find("stride"),
+            std::string::npos);
+
+  // A null descriptor is a caller mistake, not undefined behaviour.
+  llvm::Error null = executable->invoke({&da, nullptr}, {&dout});
+  ASSERT_TRUE(static_cast<bool>(null));
+  EXPECT_NE(llvm::toString(std::move(null)).find("null"), std::string::npos);
+}
+
+TEST(MicroKernelExecution, RefusesAModuleWithoutTheEntrySymbol) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kAddKernel, &context);
+  ASSERT_TRUE(module);
+  ASSERT_TRUE(lowerToLoops(*module));
+
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      llk::createMappedExecutable(*module, "not_a_kernel");
+  ASSERT_FALSE(static_cast<bool>(executable));
+  EXPECT_NE(llvm::toString(executable.takeError()).find("not_a_kernel"),
+            std::string::npos);
+}
+
+TEST(MicroKernelExecution, KeepsTheExecutableAliveAfterTheModuleIsGone) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kAddKernel, &context);
+  ASSERT_TRUE(module);
+  ASSERT_TRUE(lowerToLoops(*module));
+
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      llk::createMappedExecutable(*module, "add");
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+
+  // The executable owns its JIT and its translated LLVM module, so destroying
+  // the source module must not disturb it -- that is what "no borrowed
+  // operation" means in practice.
+  module = nullptr;
+
+  std::vector<float> a, b;
+  fillInputs(a, b, /*bBase=*/0);
+  std::vector<float> out = runAdd(**executable, a, b);
+  ASSERT_EQ(out.size(), 64u);
+  for (size_t i = 0; i < out.size(); ++i)
+    EXPECT_EQ(out[i], float(i + 1)) << "element " << i;
 }
