@@ -14,6 +14,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/CallInterfaces.h"
 #include "llvm/ADT/StringSet.h"
 
 // Attribute class declarations.
@@ -81,8 +82,109 @@ Type mlir::micro::materializedTileType(Type source, Attribute memory) {
 }
 
 //===----------------------------------------------------------------------===//
-// Custom verifier for KernelOp.
+// Custom assembly format and verifier for KernelOp.
 //===----------------------------------------------------------------------===//
+
+/// The logical `(shape, element type)` a type presents across the kernel
+/// boundary. A tile, a tensor and a memref with the same extents and element
+/// type describe the same data: memory space and layout are scheduling facts,
+/// not part of a caller's ABI.
+struct KernelLogicalImage {
+  ArrayRef<int64_t> shape;
+  Type elementType;
+};
+
+static std::optional<KernelLogicalImage> kernelLogicalImage(Type type) {
+  if (auto tile = dyn_cast<micro::TileType>(type))
+    return KernelLogicalImage{tile.getShape(), tile.getElementType()};
+  if (auto shaped = dyn_cast<ShapedType>(type))
+    return KernelLogicalImage{shaped.getShape(), shaped.getElementType()};
+  return std::nullopt;
+}
+
+/// True when `declared` and `produced` describe the same logical data. Types
+/// with no shaped image (an `index`, say) must match exactly.
+static bool sameLogicalData(Type declared, Type produced) {
+  auto lhs = kernelLogicalImage(declared);
+  auto rhs = kernelLogicalImage(produced);
+  if (!lhs || !rhs)
+    return declared == produced;
+  return lhs->shape == rhs->shape && lhs->elementType == rhs->elementType;
+}
+
+/// `micro.kernel @name` with an optional signature, then the attributes and the
+/// body. The signature is `(%arg: type, ...) -> type`; omitting it entirely is
+/// the legacy argumentless form, which carries no contract.
+ParseResult KernelOp::parse(OpAsmParser &parser, OperationState &result) {
+  StringAttr nameAttr;
+  if (parser.parseSymbolName(nameAttr, getSymNameAttrName(result.name),
+                             result.attributes))
+    return failure();
+
+  llvm::SmallVector<OpAsmParser::Argument> arguments;
+  llvm::SmallVector<Type> resultTypes;
+  if (succeeded(parser.parseOptionalLParen())) {
+    if (parser.parseArgumentList(arguments, OpAsmParser::Delimiter::None,
+                                 /*allowType=*/true) ||
+        parser.parseRParen())
+      return failure();
+
+    // The result list is optional: a kernel that produces nothing carries no
+    // `->`, which is how the compiler-generated kernels currently look while
+    // their output is still written by `micro.tile_store`. A single result is
+    // a bare type; several are parenthesized, matching what the printer emits.
+    if (succeeded(parser.parseOptionalArrow())) {
+      if (succeeded(parser.parseOptionalLParen())) {
+        if (parser.parseTypeList(resultTypes) || parser.parseRParen())
+          return failure();
+      } else if (parser.parseTypeList(resultTypes)) {
+        return failure();
+      }
+    }
+
+    llvm::SmallVector<Type> inputTypes;
+    inputTypes.reserve(arguments.size());
+    for (OpAsmParser::Argument &argument : arguments)
+      inputTypes.push_back(argument.type);
+    result.addAttribute(getFunctionTypeAttrName(result.name),
+                        TypeAttr::get(FunctionType::get(
+                            parser.getContext(), inputTypes, resultTypes)));
+  }
+
+  if (parser.parseOptionalAttrDictWithKeyword(result.attributes))
+    return failure();
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body, arguments, /*enableNameShadowing=*/true))
+    return failure();
+
+  // A custom parser has to add the implicit terminator itself; the declarative
+  // `$body` form did it, and without this a body that omits its `micro.yield`
+  // parses but fails verification.
+  KernelOp::ensureTerminator(*body, parser.getBuilder(), result.location);
+  return success();
+}
+
+void KernelOp::print(OpAsmPrinter &printer) {
+  printer << ' ';
+  printer.printSymbolName(getSymName());
+
+  // A legacy kernel has no signature to print; an explicit one names its
+  // inputs through the entry block arguments the region already carries.
+  if (FunctionType signature = getKernelFunctionType()) {
+    call_interface_impl::printFunctionSignature(
+        printer, signature.getInputs(), /*argAttrs=*/ArrayAttr(),
+        /*isVariadic=*/false, signature.getResults(),
+        /*resultAttrs=*/ArrayAttr(), &getBody(), /*printEmptyResult=*/false);
+  }
+
+  printer.printOptionalAttrDictWithKeyword(
+      (*this)->getAttrs(),
+      /*elidedAttrs=*/{getSymNameAttrName(), getFunctionTypeAttrName()});
+
+  printer << ' ';
+  printer.printRegion(getBody(), /*printEntryBlockArgs=*/false);
+}
 
 LogicalResult KernelOp::verify() {
   // workload, if present, must be non-empty.
@@ -101,6 +203,41 @@ LogicalResult KernelOp::verify() {
   if (searchOp)
     return searchOp->emitOpError(
         "search ops are not allowed inside micro.kernel");
+
+  // An explicit signature is a contract. Hold the body to it: the entry block
+  // arguments are the declared inputs and the yielded values are the results.
+  FunctionType signature = getKernelFunctionType();
+  if (!signature)
+    return success();
+
+  Block &entry = getBody().front();
+  if (entry.getNumArguments() != signature.getNumInputs())
+    return emitOpError() << "body has " << entry.getNumArguments()
+                         << " block argument(s) but the signature declares "
+                         << signature.getNumInputs() << " input(s)";
+  for (unsigned i = 0, e = signature.getNumInputs(); i < e; ++i) {
+    Type actual = entry.getArgument(i).getType();
+    if (actual != signature.getInput(i))
+      return emitOpError() << "block argument #" << i << " has type " << actual
+                           << ", but the signature declares "
+                           << signature.getInput(i);
+  }
+
+  auto yield = dyn_cast<YieldOp>(entry.getTerminator());
+  if (!yield)
+    return emitOpError("body must terminate with micro.yield");
+
+  if (yield.getNumOperands() != signature.getNumResults())
+    return emitOpError() << "body yields " << yield.getNumOperands()
+                         << " value(s) but the signature declares "
+                         << signature.getNumResults() << " result(s)";
+  for (unsigned i = 0, e = signature.getNumResults(); i < e; ++i) {
+    Type produced = yield.getOperand(i).getType();
+    if (!sameLogicalData(signature.getResult(i), produced))
+      return emitOpError() << "yielded value #" << i << " has type " << produced
+                           << ", which does not match the declared result "
+                           << signature.getResult(i);
+  }
 
   return success();
 }

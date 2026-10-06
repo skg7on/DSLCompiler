@@ -37,7 +37,7 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: llk.fused_swiglu
 
 // The mapper binds a complete plan onto the lowering-produced kernel.
-// CHECK-LABEL: micro.kernel @fused_swiglu_M16_N64_K64 attributes {
+// CHECK: micro.kernel @fused_swiglu_M16_N64_K64(%{{.*}}: tensor<16x64xbf16>, %{{.*}}: tensor<64x64xbf16>, %{{.*}}: tensor<64x64xbf16>) attributes {
 // CHECK-SAME: micro.plan
 
 // Staged copies carry their placement, bound by their own rule.

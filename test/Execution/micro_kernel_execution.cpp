@@ -3,11 +3,11 @@
 // Two checks along the #109 item-4 chain, both about the *signature* a micro
 // kernel acquires on its way to the backend:
 //
-//   1. the ABI itself -- a `micro.kernel` declares no arguments and no results,
-//      so the bridge turns its entry tensors into parameters and its stored
-//      value into the result, and bufferization turns that result into a
-//      concrete memref return. This test lowers a kernel and asserts the
-//      signature it ends up with;
+//   1. the ABI itself -- a `micro.kernel` declares its inputs and results in
+//      its signature; the entry block arguments are the parameters a caller
+//      passes and the yielded value is the result, which bufferization turns
+//      into a concrete memref return. This test lowers a kernel and asserts
+//      the signature it ends up with;
 //   2. that the JIT accepts it -- a build without a working ORC JIT is a skip,
 //      the same contract the legacy execution tests take.
 //
@@ -75,18 +75,19 @@ using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
 
 namespace {
 
-/// A vector add, written in Micro-IR. The two entry tensors are what the kernel
-/// reads; the `micro.tile_store` is what it produces.
+/// A vector add, written in Micro-IR. Its signature names the two inputs the
+/// caller passes and the result it receives; nothing about the ABI is inferred
+/// from the body. The `micro.yield` carries the logical result, which the
+/// interface accepts as the declared tensor because shape and element type
+/// agree -- memory space is a placement fact, not part of the caller's
+/// contract.
 constexpr llvm::StringLiteral kAddKernel = R"mlir(
 module {
-  micro.kernel @add {
-    %a = tensor.empty() : tensor<8x8xf32>
-    %b = tensor.empty() : tensor<8x8xf32>
+  micro.kernel @add(%a: tensor<8x8xf32>, %b: tensor<8x8xf32>) -> tensor<8x8xf32> {
     %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     %tb = micro.tile_view %b {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     %r = micro.vector "add" %ta, %tb : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<acc>>
-    micro.tile_store %r {dst_memory = #micro.memory<dram>} : !micro.tile<8x8xf32, memory = #micro.memory<acc>>
-    micro.yield
+    micro.yield %r : !micro.tile<8x8xf32, memory = #micro.memory<acc>>
   }
 }
 )mlir";
@@ -133,7 +134,7 @@ TEST(MicroKernelExecution, GivesTheKernelItsArgumentsAndResult) {
   ASSERT_TRUE(lowerToLoops(*module))
       << "the bridge and bufferization must succeed";
 
-  // The ABI: the two entry tensors are the parameters, the stored value is the
+  // The ABI: the declared inputs are the parameters, the yielded value is the
   // result, and bufferization has made it a concrete memref.
   auto function = module->lookupSymbol<mlir::func::FuncOp>("add");
   ASSERT_TRUE(function) << "the kernel must have become a function";

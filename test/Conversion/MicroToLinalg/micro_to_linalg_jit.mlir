@@ -9,21 +9,18 @@
 // `!llvm.array<4 x vector<8xf32>>` cast that LLVM translation rejects, while
 // the tensor form tiles, vectorizes, buffers, and translates cleanly.
 //
-// The kernel exercises the ABI too: two entry tensors become the function's
-// arguments and the stored value its result, so the JIT-compiled symbol takes
-// memref descriptors in and returns one -- the runtime's calling convention.
-// The test still asserts "it compiles", not "it produces the right numbers":
-// observing a result needs a harness that calls the symbol, which is the next
-// step.
+// The kernel exercises the ABI too: its two declared inputs become the
+// function's arguments and the yielded value its result, so the JIT-compiled
+// symbol takes memref descriptors in and returns one -- the runtime's calling
+// convention. The test still asserts "it compiles", not "it produces the right
+// numbers": observing a result needs a harness that calls the symbol, which is
+// the next step.
 
 module {
-  micro.kernel @add {
-    %a = tensor.empty() : tensor<8x8xf32>
-    %b = tensor.empty() : tensor<8x8xf32>
+  micro.kernel @add(%a: tensor<8x8xf32>, %b: tensor<8x8xf32>) -> tensor<8x8xf32> {
     %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     %tb = micro.tile_view %b {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     %r = micro.vector "add" %ta, %tb : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<acc>>
-    micro.tile_store %r {dst_memory = #micro.memory<dram>} : !micro.tile<8x8xf32, memory = #micro.memory<acc>>
-    micro.yield
+    micro.yield %r : !micro.tile<8x8xf32, memory = #micro.memory<acc>>
   }
 }

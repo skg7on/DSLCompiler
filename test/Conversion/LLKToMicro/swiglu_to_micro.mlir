@@ -37,7 +37,7 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK-LABEL: func.func @swiglu
 // CHECK: llk.fused_swiglu
 
-// CHECK-LABEL: micro.kernel @fused_swiglu_M16_N64_K64 attributes {
+// CHECK: micro.kernel @fused_swiglu_M16_N64_K64(%[[X:.*]]: tensor<16x64xbf16>, %[[WG:.*]]: tensor<64x64xbf16>, %[[WU:.*]]: tensor<64x64xbf16>) attributes {
 // CHECK-SAME: fragment_shape = array<i64: 8, 16, 32>
 // CHECK-SAME: memory_path = "dram:sram:acc"
 // CHECK-SAME: mma_shape = array<i64: 16, 16, 32>
@@ -48,11 +48,9 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK-SAME: tile_layout = "row_major"
 // CHECK-SAME: workload = "fused_swiglu"
 
-// The kernel is isolated from above, so it declares its own entry tensors
-// instead of referring to the function's arguments.
-// CHECK: %[[X:.*]] = tensor.empty() : tensor<16x64xbf16>
-// CHECK: %[[WG:.*]] = tensor.empty() : tensor<64x64xbf16>
-// CHECK: %[[WU:.*]] = tensor.empty() : tensor<64x64xbf16>
+// The kernel is isolated from above, so it reads the three operands its own
+// signature declared rather than materializing entry tensors.
+// CHECK-NOT: tensor.empty
 
 // One spatial loop per tiled output axis, mapped onto machine resources.
 // CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> {

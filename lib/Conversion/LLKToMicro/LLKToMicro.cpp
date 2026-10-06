@@ -474,9 +474,24 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   OpBuilder builder(ctx);
   builder.setInsertionPointToEnd(module.getBody());
 
+  // --- the kernel's explicit input contract ------------------------------
+  // The kernel reads its operands from outside, and naming them in its
+  // signature is what keeps an internal `tensor.empty` from being mistaken for
+  // a caller's buffer. Results are deliberately not declared here: this export
+  // writes each output tile through `micro.tile_store` from inside the spatial
+  // loops, so the output is not a value the kernel can yield. Turning that
+  // write into a declared, bufferized result is Stage C3's work.
+  llvm::SmallVector<Type, 3> inputTypes{
+      RankedTensorType::get({plan.M, plan.K}, plan.inputElemType)};
+  for (size_t arm = 0; arm < (fused ? 2u : 1u); ++arm)
+    inputTypes.push_back(
+        RankedTensorType::get({plan.K, plan.N}, plan.inputElemType));
+
   auto kernel = micro::KernelOp::create(
-      builder, loc, symName, StringAttr::get(ctx, workload),
-      StringAttr::get(ctx, target), /*candidate=*/StringAttr(),
+      builder, loc, symName,
+      TypeAttr::get(FunctionType::get(ctx, inputTypes, /*results=*/{})),
+      StringAttr::get(ctx, workload), StringAttr::get(ctx, target),
+      /*candidate=*/StringAttr(),
       IntegerAttr::get(IntegerType::get(ctx, 64), mBucket));
 
   // Schedule intent that the concrete ops cannot carry themselves. The tile
@@ -526,7 +541,8 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   addStr("output_dtype", dtypeName(plan.outputElemType));
   kernel->setAttr("original_workload", DictionaryAttr::get(ctx, provenance));
 
-  startRegionBody(builder, kernel.getBody(), loc);
+  Block *kernelBody =
+      startRegionBody(builder, kernel.getBody(), loc, inputTypes);
 
   // --- tile types --------------------------------------------------------
   micro::LayoutAttr layout =
@@ -548,16 +564,13 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   };
 
   // --- external tensors --------------------------------------------------
-  // The kernel is IsolatedFromAbove, so it declares its own entry tensors
-  // instead of referring to the function's arguments.
-  SmallVector<int64_t, 2> lhsExtent{plan.M, plan.K};
-  SmallVector<int64_t, 2> rhsExtent{plan.K, plan.N};
-  Value lhsTensor =
-      tensor::EmptyOp::create(builder, loc, lhsExtent, plan.inputElemType);
+  // The kernel is IsolatedFromAbove, so the operands it reads come from its
+  // own entry block arguments -- the ones the signature declared -- rather
+  // than from a placeholder that only convention says is external.
+  Value lhsTensor = kernelBody->getArgument(0);
   SmallVector<Value, 2> rhsTensors;
   for (size_t arm = 0; arm < (fused ? 2u : 1u); ++arm)
-    rhsTensors.push_back(
-        tensor::EmptyOp::create(builder, loc, rhsExtent, plan.inputElemType));
+    rhsTensors.push_back(kernelBody->getArgument(1 + arm));
 
   // --- spatial tiling ----------------------------------------------------
   auto openSpatialLoop = [&](int64_t extent, int64_t step,

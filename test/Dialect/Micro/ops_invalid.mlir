@@ -112,3 +112,55 @@ func.func @store_same_memory(%A : tensor<32x64xbf16>) {
   micro.store %A {src_memory = #micro.memory<sram>, dst_memory = #micro.memory<sram>} : tensor<32x64xbf16>
   return
 }
+
+// -----
+
+// micro.kernel: the signature is a contract, so the body must produce exactly
+// the declared results. Declaring one result and yielding none is a mismatch.
+func.func @kernel_result_count_mismatch() {
+  // expected-error @+1 {{body yields 0 value(s) but the signature declares 1 result(s)}}
+  micro.kernel @bad(%a: tensor<8x8xf32>) -> tensor<8x8xf32> {
+    micro.yield
+  }
+  return
+}
+
+// -----
+
+// A yielded value whose logical shape disagrees with the declared result is
+// refused: the caller would receive the wrong extent.
+func.func @kernel_result_shape_mismatch() {
+  // expected-error @+1 {{which does not match the declared result}}
+  micro.kernel @bad(%a: tensor<8x8xf32>) -> tensor<8x4xf32> {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+  return
+}
+
+// -----
+
+// A matching shape is not enough: the element type is part of the contract too.
+func.func @kernel_result_dtype_mismatch() {
+  // expected-error @+1 {{which does not match the declared result}}
+  micro.kernel @bad(%a: tensor<8x8xf32>) -> tensor<8x8xf16> {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+  return
+}
+
+// -----
+
+// `micro.kernel` is isolated from above: its body may only read its own
+// declared inputs, never a value captured from the enclosing function. The
+// isolation is enforced when the region is parsed, so the outer name is simply
+// not in scope.
+func.func @kernel_captures_an_outer_value(%x: tensor<8x8xf32>) {
+  // expected-error @+2 {{use of undeclared SSA value name}}
+  micro.kernel @bad(%a: tensor<8x8xf32>) {
+    %ta = micro.tile_view %x {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  return
+}

@@ -22,21 +22,54 @@ def Micro_KernelOp
   let description = [{
         Encapsulates a scheduled kernel with optional workload and target
         metadata. The body contains the execution schedule as micro ops.
+
+        A kernel may declare an explicit argument and result contract:
+
+        ```mlir
+        micro.kernel @add(%a: tensor<8x8xf32>, %b: tensor<8x8xf32>) -> tensor<8x8xf32> {
+          ...
+          micro.yield %r : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+        }
+        ```
+
+        The signature names exactly what the kernel reads and produces, so a
+        caller and a lowerer never have to guess which values are external: the
+        entry block arguments are the inputs and the values `micro.yield`
+        carries are the results. A yielded `!micro.tile` stands for a declared
+        tensor result when their logical shape and element type agree -- memory
+        space and layout are scheduling facts, not part of the caller's ABI.
+
+        A kernel written without a signature (the legacy argumentless form)
+        remains parseable for analysis and round-tripping, but carries no
+        contract and cannot be lowered for execution. An inferred signature is
+        not an interface, so migrate such a kernel to the explicit form before
+        executing it.
     }];
 
   let arguments = (ins SymbolNameAttr:$sym_name,
-      OptionalAttr<StrAttr>:$workload, OptionalAttr<StrAttr>:$target,
-      OptionalAttr<StrAttr>:$candidate, OptionalAttr<I64Attr>:$schedule_id);
+      OptionalAttr<TypeAttr>:$function_type, OptionalAttr<StrAttr>:$workload,
+      OptionalAttr<StrAttr>:$target, OptionalAttr<StrAttr>:$candidate,
+      OptionalAttr<I64Attr>:$schedule_id);
 
   let regions = (region SizedRegion<1>:$body);
 
-  let assemblyFormat = [{
-        $sym_name
-        attr-dict-with-keyword
-        $body
-    }];
+  let hasCustomAssemblyFormat = 1;
 
   let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    /// The kernel's declared signature, or a null `FunctionType` when the
+    /// kernel carries only the legacy argumentless form. A null result means
+    /// "no contract": the kernel is analysis-only and must not be executed.
+    ::mlir::FunctionType getKernelFunctionType() {
+      if (auto attr = getFunctionTypeAttr())
+        return ::llvm::cast<::mlir::FunctionType>(attr.getValue());
+      return {};
+    }
+
+    /// True when the kernel declares an explicit argument/result contract.
+    bool hasExplicitSignature() { return static_cast<bool>(getKernelFunctionType()); }
+  }];
 }
 
 //===----------------------------------------------------------------------===//

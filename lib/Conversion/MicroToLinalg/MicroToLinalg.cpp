@@ -378,46 +378,52 @@ struct MicroToLinalgPass
     MicroTypeConverter converter(context);
 
     // Phase 1: structure and the kernel ABI. Each kernel becomes an ordinary
-    // function with a signature a caller can use: the values its body reads
-    // from outside become arguments, and the value it stores becomes the
-    // result. Without this the lowered function computed dead work -- nothing
-    // to pass in, nothing to observe.
+    // function whose signature is the one the kernel declared: the entry block
+    // arguments are its inputs and the yielded values are its results. The
+    // signature is read from the kernel, never inferred from its body, so an
+    // internal `tensor.empty` can never be mistaken for a caller's buffer.
     llvm::SmallVector<micro::KernelOp> kernels;
     module.walk([&](micro::KernelOp kernel) { kernels.push_back(kernel); });
     for (micro::KernelOp kernel : kernels) {
       IRRewriter rewriter(context);
 
-      // What the kernel produces. A kernel stores to one destination in the
-      // current model; several would need several results, which is a later
-      // slice rather than something to guess at.
-      llvm::SmallVector<micro::TileStoreOp, 2> stores;
-      kernel.getBody().walk(
-          [&](micro::TileStoreOp store) { stores.push_back(store); });
-      if (stores.size() > 1) {
-        kernel.emitError("more than one micro.tile_store: the kernel ABI "
-                         "returns a single result, and a multi-output kernel "
-                         "is not implemented yet");
+      // The kernel's contract is explicit. A kernel that declares no signature
+      // has no ABI to lower, and inferring one from the entry tensors is
+      // exactly the ambiguity this interface removed -- so it is refused with
+      // a diagnostic rather than guessed at.
+      FunctionType signature = kernel.getKernelFunctionType();
+      if (!signature) {
+        kernel.emitError(
+            "kernel has no explicit signature: declare its inputs and results "
+            "(`micro.kernel @name(%arg: type, ...) -> type`) before lowering "
+            "it "
+            "for execution");
         signalPassFailure();
         return;
       }
 
-      // What the kernel reads: the entry tensors its body materializes. They
-      // sit at the top of the body (the export emits one per external tensor),
-      // so only direct children of the body block are candidates.
-      llvm::SmallVector<Operation *, 4> entries;
-      for (Operation &op : kernel.getBody().front())
-        if (isa<tensor::EmptyOp>(op))
-          entries.push_back(&op);
-
       llvm::SmallVector<Type> argumentTypes;
-      for (Operation *entry : entries)
-        argumentTypes.push_back(
-            converter.convertType(entry->getResult(0).getType()));
+      for (Type input : signature.getInputs())
+        argumentTypes.push_back(converter.convertType(input));
       llvm::SmallVector<Type> resultTypes;
-      Value stored;
-      if (!stores.empty()) {
-        stored = stores.front().getSource();
-        resultTypes.push_back(converter.convertType(stored.getType()));
+      for (Type result : signature.getResults())
+        resultTypes.push_back(converter.convertType(result));
+
+      // A `micro.tile_store` is the pre-contract way of naming the output. When
+      // the kernel declares results, the yield supersedes the store and it is
+      // dropped rather than lowered a second time. A store with no declared
+      // result has nowhere to write -- dropping it would silently discard the
+      // kernel's output, so it is refused rather than guessed at.
+      llvm::SmallVector<micro::TileStoreOp, 2> stores;
+      kernel.getBody().walk(
+          [&](micro::TileStoreOp store) { stores.push_back(store); });
+      if (!stores.empty() && resultTypes.empty()) {
+        kernel.emitError(
+            "kernel writes through micro.tile_store but declares no result; "
+            "lowering a tile store to a caller-owned output is not implemented "
+            "yet");
+        signalPassFailure();
+        return;
       }
 
       rewriter.setInsertionPoint(kernel);
@@ -434,26 +440,11 @@ struct MicroToLinalgPass
           rewriter, kernel.getLoc(), name,
           rewriter.getFunctionType(argumentTypes, resultTypes));
 
-      // An entry becomes the argument that carries it.
-      Block &body = kernel.getBody().front();
-      for (size_t index = 0; index < entries.size(); ++index) {
-        Value entry = entries[index]->getResult(0);
-        entry.replaceAllUsesWith(
-            body.addArgument(argumentTypes[index], entries[index]->getLoc()));
-      }
-      for (Operation *entry : entries)
-        entry->erase();
+      // The entry block already carries the declared inputs, so moving the
+      // region wholesale turns them into the function's parameters. Nothing is
+      // inferred from `tensor.empty`: an internal allocation stays internal.
       for (micro::TileStoreOp store : stores)
         store.erase();
-
-      // The stored value leaves through the terminator.
-      if (stored)
-        if (auto terminator = dyn_cast<micro::YieldOp>(body.getTerminator())) {
-          rewriter.setInsertionPoint(terminator);
-          micro::YieldOp::create(rewriter, terminator.getLoc(),
-                                 ValueRange{stored});
-          rewriter.eraseOp(terminator);
-        }
 
       function.getBody().takeBody(kernel.getBody());
       rewriter.eraseOp(kernel);
