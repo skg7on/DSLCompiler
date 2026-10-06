@@ -2317,8 +2317,11 @@ TEST(GraphRule, MatchesAChainAndReportsItsBoundary) {
   // graph's: `cv` first even though a finalized graph may order its nodes
   // differently. Comparing by operation rather than by id is what keeps the
   // assertion about the matcher rather than about graph numbering.
-  auto opOf = [&](WorkloadNodeId id) {
+  auto opOf = [&](WorkloadNodeId id) -> std::string {
     const WorkloadNode *node = graph.findNode(id);
+    EXPECT_NE(node, nullptr) << "a covered node is always in the graph";
+    if (!node)
+      return {};
     return node->attributes.getAs<mlir::StringAttr>("op").getValue().str();
   };
   EXPECT_EQ(opOf(matches.front().coveredNodes[0]), "convert");
