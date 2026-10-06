@@ -20,6 +20,8 @@
 
 #include "LLK/Perf/MicroCostModel.h"
 
+#include "LLK/Mapping/EventSchedule.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/MathExtras.h"
@@ -73,57 +75,6 @@ uint32_t totalSlots(const EngineRange &engines) {
   return std::max<uint32_t>(1, total);
 }
 
-/// How many of these events can run at once. Each engine name is a separate
-/// pool, so two events that name the same engine share its slots rather than
-/// each getting the whole machine.
-uint32_t resourceSlots(const MicroEvent &event,
-                       const machine::MachineModel &machine) {
-  switch (event.resource) {
-  case ResourceKind::Dma:
-    return std::max<uint32_t>(1, machine.transferEngineCount());
-  case ResourceKind::MatrixEngine: {
-    const machine::ComputeNode *engine =
-        machine.findCompute(event.resourceName);
-    return std::max<uint32_t>(1, engine ? engine->concurrency : 1);
-  }
-  case ResourceKind::VectorEngine: {
-    const machine::ComputeNode *engine =
-        machine.findCompute(event.resourceName);
-    return std::max<uint32_t>(1, engine ? engine->concurrency : 1);
-  }
-  case ResourceKind::MemoryRead:
-  case ResourceKind::MemoryWrite:
-  case ResourceKind::Sync:
-    return 1;
-  }
-  return 1;
-}
-
-std::string resourceKey(const MicroEvent &event) {
-  return (stringifyResourceKind(event.resource) + "/" + event.resourceName)
-      .str();
-}
-
-/// A pool of identical resource slots, each tracking when it frees up.
-/// Acquiring takes the slot that frees first, which is what a list scheduler
-/// would do.
-class ResourcePool {
-public:
-  explicit ResourcePool(uint32_t slots) : available_(std::max(1u, slots), 0) {}
-
-  uint64_t earliestFree() const {
-    return *std::min_element(available_.begin(), available_.end());
-  }
-
-  void acquire(uint64_t start, uint64_t duration) {
-    auto slot = std::min_element(available_.begin(), available_.end());
-    *slot = start + duration;
-  }
-
-private:
-  std::vector<uint64_t> available_;
-};
-
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -155,6 +106,7 @@ L0Report computeL0StaticBound(const MicroDAG &dag,
       break;
     case EventKind::Vector:
     case EventKind::Reduce:
+    case EventKind::Transform:
     case EventKind::TileView:
     case EventKind::TilePartition:
       vectorWork += event.minCycles;
@@ -239,106 +191,46 @@ L1Report scheduleL1(const MicroDAG &dag, const machine::MachineModel &machine) {
     return report;
   }
 
+  // Normalize through the shared core (task B8), so the performance prediction
+  // and the mapping search's candidate score are literally one schedule of one
+  // event stream.
+  std::vector<mapping::PlanCostEvent> normalized;
+  std::vector<std::string> owners;
+  normalized.reserve(count);
+  owners.reserve(count);
+  for (const MicroEvent &event : dag.events) {
+    normalized.push_back(normalizedPlanEvent(event));
+    owners.push_back(event.tileOwner);
+  }
+  mapping::EventScheduleResult schedule =
+      mapping::scheduleNormalizedEvents(normalized, machine, owners);
+
   std::vector<uint64_t> start(count, 0);
   std::vector<uint64_t> finish(count, 0);
-  std::vector<uint32_t> remaining(count, 0);
-  std::vector<std::vector<uint32_t>> dependents(count);
-
-  for (const MicroEvent &event : dag.events) {
-    for (uint32_t dep : event.deps) {
-      if (dep >= event.id)
-        continue;
-      ++remaining[event.id];
-      dependents[dep].push_back(event.id);
-    }
+  for (const mapping::ScheduledEvent &entry : schedule.entries) {
+    start[entry.id] = entry.start;
+    finish[entry.id] = entry.finish;
   }
 
-  // Lowest id among the ready set: deterministic, and stable across runs.
-  std::vector<uint32_t> ready;
-  for (const MicroEvent &event : dag.events)
-    if (remaining[event.id] == 0)
-      ready.push_back(event.id);
-  std::make_heap(ready.begin(), ready.end(), std::greater<uint32_t>());
+  const uint64_t predicted = schedule.predictedCycles;
+  const uint32_t criticalId = schedule.criticalId;
+  const uint64_t sequential = schedule.sequentialCycles;
 
-  std::map<std::string, ResourcePool> pools;
+  uint64_t busyByKind[6] = {0, 0, 0, 0, 0, 0};
   std::map<std::string, uint64_t> busy;
   std::map<std::string, uint32_t> ownerSlots;
-
-  auto poolFor = [&](const std::string &key, uint32_t slots) -> ResourcePool & {
-    auto [it, inserted] = pools.try_emplace(key, slots);
-    if (inserted)
-      busy.try_emplace(key, 0);
-    return it->second;
-  };
-
-  while (!ready.empty()) {
-    std::pop_heap(ready.begin(), ready.end(), std::greater<uint32_t>());
-    uint32_t id = ready.back();
-    ready.pop_back();
-
-    const MicroEvent &event = dag.events[id];
-    std::string key = resourceKey(event);
-    ResourcePool &pool = poolFor(key, resourceSlots(event, machine));
-
-    ResourcePool *ownerPool = nullptr;
-    std::string ownerKey;
+  for (const MicroEvent &event : dag.events) {
+    busyByKind[static_cast<size_t>(event.resource)] += event.minCycles;
     if (!event.tileOwner.empty()) {
-      ownerKey = "owner/" + event.tileOwner;
-      uint32_t slots =
-          std::max<uint32_t>(1, machine.ownerCount(event.tileOwner));
-      ownerSlots.emplace(ownerKey, slots);
-      ownerPool = &poolFor(ownerKey, slots);
-    }
-
-    uint64_t earliest = 0;
-    for (uint32_t dep : event.deps)
-      if (dep < id)
-        earliest = std::max(earliest, finish[dep]);
-
-    // Both the resource slot and the owner slot must be free at the same time.
-    uint64_t begin = earliest;
-    for (;;) {
-      uint64_t candidate = std::max(begin, pool.earliestFree());
-      if (ownerPool)
-        candidate = std::max(candidate, ownerPool->earliestFree());
-      if (candidate == begin)
-        break;
-      begin = candidate;
-    }
-
-    start[id] = begin;
-    finish[id] = begin + event.minCycles;
-    pool.acquire(begin, event.minCycles);
-    busy[key] += event.minCycles;
-    if (ownerPool) {
-      ownerPool->acquire(begin, event.minCycles);
       // Owner occupancy is utilization like any other, and a schedule that runs
       // out of owners is a different bottleneck than one that runs out of
       // engines. It only shows up if the owner's busy cycles are recorded too.
+      std::string ownerKey = "owner/" + event.tileOwner;
       busy[ownerKey] += event.minCycles;
+      ownerSlots.emplace(
+          ownerKey, std::max<uint32_t>(1, machine.ownerCount(event.tileOwner)));
     }
-
-    for (uint32_t dependent : dependents[id])
-      if (--remaining[dependent] == 0) {
-        ready.push_back(dependent);
-        std::push_heap(ready.begin(), ready.end(), std::greater<uint32_t>());
-      }
   }
-
-  uint64_t predicted = 0;
-  uint32_t criticalId = 0;
-  uint64_t sequential = 0;
-  uint64_t busyByKind[6] = {0, 0, 0, 0, 0, 0};
-  for (const MicroEvent &event : dag.events) {
-    if (finish[event.id] > predicted) {
-      predicted = finish[event.id];
-      criticalId = event.id;
-    }
-    sequential += event.minCycles;
-    busyByKind[static_cast<size_t>(event.resource)] += event.minCycles;
-  }
-  if (predicted == 0)
-    criticalId = 0;
 
   report.predictedCycles = predicted;
   report.predictedNs = machine.clockHz

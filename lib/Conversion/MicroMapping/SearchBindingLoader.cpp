@@ -32,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 // Micro attribute, type, and op declarations.
 #define GET_ATTRDEF_CLASSES
@@ -222,24 +223,125 @@ loadBoundLayouts(mlir::ModuleOp module, const SearchBinding &binding) {
   return bound;
 }
 
+llvm::Expected<BoundAxes> loadBoundAxes(mlir::ModuleOp module,
+                                        const SearchBinding &binding) {
+  if (binding.candidateId.empty())
+    return error("a binding with no candidateId cannot resolve a bound axis");
+
+  llvm::Expected<micro::CandidateOp> found =
+      findCandidateByName(module, binding.candidateId);
+  if (!found)
+    return found.takeError();
+  if (!*found)
+    return error("no micro.candidate named '" + binding.candidateId + "'");
+  micro::CandidateOp candidate = *found;
+
+  auto space = dyn_cast<micro::SearchSpaceOp>(candidate->getParentOp());
+  if (!space)
+    return error("micro.candidate @" + candidate.getSymName() +
+                 " is not nested in a micro.search_space");
+
+  llvm::Expected<perf::SearchSpace> loaded = perf::loadSearchSpace(space);
+  if (!loaded)
+    return loaded.takeError();
+
+  // By kind, never by name: whichever parameter the space declares with the
+  // axis kind is the axis, whatever it is called. Two parameters of one kind
+  // leave "which one selects the axis" unanswerable and are rejected rather
+  // than silently picking one.
+  auto resolveAxis = [&](llvm::StringRef kind,
+                         std::string &slot) -> std::optional<llvm::Error> {
+    const perf::SearchParam *chosen = nullptr;
+    for (const perf::SearchParam &param : loaded->params) {
+      if (param.kind != kind)
+        continue;
+      if (chosen)
+        return error("micro.search_space '" + loaded->name +
+                     "' declares more than one '" + kind +
+                     "' parameter; a binding cannot say which one selects the "
+                     "axis");
+      chosen = &param;
+    }
+    if (!chosen)
+      return std::nullopt;
+    auto value = binding.values.find(chosen->name);
+    if (value == binding.values.end())
+      return error("binding does not bind " + kind + " parameter '" +
+                   chosen->name + "'");
+    if (const std::string *text = std::get_if<std::string>(&value->second)) {
+      slot = *text;
+      return std::nullopt;
+    }
+    return error("binding value for " + kind + " parameter '" + chosen->name +
+                 "' is not a string");
+  };
+
+  BoundAxes axes;
+  if (std::optional<llvm::Error> failure =
+          resolveAxis("owner_mapping", axes.ownerMapping))
+    return std::move(*failure);
+  if (std::optional<llvm::Error> failure =
+          resolveAxis("memory_path", axes.memoryPath))
+    return std::move(*failure);
+  return axes;
+}
+
 namespace {
 
-/// The workload shape the space's constraints are evaluated against, taken from
-/// the kernel's first `micro.mma`: its declared M/N/K and dtypes. A GEMM-shaped
-/// space cannot be evaluated against anything else, and a kernel with no MMA
-/// offers no such shape -- the two cases are distinguished by the caller.
-std::optional<perf::WorkloadShape> workloadShapeOf(mlir::Operation *kernel) {
+/// Reads the original, pre-tiling workload dimensions the export records as
+/// generic provenance on the kernel (`original_workload`). A rule that needs
+/// the whole M/N/K -- tail divisibility -- reads them here instead of
+/// reconstructing the workload from an instruction-fragment `micro.mma`. Null
+/// when the kernel carries no complete provenance.
+std::optional<perf::WorkloadShape> originalWorkloadOf(mlir::Operation *kernel) {
+  if (!kernel)
+    return std::nullopt;
+  auto dict = kernel->getAttrOfType<mlir::DictionaryAttr>("original_workload");
+  if (!dict)
+    return std::nullopt;
+
+  auto integerOf = [&](StringRef name) -> std::optional<int64_t> {
+    if (mlir::Attribute attr = dict.get(name))
+      if (auto integer = dyn_cast<mlir::IntegerAttr>(attr))
+        return integer.getInt();
+    return std::nullopt;
+  };
+  auto textOf = [&](StringRef name, StringRef fallback) -> std::string {
+    if (mlir::Attribute attr = dict.get(name))
+      if (auto text = dyn_cast<mlir::StringAttr>(attr))
+        return text.getValue().str();
+    return fallback.str();
+  };
+
+  std::optional<int64_t> m = integerOf("M");
+  std::optional<int64_t> n = integerOf("N");
+  std::optional<int64_t> k = integerOf("K");
+  if (!m || !n || !k)
+    return std::nullopt;
+
   perf::WorkloadShape shape;
-  bool found = false;
-  kernel->walk([&](mlir::Operation *op) {
-    if (found || op->getName().getStringRef() != "micro.mma")
-      return;
-    auto mma = llvm::dyn_cast<micro::MmaOp>(op);
-    if (!mma)
-      return;
+  shape.M = *m;
+  shape.N = *n;
+  shape.K = *k;
+  shape.inputDType = textOf("input_dtype", "bf16");
+  shape.weightDType = textOf("weight_dtype", shape.inputDType);
+  shape.accumulatorDType = textOf("accumulator_dtype", "f32");
+  shape.outputDType = textOf("output_dtype", shape.accumulatorDType);
+  return shape;
+}
+
+/// One shape per `micro.mma` the kernel performs. Each contraction is checked
+/// independently, so a second MMA with a different dtype pair is not hidden by
+/// the first.
+std::vector<perf::WorkloadShape> contractionsOf(mlir::Operation *kernel) {
+  std::vector<perf::WorkloadShape> contractions;
+  if (!kernel)
+    return contractions;
+  kernel->walk([&](micro::MmaOp mma) {
     llvm::ArrayRef<int64_t> dims = mma.getShape();
     if (dims.size() != 3)
       return;
+    perf::WorkloadShape shape;
     shape.M = dims[0];
     shape.N = dims[1];
     shape.K = dims[2];
@@ -247,11 +349,19 @@ std::optional<perf::WorkloadShape> workloadShapeOf(mlir::Operation *kernel) {
     shape.weightDType = shape.inputDType;
     shape.accumulatorDType = micro::stringifyDType(mma.getAccumulator()).str();
     shape.outputDType = shape.accumulatorDType;
-    found = true;
+    contractions.push_back(std::move(shape));
   });
-  if (!found)
-    return std::nullopt;
-  return shape;
+  return contractions;
+}
+
+/// The facts a kernel can supply to its space's constraints. Either field may
+/// be empty; each constraint reads only what it needs, and one that needs a
+/// missing fact is reported as unevaluable rather than blocking the rest.
+perf::BindingFacts bindingFactsOf(mlir::Operation *kernel) {
+  perf::BindingFacts facts;
+  facts.originalWorkload = originalWorkloadOf(kernel);
+  facts.contractions = contractionsOf(kernel);
+  return facts;
 }
 
 } // namespace
@@ -274,18 +384,14 @@ llvm::Error verifyBindingLegality(mlir::ModuleOp module,
   llvm::Expected<perf::SearchSpace> loaded = perf::loadSearchSpace(space);
   if (!loaded)
     return loaded.takeError();
-  // A space with no constraints is always legal, and reading the shape would
-  // only add a failure mode that does not exist.
+  // A space with no constraints is always legal, and there is no fact to read.
   if (loaded->constraints.empty())
     return llvm::Error::success();
 
-  std::optional<perf::WorkloadShape> shape = workloadShapeOf(kernel);
-  if (!shape)
-    return error(
-        "micro.search_space '" + loaded->name +
-        "' declares micro.constraints, but the kernel has no micro.mma "
-        "to derive the workload shape from, so the constraints cannot "
-        "be evaluated");
+  // Derive only the facts each constraint needs. A kernel with no MMA is not
+  // itself a failure: a shape-independent constraint still evaluates, and a
+  // shape-dependent one reports the specific fact it is missing.
+  perf::BindingFacts facts = bindingFactsOf(kernel);
 
   perf::Candidate candidate;
   candidate.id = binding.candidateId;
@@ -298,7 +404,7 @@ llvm::Error verifyBindingLegality(mlir::ModuleOp module,
   }
 
   perf::LegalityResult legality =
-      perf::checkLegality(*loaded, candidate, *shape, machine);
+      perf::checkLegality(*loaded, candidate, facts, machine);
   if (!legality.legal)
     return error(
         "micro.candidate @" + binding.candidateId +

@@ -20,6 +20,7 @@
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -42,6 +43,12 @@
 #include <vector>
 
 namespace mlir::llk::micro_mapping_detail {
+
+/// Creates the canonical plan materializer: the dialect-aware component that
+/// turns a selected plan's connections into Micro operations (design §18.2).
+/// Defined in PlanMaterialization.cpp, which lives beside this header so the
+/// target-neutral mapping library never depends on the Micro dialect.
+std::unique_ptr<mapping::PlanMaterializer> createCanonicalPlanMaterializer();
 
 /// The 2-D rank and element-type string the layout stage instantiates its
 /// declarations against, read off the workload graph rather than assumed: the
@@ -481,9 +488,24 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     }
   }
 
+  // §B2: the space's `owner_mapping`/`memory_path` parameters are resolved by
+  // declared *kind* -- the same rule that finds the layout kinds above -- and
+  // handed to the search as explicit axes, so a space that named its parameter
+  // differently is honoured rather than silently ignored. A binding-free search
+  // resolves nothing and stays byte-identical.
+  mapping::BoundAxes boundAxes;
+  if (binding) {
+    llvm::Expected<mapping::BoundAxes> loadedAxes =
+        mapping::loadBoundAxes(module, *binding);
+    if (!loadedAxes)
+      return loadedAxes.takeError();
+    boundAxes = std::move(*loadedAxes);
+  }
+
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),
                                  deriveLayoutContext(*graph), searchOptions,
-                                 std::move(binding), std::move(boundLayouts));
+                                 std::move(binding), std::move(boundLayouts),
+                                 std::move(boundAxes));
   llvm::Expected<mapping::MappingSearchResult> result = search.search();
   if (!result)
     return result.takeError();
@@ -497,6 +519,83 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
         (passName + ": the search produced no complete plan").str();
     if (run.result.searchTruncated)
       message += " (a search cap was hit)";
+    for (const mapping::Diagnostic &detail : run.result.frontier.diagnostics)
+      message += "\n  " + mapping::stringifyDiagnosticCode(detail.code).str() +
+                 ": " + detail.message;
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   std::move(message));
+  }
+
+  // B3: build and validate the storage plan of every retained plan now, while
+  // both the source workload graph and the target machine are in hand. This is
+  // where a *real* plan is produced -- after the search has scored and named
+  // its plans, before either entry point (`micro-map`, `micro-bind-plan`)
+  // reports or binds one -- so the allocations, plan-step DAG, synchronization
+  // decisions and per-connection storage ids travel with whichever plan the
+  // caller selects. It is the single call site: neither pass finalizes again.
+  //
+  // Finalization never changes a plan id: `allocations`, `steps`, `stepEdges`,
+  // `synchronization` and a connection's `storageIds` are all excluded from
+  // `canonicalPlanString`, and the plan's score was already computed from the
+  // search's synthesized step DAG. A plan whose physical footprint or
+  // live-range occupancy exceeds a memory's capacity -- or whose strict facts
+  // cannot be derived -- is a *legitimate rejection*: it is dropped with a
+  // stable diagnostic rather than bound with an unmet reservation.
+  //
+  // Storage planning needs the target to say *where* each value lives, and a
+  // rule that binds no memory leaves every placement unbound -- the shipped
+  // AVX2 rules do exactly that. Finalizing such a plan would reject it for a
+  // missing fact rather than a real overflow, so it is skipped with an explicit
+  // note: the plan stays bindable, its storage fields stay empty, and a target
+  // that does model memory (the probe/barrier fixtures, and any future rules
+  // that declare `require memory`) gets the full capacity check.
+  auto storagePlannable = [](const mapping::CoveringPlan &plan) {
+    if (plan.placements.empty())
+      return false;
+    for (const mapping::PlanPlacement &placement : plan.placements)
+      if (placement.memories.empty() && placement.portMemoryBindings.empty())
+        return false;
+    return true;
+  };
+  std::vector<mapping::CoveringPlan> finalized;
+  finalized.reserve(run.result.plans.size());
+  for (mapping::CoveringPlan &plan : run.result.plans) {
+    // `finalizeStoragePlan` replaces `storageNotes` with its occupancy report;
+    // prepend any note an earlier stage (the plan-score fallback) recorded so
+    // it is not lost.
+    std::vector<std::string> priorNotes =
+        std::move(plan.diagnostics.storageNotes);
+    if (!storagePlannable(plan)) {
+      priorNotes.push_back(
+          "storage plan: skipped -- the target binds no memory to every "
+          "placement, so no reservation can be checked");
+      plan.diagnostics.storageNotes = std::move(priorNotes);
+      finalized.push_back(std::move(plan));
+      continue;
+    }
+    if (llvm::Error error =
+            mapping::finalizeStoragePlan(*graph, plan, run.target->machine())) {
+      std::string reason = llvm::toString(std::move(error));
+      run.result.frontier
+          .codeCounts[mapping::DiagnosticCode::MemoryCapacityExceeded] += 1;
+      run.result.frontier.diagnostics.push_back(
+          {mapping::DiagnosticCode::MemoryCapacityExceeded,
+           "storage plan rejected: " + reason});
+      continue;
+    }
+    if (!priorNotes.empty()) {
+      std::vector<std::string> merged = std::move(priorNotes);
+      llvm::append_range(merged, plan.diagnostics.storageNotes);
+      plan.diagnostics.storageNotes = std::move(merged);
+    }
+    finalized.push_back(std::move(plan));
+  }
+  run.result.plans = std::move(finalized);
+  if (run.result.plans.empty()) {
+    // Every retained plan was rejected by storage planning, so there is nothing
+    // the caller may bind. Report the reasons rather than a bare "no plan".
+    std::string message =
+        (passName + ": no retained plan has a satisfiable storage plan").str();
     for (const mapping::Diagnostic &detail : run.result.frontier.diagnostics)
       message += "\n  " + mapping::stringifyDiagnosticCode(detail.code).str() +
                  ": " + detail.message;
@@ -519,8 +618,13 @@ inline llvm::Error bindPlanOntoModule(
     ModuleOp module, const mapping::CoveringPlan &plan,
     const mapping::MappingTarget &target,
     mapping::BindContract contract = mapping::BindContract::Partial) {
+  // The CLI is the component that owns the canonical Micro dialect, so it
+  // supplies the materializer: a `--micro-map` run materializes the selected
+  // connections, while a standalone mapping caller stays metadata-only.
+  std::unique_ptr<mapping::PlanMaterializer> materializer =
+      createCanonicalPlanMaterializer();
   llvm::Expected<mapping::BoundPlan> bound =
-      mapping::bindPlan(module, plan, target, contract);
+      mapping::bindPlan(module, plan, target, contract, materializer.get());
   if (!bound)
     return bound.takeError();
   for (const std::string &unmaterialized : bound->unmaterialized)

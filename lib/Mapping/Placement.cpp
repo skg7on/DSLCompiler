@@ -299,6 +299,21 @@ enumeratePlacements(const MappingCandidate &candidate,
     solvedSolutions.push_back(solved->solutions.front());
   }
 
+  // Requirements are conjunctive. An unresolved disagreement must never
+  // become an unconstrained endpoint in connection synthesis.
+  for (size_t i = 0; i < candidate.layoutRequirements.size(); ++i)
+    for (size_t j = 0; j < i; ++j) {
+      const auto &lhs = candidate.layoutRequirements[i];
+      const auto &rhs = candidate.layoutRequirements[j];
+      if (lhs.port && rhs.port && *lhs.port == *rhs.port &&
+          (lhs.layoutClass != rhs.layoutClass ||
+           solvedSolutions[i].values != solvedSolutions[j].values ||
+           solvedSolutions[i].map != solvedSolutions[j].map)) {
+        reportFailure(PlacementFailure::NoLegalLayout);
+        return std::vector<CandidateInstance>{};
+      }
+    }
+
   // How many requirements share each layout class. One class may be required by
   // more than one port of the same candidate (the same blocked layout on two
   // operands, say), and each requirement has its own port association and its
@@ -409,9 +424,28 @@ enumeratePlacements(const MappingCandidate &candidate,
       for (size_t i = 0; i < computeChoices.size(); ++i)
         instance.computeBindings[candidate.computeRequirements[i].kind] =
             computeChoices[i][pick[i]]->id;
-      for (size_t j = 0; j < memoryChoices.size(); ++j)
-        instance.memoryBindings[candidate.memoryRequirements[j].kind] =
+      for (size_t j = 0; j < memoryChoices.size(); ++j) {
+        const MemoryRequirement &requirement = candidate.memoryRequirements[j];
+        const MemoryNodeId memory =
             memoryChoices[j][pick[computeChoices.size() + j]]->id;
+        // A requirement that named a port records the occurrence it governs, so
+        // two same-kind requirements keep distinct nodes. A bare requirement
+        // stays keyed by kind, unchanged.
+        if (requirement.port)
+          instance.portMemoryBindings.push_back(
+              PortMemoryBinding{*requirement.port, memory});
+        else
+          instance.memoryBindings[requirement.kind] = memory;
+      }
+      // Sorted by occurrence so map iteration order never reaches an id.
+      llvm::sort(instance.portMemoryBindings, [](const PortMemoryBinding &lhs,
+                                                 const PortMemoryBinding &rhs) {
+        if (lhs.port.node != rhs.port.node)
+          return lhs.port.node < rhs.port.node;
+        if (lhs.port.direction != rhs.port.direction)
+          return lhs.port.direction < rhs.port.direction;
+        return lhs.port.index < rhs.port.index;
+      });
       for (size_t i = 0; i < solvedDefs.size(); ++i) {
         const LayoutRequirement &requirement = candidate.layoutRequirements[i];
         const std::string &layoutClass = requirement.layoutClass;
@@ -439,13 +473,21 @@ enumeratePlacements(const MappingCandidate &candidate,
         // Which value the requirement was solved for, so an edge can ask for
         // *its* layout rather than the instance's only one.
         solvedLayout.portValue = requirement.portValue;
+        // The occurrence the requirement named, so a connection request can ask
+        // for *this* use's layout rather than a value-wide one that two uses
+        // would have to share.
+        solvedLayout.port = requirement.port;
         instance.layoutSolutions[solutionKey] = std::move(solvedLayout);
       }
 
       instance.resourceUsage.executorSlots = 1;
+      // Only bare requirements contribute a kind-keyed byte figure; a
+      // named-port requirement's storage is accounted per occurrence, not per
+      // kind.
       for (const MemoryRequirement &requirement : candidate.memoryRequirements)
-        instance.resourceUsage.memoryBytes[requirement.kind] =
-            requirement.minBytes;
+        if (!requirement.port)
+          instance.resourceUsage.memoryBytes[requirement.kind] =
+              requirement.minBytes;
 
       instance.localCost = candidate.lowerBound;
       // Compute utilization is the rule-local compute cycles over the cycles
@@ -532,6 +574,44 @@ synthesizeConnections(const ConnectionRequest &request,
   // `plans` is that attempt order.
   std::vector<ConnectionPlan> plans;
 
+  // Copies the request's endpoint occurrences onto every synthesized plan, so
+  // the connection names the *use* it serves -- not just the SSA value two uses
+  // share -- and folds them into its canonical id. A request with no endpoints
+  // leaves the plan's endpoint fields empty and its id as it was before the
+  // migration.
+  auto assignEndpoints = [&](ConnectionPlan &plan) {
+    plan.producerPort = request.producerPort;
+    if (request.consumerPort)
+      plan.consumerPorts.push_back(*request.consumerPort);
+  };
+
+  auto chargeTransform = [&](ConnectionPlan &plan) -> llvm::Error {
+    if (!plan.transform)
+      return llvm::Error::success();
+    auto &transform = *plan.transform;
+    transform.memoryNode = plan.memoryRoute.back();
+    auto resource = selectTransformResource(machine, transform.memoryNode);
+    if (!resource)
+      return resource.takeError();
+    transform.computeResource = *resource;
+    TransformCostInput input;
+    input.inputType = request.elementType;
+    input.outputType = request.consumerType;
+    if (auto tensor = tileAsTensor(input.inputType))
+      input.inputType = tensor;
+    if (auto tensor = tileAsTensor(input.outputType))
+      input.outputType = tensor;
+    input.srcMap = transform.srcMap;
+    input.dstMap = transform.dstMap;
+    input.memoryNode = transform.memoryNode;
+    input.computeResource = transform.computeResource;
+    auto cost = estimateTransformCost(input, machine);
+    if (!cost)
+      return cost.takeError();
+    plan.cost = addCost(plan.cost, *cost);
+    return llvm::Error::success();
+  };
+
   // Alternative 1: a direct connection -- nothing is moved and nothing is
   // transformed. §10.2 defines direct compatibility by element type, logical
   // tile shape, memory *visibility*, and affine index relation, so the two
@@ -547,6 +627,7 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.kind = ConnectionKind::Direct;
     plan.memoryRoute.push_back(request.producerMemory);
     plan.cost.localBytes = request.bytes;
+    assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
   }
@@ -572,7 +653,9 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.kind = ConnectionKind::LayoutTransform;
     plan.memoryRoute.push_back(request.producerMemory);
     plan.transform = transformOf();
-    plan.cost.localBytes = request.bytes;
+    if (auto error = chargeTransform(plan))
+      return std::move(error);
+    assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
   }
@@ -624,7 +707,7 @@ synthesizeConnections(const ConnectionRequest &request,
     (memoryRoute.hopCount() == 1 ? directRoutes : multiHopRoutes)
         .push_back(&memoryRoute);
 
-  auto emitRoute = [&](const MemoryRoute &memoryRoute) {
+  auto emitRoute = [&](const MemoryRoute &memoryRoute) -> llvm::Error {
     if (transformRequired) {
       // A transform that no hop can carry makes this route no alternative at
       // all: the value cannot be held in either layout regime along it. The
@@ -637,7 +720,7 @@ synthesizeConnections(const ConnectionRequest &request,
       // must be added to `ConnectionPlan`, before it can place the transform.
       if (!legalTransformHop(memoryRoute.nodes, machine,
                              *request.producerLayout, *request.consumerLayout))
-        return;
+        return llvm::Error::success();
     }
     ConnectionPlan plan;
     plan.producer = request.producer;
@@ -649,61 +732,131 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.transferEngines = memoryRoute.transferEngines;
     plan.transform = transformOf();
     plan.cost = memoryRoute.cost;
+    if (auto error = chargeTransform(plan))
+      return error;
+    assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
+    return llvm::Error::success();
   };
   for (const MemoryRoute *memoryRoute : directRoutes)
-    emitRoute(*memoryRoute);
+    if (auto error = emitRoute(*memoryRoute))
+      return std::move(error);
   for (const MemoryRoute *memoryRoute : multiHopRoutes)
-    emitRoute(*memoryRoute);
+    if (auto error = emitRoute(*memoryRoute))
+      return std::move(error);
   return plans;
 }
 
-llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
-    const ConnectionRequest &base, llvm::ArrayRef<ConnectionRequest> consumers,
-    const MachineModel &machine, const TopologyService &topology,
-    const PlacementOptions &options, bool *truncated,
-    const ObjectiveOrder &objective, bool *choseAmongAlternatives) {
+llvm::Expected<ConnectionChoiceSet>
+enumerateConnectionChoices(llvm::ArrayRef<ConnectionRequest> requests,
+                           const MappingTarget &target,
+                           const PlacementOptions &options) {
+  const MachineModel &machine = target.machine();
+  TopologyService topology(machine,
+                           RouteOptions{options.maxRoutesPerConnection, 4});
+  return enumerateConnectionChoices(requests, machine, topology, options);
+}
+
+llvm::Expected<ConnectionChoiceSet> enumerateConnectionChoices(
+    llvm::ArrayRef<ConnectionRequest> requests, const MachineModel &machine,
+    const TopologyService &topology, const PlacementOptions &options) {
+  ConnectionChoiceSet set;
+  // No requests is one empty choice -- the identity of the product, so a caller
+  // can treat a placement that completed no value as a single state.
+  if (requests.empty()) {
+    set.combinations.emplace_back();
+    return set;
+  }
+
+  // Each request's own legal alternatives, in `synthesizeConnections`' order.
+  // A request with no legal route makes the whole product empty: the pair is
+  // incompatible (never an error), exactly as the single-request path reports.
+  std::vector<std::vector<ConnectionPlan>> alternatives;
+  alternatives.reserve(requests.size());
+  for (const ConnectionRequest &request : requests) {
+    bool requestTruncated = false;
+    llvm::Expected<std::vector<ConnectionPlan>> plans = synthesizeConnections(
+        request, machine, topology, options, &requestTruncated);
+    if (!plans)
+      return plans.takeError();
+    if (requestTruncated)
+      set.truncated = true;
+    if (plans->empty())
+      return set;
+    alternatives.push_back(std::move(*plans));
+  }
+
+  // Deterministic bounded product. The last request varies fastest, the same
+  // odometer `enumeratePlacements` uses, so a given input enumerates the same
+  // combinations every time. Reaching the cap is reported, never hidden.
+  std::vector<size_t> pick(requests.size(), 0);
+  for (;;) {
+    if (set.combinations.size() >= options.maxConnectionCombinations) {
+      set.truncated = true;
+      break;
+    }
+    std::vector<ConnectionPlan> combination;
+    combination.reserve(requests.size());
+    for (size_t index = 0; index < requests.size(); ++index)
+      combination.push_back(alternatives[index][pick[index]]);
+    set.combinations.push_back(std::move(combination));
+
+    bool advanced = false;
+    for (size_t dimension = pick.size(); dimension-- > 0;) {
+      if (++pick[dimension] < alternatives[dimension].size()) {
+        advanced = true;
+        break;
+      }
+      pick[dimension] = 0; // wrapped: carry into the next dimension
+    }
+    if (!advanced)
+      break; // every dimension wrapped: the product is exhausted
+  }
+  return set;
+}
+
+llvm::Expected<std::vector<std::vector<ConnectionPlan>>>
+enumerateFanOutAlternatives(const ConnectionRequest &base,
+                            llvm::ArrayRef<ConnectionRequest> consumers,
+                            const MachineModel &machine,
+                            const TopologyService &topology,
+                            const PlacementOptions &options, bool *truncated) {
+  std::vector<std::vector<ConnectionPlan>> groupsOut;
   if (consumers.empty())
-    return std::vector<ConnectionPlan>{};
+    return groupsOut;
 
   // §15.3(a): a shared read is legal exactly when every consumer can legally
-  // access the producer's placement. That is a visibility fact, checked here
-  // against *each* consumer's own request -- not a memory-equality shortcut and
-  // not a check of one representative only.
+  // access the producer's placement. It is one group (every consumer) with one
+  // `Direct` alternative.
   bool allShareProducerPlacement = true;
   for (const ConnectionRequest &consumer : consumers)
     if (!portsDirectCompatible(consumer, machine)) {
       allShareProducerPlacement = false;
       break;
     }
-
   if (allShareProducerPlacement) {
     ConnectionPlan plan;
     plan.producer = base.producer;
     plan.value = base.value;
-    for (const ConnectionRequest &consumer : consumers)
+    plan.producerPort = base.producerPort;
+    for (const ConnectionRequest &consumer : consumers) {
       plan.consumers.push_back(consumer.consumer);
-    llvm::sort(plan.consumers);
+      if (consumer.consumerPort)
+        plan.consumerPorts.push_back(*consumer.consumerPort);
+    }
+    sortUnique(plan.consumers);
     plan.kind = ConnectionKind::Direct;
     plan.memoryRoute.push_back(base.producerMemory);
     plan.cost.localBytes = base.bytes;
     plan.id = computeConnectionId(plan);
-    return std::vector<ConnectionPlan>{std::move(plan)};
+    groupsOut.push_back({std::move(plan)});
+    return groupsOut;
   }
 
-  // §15.3(b): replication. Consumers that share a destination memory *and* the
-  // same required representation share one copy or transform, so its cost and
-  // capacity are counted once per representation rather than once per consumer.
-  // Each consumer is still validated on its own request, so a mismatched
-  // element type or affine relation is not missed. The layout a consumer binds
-  // partitions the group as well as the memory: grouping by memory alone would
-  // assign one member's resulting layout to a consumer that requires a
-  // different one, a representation it could never read.
-  // The layout a consumer binds partitions the group by *family and concrete
-  // parameterization*: two consumers that both name `t.blocked` but solved
-  // `VW = 4` against `VW = 8` require different representations, so one copy
-  // cannot serve both.
+  // §15.3(b): replication groups. Consumers that share a destination memory
+  // *and* the same required representation (family and concrete parameters)
+  // share one copy or transform.
   struct FanOutKey {
     MemoryNodeId memory;
     std::optional<LayoutId> layout;
@@ -730,7 +883,6 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
     groups[group].push_back(index);
   }
 
-  std::vector<ConnectionPlan> plans;
   for (const std::vector<size_t> &group : groups) {
     // A group every member of which reads the producer's placement needs no
     // copy at all.
@@ -744,22 +896,23 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
       ConnectionPlan plan;
       plan.producer = base.producer;
       plan.value = base.value;
-      for (size_t index : group)
+      plan.producerPort = base.producerPort;
+      for (size_t index : group) {
         plan.consumers.push_back(consumers[index].consumer);
-      llvm::sort(plan.consumers);
+        if (consumers[index].consumerPort)
+          plan.consumerPorts.push_back(*consumers[index].consumerPort);
+      }
+      sortUnique(plan.consumers);
       plan.kind = ConnectionKind::Direct;
       plan.memoryRoute.push_back(base.producerMemory);
       plan.cost.localBytes = base.bytes;
       plan.id = computeConnectionId(plan);
-      plans.push_back(std::move(plan));
+      groupsOut.push_back({std::move(plan)});
       continue;
     }
 
     // An in-place layout transform is a shared read of the producer's memory,
-    // so it can serve the whole group only when *every* member can reach that
-    // memory. A member that cannot would have offered a transfer instead, so
-    // excluding it here keeps a shared transform from being assigned to a
-    // consumer that cannot read where it lands.
+    // so it can serve the whole group only when *every* member can reach it.
     bool groupSeesProducer = true;
     for (size_t index : group)
       if (!consumerSeesProducerMemory(consumers[index], machine)) {
@@ -767,26 +920,23 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
         break;
       }
 
-    // A copy into this memory serves the whole group. Validate every member and
-    // pick the cheapest alternative among them; group members share a
-    // destination memory, so one copy's route is the group's route. Only plans
-    // that actually serve the group count -- a member's in-place read or
-    // transform does not serve the group's non-sharing members unless every
-    // member can read the producer's memory too.
     std::vector<ConnectionPlan> alternatives;
+    bool groupServed = true;
     for (size_t index : group) {
       llvm::Expected<std::vector<ConnectionPlan>> member =
           synthesizeConnections(consumers[index], machine, topology, options,
                                 truncated);
       if (!member)
         return member.takeError();
-      if (member->empty())
-        return std::vector<ConnectionPlan>{}; // this consumer cannot be served
+      if (member->empty()) {
+        // This consumer cannot be served, so neither can its whole group.
+        groupServed = false;
+        break;
+      }
       for (ConnectionPlan &plan : *member) {
         if (plan.kind == ConnectionKind::Transfer ||
             plan.kind == ConnectionKind::TransferAndTransform) {
           plan.kind = ConnectionKind::Replicate;
-          // `kind` is part of the canonical string, so the id is recomputed.
           plan.id = computeConnectionId(plan);
         }
         if (plan.kind == ConnectionKind::Replicate ||
@@ -794,10 +944,56 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
           alternatives.push_back(std::move(plan));
       }
     }
+    if (!groupServed || alternatives.empty()) {
+      // The group has no alternative at all, so the whole fan-out is
+      // infeasible. Recorded as a group with an empty alternative list.
+      groupsOut.emplace_back();
+      continue;
+    }
+
+    // Every alternative serves the *whole* group: its consumer association and
+    // producer endpoint are the group's, not one member's, so the id is
+    // recomputed from those final fields.
+    for (ConnectionPlan &plan : alternatives) {
+      plan.consumers.clear();
+      plan.consumerPorts.clear();
+      plan.producerPort = base.producerPort;
+      for (size_t index : group) {
+        plan.consumers.push_back(consumers[index].consumer);
+        if (consumers[index].consumerPort)
+          plan.consumerPorts.push_back(*consumers[index].consumerPort);
+      }
+      sortUnique(plan.consumers);
+      plan.id = computeConnectionId(plan);
+    }
+    groupsOut.push_back(std::move(alternatives));
+  }
+  return groupsOut;
+}
+
+llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
+    const ConnectionRequest &base, llvm::ArrayRef<ConnectionRequest> consumers,
+    const MachineModel &machine, const TopologyService &topology,
+    const PlacementOptions &options, bool *truncated,
+    const ObjectiveOrder &objective, bool *choseAmongAlternatives) {
+  // One implementation, two views: the joint search branches over every group's
+  // alternatives, while this caller keeps the pre-B7 shape -- the single
+  // objective-ranked pick per group -- so both agree on which alternatives
+  // exist.
+  llvm::Expected<std::vector<std::vector<ConnectionPlan>>> groups =
+      enumerateFanOutAlternatives(base, consumers, machine, topology, options,
+                                  truncated);
+  if (!groups)
+    return groups.takeError();
+
+  std::vector<ConnectionPlan> plans;
+  for (const std::vector<ConnectionPlan> &alternatives : *groups) {
+    // A group with no alternative cannot be served, so the whole fan-out is
+    // incompatible -- the same empty result the pre-refactor body returned.
     if (alternatives.empty())
       return std::vector<ConnectionPlan>{};
-    // More than one way to serve this group, but only the cheapest is taken:
-    // the caller can no longer claim an exhaustive joint search, so it is told.
+    // More than one way to serve this group, but only the cheapest is taken
+    // here: this caller is the heuristic single-pick view, so it says so.
     if (alternatives.size() > 1 && choseAmongAlternatives)
       *choseAmongAlternatives = true;
     // §17.1: the copies are ranked by the declared objective, not by a
@@ -807,13 +1003,7 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
                                                     const ConnectionPlan &rhs) {
       return costLess(lhs.cost, rhs.cost, objective);
     });
-    ConnectionPlan chosen = *best;
-    chosen.consumers.clear();
-    for (size_t index : group)
-      chosen.consumers.push_back(consumers[index].consumer);
-    llvm::sort(chosen.consumers);
-    chosen.id = computeConnectionId(chosen);
-    plans.push_back(std::move(chosen));
+    plans.push_back(*best);
   }
   return plans;
 }
@@ -822,11 +1012,21 @@ ConnectionPlan synthesizeFanIn(llvm::ArrayRef<InstanceId> producers,
                                llvm::ArrayRef<InstanceId> consumers,
                                WorkloadValueId value,
                                MemoryNodeId consumerMemory, uint64_t bytes,
-                               const Cost &feedCost) {
+                               const Cost &feedCost,
+                               llvm::ArrayRef<PortRef> consumerPorts,
+                               std::optional<GatherSemantics> semantics,
+                               std::optional<uint64_t> concatAxis) {
   ConnectionPlan plan;
   plan.kind = ConnectionKind::Reduce;
   plan.consumers.assign(consumers.begin(), consumers.end());
   plan.producers.assign(producers.begin(), producers.end());
+  plan.consumerPorts.assign(consumerPorts.begin(), consumerPorts.end());
+  // The explicit combination (task B6): nothing is inferred from the producer
+  // count, so a caller that declares none leaves the connection
+  // unmaterializable rather than meaning "sum". The axis is set exactly for a
+  // concatenation. Both fold into the connection's canonical identity.
+  plan.gatherSemantics = semantics;
+  plan.concatAxis = concatAxis;
   plan.value = value;
   plan.memoryRoute.push_back(std::move(consumerMemory));
   // A gather sums what its feeds cost. The gathered tile's `bytes` are charged

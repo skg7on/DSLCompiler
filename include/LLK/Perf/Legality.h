@@ -29,7 +29,9 @@
 #include "LLK/Perf/Candidate.h"
 #include "LLK/Perf/SearchSpace.h"
 
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace mlir::llk::perf {
 
@@ -43,17 +45,45 @@ struct LegalityResult {
 /// MVP limit in the auto-tuning spec.
 inline constexpr double kSramUtilizationLimit = 0.80;
 
-/// Evaluates one constraint. A constraint whose referenced parameters are not
-/// all bound by `candidate` is rejected rather than skipped, so a malformed
-/// candidate can never pass by omission.
+/// The workload facts a constraint is evaluated against. `originalWorkload` is
+/// the pre-tiling M/N/K the export records as provenance; `contractions` holds
+/// one shape per `micro.mma` the kernel performs. Either may be absent: a
+/// shape-independent constraint (mapping extent, owner availability) evaluates
+/// with no facts at all, while a shape-dependent one reports the specific fact
+/// it is missing rather than blocking every constrained kernel.
+struct BindingFacts {
+  std::optional<WorkloadShape> originalWorkload;
+  std::vector<WorkloadShape> contractions;
+};
+
+/// Evaluates one constraint against the facts the constraint actually needs. A
+/// constraint whose referenced parameters are not all bound by `candidate` is
+/// rejected rather than skipped, so a malformed candidate can never pass by
+/// omission; a shape-dependent constraint whose required fact is absent is
+/// rejected with a diagnostic naming that fact.
+LegalityResult checkConstraint(const SearchConstraint &constraint,
+                               const SearchSpace &space,
+                               const Candidate &candidate,
+                               const BindingFacts &facts,
+                               const machine::MachineModel &machine);
+
+/// Evaluates every constraint in declaration order and returns the first
+/// rejection. A space with no constraints is legal.
+LegalityResult checkLegality(const SearchSpace &space,
+                             const Candidate &candidate,
+                             const BindingFacts &facts,
+                             const machine::MachineModel &machine);
+
+/// Shape-based convenience overload: the single `shape` is used both as the
+/// original workload (tail divisibility) and as the sole contraction (dtype and
+/// fragment requirements).
 LegalityResult checkConstraint(const SearchConstraint &constraint,
                                const SearchSpace &space,
                                const Candidate &candidate,
                                const WorkloadShape &shape,
                                const machine::MachineModel &machine);
 
-/// Evaluates every constraint in declaration order and returns the first
-/// rejection. A space with no constraints is legal.
+/// Shape-based convenience overload of checkLegality; see above.
 LegalityResult checkLegality(const SearchSpace &space,
                              const Candidate &candidate,
                              const WorkloadShape &shape,

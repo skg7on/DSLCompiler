@@ -214,3 +214,41 @@ func.func @transform_unshaped(%i : index) {
   %r = micro.transform %i : index -> index
   return
 }
+
+// -----
+
+// A same-kind movement that records no concrete node identity is not a real
+// move: equal abstract kinds alone do not establish distinct storage.
+func.func @same_kind_copy_without_node_identity(%tile : !micro.tile<32x64xbf16, memory = #micro.memory<sram>>) {
+  // expected-error @+1 {{a same-kind movement requires distinct 'micro.src_node' and 'micro.dst_node'}}
+  %dst, %tok = micro.tile_async_copy %tile {dst_memory = #micro.memory<sram>} : !micro.tile<32x64xbf16, memory = #micro.memory<sram>> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>>, !micro.async_token
+  return
+}
+
+// -----
+
+// A same-kind movement whose recorded source and destination nodes are equal
+// has no concrete storage to move between.
+func.func @same_kind_copy_equal_nodes(%tile : !micro.tile<32x64xbf16, memory = #micro.memory<sram>>) {
+  // expected-error @+1 {{'micro.src_node' and 'micro.dst_node' must name distinct concrete memories}}
+  %dst, %tok = micro.tile_async_copy %tile {dst_memory = #micro.memory<sram>, micro.src_node = "sram.0", micro.dst_node = "sram.0"} : !micro.tile<32x64xbf16, memory = #micro.memory<sram>> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>>, !micro.async_token
+  return
+}
+
+// -----
+
+// A recorded node identity must be a string id, not an integer.
+func.func @same_kind_copy_malformed_node(%tile : !micro.tile<32x64xbf16, memory = #micro.memory<sram>>) {
+  // expected-error @+1 {{'micro.src_node' must be a string memory id}}
+  %dst, %tok = micro.tile_async_copy %tile {dst_memory = #micro.memory<sram>, micro.src_node = 0 : i64, micro.dst_node = "sram.1"} : !micro.tile<32x64xbf16, memory = #micro.memory<sram>> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>>, !micro.async_token
+  return
+}
+
+// -----
+
+// The generic shaped copy enforces the same node identity for a same-kind move.
+func.func @same_kind_async_copy_without_node_identity(%t : tensor<8x8xf32>) {
+  // expected-error @+1 {{a same-kind movement requires distinct 'micro.src_node' and 'micro.dst_node'}}
+  %r, %tok = micro.async_copy %t {src_memory = #micro.memory<sram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  return
+}

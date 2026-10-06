@@ -71,7 +71,7 @@ struct SearchParam {
   /// name (`operand0`, `lhs`) for the layout axis, which is the one that can
   /// bind several parameters at once. Empty means the parameter governs its
   /// axis as a whole.
-  std::string role;
+  std::string role = {};
 };
 
 /// The typed legality rules a `micro.constraint` can name. The enum order and

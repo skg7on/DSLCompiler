@@ -16,6 +16,7 @@
 #include "MicroTileInfo.h"
 
 #include "LLK/Dialect/Micro/MicroEnums.h"
+#include "LLK/Mapping/CostModel.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -41,6 +42,18 @@ namespace {
 llvm::Error invalid(const llvm::Twine &message) {
   return llvm::make_error<llvm::StringError>(message.str(),
                                              llvm::inconvertibleErrorCode());
+}
+
+/// The plain shaped type the shared transform-cost model reads. A `!micro.tile`
+/// carries its shape and element type the same way a ranked tensor does, but
+/// the cost model sits below the dialect, so the tile is presented to it as the
+/// shaped type it describes.
+mlir::Type shapedCostType(mlir::Type type) {
+  if (llvm::isa<mlir::ShapedType>(type))
+    return type;
+  if (auto tile = llvm::dyn_cast<micro::TileType>(type))
+    return mlir::RankedTensorType::get(tile.getShape(), tile.getElementType());
+  return type;
 }
 
 /// Trip count of a `micro.for`/`micro.spatial_for` when both bounds and the
@@ -84,6 +97,17 @@ llvm::StringRef mappedExecutor(mlir::Operation &op) {
   if (auto executor = mapping.getAs<mlir::StringAttr>("executor"))
     return executor.getValue();
   return {};
+}
+
+/// The executor a materialized `micro.transform` selected: stamped as
+/// `micro.engine` by the binder (task B8), because a conversion is not a
+/// covered workload node and carries no `micro.mapping`. A hand-written or
+/// older kernel without the stamp falls back to `micro.mapping` exactly as a
+/// compute op does.
+llvm::StringRef transformExecutor(mlir::Operation &op) {
+  if (auto engine = op.getAttrOfType<mlir::StringAttr>("micro.engine"))
+    return engine.getValue();
+  return mappedExecutor(op);
 }
 
 class DAGBuilder {
@@ -192,6 +216,12 @@ private:
   const machine::MachineModel &machine;
   std::string kernelName;
   std::vector<PlannedRoute> routes;
+  /// Each declared route, by the connection id it was declared under. A stamped
+  /// copy records its connection id and hop index, so the perf model can charge
+  /// exactly that hop rather than a destination kind or the first link of the
+  /// endpoint-kind pair -- which is what keeps two movements between distinct
+  /// memories of one abstract kind apart.
+  llvm::DenseMap<uint64_t, size_t> routeForConnection;
   std::vector<bool> routeClaimed;
   /// The links each movement op resolved to, so unrolled iterations of the
   /// same op do not each consume a fresh route (an empty result is a
@@ -332,7 +362,11 @@ void DAGBuilder::loadRoutes(mlir::Operation *kernel) {
       continue;
     built.srcSpace = source->kind;
     built.dstSpace = destination->kind;
+    auto connectionId = route.getAs<mlir::IntegerAttr>("id");
     routes.push_back(std::move(built));
+    if (connectionId)
+      routeForConnection[static_cast<uint64_t>(
+          connectionId.getValue().getZExtValue())] = routes.size() - 1;
   }
   routeClaimed.assign(routes.size(), false);
 }
@@ -357,6 +391,27 @@ DAGBuilder::matchRoute(mlir::Operation &op, llvm::StringRef srcSpace,
     return memo->second;
 
   llvm::SmallVector<const machine::LinkEdge *, 4> charged;
+
+  // Most specific: the connection id and hop index the binder stamps on a
+  // per-hop copy. Together they name exactly one hop of exactly one route, so a
+  // movement between two distinct memories of one abstract kind -- which no
+  // destination *kind* and no first-link-of-the-kind-pair heuristic can tell
+  // apart -- is charged its own link.
+  if (auto connection = op.getAttrOfType<mlir::IntegerAttr>("micro.connection"))
+    if (auto hop = op.getAttrOfType<mlir::IntegerAttr>("micro.hop")) {
+      auto found =
+          routeForConnection.find(connection.getValue().getZExtValue());
+      if (found != routeForConnection.end()) {
+        const PlannedRoute &route = routes[found->second];
+        uint64_t index = hop.getValue().getZExtValue();
+        if (route.moves && index >= 1 && index <= route.hops.size()) {
+          charged.push_back(route.hops[index - 1]);
+          routeOfOp[&op] = charged;
+          return charged;
+        }
+      }
+    }
+
   auto stampNode = op.getAttrOfType<mlir::StringAttr>("micro.dst_node");
   auto stampValue = op.getAttrOfType<mlir::IntegerAttr>("micro.value");
   auto valueOf = [&](const PlannedRoute &route) {
@@ -476,14 +531,9 @@ uint64_t DAGBuilder::vectorCycles(const machine::ComputeNode *engine,
                                   uint64_t elements) const {
   if (!engine)
     return elements;
-  // A dtype the engine does not declare is issued one element at a time. That
-  // is slower than the hardware, never faster, so it cannot hide a bottleneck.
-  int64_t lanes = 1;
-  auto it = engine->lanes.find(dtype.str());
-  if (it != engine->lanes.end() && it->second > 0)
-    lanes = it->second;
-  uint64_t issues = llvm::divideCeil(elements, static_cast<uint64_t>(lanes));
-  return issues * std::max<uint64_t>(1, engine->issueCycles);
+  // The one shared elementwise-issue formula (task B8), so a normalized plan
+  // event and this DAG's event charge an elementwise pass identically.
+  return mapping::elementwiseCycles(*engine, dtype, elements);
 }
 
 uint64_t DAGBuilder::mmaCycles(const machine::ComputeNode &engine,
@@ -949,6 +999,137 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     return llvm::Error::success();
   }
 
+  if (auto gather = llvm::dyn_cast<micro::GatherOp>(op)) {
+    // A gather combines several producer values, so it is real compute work on
+    // the engine the plan selected -- charged like the reduction it performs,
+    // never folded into the zero-cost path. Its semantics must be one the model
+    // understands; an undeclared or unknown kind is rejected rather than
+    // charged some invented cost.
+    if (!micro::symbolizeGatherKind(gather.getKind()))
+      return invalid("kernel '" + kernelName +
+                     "' uses micro.gather: unknown "
+                     "gather kind '" +
+                     gather.getKind().str() + "'");
+    std::string reason;
+    const machine::ComputeNode *engine =
+        pickVectorEngine(reason, mappedExecutor(op));
+    if (!engine)
+      return invalid("kernel '" + kernelName +
+                     "' uses micro.gather: " + reason);
+
+    TileInfo resultInfo = describeType(gather.getResult().getType());
+    MicroEvent event;
+    event.kind = EventKind::Reduce;
+    event.resource = ResourceKind::VectorEngine;
+    event.resourceName = engine->id;
+    event.workItems = resultInfo.elements();
+    event.minCycles =
+        vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
+    event.sourceOpName = op.getName().getStringRef().str();
+    event.tileShape = shapeString(resultInfo.shape);
+    event.tileLayout = resultInfo.layout;
+    event.tileMemory = resultInfo.memory;
+    event.tileOwner = resultInfo.owner;
+    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
+
+    uint32_t id =
+        addEvent(std::move(event), state, producerDeps(gather.getInputs()));
+    producers[gather.getResult()] = id;
+    return llvm::Error::success();
+  }
+
+  if (auto transform = llvm::dyn_cast<micro::TransformOp>(op)) {
+    // A conversion is real work: it runs on a compute capability like the other
+    // mapped elementwise work, and its selected resource is the executor the
+    // plan stamped on it (`micro.engine`, task B8) -- the same one the planner
+    // charged -- falling back to `micro.mapping` and then the machine default.
+    // A hand-written or pre-B8 kernel may instead name the resource directly
+    // with `micro.compute_resource`; when present it wins over the stamped
+    // executor, so a stale or misspelled resource is rejected rather than
+    // silently charged against some other engine.
+    std::string reason;
+    const machine::ComputeNode *engine = nullptr;
+    if (mlir::Attribute raw = op.getAttr("micro.compute_resource")) {
+      auto resource = mlir::dyn_cast<mlir::StringAttr>(raw);
+      engine = resource ? machine.findCompute(resource.getValue()) : nullptr;
+      if (!engine || engine->kind != "vector_engine")
+        return invalid("micro.transform selects an invalid vector resource");
+    } else {
+      engine = pickVectorEngine(reason, transformExecutor(op));
+    }
+    if (!engine)
+      return invalid("kernel '" + kernelName +
+                     "' uses micro.transform: " + reason);
+
+    TileInfo sourceInfo = describeType(transform.getSource().getType());
+    TileInfo resultInfo = describeType(transform.getResult().getType());
+    // The conversion reads the memory its source landed in and writes its
+    // output there: a logical view carries no memory of its own, so the
+    // producing event is asked (as `memoryOf` does for a copy source).
+    std::string sourceMemory = memoryOf(transform.getSource());
+    std::string destination =
+        resultInfo.memory.empty() ? sourceMemory : resultInfo.memory;
+
+    // A hand-written or pre-B8 kernel may name the landing memory explicitly;
+    // the stamp wins over the memory the result type implies, so the cost model
+    // charges the placement the kernel actually declared.
+    if (mlir::Attribute raw = op.getAttr("micro.memory_node")) {
+      auto memory = mlir::dyn_cast<mlir::StringAttr>(raw);
+      if (!memory)
+        return invalid("micro.transform memory node is not a string");
+      destination = memory.getValue().str();
+    }
+
+    // The one shared estimate the planner and the simulator both charge. An
+    // unknown resource or footprint comes back as an error, never a silent
+    // zero, so a mis-modeled conversion cannot vanish from the report.
+    mapping::TransformCostInput costInput;
+    costInput.inputType = shapedCostType(transform.getSource().getType());
+    costInput.outputType = shapedCostType(transform.getResult().getType());
+    if (std::optional<mlir::AffineMap> srcMap = transform.getSrcMap())
+      costInput.srcMap = *srcMap;
+    if (std::optional<mlir::AffineMap> dstMap = transform.getDstMap())
+      costInput.dstMap = *dstMap;
+    costInput.memoryNode = destination;
+    costInput.computeResource = engine->id;
+
+    llvm::Expected<mapping::Cost> cost =
+        mapping::estimateTransformCost(costInput, machine);
+    if (!cost)
+      return invalid("kernel '" + kernelName + "' uses micro.transform: " +
+                     llvm::toString(cost.takeError()));
+
+    MicroEvent event;
+    event.kind = EventKind::Transform;
+    event.resource = ResourceKind::VectorEngine;
+    event.resourceName = engine->id;
+    event.workItems =
+        resultInfo.elements() ? resultInfo.elements() : sourceInfo.elements();
+    event.bytes = cost->localBytes;
+    event.minCycles = static_cast<uint64_t>(std::ceil(cost->latencyCycles));
+    event.sourceOpName = op.getName().getStringRef().str();
+    event.tileShape = shapeString(resultInfo.shape.empty() ? sourceInfo.shape
+                                                           : resultInfo.shape);
+    event.tileLayout =
+        resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
+    event.tileMemory = destination;
+    event.srcMemory = sourceMemory;
+    event.tileOwner =
+        resultInfo.owner.empty() ? sourceInfo.owner : resultInfo.owner;
+    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
+
+    const uint64_t bytes = event.bytes;
+    uint32_t id = addEvent(std::move(event), state,
+                           producerDeps({transform.getSource()}));
+    // The result is produced by this event, so every consumer depends on the
+    // conversion rather than on whatever produced its input.
+    producers[transform.getResult()] = id;
+    // The conversion materializes a fresh output buffer, which the capacity
+    // check must see.
+    noteStorage(op, destination, bytes, state.storageFactor);
+    return llvm::Error::success();
+  }
+
   if (auto wait = llvm::dyn_cast<micro::WaitOp>(op)) {
     MicroEvent event;
     event.kind = EventKind::Wait;
@@ -957,6 +1138,27 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.minCycles = machine.sync.waitCycles;
     event.sourceOpName = op.getName().getStringRef().str();
     addEvent(std::move(event), state, producerDeps(wait.getTokens()));
+    return llvm::Error::success();
+  }
+
+  if (auto barrier = llvm::dyn_cast<micro::BarrierOp>(op)) {
+    // A barrier is charged as synchronization, not as free program order. Its
+    // scope must be one the dialect and the machine can express; an unknown
+    // scope is rejected rather than silently treated as a full-machine fence.
+    if (!micro::symbolizeBarrierScope(barrier.getScope()))
+      return invalid("kernel '" + kernelName +
+                     "' uses micro.barrier: unknown "
+                     "barrier scope '" +
+                     barrier.getScope().str() + "'");
+    MicroEvent event;
+    event.kind = EventKind::Barrier;
+    event.resource = ResourceKind::Sync;
+    event.resourceName = "sync";
+    event.minCycles = machine.sync.barrierCycles;
+    event.sourceOpName = op.getName().getStringRef().str();
+    // A barrier depends on every token it covers, so the work it orders cannot
+    // be scheduled as if the barrier were absent.
+    addEvent(std::move(event), state, producerDeps(barrier.getTokens()));
     return llvm::Error::success();
   }
 
@@ -1149,10 +1351,23 @@ llvm::Error DAGBuilder::requireMemory(mlir::Operation &op,
 llvm::Error DAGBuilder::requireReachable(mlir::Operation &op,
                                          llvm::StringRef src,
                                          llvm::StringRef dst) {
-  if (src == dst)
-    return invalid("kernel '" + kernelName +
-                   "': " + op.getName().getStringRef() +
-                   " copies from and to '" + src.str() + "'");
+  if (src == dst) {
+    // Equal abstract kinds are not the same concrete memory: the movement is
+    // real work only when the copy records two distinct concrete node ids.
+    // Without that node identity a same-space copy is a no-op and is rejected.
+    // (The machine verifier resolves the nodes, link and engine against the
+    // model; this is the perf model's own guard.)
+    auto srcNode = op.getAttrOfType<mlir::StringAttr>("micro.src_node");
+    auto dstNode = op.getAttrOfType<mlir::StringAttr>("micro.dst_node");
+    const bool distinctNodes =
+        srcNode && dstNode && !srcNode.getValue().empty() &&
+        !dstNode.getValue().empty() && srcNode.getValue() != dstNode.getValue();
+    if (!distinctNodes)
+      return invalid("kernel '" + kernelName +
+                     "': " + op.getName().getStringRef() +
+                     " copies from and to '" + src.str() + "'");
+    return llvm::Error::success();
+  }
 
   // A machine declares the copy paths it can perform. A pair it does not list
   // is still charged through both endpoints' latencies, but the gap is worth
@@ -1228,6 +1443,8 @@ llvm::StringRef stringifyEventKind(EventKind kind) {
     return "tile_view";
   case EventKind::TilePartition:
     return "tile_partition";
+  case EventKind::Transform:
+    return "transform";
   case EventKind::AsyncCopy:
     return "async_copy";
   case EventKind::Load:
@@ -1248,6 +1465,17 @@ llvm::StringRef stringifyEventKind(EventKind kind) {
   return "unknown";
 }
 
+mapping::PlanCostEvent normalizedPlanEvent(const MicroEvent &event) {
+  // The single shared construction point, so this view and a plan-derived event
+  // cannot differ in their normalized fields (task B8). The event's own
+  // `resourceName` is the machine resource both paths name.
+  std::vector<uint32_t> deps(event.deps.begin(), event.deps.end());
+  return mapping::makePlanCostEvent(
+      costEventKindOf(event.kind), event.resourceName,
+      static_cast<double>(event.minCycles), event.workItems, event.bytes,
+      std::move(deps));
+}
+
 mapping::CostEventKind costEventKindOf(EventKind kind) {
   switch (kind) {
   case EventKind::Mma:
@@ -1260,6 +1488,7 @@ mapping::CostEventKind costEventKindOf(EventKind kind) {
     return mapping::CostEventKind::TransferHop;
   case EventKind::TileView:
   case EventKind::TilePartition:
+  case EventKind::Transform:
     return mapping::CostEventKind::Transform;
   case EventKind::Wait:
   case EventKind::Barrier:

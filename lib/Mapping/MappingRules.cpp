@@ -14,6 +14,8 @@
 
 #include "LLK/Mapping/MappingRules.h"
 
+#include "LLK/Mapping/Diagnostics.h"
+#include "LLK/Mapping/MappingHelpers.h"
 #include "LLK/Mapping/StableHash.h"
 #include "LLK/Mapping/TileFacts.h"
 #include "LLK/Mapping/WorkloadGraph.h"
@@ -175,6 +177,26 @@ bool RuleParser::parseRule(RuleDef &out) {
     return failAt(current(), "rule '" + out.id + "' is missing a bundle");
   if (out.emitter.empty())
     return failAt(current(), "rule '" + out.id + "' is missing an emit");
+  // A memory requirement's port subject must name a declared port of the same
+  // direction, or the requirement could never resolve to an occurrence. Checked
+  // after the whole rule body so declaration order does not matter.
+  for (const KindRequirement &requirement : out.kindRequirements) {
+    if (!requirement.port)
+      continue;
+    bool declared = false;
+    for (const RulePort &port : out.ports)
+      if (port.name == requirement.port->name &&
+          port.isInput == requirement.port->isInput) {
+        declared = true;
+        break;
+      }
+    if (!declared)
+      return failAt(current(),
+                    "rule '" + out.id +
+                        "': memory requirement names undeclared " +
+                        (requirement.port->isInput ? "input '" : "output '") +
+                        requirement.port->name + "'");
+  }
   return true;
 }
 
@@ -390,29 +412,61 @@ bool RuleParser::parseRequire(RuleDef &out) {
   bool isKindRole = current().kind == LlkMapToken::Kind::Identifier &&
                     (current().text == "executor" ||
                      current().text == "compute" || current().text == "memory");
-  if (isKindRole && peek().kind == LlkMapToken::Kind::Identifier &&
-      peek().text == "kind") {
-    KindRequirement requirement;
-    requirement.role = current().text;
-    const LlkMapToken roleToken = current();
-    advance(); // role
-    advance(); // 'kind'
-    if (!expectIdentifier("a capability kind", requirement.kind))
-      return false;
-    if (!expectPunct(";"))
-      return false;
-    // A rule may not require the same (role, kind) twice: placement binds
-    // attachments by kind, so a duplicate would collide in the binding map and
-    // emit indistinguishable instances. Rejected here, in source order, before
-    // any candidate is built.
-    for (const KindRequirement &existing : out.kindRequirements)
-      if (existing.role == requirement.role &&
-          existing.kind == requirement.kind)
-        return failAt(roleToken, "duplicate " + requirement.role +
-                                     " kind requirement '" + requirement.kind +
-                                     "'");
-    out.kindRequirements.push_back(std::move(requirement));
-    return true;
+  if (isKindRole) {
+    // Two clause forms share the role prefix: the legacy `kind <k>` and a
+    // memory requirement that names the port it governs, `output "x" kind <k>`.
+    const bool bareForm =
+        peek().kind == LlkMapToken::Kind::Identifier && peek().text == "kind";
+    const bool portForm = peek().kind == LlkMapToken::Kind::Identifier &&
+                          (peek().text == "input" || peek().text == "output");
+    if (bareForm || portForm) {
+      KindRequirement requirement;
+      requirement.role = current().text;
+      const LlkMapToken roleToken = current();
+      advance(); // role
+      if (portForm) {
+        // Only memory is materialized per port; the owner and compute roles are
+        // a property of the whole operation, so naming a port there is a
+        // load-time error rather than a silently ignored field.
+        if (requirement.role != "memory")
+          return failAt(roleToken, "only a memory requirement may name a port");
+        RulePort port;
+        port.isInput = current().text == "input";
+        advance(); // direction
+        if (current().kind != LlkMapToken::Kind::String)
+          return failAt(current(), "expected a quoted port name");
+        port.name = current().text;
+        advance();
+        requirement.port = std::move(port);
+        if (current().kind != LlkMapToken::Kind::Identifier ||
+            current().text != "kind")
+          return failAt(current(), "expected 'kind'");
+      }
+      advance(); // 'kind'
+      if (!expectIdentifier("a capability kind", requirement.kind))
+        return false;
+      if (!expectPunct(";"))
+        return false;
+      // Two requirements collide when they share role and kind and their port
+      // subjects overlap. Two distinct named ports are distinct requirements;
+      // a bare requirement and a named one of the same kind overlap (the bare
+      // one would have to govern every port), so that is rejected too.
+      auto collides = [](const std::optional<RulePort> &lhs,
+                         const std::optional<RulePort> &rhs) {
+        if (!lhs || !rhs)
+          return true;
+        return lhs->name == rhs->name && lhs->isInput == rhs->isInput;
+      };
+      for (const KindRequirement &existing : out.kindRequirements)
+        if (existing.role == requirement.role &&
+            existing.kind == requirement.kind &&
+            collides(existing.port, requirement.port))
+          return failAt(roleToken, "duplicate " + requirement.role +
+                                       " kind requirement '" +
+                                       requirement.kind + "'");
+      out.kindRequirements.push_back(std::move(requirement));
+      return true;
+    }
   }
 
   bool isLayoutRequirement = current().kind == LlkMapToken::Kind::Identifier &&
@@ -616,8 +670,25 @@ std::string canonicalRuleDefString(const RuleDef &def) {
   for (const ExprPtr &constraint : def.constraints)
     field("constraint",
           constraint ? canonicalExprString(*constraint) : "<null>");
-  for (const KindRequirement &requirement : def.kindRequirements)
-    field("require", requirement.role + ":" + requirement.kind);
+  for (const KindRequirement &requirement : def.kindRequirements) {
+    std::string text = requirement.role;
+    if (requirement.port) {
+      // Unit separators keep a port name containing the printable delimiter
+      // from being read as the kind.
+      text += '\x1f';
+      text += requirement.port->isInput ? 'i' : 'o';
+      text += '\x1f';
+      text += requirement.port->name;
+      text += '\x1f';
+      text += requirement.kind;
+    } else {
+      // The bare form renders exactly as before, so a rule that names no port
+      // keeps its pre-existing content hash.
+      text += ':';
+      text += requirement.kind;
+    }
+    field("require", text);
+  }
   for (const RuleLayoutRequirement &requirement : def.layoutRequirements)
     field("layout", requirement.port + ":" + requirement.layoutId);
   for (const RulePort &port : def.ports)
@@ -696,9 +767,15 @@ std::string printRule(const RuleDef &def) {
     out += constraint ? printExpr(*constraint) : "<null>";
     out += ";\n";
   }
-  for (const KindRequirement &requirement : def.kindRequirements)
-    out +=
-        "  require " + requirement.role + " kind " + requirement.kind + ";\n";
+  for (const KindRequirement &requirement : def.kindRequirements) {
+    out += "  require " + requirement.role;
+    if (requirement.port) {
+      out += requirement.port->isInput ? " input \"" : " output \"";
+      out += requirement.port->name;
+      out += '"';
+    }
+    out += " kind " + requirement.kind + ";\n";
+  }
   for (const RuleLayoutRequirement &requirement : def.layoutRequirements)
     out += "  require layout " + requirement.port + " satisfies " +
            requirement.layoutId + ";\n";
@@ -1234,6 +1311,132 @@ mlir::DictionaryAttr buildBundleParameters(const RuleDef &rule,
   return mlir::DictionaryAttr::get(context, attributes);
 }
 
+/// Projects the bound `owner_mapping` and `memory_path` search axes onto the
+/// candidate's abstract requirements, validating each against machine data. The
+/// projection is explicit: a bound axis changes which executors, computes, and
+/// memories placement may bind, rather than being recorded as provenance and
+/// ignored. Returns an error message when an axis is malformed, names something
+/// the machine does not model, or contradicts the rule's own requirements; on
+/// success it appends the projected requirements to `candidate`.
+///
+/// `owner_mapping` is a `/`-separated chain of owner kinds (`worker/pe`): the
+/// outer component is the executor the work must run on, and inner components
+/// are nested owners or compute capabilities. A rule's own executor and compute
+/// requirements must lie on that chain.
+///
+/// `memory_path` is a `:`-separated chain of memory kinds (`dram:sram:acc`),
+/// the allowed levels. Every memory a rule requires must sit on it. A level the
+/// machine does not model, or an owner kind it does not model, is rejected
+/// explicitly -- a selected axis is never silently dropped.
+///
+/// The value for an axis is taken from `boundAxes` (resolved by parameter
+/// *kind* by the caller) when set, else from the binding's conventional
+/// exported name in `pinned` -- so a name-keyed binding still projects, and a
+/// space that named its parameter differently is honoured because the caller
+/// resolved it by kind rather than by name.
+std::optional<std::string>
+projectBoundAxes(const RuleDef &rule, const BoundAxes *boundAxes,
+                 const llvm::StringMap<SearchValue> *pinned,
+                 const machine::MachineModel &machine,
+                 MappingCandidate &candidate) {
+  std::string ownerValue;
+  if (boundAxes && !boundAxes->ownerMapping.empty())
+    ownerValue = boundAxes->ownerMapping;
+  else if (pinned)
+    if (auto entry = pinned->find("owner_mapping"); entry != pinned->end()) {
+      const std::string *value = std::get_if<std::string>(&entry->second);
+      if (!value || value->empty())
+        return "owner_mapping axis must be a non-empty symbolic value";
+      ownerValue = *value;
+    }
+
+  if (!ownerValue.empty()) {
+    llvm::StringRef value = ownerValue;
+    llvm::SmallVector<llvm::StringRef, 4> owners;
+    value.split(owners, '/');
+    for (llvm::StringRef owner : owners)
+      if (owner.empty())
+        return "owner_mapping axis has an empty owner";
+    // The outer component names the executor the work runs on.
+    if (!machine.hasOwnerKind(owners.front()))
+      return "owner_mapping names owner '" + owners.front().str() +
+             "', which machine '" + machine.target + "' does not model";
+    for (const KindRequirement &requirement : rule.kindRequirements)
+      if (requirement.role == "executor" && requirement.kind != owners.front())
+        return "owner_mapping '" + value.str() +
+               "' contradicts executor kind '" + requirement.kind + "'";
+    // Inner components are nested owners or attached compute capabilities; each
+    // must be modeled as one or the other.
+    llvm::SmallVector<std::string, 2> projectedComputes;
+    for (size_t index = 1; index < owners.size(); ++index) {
+      llvm::StringRef owner = owners[index];
+      bool isOwnerKind = machine.hasOwnerKind(owner);
+      bool isComputeKind = !machine.computesOfKind(owner).empty();
+      if (!isOwnerKind && !isComputeKind)
+        return "owner_mapping names owner '" + owner.str() +
+               "', which machine '" + machine.target + "' does not model";
+      if (isComputeKind)
+        projectedComputes.push_back(owner.str());
+    }
+    // A rule that requires a compute must require one the chain reaches.
+    for (const KindRequirement &requirement : rule.kindRequirements) {
+      if (requirement.role != "compute")
+        continue;
+      if (!projectedComputes.empty() &&
+          !llvm::is_contained(projectedComputes, requirement.kind))
+        return "owner_mapping '" + value.str() +
+               "' does not reach compute kind '" + requirement.kind + "'";
+    }
+    // Project the outer owner as an executor requirement, and each inner
+    // compute kind as a compute requirement -- deduplicated, so a rule that
+    // already declares them is left unchanged.
+    bool hasExecutor = false;
+    for (const ExecutorRequirement &existing : candidate.executorRequirements)
+      hasExecutor |= existing.capability == owners.front();
+    if (!hasExecutor) {
+      ExecutorRequirement resolved;
+      resolved.capability = owners.front().str();
+      candidate.executorRequirements.push_back(std::move(resolved));
+    }
+    for (const std::string &kind : projectedComputes) {
+      bool declared = false;
+      for (const ComputeRequirement &existing : candidate.computeRequirements)
+        declared |= existing.kind == kind;
+      if (!declared) {
+        ComputeRequirement resolved;
+        resolved.kind = kind;
+        candidate.computeRequirements.push_back(std::move(resolved));
+      }
+    }
+  }
+
+  std::string memoryPathValue;
+  if (boundAxes && !boundAxes->memoryPath.empty())
+    memoryPathValue = boundAxes->memoryPath;
+  else if (pinned)
+    if (auto entry = pinned->find("memory_path"); entry != pinned->end()) {
+      const std::string *value = std::get_if<std::string>(&entry->second);
+      if (!value || value->empty())
+        return "memory_path axis must be a non-empty symbolic value";
+      memoryPathValue = *value;
+    }
+
+  if (!memoryPathValue.empty()) {
+    llvm::StringRef value = memoryPathValue;
+    llvm::SmallVector<llvm::StringRef, 4> path;
+    value.split(path, ':');
+    for (llvm::StringRef level : path)
+      if (level.empty() || !machine.findMemoryOfKind(level))
+        return "memory_path names level '" + level.str() +
+               "', which machine '" + machine.target + "' does not model";
+    for (const MemoryRequirement &requirement : candidate.memoryRequirements)
+      if (!llvm::is_contained(path, llvm::StringRef(requirement.kind)))
+        return "memory_path '" + value.str() + "' excludes memory kind '" +
+               requirement.kind + "'";
+  }
+  return std::nullopt;
+}
+
 } // namespace
 
 std::optional<MappingCandidate>
@@ -1241,7 +1444,8 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason,
                    bool *truncated, const llvm::StringMap<SearchValue> *pinned,
-                   const llvm::StringMap<std::string> *boundLayouts) {
+                   const llvm::StringMap<std::string> *boundLayouts,
+                   const BoundAxes *boundAxes) {
   RuleResolution resolution =
       resolveRuleConstraints(rule, node, machine, context, pinned);
   if (!resolution.matched) {
@@ -1325,11 +1529,21 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     spec.name = port.name;
     spec.isInput = port.isInput;
     if (port.isInput) {
-      if (inputIndex < node.inputs.size())
-        spec.value = node.inputs[inputIndex++].value;
+      if (inputIndex < node.inputs.size()) {
+        spec.value = node.inputs[inputIndex].value;
+        // The operand occurrence, so two uses of one value stay distinct ports
+        // rather than collapsing into one spec.
+        spec.port = PortRef{node.id, PortDirection::Input,
+                            static_cast<uint32_t>(inputIndex)};
+      }
+      ++inputIndex;
     } else {
-      if (outputIndex < node.outputs.size())
-        spec.value = node.outputs[outputIndex++].value;
+      if (outputIndex < node.outputs.size()) {
+        spec.value = node.outputs[outputIndex].value;
+        spec.port = PortRef{node.id, PortDirection::Output,
+                            static_cast<uint32_t>(outputIndex)};
+      }
+      ++outputIndex;
     }
     candidate.ports.push_back(std::move(spec));
   }
@@ -1342,11 +1556,39 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     } else if (requirement.role == "memory") {
       MemoryRequirement resolved;
       resolved.kind = requirement.kind;
+      // A named port is resolved to the matched node's occurrence the same way
+      // a layout requirement is: rule ports wire positionally to the node's
+      // inputs then its outputs, so the port's position within its direction is
+      // the occurrence index. A requirement whose port the node does not have
+      // cannot be attributed, so the rule is a non-match rather than a bare
+      // fallback.
+      if (requirement.port) {
+        resolved.port = portRefForRulePort(rule, node, *requirement.port);
+        if (!resolved.port) {
+          if (reason)
+            *reason = "memory requirement names port '" +
+                      requirement.port->name +
+                      "', which the matched operation does not expose";
+          return std::nullopt;
+        }
+      }
       candidate.memoryRequirements.push_back(std::move(resolved));
     } else if (requirement.role == "compute") {
       ComputeRequirement resolved;
       resolved.kind = requirement.kind;
       candidate.computeRequirements.push_back(std::move(resolved));
+    }
+  }
+
+  // Bound search axes are projected onto explicit requirements before the
+  // candidate is identified, so placement consumes what the binding selected
+  // rather than ignoring it as provenance.
+  if (pinned || (boundAxes && !boundAxes->empty())) {
+    if (std::optional<std::string> axisError =
+            projectBoundAxes(rule, boundAxes, pinned, machine, candidate)) {
+      if (reason)
+        *reason = *axisError;
+      return std::nullopt;
     }
   }
 
@@ -1387,11 +1629,16 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
     size_t layoutOutputIndex = 0;
     for (const RulePort &port : rule.ports) {
       const WorkloadPort *nodePort = nullptr;
+      PortDirection direction = PortDirection::Input;
+      uint32_t position = 0;
       if (port.isInput) {
+        position = static_cast<uint32_t>(layoutInputIndex);
         if (layoutInputIndex < node.inputs.size())
           nodePort = &node.inputs[layoutInputIndex];
         ++layoutInputIndex;
       } else {
+        direction = PortDirection::Output;
+        position = static_cast<uint32_t>(layoutOutputIndex);
         if (layoutOutputIndex < node.outputs.size())
           nodePort = &node.outputs[layoutOutputIndex];
         ++layoutOutputIndex;
@@ -1407,12 +1654,231 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
       // the edge that carries it. A rule that names only an input port
       // therefore does *not* claim a layout for the value its node produces.
       resolved.portValue = static_cast<int64_t>(nodePort->value);
+      // The operand occurrence itself, so two uses of one value resolve their
+      // own layout instead of a value-wide lookup that would give up.
+      resolved.port = PortRef{node.id, direction, position};
     }
     candidate.layoutRequirements.push_back(std::move(resolved));
   }
 
   candidate.id = computeCandidateId(candidate);
   return candidate;
+}
+
+//===----------------------------------------------------------------------===//
+// Re-verifying a recorded selection (design §18.3, phase 2)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Why a recorded parameter assignment is illegal, or nullopt when it is legal.
+/// Validates the assignment the plan *recorded* -- it never searches for a
+/// different one -- so an unknown name, a value outside its declared domain, a
+/// required name left out, and a constraint the recorded values do not satisfy
+/// are each reported. The fallback satisfiability test lives in the caller, so
+/// this is reached only when an assignment was actually persisted.
+std::optional<std::string>
+recordedParameterProblem(const RuleDef &rule, const WorkloadNode &node,
+                         const machine::MachineModel &machine,
+                         const llvm::StringMap<SearchValue> &recorded) {
+  for (const auto &entry : recorded) {
+    if (!rule.findParam(entry.first()))
+      return "records parameter '" + entry.first().str() +
+             "', which it does not declare";
+    auto domain = rule.domains.find(entry.first().str());
+    if (domain == rule.domains.end() ||
+        !llvm::is_contained(domain->second.values, entry.second))
+      return "records parameter '" + entry.first().str() + " = " +
+             canonicalValueString(entry.second) +
+             "', outside its declared domain";
+  }
+
+  // Every parameter a constraint derives must have been recorded: verification
+  // cannot reconstruct the value the plan actually used.
+  llvm::StringSet<> referenced;
+  llvm::StringSet<> bound; // no quantifier is in scope at the top level
+  for (const ExprPtr &constraint : rule.constraints)
+    collectIdentifiers(*constraint, referenced, bound);
+  for (const LayoutParam &param : rule.params)
+    if (referenced.contains(param.name) && !recorded.count(param.name))
+      return "does not record the derived parameter '" + param.name + "'";
+
+  llvm::StringMap<LayoutValue> bindings;
+  for (const auto &entry : recorded)
+    bindings[entry.first()] = entry.second;
+
+  LayoutContext ruleContext = ruleLayoutContext(node, LayoutContext{});
+  QuantifierBudget budget;
+  budget.limit = kMaxRuleAssignments;
+  auto resolveDomain =
+      [&rule](
+          llvm::StringRef name) -> std::optional<llvm::ArrayRef<LayoutValue>> {
+    auto it = rule.domains.find(name.str());
+    if (it == rule.domains.end())
+      return std::nullopt;
+    return llvm::ArrayRef<LayoutValue>(it->second.values);
+  };
+  EvalOptions options;
+  options.budget = &budget;
+  options.domainResolver = resolveDomain;
+
+  for (const ExprPtr &constraint : rule.constraints) {
+    llvm::Expected<EvalValue> value =
+        evaluateExpr(*constraint, bindings, machine, ruleContext, options);
+    if (!value)
+      return "does not satisfy its require constraints: " +
+             llvm::toString(value.takeError());
+    if (value->kind != EvalValue::Kind::Int || value->intValue == 0)
+      return "records a parameter assignment its require constraints reject";
+  }
+  if (budget.exhausted)
+    return "require evaluation exceeded the quantifier bound without deciding "
+           "every constraint";
+  return std::nullopt;
+}
+
+} // namespace
+
+bool ruleDerivesParameters(const RuleDef &rule) {
+  llvm::StringSet<> referenced;
+  llvm::StringSet<> bound; // no quantifier is in scope at the top level
+  for (const ExprPtr &constraint : rule.constraints)
+    collectIdentifiers(*constraint, referenced, bound);
+  for (const LayoutParam &param : rule.params)
+    if (referenced.contains(param.name))
+      return true;
+  return false;
+}
+
+llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
+                                const machine::MachineModel &machine,
+                                const RecordedRuleSelection &selection,
+                                llvm::StringRef where) {
+  auto reject = [&](DiagnosticCode code, std::string detail) {
+    std::string message = stringifyDiagnosticCode(code).str();
+    message += ": ";
+    if (!where.empty()) {
+      message += where.str();
+      message += ": ";
+    }
+    message += detail;
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+  };
+
+  // 1. The recorded rule must implement this operation, not merely exist.
+  if (rule.matchOp != node.opName)
+    return reject(DiagnosticCode::NoMatchingRule,
+                  "rule '" + rule.id + "' implements '" + rule.matchOp +
+                      "', not '" + node.opName + "'");
+
+  // 2. Every predicate must still hold for the operation's endpoints.
+  for (const RulePredicate &predicate : rule.predicates)
+    if (!predicateMatches(predicate, node))
+      return reject(DiagnosticCode::NoMatchingRule,
+                    "rule '" + rule.id + "' predicate '" +
+                        printPredicate(predicate) +
+                        "' does not match the operation");
+
+  // 3. The recorded parameter assignment, or -- when none was recorded --
+  // generation's existential check, so a rule that no assignment can satisfy is
+  // still rejected.
+  if (!selection.parameters.empty()) {
+    if (std::optional<std::string> problem =
+            recordedParameterProblem(rule, node, machine, selection.parameters))
+      return reject(DiagnosticCode::NoMatchingRule,
+                    "rule '" + rule.id + "' " + *problem);
+  } else if (!rule.constraints.empty()) {
+    RuleResolution resolution =
+        resolveRuleConstraints(rule, node, machine, LayoutContext{}, nullptr);
+    if (!resolution.matched)
+      return reject(DiagnosticCode::NoMatchingRule,
+                    "rule '" + rule.id + "' " +
+                        (resolution.reason.empty()
+                             ? std::string("require constraints not satisfied")
+                             : resolution.reason));
+  }
+
+  // 4. The recorded executor, and the executor *kind* each requirement names.
+  if (!selection.executor.empty() && !machine.findExecutor(selection.executor))
+    return reject(DiagnosticCode::NoLegalExecutor,
+                  "unknown executor '" + selection.executor + "'");
+  for (const KindRequirement &requirement : rule.kindRequirements)
+    if (requirement.role == "executor" &&
+        !machine.ownerMatches(requirement.kind, selection.executor))
+      return reject(DiagnosticCode::NoLegalExecutor,
+                    "executor '" + selection.executor +
+                        "' does not satisfy the rule's required kind '" +
+                        requirement.kind + "'");
+
+  // 5. Attached compute capabilities.
+  for (const KindRequirement &requirement : rule.kindRequirements) {
+    if (requirement.role != "compute")
+      continue;
+    bool attached = false;
+    for (const mlir::llk::machine::ComputeNode *compute :
+         machine.computesFor(selection.executor))
+      if (compute->kind == requirement.kind) {
+        attached = true;
+        break;
+      }
+    if (!attached)
+      return reject(DiagnosticCode::UnsupportedComputeFragment,
+                    "executor '" + selection.executor + "' has no attached '" +
+                        requirement.kind + "' compute capability");
+  }
+
+  // 6. Memory kinds and visibility. A requirement that named a port is checked
+  // against the recorded port-to-memory association -- the kind-keyed map
+  // cannot tell two same-kind requirements apart -- and a bare requirement
+  // against the kind-keyed map, exactly as generation bound each.
+  for (const KindRequirement &requirement : rule.kindRequirements) {
+    if (requirement.role != "memory")
+      continue;
+    std::string boundMemory;
+    if (requirement.port) {
+      std::optional<PortRef> ref =
+          portRefForRulePort(rule, node, *requirement.port);
+      if (!ref)
+        return reject(DiagnosticCode::NoMemoryRoute,
+                      "rule '" + rule.id + "' requires a '" + requirement.kind +
+                          "' memory on port '" + requirement.port->name +
+                          "', which the operation does not expose");
+      const PortMemoryBinding *found = nullptr;
+      for (const PortMemoryBinding &binding : selection.portMemories)
+        if (binding.port == *ref) {
+          found = &binding;
+          break;
+        }
+      if (!found)
+        return reject(DiagnosticCode::NoMemoryRoute,
+                      "rule '" + rule.id + "' requires a '" + requirement.kind +
+                          "' memory on port '" + requirement.port->name +
+                          "', which the mapping does not bind");
+      boundMemory = found->memory;
+    } else {
+      auto bound = selection.memories.find(requirement.kind);
+      if (bound == selection.memories.end())
+        return reject(DiagnosticCode::NoMemoryRoute,
+                      "rule '" + rule.id + "' requires a '" + requirement.kind +
+                          "' memory, which the mapping does not bind");
+      boundMemory = bound->second;
+    }
+    const mlir::llk::machine::MemoryNode *memory =
+        machine.findMemory(boundMemory);
+    if (!memory)
+      return reject(DiagnosticCode::NoMemoryRoute,
+                    "unknown memory '" + boundMemory + "'");
+    if (memory->kind != requirement.kind)
+      return reject(DiagnosticCode::NoMemoryRoute,
+                    "memory '" + boundMemory + "' has kind '" + memory->kind +
+                        "', not the required '" + requirement.kind + "'");
+    if (!machine.isVisible(boundMemory, selection.executor))
+      return reject(DiagnosticCode::NoMemoryRoute,
+                    "executor '" + selection.executor +
+                        "' cannot see memory '" + boundMemory + "'");
+  }
+
+  return llvm::Error::success();
 }
 
 } // namespace mlir::llk::mapping

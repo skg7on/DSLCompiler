@@ -29,11 +29,13 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
 
 #include <memory>
 #include <string>
+#include <vector>
 
 using namespace mlir;
 using namespace mlir::llk::mapping;
@@ -145,6 +147,7 @@ TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
   ASSERT_TRUE(root);
 
   EXPECT_TRUE(root->getInteger("version").has_value());
+  EXPECT_EQ(*root->getInteger("version"), 2);
   EXPECT_TRUE(root->getString("compilerVersion").has_value());
   EXPECT_NE(*root->getString("compilerVersion"), "llk-compiler");
   EXPECT_TRUE(root->getInteger("costModelVersion").has_value());
@@ -310,6 +313,50 @@ TEST(MappingPlanReportTest, AssumedValueSizeIsANoticeNotARejection) {
   EXPECT_NE(noticed.find("latency_cache_miss"), noticed.end());
 }
 
+// A collapsed connection choice is a notice, never a rejection: like a
+// truncation or an assumed size, `connection_choice_unexplored` belongs under
+// `notices` and must not inflate §22.2's rejected tally. A restricted search is
+// not a search that refused the plan, so reporting it as a rejection would make
+// a feasible-but-collapsed run look like a failure.
+TEST(MappingPlanReportTest, ConnectionChoiceUnexploredIsANoticeNotARejection) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchResult result;
+  result.connectionChoicesUnexplored = true;
+  result.frontier.codeCounts[DiagnosticCode::ConnectionChoiceUnexplored] = 1;
+  result.frontier.codeCounts[DiagnosticCode::MemoryCapacityExceeded] = 2;
+
+  MappingSearchOptions options;
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash("collapse"));
+  llvm::Expected<llvm::json::Value> json = llvm::json::parse(report);
+  ASSERT_TRUE(static_cast<bool>(json)) << llvm::toString(json.takeError());
+  const llvm::json::Object *root = json->getAsObject();
+  ASSERT_TRUE(root);
+
+  auto codesIn = [](const llvm::json::Array *array) {
+    llvm::StringSet<> codes;
+    for (const llvm::json::Value &entry : *array)
+      if (const llvm::json::Object *object = entry.getAsObject())
+        if (std::optional<llvm::StringRef> code = object->getString("code"))
+          codes.insert(*code);
+    return codes;
+  };
+  const llvm::json::Array *rejections = root->getArray("rejections");
+  const llvm::json::Array *notices = root->getArray("notices");
+  ASSERT_TRUE(rejections);
+  ASSERT_TRUE(notices);
+  llvm::StringSet<> rejected = codesIn(rejections);
+  llvm::StringSet<> noticed = codesIn(notices);
+
+  EXPECT_EQ(rejected.find("connection_choice_unexplored"), rejected.end());
+  EXPECT_NE(noticed.find("connection_choice_unexplored"), noticed.end());
+  EXPECT_NE(rejected.find("memory_capacity_exceeded"), rejected.end());
+  EXPECT_EQ(noticed.find("memory_capacity_exceeded"), noticed.end());
+}
+
 // The library hashes are content-derived and stable, and differ between the
 // two registries (a layout library is not a rule library).
 TEST(MappingPlanReportTest, RegistryHashesAreContentDerivedAndStable) {
@@ -364,4 +411,257 @@ TEST(MappingPlanReportTest, RegistryHashChangesWithContent) {
 
   EXPECT_NE(ruleBase.computeContentHash(), ruleChanged.computeContentHash());
   EXPECT_EQ(ruleBase.computeContentHash(), ruleBase.computeContentHash());
+}
+
+//===----------------------------------------------------------------------===//
+// Versioned replay (task B1)
+//===----------------------------------------------------------------------===//
+
+// A v2 report round-trips the selected state: reading it back reconstructs the
+// same plan identity, endpoints, routes and solved-layout assignments.
+TEST(MappingPlanReportTest, ReplayReportRoundTripsSelectedState) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult result =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  ASSERT_FALSE(result.plans.empty());
+  const CoveringPlan &selected = result.plans.front();
+
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash(kKernel));
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, **target, *graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+  EXPECT_EQ(replay->id, selected.id);
+  EXPECT_EQ(replay->schemaVersion, 2u);
+  EXPECT_EQ(replay->sourceBindingHash, selected.sourceBindingHash);
+
+  ASSERT_EQ(replay->placements.size(), selected.placements.size());
+  for (size_t i = 0; i < selected.placements.size(); ++i) {
+    EXPECT_EQ(replay->placements[i].node, selected.placements[i].node);
+    EXPECT_EQ(replay->placements[i].instance, selected.placements[i].instance);
+    EXPECT_EQ(replay->placements[i].rule, selected.placements[i].rule);
+    EXPECT_EQ(replay->placements[i].executor, selected.placements[i].executor);
+    EXPECT_EQ(replay->placements[i].layoutSolutions.size(),
+              selected.placements[i].layoutSolutions.size());
+    // An `AffineMap` is context-bound and a replay re-derives it from the
+    // parameters; the report still records its printed form, which this checks.
+    for (const auto &entry : selected.placements[i].layoutSolutions) {
+      ASSERT_TRUE(replay->placements[i].layoutSolutions.count(entry.first()));
+      EXPECT_EQ(
+          canonicalSearchValueString(replay->placements[i]
+                                         .layoutSolutions.lookup(entry.first())
+                                         .parameters),
+          canonicalSearchValueString(entry.second.parameters));
+      EXPECT_EQ(
+          replay->placements[i].layoutSolutions.lookup(entry.first()).port,
+          entry.second.port);
+    }
+  }
+  ASSERT_EQ(replay->connectionPlans.size(), selected.connectionPlans.size());
+  for (size_t i = 0; i < selected.connectionPlans.size(); ++i) {
+    EXPECT_EQ(replay->connectionPlans[i].id, selected.connectionPlans[i].id);
+    EXPECT_EQ(replay->connectionPlans[i].kind,
+              selected.connectionPlans[i].kind);
+    EXPECT_EQ(replay->connectionPlans[i].route,
+              selected.connectionPlans[i].route);
+    EXPECT_EQ(replay->connectionPlans[i].consumerPorts,
+              selected.connectionPlans[i].consumerPorts);
+    EXPECT_EQ(replay->connectionPlans[i].producerPort,
+              selected.connectionPlans[i].producerPort);
+  }
+
+  // The report persists each solved layout's concrete map in its printed form,
+  // which is what a materializer re-derives the map from.
+  auto renderMap = [](mlir::AffineMap map) {
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    map.print(stream);
+    return stream.str();
+  };
+  for (const PlanPlacement &placement : selected.placements)
+    for (const auto &entry : placement.layoutSolutions)
+      if (entry.second.map)
+        EXPECT_NE(report.find(renderMap(entry.second.map)), std::string::npos);
+}
+
+// A report round-trips a gather connection's declared combination semantics,
+// its concat axis, and the producer occurrences it combines (task I2). Without
+// them a replayed `Reduce` connection degrades to `reduce_not_materialized`
+// even though the report states what the gather means.
+TEST(MappingPlanReportTest, ReplayRoundTripsGatherSemantics) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult searched =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  ASSERT_FALSE(searched.plans.empty());
+
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  // Two resolvable producer occurrences to feed the gather, taken from the
+  // source graph so the reader's endpoint-resolution check accepts them.
+  std::vector<PortRef> producers;
+  for (const WorkloadNode &node : graph->getNodes())
+    for (uint32_t index = 0; index < node.outputs.size(); ++index)
+      producers.push_back(PortRef{node.id, PortDirection::Output, index});
+  ASSERT_GE(producers.size(), 2u);
+
+  MappingSearchResult result;
+  result.workloadHash = searched.workloadHash;
+  CoveringPlan plan = searched.plans.front();
+  PlanConnection gather;
+  gather.id = 0x1234;
+  gather.kind = ConnectionKind::Reduce;
+  gather.gatherSemantics = GatherSemantics::Sum;
+  gather.producerPorts = {producers[0], producers[1]};
+  plan.connectionPlans.clear();
+  plan.connectionPlans.push_back(gather);
+  result.plans.push_back(std::move(plan));
+
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash(kKernel));
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, **target, *graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+  ASSERT_EQ(replay->connectionPlans.size(), 1u);
+  const PlanConnection &replayed = replay->connectionPlans.front();
+  EXPECT_EQ(replayed.kind, ConnectionKind::Reduce);
+  ASSERT_TRUE(replayed.gatherSemantics.has_value());
+  EXPECT_EQ(*replayed.gatherSemantics, GatherSemantics::Sum);
+  EXPECT_EQ(replayed.producerPorts, gather.producerPorts);
+}
+
+// A report carries each placement's per-occurrence memory bindings, so a replay
+// reconstructs them exactly (task B2 fix round 1).
+TEST(MappingPlanReportTest, ReportRoundTripsNamedPortMemoryBindings) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult result =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  ASSERT_FALSE(result.plans.empty());
+
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  // Attach a per-occurrence binding to a placement whose node has an output the
+  // graph can resolve.
+  bool attached = false;
+  for (PlanPlacement &placement : result.plans.front().placements) {
+    const WorkloadNode *node = graph->findNode(placement.node);
+    if (!node || node->outputs.empty())
+      continue;
+    placement.portMemoryBindings.push_back(PortMemoryBinding{
+        PortRef{placement.node, PortDirection::Output, 0}, "sram.0"});
+    attached = true;
+    break;
+  }
+  ASSERT_TRUE(attached) << "no placement had a resolvable output occurrence";
+
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash(kKernel));
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, **target, *graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+
+  for (const PlanPlacement &original : result.plans.front().placements) {
+    if (original.portMemoryBindings.empty())
+      continue;
+    const PlanPlacement *match = nullptr;
+    for (const PlanPlacement &candidate : replay->placements)
+      if (candidate.node == original.node)
+        match = &candidate;
+    ASSERT_NE(match, nullptr);
+    EXPECT_EQ(match->portMemoryBindings, original.portMemoryBindings);
+  }
+}
+
+// A report replayed against a target whose content differs is rejected: the
+// recorded target hash no longer matches.
+TEST(MappingPlanReportTest, ReplayRejectsAChangedTarget) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult result =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash(kKernel));
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph));
+
+  // The same machine and layouts but a different rule library: the target
+  // content hash moves.
+  llvm::Expected<RuleRegistry> rules =
+      parseRuleText("rule extra { match micro.vector(); bundle \"b\"; emit "
+                    "\"e1\"; }",
+                    "<test>");
+  ASSERT_TRUE(static_cast<bool>(rules)) << llvm::toString(rules.takeError());
+  FileMappingTarget other("x86-avx2", (**target).machine(),
+                          (**target).layouts(), std::move(*rules),
+                          std::vector<std::string>{"e1"});
+  llvm::Expected<CoveringPlan> replay = readPlanReport(report, other, *graph);
+  ASSERT_FALSE(static_cast<bool>(replay));
+  EXPECT_NE(llvm::toString(replay.takeError()).find("target"),
+            std::string::npos);
+}
+
+// A report replayed against a graph whose workload changed semantically -- the
+// same node ids and port shapes, but a different operation attribute -- is
+// rejected by the source-graph content hash, not merely by node resolution.
+TEST(MappingPlanReportTest, ReplayRejectsAChangedInputGraph) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult result =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, stableHash(kKernel));
+
+  // The same kernel with one semantic attribute changed. Node ids, ports and
+  // the placement's rule mnemonic all still resolve, so only a content hash can
+  // distinguish it.
+  Parsed changed = parseKernel(kKernel);
+  ASSERT_TRUE(changed.module);
+  changed.module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.vector")
+      op->setAttr("op", StringAttr::get(changed.context.get(), "mul"));
+  });
+  llvm::Expected<WorkloadGraph> changedGraph =
+      extractWorkloadGraph(changed.kernel);
+  ASSERT_TRUE(static_cast<bool>(changedGraph));
+
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, **target, *changedGraph);
+  ASSERT_FALSE(static_cast<bool>(replay));
+  EXPECT_NE(llvm::toString(replay.takeError()).find("graph"),
+            std::string::npos);
 }

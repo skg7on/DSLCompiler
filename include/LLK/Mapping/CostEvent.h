@@ -20,8 +20,10 @@
 
 #include "llvm/ADT/StringRef.h"
 
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace mlir::llk::mapping {
 
@@ -47,6 +49,62 @@ struct CostEvent {
   std::string resource;
   Cost cost;
 };
+
+/// One normalized event with the structural facts a scheduler needs: the
+/// category/resource/cycle triple, how many work items and bytes it accounts
+/// for, and the events it depends on. The mapping search emits these from a
+/// selected plan; the performance DAG emits them from a scheduled kernel
+/// (task B8), so both sides are directly comparable.
+struct PlanCostEvent {
+  CostEvent event;
+  /// MACs for a matrix event, elements otherwise -- the same convention
+  /// `MicroEvent::workItems` uses.
+  uint64_t workItems = 0;
+  uint64_t bytes = 0;
+  std::vector<uint32_t> deps;
+};
+
+/// The normalized event stream of one selected plan, in dependency order.
+struct PlanEventDAG {
+  std::vector<PlanCostEvent> events;
+};
+
+/// The single construction point both event paths use, so a plan event and its
+/// materialized counterpart cannot drift in category, resource, cycles, work,
+/// or bytes (task B8).
+PlanCostEvent makePlanCostEvent(CostEventKind kind, std::string resource,
+                                double latencyCycles, uint64_t workItems,
+                                uint64_t bytes,
+                                std::vector<uint32_t> deps = {});
+
+struct CoveringPlan;
+
+/// Builds the normalized event stream of a selected plan (task B8).
+///
+/// The plan must carry its execution structure -- the storage plan's step DAG
+/// and per-event byte/work facts -- so the events describe the same work the
+/// materialized kernel does: one compute event per placement, one transfer
+/// event per route hop (plus the wait the movement implies), one transform
+/// event per layout conversion, and one synchronization event per barrier. An
+/// unknown strict fact (a movement with no route, a transform with no maps, a
+/// gather with no declared semantics, a missing step DAG) is an error rather
+/// than a silently charged single iteration.
+llvm::Expected<PlanEventDAG>
+buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine);
+
+/// Schedules a normalized plan-event stream with the *same* resource scheduler
+/// the performance evaluator uses (task B8): events share a resource pool by
+/// resource name, deps are respected, and the returned `Cost` carries the
+/// overlapped critical-path latency plus the schedule's byte total. Defined in
+/// `lib/Mapping/EventSchedule.cpp`, the translation unit that owns the shared
+/// scheduler, so the plan score and the perf prediction cannot be two different
+/// schedules.
+///
+/// A plan event whose resource the machine does not model is scheduled on the
+/// machine's default pool for its kind rather than rejected: the schedule is a
+/// cost, and cost never decides legality.
+llvm::Expected<Cost> schedulePlanEvents(const PlanEventDAG &dag,
+                                        const machine::MachineModel &machine);
 
 } // namespace mlir::llk::mapping
 

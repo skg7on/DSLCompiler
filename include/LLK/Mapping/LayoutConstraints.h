@@ -213,6 +213,38 @@ solveLayout(const LayoutDef &def, const machine::MachineModel &machine,
             mlir::MLIRContext &context, const LayoutContext &layoutContext,
             const SolverLimits &limits = {});
 
+/// Re-validates a *recorded* solved layout assignment (design §18.3, phase 2).
+///
+/// Verification must confirm the assignment a plan persisted, never choose a
+/// different legal one. `def` is the target declaration the recorded layout
+/// class names; `recordedValues` is the parameter assignment the plan recorded,
+/// and `recordedMap` the affine map it recorded (null when it recorded none).
+/// `layoutContext` supplies the exact endpoint's rank and element type, so the
+/// layout is checked against the value it constrains rather than a graph-wide
+/// fact.
+///
+/// The assignment is validated as-is: a name the declaration does not have, a
+/// declared name left unrecorded, and a value outside its declared domain are
+/// each rejected before anything is pinned. Every declared domain is then
+/// pinned to the recorded singleton and `solveLayout` is asked to evaluate
+/// exactly that assignment -- every domain has one member, so the solver cannot
+/// substitute a different legal value. An error, an empty solution set, and an
+/// `undecided` solve are all violations; a caller must never accept a solution
+/// from an undecided solve. The affine map is rebuilt from the recorded
+/// parameters: a declaration with no map clause must record none, a recorded
+/// map must equal the rebuild, and a v1 binding that recorded no map has it
+/// rebuilt from the (now-confirmed complete and legal) assignment.
+///
+/// Returns a stable, `no_legal_layout`-coded error naming the first violation,
+/// or success. `where` is prepended to the message for context.
+llvm::Error
+verifySolvedLayout(const LayoutDef &def, const machine::MachineModel &machine,
+                   mlir::MLIRContext &context,
+                   const LayoutContext &layoutContext,
+                   const llvm::StringMap<LayoutValue> &recordedValues,
+                   mlir::AffineMap recordedMap, const SolverLimits &limits = {},
+                   llvm::StringRef where = {});
+
 } // namespace mlir::llk::mapping
 
 #endif // LLK_MAPPING_LAYOUTCONSTRAINTS_H

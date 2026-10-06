@@ -190,7 +190,7 @@ struct ComputeNode {
   /// Element types this capability accumulates into, when it distinguishes
   /// them from its inputs. Ranked by the checks that guard accumulator
   /// capacity and MMA compatibility.
-  std::vector<std::string> accumulatorDTypes;
+  std::vector<std::string> accumulatorDTypes{};
   /// Most work items that may reside on the capability at once, when the
   /// profile models a limit. This is the occupancy half of design §11.3's
   /// "concurrency and occupancy limits"; `concurrency` is the issue-slot half,

@@ -283,3 +283,157 @@ TEST(WorkloadGraph, CanonicalIdsIgnoreInsertionOrder) {
   EXPECT_EQ(findNodeByOp(forward, "micro.async_copy")->id,
             findNodeByOp(backward, "micro.async_copy")->id);
 }
+
+TEST(WorkloadGraph, EndpointIdentityDistinguishesRepeatedUses) {
+  PortRef lhs{7, PortDirection::Input, 0};
+  PortRef rhs{7, PortDirection::Input, 1};
+  EXPECT_NE(canonicalPortRefString(lhs), canonicalPortRefString(rhs));
+  EXPECT_EQ(canonicalPortRefString(lhs), "node=7,input=0");
+}
+
+TEST(WorkloadGraph, EndpointLookupDistinguishesRepeatedUses) {
+  Parsed parsed = parseKernel(kVector);
+  ASSERT_TRUE(parsed.module);
+  auto graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph));
+
+  const WorkloadNode *vector = findNodeByOp(*graph, "micro.vector");
+  ASSERT_NE(vector, nullptr);
+  ASSERT_EQ(vector->inputs.size(), 2u);
+
+  // Both operand uses carry the same SSA value, but they are distinct
+  // occurrences: the endpoint, not the value id, tells them apart.
+  const WorkloadPort *first =
+      lookupPort(*graph, PortRef{vector->id, PortDirection::Input, 0});
+  const WorkloadPort *second =
+      lookupPort(*graph, PortRef{vector->id, PortDirection::Input, 1});
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  EXPECT_NE(first, second);
+  EXPECT_EQ(first->value, second->value);
+  EXPECT_NE(canonicalPortRefString({vector->id, PortDirection::Input, 0}),
+            canonicalPortRefString({vector->id, PortDirection::Input, 1}));
+}
+
+TEST(WorkloadGraph, EndpointLookupRejectsInvalidReferences) {
+  Parsed parsed = parseKernel(kVector);
+  ASSERT_TRUE(parsed.module);
+  auto graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph));
+
+  const WorkloadNode *vector = findNodeByOp(*graph, "micro.vector");
+  ASSERT_NE(vector, nullptr);
+  ASSERT_EQ(vector->inputs.size(), 2u);
+  ASSERT_EQ(vector->outputs.size(), 1u);
+
+  // An unknown node, an input index past the node's ports, an output index past
+  // the node's ports, and a direction that is not one of the two ranks all
+  // resolve to nothing rather than inventing a port.
+  EXPECT_EQ(lookupPort(*graph, PortRef{9999, PortDirection::Input, 0}),
+            nullptr);
+  EXPECT_EQ(lookupPort(*graph, PortRef{vector->id, PortDirection::Input, 2}),
+            nullptr);
+  EXPECT_EQ(lookupPort(*graph, PortRef{vector->id, PortDirection::Output, 1}),
+            nullptr);
+  EXPECT_EQ(
+      lookupPort(*graph, PortRef{vector->id, static_cast<PortDirection>(7), 0}),
+      nullptr);
+}
+
+TEST(WorkloadGraph, EndpointLookupResolvesExternalSource) {
+  Parsed parsed = parseKernel(kVector);
+  ASSERT_TRUE(parsed.module);
+  auto graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph));
+
+  const WorkloadNode *copy = findNodeByOp(*graph, "micro.async_copy");
+  ASSERT_NE(copy, nullptr);
+  ASSERT_EQ(copy->inputs.size(), 1u);
+
+  // The copy reads the external `tensor.empty`; its endpoint resolves, and the
+  // value it carries stays marked external.
+  const WorkloadPort *port =
+      lookupPort(*graph, PortRef{copy->id, PortDirection::Input, 0});
+  ASSERT_NE(port, nullptr);
+  const WorkloadValue *value = graph->findValue(port->value);
+  ASSERT_NE(value, nullptr);
+  EXPECT_TRUE(value->external);
+}
+
+TEST(WorkloadGraph, ReversedInsertionKeepsEndpointValueRelationships) {
+  MLIRContext context;
+  context.getOrLoadDialect<micro::MicroDialect>();
+  Type f32 = Float32Type::get(&context);
+
+  // One producer whose result feeds both operand ports of one consumer. The
+  // node ids differ before finalization, so endpoints must be resolved after.
+  auto build = [&](bool reverse) -> WorkloadGraph {
+    WorkloadGraph graph;
+    WorkloadValueId source =
+        graph.addValue(WorkloadValue{0, f32, "src", /*external=*/true});
+    WorkloadValueId tile =
+        graph.addValue(WorkloadValue{0, f32, "tile", /*external=*/false});
+    WorkloadValueId result =
+        graph.addValue(WorkloadValue{0, f32, "result", /*external=*/false});
+
+    WorkloadNode copy;
+    copy.opName = "micro.async_copy";
+    copy.inputs.push_back(WorkloadPort{source, f32, std::nullopt});
+    copy.outputs.push_back(WorkloadPort{tile, f32, std::nullopt});
+
+    WorkloadNode vector;
+    vector.opName = "micro.vector";
+    vector.inputs.push_back(WorkloadPort{tile, f32, std::nullopt});
+    vector.inputs.push_back(WorkloadPort{tile, f32, std::nullopt});
+    vector.outputs.push_back(WorkloadPort{result, f32, std::nullopt});
+
+    if (!reverse) {
+      graph.addNode(std::move(copy));
+      graph.addNode(std::move(vector));
+    } else {
+      graph.addNode(std::move(vector));
+      graph.addNode(std::move(copy));
+    }
+    graph.finalize();
+    return graph;
+  };
+
+  WorkloadGraph forward = build(/*reverse=*/false);
+  WorkloadGraph backward = build(/*reverse=*/true);
+  EXPECT_EQ(forward.canonicalString(), backward.canonicalString());
+
+  const WorkloadNode *forwardProducer =
+      findNodeByOp(forward, "micro.async_copy");
+  const WorkloadNode *forwardConsumer = findNodeByOp(forward, "micro.vector");
+  const WorkloadNode *backwardProducer =
+      findNodeByOp(backward, "micro.async_copy");
+  const WorkloadNode *backwardConsumer = findNodeByOp(backward, "micro.vector");
+  ASSERT_NE(forwardProducer, nullptr);
+  ASSERT_NE(forwardConsumer, nullptr);
+  ASSERT_NE(backwardProducer, nullptr);
+  ASSERT_NE(backwardConsumer, nullptr);
+
+  // The producer's output endpoint and both consumer input endpoints agree on
+  // the value they carry, and that relationship is identical after finalizing
+  // either insertion order.
+  auto resolve = [&](const WorkloadGraph &graph, WorkloadNodeId node,
+                     PortDirection direction, uint32_t index) {
+    const WorkloadPort *port =
+        lookupPort(graph, PortRef{node, direction, index});
+    EXPECT_NE(port, nullptr);
+    return port ? port->value : WorkloadValueId(-1);
+  };
+
+  WorkloadValueId forwardProducerValue =
+      resolve(forward, forwardProducer->id, PortDirection::Output, 0);
+  for (uint32_t index = 0; index < 2; ++index)
+    EXPECT_EQ(
+        resolve(forward, forwardConsumer->id, PortDirection::Input, index),
+        forwardProducerValue);
+  EXPECT_EQ(resolve(backward, backwardProducer->id, PortDirection::Output, 0),
+            forwardProducerValue);
+  for (uint32_t index = 0; index < 2; ++index)
+    EXPECT_EQ(
+        resolve(backward, backwardConsumer->id, PortDirection::Input, index),
+        forwardProducerValue);
+}

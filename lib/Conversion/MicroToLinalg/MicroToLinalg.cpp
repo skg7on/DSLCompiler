@@ -50,6 +50,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -206,8 +207,11 @@ struct TileAllocOpLowering : OpConversionPattern<micro::TileAllocOp> {
 };
 
 /// A logical view allocates nothing: it is the source value, when it covers the
-/// whole source. A windowed view needs `tensor.extract_slice`, which is a later
-/// slice -- it fails loudly rather than silently reading the wrong elements.
+/// whole source. Covering the whole source means both an equal shape *and* no
+/// window: an offset that is not provably a constant zero starts the view
+/// somewhere else, so replacing it with the source would silently read the
+/// wrong elements. A windowed view needs `tensor.extract_slice`, which is a
+/// later slice -- it fails loudly rather than quietly dropping the offsets.
 struct TileViewOpLowering : OpConversionPattern<micro::TileViewOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
@@ -222,6 +226,17 @@ struct TileViewOpLowering : OpConversionPattern<micro::TileViewOp> {
       return rewriter.notifyMatchFailure(
           op, "a windowed micro.tile_view needs slice lowering, which is not "
               "implemented yet");
+    // Equal shapes are not enough: the view must also start at the origin.
+    // Identity is only provable when every supplied offset is a constant zero.
+    // An offset the pattern cannot fold -- and a nonzero constant -- cannot
+    // prove that, so it fails the match rather than being assumed zero.
+    for (Value offset : adaptor.getOffsets()) {
+      std::optional<int64_t> constant = getConstantIntValue(offset);
+      if (!constant || *constant != 0)
+        return rewriter.notifyMatchFailure(
+            op, "a micro.tile_view with a nonzero or dynamic offset needs "
+                "slice lowering, which is not implemented yet");
+    }
     rewriter.replaceOp(op, adaptor.getSource());
     return success();
   }

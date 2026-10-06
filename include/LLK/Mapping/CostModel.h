@@ -16,6 +16,9 @@
 #ifndef LLK_MAPPING_COSTMODEL_H
 #define LLK_MAPPING_COSTMODEL_H
 
+#include "mlir/IR/AffineMap.h"
+#include "mlir/IR/Types.h"
+
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -27,6 +30,7 @@
 
 namespace mlir::llk::machine {
 struct MachineModel;
+struct ComputeNode;
 } // namespace mlir::llk::machine
 
 namespace mlir::llk::mapping {
@@ -182,6 +186,61 @@ objectiveOrderFromMicro(llvm::StringRef metric, bool minimize,
 /// Fixed-format rendering of every dimension, byte-stable across runs and
 /// platforms so it can key hashes and reports.
 std::string canonicalCostString(const Cost &cost);
+
+/// The machine spelling of an element type (`f32`, `bf16`, `i8`), or empty when
+/// the type has no width a transform could move. The single shared rendering,
+/// so the planner, the performance DAG and the transform estimate all name a
+/// dtype the same way (task B8 folds A9's deferred DRY).
+std::string elementTypeName(mlir::Type type);
+
+/// Bytes of one element, or nullopt for an element type with no width. The
+/// companion of `elementTypeName`, shared for the same reason.
+std::optional<unsigned> elementByteWidth(mlir::Type type);
+
+/// The issue cycles one elementwise pass over `elements` takes on `engine`:
+/// `ceil(elements / lanes[dtype]) x issueCycles`, with a one-element-per-issue
+/// fallback for a dtype the engine does not declare -- slower than the
+/// hardware, never faster. The one formula both the performance DAG and the
+/// normalized plan events charge an elementwise (vector or reduce) event, so
+/// the two cannot drift.
+uint64_t elementwiseCycles(const machine::ComputeNode &engine,
+                           llvm::StringRef dtype, uint64_t elements);
+
+/// The static facts one layout conversion is costed from: the value's type on
+/// each side, the logical-to-physical affine map of the layout on each side,
+/// the memory the conversion runs in, and the compute capability selected for
+/// it. `srcMap`/`dstMap` are null when the corresponding layout declares no map
+/// clause.
+struct TransformCostInput {
+  mlir::Type inputType;
+  mlir::Type outputType;
+  mlir::AffineMap srcMap;
+  mlir::AffineMap dstMap;
+  std::string memoryNode;
+  std::string computeResource;
+};
+
+/// Estimates one layout conversion from checked static facts and the machine's
+/// capabilities (design §17.2), so the planner and the performance DAG charge a
+/// `micro.transform` from one shared estimate rather than two. Bytes and issue
+/// cycles are read off the value's type and the selected capability -- never
+/// from a constant in this file.
+///
+/// Fails, rather than returning a silent zero, when the footprint cannot be
+/// computed (a non-shaped or dynamic value, or an element type with no width)
+/// or when a named compute resource or memory node is not modeled by `machine`.
+/// A present and equal source/destination map pair is an explicit identity
+/// re-representation: it is modeled as zero *arithmetic* while still
+/// materializing its output bytes. Every other conversion is charged the
+/// capability's issue cost.
+/// First declared vector capability that can access the transform memory.
+llvm::Expected<std::string>
+selectTransformResource(const machine::MachineModel &,
+                        llvm::StringRef memoryNode);
+
+llvm::Expected<Cost>
+estimateTransformCost(const TransformCostInput &input,
+                      const machine::MachineModel &machine);
 
 } // namespace mlir::llk::mapping
 

@@ -93,10 +93,17 @@ struct RulePort {
 };
 
 /// An abstract capability requirement: role is `executor`, `compute`, or
-/// `memory`, and `kind` is the abstract kind a placement must satisfy.
+/// `memory`, and `kind` is the abstract kind a placement must satisfy. A
+/// `memory` requirement may additionally name the rule port it governs
+/// (`require memory output "large" kind dram`); the port is resolved through
+/// the rule's declared `RulePort`s and then to the matched node's occurrence.
+/// `executor` and `compute` requirements never name a port.
 struct KindRequirement {
   std::string role;
   std::string kind;
+  /// The rule port this requirement governs, when the clause named one. Unset
+  /// for the legacy bare form, which governs the requirement kind as a whole.
+  std::optional<RulePort> port;
 };
 
 /// A layout the value on `port` must satisfy, named by layout id.
@@ -184,6 +191,60 @@ bool predicateMatches(const RulePredicate &predicate, const WorkloadNode &node);
 std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
                                         const RuleRegistry &rules);
 
+//===----------------------------------------------------------------------===//
+// Re-verifying a recorded selection (design §18.3, phase 2)
+//===----------------------------------------------------------------------===//
+
+/// The resource bindings a mapped operation records for its selected rule: the
+/// executor its work is placed on, the memory id bound per rule memory-kind
+/// requirement, and -- from schema v2 onward -- the resolved values of the
+/// rule's declared parameters. Verification re-checks these against the machine
+/// and the operation; it never chooses a different legal binding.
+struct RecordedRuleSelection {
+  std::string executor;
+  /// Memory id per required memory kind, keyed exactly as generation binds it
+  /// (`instance.memoryBindings[requirement.kind]`). A requirement that named a
+  /// port records into `portMemories` instead, because a kind-keyed map cannot
+  /// tell two same-kind requirements apart.
+  llvm::StringMap<std::string> memories;
+  /// The port to memory id assignment of every requirement that named a port,
+  /// as generation records it (`instance.portMemoryBindings`). A named
+  /// requirement is re-checked against *this*, never the kind-keyed map.
+  std::vector<PortMemoryBinding> portMemories;
+  /// The resolved parameter assignment, when the binding records one. Empty for
+  /// a binding that predates parameter persistence: verification then falls
+  /// back to generation's existential requirement check (some assignment
+  /// satisfies every constraint), because the plan did not state *which* one.
+  llvm::StringMap<SearchValue> parameters;
+};
+
+/// Re-validates that `rule` still legally implements `node` under the recorded
+/// `selection`, using exactly the semantics generation applied: the same match
+/// operation and predicate evaluation (`predicateMatches`), the same parameter
+/// domains and `require` expressions, and the same machine-capability tests
+/// placement runs (executor kind, attached compute kind, memory kind and
+/// visibility). A recorded parameter assignment is validated as-is -- unknown
+/// names, values outside their declared domain, omitted required names, and
+/// constraints the recorded values do not satisfy are all violations -- so
+/// verification never substitutes a different legal assignment for the recorded
+/// one. `where` is prepended to the message for context.
+///
+/// Returns a stable, diagnostic-coded error naming the first violation, or
+/// success.
+llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
+                                const machine::MachineModel &machine,
+                                const RecordedRuleSelection &selection,
+                                llvm::StringRef where);
+
+/// True when `rule`'s `require` constraints reference at least one of its own
+/// declared parameters, so a recorded assignment cannot legitimately be empty
+/// (the derivation must be recorded, since verification cannot reconstruct the
+/// value the plan used). A rule whose constraints reference no declared
+/// parameter may record an empty assignment and fall back to generation's
+/// existential check. Used to keep a schema-v2 binding with an empty recorded
+/// assignment from silently downgrading to that fallback.
+bool ruleDerivesParameters(const RuleDef &rule);
+
 /// Bridges a matched rule onto the workload node it covers: the result is the
 /// unplaced `MappingCandidate` the placement engine consumes. Rule ports are
 /// wired positionally to the node's inputs and then its outputs.
@@ -235,13 +296,24 @@ std::vector<const RuleDef *> matchRules(const WorkloadNode &node,
 /// make every movement/reduce rule -- which the shipped rule files leave
 /// layout-agnostic -- unmappable under any bound layout. A null `boundLayout`
 /// leaves layout selection byte-identical to the pre-binding behaviour.
+///
+/// `boundAxes` carries the binding's `owner_mapping`/`memory_path` axes, which
+/// the caller resolved by parameter *kind* (only it can see the search space).
+/// They are projected onto explicit executor/compute/memory requirements -- a
+/// rule the axis contradicts, or an axis the machine does not model, is a
+/// non-match with a reason, never a silent drop. When an axis is unset the
+/// caller's `pinned` values are consulted for the conventional exported name as
+/// a fallback, so a name-keyed binding still projects; a null `boundAxes` with
+/// no such name leaves both axes unprojected, byte-identical to the
+/// pre-binding behaviour.
 std::optional<MappingCandidate>
 toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
                    const machine::MachineModel &machine,
                    const LayoutContext &context, std::string *reason = nullptr,
                    bool *truncated = nullptr,
                    const llvm::StringMap<SearchValue> *pinned = nullptr,
-                   const llvm::StringMap<std::string> *boundLayouts = nullptr);
+                   const llvm::StringMap<std::string> *boundLayouts = nullptr,
+                   const BoundAxes *boundAxes = nullptr);
 
 } // namespace mlir::llk::mapping
 

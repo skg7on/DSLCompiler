@@ -129,6 +129,76 @@ bool isMasked(const SearchSpace &space, const Candidate &candidate) {
   return policy && *policy == "mask";
 }
 
+/// The shapes a dtype/shape-dependent rule must evaluate: every contraction the
+/// kernel performs, or -- when it performs none -- the original workload. Empty
+/// when neither fact is available, which the caller reports as unevaluable.
+llvm::SmallVector<const WorkloadShape *>
+applicableShapes(const BindingFacts &facts) {
+  llvm::SmallVector<const WorkloadShape *> shapes;
+  if (!facts.contractions.empty()) {
+    for (const WorkloadShape &contraction : facts.contractions)
+      shapes.push_back(&contraction);
+    return shapes;
+  }
+  if (facts.originalWorkload)
+    shapes.push_back(&*facts.originalWorkload);
+  return shapes;
+}
+
+/// The shape whose element type a dtype-only rule reads: the original workload
+/// when the export recorded one, otherwise the first contraction. Null when
+/// the kernel supplies no dtype-bearing fact at all.
+const WorkloadShape *dtypeShape(const BindingFacts &facts) {
+  if (facts.originalWorkload)
+    return &*facts.originalWorkload;
+  if (!facts.contractions.empty())
+    return &facts.contractions.front();
+  return nullptr;
+}
+
+/// Resolves the symbolic parameters a constraint references against `kind`,
+/// appending each to `out` in declaration order. A reference that names neither
+/// a declared parameter nor a declared role of that kind is unresolved; a
+/// reference to a parameter of a different kind is a kind mismatch. Both are
+/// returned as an error string rather than silently skipped, because "the
+/// space declares no layout choice to check" and "the constraint names a role
+/// nothing declares" must not answer the same way. A role declared by more than
+/// one parameter of `kind` is likewise rejected: which one governs that role is
+/// then unanswerable.
+std::optional<std::string>
+resolveReferencedParams(const SearchSpace &space,
+                        const SearchConstraint &constraint, StringRef kind,
+                        llvm::SmallVectorImpl<const SearchParam *> &out) {
+  llvm::StringSet<> declaredRoles;
+  for (const SearchParam &param : space.params) {
+    if (param.kind != kind || param.role.empty())
+      continue;
+    if (!declaredRoles.insert(param.role).second)
+      return std::string("more than one ") + kind.str() +
+             " parameter declares role '" + param.role + "'";
+  }
+
+  for (const std::string &name : constraint.params) {
+    const SearchParam *param = space.findParam(name);
+    if (!param) {
+      // A reference may name the role rather than the parameter itself.
+      for (const SearchParam &candidateParam : space.params)
+        if (candidateParam.kind == kind && candidateParam.role == name) {
+          param = &candidateParam;
+          break;
+        }
+    }
+    if (!param)
+      return std::string("references '") + name +
+             "', which the space does not declare";
+    if (param->kind != kind)
+      return std::string("references '") + name + "', which is not a " +
+             kind.str() + " parameter";
+    out.push_back(param);
+  }
+  return std::nullopt;
+}
+
 /// Reads required integer parameters, remembering the first that is missing so
 /// a rule can report it instead of dividing by zero.
 struct IntResolver {
@@ -207,7 +277,7 @@ bool nestedUnder(const machine::MachineModel &machine, StringRef inner,
 
 LegalityResult checkSramCapacity(const SearchSpace &space,
                                  const Candidate &candidate,
-                                 const WorkloadShape &shape,
+                                 const BindingFacts &facts,
                                  const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::SramCapacity;
   const machine::MemoryNode *sram = machine.findMemoryOfKind("sram");
@@ -222,29 +292,37 @@ LegalityResult checkSramCapacity(const SearchSpace &space,
   if (!resolver.error.empty())
     return illegal(kind, resolver.error);
 
-  std::optional<uint64_t> tileBytes =
-      stagedTileBytes(space, shape, *BM, *BN, *BK);
-  if (!tileBytes)
-    return illegal(kind, "input or weight dtype is not a micro dtype");
+  llvm::SmallVector<const WorkloadShape *> shapes = applicableShapes(facts);
+  if (shapes.empty())
+    return illegal(kind, "cannot be evaluated: the kernel supplies no workload "
+                         "shape (no micro.mma and no original-workload "
+                         "provenance)");
 
-  // A multi-stage pipeline double-buffers the staged tiles.
-  int64_t stages =
-      std::max<int64_t>(1, candidate.integer("pipeline_stages").value_or(1));
-  uint64_t factor = stages > 1 ? 2 : 1;
-  uint64_t required = factor * *tileBytes;
   uint64_t limit =
       static_cast<uint64_t>(sram->capacityBytes * kSramUtilizationLimit);
-  if (required > limit)
-    return illegal(kind, "requires " + llvm::Twine(required) +
-                             " bytes but sram holds " +
-                             llvm::Twine(sram->capacityBytes) +
-                             " bytes (limit " + llvm::Twine(limit) + ")");
+  for (const WorkloadShape *shape : shapes) {
+    std::optional<uint64_t> tileBytes =
+        stagedTileBytes(space, *shape, *BM, *BN, *BK);
+    if (!tileBytes)
+      return illegal(kind, "input or weight dtype is not a micro dtype");
+
+    // A multi-stage pipeline double-buffers the staged tiles.
+    int64_t stages =
+        std::max<int64_t>(1, candidate.integer("pipeline_stages").value_or(1));
+    uint64_t factor = stages > 1 ? 2 : 1;
+    uint64_t required = factor * *tileBytes;
+    if (required > limit)
+      return illegal(kind, "requires " + llvm::Twine(required) +
+                               " bytes but sram holds " +
+                               llvm::Twine(sram->capacityBytes) +
+                               " bytes (limit " + llvm::Twine(limit) + ")");
+  }
   return legal();
 }
 
 LegalityResult checkAccCapacity(const SearchSpace &space,
                                 const Candidate &candidate,
-                                const WorkloadShape &shape,
+                                const BindingFacts &facts,
                                 const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::AccCapacity;
   const machine::MemoryNode *acc = machine.findMemoryOfKind("acc");
@@ -252,85 +330,113 @@ LegalityResult checkAccCapacity(const SearchSpace &space,
     return illegal(kind, "machine '" + machine.target +
                              "' does not model memory 'acc'");
 
-  std::optional<int64_t> accBytes = dtypeBytes(shape.accumulatorDType);
-  if (!accBytes)
-    return illegal(kind, "accumulator dtype '" + shape.accumulatorDType +
-                             "' is not a micro dtype");
-
   IntResolver resolver{candidate, {}};
   std::optional<int64_t> BM = resolver.get("BM");
   std::optional<int64_t> BN = resolver.get("BN");
   if (!resolver.error.empty())
     return illegal(kind, resolver.error);
 
-  // Every accumulator the workload keeps live must fit at once.
-  uint64_t required =
-      uint64_t(accumulatorCount(space.workload)) * *BM * *BN * *accBytes;
-  if (required > acc->capacityBytes)
-    return illegal(kind, "requires " + llvm::Twine(required) +
-                             " bytes but acc holds " +
-                             llvm::Twine(acc->capacityBytes) + " bytes");
+  llvm::SmallVector<const WorkloadShape *> shapes = applicableShapes(facts);
+  if (shapes.empty())
+    return illegal(kind, "cannot be evaluated: the kernel supplies no workload "
+                         "shape (no micro.mma and no original-workload "
+                         "provenance)");
+
+  for (const WorkloadShape *shape : shapes) {
+    std::optional<int64_t> accBytes = dtypeBytes(shape->accumulatorDType);
+    if (!accBytes)
+      return illegal(kind, "accumulator dtype '" + shape->accumulatorDType +
+                               "' is not a micro dtype");
+
+    // Every accumulator the workload keeps live must fit at once.
+    uint64_t required =
+        uint64_t(accumulatorCount(space.workload)) * *BM * *BN * *accBytes;
+    if (required > acc->capacityBytes)
+      return illegal(kind, "requires " + llvm::Twine(required) +
+                               " bytes but acc holds " +
+                               llvm::Twine(acc->capacityBytes) + " bytes");
+  }
   return legal();
+}
+
+/// Reports that `engine` cannot run `shape`; shared by each contraction so the
+/// diagnostic names the *first* offending dtype pair.
+LegalityResult mmaUnsupported(const machine::ComputeNode &engine,
+                              const WorkloadShape &shape) {
+  ConstraintKind kind = ConstraintKind::MmaCompatible;
+  if (!llvm::is_contained(engine.elementTypes, shape.inputDType))
+    return illegal(kind, "engine '" + engine.id +
+                             "' does not support input dtype '" +
+                             shape.inputDType + "' (supported: " +
+                             llvm::join(engine.elementTypes, ", ") + ")");
+  return illegal(kind, "no matrix engine supports accumulator dtype '" +
+                           shape.accumulatorDType + "' (engine '" + engine.id +
+                           "' supports: " +
+                           llvm::join(engine.accumulatorDTypes, ", ") + ")");
 }
 
 LegalityResult checkMmaCompatible(const SearchSpace &space,
                                   const Candidate &candidate,
-                                  const WorkloadShape &shape,
+                                  const BindingFacts &facts,
                                   const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::MmaCompatible;
   if (machine.computesOfKind("matrix_engine").empty())
     return illegal(kind, "machine '" + machine.target +
                              "' declares no matrix engine");
 
-  // Any engine that accepts the dtype pair can run the contraction; the first
-  // matching one is used, so a machine is not rejected because its *first*
-  // engine happens to have a different dtype mix.
-  const machine::ComputeNode *engine = nullptr;
-  for (const machine::ComputeNode *candidateEngine :
-       machine.computesOfKind("matrix_engine"))
-    if (llvm::is_contained(candidateEngine->elementTypes, shape.inputDType) &&
-        llvm::is_contained(candidateEngine->accumulatorDTypes,
-                           shape.accumulatorDType)) {
-      engine = candidateEngine;
-      break;
-    }
-  if (!engine) {
-    const machine::ComputeNode *first =
-        machine.computesOfKind("matrix_engine").front();
-    if (!llvm::is_contained(first->elementTypes, shape.inputDType))
-      return illegal(kind, "engine '" + first->id +
-                               "' does not support input dtype '" +
-                               shape.inputDType + "' (supported: " +
-                               llvm::join(first->elementTypes, ", ") + ")");
-    return illegal(kind, "no matrix engine supports accumulator dtype '" +
-                             shape.accumulatorDType + "' (engine '" +
-                             first->id + "' supports: " +
-                             llvm::join(first->accumulatorDTypes, ", ") + ")");
+  // Every contraction the kernel performs must be runnable, not merely the
+  // first: a second `micro.mma` with an unsupported dtype pair is a rejection.
+  llvm::SmallVector<const WorkloadShape *> shapes = applicableShapes(facts);
+  if (shapes.empty())
+    return illegal(kind, "cannot be evaluated: the kernel performs no "
+                         "contraction (micro.mma) to check");
+
+  bool masked = isMasked(space, candidate);
+  IntResolver resolver{candidate, {}};
+  std::optional<int64_t> BM;
+  std::optional<int64_t> BN;
+  std::optional<int64_t> BK;
+  if (!masked) {
+    BM = resolver.get("BM");
+    BN = resolver.get("BN");
+    BK = resolver.get("BK");
+    if (!resolver.error.empty())
+      return illegal(kind, resolver.error);
   }
 
-  if (isMasked(space, candidate))
-    return legal();
+  for (const WorkloadShape *shape : shapes) {
+    // Any engine that accepts the dtype pair can run this contraction; the
+    // first matching one is used, so a machine is not rejected because its
+    // *first* engine happens to have a different dtype mix.
+    const machine::ComputeNode *engine = nullptr;
+    for (const machine::ComputeNode *candidateEngine :
+         machine.computesOfKind("matrix_engine"))
+      if (llvm::is_contained(candidateEngine->elementTypes,
+                             shape->inputDType) &&
+          llvm::is_contained(candidateEngine->accumulatorDTypes,
+                             shape->accumulatorDType)) {
+        engine = candidateEngine;
+        break;
+      }
+    if (!engine)
+      return mmaUnsupported(*machine.computesOfKind("matrix_engine").front(),
+                            *shape);
+    if (masked)
+      continue;
 
-  IntResolver resolver{candidate, {}};
-  std::optional<int64_t> BM = resolver.get("BM");
-  std::optional<int64_t> BN = resolver.get("BN");
-  std::optional<int64_t> BK = resolver.get("BK");
-  if (!resolver.error.empty())
-    return illegal(kind, resolver.error);
-
-  const std::vector<int64_t> &fragment = largestTileShape(*engine);
-  if (*BM % fragment[0] != 0 || *BN % fragment[1] != 0 ||
-      *BK % fragment[2] != 0)
-    return illegal(kind, "tile " + tripleText({*BM, *BN, *BK}) +
-                             " is not a multiple of engine '" + engine->id +
-                             "' fragment " + tripleText(fragment) +
-                             " and tail_policy is not 'mask'");
+    const std::vector<int64_t> &fragment = largestTileShape(*engine);
+    if (*BM % fragment[0] != 0 || *BN % fragment[1] != 0 ||
+        *BK % fragment[2] != 0)
+      return illegal(kind, "tile " + tripleText({*BM, *BN, *BK}) +
+                               " is not a multiple of engine '" + engine->id +
+                               "' fragment " + tripleText(fragment) +
+                               " and tail_policy is not 'mask'");
+  }
   return legal();
 }
 
 LegalityResult checkMappingExtent(const SearchSpace &,
                                   const Candidate &candidate,
-                                  const WorkloadShape &,
                                   const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::MappingExtent;
   std::optional<int64_t> threads = candidate.integer("num_threads");
@@ -340,6 +446,8 @@ LegalityResult checkMappingExtent(const SearchSpace &,
     return illegal(kind, "num_threads must be positive");
   // The spec's second condition -- the spatial map's worker extent -- is not a
   // search parameter in the current export, so only the thread count is bound.
+  // Nothing here needs a workload shape, which is why a vector-only kernel can
+  // satisfy a mapping_extent constraint.
   if (uint64_t(*threads) > machine.workerThreads)
     return illegal(kind, "num_threads " + llvm::Twine(*threads) +
                              " exceeds machine '" + machine.target +
@@ -350,11 +458,20 @@ LegalityResult checkMappingExtent(const SearchSpace &,
 
 LegalityResult checkTailSupported(const SearchSpace &space,
                                   const Candidate &candidate,
-                                  const WorkloadShape &shape,
+                                  const BindingFacts &facts,
                                   const machine::MachineModel &) {
   ConstraintKind kind = ConstraintKind::TailSupported;
   if (isMasked(space, candidate))
     return legal();
+
+  // Divisibility is a whole-workload question, so it reads the original
+  // dimensions the export recorded before tiling -- never a contraction's
+  // instruction-fragment shape.
+  if (!facts.originalWorkload)
+    return illegal(kind, "cannot be evaluated: the kernel supplies no original "
+                         "workload dimensions (no original-workload "
+                         "provenance)");
+  const WorkloadShape &shape = *facts.originalWorkload;
 
   IntResolver resolver{candidate, {}};
   std::optional<int64_t> BM = resolver.get("BM");
@@ -373,7 +490,7 @@ LegalityResult checkTailSupported(const SearchSpace &space,
 
 LegalityResult checkVectorWidthSupported(const SearchSpace &,
                                          const Candidate &candidate,
-                                         const WorkloadShape &shape,
+                                         const BindingFacts &facts,
                                          const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::VectorWidthSupported;
   std::optional<int64_t> width = candidate.integer("vector_width");
@@ -381,6 +498,14 @@ LegalityResult checkVectorWidthSupported(const SearchSpace &,
     return illegal(kind, "candidate does not bind parameter 'vector_width'");
   if (*width < 1)
     return illegal(kind, "vector_width must be positive");
+
+  // The check is about the element type the engine must vectorize, so it needs
+  // a dtype-bearing fact but no contraction per se.
+  const WorkloadShape *shape = dtypeShape(facts);
+  if (!shape)
+    return illegal(kind, "cannot be evaluated: the kernel supplies no input "
+                         "dtype (no original-workload provenance and no "
+                         "micro.mma)");
 
   if (machine.computesOfKind("vector_engine").empty())
     return illegal(kind, "machine '" + machine.target +
@@ -390,7 +515,7 @@ LegalityResult checkVectorWidthSupported(const SearchSpace &,
   int64_t lanes = 0;
   for (const machine::ComputeNode *engine :
        machine.computesOfKind("vector_engine")) {
-    auto it = engine->lanes.find(shape.inputDType);
+    auto it = engine->lanes.find(shape->inputDType);
     if (it != engine->lanes.end() && it->second > lanes) {
       lanes = it->second;
       best = engine;
@@ -398,23 +523,31 @@ LegalityResult checkVectorWidthSupported(const SearchSpace &,
   }
   if (!best)
     return illegal(kind, "no vector engine supports dtype '" +
-                             shape.inputDType + "'");
+                             shape->inputDType + "'");
   if (*width > lanes)
     return illegal(kind, "vector_width " + llvm::Twine(*width) +
                              " exceeds engine '" + best->id + "' lanes " +
                              llvm::Twine(lanes) + " for dtype '" +
-                             shape.inputDType + "'");
+                             shape->inputDType + "'");
   return legal();
 }
 
 LegalityResult checkLayoutSupported(const SearchSpace &space,
                                     const Candidate &candidate,
-                                    const WorkloadShape &,
+                                    const SearchConstraint &constraint,
                                     const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::LayoutSupported;
-  std::optional<StringRef> layout = symbolOfKind(space, candidate, "layout");
-  if (!layout)
-    return legal(); // the space declares no layout choice to check
+
+  // Evaluate every layout parameter the constraint references, by name or by
+  // declared role. A space that binds one layout per port must have each of
+  // them checked; resolving "the layout" by unique kind silently skipped a
+  // second parameter, treating ambiguity as absence.
+  llvm::SmallVector<const SearchParam *, 2> layouts;
+  if (std::optional<std::string> error =
+          resolveReferencedParams(space, constraint, "layout", layouts))
+    return illegal(kind, *error);
+  if (layouts.empty())
+    return legal();
 
   // The layout must be materializable somewhere in the target's memory system.
   // The source level (dram) is excluded because it holds caller-owned buffers
@@ -422,7 +555,8 @@ LegalityResult checkLayoutSupported(const SearchSpace &space,
   // accepts the layout is enough. The machine's per-level layout lists are
   // coarse, and a specific kernel's layout mismatches are reported by the
   // simulator as warnings, so this rule is deliberately a floor, not a
-  // per-tile verdict.
+  // per-tile verdict. `memory_path` is supporting context, not a referenced
+  // axis, so it is read best-effort.
   llvm::SmallVector<StringRef, 4> path;
   if (std::optional<StringRef> text =
           symbolOfKind(space, candidate, "memory_path"))
@@ -430,56 +564,96 @@ LegalityResult checkLayoutSupported(const SearchSpace &space,
   else
     path.push_back("sram");
 
-  bool sawModeledLevel = false;
-  for (StringRef level : path) {
-    if (level == "dram")
-      continue;
-    const machine::MemoryNode *model = machine.findMemoryOfKind(level);
-    if (!model)
-      continue;
-    sawModeledLevel = true;
-    if (llvm::is_contained(model->supportedLayouts, *layout))
-      return legal();
-  }
+  for (const SearchParam *param : layouts) {
+    std::optional<StringRef> layout = candidate.symbol(param->name);
+    if (!layout)
+      return illegal(kind,
+                     "candidate does not bind parameter '" + param->name + "'");
 
-  if (!sawModeledLevel)
-    return illegal(kind, "machine '" + machine.target +
-                             "' models no memory on the path '" +
-                             llvm::join(path, ":") + "'");
-  return illegal(kind, "no memory supports layout '" + *layout + "'");
+    bool supported = false;
+    bool sawModeledLevel = false;
+    for (StringRef level : path) {
+      if (level == "dram")
+        continue;
+      const machine::MemoryNode *model = machine.findMemoryOfKind(level);
+      if (!model)
+        continue;
+      sawModeledLevel = true;
+      if (llvm::is_contained(model->supportedLayouts, *layout)) {
+        supported = true;
+        break;
+      }
+    }
+
+    // Name the referenced parameter (and role) when the constraint governs
+    // more than one layout, so the rejection says which port failed.
+    std::string where;
+    if (layouts.size() > 1 || !param->role.empty()) {
+      std::string label = param->role.empty() ? param->name : param->role;
+      where = "(role '" + label + "') ";
+    }
+    if (!supported) {
+      if (!sawModeledLevel)
+        return illegal(kind, where + "machine '" + machine.target +
+                                 "' models no memory on the path '" +
+                                 llvm::join(path, ":") + "'");
+      return illegal(kind,
+                     where + "no memory supports layout '" + *layout + "'");
+    }
+  }
+  return legal();
 }
 
 LegalityResult checkOwnerSupported(const SearchSpace &space,
                                    const Candidate &candidate,
-                                   const WorkloadShape &,
+                                   const SearchConstraint &constraint,
                                    const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::OwnerSupported;
-  std::optional<StringRef> mapping =
-      symbolOfKind(space, candidate, "owner_mapping");
-  if (!mapping)
+
+  // As with layouts, evaluate each referenced owner_mapping parameter so a
+  // multi-role declaration is checked in full rather than skipped.
+  llvm::SmallVector<const SearchParam *, 2> mappings;
+  if (std::optional<std::string> error =
+          resolveReferencedParams(space, constraint, "owner_mapping", mappings))
+    return illegal(kind, *error);
+  if (mappings.empty())
     return legal();
 
-  llvm::SmallVector<StringRef, 4> owners;
-  mapping->split(owners, '/');
-  if (owners.empty())
-    return illegal(kind, "owner_mapping is empty");
+  for (const SearchParam *param : mappings) {
+    std::optional<StringRef> mapping = candidate.symbol(param->name);
+    if (!mapping)
+      return illegal(kind,
+                     "candidate does not bind parameter '" + param->name + "'");
 
-  for (StringRef owner : owners)
-    if (!machine.hasOwnerKind(owner))
-      return illegal(kind, "owner '" + owner + "' is not modeled by machine '" +
-                               machine.target + "'");
+    std::string where;
+    if (mappings.size() > 1 || !param->role.empty()) {
+      std::string label = param->role.empty() ? param->name : param->role;
+      where = "(role '" + label + "') ";
+    }
 
-  // Outer comes first: each owner must sit inside the one to its left.
-  for (size_t i = 1; i < owners.size(); ++i)
-    if (!nestedUnder(machine, owners[i], owners[i - 1]))
-      return illegal(kind, "owner '" + owners[i] + "' is not nested under '" +
-                               owners[i - 1] + "'");
+    llvm::SmallVector<StringRef, 4> owners;
+    mapping->split(owners, '/');
+    if (owners.empty())
+      return illegal(kind, where + "owner_mapping is empty");
+
+    for (StringRef owner : owners)
+      if (!machine.hasOwnerKind(owner))
+        return illegal(kind, where + "owner '" + owner +
+                                 "' is not modeled by machine '" +
+                                 machine.target + "'");
+
+    // Outer comes first: each owner must sit inside the one to its left.
+    for (size_t i = 1; i < owners.size(); ++i)
+      if (!nestedUnder(machine, owners[i], owners[i - 1]))
+        return illegal(kind, where + "owner '" + owners[i] +
+                                 "' is not nested under '" + owners[i - 1] +
+                                 "'");
+  }
   return legal();
 }
 
 LegalityResult checkFragmentCompatible(const SearchSpace &space,
                                        const Candidate &candidate,
-                                       const WorkloadShape &,
                                        const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::FragmentCompatible;
   std::optional<StringRef> text =
@@ -525,7 +699,6 @@ LegalityResult checkFragmentCompatible(const SearchSpace &space,
 
 LegalityResult checkTileHierarchyCompatible(const SearchSpace &space,
                                             const Candidate &candidate,
-                                            const WorkloadShape &,
                                             const machine::MachineModel &) {
   ConstraintKind kind = ConstraintKind::TileHierarchyCompatible;
   std::optional<StringRef> text =
@@ -557,7 +730,7 @@ LegalityResult checkTileHierarchyCompatible(const SearchSpace &space,
 
 LegalityResult checkPipelineLiveTiles(const SearchSpace &space,
                                       const Candidate &candidate,
-                                      const WorkloadShape &shape,
+                                      const BindingFacts &facts,
                                       const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::PipelineLiveTiles;
   const machine::MemoryNode *sram = machine.findMemoryOfKind("sram");
@@ -587,19 +760,27 @@ LegalityResult checkPipelineLiveTiles(const SearchSpace &space,
   if (!resolver.error.empty())
     return illegal(kind, resolver.error);
 
-  std::optional<uint64_t> tileBytes =
-      stagedTileBytes(space, shape, *BM, *BN, *BK);
-  if (!tileBytes)
-    return illegal(kind, "input or weight dtype is not a micro dtype");
+  llvm::SmallVector<const WorkloadShape *> shapes = applicableShapes(facts);
+  if (shapes.empty())
+    return illegal(kind, "cannot be evaluated: the kernel supplies no workload "
+                         "shape (no micro.mma and no original-workload "
+                         "provenance)");
 
-  uint64_t live = static_cast<uint64_t>(stages) * *tileBytes;
   uint64_t limit =
       static_cast<uint64_t>(sram->capacityBytes * kSramUtilizationLimit);
-  if (live > limit)
-    return illegal(kind, "requires " + llvm::Twine(live) +
-                             " live bytes but sram holds " +
-                             llvm::Twine(sram->capacityBytes) +
-                             " bytes (limit " + llvm::Twine(limit) + ")");
+  for (const WorkloadShape *shape : shapes) {
+    std::optional<uint64_t> tileBytes =
+        stagedTileBytes(space, *shape, *BM, *BN, *BK);
+    if (!tileBytes)
+      return illegal(kind, "input or weight dtype is not a micro dtype");
+
+    uint64_t live = static_cast<uint64_t>(stages) * *tileBytes;
+    if (live > limit)
+      return illegal(kind, "requires " + llvm::Twine(live) +
+                               " live bytes but sram holds " +
+                               llvm::Twine(sram->capacityBytes) +
+                               " bytes (limit " + llvm::Twine(limit) + ")");
+  }
   return legal();
 }
 
@@ -608,53 +789,89 @@ LegalityResult checkPipelineLiveTiles(const SearchSpace &space,
 LegalityResult checkConstraint(const SearchConstraint &constraint,
                                const SearchSpace &space,
                                const Candidate &candidate,
-                               const WorkloadShape &shape,
+                               const BindingFacts &facts,
                                const machine::MachineModel &machine) {
-  // A rule cannot be evaluated against a value the candidate never bound; that
-  // is a malformed candidate, not a legal one.
-  for (const std::string &name : constraint.params)
-    if (!candidate.integer(name) && !candidate.symbol(name))
+  // Resolve every reference to a declared parameter -- by name, or by a role a
+  // parameter declares. An unresolved reference is a malformed space and is
+  // reported as such rather than attributed to the candidate. Once resolved,
+  // the candidate is keyed by the parameter's *name* (Candidate has no role
+  // lookup), so a valid role reference is admitted and evaluated instead of
+  // being rejected as an unbound parameter. A parameter the candidate never
+  // bound is still a rejection: a malformed candidate must not pass by
+  // omission.
+  for (const std::string &name : constraint.params) {
+    const SearchParam *param = space.findParam(name);
+    if (!param)
+      for (const SearchParam &candidateParam : space.params)
+        if (!candidateParam.role.empty() && candidateParam.role == name) {
+          param = &candidateParam;
+          break;
+        }
+    if (!param)
+      return illegal(constraint.kind, "references '" + name +
+                                          "', which the space does not "
+                                          "declare as a parameter or role");
+    if (!candidate.integer(param->name) && !candidate.symbol(param->name))
       return illegal(constraint.kind,
-                     "candidate does not bind parameter '" + name + "'");
+                     "candidate does not bind parameter '" + param->name + "'");
+  }
 
   switch (constraint.kind) {
   case ConstraintKind::SramCapacity:
-    return checkSramCapacity(space, candidate, shape, machine);
+    return checkSramCapacity(space, candidate, facts, machine);
   case ConstraintKind::AccCapacity:
-    return checkAccCapacity(space, candidate, shape, machine);
+    return checkAccCapacity(space, candidate, facts, machine);
   case ConstraintKind::MmaCompatible:
-    return checkMmaCompatible(space, candidate, shape, machine);
+    return checkMmaCompatible(space, candidate, facts, machine);
   case ConstraintKind::MappingExtent:
-    return checkMappingExtent(space, candidate, shape, machine);
+    return checkMappingExtent(space, candidate, machine);
   case ConstraintKind::TailSupported:
-    return checkTailSupported(space, candidate, shape, machine);
+    return checkTailSupported(space, candidate, facts, machine);
   case ConstraintKind::VectorWidthSupported:
-    return checkVectorWidthSupported(space, candidate, shape, machine);
+    return checkVectorWidthSupported(space, candidate, facts, machine);
   case ConstraintKind::TileHierarchyCompatible:
-    return checkTileHierarchyCompatible(space, candidate, shape, machine);
+    return checkTileHierarchyCompatible(space, candidate, machine);
   case ConstraintKind::LayoutSupported:
-    return checkLayoutSupported(space, candidate, shape, machine);
+    return checkLayoutSupported(space, candidate, constraint, machine);
   case ConstraintKind::OwnerSupported:
-    return checkOwnerSupported(space, candidate, shape, machine);
+    return checkOwnerSupported(space, candidate, constraint, machine);
   case ConstraintKind::FragmentCompatible:
-    return checkFragmentCompatible(space, candidate, shape, machine);
+    return checkFragmentCompatible(space, candidate, machine);
   case ConstraintKind::PipelineLiveTiles:
-    return checkPipelineLiveTiles(space, candidate, shape, machine);
+    return checkPipelineLiveTiles(space, candidate, facts, machine);
   }
   llvm_unreachable("unhandled constraint kind");
+}
+
+LegalityResult checkConstraint(const SearchConstraint &constraint,
+                               const SearchSpace &space,
+                               const Candidate &candidate,
+                               const WorkloadShape &shape,
+                               const machine::MachineModel &machine) {
+  // The single shape stands in for both facts: the whole workload (tail
+  // divisibility) and the one contraction (dtype and fragment requirements).
+  return checkConstraint(constraint, space, candidate,
+                         BindingFacts{shape, {shape}}, machine);
+}
+
+LegalityResult checkLegality(const SearchSpace &space,
+                             const Candidate &candidate,
+                             const BindingFacts &facts,
+                             const machine::MachineModel &machine) {
+  for (const SearchConstraint &constraint : space.constraints) {
+    LegalityResult result =
+        checkConstraint(constraint, space, candidate, facts, machine);
+    if (!result.legal)
+      return result;
+  }
+  return legal();
 }
 
 LegalityResult checkLegality(const SearchSpace &space,
                              const Candidate &candidate,
                              const WorkloadShape &shape,
                              const machine::MachineModel &machine) {
-  for (const SearchConstraint &constraint : space.constraints) {
-    LegalityResult result =
-        checkConstraint(constraint, space, candidate, shape, machine);
-    if (!result.legal)
-      return result;
-  }
-  return legal();
+  return checkLegality(space, candidate, BindingFacts{shape, {shape}}, machine);
 }
 
 } // namespace mlir::llk::perf

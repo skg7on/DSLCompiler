@@ -6,6 +6,7 @@
 
 #include "LLK/Mapping/LayoutConstraints.h"
 
+#include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/StableHash.h"
 
 #include "mlir/IR/AffineExpr.h"
@@ -734,6 +735,107 @@ solveLayout(const LayoutDef &def, const MachineModel &machine,
   // Preserved as a thin wrapper; new clients take the `LayoutSolver` interface.
   return makeBoundedLayoutSolver()->solve(def, machine, context, layoutContext,
                                           limits);
+}
+
+//===----------------------------------------------------------------------===//
+// Re-validating a recorded assignment (design §18.3, phase 2)
+//===----------------------------------------------------------------------===//
+
+llvm::Error
+verifySolvedLayout(const LayoutDef &def, const MachineModel &machine,
+                   mlir::MLIRContext &context,
+                   const LayoutContext &layoutContext,
+                   const llvm::StringMap<LayoutValue> &recordedValues,
+                   mlir::AffineMap recordedMap, const SolverLimits &limits,
+                   llvm::StringRef where) {
+  // The code is the stable interface a caller may switch on; the detail is
+  // prose. `where` names the mapped operation a phase-2 caller is checking.
+  auto reject = [&](std::string detail) {
+    std::string message =
+        stringifyDiagnosticCode(DiagnosticCode::NoLegalLayout).str();
+    message += ": ";
+    if (!where.empty()) {
+      message += where.str();
+      message += ": ";
+    }
+    message += detail;
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+  };
+
+  // 1. Names: the assignment is the recorded one, so a name the declaration
+  //    does not have is a violation before anything is pinned.
+  for (const auto &entry : recordedValues)
+    if (!def.findParam(entry.first()))
+      return reject("layout '" + def.id + "' records parameter '" +
+                    entry.first().str() + "', which it does not declare");
+
+  // 2. Completeness: a declared parameter left unrecorded cannot be
+  //    reconstructed, so it is rejected rather than re-derived -- choosing a
+  //    value here would be exactly the substitution this verification forbids.
+  for (const LayoutParam &param : def.params) {
+    if (!recordedValues.count(param.name))
+      return reject("layout '" + def.id + "' does not record parameter '" +
+                    param.name + "'");
+    // 3. Declared-domain membership. A parameter with no domain cannot be
+    //    validated, so it is a violation rather than an unchecked pass.
+    auto domain = def.domains.find(param.name);
+    if (domain == def.domains.end())
+      return reject("layout '" + def.id + "' parameter '" + param.name +
+                    "' has no declared domain");
+    const LayoutValue &recorded = recordedValues.lookup(param.name);
+    if (!llvm::is_contained(domain->second.values, recorded))
+      return reject("layout '" + def.id + "' records parameter '" + param.name +
+                    " = " + canonicalValueString(recorded) +
+                    "', outside its declared domain " +
+                    printParamDomain(domain->second));
+  }
+
+  // 4. Pin every declared domain to the recorded singleton, so the solve has
+  //    exactly one candidate assignment: the recorded one. The solver
+  //    enumerates the space, but the space is now a single point.
+  LayoutDef pinned = def;
+  for (const LayoutParam &param : def.params) {
+    ParamDomain singleton;
+    singleton.values.push_back(recordedValues.lookup(param.name));
+    pinned.domains[param.name] = std::move(singleton);
+  }
+  llvm::Expected<LayoutSolveResult> solved =
+      solveLayout(pinned, machine, context, layoutContext, limits);
+  if (!solved)
+    return reject("layout '" + def.id +
+                  "': " + llvm::toString(solved.takeError()));
+  if (solved->undecided)
+    return reject("layout '" + def.id +
+                  "' solve is undecided: a quantifier exhausted its bound, so "
+                  "the recorded assignment's legality cannot be confirmed");
+  if (solved->solutions.empty())
+    return reject("layout '" + def.id +
+                  "' records a parameter assignment its constraints reject");
+
+  // 5. Rebuild the affine map from the recorded parameters and compare it to
+  //    the recorded map. A declaration with no map clause must record none; a
+  //    v1 binding that recorded no map has it rebuilt here, from an assignment
+  //    already confirmed complete and legal -- never from a guess.
+  if (!def.map) {
+    if (recordedMap)
+      return reject("layout '" + def.id +
+                    "' declares no map, but an affine map was recorded");
+    return llvm::Error::success();
+  }
+  llvm::StringMap<int64_t> constants;
+  for (const auto &entry : recordedValues)
+    if (const auto *integer = std::get_if<int64_t>(&entry.second))
+      constants[entry.first()] = *integer;
+  llvm::Expected<mlir::AffineMap> expected =
+      buildAffineMap(*def.map, constants, context);
+  if (!expected)
+    return reject("layout '" + def.id +
+                  "': " + llvm::toString(expected.takeError()));
+  if (recordedMap && recordedMap != *expected)
+    return reject("layout '" + def.id +
+                  "' records an affine map its recorded parameters do not "
+                  "build");
+  return llvm::Error::success();
 }
 
 } // namespace mlir::llk::mapping

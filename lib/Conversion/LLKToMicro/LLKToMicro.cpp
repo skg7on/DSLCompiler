@@ -497,6 +497,35 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   // Non-dividing tiles are rejected instead of masked, so there is no tail.
   kernel->setAttr("tail_policy", StringAttr::get(ctx, "none"));
 
+  // Original workload dimensions before tiling, as generic provenance. A
+  // legality rule that needs the whole M/N/K (tail divisibility) reads this
+  // rather than reconstructing the workload from an instruction-fragment MMA --
+  // which is what lets a non-MMA, or multiple-MMA, kernel still be checked.
+  auto dtypeName = [](Type elementType) -> std::string {
+    if (std::optional<micro::DType> dtype =
+            micro::dtypeOfElementType(elementType))
+      return micro::stringifyDType(*dtype).str();
+    return "bf16";
+  };
+  llvm::SmallVector<NamedAttribute, 8> provenance;
+  auto addI64 = [&](StringRef name, int64_t value) {
+    provenance.push_back(
+        NamedAttribute(StringAttr::get(ctx, name),
+                       IntegerAttr::get(IntegerType::get(ctx, 64), value)));
+  };
+  auto addStr = [&](StringRef name, const std::string &value) {
+    provenance.push_back(NamedAttribute(StringAttr::get(ctx, name),
+                                        StringAttr::get(ctx, value)));
+  };
+  addI64("M", plan.M);
+  addI64("N", plan.N);
+  addI64("K", plan.K);
+  addStr("input_dtype", dtypeName(plan.inputElemType));
+  addStr("weight_dtype", dtypeName(plan.inputElemType));
+  addStr("accumulator_dtype", dtypeName(plan.accumulatorElemType));
+  addStr("output_dtype", dtypeName(plan.outputElemType));
+  kernel->setAttr("original_workload", DictionaryAttr::get(ctx, provenance));
+
   startRegionBody(builder, kernel.getBody(), loc);
 
   // --- tile types --------------------------------------------------------

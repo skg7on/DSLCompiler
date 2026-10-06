@@ -63,6 +63,21 @@ struct WorkloadPort {
   std::optional<AffineMap> accessMap;
 };
 
+/// Which side of a node a port sits on.
+enum class PortDirection { Input, Output };
+
+/// One operand or result occurrence on a node: the node it belongs to, the side
+/// it sits on, and its position within that side. A `PortRef` names the
+/// occurrence, not the SSA value it carries -- a single value used through two
+/// operand ports is two refs -- so it is what tells repeated uses apart. Refs
+/// name finalized node ids, so resolve them only after `finalize()`.
+struct PortRef {
+  WorkloadNodeId node = 0;
+  PortDirection direction = PortDirection::Input;
+  uint32_t index = 0;
+  bool operator==(const PortRef &) const = default;
+};
+
 /// One unit of work to implement. `coveredNodes` in a mapping candidate names
 /// these ids.
 ///
@@ -79,6 +94,24 @@ struct WorkloadNode {
   /// Program position, used only to break content-key ties during
   /// canonicalization; it never survives as an ordering key on its own.
   uint32_t sourceOrdinal = 0;
+  /// How many times this node executes, recovered during extraction from the
+  /// structural ops that enclose it: the product of a `micro.for` /
+  /// `micro.spatial_for` trip count and a `micro.pipeline` stage count. A node
+  /// outside any structural op runs exactly once, so `1` -- not unset -- is the
+  /// common case. It is unset only when a bound is not statically recoverable
+  /// (a non-constant bound), and a strict executable plan must not pretend such
+  /// a loop runs once.
+  ///
+  /// Deliberately *not* folded into `nodeContentKey` / `canonicalString`: it is
+  /// a recovered execution fact, not a node's structural identity, so it never
+  /// churns node ids. It *is* folded into the projected source-graph identity
+  /// (`canonicalProjectedGraphString`, task B3): a changed trip count scales
+  /// the storage reservation, so two kernels identical but for a loop bound
+  /// must hash differently and a plan id derived from the source graph moves
+  /// with it. It is not folded into `structuralNodeKey`, which correlates
+  /// source nodes with their materialized counterparts and must stay
+  /// multiplicity-free.
+  std::optional<uint64_t> executionMultiplicity;
 };
 
 /// A target-independent view of one concrete `micro.kernel`'s work.
@@ -112,6 +145,14 @@ private:
   llvm::SmallVector<WorkloadNode> nodes;
   llvm::SmallVector<WorkloadValue> values;
 };
+
+/// The port a reference names on a finalized graph, or null when the node does
+/// not exist or `index` is out of range for that direction.
+const WorkloadPort *lookupPort(const WorkloadGraph &graph, const PortRef &ref);
+
+/// Deterministic rendering of a port reference (`node=7,input=0`). Used as the
+/// endpoint identity in candidate and connection content keys.
+std::string canonicalPortRefString(const PortRef &p);
 
 /// True for ops that become workload nodes: concrete execution and movement
 /// ops that a target must implement.

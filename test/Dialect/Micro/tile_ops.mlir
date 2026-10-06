@@ -116,6 +116,30 @@ func.func @test_tile_async_copy(%logical : !micro.tile<32x64xbf16>) {
   return
 }
 
+// A movement between two *distinct* concrete memories of one abstract space is
+// real work. Kind equality is not node identity, so the copy records the two
+// concrete node ids it moves between (`micro.src_node`/`micro.dst_node`). The
+// abstract memory kind stays `sram` on both the source and the result tile.
+// CHECK-LABEL: func.func @test_tile_async_copy_same_kind_distinct_nodes
+func.func @test_tile_async_copy_same_kind_distinct_nodes(%tile : !micro.tile<32x64xbf16, memory = #micro.memory<sram>>) {
+  // CHECK: micro.tile_async_copy %{{.*}} {dst_memory = #micro.memory<sram>, micro.dst_node = "sram.1", micro.src_node = "sram.0"} : !micro.tile<32x64xbf16, memory = #micro.memory<sram>> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>>, !micro.async_token
+  %dst, %tok = micro.tile_async_copy %tile {dst_memory = #micro.memory<sram>, micro.src_node = "sram.0", micro.dst_node = "sram.1"} : !micro.tile<32x64xbf16, memory = #micro.memory<sram>> -> !micro.tile<32x64xbf16, memory = #micro.memory<sram>>, !micro.async_token
+  return
+}
+
+//===----------------------------------------------------------------------===//
+// micro.async_copy — same-kind movement between distinct concrete nodes
+//===----------------------------------------------------------------------===//
+
+// A shaped value carries both spaces as attributes; a same-kind move carries
+// the source and destination node identities the same way.
+// CHECK-LABEL: func.func @test_async_copy_same_kind_distinct_nodes
+func.func @test_async_copy_same_kind_distinct_nodes(%t : tensor<8x8xf32>) {
+  // CHECK: micro.async_copy %{{.*}} {dst_memory = #micro.memory<sram>, micro.dst_node = "sram.1", micro.src_node = "sram.0", src_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  %r, %tok = micro.async_copy %t {src_memory = #micro.memory<sram>, dst_memory = #micro.memory<sram>, micro.src_node = "sram.0", micro.dst_node = "sram.1"} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  return
+}
+
 //===----------------------------------------------------------------------===//
 // micro.tile_store — write back to external memory
 //===----------------------------------------------------------------------===//
@@ -198,3 +222,52 @@ func.func @test_tile_reduce(%scores : !micro.tile<32x64xf32>) {
   %p = micro.reduce "product" %scores {axis = 0 : i64} : !micro.tile<32x64xf32> -> !micro.tile<64xf32>
   return
 }
+
+//===----------------------------------------------------------------------===//
+// micro.gather — combine several producers under explicit semantics
+//===----------------------------------------------------------------------===//
+
+// The combination is explicit and round-trips: `sum` and `max` combine
+// like-for-like shape/type, and carry no axis.
+// CHECK-LABEL: func.func @test_gather_sum
+func.func @test_gather_sum(%a : !micro.tile<32x64xf32>, %b : !micro.tile<32x64xf32>) {
+  // CHECK: micro.gather %{{.*}}, %{{.*}} kind = "sum" : !micro.tile<32x64xf32>, !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  %r = micro.gather %a, %b kind = "sum" : !micro.tile<32x64xf32>, !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @test_gather_max
+func.func @test_gather_max(%a : !micro.tile<32x64xf32>, %b : !micro.tile<32x64xf32>) {
+  // CHECK: micro.gather %{{.*}}, %{{.*}} kind = "max" : !micro.tile<32x64xf32>, !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  %r = micro.gather %a, %b kind = "max" : !micro.tile<32x64xf32>, !micro.tile<32x64xf32> -> !micro.tile<32x64xf32>
+  return
+}
+
+// A concatenation names the axis and produces exactly the summed extent along
+// it, with every other extent matching.
+// CHECK-LABEL: func.func @test_gather_concat
+func.func @test_gather_concat(%a : !micro.tile<32x64xf32>, %b : !micro.tile<32x32xf32>) {
+  // CHECK: micro.gather %{{.*}}, %{{.*}} kind = "concat" axis = 1 : !micro.tile<32x64xf32>, !micro.tile<32x32xf32> -> !micro.tile<32x96xf32>
+  %r = micro.gather %a, %b kind = "concat" axis = 1 : !micro.tile<32x64xf32>, !micro.tile<32x32xf32> -> !micro.tile<32x96xf32>
+  return
+}
+
+//===----------------------------------------------------------------------===//
+// micro.barrier — executor-group barrier over dependency tokens
+//===----------------------------------------------------------------------===//
+
+// CHECK-LABEL: func.func @test_barrier
+func.func @test_barrier(%tok : !micro.async_token) {
+  // CHECK: micro.barrier %{{.*}} scope = "executor_group"
+  micro.barrier %tok scope = "executor_group"
+  return
+}
+
+// A collective barrier carries no token: the group itself is the dependency.
+// CHECK-LABEL: func.func @test_barrier_collective
+func.func @test_barrier_collective() {
+  // CHECK: micro.barrier scope = "executor_group"
+  micro.barrier scope = "executor_group"
+  return
+}
+

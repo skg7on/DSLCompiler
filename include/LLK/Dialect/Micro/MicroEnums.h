@@ -201,6 +201,68 @@ inline std::optional<LayoutKind> symbolizeLayoutKind(llvm::StringRef str) {
 }
 
 //===----------------------------------------------------------------------===//
+// Gather semantics (for micro.gather)
+//===----------------------------------------------------------------------===//
+//
+// The explicit combination a multi-producer gather performs. It is never
+// inferred from topology: a gather with several inputs and no declared kind is
+// not arithmetic, so the op requires one. The string table is hand-written for
+// the same reason every other enum here is (the CMake tablegen config does not
+// run -gen-enum-decls/-gen-enum-defs).
+
+enum class GatherKind : uint32_t {
+  sum = 0,
+  max = 1,
+  concat = 2,
+};
+
+inline llvm::StringRef stringifyGatherKind(GatherKind val) {
+  switch (val) {
+  case GatherKind::sum:
+    return "sum";
+  case GatherKind::max:
+    return "max";
+  case GatherKind::concat:
+    return "concat";
+  }
+  return "";
+}
+
+inline std::optional<GatherKind> symbolizeGatherKind(llvm::StringRef str) {
+  return llvm::StringSwitch<std::optional<GatherKind>>(str)
+      .Case("sum", GatherKind::sum)
+      .Case("max", GatherKind::max)
+      .Case("concat", GatherKind::concat)
+      .Default(std::nullopt);
+}
+
+//===----------------------------------------------------------------------===//
+// Barrier scope (for micro.barrier)
+//===----------------------------------------------------------------------===//
+//
+// The synchronization domain a barrier covers. `executor_group` is the generic
+// executor group the dialect can express; a plan that needs a scope outside it
+// has no Micro spelling and must be rejected rather than silently widened.
+
+enum class BarrierScope : uint32_t {
+  executor_group = 0,
+};
+
+inline llvm::StringRef stringifyBarrierScope(BarrierScope val) {
+  switch (val) {
+  case BarrierScope::executor_group:
+    return "executor_group";
+  }
+  return "";
+}
+
+inline std::optional<BarrierScope> symbolizeBarrierScope(llvm::StringRef str) {
+  return llvm::StringSwitch<std::optional<BarrierScope>>(str)
+      .Case("executor_group", BarrierScope::executor_group)
+      .Default(std::nullopt);
+}
+
+//===----------------------------------------------------------------------===//
 // Owner enum (for #micro.owner)
 //===----------------------------------------------------------------------===//
 

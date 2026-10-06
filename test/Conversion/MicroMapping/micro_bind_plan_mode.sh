@@ -44,8 +44,10 @@ grep -q 'micro\.plan' "$WORK/beam_bind.mlir" || {
 
 # The bound plan's own decimal id names the same plan: binding it again by that
 # spelling succeeds, proving the report's hex and the emitted decimal agree.
-BEAM_DEC=$(grep -o 'micro\.plan = {[^}]*}' "$WORK/beam_bind.mlir" |
-    sed -n 's/.*id = \([0-9-][0-9-]*\) : i64.*/\1/p')
+# The plan-id field is anchored on `layout_hash`, which follows it; a bare
+# `id = N` is ambiguous now that allocations and steps also carry an id.
+BEAM_DEC=$(sed -n 's/.*id = \([0-9-][0-9-]*\) : i64, layout_hash =.*/\1/p' \
+    "$WORK/beam_bind.mlir" | head -1)
 [ -n "$BEAM_DEC" ] || { echo "the bound IR carried no plan id" >&2; exit 1; }
 "$LLK_OPT" "--micro-bind-plan=plan-id=$BEAM_DEC $TARGET mode=beam top-k=8" \
     "$KERNEL" > "$WORK/beam_decimal.mlir"

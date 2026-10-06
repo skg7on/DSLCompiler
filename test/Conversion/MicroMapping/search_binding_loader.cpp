@@ -419,6 +419,71 @@ micro.search_space @space attributes {workload = "w"} {
   EXPECT_TRUE(layouts->empty());
 }
 
+TEST(SearchBindingLoader, LoadsOwnerAndMemoryPathAxesByKind) {
+  // The parameters are spelled "owner" and "mem", but declare the axis *kinds*,
+  // so resolving by kind honours them: the name is not a contract.
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "owner" {kind = "owner_mapping", choices = ["worker/vector_engine"]}
+  micro.param "mem" {kind = "memory_path", choices = ["dram:sram:acc"]}
+  micro.candidate @c {bindings = {owner = "worker/vector_engine", mem = "dram:sram:acc"}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto axes = loadBoundAxes(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(axes)) << llvm::toString(axes.takeError());
+  EXPECT_EQ(axes->ownerMapping, "worker/vector_engine");
+  EXPECT_EQ(axes->memoryPath, "dram:sram:acc");
+  EXPECT_FALSE(axes->empty());
+}
+
+TEST(SearchBindingLoader, TwoOwnerMappingParamsCannotBeResolved) {
+  // Two parameters of one axis kind: which one selects the axis is
+  // unanswerable, so it is reported rather than silently picking one -- a value
+  // the caller bound would otherwise be ignored.
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "a" {kind = "owner_mapping", choices = ["worker/lane"]}
+  micro.param "b" {kind = "owner_mapping", choices = ["worker/lane"]}
+  micro.candidate @c {bindings = {a = "worker/lane", b = "worker/lane"}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto axes = loadBoundAxes(parsed->module.get(), *binding);
+  std::string error = takeError(axes);
+  EXPECT_NE(error.find("more than one 'owner_mapping' parameter"),
+            std::string::npos)
+      << error;
+}
+
+TEST(SearchBindingLoader, NoAxisKindParameterLeavesAxesUnbound) {
+  auto parsed = parse(R"MLIR(
+micro.search_space @space attributes {workload = "w"} {
+  micro.param "VW" {kind = "integer", choices = [4 : i64, 8 : i64]}
+  micro.candidate @c {bindings = {VW = 8 : i64}}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+
+  auto axes = loadBoundAxes(parsed->module.get(), *binding);
+  ASSERT_TRUE(static_cast<bool>(axes)) << llvm::toString(axes.takeError());
+  EXPECT_TRUE(axes->empty());
+}
+
 TEST(SearchBindingLoader, RejectsABindingWhoseCandidateIsGone) {
   auto parsed = parseFixture();
   ASSERT_TRUE(parsed);
@@ -555,6 +620,130 @@ module {
 }
 )mlir";
 
+/// The review's vector-only fixture: a kernel with no `micro.mma` whose space
+/// declares an explicitly shape-independent `mapping_extent` constraint. The
+/// constraint reads the thread count and the machine's capacity only, so a
+/// kernel that cannot supply a GEMM shape can still satisfy it.
+constexpr llvm::StringLiteral kVectorOnlyMappingExtentSpace = R"mlir(
+module {
+  micro.kernel @plain {
+    %t = micro.tile_alloc : !micro.tile<8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  micro.search_space @space attributes {workload = "plain"} {
+    micro.param "num_threads" {kind = "integer", choices = [1 : i64, 2 : i64]}
+    micro.constraint "mapping_extent" {params = ["num_threads"]}
+    micro.candidate @ok {bindings = {num_threads = 1 : i64}}
+    micro.candidate @too_many {bindings = {num_threads = 2 : i64}}
+  }
+}
+)mlir";
+
+/// A machine with one matrix engine that accepts f32 but not f16, so a
+/// candidate's MMA compatibility depends on *which* contraction is examined.
+constexpr llvm::StringLiteral kMatrixMachine = R"yaml(
+schema: llk.machine.v2
+target: constrained
+executors:
+  - id: worker.0
+    kind: worker
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: worker.0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+compute:
+  - id: mxu
+    kind: matrix_engine
+    attached_to: worker.0
+    element_types: [f32, bf16]
+    accumulator_dtypes: [f32]
+    shapes: [[4, 8, 8]]
+)yaml";
+
+/// Two MMAs over one kernel: the first is f32 and MMA-compatible, the second is
+/// f16 and not. The old loader derived the shape from the *first* MMA, so the
+/// incompatible second contraction was never examined.
+constexpr llvm::StringLiteral kTwoContractionsDifferentDtypes = R"mlir(
+module {
+  micro.kernel @mixed {
+    %a = micro.tile_alloc : !micro.tile<16x32xf32, memory = #micro.memory<sram>>
+    %b = micro.tile_alloc : !micro.tile<32x16xf32, memory = #micro.memory<sram>>
+    %c = micro.tile_alloc : !micro.tile<16x16xf32, memory = #micro.memory<sram>>
+    %r0 = micro.mma %a, %b, %c {shape = array<i64: 16, 16, 32>, input = #micro.dtype<f32>, accumulator = #micro.dtype<f32>} : !micro.tile<16x32xf32, memory = #micro.memory<sram>>, !micro.tile<32x16xf32, memory = #micro.memory<sram>>, !micro.tile<16x16xf32, memory = #micro.memory<sram>> -> !micro.tile<16x16xf32, memory = #micro.memory<sram>>
+    %d = micro.tile_alloc : !micro.tile<8x16xf16, memory = #micro.memory<sram>>
+    %e = micro.tile_alloc : !micro.tile<16x8xf16, memory = #micro.memory<sram>>
+    %f = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r1 = micro.mma %d, %e, %f {shape = array<i64: 8, 8, 16>, input = #micro.dtype<f16>, accumulator = #micro.dtype<f32>} : !micro.tile<8x16xf16, memory = #micro.memory<sram>>, !micro.tile<16x8xf16, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  micro.search_space @space attributes {workload = "matmul"} {
+    micro.param "BM" {kind = "integer", choices = [8 : i64]}
+    micro.param "BN" {kind = "integer", choices = [8 : i64]}
+    micro.param "BK" {kind = "integer", choices = [16 : i64]}
+    micro.constraint "mma_compatible" {params = ["BM", "BN", "BK"]}
+    micro.candidate @c {bindings = {BM = 8 : i64, BN = 8 : i64, BK = 16 : i64}}
+  }
+}
+)mlir";
+
+/// A kernel carrying the exported original-workload provenance: the pre-tiling
+/// M/N/K the export records before it tiles, so a divisibility/tail rule can be
+/// evaluated without reconstructing the workload from an MMA. M = 17 is not a
+/// multiple of BM = 8.
+constexpr llvm::StringLiteral kProvenancedTailSpace = R"mlir(
+module {
+  micro.kernel @gemm attributes {original_workload = {M = 17 : i64, N = 64 : i64, K = 64 : i64, input_dtype = "bf16", weight_dtype = "bf16", accumulator_dtype = "f32", output_dtype = "bf16"}} {
+    %a = micro.tile_alloc : !micro.tile<17x64xbf16, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  micro.search_space @space attributes {workload = "matmul"} {
+    micro.param "BM" {kind = "integer", choices = [8 : i64]}
+    micro.param "BN" {kind = "integer", choices = [64 : i64]}
+    micro.param "BK" {kind = "integer", choices = [64 : i64]}
+    micro.constraint "tail_supported" {params = ["BM", "BN", "BK"]}
+    micro.candidate @c {bindings = {BM = 8 : i64, BN = 64 : i64, BK = 64 : i64}}
+  }
+}
+)mlir";
+
+/// The same tail constraint over a kernel with no provenance and no MMA, so the
+/// original M/N/K the rule needs are simply not available.
+constexpr llvm::StringLiteral kTailWithoutOriginalWorkload = R"mlir(
+module {
+  micro.kernel @plain {
+    %t = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  micro.search_space @space attributes {workload = "matmul"} {
+    micro.param "BM" {kind = "integer", choices = [8 : i64]}
+    micro.param "BN" {kind = "integer", choices = [64 : i64]}
+    micro.param "BK" {kind = "integer", choices = [64 : i64]}
+    micro.constraint "tail_supported" {params = ["BM", "BN", "BK"]}
+    micro.candidate @c {bindings = {BM = 8 : i64, BN = 64 : i64, BK = 64 : i64}}
+  }
+}
+)mlir";
+
+/// A space whose layout parameter declares a role (`operand0`). The constraint
+/// references that role directly, exercising the verified-IR loader path.
+constexpr llvm::StringLiteral kRoleReferencedLayoutSpace = R"mlir(
+module {
+  micro.kernel @plain {
+    %t = micro.tile_alloc : !micro.tile<8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+  micro.search_space @space attributes {workload = "plain"} {
+    micro.param "lhs_layout" {kind = "layout", role = "operand0", choices = ["row_major", "blocked"]}
+    micro.constraint "layout_supported" {params = ["operand0"]}
+    micro.candidate @ok {bindings = {lhs_layout = "row_major"}}
+    micro.candidate @bad {bindings = {lhs_layout = "blocked"}}
+  }
+}
+)mlir";
+
 /// The first `micro.kernel` in `module`, or null.
 mlir::Operation *firstKernel(mlir::ModuleOp module) {
   mlir::Operation *kernel = nullptr;
@@ -567,6 +756,10 @@ mlir::Operation *firstKernel(mlir::ModuleOp module) {
 
 llvm::Expected<mlir::llk::machine::MachineModel> vectorMachine() {
   return mlir::llk::machine::parseMachineModel(kVectorMachine, "<test>");
+}
+
+llvm::Expected<mlir::llk::machine::MachineModel> matrixMachine() {
+  return mlir::llk::machine::parseMachineModel(kMatrixMachine, "<test>");
 }
 } // namespace
 
@@ -616,6 +809,130 @@ TEST(SearchBindingLoader, AConstrainedSpaceWithoutAShapeIsRejected) {
   ASSERT_TRUE(static_cast<bool>(error));
   EXPECT_NE(llvm::toString(std::move(error)).find("cannot be evaluated"),
             std::string::npos);
+}
+
+// The review's P2 defect: a valid vector-only candidate whose only constraint
+// is shape-independent (`mapping_extent` reads the thread count and the
+// machine's thread capacity) must be evaluated, not rejected because the kernel
+// has no `micro.mma`. The constraint is still enforced -- one thread too many
+// is a capacity violation, so the fix cannot turn into "skip every constraint".
+TEST(SearchBindingLoader, VectorOnlyMappingExtentConstraintIsEnforced) {
+  auto parsed = parse(kVectorOnlyMappingExtentSpace);
+  ASSERT_TRUE(parsed);
+  llvm::Expected<mlir::llk::machine::MachineModel> machine = vectorMachine();
+  ASSERT_TRUE(static_cast<bool>(machine))
+      << llvm::toString(machine.takeError());
+
+  auto ok = loadSearchBinding(parsed->module.get(), "ok");
+  ASSERT_TRUE(static_cast<bool>(ok)) << llvm::toString(ok.takeError());
+  llvm::Error okError = verifyBindingLegality(
+      *parsed->module, *ok, firstKernel(*parsed->module), *machine);
+  EXPECT_FALSE(static_cast<bool>(okError))
+      << llvm::toString(std::move(okError));
+
+  auto tooMany = loadSearchBinding(parsed->module.get(), "too_many");
+  ASSERT_TRUE(static_cast<bool>(tooMany))
+      << llvm::toString(tooMany.takeError());
+  llvm::Error error = verifyBindingLegality(
+      *parsed->module, *tooMany, firstKernel(*parsed->module), *machine);
+  ASSERT_TRUE(static_cast<bool>(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("mapping_extent"), std::string::npos) << text;
+  EXPECT_NE(text.find("num_threads 2"), std::string::npos) << text;
+}
+
+// Every contraction the kernel performs must satisfy an MMA-compatibility
+// constraint, not merely the first one. The f16 contraction is unsupported by
+// the machine's f32/bf16 matrix engine, so the candidate is rejected.
+TEST(SearchBindingLoader, AMmaCompatibleConstraintChecksEveryContraction) {
+  auto parsed = parse(kTwoContractionsDifferentDtypes);
+  ASSERT_TRUE(parsed);
+  llvm::Expected<mlir::llk::machine::MachineModel> machine = matrixMachine();
+  ASSERT_TRUE(static_cast<bool>(machine))
+      << llvm::toString(machine.takeError());
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+  llvm::Error error = verifyBindingLegality(
+      *parsed->module, *binding, firstKernel(*parsed->module), *machine);
+  ASSERT_TRUE(static_cast<bool>(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("mma_compatible"), std::string::npos) << text;
+  EXPECT_NE(text.find("f16"), std::string::npos) << text;
+}
+
+// A tail check needs the workload's original M/N/K. The export records them as
+// provenance before tiling, so M = 17 is divisible-checked against BM = 8 and
+// rejected even though the kernel's tiles are already 8-wide.
+TEST(SearchBindingLoader, TailConstraintUsesExportedOriginalWorkload) {
+  auto parsed = parse(kProvenancedTailSpace);
+  ASSERT_TRUE(parsed);
+  llvm::Expected<mlir::llk::machine::MachineModel> machine = vectorMachine();
+  ASSERT_TRUE(static_cast<bool>(machine))
+      << llvm::toString(machine.takeError());
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+  llvm::Error error = verifyBindingLegality(
+      *parsed->module, *binding, firstKernel(*parsed->module), *machine);
+  ASSERT_TRUE(static_cast<bool>(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("tail_supported"), std::string::npos) << text;
+  EXPECT_NE(text.find("17"), std::string::npos) << text;
+}
+
+// Without provenance, or an MMA to stand in for it, the original dimensions a
+// tail check requires are simply absent: the constraint is reported
+// specifically as unevaluable rather than passing by omission.
+TEST(SearchBindingLoader, TailConstraintWithoutOriginalDimensionsIsRejected) {
+  auto parsed = parse(kTailWithoutOriginalWorkload);
+  ASSERT_TRUE(parsed);
+  llvm::Expected<mlir::llk::machine::MachineModel> machine = vectorMachine();
+  ASSERT_TRUE(static_cast<bool>(machine))
+      << llvm::toString(machine.takeError());
+
+  auto binding = loadSearchBinding(parsed->module.get(), "c");
+  ASSERT_TRUE(static_cast<bool>(binding))
+      << llvm::toString(binding.takeError());
+  llvm::Error error = verifyBindingLegality(
+      *parsed->module, *binding, firstKernel(*parsed->module), *machine);
+  ASSERT_TRUE(static_cast<bool>(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("tail_supported"), std::string::npos) << text;
+  EXPECT_NE(text.find("cannot be evaluated"), std::string::npos) << text;
+}
+
+// A constraint may reference a parameter by the role it declares. The candidate
+// is keyed by parameter name, so the role resolves to `lhs_layout` and the
+// candidate is evaluated -- not rejected as an unbound parameter named
+// `operand0`. The bound value still decides: `blocked` is unsupported by the
+// machine's row_major-only SRAM.
+TEST(SearchBindingLoader, ResolvedRoleReferenceIsEvaluated) {
+  auto parsed = parse(kRoleReferencedLayoutSpace);
+  ASSERT_TRUE(parsed);
+  // This role reference parsed through ordinary verified IR, without mutation.
+  EXPECT_TRUE(mlir::succeeded(mlir::verify(*parsed->module)));
+  llvm::Expected<mlir::llk::machine::MachineModel> machine = vectorMachine();
+  ASSERT_TRUE(static_cast<bool>(machine))
+      << llvm::toString(machine.takeError());
+
+  auto ok = loadSearchBinding(parsed->module.get(), "ok");
+  ASSERT_TRUE(static_cast<bool>(ok)) << llvm::toString(ok.takeError());
+  llvm::Error okError = verifyBindingLegality(
+      *parsed->module, *ok, firstKernel(*parsed->module), *machine);
+  EXPECT_FALSE(static_cast<bool>(okError))
+      << llvm::toString(std::move(okError));
+
+  auto bad = loadSearchBinding(parsed->module.get(), "bad");
+  ASSERT_TRUE(static_cast<bool>(bad)) << llvm::toString(bad.takeError());
+  llvm::Error error = verifyBindingLegality(
+      *parsed->module, *bad, firstKernel(*parsed->module), *machine);
+  ASSERT_TRUE(static_cast<bool>(error));
+  std::string text = llvm::toString(std::move(error));
+  EXPECT_NE(text.find("layout_supported"), std::string::npos) << text;
+  EXPECT_NE(text.find("blocked"), std::string::npos) << text;
 }
 
 // A space with no constraints is always legal, and the check costs nothing --

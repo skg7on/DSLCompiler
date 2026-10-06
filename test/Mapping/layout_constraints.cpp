@@ -909,3 +909,218 @@ TEST(LayoutSolverInterface, SolvesThroughTheInterface) {
   EXPECT_EQ(throughInterface->solutions.size(), 12u);
   EXPECT_FALSE(throughInterface->truncated);
 }
+
+//===----------------------------------------------------------------------===//
+// Re-validating a recorded solved assignment (design §18.3, phase 2)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The shipped AVX2 layouts, or a failure the caller asserts on.
+llvm::Expected<LayoutRegistry> avx2Layouts() {
+  return loadLayoutFile(kShippedLayouts);
+}
+
+/// The rank and element type the AVX2 blocked layout is declared for: a rank-2
+/// f32 operand, whose vector engine has 8 lanes.
+LayoutContext rank2F32() {
+  LayoutContext context;
+  context.rank = 2;
+  context.elementType = "f32";
+  return context;
+}
+
+/// `{M, N, VW}` as a recorded assignment.
+llvm::StringMap<LayoutValue> blockedValues(int64_t m, int64_t n, int64_t vw) {
+  llvm::StringMap<LayoutValue> values;
+  values["M"] = m;
+  values["N"] = n;
+  values["VW"] = vw;
+  return values;
+}
+
+/// The affine map `def`'s recorded parameters build for `VW = vw`. `def` must
+/// carry a map clause.
+mlir::AffineMap blockedMap(mlir::MLIRContext &context, const LayoutDef &def,
+                           int64_t vw) {
+  llvm::StringMap<int64_t> constants;
+  constants["VW"] = vw;
+  llvm::Expected<mlir::AffineMap> map =
+      buildAffineMap(*def.map, constants, context);
+  if (!map) {
+    llvm::consumeError(map.takeError());
+    return {};
+  }
+  return *map;
+}
+
+} // namespace
+
+// A recorded assignment the declaration's own constraints accept verifies, and
+// reporting the matching affine map verifies identically.
+TEST(VerifySolvedLayout, AcceptsTheRecordedLegalAssignment) {
+  llvm::Expected<LayoutRegistry> registry = avx2Layouts();
+  ASSERT_TRUE(static_cast<bool>(registry))
+      << llvm::toString(registry.takeError());
+  const LayoutDef *def = registry->find("avx2.blocked_2d");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::StringMap<LayoutValue> recorded = blockedValues(4, 8, 8);
+  llvm::Error error =
+      verifySolvedLayout(*def, machine, context, rank2F32(), recorded,
+                         blockedMap(context, *def, 8));
+  EXPECT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+}
+
+// A v1 binding records parameters but no map: the map is rebuilt from the
+// (complete and legal) recorded assignment rather than re-selected.
+TEST(VerifySolvedLayout, RebuildsAMissingMapFromTheRecordedAssignment) {
+  llvm::Expected<LayoutRegistry> registry = avx2Layouts();
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("avx2.blocked_2d");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::StringMap<LayoutValue> recorded = blockedValues(4, 8, 8);
+  llvm::Error error =
+      verifySolvedLayout(*def, machine, context, rank2F32(), recorded, {});
+  EXPECT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+}
+
+// The regression: a tampered vector width -- one the declaration's own
+// `require VW == lanes` rejects -- must not verify. The solver must not
+// substitute the legal VW = 8.
+TEST(VerifySolvedLayout, RejectsATamperedVectorWidth) {
+  llvm::Expected<LayoutRegistry> registry = avx2Layouts();
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("avx2.blocked_2d");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::StringMap<LayoutValue> recorded = blockedValues(4, 8, 4);
+  llvm::Error error =
+      verifySolvedLayout(*def, machine, context, rank2F32(), recorded, {});
+  ASSERT_TRUE(static_cast<bool>(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("no_legal_layout"),
+            std::string::npos);
+}
+
+TEST(VerifySolvedLayout, RejectsAValueOutsideItsDeclaredDomain) {
+  llvm::Expected<LayoutRegistry> registry = avx2Layouts();
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("avx2.blocked_2d");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  // VW is declared over [4..8]; 9 is outside it and also not a lane count.
+  llvm::StringMap<LayoutValue> recorded = blockedValues(4, 8, 9);
+  llvm::Error error =
+      verifySolvedLayout(*def, machine, context, rank2F32(), recorded, {});
+  EXPECT_TRUE(static_cast<bool>(error)) << "out-of-domain VW must be rejected";
+}
+
+TEST(VerifySolvedLayout, RejectsAMissingDeclaredParameter) {
+  llvm::Expected<LayoutRegistry> registry = avx2Layouts();
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("avx2.blocked_2d");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::StringMap<LayoutValue> recorded = blockedValues(4, 8, 8);
+  recorded.erase("VW"); // the value the constraints turn on is absent
+  llvm::Error error =
+      verifySolvedLayout(*def, machine, context, rank2F32(), recorded, {});
+  EXPECT_TRUE(static_cast<bool>(error))
+      << "a missing parameter must be rejected";
+}
+
+TEST(VerifySolvedLayout, RejectsAnUnknownParameter) {
+  llvm::Expected<LayoutRegistry> registry = avx2Layouts();
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("avx2.blocked_2d");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::StringMap<LayoutValue> recorded = blockedValues(4, 8, 8);
+  recorded["X"] = int64_t{1};
+  llvm::Error error =
+      verifySolvedLayout(*def, machine, context, rank2F32(), recorded, {});
+  EXPECT_TRUE(static_cast<bool>(error))
+      << "an undeclared parameter must be rejected";
+}
+
+// The recorded parameters build one map; a recorded map built for a different
+// width is not that map and must be rejected rather than trusted.
+TEST(VerifySolvedLayout, RejectsAWrongRebuiltAffineMap) {
+  llvm::Expected<LayoutRegistry> registry = avx2Layouts();
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("avx2.blocked_2d");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::StringMap<LayoutValue> recorded = blockedValues(4, 8, 8);
+  // The parameters say VW = 8, so the recorded map must have been built for 8.
+  llvm::Error error =
+      verifySolvedLayout(*def, machine, context, rank2F32(), recorded,
+                         blockedMap(context, *def, 4));
+  EXPECT_TRUE(static_cast<bool>(error))
+      << "a mismatched affine map must be rejected";
+}
+
+// An exhausted quantifier leaves a constraint undecided, so the solve cannot
+// confirm the recorded assignment and must be rejected -- never accepted on the
+// strength of the values it happened to report.
+TEST(VerifySolvedLayout, RejectsAnUndecidedSolveFromAnExhaustedQuantifier) {
+  constexpr llvm::StringLiteral kQuantified = R"llkmap(
+layout t.q(int N) {
+  param N in {4, 8};
+  require forall v in domain(N) : v >= 2;
+}
+)llkmap";
+  llvm::Expected<LayoutRegistry> registry = parse(kQuantified);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("t.q");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  llvm::StringMap<LayoutValue> recorded;
+  recorded["N"] = int64_t{4};
+  SolverLimits limits;
+  limits.maxQuantifierIterations = 0; // the quantifier cannot decide anything
+  llvm::Error error =
+      verifySolvedLayout(*def, machine, context, {}, recorded, {}, limits);
+  EXPECT_TRUE(static_cast<bool>(error))
+      << "an undecided solve must be rejected";
+}
+
+// Verification validates the recorded assignment, it does not merely repeat the
+// enumerator's pick: a legal solution that is not the first the solver would
+// report still verifies.
+TEST(VerifySolvedLayout, AcceptsANonFirstLegalSolution) {
+  llvm::Expected<LayoutRegistry> registry = parse(kSolvable);
+  ASSERT_TRUE(static_cast<bool>(registry));
+  const LayoutDef *def = registry->find("t.block");
+  ASSERT_NE(def, nullptr);
+
+  mlir::MLIRContext context;
+  MachineModel machine = evalMachine();
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  // The canonical first solution is M=1, N=4, VW=2 (see LayoutSolve).
+  llvm::StringMap<LayoutValue> recorded;
+  recorded["M"] = int64_t{2};
+  recorded["N"] = int64_t{8};
+  recorded["VW"] = int64_t{4};
+  llvm::Error error =
+      verifySolvedLayout(*def, machine, context, layoutContext, recorded, {});
+  EXPECT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+}

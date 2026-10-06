@@ -63,9 +63,12 @@ inline constexpr uint64_t kMaxEvents = 100000;
 /// One machine-visible action. `Load` and `Barrier` are named for the event
 /// families the model is meant to cover but no micro op produces them yet: the
 /// dialect currently expresses every read as a copy and every sync as a wait.
+/// `Transform` *is* produced -- `micro.transform` performs a real layout
+/// conversion, so it is charged instead of falling through the zero-cost path.
 enum class EventKind {
   TileView,
   TilePartition,
+  Transform,
   AsyncCopy,
   Load,
   Store,
@@ -171,6 +174,13 @@ struct PlannedRoute {
 /// not model, or expands past kMaxEvents.
 llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
                                        const machine::MachineModel &machine);
+
+/// The normalized view of one DAG event (task B8): the same
+/// `mapping::PlanCostEvent` shape `buildPlanEvents` produces, so a plan's
+/// selected-plan event stream and its materialized kernel's event stream are
+/// directly comparable kind for kind, resource for resource, work and byte for
+/// work and byte.
+mapping::PlanCostEvent normalizedPlanEvent(const MicroEvent &event);
 
 /// Locates the `micro.kernel` to simulate anywhere under `root`: the one named
 /// `symbol`, or the only one present when `symbol` is empty. Fails when the

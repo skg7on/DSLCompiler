@@ -56,6 +56,26 @@ struct PlacementOptions {
   unsigned maxInstances = 64;
   /// Upper bound on the routes one connection may consider.
   unsigned maxRoutesPerConnection = 4;
+  /// Upper bound on the joint connection combinations one
+  /// `enumerateConnectionChoices` call returns, and therefore on the joint
+  /// connection states one search placement may branch into (task B7). Reaching
+  /// it is a *cap*: the caller is told (`truncated`) and may not read the
+  /// result as the complete product.
+  unsigned maxConnectionCombinations = 64;
+};
+
+/// The bounded joint connection combinations an extension step may choose
+/// among (task B7). Each combination is one `ConnectionPlan` per request, in
+/// request order. `truncated` is set when the combination cap ended the
+/// enumeration or a route enumeration hit its own cap, so the caller may not
+/// read `combinations` as exhaustive. `undecided` is a *separate* status: a
+/// solver could not decide, so no combination in the set may be treated as
+/// legal. The two are never conflated -- a truncated product is still legal,
+/// an undecided one is not.
+struct ConnectionChoiceSet {
+  std::vector<std::vector<ConnectionPlan>> combinations;
+  bool truncated = false;
+  bool undecided = false;
 };
 
 /// Why a candidate produced no legal placement. Reported only when the result
@@ -104,6 +124,13 @@ struct ConnectionRequest {
   InstanceId producer = 0;
   InstanceId consumer = 0;
   WorkloadValueId value = 0;
+  /// The producer-side result occurrence this movement reads, and the single
+  /// consumer operand occurrence it serves. They name the *use*, not the SSA
+  /// value: a value consumed through two operand ports is two requests, each
+  /// with its own consumer port. Unset when the caller knows no endpoint, in
+  /// which case the synthesized plan carries none either.
+  std::optional<PortRef> producerPort;
+  std::optional<PortRef> consumerPort;
   MemoryNodeId producerMemory;
   MemoryNodeId consumerMemory;
   std::optional<LayoutId> producerLayout;
@@ -178,6 +205,25 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeConnections(
     const TopologyService &topology, const PlacementOptions &options = {},
     bool *truncated = nullptr);
 
+/// Enumerates the legal joint ways to connect every request at once, bounded by
+/// `options.maxConnectionCombinations`. Each request's own alternatives come
+/// from `synthesizeConnections` (design §15.2), so a request with no legal
+/// route makes the whole set empty (the pair is incompatible, never an error).
+/// The product is deterministic: requests keep their order and the last request
+/// varies fastest, so the same inputs always enumerate identically.
+llvm::Expected<ConnectionChoiceSet>
+enumerateConnectionChoices(llvm::ArrayRef<ConnectionRequest> requests,
+                           const MappingTarget &target,
+                           const PlacementOptions &options = {});
+
+/// The same joint enumeration against a caller-held topology service, so a
+/// search that already owns one does not rebuild it per decision per prefix.
+llvm::Expected<ConnectionChoiceSet>
+enumerateConnectionChoices(llvm::ArrayRef<ConnectionRequest> requests,
+                           const machine::MachineModel &machine,
+                           const TopologyService &topology,
+                           const PlacementOptions &options = {});
+
 /// Fan-out (design §15.3). Every consumer is given by its own fully-specified
 /// `ConnectionRequest`, so §10.2 (element type, logical tile shape, visibility,
 /// affine index relation) is checked against *each* consumer rather than one
@@ -206,15 +252,40 @@ llvm::Expected<std::vector<ConnectionPlan>> synthesizeFanOut(
     const ObjectiveOrder &objective = {},
     bool *choseAmongAlternatives = nullptr);
 
+/// The fan-out's *alternatives*, one entry per serving group (task B7): every
+/// legal plan that can serve that whole group, in the order replication builds
+/// them. A shared read yields one group (every consumer) with one `Direct`
+/// plan. An empty group means that group cannot be served, so the whole fan-out
+/// is infeasible -- the same outcome `synthesizeFanOut` reports by returning no
+/// plans. `synthesizeFanOut` is this function plus one objective-ranked pick
+/// per group, so the joint search and the greedy synthesis cannot disagree on
+/// which alternatives exist.
+llvm::Expected<std::vector<std::vector<ConnectionPlan>>>
+enumerateFanOutAlternatives(const ConnectionRequest &base,
+                            llvm::ArrayRef<ConnectionRequest> consumers,
+                            const machine::MachineModel &machine,
+                            const TopologyService &topology,
+                            const PlacementOptions &options = {},
+                            bool *truncated = nullptr);
+
 /// Fan-in (design §15.3): one gather plan collecting several producers into one
 /// or more consumers that share a destination memory. `feedCost` is the summed
 /// cost of moving each producer's value to that memory -- a gather sums its
 /// feeds. `bytes` is the gathered tile's size; the search charges its capacity.
-ConnectionPlan synthesizeFanIn(llvm::ArrayRef<InstanceId> producers,
-                               llvm::ArrayRef<InstanceId> consumers,
-                               WorkloadValueId value,
-                               MemoryNodeId consumerMemory, uint64_t bytes,
-                               const Cost &feedCost = {});
+///
+/// `semantics` is the explicit combination the gather performs (task B6); it is
+/// never inferred from the producer count, so a connection that leaves it unset
+/// cannot be materialized. `concatAxis` is set exactly for `Concatenate`; both
+/// are folded into the connection's canonical identity when present. The
+/// producer-side occurrences a gather combines are carried on the plan
+/// projection (`PlanConnection::producerPorts`), not on the `ConnectionPlan`,
+/// which names its producers by instance id.
+ConnectionPlan synthesizeFanIn(
+    llvm::ArrayRef<InstanceId> producers, llvm::ArrayRef<InstanceId> consumers,
+    WorkloadValueId value, MemoryNodeId consumerMemory, uint64_t bytes,
+    const Cost &feedCost = {}, llvm::ArrayRef<PortRef> consumerPorts = {},
+    std::optional<GatherSemantics> semantics = std::nullopt,
+    std::optional<uint64_t> concatAxis = std::nullopt);
 
 } // namespace mlir::llk::mapping
 

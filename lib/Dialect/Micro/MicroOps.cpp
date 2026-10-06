@@ -40,6 +40,47 @@ using namespace mlir;
 using namespace mlir::micro;
 
 //===----------------------------------------------------------------------===//
+// Canonical tile construction (MicroHelpers.h)
+//===----------------------------------------------------------------------===//
+
+Type mlir::micro::materializedTileType(Type source, Attribute memory) {
+  auto memoryAttr = dyn_cast<MemorySpaceAttr>(memory);
+  if (!memoryAttr)
+    return {};
+
+  ArrayRef<int64_t> shape;
+  Type elementType;
+  LayoutAttr layout;
+  OwnerAttr owner;
+  if (auto tile = dyn_cast<TileType>(source)) {
+    shape = tile.getShape();
+    elementType = tile.getElementType();
+    layout = tile.getLayout();
+    owner = tile.getOwner();
+  } else if (auto shaped = dyn_cast<ShapedType>(source)) {
+    // A shaped source must have a statically known image: a dynamic extent has
+    // no tile shape to materialize, so it is refused rather than guessed.
+    if (!shaped.hasStaticShape())
+      return {};
+    shape = shaped.getShape();
+    elementType = shaped.getElementType();
+  } else {
+    return {};
+  }
+
+  // A destination tile needs a concrete storage footprint, so every extent must
+  // be statically known; a dynamic extent has no byte size to reserve and is
+  // refused rather than guessed.
+  for (int64_t dim : shape)
+    if (ShapedType::isDynamic(dim))
+      return {};
+  if (!dtypeOfElementType(elementType))
+    return {};
+  return TileType::get(source.getContext(), shape, elementType, layout,
+                       memoryAttr, owner);
+}
+
+//===----------------------------------------------------------------------===//
 // Custom verifier for KernelOp.
 //===----------------------------------------------------------------------===//
 
@@ -212,6 +253,38 @@ LogicalResult TilePartitionOp::verify() {
   return success();
 }
 
+/// Validates a movement's concrete node identity (`micro.src_node` /
+/// `micro.dst_node`) as *attribute shape*: a recorded node id is a non-empty
+/// string. When the two abstract memories coincide, kind equality is not node
+/// identity, so a same-kind movement must record two *distinct* concrete node
+/// ids; the machine-aware verifier resolves those ids against the machine model
+/// (link, engine, transaction/alignment facts). A same-kind move with no node
+/// identity is rejected here, so `#micro.memory<sram>` -> `#micro.memory<sram>`
+/// can never pass as real work on kind equality alone.
+static LogicalResult verifyMovementNodeIdentity(Operation *op, bool sameSpace) {
+  Attribute src = op->getAttr("micro.src_node");
+  Attribute dst = op->getAttr("micro.dst_node");
+  if (src && !isa<StringAttr>(src))
+    return op->emitOpError() << "'micro.src_node' must be a string memory id";
+  if (dst && !isa<StringAttr>(dst))
+    return op->emitOpError() << "'micro.dst_node' must be a string memory id";
+  if (!sameSpace)
+    return success();
+
+  auto srcId = dyn_cast_or_null<StringAttr>(src);
+  auto dstId = dyn_cast_or_null<StringAttr>(dst);
+  if (!srcId || !dstId || srcId.getValue().empty() || dstId.getValue().empty())
+    return op->emitOpError()
+           << "source and destination memory must differ: a same-kind "
+              "movement requires distinct 'micro.src_node' and "
+              "'micro.dst_node'";
+  if (srcId.getValue() == dstId.getValue())
+    return op->emitOpError()
+           << "'micro.src_node' and 'micro.dst_node' must name distinct "
+              "concrete memories: equal memory kinds are not node identity";
+  return success();
+}
+
 LogicalResult TileAsyncCopyOp::verify() {
   auto sourceType = dyn_cast<TileType>(getSource().getType());
   if (!sourceType)
@@ -228,9 +301,14 @@ LogicalResult TileAsyncCopyOp::verify() {
   if (resultType.getMemory().getValue() != getDstMemory())
     return emitOpError("result tile memory must match destination memory");
 
-  if (sourceType.getMemory() &&
-      sourceType.getMemory().getValue() == getDstMemory())
-    return emitOpError("source and destination memory must differ");
+  // Source and destination *kinds* must differ, unless the op records two
+  // distinct concrete node ids: a machine may hold several memories of one
+  // abstract kind, and a move between two of them is real work even though the
+  // kinds are equal. Kind equality is not node identity.
+  const bool sameSpace = sourceType.getMemory() &&
+                         sourceType.getMemory().getValue() == getDstMemory();
+  if (failed(verifyMovementNodeIdentity(getOperation(), sameSpace)))
+    return failure();
 
   // The copy must preserve shape and element type.
   if (resultType.getShape() != sourceType.getShape())
@@ -367,9 +445,101 @@ LogicalResult ReduceOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
-// Concrete loop/sync op verifiers and parsers
+// Gather and barrier verifiers
 //===----------------------------------------------------------------------===//
 
+/// The static shape and element type a value states, whether it is a
+/// `!micro.tile` or a plain shaped type. A gather may combine either, so both
+/// are read here; a value that is neither is refused by the caller.
+static std::optional<std::pair<llvm::ArrayRef<int64_t>, Type>>
+gatherShapeAndElement(Type type) {
+  if (auto shaped = dyn_cast<ShapedType>(type))
+    return std::make_pair(shaped.getShape(), shaped.getElementType());
+  if (auto tile = dyn_cast<TileType>(type))
+    return std::make_pair(tile.getShape(), tile.getElementType());
+  return std::nullopt;
+}
+
+LogicalResult GatherOp::verify() {
+  std::optional<GatherKind> kind = symbolizeGatherKind(getKind());
+  if (!kind)
+    return emitOpError("unknown gather kind '")
+           << getKind() << "' (expected sum, max, or concat)";
+
+  // A gather combines producers; fewer than two is not a gather.
+  if (getInputs().size() < 2)
+    return emitOpError("gather requires at least two inputs");
+
+  auto result = gatherShapeAndElement(getResult().getType());
+  if (!result)
+    return emitOpError("gather result must be a tile or shaped type");
+
+  SmallVector<llvm::ArrayRef<int64_t>> shapes;
+  for (Value input : getInputs()) {
+    auto shapeAndElement = gatherShapeAndElement(input.getType());
+    if (!shapeAndElement)
+      return emitOpError("gather inputs must be tile or shaped types");
+    if (shapeAndElement->second != result->second)
+      return emitOpError("gather input and result element types must match");
+    shapes.push_back(shapeAndElement->first);
+  }
+
+  if (*kind == GatherKind::concat) {
+    std::optional<int64_t> axis = getAxis();
+    if (!axis)
+      return emitOpError("concat gather requires an axis");
+    if (*axis < 0 || static_cast<uint64_t>(*axis) >= result->first.size())
+      return emitOpError("concat axis must be within the result rank");
+    unsigned position = static_cast<unsigned>(*axis);
+    // Every non-axis extent must match the result and be statically known; the
+    // axis extent must be exactly the sum of the inputs' extents. An unknown
+    // extent has no exact resulting extent, so it is refused rather than
+    // guessed.
+    int64_t axisExtent = 0;
+    for (llvm::ArrayRef<int64_t> shape : shapes) {
+      if (shape.size() != result->first.size())
+        return emitOpError("concat input and result ranks must match");
+      for (unsigned dim = 0; dim < shape.size(); ++dim) {
+        if (dim == position)
+          continue;
+        if (ShapedType::isDynamic(shape[dim]) ||
+            ShapedType::isDynamic(result->first[dim]) ||
+            shape[dim] != result->first[dim])
+          return emitOpError(
+              "concat gather requires every non-axis extent to match exactly");
+      }
+      if (ShapedType::isDynamic(shape[position]))
+        return emitOpError(
+            "concat gather requires statically known input extents");
+      axisExtent += shape[position];
+    }
+    if (ShapedType::isDynamic(result->first[position]) ||
+        axisExtent != result->first[position])
+      return emitOpError("concat result extent along the axis must equal the "
+                         "sum of the input extents");
+    return success();
+  }
+
+  // Sum and Max combine like-for-like operands and must not carry an axis.
+  if (getAxis())
+    return emitOpError("sum and max gather must not carry an axis");
+  for (llvm::ArrayRef<int64_t> shape : shapes)
+    if (shape != result->first)
+      return emitOpError(
+          "sum and max gather inputs and result must have the same shape");
+  return success();
+}
+
+LogicalResult BarrierOp::verify() {
+  if (!symbolizeBarrierScope(getScope()))
+    return emitOpError("unknown barrier scope '")
+           << getScope() << "' (expected executor_group)";
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Concrete loop/sync op verifiers and parsers
+//===----------------------------------------------------------------------===//
 /// Verifies a loop step is positive when statically known.
 static LogicalResult verifyStaticPositiveStep(Operation *op, Value step) {
   if (auto constantOp = step.getDefiningOp<arith::ConstantOp>()) {
@@ -492,8 +662,11 @@ LogicalResult AsyncCopyOp::verify() {
     return emitOpError("source and result must be shaped types");
   if (!isa<AsyncTokenType>(getToken().getType()))
     return emitOpError("token result must be an async token");
-  if (getSrcMemory() == getDstMemory())
-    return emitOpError("source and destination memory must differ");
+  // Same abstract kind is legal only between two distinct concrete nodes; see
+  // `verifyMovementNodeIdentity`.
+  if (failed(verifyMovementNodeIdentity(getOperation(),
+                                        getSrcMemory() == getDstMemory())))
+    return failure();
   return success();
 }
 
@@ -842,9 +1015,21 @@ LogicalResult SearchSpaceOp::verify() {
     if (auto constraint = dyn_cast<ConstraintOp>(op)) {
       for (Attribute param : constraint.getParams()) {
         StringRef name = cast<StringAttr>(param).getValue();
-        if (!params.count(name))
+        if (params.count(name))
+          continue;
+        unsigned matches = 0;
+        for (const auto &entry : params) {
+          auto role = entry.second->getAttrOfType<StringAttr>("role");
+          if (role && role.getValue() == name)
+            ++matches;
+        }
+        if (matches == 0)
           return constraint.emitOpError(
                      "constraint references unknown parameter '")
+                 << name << "'";
+        if (matches > 1)
+          return constraint.emitOpError(
+                     "constraint references ambiguous role '")
                  << name << "'";
       }
       continue;

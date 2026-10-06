@@ -60,6 +60,22 @@ module {
     micro.tile_store %conv {dst_memory = #micro.memory<dram>} : !micro.tile<8x8xf32, memory = #micro.memory<acc>>
     micro.yield
   }
+
+  // An explicit zero offset is still the whole source. The offsets are real SSA
+  // values here, not absent -- but each is a constant zero, so the view starts
+  // at the origin and stays the identity: no slice is needed or emitted.
+  // CHECK-LABEL: func.func @explicit_zero_offsets(%arg0: tensor<8x8xf32>)
+  micro.kernel @explicit_zero_offsets {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %z = arith.constant 0 : index
+    %ta = micro.tile_view %a[%z, %z] {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    // The view is its source: the add reads %arg0 itself twice, not a copy of
+    // it. A dropped-but-nonzero offset would read other elements instead.
+    // CHECK: linalg.generic
+    // CHECK-SAME: ins(%arg0, %arg0 : tensor<8x8xf32>, tensor<8x8xf32>)
+    %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<acc>>
+    micro.yield
+  }
 }
 
 // CHECK-NOT: micro.

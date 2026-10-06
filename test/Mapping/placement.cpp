@@ -2,6 +2,9 @@
 
 #include "LLK/Mapping/Placement.h"
 
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/MLIRContext.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
@@ -292,6 +295,50 @@ TEST(Placement, EnumeratesEveryVisibleMemoryAttachment) {
   ASSERT_EQ(instances->size(), 2u);
   EXPECT_EQ((*instances)[0].memoryBindings.lookup("sram"), "sram.a");
   EXPECT_EQ((*instances)[1].memoryBindings.lookup("sram"), "sram.b");
+}
+
+TEST(Placement, BindsANamedMemoryRequirementToItsOutputPort) {
+  std::unique_ptr<MappingTarget> target = targetFor(attachmentMachine());
+  ASSERT_NE(target, nullptr);
+  MappingCandidate withPorts = coreCandidate();
+  // Two same-kind requirements, each governing its own output occurrence.
+  MemoryRequirement first;
+  first.kind = "sram";
+  first.port = PortRef{0, PortDirection::Output, 0};
+  MemoryRequirement second;
+  second.kind = "sram";
+  second.port = PortRef{0, PortDirection::Output, 1};
+  withPorts.memoryRequirements = {first, second};
+  mlir::MLIRContext context;
+
+  llvm::Expected<std::vector<CandidateInstance>> instances =
+      enumeratePlacements(withPorts, *target, context, LayoutContext{});
+  ASSERT_TRUE(static_cast<bool>(instances))
+      << llvm::toString(instances.takeError());
+  // core.0 sees two sram nodes, so the two requirements cross to four
+  // placements (the last requirement varies fastest).
+  ASSERT_EQ(instances->size(), 4u);
+  // Every requirement named a port, so nothing is filed by kind.
+  EXPECT_TRUE((*instances)[0].memoryBindings.empty());
+
+  auto memoryForPort = [](const CandidateInstance &instance, uint32_t index) {
+    for (const PortMemoryBinding &binding : instance.portMemoryBindings)
+      if (binding.port.direction == PortDirection::Output &&
+          binding.port.index == index)
+        return binding.memory;
+    return std::string();
+  };
+  EXPECT_EQ(memoryForPort((*instances)[0], 0), "sram.a");
+  EXPECT_EQ(memoryForPort((*instances)[0], 1), "sram.a");
+  EXPECT_EQ(memoryForPort((*instances)[1], 0), "sram.a");
+  EXPECT_EQ(memoryForPort((*instances)[1], 1), "sram.b");
+  EXPECT_EQ(memoryForPort((*instances)[2], 0), "sram.b");
+  EXPECT_EQ(memoryForPort((*instances)[2], 1), "sram.a");
+  EXPECT_EQ(memoryForPort((*instances)[3], 0), "sram.b");
+  EXPECT_EQ(memoryForPort((*instances)[3], 1), "sram.b");
+  // The occurrence-to-memory assignment is execution-affecting: two placements
+  // that swap which port gets which node must not share an id.
+  EXPECT_NE((*instances)[1].id, (*instances)[2].id);
 }
 
 TEST(Placement, EnumeratesComputeMemoryAttachmentCombinations) {
@@ -835,4 +882,118 @@ TEST(Placement, ComputeUtilizationStaysZeroWithoutSyncFacts) {
       << llvm::toString(instances.takeError());
   ASSERT_FALSE(instances->empty());
   EXPECT_DOUBLE_EQ(instances->front().localCost.computeUtilization, 0.0);
+}
+
+//===----------------------------------------------------------------------===//
+// Task B8 (closes A9's parked finding): a layout-transform connection is costed
+// from the shared `estimateTransformCost`, so the planner and the performance
+// DAG cannot disagree or double-count.
+//===---------------------------------------------------------------------===//
+
+/// One worker with a vector engine that sees a single SRAM able to hold both
+/// layouts, so a layout difference becomes an in-place transform.
+MachineModel transformConnectionMachine() {
+  MachineModel model;
+  model.target = "transform-connection";
+  model.workerThreads = 1;
+  model.sync.waitCycles = 1;
+  model.sync.barrierCycles = 1;
+  model.executors = {{"core.0", "worker", std::nullopt, {}, 1, {}}};
+
+  ComputeNode vpu;
+  vpu.id = "vpu";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "core.0";
+  vpu.lanes["f32"] = 8;
+  vpu.issueCycles = 1;
+  model.computes.push_back(vpu);
+
+  MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "core.0";
+  sram.capacityBytes = 1u << 20;
+  sram.alignmentBytes = 64;
+  sram.supportedLayouts = {"row_major", "blocked"};
+  model.memories.push_back(sram);
+  return model;
+}
+
+TEST(Placement, LayoutTransformChargesTheSharedEstimate) {
+  mlir::MLIRContext context;
+  MachineModel machine = transformConnectionMachine();
+  TopologyService topology(machine);
+  auto type =
+      mlir::RankedTensorType::get({8, 8}, mlir::Float32Type::get(&context));
+
+  ConnectionRequest request;
+  request.producer = 1;
+  request.consumer = 2;
+  request.value = 0;
+  request.producerMemory = "sram.0";
+  request.consumerMemory = "sram.0";
+  request.producerLayout = "row_major";
+  request.consumerLayout = "blocked";
+  request.producerLayoutMap =
+      mlir::AffineMap::getMultiDimIdentityMap(2, &context);
+  request.consumerLayoutMap = mlir::AffineMap::getPermutationMap(
+      llvm::ArrayRef<unsigned>{1u, 0u}, &context);
+  request.elementType = type;
+  request.consumerType = type;
+  request.producerExecutor = "core.0";
+  request.consumerExecutor = "core.0";
+  request.bytes = 256;
+  request.alignmentBytes = 64;
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology, {});
+  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
+  ASSERT_EQ(plans->size(), 1u);
+  const ConnectionPlan &plan = plans->front();
+  EXPECT_EQ(plan.kind, ConnectionKind::LayoutTransform);
+
+  // The cost is exactly the shared estimate for the selected resource.
+  TransformCostInput input;
+  input.inputType = type;
+  input.outputType = type;
+  input.srcMap = request.producerLayoutMap;
+  input.dstMap = request.consumerLayoutMap;
+  input.memoryNode = "sram.0";
+  input.computeResource = "vpu";
+  llvm::Expected<Cost> shared = estimateTransformCost(input, machine);
+  ASSERT_TRUE(static_cast<bool>(shared)) << llvm::toString(shared.takeError());
+  EXPECT_DOUBLE_EQ(plan.cost.latencyCycles, shared->latencyCycles);
+  EXPECT_EQ(plan.cost.localBytes, shared->localBytes);
+  // 64 f32 elements over 8 lanes: 8 one-cycle issues.
+  EXPECT_DOUBLE_EQ(plan.cost.latencyCycles, 8.0);
+  EXPECT_EQ(plan.cost.localBytes, 256u);
+}
+
+// A hand-built request that states no measurable footprint is rejected rather
+// than charged a kept byte count: the shared transform estimator is
+// authoritative, so a conversion whose footprint it cannot measure fails closed
+// instead of producing a plan whose cost was never modeled. (The surviving
+// transform-cost mechanism is the shared estimator; the earlier "keep the
+// recorded bytes when unmeasurable" fallback was removed with the duplicate
+// charge paths — issue #67 stage A, A9.)
+TEST(Placement, LayoutTransformWithoutFootprintIsRejected) {
+  mlir::MLIRContext context;
+  MachineModel machine = transformConnectionMachine();
+  TopologyService topology(machine);
+
+  ConnectionRequest request;
+  request.producer = 1;
+  request.consumer = 2;
+  request.value = 0;
+  request.producerMemory = "sram.0";
+  request.consumerMemory = "sram.0";
+  request.producerLayout = "row_major";
+  request.consumerLayout = "blocked";
+  request.bytes = 128;
+
+  llvm::Expected<std::vector<ConnectionPlan>> plans =
+      synthesizeConnections(request, machine, topology, {});
+  ASSERT_FALSE(static_cast<bool>(plans));
+  std::string text = llvm::toString(plans.takeError());
+  EXPECT_NE(text.find("shaped type"), std::string::npos) << text;
 }

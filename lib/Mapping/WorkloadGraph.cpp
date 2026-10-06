@@ -8,6 +8,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <functional>
+#include <limits>
 #include <numeric>
 
 namespace mlir::llk::mapping {
@@ -68,6 +69,65 @@ std::optional<int64_t> constantIndex(Value value) {
   if (auto attr = op->getAttrOfType<IntegerAttr>("value"))
     return attr.getInt();
   return std::nullopt;
+}
+
+/// The number of iterations a `micro.for` / `micro.spatial_for` performs, when
+/// its lower bound, upper bound, and step are all constant indices. `nullopt`
+/// when any bound is not a constant (a non-positive step or an empty range is
+/// likewise not represented as a multiplicity).
+std::optional<uint64_t> loopTripCount(Operation *loop) {
+  if (loop->getNumOperands() < 3)
+    return std::nullopt;
+  std::optional<int64_t> lower = constantIndex(loop->getOperand(0));
+  std::optional<int64_t> upper = constantIndex(loop->getOperand(1));
+  std::optional<int64_t> step = constantIndex(loop->getOperand(2));
+  if (!lower || !upper || !step || *step <= 0 || *upper <= *lower)
+    return std::nullopt;
+  // Compute the span in unsigned arithmetic: `*upper - *lower` as signed int64
+  // would be UB for pathological bounds (for example INT64_MIN..INT64_MAX) even
+  // though the `*upper > *lower` guard above makes the difference positive.
+  uint64_t span = static_cast<uint64_t>(*upper) - static_cast<uint64_t>(*lower);
+  uint64_t stride = static_cast<uint64_t>(*step);
+  if (span > std::numeric_limits<uint64_t>::max() - (stride - 1))
+    return std::nullopt; // the rounded-up span would overflow
+  return (span + stride - 1) / stride;
+}
+
+/// The stage count a `micro.pipeline` declares, when positive.
+std::optional<uint64_t> pipelineStages(Operation *pipeline) {
+  if (auto stages = pipeline->getAttrOfType<IntegerAttr>("stages"))
+    if (stages.getInt() > 0)
+      return static_cast<uint64_t>(stages.getInt());
+  return std::nullopt;
+}
+
+/// The execution multiplicity of a compute op: the product of the factors of
+/// every structural op between it and `kernel` (`micro.for` /
+/// `micro.spatial_for` trip counts, `micro.pipeline` stage counts). `1` when no
+/// structural op encloses it -- a bare op runs once. `nullopt` when any
+/// enclosing factor is not statically recoverable, so an unknown loop is
+/// *reported* as unknown rather than assumed to run once.
+std::optional<uint64_t> executionMultiplicityOf(Operation *op,
+                                                Operation *kernel) {
+  uint64_t product = 1;
+  for (Operation *parent = op->getParentOp(); parent && parent != kernel;
+       parent = parent->getParentOp()) {
+    llvm::StringRef name = parent->getName().getStringRef();
+    std::optional<uint64_t> factor;
+    if (name == "micro.for" || name == "micro.spatial_for")
+      factor = loopTripCount(parent);
+    else if (name == "micro.pipeline")
+      factor = pipelineStages(parent);
+    else
+      continue;
+    if (!factor)
+      return std::nullopt;
+    uint64_t scaled = 0;
+    if (__builtin_mul_overflow(product, *factor, &scaled))
+      return std::nullopt;
+    product = scaled;
+  }
+  return product;
 }
 
 /// The affine relationship a chain of logical ops states between an operand's
@@ -199,6 +259,31 @@ const WorkloadValue *WorkloadGraph::findValue(WorkloadValueId id) const {
   if (id >= values.size())
     return nullptr;
   return &values[id];
+}
+
+const WorkloadPort *lookupPort(const WorkloadGraph &graph, const PortRef &ref) {
+  const WorkloadNode *node = graph.findNode(ref.node);
+  if (!node)
+    return nullptr;
+  switch (ref.direction) {
+  case PortDirection::Input:
+    if (ref.index >= node->inputs.size())
+      return nullptr;
+    return &node->inputs[ref.index];
+  case PortDirection::Output:
+    if (ref.index >= node->outputs.size())
+      return nullptr;
+    return &node->outputs[ref.index];
+  }
+  // Reached only for a direction value that is not one of the two ranks; a
+  // reference it renders is not a port.
+  return nullptr;
+}
+
+std::string canonicalPortRefString(const PortRef &p) {
+  return "node=" + std::to_string(p.node) +
+         (p.direction == PortDirection::Input ? ",input=" : ",output=") +
+         std::to_string(p.index);
 }
 
 void WorkloadGraph::finalize(
@@ -372,6 +457,10 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
       node.opName = name.getStringRef().str();
       node.attributes = op->getAttrDictionary();
       node.sourceOrdinal = ordinal;
+      // Recover the node's execution multiplicity from its enclosing structural
+      // ops, so a strict storage plan sees a real, statically-known loop bound
+      // rather than an always-unknown node.
+      node.executionMultiplicity = executionMultiplicityOf(op, kernel);
       ordinalOps[ordinal] = op;
       ++ordinal;
       for (Value operand : op->getOperands()) {

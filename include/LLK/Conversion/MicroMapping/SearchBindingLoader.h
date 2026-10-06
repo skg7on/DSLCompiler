@@ -114,6 +114,22 @@ loadSearchBinding(mlir::ModuleOp module, llvm::StringRef candidateSymbol = "");
 llvm::Expected<llvm::StringMap<std::string>>
 loadBoundLayouts(mlir::ModuleOp module, const SearchBinding &binding);
 
+/// The `owner_mapping`/`memory_path` axes the binding resolves, found by each
+/// parameter's declared `kind` -- never by name, so a space that calls its
+/// parameter `owner` (kind `owner_mapping`) is still honoured. The mapping
+/// engine consumes these as explicit requirements (see `mapping::BoundAxes`),
+/// which is why the resolution lives here: only this layer can see the search
+/// space's parameter kinds. A space that declares neither kind binds neither
+/// axis, so the projection is byte-identical to a binding-free search.
+///
+/// Fails when `binding.candidateId` names no candidate in `module`, when the
+/// candidate is not nested in a `micro.search_space`, when the space declares
+/// more than one parameter of a kind (which one selects the axis is then not
+/// expressible), when a bound axis parameter is missing, or when it does not
+/// hold a string.
+llvm::Expected<BoundAxes> loadBoundAxes(mlir::ModuleOp module,
+                                        const SearchBinding &binding);
+
 /// Evaluates the selected search space's `micro.constraint`s against the
 /// binding, using the machine model and a workload shape derived from `kernel`.
 ///

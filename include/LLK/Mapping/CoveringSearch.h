@@ -60,6 +60,11 @@ struct MappingSearchOptions {
   unsigned maxCandidatesPerNode = 64;
   unsigned maxInstancesPerCandidate = 64;
   unsigned maxRoutesPerConnection = 8;
+  /// Upper bound on the joint connection combinations one placement may branch
+  /// into (task B7). Exact explores every combination within this cap; reaching
+  /// it is a *cap*, reported through `searchTruncated`, and never conflated
+  /// with the solver-undecided status.
+  unsigned maxConnectionCombinations = 64;
   uint64_t memoryBudgetBytes = 512ULL << 20;
   bool enableLatencyCache = true;
   bool enableSymmetryReduction = true;
@@ -109,14 +114,16 @@ struct MappingSearchResult {
   std::vector<CoveringPlan> plans;
   /// True when any cap ended the search early.
   bool searchTruncated = false;
-  /// True when the search picked each connection's locally cheapest alternative
-  /// instead of branching over the alternatives the topology offered (set in
-  /// exact mode; the beam and deterministic modes are heuristic by contract).
-  /// The result is then not an exhaustive joint placement/route search: a
-  /// covering rejected here may still be feasible through a more expensive
-  /// route combination. Distinct from `searchTruncated` -- this holds with
-  /// every cap lifted -- and reported with
-  /// `DiagnosticCode::ConnectionChoiceUnexplored`.
+  /// True when the search collapsed a connection's alternatives to its locally
+  /// cheapest instead of branching over them, so the result is not an
+  /// exhaustive joint placement/route search. Since task B7 every mode branches
+  /// over the joint connection combinations within the reported caps, so the
+  /// search itself no longer sets this -- a full search is never a collapse. It
+  /// is retained because it is part of the result's public shape (a report, or
+  /// a caller that deliberately collapses, still records it) and because
+  /// `DiagnosticCode::ConnectionChoiceUnexplored` remains the stable notice a
+  /// collapse is reported with. A *cap* is reported separately through
+  /// `searchTruncated` and never as a collapse.
   bool connectionChoicesUnexplored = false;
   FailureFrontier frontier;
   /// Partial plans the search expanded, for diagnostics.
@@ -133,6 +140,10 @@ struct MappingSearchResult {
   uint64_t routeCount = 0;
   /// Complete plans found before the top-K cap truncated `plans`.
   uint64_t planCount = 0;
+  /// The canonical, pre-materialization content hash of the workload graph the
+  /// search ran over (`computeSourceGraphHash`). A report records it so a
+  /// reader can require the same source identity before replaying a selection.
+  uint64_t workloadHash = 0;
 };
 
 /// Searches one workload graph against one target.
@@ -142,7 +153,8 @@ public:
                  mlir::MLIRContext &context, const LayoutContext &layoutContext,
                  const MappingSearchOptions &options = {},
                  std::optional<SearchBinding> binding = std::nullopt,
-                 llvm::StringMap<std::string> boundLayouts = {});
+                 llvm::StringMap<std::string> boundLayouts = {},
+                 BoundAxes boundAxes = {});
 
   llvm::Expected<MappingSearchResult> search();
 
@@ -176,6 +188,13 @@ private:
   /// nor contradicts the bound value. Absent leaves layout selection exactly as
   /// it was before bindings.
   llvm::StringMap<std::string> boundLayouts_;
+  /// The `owner_mapping`/`memory_path` axes the binding resolves, projected by
+  /// the caller (the pass layer, which alone can see the parameter *kinds*).
+  /// Placement is otherwise binding-independent (ruling S3); these axes are the
+  /// exception because they name abstract capability choices, not concrete
+  /// machine resources. Empty leaves every axis exactly as the rules declare
+  /// it.
+  BoundAxes boundAxes_;
 };
 
 } // namespace mlir::llk::mapping
