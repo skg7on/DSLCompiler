@@ -897,12 +897,70 @@ LogicalResult SpatialForOp::verify() {
   return verifyLoopCarriedValues(*this);
 }
 
+ParseResult PipelineOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto &builder = parser.getBuilder();
+
+  // `stages = N`
+  IntegerAttr stages;
+  if (parser.parseKeyword("stages") || parser.parseEqual() ||
+      parser.parseAttribute(stages, builder.getI64Type(), "stages",
+                            result.attributes))
+    return failure();
+
+  // An optional `-> (types)` clause: a pipeline that overlaps compute with the
+  // movement feeding it has to be able to hand the computed value back out.
+  if (succeeded(parser.parseOptionalArrow())) {
+    SmallVector<Type> resultTypes;
+    if (parser.parseLParen() || parser.parseTypeList(resultTypes) ||
+        parser.parseRParen())
+      return failure();
+    result.addTypes(resultTypes);
+  }
+
+  Region *body = result.addRegion();
+  if (parser.parseRegion(*body))
+    return failure();
+  PipelineOp::ensureTerminator(*body, builder, result.location);
+  return success();
+}
+
+void PipelineOp::print(OpAsmPrinter &printer) {
+  printer << " stages = " << getStages();
+  if (!getResults().empty()) {
+    printer << " -> (";
+    llvm::interleaveComma(getResults().getTypes(), printer);
+    printer << ")";
+  }
+  printer.printOptionalAttrDictWithKeyword((*this)->getAttrs(),
+                                           /*elidedAttrs=*/{"stages"});
+  printer << ' ';
+  // With nothing to carry, the implicit terminator stays implicit -- the form
+  // every existing fixture prints.
+  printer.printRegion(getBody(), /*printEntryBlockArgs=*/false,
+                      /*printBlockTerminators=*/!getResults().empty());
+}
+
 LogicalResult PipelineOp::verify() {
   if (getStages() < 1)
     return emitOpError("pipeline stages must be at least 1");
   for (Operation &op : getBody().getOps())
     if (auto nested = dyn_cast<PipelineOp>(op))
       return nested.emitOpError("nested pipeline is not allowed");
+
+  // Whatever the pipeline claims to carry has to actually be yielded.
+  auto yield = dyn_cast<YieldOp>(getBody().front().getTerminator());
+  if (!yield)
+    return emitOpError("body must terminate with micro.yield");
+  if (yield.getNumOperands() != getResults().size())
+    return emitOpError() << "body yields " << yield.getNumOperands()
+                         << " value(s) but the pipeline has "
+                         << getResults().size() << " result(s)";
+  for (unsigned i = 0, e = getResults().size(); i < e; ++i)
+    if (yield.getOperand(i).getType() != getResults()[i].getType())
+      return emitOpError() << "yielded value #" << i << " has type "
+                           << yield.getOperand(i).getType()
+                           << " but the pipeline's result is "
+                           << getResults()[i].getType();
   return success();
 }
 

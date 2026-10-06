@@ -60,10 +60,12 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: %[[GATE_ACC:.*]] = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
 // CHECK: %[[UP_ACC:.*]] = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
 
-// The K loop carries the pipeline, which is the position the performance model
-// reads as software pipelining.
-// CHECK: micro.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} {
-// CHECK: micro.pipeline stages = 1 {
+// The K loop carries both accumulators, and the pipeline carries them out of
+// its own body, because the MMAs run inside it and the loop's terminator could
+// not otherwise see them. The pipeline sits inside the loop body: that is the
+// position the performance model reads as software pipelining.
+// CHECK: %[[LOOP:.*]]:2 = micro.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%[[GATE_CARRY:.*]] = %[[GATE_ACC]], %[[UP_CARRY:.*]] = %[[UP_ACC]]) -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>, !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>) {
+// CHECK: %[[PIPED:.*]]:2 = micro.pipeline stages = 1 -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>, !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>) {
 
 // Each input is viewed logically, then materialized into the staging level.
 // CHECK: %[[XV:.*]] = micro.tile_view %[[X]]{{.*}} {layout = #micro.layout<row_major, vector = 8>, shape = array<i64: 8, 32>} : tensor<16x64xbf16> -> !micro.tile<8x32xbf16, layout = #micro.layout<row_major, vector = 8>, memory = #micro.memory<dram>>
@@ -82,15 +84,21 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: micro.tile_partition %[[WGT]] {owner = #micro.owner<vector_engine>, shape = array<i64: 32, 16>} : {{.*}} -> !micro.tile<32x16xbf16, {{.*}}owner = #micro.owner<vector_engine>>
 // CHECK: micro.tile_partition %[[WUT]] {owner = #micro.owner<vector_engine>, shape = array<i64: 32, 16>} : {{.*}} -> !micro.tile<32x16xbf16, {{.*}}owner = #micro.owner<vector_engine>>
 
-// One MMA per projection, both feeding the accumulators in acc memory.
-// CHECK: micro.mma %[[XT]], %[[WGT]], %[[GATE_ACC]] {accumulator = #micro.dtype<f32>, input = #micro.dtype<bf16>, shape = array<i64: 8, 32, 32>}
-// CHECK: micro.mma %[[XT]], %[[WUT]], %[[UP_ACC]] {accumulator = #micro.dtype<f32>, input = #micro.dtype<bf16>, shape = array<i64: 8, 32, 32>}
+// One MMA per projection, each accumulating into the value the loop carried in
+// for its own arm.
+// CHECK: %[[GATE_NEXT:.*]] = micro.mma %[[XT]], %[[WGT]], %[[GATE_CARRY]] {accumulator = #micro.dtype<f32>, input = #micro.dtype<bf16>, shape = array<i64: 8, 32, 32>}
+// CHECK: %[[UP_NEXT:.*]] = micro.mma %[[XT]], %[[WUT]], %[[UP_CARRY]] {accumulator = #micro.dtype<f32>, input = #micro.dtype<bf16>, shape = array<i64: 8, 32, 32>}
+
+// The carry is real at both levels.
+// CHECK: micro.yield %[[GATE_NEXT]], %[[UP_NEXT]] : {{.*}}
+// CHECK: micro.yield %[[PIPED]]#0, %[[PIPED]]#1 : {{.*}}
 
 // The epilogue runs once per output tile, after the K loop: SiLU on the gate
 // accumulator, the gating multiply, then the narrowing to the output dtype and
-// the write back to external memory.
-// CHECK: %[[GATE:.*]] = micro.vector "silu" %[[GATE_ACC]] {math_mode = "bounded_fast"}
-// CHECK: %[[MUL:.*]] = micro.vector "mul" %[[GATE]], %[[UP_ACC]]
+// the write back to external memory. It reads the loop's *results*, which is
+// what proves both accumulators were threaded.
+// CHECK: %[[GATE:.*]] = micro.vector "silu" %[[LOOP]]#0 {math_mode = "bounded_fast"}
+// CHECK: %[[MUL:.*]] = micro.vector "mul" %[[GATE]], %[[LOOP]]#1
 // CHECK: %[[OUT:.*]] = micro.vector "convert" %[[MUL]] : {{.*}} -> !micro.tile<8x32xbf16, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
 // CHECK: micro.tile_store %[[OUT]] {dst_memory = #micro.memory<dram>}
 

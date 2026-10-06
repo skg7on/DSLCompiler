@@ -451,13 +451,31 @@ def Micro_PipelineOp
   let description = [{
         Marks pipeline overlap between data movement and compute. The stages
         attribute controls the number of pipeline stages.
+
+        A pipeline may carry values out of its body, on the same terms as a
+        loop: `micro.yield` names them and the pipeline's results are those
+        values. It needs this because the compute it overlaps with often
+        accumulates into something the staged movement produced, and the value
+        has to reach whatever comes after the pipeline:
+
+        ```mlir
+        %acc = micro.pipeline stages = 2 -> (!micro.tile<8x32xf32, memory = #micro.memory<acc>>) {
+          %next = micro.mma %a, %b, %carried
+          micro.yield %next : !micro.tile<8x32xf32, memory = #micro.memory<acc>>
+        }
+        ```
+
+        With no results the pipeline carries nothing and prints without the
+        clause, which is the form every existing fixture uses.
     }];
 
   let arguments = (ins I64Attr:$stages);
 
+  let results = (outs Variadic<AnyType>:$results);
+
   let regions = (region SizedRegion<1>:$body);
 
-  let assemblyFormat = "`stages` `=` $stages attr-dict-with-keyword $body";
+  let hasCustomAssemblyFormat = 1;
 
   let hasVerifier = 1;
 }

@@ -518,7 +518,8 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   // `micro.pipeline` goes inside the loop body: that is the position MicroDAG
   // reads as software pipelining.
   auto pipeline = micro::PipelineOp::create(
-      builder, loc, static_cast<uint64_t>(decisions.pipelineStages));
+      builder, loc, TypeRange{},
+      static_cast<uint64_t>(decisions.pipelineStages));
   startRegionBody(builder, pipeline.getBody(), loc);
 
   // --- logical views and staged copies -----------------------------------

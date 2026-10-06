@@ -606,15 +606,26 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
       arith::ConstantIndexOp::create(builder, loc, plan.K).getResult();
   Value kStep =
       arith::ConstantIndexOp::create(builder, loc, plan.BK).getResult();
-  auto kLoop = micro::ForOp::create(builder, loc, TypeRange{}, kLower, kUpper,
-                                    kStep, ValueRange{});
-  BlockArgument bk = startRegionBody(builder, kLoop.getBody(), loc,
-                                     TypeRange{IndexType::get(ctx)})
-                         ->getArgument(0);
+  // The loop carries the accumulators. What an iteration computes is what the
+  // next iteration accumulates into, and what the last one left is the kernel's
+  // result. Without the carried values the MMA inside the loop would compute
+  // dead results while the epilogue read an allocation nothing ever wrote.
+  llvm::SmallVector<Type> carriedTypes(accumulators.size(), accTileType);
+  auto kLoop = micro::ForOp::create(builder, loc, carriedTypes, kLower, kUpper,
+                                    kStep, ValueRange(accumulators));
+  llvm::SmallVector<Type> kBodyTypes{IndexType::get(ctx)};
+  kBodyTypes.append(carriedTypes);
+  Block *kBody = startRegionBody(builder, kLoop.getBody(), loc, kBodyTypes);
+  BlockArgument bk = kBody->getArgument(0);
+  llvm::SmallVector<BlockArgument> carried;
+  for (size_t arm = 0; arm < accumulators.size(); ++arm)
+    carried.push_back(kBody->getArgument(arm + 1));
 
   // `micro.pipeline` goes inside the loop body: that is the position MicroDAG
-  // reads as software pipelining. With one stage the two spellings agree.
-  auto pipeline = micro::PipelineOp::create(builder, loc,
+  // reads as software pipelining. With one stage the two spellings agree. It
+  // carries the accumulators out of its own body, because the MMA it overlaps
+  // runs inside it and the loop above still has to hand the result on.
+  auto pipeline = micro::PipelineOp::create(builder, loc, carriedTypes,
                                             static_cast<uint64_t>(plan.stages));
   startRegionBody(builder, pipeline.getBody(), loc);
 
@@ -680,17 +691,43 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
           /*tail=*/BoolAttr());
 
   // --- MMA ---------------------------------------------------------------
+  // Each arm accumulates into the value the loop carried in, not into the
+  // original allocation: the carried value is this iteration's accumulator.
   DenseI64ArrayAttr mmaShape = DenseI64ArrayAttr::get(
       ctx, SmallVector<int64_t, 3>{plan.BM, plan.BN, plan.BK});
+  llvm::SmallVector<Value> nextAccumulators;
   for (size_t arm = 0; arm < rhsStaged.size(); ++arm)
-    micro::MmaOp::create(
-        builder, loc, accTileType, lhsStaged, rhsStaged[arm], accumulators[arm],
-        mmaShape,
-        micro::DTypeAttr::get(ctx,
-                              *micro::dtypeOfElementType(plan.inputElemType)),
-        micro::DTypeAttr::get(
-            ctx, *micro::dtypeOfElementType(plan.accumulatorElemType)),
-        /*engine=*/StringAttr());
+    nextAccumulators.push_back(
+        micro::MmaOp::create(
+            builder, loc, accTileType, lhsStaged, rhsStaged[arm], carried[arm],
+            mmaShape,
+            micro::DTypeAttr::get(
+                ctx, *micro::dtypeOfElementType(plan.inputElemType)),
+            micro::DTypeAttr::get(
+                ctx, *micro::dtypeOfElementType(plan.accumulatorElemType)),
+            /*engine=*/StringAttr())
+            .getResult());
+
+  // The pipeline hands the computed values out of its body, and the loop hands
+  // them to the next iteration. Both steps are what make the carry real rather
+  // than implied: the MMA runs inside the pipeline, so without the first the
+  // value would not be visible to the loop's own terminator at all.
+  if (auto terminator = dyn_cast<micro::YieldOp>(
+          pipeline.getBody().front().getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, nextAccumulators);
+    terminator.erase();
+  }
+  if (auto terminator = dyn_cast<micro::YieldOp>(kBody->getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, pipeline.getResults());
+    terminator.erase();
+  }
+
+  // Everything after the loop reads what the loop left, so the epilogue and the
+  // write-back see the accumulated result rather than the initial allocation.
+  for (size_t arm = 0; arm < accumulators.size(); ++arm)
+    accumulators[arm] = kLoop.getResults()[arm];
 
   // The epilogue belongs to the output tile, not to one K iteration.
   builder.setInsertionPoint(kLoop->getNextNode());
