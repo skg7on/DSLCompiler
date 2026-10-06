@@ -32,9 +32,14 @@
 #include "LLK/Perf/ScheduleRecord.h"
 #include "LLK/Perf/SearchSpace.h"
 
+#include "mlir/IR/BuiltinOps.h"
+
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -44,6 +49,51 @@ class MLIRContext;
 
 namespace mlir::llk::perf {
 
+/// The metrics a tuning objective may name.
+///
+/// The tuner ranks by these and produces every one of them, except the two
+/// measured ones, which a measurement provider supplies and which fall back to
+/// their static counterparts when it has none.
+bool isKnownMetric(llvm::StringRef name);
+
+/// Checks that every metric an objective names is one the tuner can rank by.
+///
+/// A name outside that set is a *usage error*, not a neutral zero. An objective
+/// naming a metric the model never computes would rank every candidate equal
+/// under it and still look like it had decided something; the design names
+/// `capacity_spill_bytes`, which is not modelled, so it is refused for exactly
+/// that reason rather than quietly ignored.
+llvm::Error validateObjective(const SearchObjective &objective);
+
+/// Measures one ranked candidate.
+///
+/// The session hands over the candidate's bound module; a provider that wants a
+/// running kernel compiles it -- `compileMappedKernel` is what a mapping caller
+/// passes -- and invokes it. Keeping the compilation on this side is what keeps
+/// the tuning core off the JIT while still making a measurement an answer about
+/// code that actually ran.
+///
+/// The two failures are different and are reported differently:
+///   * `llvm::Error` -- the candidate could not be compiled or verified, which
+///     is a rejection carrying that reason;
+///   * `std::nullopt` -- a *miss*: the static score stands and legality is
+///     untouched, because an unavailable measurement is not a rejection.
+using MeasurementProvider =
+    std::function<llvm::Expected<std::optional<CandidateMetrics>>(
+        mlir::ModuleOp boundModule, const TuningResult &candidate)>;
+
+struct MeasurementOptions {
+  MeasurementProvider provider;
+  /// How many of the best-ranked candidates to measure. Zero measures none.
+  uint64_t measureTop = 1;
+  /// Recorded on every measurement so a stored number can be traced to the
+  /// target, machine and model that produced it. Production persistence (and
+  /// the calibration that reads it back) stays with #51/#52.
+  std::string targetIdentity;
+  std::string machineIdentity;
+  std::string abiIdentity;
+};
+
 struct TuningSessionOptions {
   CandidateGeneratorOptions generator;
   /// 0 static bound only, 1 also schedule resources.
@@ -52,6 +102,9 @@ struct TuningSessionOptions {
   uint64_t topK = 10;
   /// Path the machine model was read from, recorded in every schedule record.
   std::string machinePath;
+  /// Optional measurement of the best candidates. Empty measures none, so the
+  /// default session is exactly the static ranking it always was.
+  MeasurementOptions measurement;
 };
 
 /// One legal candidate with the cost it was predicted and the decisions it
@@ -59,6 +112,15 @@ struct TuningSessionOptions {
 struct RankedCandidate {
   TuningResult result;
   BoundTileDecisions decisions;
+  /// What a measurement observed, when one ran. Unset for a candidate that was
+  /// never measured, and for one the provider could not measure.
+  std::optional<CandidateMetrics> measured;
+  /// The target, machine and ABI the measurement was taken against. A stored
+  /// cycle count is only interpretable with these, which is why they travel
+  /// with it rather than being looked up later.
+  std::string measuredTarget;
+  std::string measuredMachine;
+  std::string measuredAbi;
 };
 
 struct TuningSessionReport {
@@ -70,15 +132,38 @@ struct TuningSessionReport {
   uint64_t generated = 0;
   /// Legal candidates, best first, at most `topK` of them.
   std::vector<RankedCandidate> ranked;
-  /// Illegal (or unbindable) candidates, in generation order, each with a
-  /// stable rejection reason.
+  /// Illegal, unbindable, or uncompilable candidates, in generation order,
+  /// each with a stable rejection reason.
   std::vector<TuningResult> rejected;
+
+  /// The objective the ranking used, recorded so a reader can tell what "best"
+  /// meant rather than having to find the search space again.
+  SearchObjective objective;
+  /// The report schema, bumped when a field's meaning changes, so a stored
+  /// report is never read as a different one.
+  uint32_t schemaVersion = 1;
 };
+
+/// Compiles and measures the best-ranked candidates.
+///
+/// Each is bound again into a scratch module -- binding is deterministic, so
+/// the module measured is the one the ranking described -- and handed to the
+/// provider. A candidate whose compilation fails moves to `rejected` with the
+/// compiler's reason, because a plan that cannot be turned into code is not a
+/// candidate whatever its predicted cost; a candidate the provider cannot
+/// measure keeps its static score and stays ranked, because a miss is not a
+/// rejection.
+llvm::Error measureTopCandidates(mlir::MLIRContext &context,
+                                 const SearchSpace &space,
+                                 const WorkloadShape &shape,
+                                 TuningSessionReport &report,
+                                 const MeasurementOptions &options);
 
 /// True when `a` ranks before `b` under `objective`: primary metric first, then
 /// the secondary metrics in order, then the candidate id ascending. The metric
-/// name maps to a CandidateMetrics field; an unknown name is neutral, so it
-/// never reorders the result.
+/// name maps to a CandidateMetrics field; `validateObjective` is what rejects a
+/// name with no field, so a ranking that runs at all is ranking by something
+/// the model produces.
 bool ranksBefore(const TuningResult &a, const TuningResult &b,
                  const SearchObjective &objective);
 

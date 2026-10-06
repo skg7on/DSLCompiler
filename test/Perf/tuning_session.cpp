@@ -16,9 +16,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Perf/ScheduleRecord.h"
 #include "LLK/Perf/TuningSession.h"
+#include "LLK/Runtime/MappedExecutable.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 
@@ -29,6 +31,8 @@
 
 #include "gtest/gtest.h"
 
+#include <chrono>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <optional>
@@ -272,6 +276,21 @@ SearchParam symbolicParam(std::string name, std::string kind,
   return SearchParam{std::move(name), std::move(kind), std::move(choices)};
 }
 
+/// `bfloat16` is the top half of an `f32`, which is all the test needs to seed
+/// operands and read results: 1.0 and 4096.0 are both exact in it.
+uint16_t toBf16(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return static_cast<uint16_t>(bits >> 16);
+}
+
+float fromBf16(uint16_t value) {
+  uint32_t bits = static_cast<uint32_t>(value) << 16;
+  float result;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result;
+}
+
 /// A space with two candidates that differ only in num_threads: 8 is legal on
 /// the AVX2 model, 16 is not.
 SearchSpace threadChoiceSpace() {
@@ -413,6 +432,273 @@ TEST(TuningSession, BuildsScheduleRecordsWithTileDecisions) {
   std::string yaml = yamlOf(records);
   EXPECT_NE(yaml.find("      worker: [8, 64, 64]\n"), std::string::npos);
   EXPECT_NE(yaml.find("workload: fused_swiglu\n"), std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Stage C6: the objective is checked, and candidates can be measured
+//===----------------------------------------------------------------------===//
+
+TEST(Objective, RejectsAMetricTheModelDoesNotProduce) {
+  // `capacity_spill_bytes` is named by the design and not modelled. Ranking by
+  // it would order every candidate equally and still look like a decision, so
+  // it is a usage error rather than a silent zero.
+  SearchObjective objective;
+  objective.primaryMetric = "capacity_spill_bytes";
+  llvm::Error error = validateObjective(objective);
+  ASSERT_TRUE(static_cast<bool>(error));
+  EXPECT_NE(llvm::toString(std::move(error)).find("capacity_spill_bytes"),
+            std::string::npos);
+
+  // Refused wherever it appears, not only as the primary metric.
+  SearchObjective secondary;
+  secondary.primaryMetric = "latency_cycles";
+  secondary.secondaryMetrics = {"not_a_metric"};
+  EXPECT_TRUE(static_cast<bool>(validateObjective(secondary)));
+}
+
+TEST(Objective, AcceptsEveryMetricTheTunerProduces) {
+  for (llvm::StringRef name :
+       {"latency_cycles", "dram_bytes", "sram_bytes", "matrix_utilization",
+        "dma_utilization", "measured_ns", "measured_gflops"}) {
+    SearchObjective objective;
+    objective.primaryMetric = name.str();
+    EXPECT_FALSE(static_cast<bool>(validateObjective(objective))) << name.str();
+  }
+}
+
+TEST(TuningSession, RefusesAnObjectiveItCannotRankBy) {
+  auto context = perfContext();
+  SearchSpace space = threadChoiceSpace();
+  space.objective.primaryMetric = "capacity_spill_bytes";
+
+  auto report = runTuningSession(*context, space, swigluShape(), avx2(), {});
+  ASSERT_FALSE(static_cast<bool>(report));
+  EXPECT_NE(llvm::toString(report.takeError()).find("capacity_spill_bytes"),
+            std::string::npos);
+}
+
+TEST(Ranking, OrdersByANonLatencyPrimaryMetricThenASecondary) {
+  // A has the smaller DRAM footprint, B the better utilization. Ranking by
+  // dram_bytes must put A first even though B wins on utilization alone --
+  // which is what proves the primary really is the primary.
+  std::vector<TuningResult> results = {
+      resultWith("a", /*cycles=*/100, /*matrixUtil=*/0.50, /*dramBytes=*/200),
+      resultWith("b", /*cycles=*/100, /*matrixUtil=*/0.90, /*dramBytes=*/400),
+  };
+  SearchObjective objective;
+  objective.primaryMetric = "dram_bytes";
+  objective.direction = ObjectiveDirection::Minimize;
+  objective.secondaryMetrics = {"matrix_utilization"};
+
+  std::vector<TuningResult> ranked = rankTuningResults(results, objective);
+  ASSERT_EQ(ranked.size(), 2u);
+  EXPECT_EQ(ranked[0].candidate.id, "a");
+  EXPECT_EQ(ranked[1].candidate.id, "b");
+
+  // A tie on the primary falls through to the secondary, which is maximized.
+  results[1].metrics.dramBytes = 200;
+  ranked = rankTuningResults(results, objective);
+  EXPECT_EQ(ranked[0].candidate.id, "b");
+}
+
+TEST(Measurement, AMissKeepsTheStaticScoreAndTheRanking) {
+  auto context = perfContext();
+  TuningSessionOptions options;
+  options.measurement.measureTop = 1;
+  options.measurement.provider = [](mlir::ModuleOp, const TuningResult &)
+      -> llvm::Expected<std::optional<CandidateMetrics>> {
+    // No measurement available: not a failure, just nothing to add.
+    return std::optional<CandidateMetrics>();
+  };
+
+  auto report = runTuningSession(*context, threadChoiceSpace(), swigluShape(),
+                                 avx2(), options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+
+  // The candidate is still ranked, still legal, with its static cost standing.
+  ASSERT_EQ(report->ranked.size(), 1u);
+  EXPECT_FALSE(report->ranked.front().measured.has_value());
+  EXPECT_GT(report->ranked.front().result.metrics.predictedCycles, 0u);
+  EXPECT_TRUE(report->ranked.front().result.legal);
+}
+
+TEST(Measurement, AProviderThatObservedSomethingRecordsItWithItsIdentity) {
+  auto context = perfContext();
+  TuningSessionOptions options;
+  options.measurement.measureTop = 1;
+  options.measurement.targetIdentity = "x86-avx2";
+  options.measurement.machineIdentity = "machines/x86-avx2-v2.yaml";
+  options.measurement.abiIdentity = "memref2d-descriptors";
+  options.measurement.provider = [](mlir::ModuleOp, const TuningResult &)
+      -> llvm::Expected<std::optional<CandidateMetrics>> {
+    CandidateMetrics observed;
+    observed.measuredNs = 1234.5;
+    observed.measuredGflops = 4.5;
+    return std::optional<CandidateMetrics>(observed);
+  };
+
+  auto report = runTuningSession(*context, threadChoiceSpace(), swigluShape(),
+                                 avx2(), options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  ASSERT_EQ(report->ranked.size(), 1u);
+
+  const RankedCandidate &best = report->ranked.front();
+  ASSERT_TRUE(best.measured.has_value());
+  EXPECT_DOUBLE_EQ(best.measured->measuredNs.value(), 1234.5);
+  // The identity travels with the number: a cycle count from another target or
+  // another ABI is a different measurement, not the same one.
+  EXPECT_EQ(best.measuredTarget, "x86-avx2");
+  EXPECT_EQ(best.measuredMachine, "machines/x86-avx2-v2.yaml");
+  EXPECT_EQ(best.measuredAbi, "memref2d-descriptors");
+}
+
+TEST(Measurement, ACandidateThatCannotBeCompiledIsRejectedWithItsReason) {
+  auto context = perfContext();
+  TuningSessionOptions options;
+  options.measurement.measureTop = 1;
+  options.measurement.provider = [](mlir::ModuleOp, const TuningResult &)
+      -> llvm::Expected<std::optional<CandidateMetrics>> {
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the target emitter refused the bundle");
+  };
+
+  auto report = runTuningSession(*context, threadChoiceSpace(), swigluShape(),
+                                 avx2(), options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+
+  // A plan that cannot become code is not a candidate, whatever it was
+  // predicted to cost -- and the reason is kept, not summarized away.
+  EXPECT_TRUE(report->ranked.empty());
+  ASSERT_EQ(report->rejected.size(), 2u);
+  const TuningResult *measuredRejection = nullptr;
+  for (const TuningResult &rejected : report->rejected)
+    if (rejected.rejectionReason.rfind("measurement:", 0) == 0)
+      measuredRejection = &rejected;
+  ASSERT_TRUE(measuredRejection);
+  EXPECT_NE(measuredRejection->rejectionReason.find(
+                "the target emitter refused the bundle"),
+            std::string::npos);
+}
+
+TEST(Measurement, IsOffUnlessAProviderIsSupplied) {
+  auto context = perfContext();
+  // The default session is exactly the static ranking it always was: no
+  // provider means no compilation, no invocation and no measurement.
+  auto report = runTuningSession(*context, threadChoiceSpace(), swigluShape(),
+                                 avx2(), {});
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  ASSERT_EQ(report->ranked.size(), 1u);
+  EXPECT_FALSE(report->ranked.front().measured.has_value());
+  EXPECT_EQ(report->schemaVersion, 1u);
+}
+
+TEST(Measurement, InvokesATopCandidateAndRecordsWhatItComputed) {
+  auto context = perfContext();
+
+  // The space's own dtypes: bf16 operands fit the AVX2 model's SRAM, and the
+  // test hands over bf16 buffers to match.
+  WorkloadShape shape = swigluShape();
+
+  TuningSessionOptions options;
+  options.measurement.measureTop = 1;
+  options.measurement.targetIdentity = "x86-avx2";
+  options.measurement.machineIdentity = "machines/x86-avx2-v2.yaml";
+  options.measurement.abiIdentity = "memref2d-descriptors";
+
+  unsigned invocations = 0;
+  options.measurement.provider = [&](mlir::ModuleOp boundModule,
+                                     const TuningResult &)
+      -> llvm::Expected<std::optional<CandidateMetrics>> {
+    // Compile the candidate the session bound. This is what makes a
+    // measurement an answer about code that ran rather than a prediction about
+    // code that might.
+    std::string entry;
+    boundModule->walk([&](mlir::Operation *op) {
+      if (entry.empty() && op->getName().getStringRef() == "micro.kernel")
+        entry = mlir::cast<mlir::StringAttr>(op->getAttr("sym_name")).str();
+    });
+    if (entry.empty())
+      return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                     "no kernel to compile");
+
+    ::llk::MappedCompileOptions compileOptions;
+    compileOptions.entrySymbol = entry;
+    llvm::Expected<::llk::MappedCompilation> compiled =
+        ::llk::compileConcreteMicroKernel(boundModule, compileOptions);
+    if (!compiled)
+      return compiled.takeError();
+    if (!compiled->executable)
+      return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                     "no executable was produced");
+
+    const ::llk::KernelAbi &abi = compiled->executable->abi();
+    const uint16_t one = toBf16(1.0f);
+    llvm::SmallVector<std::vector<uint16_t>, 4> inputStorage;
+    inputStorage.reserve(abi.inputs.size());
+    for (const ::llk::KernelAbi::Port &port : abi.inputs) {
+      size_t elements = 1;
+      for (int64_t dim : port.shape)
+        elements *= static_cast<size_t>(dim);
+      inputStorage.emplace_back(elements, one);
+    }
+    llvm::SmallVector<MemRef2D, 4> inputDescriptors;
+    for (size_t i = 0; i < abi.inputs.size(); ++i) {
+      const std::vector<int64_t> &portShape = abi.inputs[i].shape;
+      std::vector<uint16_t> &storage = inputStorage[i];
+      inputDescriptors.push_back(MemRef2D{storage.data(), storage.data(), 0,
+                                          portShape[0], portShape[1],
+                                          portShape[1], 1});
+    }
+    if (abi.outputs.size() != 1u)
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "the kernel does not declare exactly one output");
+    const std::vector<int64_t> &outShape = abi.outputs.front().shape;
+    std::vector<uint16_t> output(static_cast<size_t>(outShape[0] * outShape[1]),
+                                 toBf16(-1.0f));
+    MemRef2D outputDescriptor{output.data(), output.data(), 0, outShape[0],
+                              outShape[1],   outShape[1],   1};
+
+    llvm::SmallVector<MemRef2D *, 4> inputPointers;
+    for (MemRef2D &descriptor : inputDescriptors)
+      inputPointers.push_back(&descriptor);
+    llvm::SmallVector<MemRef2D *, 1> outputPointers{&outputDescriptor};
+
+    const auto start = std::chrono::steady_clock::now();
+    llvm::Error error =
+        compiled->executable->invoke(inputPointers, outputPointers);
+    const auto stop = std::chrono::steady_clock::now();
+    if (error)
+      return std::move(error);
+    ++invocations;
+
+    // Every output is silu(gate) * up over an all-ones operands: the gate and
+    // the up projection both sum K=64 ones to 64, silu(64) is 64 to f32
+    // precision, and the product is 4096. A number this specific is only right
+    // if the copy, the contraction, the activation and the write-back all
+    // happened -- which is what makes this a measurement rather than a timing.
+    for (uint16_t value : output)
+      EXPECT_NEAR(fromBf16(value), 4096.0f, 1.0f);
+
+    CandidateMetrics measured;
+    measured.measuredNs =
+        std::chrono::duration<double, std::nano>(stop - start).count();
+    measured.measuredGflops = 2.0 * static_cast<double>(shape.M) * shape.N *
+                              shape.K / measured.measuredNs.value();
+    return std::optional<CandidateMetrics>(measured);
+  };
+
+  auto report =
+      runTuningSession(*context, threadChoiceSpace(), shape, avx2(), options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  ASSERT_EQ(report->ranked.size(), 1u);
+  EXPECT_EQ(invocations, 1u);
+
+  const RankedCandidate &best = report->ranked.front();
+  ASSERT_TRUE(best.measured.has_value());
+  EXPECT_GT(best.measured->measuredNs.value(), 0.0);
+  EXPECT_EQ(best.measuredTarget, "x86-avx2");
+  EXPECT_EQ(best.measuredAbi, "memref2d-descriptors");
 }
 
 } // namespace

@@ -264,8 +264,14 @@ TEST(CandidateBinding, BindsAMatmulWithoutTheFusedEpilogue) {
                                           candidate, shape);
   ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
 
-  // One weight operand, one accumulator, and no SwiGLU activation.
-  EXPECT_EQ(countOps<tensor::EmptyOp>(scratch->module.get()), 2u);
+  // One weight operand, one accumulator, and no SwiGLU activation. The
+  // operands are the kernel's declared inputs, so nothing is materialized for
+  // the builder to guess at.
+  EXPECT_EQ(countOps<tensor::EmptyOp>(scratch->module.get()), 0u);
+  ModuleOp matmul = scratch->module.get();
+  auto matmulKernel = *matmul.getOps<micro::KernelOp>().begin();
+  ASSERT_TRUE(matmulKernel.getKernelFunctionType());
+  EXPECT_EQ(matmulKernel.getKernelFunctionType().getNumInputs(), 2u);
   EXPECT_EQ(countOps<micro::MmaOp>(scratch->module.get()), 1u);
   unsigned silu = 0;
   scratch->module.get().walk([&](micro::VectorOp op) {
@@ -344,14 +350,18 @@ TEST(CandidateBinding, BindsTileSizesIntoLoopStepsAndTensorExtents) {
   });
   EXPECT_EQ(forSteps, (std::vector<int64_t>{64}));
 
-  // External tensors: A [M, K], then two B [K, N].
-  std::vector<std::vector<int64_t>> tensorShapes;
-  module.walk([&](tensor::EmptyOp empty) {
-    ArrayRef<int64_t> shape =
-        mlir::cast<ShapedType>(empty.getType()).getShape();
-    tensorShapes.push_back(std::vector<int64_t>(shape.begin(), shape.end()));
-  });
-  EXPECT_EQ(tensorShapes,
+  // External operands: A [M, K], then two B [K, N]. They are the kernel's
+  // declared inputs, so their extents are read from the signature rather than
+  // from tensors the builder materializes.
+  auto kernel = *module.getOps<micro::KernelOp>().begin();
+  mlir::FunctionType signature = kernel.getKernelFunctionType();
+  ASSERT_TRUE(signature);
+  std::vector<std::vector<int64_t>> inputShapes;
+  for (mlir::Type input : signature.getInputs()) {
+    ArrayRef<int64_t> shape = mlir::cast<ShapedType>(input).getShape();
+    inputShapes.push_back(std::vector<int64_t>(shape.begin(), shape.end()));
+  }
+  EXPECT_EQ(inputShapes,
             (std::vector<std::vector<int64_t>>{{8, 64}, {64, 64}, {64, 64}}));
 }
 

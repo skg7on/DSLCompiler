@@ -858,6 +858,10 @@ add_llk_perf_test(CandidateBindingTest test/Perf/candidate_binding.cpp)
 # and the persisted record. Uses the shipped machine model, so the model the
 # driver tunes against is the one under test.
 add_llk_perf_test(TuningSessionTest test/Perf/tuning_session.cpp)
+# The session test also *measures* a candidate: the provider compiles the
+# kernel the session bound and invokes it, so this one test links the shared
+# mapped-compilation path. The other perf tests stay off the JIT.
+target_link_libraries(TuningSessionTest PRIVATE LLKMappedCompilation)
 
 # Machine topology tests (issue #82, epic #67): the v2 model, its normalized
 # queries, validation, and the YAML loader. They are plain-data tests -- no

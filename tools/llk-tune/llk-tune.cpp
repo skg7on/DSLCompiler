@@ -394,6 +394,15 @@ int runMicroSearch() {
   llvm::outs() << "Generated " << report->generated
                << " candidates: " << report->ranked.size() << " ranked, "
                << report->rejected.size() << " rejected\n";
+  // What "best" meant, next to the report schema that defines it: a stored
+  // ranking is only interpretable with the objective it was ordered by, and a
+  // record read later has to know which schema wrote it.
+  llvm::outs() << "objective " << report->objective.primaryMetric << " ("
+               << perf::stringifyObjectiveDirection(report->objective.direction)
+               << ")";
+  for (const std::string &name : report->objective.secondaryMetrics)
+    llvm::outs() << " then " << name;
+  llvm::outs() << ", report schema v" << report->schemaVersion << "\n";
   for (size_t i = 0; i < records.size(); ++i) {
     const perf::ScheduleRecord &record = records[i];
     llvm::outs() << "  [" << i << "] " << record.candidate.id << "  "

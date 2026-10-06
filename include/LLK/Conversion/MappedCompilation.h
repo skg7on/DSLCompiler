@@ -95,6 +95,19 @@ compileMappedKernel(mlir::ModuleOp source,
                     const mlir::llk::mapping::CoveringPlan &plan,
                     const MappedCompileOptions &options);
 
+/// Compiles concrete Micro-IR that carries no mapping plan.
+///
+/// A bound tuning candidate is exactly that: the search space already selected
+/// its schedule, so there is no plan to bind and no target to verify against.
+/// The sequence from the lowering on is the same one -- bufferize, roll into
+/// loops, apply the calling convention, compile -- and sharing it is what keeps
+/// a measured candidate and a compiled mapped kernel the same kind of artifact.
+/// The first two stops are unreachable here and are refused rather than
+/// reported as reached.
+llvm::Expected<MappedCompilation>
+compileConcreteMicroKernel(mlir::ModuleOp source,
+                           const MappedCompileOptions &options);
+
 } // namespace llk
 
 #endif // LLK_CONVERSION_MAPPEDCOMPILATION_H

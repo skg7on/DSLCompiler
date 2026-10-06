@@ -30,8 +30,9 @@ using llvm::StringRef;
 
 namespace {
 
-/// The CandidateMetrics field a metric name selects. A name the model does not
-/// produce reads as zero, which is neutral: it can only tie, never reorder.
+/// The CandidateMetrics field a metric name selects. `validateObjective` is
+/// what rejects a name with no field, so this is only reached for names the
+/// model produces.
 double metricValue(const CandidateMetrics &metrics, StringRef name) {
   if (name == "latency_cycles")
     return static_cast<double>(metrics.predictedCycles);
@@ -43,8 +44,15 @@ double metricValue(const CandidateMetrics &metrics, StringRef name) {
     return metrics.matrixUtilization;
   if (name == "dma_utilization")
     return metrics.dmaUtilization;
-  // capacity_spill_bytes is named by the spec but not modeled yet; a metric
-  // the model cannot produce must not decide an order.
+  // A measured metric falls back to its static counterpart when no measurement
+  // was taken: a provider *miss* leaves the static score standing, which is a
+  // different statement from scoring the candidate zero.
+  if (name == "measured_ns")
+    return metrics.measuredNs.value_or(metrics.predictedNs);
+  if (name == "measured_gflops")
+    return metrics.measuredGflops.value_or(0.0);
+  // Every other name is refused by validateObjective before a ranking runs, so
+  // reaching here would mean the check was skipped.
   return 0.0;
 }
 
@@ -52,7 +60,8 @@ double metricValue(const CandidateMetrics &metrics, StringRef name) {
 /// objective can name is a cost. Secondary metrics declare no direction, so
 /// their sense comes from what they measure.
 bool lowerIsBetter(StringRef name) {
-  return name != "matrix_utilization" && name != "dma_utilization";
+  return name != "matrix_utilization" && name != "dma_utilization" &&
+         name != "measured_gflops";
 }
 
 CandidateMetrics metricsFrom(const MicroPerfReport &report,
@@ -78,6 +87,33 @@ CandidateMetrics metricsFrom(const MicroPerfReport &report,
 }
 
 } // namespace
+
+bool isKnownMetric(StringRef name) {
+  return name == "latency_cycles" || name == "dram_bytes" ||
+         name == "sram_bytes" || name == "matrix_utilization" ||
+         name == "dma_utilization" || name == "measured_ns" ||
+         name == "measured_gflops";
+}
+
+llvm::Error validateObjective(const SearchObjective &objective) {
+  auto check = [](StringRef name) -> llvm::Error {
+    if (isKnownMetric(name))
+      return llvm::Error::success();
+    return llvm::make_error<llvm::StringError>(
+        ("objective names metric '" + name +
+         "', which the tuner does not produce; it ranks by latency_cycles, "
+         "dram_bytes, sram_bytes, matrix_utilization, dma_utilization, "
+         "measured_ns or measured_gflops")
+            .str(),
+        llvm::inconvertibleErrorCode());
+  };
+  if (llvm::Error error = check(objective.primaryMetric))
+    return error;
+  for (const std::string &name : objective.secondaryMetrics)
+    if (llvm::Error error = check(name))
+      return error;
+  return llvm::Error::success();
+}
 
 bool ranksBefore(const TuningResult &a, const TuningResult &b,
                  const SearchObjective &objective) {
@@ -121,8 +157,14 @@ runTuningSession(mlir::MLIRContext &context, const SearchSpace &space,
     return llvm::make_error<llvm::StringError>(
         "unsupported performance level; the tuner knows 0 and 1",
         llvm::inconvertibleErrorCode());
+  // A ranking under a metric the model does not produce would order every
+  // candidate equally and still look like a decision, so the objective is
+  // checked before anything is generated.
+  if (llvm::Error error = validateObjective(space.objective))
+    return std::move(error);
 
   TuningSessionReport report;
+  report.objective = space.objective;
   report.machinePath = options.machinePath;
   report.machineName = machine.target;
   report.perfLevel = options.perfLevel;
@@ -172,7 +214,70 @@ runTuningSession(mlir::MLIRContext &context, const SearchSpace &space,
   if (options.topK != 0 && report.ranked.size() > options.topK)
     report.ranked.resize(options.topK);
 
+  // Measurement is optional and comes last: it measures the best candidates the
+  // ranking just chose, so it can only ever confirm or reject them, never
+  // change which ones they are.
+  if (llvm::Error error = measureTopCandidates(context, space, shape, report,
+                                               options.measurement))
+    return std::move(error);
+
   return report;
+}
+
+llvm::Error measureTopCandidates(mlir::MLIRContext &context,
+                                 const SearchSpace &space,
+                                 const WorkloadShape &shape,
+                                 TuningSessionReport &report,
+                                 const MeasurementOptions &options) {
+  if (!options.provider || options.measureTop == 0)
+    return llvm::Error::success();
+
+  const size_t count = std::min<size_t>(static_cast<size_t>(options.measureTop),
+                                        report.ranked.size());
+
+  std::vector<size_t> rejectedIndices;
+  for (size_t index = 0; index < count; ++index) {
+    RankedCandidate &ranked = report.ranked[index];
+
+    // Binding is deterministic, so binding again gives the module the ranking
+    // described. Re-binding is how a candidate reaches the provider without the
+    // session holding every module it ever bound.
+    OwningOpRef<ModuleOp> scratch = ModuleOp::create(UnknownLoc::get(&context));
+    llvm::Expected<BoundKernel> bound = bindCandidateToMicroKernel(
+        scratch.get(), space, ranked.result.candidate, shape);
+    if (!bound) {
+      report.rejected.push_back(TuningResult{
+          ranked.result.candidate, ranked.result.metrics, false,
+          "measurement binding: " + llvm::toString(bound.takeError())});
+      rejectedIndices.push_back(index);
+      continue;
+    }
+
+    llvm::Expected<std::optional<CandidateMetrics>> observed =
+        options.provider(scratch.get(), ranked.result);
+    if (!observed) {
+      // A candidate that cannot be compiled or verified is rejected rather than
+      // ranked: its predicted cost is a claim about code that does not exist.
+      report.rejected.push_back(
+          TuningResult{ranked.result.candidate, ranked.result.metrics, false,
+                       "measurement: " + llvm::toString(observed.takeError())});
+      rejectedIndices.push_back(index);
+      continue;
+    }
+    if (*observed) {
+      ranked.measured = **observed;
+      ranked.measuredTarget = options.targetIdentity;
+      ranked.measuredMachine = options.machineIdentity;
+      ranked.measuredAbi = options.abiIdentity;
+    }
+    // A miss leaves the candidate exactly as it was: still ranked, still
+    // legal, with its static score standing.
+  }
+
+  // Removed back to front so the surviving order is untouched.
+  for (auto it = rejectedIndices.rbegin(); it != rejectedIndices.rend(); ++it)
+    report.ranked.erase(report.ranked.begin() + *it);
+  return llvm::Error::success();
 }
 
 std::vector<ScheduleRecord>
