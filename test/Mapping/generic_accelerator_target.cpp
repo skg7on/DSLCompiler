@@ -4,6 +4,8 @@
 #include "LLK/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/PatternMatch.h"
 
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -223,4 +225,44 @@ TEST(GenericAcceleratorTarget, TargetVocabularyStaysOutOfGenericMicroOds) {
   EXPECT_EQ(found, kKnownGenericLeaks)
       << "generic Micro leaks changed; update kKnownGenericLeaks only when the "
          "dialect genuinely changed";
+}
+
+TEST(GenericAcceleratorTarget, DoesNotClaimAnExecutableBackend) {
+  // The second target proves the C2 boundary as much as the first one does.
+  // Its bundles are well-formed and its emitters verify them, but this package
+  // ships no lowering: the accelerator has no code generator here, and saying
+  // so is the honest answer. What would be dishonest is a lowering hook that
+  // returned success and emitted nothing, because the compiler could not then
+  // tell a configured target from an executable one.
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      accel_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::ArrayRef<llvm::StringRef> keys = accel_mapping::emitterKeys();
+  ASSERT_FALSE(keys.empty());
+
+  mlir::MLIRContext context;
+  mlir::DictionaryAttr noParameters;
+  TargetBundle bundle;
+  bundle.name = "accel.vector.add.f32";
+  bundle.emitterKey = keys.front().str();
+  bundle.parameters = noParameters;
+
+  for (llvm::StringRef key : keys) {
+    std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter(key);
+    ASSERT_TRUE(emitter) << key.str();
+    bundle.emitterKey = key.str();
+    EXPECT_FALSE(static_cast<bool>(emitter->verify(bundle)))
+        << "a well-formed bundle must still verify for " << key.str();
+
+    TargetLoweringContext lowering{(*target)->machine(), {}, {}};
+    mlir::IRRewriter rewriter(&context);
+    llvm::Error error =
+        emitter->lower(/*coveredOps=*/{}, bundle, lowering, rewriter);
+    ASSERT_TRUE(static_cast<bool>(error)) << key.str();
+    EXPECT_NE(
+        llvm::toString(std::move(error)).find("target_lowering_unsupported"),
+        std::string::npos)
+        << key.str();
+  }
 }
