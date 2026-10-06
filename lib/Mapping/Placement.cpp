@@ -203,61 +203,6 @@ bool sameLayoutParameters(const llvm::StringMap<SearchValue> &lhs,
   return true;
 }
 
-/// The compute resource a layout conversion runs on: the consumer executor's
-/// vector engine when one is known, else the producer's, else empty (the
-/// machine's declared default). Resolving it here means the planner charges the
-/// same resource the binder stamps on the emitted `micro.transform` and the
-/// performance DAG then resolves, so the two cannot disagree about the cost of
-/// a conversion (task B8).
-std::string transformResourceFor(const ConnectionRequest &request,
-                                 const MachineModel &machine) {
-  auto vectorEngineOf =
-      [&](const std::optional<ExecutorId> &executor) -> std::string {
-    if (!executor)
-      return {};
-    for (const ComputeNode *node : machine.computesFor(*executor))
-      if (node->kind == "vector_engine")
-        return node->id;
-    return {};
-  };
-  if (std::string engine = vectorEngineOf(request.consumerExecutor);
-      !engine.empty())
-    return engine;
-  if (std::string engine = vectorEngineOf(request.producerExecutor);
-      !engine.empty())
-    return engine;
-  return {};
-}
-
-/// The shared estimate of one connection's layout conversion (task B8). The
-/// conversion's types are unwrapped to the shaped type they describe, and the
-/// selected compute resource is resolved from the endpoint executors, so this
-/// is the *same* estimate the performance DAG's `micro.transform` handler
-/// charges. A request that states no measurable footprint (a hand-built pair
-/// with no types) falls back to its recorded byte count -- exactly the cost it
-/// had before, never a double count, and never a silently invented zero.
-Cost transformCostFor(const ConnectionRequest &request,
-                      const MachineModel &machine) {
-  TransformCostInput input;
-  input.inputType = tileAsTensor(request.elementType);
-  if (!input.inputType)
-    input.inputType = request.elementType;
-  input.outputType = tileAsTensor(request.consumerType);
-  if (!input.outputType)
-    input.outputType = request.consumerType;
-  input.srcMap = request.producerLayoutMap;
-  input.dstMap = request.consumerLayoutMap;
-  input.memoryNode = request.producerMemory;
-  input.computeResource = transformResourceFor(request, machine);
-  llvm::Expected<Cost> cost = estimateTransformCost(input, machine);
-  if (cost)
-    return *cost;
-  llvm::consumeError(cost.takeError());
-  Cost fallback;
-  fallback.localBytes = request.bytes;
-  return fallback;
-}
-
 } // namespace
 
 bool portsDirectCompatible(const ConnectionRequest &request,
@@ -353,6 +298,21 @@ enumeratePlacements(const MappingCandidate &candidate,
     solvedDefs.push_back(def);
     solvedSolutions.push_back(solved->solutions.front());
   }
+
+  // Requirements are conjunctive. An unresolved disagreement must never
+  // become an unconstrained endpoint in connection synthesis.
+  for (size_t i = 0; i < candidate.layoutRequirements.size(); ++i)
+    for (size_t j = 0; j < i; ++j) {
+      const auto &lhs = candidate.layoutRequirements[i];
+      const auto &rhs = candidate.layoutRequirements[j];
+      if (lhs.port && rhs.port && *lhs.port == *rhs.port &&
+          (lhs.layoutClass != rhs.layoutClass ||
+           solvedSolutions[i].values != solvedSolutions[j].values ||
+           solvedSolutions[i].map != solvedSolutions[j].map)) {
+        reportFailure(PlacementFailure::NoLegalLayout);
+        return std::vector<CandidateInstance>{};
+      }
+    }
 
   // How many requirements share each layout class. One class may be required by
   // more than one port of the same candidate (the same blocked layout on two
@@ -625,6 +585,33 @@ synthesizeConnections(const ConnectionRequest &request,
       plan.consumerPorts.push_back(*request.consumerPort);
   };
 
+  auto chargeTransform = [&](ConnectionPlan &plan) -> llvm::Error {
+    if (!plan.transform)
+      return llvm::Error::success();
+    auto &transform = *plan.transform;
+    transform.memoryNode = plan.memoryRoute.back();
+    auto resource = selectTransformResource(machine, transform.memoryNode);
+    if (!resource)
+      return resource.takeError();
+    transform.computeResource = *resource;
+    TransformCostInput input;
+    input.inputType = request.elementType;
+    input.outputType = request.consumerType;
+    if (auto tensor = tileAsTensor(input.inputType))
+      input.inputType = tensor;
+    if (auto tensor = tileAsTensor(input.outputType))
+      input.outputType = tensor;
+    input.srcMap = transform.srcMap;
+    input.dstMap = transform.dstMap;
+    input.memoryNode = transform.memoryNode;
+    input.computeResource = transform.computeResource;
+    auto cost = estimateTransformCost(input, machine);
+    if (!cost)
+      return cost.takeError();
+    plan.cost = addCost(plan.cost, *cost);
+    return llvm::Error::success();
+  };
+
   // Alternative 1: a direct connection -- nothing is moved and nothing is
   // transformed. §10.2 defines direct compatibility by element type, logical
   // tile shape, memory *visibility*, and affine index relation, so the two
@@ -666,11 +653,8 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.kind = ConnectionKind::LayoutTransform;
     plan.memoryRoute.push_back(request.producerMemory);
     plan.transform = transformOf();
-    // The conversion's cost is the *shared* transform estimate, not an ad-hoc
-    // local byte charge: the same estimator the performance DAG charges, so the
-    // planner cannot double-count or disagree with perf (task B8, closing A9's
-    // parked finding).
-    plan.cost = transformCostFor(request, machine);
+    if (auto error = chargeTransform(plan))
+      return std::move(error);
     assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
@@ -723,7 +707,7 @@ synthesizeConnections(const ConnectionRequest &request,
     (memoryRoute.hopCount() == 1 ? directRoutes : multiHopRoutes)
         .push_back(&memoryRoute);
 
-  auto emitRoute = [&](const MemoryRoute &memoryRoute) {
+  auto emitRoute = [&](const MemoryRoute &memoryRoute) -> llvm::Error {
     if (transformRequired) {
       // A transform that no hop can carry makes this route no alternative at
       // all: the value cannot be held in either layout regime along it. The
@@ -736,7 +720,7 @@ synthesizeConnections(const ConnectionRequest &request,
       // must be added to `ConnectionPlan`, before it can place the transform.
       if (!legalTransformHop(memoryRoute.nodes, machine,
                              *request.producerLayout, *request.consumerLayout))
-        return;
+        return llvm::Error::success();
     }
     ConnectionPlan plan;
     plan.producer = request.producer;
@@ -748,23 +732,19 @@ synthesizeConnections(const ConnectionRequest &request,
     plan.transferEngines = memoryRoute.transferEngines;
     plan.transform = transformOf();
     plan.cost = memoryRoute.cost;
-    if (transformRequired) {
-      // The movement and the conversion are both real work the materialized
-      // kernel charges; the conversion's arithmetic is added here from the same
-      // shared estimate, while its bytes are already the route's (adding them
-      // would double-count the one value's traffic).
-      Cost conversion = transformCostFor(request, machine);
-      plan.cost.latencyCycles += conversion.latencyCycles;
-      plan.cost.computeUtilization += conversion.computeUtilization;
-    }
+    if (auto error = chargeTransform(plan))
+      return error;
     assignEndpoints(plan);
     plan.id = computeConnectionId(plan);
     plans.push_back(std::move(plan));
+    return llvm::Error::success();
   };
   for (const MemoryRoute *memoryRoute : directRoutes)
-    emitRoute(*memoryRoute);
+    if (auto error = emitRoute(*memoryRoute))
+      return std::move(error);
   for (const MemoryRoute *memoryRoute : multiHopRoutes)
-    emitRoute(*memoryRoute);
+    if (auto error = emitRoute(*memoryRoute))
+      return std::move(error);
   return plans;
 }
 

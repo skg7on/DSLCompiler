@@ -31,7 +31,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -148,7 +148,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.no_such_rule", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.no_such_rule", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -173,7 +173,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.9", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.9", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -185,7 +185,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", memories = {sram = "no.such.memory"}, layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", memories = {sram = "no.such.memory"}, layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -223,7 +223,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "garbage", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "garbage", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -236,7 +236,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_mma"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_mma"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -248,7 +248,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_no_such_emitter"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_no_such_emitter"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -261,7 +261,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", memories = {operand0 = 42 : i64}, layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", memories = {operand0 = 42 : i64}, layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -287,7 +287,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}, micro.routes = [42 : i64]} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -299,7 +299,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}, micro.routes = [{kind = "direct", route = ["no.such.memory"], value = 0 : i64}]} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -312,7 +312,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}, micro.routes = [{kind = "direct", route = ["dram.0", "acc.0"], value = 0 : i64}]} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -325,7 +325,7 @@ module {
   micro.kernel @k attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}, micro.routes = [{kind = "transfer", route = ["dram.0", "sram.0"], engines = ["nonexistent"], value = 0 : i64}]} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }
 
@@ -349,11 +349,11 @@ module {
   micro.kernel @a attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
   micro.kernel @b attributes {micro.plan = {id = 0 : i64, binding_hash = 0 : i64, truncated = false}} {
     %0 = tensor.empty() : tensor<8x8xf32>
     %t = micro.tile_view %0 {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {rule = "avx2.vector_add", executor = "worker.0", layouts = {avx2.blocked_2d = "avx2.blocked_2d"}, layout_parameters = {avx2.blocked_2d = {M = 8 : i64, N = 8 : i64, VW = 8 : i64}}, bundle = "avx2.vector.add.f32", emitter = "avx2_vector_add"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
   }
 }

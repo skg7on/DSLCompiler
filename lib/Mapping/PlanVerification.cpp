@@ -170,7 +170,7 @@ LayoutValue layoutValueOf(mlir::Attribute attribute) {
 /// operand the rule names, resolved positionally against the node's ports.
 LayoutContext layoutContextForRule(const RuleDef &rule,
                                    const WorkloadNode &node,
-                                   llvm::StringRef layoutId,
+                                   const RuleLayoutRequirement &requirement,
                                    const LayoutContext &fallback) {
   LayoutContext context = fallback;
   size_t inputIndex = 0;
@@ -188,13 +188,7 @@ LayoutContext layoutContextForRule(const RuleDef &rule,
     }
     if (!nodePort)
       continue;
-    bool required = false;
-    for (const RuleLayoutRequirement &requirement : rule.layoutRequirements)
-      if (requirement.layoutId == layoutId && requirement.port == port.name) {
-        required = true;
-        break;
-      }
-    if (!required)
+    if (requirement.port != port.name)
       continue;
     if (mlir::Type element = elementTypeOf(nodePort->type))
       context.elementType = printedTypeOf(element);
@@ -218,7 +212,7 @@ llvm::Expected<uint64_t> movementUintAttr(mlir::Operation *op,
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
                        prefix + ": '" + name.str() + "' is missing");
   auto integer = mlir::dyn_cast<mlir::IntegerAttr>(raw);
-  if (!integer)
+  if (!integer || integer.getValue().getActiveBits() > 64)
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
                        prefix + ": '" + name.str() + "' is not an integer");
   return integer.getValue().getZExtValue();
@@ -511,17 +505,49 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
                        where + ": op '" + name.str() +
                            "' copies a value whose type differs from its "
                            "result");
-  mlir::Operation *producer = op->getOperand(0).getDefiningOp();
+  // Compare the actual operand with the original result identity, not just two
+  // bookkeeping integers. A first hop must read the value its connection
+  // records -- the original workload result whose id is that value -- so an
+  // unrelated mapped value cannot borrow a connection's stamps. A later hop
+  // must read its immediate predecessor on the same connection (stage-A A5).
+  mlir::Value source = resolveThroughTransparentOps(op->getOperand(0));
+  mlir::Operation *producer = source.getDefiningOp();
   if (!producer || enclosingKernel(producer) != kernel)
-    return verifyError(
-        DiagnosticCode::InvalidMappingMetadata,
-        where + ": op '" + name.str() +
-            "' reads a value no operation in its kernel defines");
-  if (!producer->getAttr(kMappingAttr) && !producer->hasAttr(kConnectionAttr))
     return verifyError(DiagnosticCode::InvalidMappingMetadata,
-                       where + ": op '" + name.str() +
-                           "' reads a value that no mapped or materialized "
-                           "operation produces");
+                       where + ": movement has no kernel producer");
+  if (*hop == 1) {
+    auto mapping = producer->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
+    auto outputs = mapping
+                       ? mapping.getAs<mlir::DictionaryAttr>("output_values")
+                       : mlir::DictionaryAttr{};
+    auto result = mlir::dyn_cast<mlir::OpResult>(source);
+    auto id = outputs && result ? outputs.getAs<mlir::IntegerAttr>(
+                                      std::to_string(result.getResultNumber()))
+                                : mlir::IntegerAttr{};
+    if (!id || id.getValue().getActiveBits() > 64 ||
+        id.getValue().getZExtValue() != *value)
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": movement source is not its recorded value");
+  } else {
+    auto predecessorConnection =
+        producer->getAttrOfType<mlir::IntegerAttr>(kConnectionAttr);
+    auto predecessorHop = producer->getAttrOfType<mlir::IntegerAttr>(kHopAttr);
+    auto predecessorValue =
+        producer->getAttrOfType<mlir::IntegerAttr>(kValueAttr);
+    if (materializedMovementOpName(producer->getName().getStringRef())
+            .empty() ||
+        source != producer->getResult(0) || !predecessorConnection ||
+        !predecessorHop || !predecessorValue ||
+        predecessorConnection.getValue().getActiveBits() > 64 ||
+        predecessorHop.getValue().getActiveBits() > 64 ||
+        predecessorValue.getValue().getActiveBits() > 64 ||
+        predecessorConnection.getValue().getZExtValue() != *connectionId ||
+        predecessorHop.getValue().getZExtValue() != *hop - 1 ||
+        predecessorValue.getValue().getZExtValue() != *value)
+      return verifyError(
+          DiagnosticCode::InvalidMappingMetadata,
+          where + ": movement does not read the preceding connection hop");
+  }
 
   // Selected consumers: the connection's consumer set is generic metadata too,
   // so its shape is validated here with the same checked reads as every other
@@ -717,6 +743,42 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         return;
       }
     }
+
+    // Original identity is unique: every mapped operation records the workload
+    // node it implements and, for each output, the original workload value it
+    // produces. Two operations claiming the same node, or two claims to the
+    // same produced value, mean the recorded projection is ambiguous, so a
+    // later provenance check (stage-A A5) could resolve an endpoint to the
+    // wrong operation. Reject the ambiguity here rather than picking one.
+    llvm::DenseMap<uint64_t, mlir::Operation *> mappedNodes;
+    llvm::DenseMap<uint64_t, mlir::Operation *> mappedValues;
+    kernel->walk([&](mlir::Operation *op) {
+      if (failure)
+        return;
+      auto mapping = op->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
+      if (!mapping)
+        return;
+      if (mlir::Attribute raw = mapping.get("node")) {
+        auto node = mlir::dyn_cast<mlir::IntegerAttr>(raw);
+        if (!node || node.getValue().getActiveBits() > 64 ||
+            !mappedNodes.try_emplace(node.getValue().getZExtValue(), op).second)
+          fail(DiagnosticCode::InvalidMappingMetadata,
+               where +
+                   ": duplicate or malformed original workload node identity");
+      }
+      if (auto outputs = mapping.getAs<mlir::DictionaryAttr>("output_values"))
+        for (mlir::NamedAttribute output : outputs) {
+          auto id = mlir::dyn_cast<mlir::IntegerAttr>(output.getValue());
+          if (!id || id.getValue().getActiveBits() > 64 ||
+              !mappedValues.try_emplace(id.getValue().getZExtValue(), op)
+                   .second) {
+            fail(DiagnosticCode::InvalidMappingMetadata,
+                 where + ": duplicate or malformed original workload value "
+                         "identity");
+            return;
+          }
+        }
+    });
 
     // Task B6: a fully materialized plan that records a synchronization
     // requiring a barrier must have that barrier represented in the IR. A
@@ -1264,18 +1326,25 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                      "layout assignment");
         return;
       }
-      for (const RuleLayoutRequirement &requirement :
-           rule->layoutRequirements) {
-        bool recorded =
-            llvm::any_of(byClass, [&](const mlir::NamedAttribute &entry) {
-              return baseLayoutClass(entry.getName().getValue()) ==
-                     requirement.layoutId;
-            });
-        if (!recorded) {
+      // Each occurrence key of a repeated family is validated against its own
+      // port context: `#<index>` disambiguates a family required by more than
+      // one port, so a family-level existence test cannot prove that every
+      // occurrence has its own legal assignment. Build the exact expected key
+      // set and match recorded keys against it, so a missing assignment and an
+      // unexpected one are both rejected (issue #67, stage A, A4).
+      llvm::StringMap<unsigned> counts;
+      for (const auto &requirement : rule->layoutRequirements)
+        ++counts[requirement.layoutId];
+      llvm::StringMap<const RuleLayoutRequirement *> expected;
+      for (size_t index = 0; index < rule->layoutRequirements.size(); ++index) {
+        const auto &requirement = rule->layoutRequirements[index];
+        std::string key = requirement.layoutId;
+        if (counts[key] > 1)
+          key += "#" + std::to_string(index);
+        expected[key] = &requirement;
+        if (!byClass.get(key)) {
           fail(DiagnosticCode::NoLegalLayout,
-               where + ": rule '" + *ruleId + "' requires layout '" +
-                   requirement.layoutId +
-                   "', which the mapping records no assignment for");
+               where + ": missing solved layout assignment for '" + key + "'");
           return;
         }
       }
@@ -1284,15 +1353,12 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
           return;
         llvm::StringRef layoutClass =
             baseLayoutClass(entry.getName().getValue());
-        bool required =
-            llvm::any_of(rule->layoutRequirements,
-                         [&](const RuleLayoutRequirement &requirement) {
-                           return requirement.layoutId == layoutClass;
-                         });
-        if (!required) {
+        const RuleLayoutRequirement *requirement =
+            expected.lookup(entry.getName().getValue());
+        if (!requirement) {
           fail(DiagnosticCode::NoLegalLayout,
-               where + ": rule '" + *ruleId + "' does not require layout '" +
-                   layoutClass.str() + "', which the mapping records");
+               where + ": unexpected solved layout assignment '" +
+                   entry.getName().str() + "'");
           return;
         }
         const LayoutDef *def = target.layouts().find(layoutClass);
@@ -1361,7 +1427,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
             recordedMap = mapAttr.getValue();
         }
         LayoutContext portContext = layoutContextForRule(
-            *rule, *lookup.node, layoutClass, LayoutContext{});
+            *rule, *lookup.node, *requirement, LayoutContext{});
         if (llvm::Error error = verifySolvedLayout(
                 *def, machine, *module.getContext(), portContext,
                 recordedValues, recordedMap, {}, where)) {

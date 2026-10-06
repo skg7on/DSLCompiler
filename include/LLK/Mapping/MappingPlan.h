@@ -151,6 +151,8 @@ struct LayoutTransform {
   std::string dstLayout;
   AffineMap srcMap;
   AffineMap dstMap;
+  std::string memoryNode{};
+  std::string computeResource{};
 };
 
 /// An unplaced rule match.

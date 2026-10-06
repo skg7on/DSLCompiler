@@ -816,6 +816,21 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
                             u64Attr(context, kMappingMetadataVersion));
     attributes.emplace_back(mlir::StringAttr::get(context, "node"),
                             u64Attr(context, placement.node));
+    // The original workload result identity of every output this operation
+    // produces, keyed by result number. A materialized movement's first hop
+    // resolves against this to prove it reads the value its connection carries
+    // rather than an unrelated mapped value stamped with the same route
+    // (issue #67, stage A, A5).
+    llvm::SmallVector<mlir::NamedAttribute> outputValues;
+    for (const auto &entry : binding.values)
+      if (auto result = mlir::dyn_cast<mlir::OpResult>(entry.second))
+        if (result.getOwner() == op)
+          outputValues.emplace_back(
+              mlir::StringAttr::get(context,
+                                    std::to_string(result.getResultNumber())),
+              u64Attr(context, entry.first));
+    attributes.emplace_back(mlir::StringAttr::get(context, "output_values"),
+                            mlir::DictionaryAttr::get(context, outputValues));
     attributes.emplace_back(mlir::StringAttr::get(context, "instance"),
                             u64Attr(context, placement.instance));
     attributes.emplace_back(mlir::StringAttr::get(context, "rule"),

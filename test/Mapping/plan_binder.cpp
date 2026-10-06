@@ -3891,3 +3891,87 @@ TEST(PlanBinder, IndependentCopiesReceiveNoBarrier) {
   EXPECT_EQ(countOps(*b->module, "micro.barrier"), 0u);
   EXPECT_FALSE(bool(verifyMappedMicroIR(*b->module, **target)));
 }
+
+//===----------------------------------------------------------------------===//
+// Stage-A provenance coverage (issue #67 review A5): the verifier must tie a
+// movement's actual SSA source to its recorded connection/value, and prove
+// every selected consumer reads the emitted movement. The deletion/rejection
+// scenarios Stage B already covers with richer assertions
+// (RejectsADeletedLayoutContainer, RejectsAConsumerThatDoesNotReadTheValue) are
+// not duplicated here.
+//===----------------------------------------------------------------------===//
+
+TEST(PlanBinder, RejectsMissingLayoutAssignments) {
+  auto f = makeFixture();
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindPlan(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    ASSERT_TRUE(mapping.get("layout_parameters"));
+    NamedAttrList attrs(mapping);
+    attrs.erase("layout_parameters");
+    op->setAttr("micro.mapping", attrs.getDictionary(f.context.get()));
+  });
+  auto e = verifyMappedMicroIR(*b->module, *f.target);
+  EXPECT_TRUE(bool(e));
+  llvm::consumeError(std::move(e));
+}
+
+TEST(PlanBinder, RejectsMovementReadingAnotherMappedValue) {
+  auto f = makeFixture();
+  auto target = movementTarget();
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+  Operation *copy = materializedCopy(*b->module);
+  ASSERT_TRUE(copy);
+  Operation *original = copy->getOperand(0).getDefiningOp();
+  ASSERT_TRUE(original);
+  ASSERT_TRUE(original->getAttr("micro.mapping"));
+  Operation *other = original->clone();
+  // Give the other producer a distinct, internally consistent identity. This
+  // exercises source/result validation rather than duplicate-node detection.
+  auto mapping = other->getAttrOfType<DictionaryAttr>("micro.mapping");
+  NamedAttrList attrs(mapping);
+  attrs.set("node",
+            IntegerAttr::get(IntegerType::get(f.context.get(), 64), 999));
+  NamedAttrList outputs;
+  outputs.set("0",
+              IntegerAttr::get(IntegerType::get(f.context.get(), 64), 999));
+  attrs.set("output_values", outputs.getDictionary(f.context.get()));
+  other->setAttr("micro.mapping", attrs.getDictionary(f.context.get()));
+  original->getBlock()->getOperations().insert(original->getIterator(), other);
+  copy->setOperand(0, other->getResult(0));
+  auto e = verifyMappedMicroIR(*b->module, **target);
+  EXPECT_TRUE(bool(e));
+  llvm::consumeError(std::move(e));
+}
+
+TEST(PlanBinder, RejectsMovementDisconnectedFromSelectedConsumer) {
+  auto f = makeFixture();
+  auto target = movementTarget();
+  ASSERT_TRUE(bool(target));
+  auto p = selectPlan(*f.context, *f.module, **target);
+  ASSERT_TRUE(bool(p));
+  auto b = bindCanonical(*f.module, *p, **target);
+  ASSERT_TRUE(bool(b));
+  Operation *copy = materializedCopy(*b->module);
+  ASSERT_TRUE(copy);
+  b->module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() != "micro.vector")
+      return;
+    Operation *view = op->getOperand(0).getDefiningOp()->clone();
+    op->getBlock()->getOperations().insert(op->getIterator(), view);
+    view->setOperand(0, copy->getOperand(0));
+    op->setOperand(0, view->getResult(0));
+  });
+  auto e = verifyMappedMicroIR(*b->module, **target);
+  EXPECT_TRUE(bool(e));
+  llvm::consumeError(std::move(e));
+}

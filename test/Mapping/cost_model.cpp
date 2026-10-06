@@ -34,6 +34,8 @@ mlir::llk::machine::MachineModel transformMachine() {
   mlir::llk::machine::ComputeNode vpu;
   vpu.id = "vpu";
   vpu.kind = "vector_engine";
+  vpu.attachedTo = "worker.0";
+  machine.executors = {{"worker.0", "worker", std::nullopt, {}, 1, {}}};
   vpu.lanes["f32"] = 8;
   vpu.issueCycles = 1;
   machine.computes.push_back(vpu);
@@ -41,6 +43,7 @@ mlir::llk::machine::MachineModel transformMachine() {
   mlir::llk::machine::MemoryNode sram;
   sram.id = "sram.0";
   sram.kind = "sram";
+  sram.visibleFrom = "worker.0";
   machine.memories.push_back(sram);
   return machine;
 }
@@ -83,6 +86,11 @@ mlir::llk::machine::MachineModel planEventMachine() {
     MemoryNode memory;
     memory.id = id;
     memory.kind = kind;
+    // Every memory is addressable from the worker, so the transform cost's
+    // resource/memory visibility check accepts the transform this machine
+    // models; without it the estimator fails a footprintless-in-memory
+    // conversion the plan legitimately selected.
+    memory.visibleFrom = "w0";
     machine.memories.push_back(memory);
   }
 

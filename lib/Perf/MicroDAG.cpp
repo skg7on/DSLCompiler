@@ -1043,9 +1043,20 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     // mapped elementwise work, and its selected resource is the executor the
     // plan stamped on it (`micro.engine`, task B8) -- the same one the planner
     // charged -- falling back to `micro.mapping` and then the machine default.
+    // A hand-written or pre-B8 kernel may instead name the resource directly
+    // with `micro.compute_resource`; when present it wins over the stamped
+    // executor, so a stale or misspelled resource is rejected rather than
+    // silently charged against some other engine.
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickVectorEngine(reason, transformExecutor(op));
+    const machine::ComputeNode *engine = nullptr;
+    if (mlir::Attribute raw = op.getAttr("micro.compute_resource")) {
+      auto resource = mlir::dyn_cast<mlir::StringAttr>(raw);
+      engine = resource ? machine.findCompute(resource.getValue()) : nullptr;
+      if (!engine || engine->kind != "vector_engine")
+        return invalid("micro.transform selects an invalid vector resource");
+    } else {
+      engine = pickVectorEngine(reason, transformExecutor(op));
+    }
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.transform: " + reason);
@@ -1058,6 +1069,16 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     std::string sourceMemory = memoryOf(transform.getSource());
     std::string destination =
         resultInfo.memory.empty() ? sourceMemory : resultInfo.memory;
+
+    // A hand-written or pre-B8 kernel may name the landing memory explicitly;
+    // the stamp wins over the memory the result type implies, so the cost model
+    // charges the placement the kernel actually declared.
+    if (mlir::Attribute raw = op.getAttr("micro.memory_node")) {
+      auto memory = mlir::dyn_cast<mlir::StringAttr>(raw);
+      if (!memory)
+        return invalid("micro.transform memory node is not a string");
+      destination = memory.getValue().str();
+    }
 
     // The one shared estimate the planner and the simulator both charge. An
     // unknown resource or footprint comes back as an error, never a silent

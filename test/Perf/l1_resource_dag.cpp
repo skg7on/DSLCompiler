@@ -448,6 +448,40 @@ module {
   EXPECT_GT(dag->events.front().minCycles, 0u);
 }
 
+TEST(L1ResourceDag, TransformHonorsItsSelectedResource) {
+  auto parsed = parseKernel(R"mlir(
+module {
+  micro.kernel @selected_transform {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %t = micro.transform %a {src_map = affine_map<(d0,d1)->(d0,d1)>, dst_map = affine_map<(d0,d1)->(d1,d0)>, micro.compute_resource = "vpu.slow", micro.memory_node = "sram.0"} : tensor<8x8xf32> -> tensor<8x8xf32>
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(parsed);
+  auto model = parseMachine(testMachine(1, 1, 1));
+  auto slow = *model.findCompute("vpu");
+  slow.id = "vpu.slow";
+  slow.lanes["f32"] = 2;
+  model.computes.push_back(slow);
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 1u);
+  EXPECT_EQ(dag->events.front().resourceName, "vpu.slow");
+  EXPECT_EQ(dag->events.front().minCycles, 32u);
+
+  parsed->kernel->walk([&](mlir::Operation *transform) {
+    if (transform->getName().getStringRef() != "micro.transform")
+      return;
+    transform->setAttr("micro.compute_resource",
+                       mlir::StringAttr::get(parsed->context.get(), "missing"));
+  });
+  auto invalid = buildMicroDAG(parsed->kernel, model);
+  EXPECT_FALSE(bool(invalid));
+  if (!invalid)
+    llvm::consumeError(invalid.takeError());
+}
+
 /// A copy into SRAM, a layout conversion of what it landed, and a consumer that
 /// reads the converted value. The transform is charged, materializes its own
 /// output buffer, and both edges around it are data dependencies.

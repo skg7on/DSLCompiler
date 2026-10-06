@@ -969,10 +969,14 @@ TEST(Placement, LayoutTransformChargesTheSharedEstimate) {
   EXPECT_EQ(plan.cost.localBytes, 256u);
 }
 
-// A hand-built request that states no measurable footprint keeps its recorded
-// byte charge rather than an invented zero: the estimator is only authoritative
-// when it can actually measure.
-TEST(Placement, LayoutTransformWithoutFootprintKeepsItsBytes) {
+// A hand-built request that states no measurable footprint is rejected rather
+// than charged a kept byte count: the shared transform estimator is
+// authoritative, so a conversion whose footprint it cannot measure fails closed
+// instead of producing a plan whose cost was never modeled. (The surviving
+// transform-cost mechanism is the shared estimator; the earlier "keep the
+// recorded bytes when unmeasurable" fallback was removed with the duplicate
+// charge paths — issue #67 stage A, A9.)
+TEST(Placement, LayoutTransformWithoutFootprintIsRejected) {
   mlir::MLIRContext context;
   MachineModel machine = transformConnectionMachine();
   TopologyService topology(machine);
@@ -989,9 +993,7 @@ TEST(Placement, LayoutTransformWithoutFootprintKeepsItsBytes) {
 
   llvm::Expected<std::vector<ConnectionPlan>> plans =
       synthesizeConnections(request, machine, topology, {});
-  ASSERT_TRUE(static_cast<bool>(plans)) << llvm::toString(plans.takeError());
-  ASSERT_EQ(plans->size(), 1u);
-  EXPECT_EQ(plans->front().kind, ConnectionKind::LayoutTransform);
-  EXPECT_DOUBLE_EQ(plans->front().cost.latencyCycles, 0.0);
-  EXPECT_EQ(plans->front().cost.localBytes, 128u);
+  ASSERT_FALSE(static_cast<bool>(plans));
+  std::string text = llvm::toString(plans.takeError());
+  EXPECT_NE(text.find("shaped type"), std::string::npos) << text;
 }

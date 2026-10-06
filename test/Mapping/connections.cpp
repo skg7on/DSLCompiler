@@ -72,11 +72,22 @@ MachineModel connectionMachine() {
   model.links = {link("dram_to_acc.0", "dram.0", "acc.0"),
                  link("dram_to_sram.0", "dram.0", "sram.0"),
                  link("sram_to_acc.0", "sram.0", "acc.0")};
+  ComputeNode vector;
+  vector.id = "vpu";
+  vector.kind = "vector_engine";
+  vector.attachedTo = "e0";
+  vector.elementTypes = {"f32"};
+  vector.lanes["f32"] = 8;
+  model.computes.push_back(vector);
   return model;
 }
 
 ConnectionRequest baseRequest() {
+  static mlir::MLIRContext context;
   ConnectionRequest request;
+  request.elementType =
+      mlir::RankedTensorType::get({16, 16}, mlir::Float32Type::get(&context));
+  request.consumerType = request.elementType;
   request.producer = 1;
   request.consumer = 2;
   request.value = 5;
@@ -172,6 +183,7 @@ mlir::AffineMap shifted2(mlir::MLIRContext &context) {
 MachineModel transformHopMachine() {
   MachineModel model;
   model.target = "transform-hop";
+  model.computes = connectionMachine().computes;
   model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}}};
   MemoryNode dram = memory("dram.0", "dram");
   dram.supportedLayouts = {"t.a"};
