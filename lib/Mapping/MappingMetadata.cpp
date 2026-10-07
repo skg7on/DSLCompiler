@@ -1175,12 +1175,12 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         "attached capability it selected cannot be recovered from it. Re-run "
         "the mapping search to regenerate the binding under the current "
         "schema.");
-  // Every accepted binding is v3 or newer under these semantics, so its
-  // v2-or-newer requirements apply. (The v1 recovery paths below are therefore
-  // unreachable here; they are retained to document the older format this
-  // reader no longer accepts.)
-  const bool v2 = schemaVersion >= 2;
-
+  // The check above accepts exactly `kMappingMetadataVersion` (3), so every
+  // accepted binding already satisfies the v2-or-newer requirements these
+  // decoders rely on. The guards that once distinguished v1 from v2 are gone
+  // with the v1 reader: a `v2` predicate over an exactly-v3 version was a
+  // constant, and the older format this reader no longer accepts had no path
+  // through here anyway (CodeQL review, PR #133).
   WorkloadGraphBinding binding;
   llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel, &binding);
   if (!graph)
@@ -1225,36 +1225,27 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
                                           plan.diagnostics.physicalDecisions))
     return std::move(error);
 
-  if (v2) {
-    llvm::Expected<std::string> graphHash =
-        readMetadataString(planAttr, "graph_hash", "micro.plan");
-    if (!graphHash)
-      return graphHash.takeError();
-    llvm::Expected<std::string> targetHash =
-        readMetadataString(planAttr, "target_hash", "micro.plan");
-    if (!targetHash)
-      return targetHash.takeError();
-    llvm::Expected<uint64_t> current = computeModuleSourceGraphHash(kernel);
-    if (!current)
-      return current.takeError();
-    if (*graphHash != hexId(*current))
-      return metadataError("micro.plan graph_hash does not match the kernel's "
-                           "source graph");
-    if (*targetHash != hexId(computeTargetContentHash(target)))
-      return metadataError("micro.plan target_hash does not match the target");
-    plan.graphHash = *current;
-    plan.targetHash = computeTargetContentHash(target);
-    plan.machineHash = machine::computeContentHash(target.machine());
-    plan.layoutHash = target.layouts().computeContentHash();
-    plan.ruleHash = target.rules().computeContentHash();
-  } else {
-    // Legacy: still expose the current hashes for a caller that re-encodes, but
-    // do not validate them -- a v1 binding predates the fields.
-    plan.machineHash = machine::computeContentHash(target.machine());
-    plan.layoutHash = target.layouts().computeContentHash();
-    plan.ruleHash = target.rules().computeContentHash();
-    plan.targetHash = computeTargetContentHash(target);
-  }
+  llvm::Expected<std::string> graphHash =
+      readMetadataString(planAttr, "graph_hash", "micro.plan");
+  if (!graphHash)
+    return graphHash.takeError();
+  llvm::Expected<std::string> targetHash =
+      readMetadataString(planAttr, "target_hash", "micro.plan");
+  if (!targetHash)
+    return targetHash.takeError();
+  llvm::Expected<uint64_t> current = computeModuleSourceGraphHash(kernel);
+  if (!current)
+    return current.takeError();
+  if (*graphHash != hexId(*current))
+    return metadataError("micro.plan graph_hash does not match the kernel's "
+                         "source graph");
+  if (*targetHash != hexId(computeTargetContentHash(target)))
+    return metadataError("micro.plan target_hash does not match the target");
+  plan.graphHash = *current;
+  plan.targetHash = computeTargetContentHash(target);
+  plan.machineHash = machine::computeContentHash(target.machine());
+  plan.layoutHash = target.layouts().computeContentHash();
+  plan.ruleHash = target.rules().computeContentHash();
 
   // --- storage and synchronization state (design §9.6) -------------------
   // B1 persists these; B3 populates them. An empty container is legal today.
@@ -1387,30 +1378,21 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
 
     PlanPlacement placement;
     // The source node id: recorded for v2, recovered from the graph for v1.
-    if (v2) {
-      auto node = mapping.getAs<mlir::IntegerAttr>("node");
-      if (!node) {
-        sawUnrecoverable = true;
-        return;
-      }
-      placement.node = static_cast<WorkloadNodeId>(node.getInt());
-      // The recorded node must be the op's own projected source node, so a
-      // mapping cannot be moved onto another operation.
-      auto found = sourceNodeForOp.find(op);
-      if (found == sourceNodeForOp.end() || found->second != placement.node) {
-        sawUnrecoverable = true;
-        return;
-      }
-      if (auto instance = mapping.getAs<mlir::IntegerAttr>("instance"))
-        placement.instance = static_cast<InstanceId>(instance.getInt());
-    } else {
-      auto found = sourceNodeForOp.find(op);
-      if (found == sourceNodeForOp.end()) {
-        sawUnrecoverable = true;
-        return;
-      }
-      placement.node = found->second;
+    auto node = mapping.getAs<mlir::IntegerAttr>("node");
+    if (!node) {
+      sawUnrecoverable = true;
+      return;
     }
+    placement.node = static_cast<WorkloadNodeId>(node.getInt());
+    // The recorded node must be the op's own projected source node, so a
+    // mapping cannot be moved onto another operation.
+    auto found = sourceNodeForOp.find(op);
+    if (found == sourceNodeForOp.end() || found->second != placement.node) {
+      sawUnrecoverable = true;
+      return;
+    }
+    if (auto instance = mapping.getAs<mlir::IntegerAttr>("instance"))
+      placement.instance = static_cast<InstanceId>(instance.getInt());
 
     llvm::Expected<std::string> rule =
         readMetadataString(mapping, "rule", where);
@@ -1484,9 +1466,6 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         sawUnrecoverable = true;
         return;
       }
-    } else if (v2) {
-      sawUnrecoverable = true;
-      return;
     }
     // The named-port memory associations. Each recorded occurrence must resolve
     // in the source graph, so a tampered association cannot point at a made-up
@@ -1524,14 +1503,6 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         placement.portMemoryBindings.push_back(
             PortMemoryBinding{*ref, *memory});
       }
-    } else if (v2) {
-      if (const RuleDef *def = target.rules().find(placement.rule)) {
-        for (const KindRequirement &requirement : def->kindRequirements)
-          if (requirement.role == "memory" && requirement.port) {
-            sawUnrecoverable = true;
-            return;
-          }
-      }
     }
     if (mlir::Attribute layouts = mapping.get("layouts")) {
       llvm::Expected<llvm::StringMap<std::string>> read =
@@ -1562,15 +1533,11 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         }
         placement.resolvedParameters[parameter.getName()] = *value;
       }
-    } else if (v2) {
-      sawUnrecoverable = true;
-      return;
     }
 
     // A v2 solved-layout container must be accompanied by its entries, so
     // deleting `layout_entries` fails on decode as well as on verify.
-    if (v2 && mapping.get("layout_parameters") &&
-        !mapping.get("layout_entries")) {
+    if (mapping.get("layout_parameters") && !mapping.get("layout_entries")) {
       sawUnrecoverable = true;
       return;
     }
@@ -1629,42 +1596,7 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         // Legacy recovery: a v1 binding records no endpoint, so recover the
         // occurrence the rule names for this class when the declaration makes
         // it unique.
-        if (!v2 && !solved.port) {
-          if (const RuleDef *def = target.rules().find(placement.rule)) {
-            if (const WorkloadNode *node =
-                    sourceGraph.findNode(placement.node)) {
-              for (const RuleLayoutRequirement &requirement :
-                   def->layoutRequirements)
-                if (requirement.layoutId == solved.layoutClass)
-                  if (std::optional<PortRef> ref =
-                          portRefForRulePort(*def, *node, requirement.port)) {
-                    solved.port = ref;
-                    break;
-                  }
-            }
-          }
-        }
         placement.layoutSolutions[entry.getName()] = std::move(solved);
-      }
-    } else if (!v2) {
-      // Legacy recovery: rebuild the solved assignment from the declaration so
-      // an unambiguous v1 binding still replays. A missing assignment the rule
-      // requires is not recoverable.
-      if (const RuleDef *ruleDef = target.rules().find(placement.rule)) {
-        for (const RuleLayoutRequirement &requirement :
-             ruleDef->layoutRequirements) {
-          const WorkloadNode *node = sourceGraph.findNode(placement.node);
-          if (!node) {
-            sawUnrecoverable = true;
-            return;
-          }
-          SolvedLayout solved;
-          solved.layoutClass = requirement.layoutId;
-          if (std::optional<PortRef> ref =
-                  portRefForRulePort(*ruleDef, *node, requirement.port))
-            solved.port = ref;
-          placement.layoutSolutions[requirement.layoutId] = std::move(solved);
-        }
       }
     }
 
@@ -1832,33 +1764,6 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         if (auto compute = transform.getAs<mlir::StringAttr>("compute"))
           layoutTransform.computeResource = compute.getValue().str();
         connection.transform = layoutTransform;
-      }
-
-      // Legacy recovery: a v1 connection records no consumer endpoints, and
-      // which operand occurrence a recorded consumer instance reads is not
-      // uniquely recoverable from the instance projection -- two operand uses
-      // of one value list the same instance. A v1 connection that names
-      // consumers is therefore ambiguous executable replay and is rejected. A
-      // consumer-free connection has nothing to recover; its producer endpoint
-      // is recovered when the value has exactly one producing occurrence.
-      if (!v2 && !connection.consumers.empty())
-        return metadataError(
-            "legacy micro.routes has no recoverable consumer endpoints; "
-            "ambiguous executable replay is rejected");
-      if (!v2 && connection.consumerPorts.empty()) {
-        const WorkloadNode *producerNode = nullptr;
-        unsigned producerIndex = 0;
-        unsigned producers = 0;
-        for (const WorkloadNode &node : sourceGraph.getNodes())
-          for (unsigned index = 0; index < node.outputs.size(); ++index)
-            if (node.outputs[index].value == connection.value) {
-              producerNode = &node;
-              producerIndex = index;
-              ++producers;
-            }
-        if (producers == 1 && producerNode)
-          connection.producerPort =
-              PortRef{producerNode->id, PortDirection::Output, producerIndex};
       }
 
       plan.connectionPlans.push_back(std::move(connection));
