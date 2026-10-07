@@ -142,16 +142,28 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
   // reasons. A genuine rejection -- a capacity overflow, a cyclic graph, a
   // coverage gap -- fails both passes and is dropped.
   plan.materialized = true;
-  if (llvm::Error error = finalizeStoragePlan(graph, plan, machine)) {
+  bool strictCapacity = false;
+  if (llvm::Error error =
+          finalizeStoragePlan(graph, plan, machine, &strictCapacity)) {
     std::string reason = llvm::toString(std::move(error));
     CoveringPlan analysis = proposal;
     analysis.materialized = false;
     recordProvenance(analysis, graph, target);
-    if (llvm::Error second = finalizeStoragePlan(graph, analysis, machine)) {
+    bool analysisCapacity = false;
+    if (llvm::Error second =
+            finalizeStoragePlan(graph, analysis, machine, &analysisCapacity)) {
       std::string secondText = llvm::toString(std::move(second));
       if (secondText != reason)
         reason += "; analysis: " + secondText;
-      return rejected(DiagnosticCode::MemoryCapacityExceeded,
+      // Both passes failed, so this is a *hard* rejection and not merely an
+      // incomplete physical fact. Label it by its actual cause (issue #129,
+      // task R7 review): only a real capacity overflow is a capacity rejection;
+      // a cyclic alias chain, an unknown memory or value, an uncovered node or
+      // a footprint overflow is a plan that cannot be materialized. Conflating
+      // them inflated `plansRejectedByCapacity` and made the stable code lie.
+      return rejected(strictCapacity || analysisCapacity
+                          ? DiagnosticCode::MemoryCapacityExceeded
+                          : DiagnosticCode::UnsupportedMaterialization,
                       std::move(reason));
     }
     plan = std::move(analysis);

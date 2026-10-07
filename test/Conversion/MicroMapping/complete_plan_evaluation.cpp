@@ -153,6 +153,33 @@ TEST(CompletePlanEvaluationTest, EnforcesTheWholePlanByteBudget) {
   ASSERT_TRUE(roomy->plan.has_value());
 }
 
+// A hard storage failure that is *not* a capacity overflow must not be labelled
+// one (issue #129, task R7 review): the stable code is a machine-readable
+// interface, and the search keys `plansRejectedByCapacity` off it, so calling
+// every storage failure a capacity refusal both lies and inflates the tally. A
+// proposal with no placement at all is a structural refusal (the graph is not
+// covered), so the code is the materialization code.
+TEST(CompletePlanEvaluationTest, AStructuralFailureIsNotLabelledCapacity) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  std::vector<CoveringPlan> proposals = proposalsFor(*c);
+  std::optional<CoveringPlan> dram;
+  for (const CoveringPlan &proposal : proposals)
+    if (proposal.placements.front().rule == "r.large")
+      dram = proposal;
+  ASSERT_TRUE(dram.has_value());
+
+  CoveringPlan uncovered = *dram;
+  uncovered.placements.clear(); // no placement covers the graph's node
+  llvm::Expected<CompletePlanEvaluation> evaluated = evaluateCompletePlan(
+      *c->source, c->graph, *c->target, uncovered, BindContract::Partial);
+  ASSERT_TRUE(static_cast<bool>(evaluated))
+      << llvm::toString(evaluated.takeError());
+  ASSERT_TRUE(evaluated->rejection.has_value());
+  EXPECT_EQ(evaluated->rejection->code,
+            DiagnosticCode::UnsupportedMaterialization);
+}
+
 // Evaluation is deterministic and idempotent: two evaluations of one proposal
 // produce the same decisions and therefore the same decision-only id, and
 // re-finalizing a returned plan reproduces that id (the invariant the search's

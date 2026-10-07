@@ -678,7 +678,10 @@ computePeakStorage(llvm::ArrayRef<StorageAllocation> allocations) {
 //===----------------------------------------------------------------------===//
 
 llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
-                                const machine::MachineModel &machine) {
+                                const machine::MachineModel &machine,
+                                bool *capacityExceeded) {
+  if (capacityExceeded)
+    *capacityExceeded = false;
   // Everything this function decides -- allocations, steps, the physical
   // verdict -- is collected in locals and written to `plan` only on success, so
   // a failure leaves the plan exactly as it was rather than half-annotated.
@@ -1667,13 +1670,16 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
       if (allocation.memory == entry.first)
         mostResident =
             std::max(mostResident, allocation.simultaneousOccurrences);
-    if (entry.second > memory->capacityBytes)
+    if (entry.second > memory->capacityBytes) {
+      if (capacityExceeded)
+        *capacityExceeded = true;
       return storageError(
           "storage plan: memory '" + entry.first + "' over capacity (peak " +
           std::to_string(entry.second) + " bytes live over up to " +
           std::to_string(mostResident) +
           " simultaneous occurrence(s) per slot, " +
           std::to_string(memory->capacityBytes) + " byte capacity)");
+    }
     notes.push_back("storage plan: memory '" + entry.first + "' peak " +
                     std::to_string(entry.second) + " bytes of " +
                     std::to_string(memory->capacityBytes));

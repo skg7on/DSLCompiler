@@ -166,8 +166,17 @@ resolveEndpointMemory(const WorkloadGraph &graph,
 /// an unsupported footprint is an error; a non-materialized (analysis) plan
 /// uses a reported conservative fallback instead. Every plan memory must be
 /// modeled by `machine`, and the graph must be acyclic and fully covered.
+///
+/// When `capacityExceeded` is non-null it is set to true iff the error being
+/// returned is a *capacity* rejection (a memory's live peak over its own
+/// capacity); every other failure -- an unknown memory or value, an uncovered
+/// node, an unsupported footprint, a malformed alias chain, an arithmetic
+/// overflow -- leaves it false. A caller that maps the failure to a stable
+/// diagnostic code (issue #129, task R7 review) can then report capacity
+/// refusals distinctly instead of labelling every storage failure as one.
 llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
-                                const machine::MachineModel &machine);
+                                const machine::MachineModel &machine,
+                                bool *capacityExceeded = nullptr);
 
 } // namespace mlir::llk::mapping
 
