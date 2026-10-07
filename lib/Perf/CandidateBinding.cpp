@@ -129,38 +129,6 @@ std::optional<Type> elementTypeFor(MLIRContext *context, StringRef name) {
   return std::nullopt;
 }
 
-/// Returns the spatial mapping target of the same name as `owner`.
-///
-/// `MappingTarget` and `Owner` are independent vocabularies with different
-/// enumerator values, so this is a name match, not a numeric cast. Returns
-/// nullopt for the owner scopes that have no spatial axis.
-std::optional<micro::MappingTarget> spatialTargetFor(micro::Owner owner) {
-  switch (owner) {
-  case micro::Owner::cluster:
-    return micro::MappingTarget::cluster_x;
-  case micro::Owner::core:
-    return micro::MappingTarget::core_x;
-  case micro::Owner::pe:
-    return micro::MappingTarget::pe_x;
-  case micro::Owner::lane:
-    return micro::MappingTarget::lane;
-  case micro::Owner::worker:
-    return micro::MappingTarget::worker;
-  case micro::Owner::matrix_engine:
-    return micro::MappingTarget::matrix_engine;
-  case micro::Owner::vector_engine:
-    return micro::MappingTarget::vector_engine;
-  case micro::Owner::dma:
-    return micro::MappingTarget::dma;
-  case micro::Owner::warp:
-  case micro::Owner::wave:
-  case micro::Owner::subgroup:
-  case micro::Owner::pe_group:
-    return std::nullopt;
-  }
-  return std::nullopt;
-}
-
 /// Builds a `#micro.layout` attribute. `vectorWidth` is 0 when the layout makes
 /// no claim about vectorization.
 micro::LayoutAttr makeLayoutAttr(MLIRContext *context, micro::LayoutKind kind,
@@ -253,8 +221,14 @@ llvm::Error resolveMemoryPath(StringRef path, std::vector<std::string> &spaces,
 }
 
 /// Resolves the owner mapping into an outer scope and a fragment owner. A
-/// single owner names the tiled axes; the other keeps `lane`, which is what the
-/// export uses for the AVX2 validation backend.
+/// single owner names the tiled axes; the other keeps the legacy `lane` scope
+/// the export has always completed it with.
+///
+/// The names are carried as *symbols* and never resolved against a fixed list:
+/// an owner_mapping spelling is target-owned data, and the owning target's
+/// machine model is what turns it into a concrete class before execution. The
+/// binder checks only the structure it implements -- one name at least, no more
+/// than the two levels its two spatial loops cover.
 llvm::Error resolveOwnerMapping(StringRef mapping, std::string &outer,
                                 std::string &fragment) {
   if (mapping.empty())
@@ -265,14 +239,6 @@ llvm::Error resolveOwnerMapping(StringRef mapping, std::string &outer,
     return invalid("owner_mapping '" + mapping +
                    "' names more than two owner levels; the binder emits one "
                    "spatial loop per tiled axis");
-  for (StringRef owner : owners) {
-    std::optional<micro::Owner> resolved = micro::symbolizeOwner(owner);
-    if (!resolved)
-      return invalid("owner_mapping names unknown owner '" + owner + "'");
-    if (!spatialTargetFor(*resolved))
-      return invalid("owner_mapping owner '" + owner +
-                     "' has no spatial axis to map onto");
-  }
   outer = owners[0].str();
   fragment = (owners.size() > 1 ? owners[1] : StringRef("lane")).str();
   return llvm::Error::success();
@@ -456,9 +422,9 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   micro::LayoutAttr layoutAttr =
       makeLayoutAttr(ctx, *layout, decisions.vectorWidth);
   micro::OwnerAttr outerOwner =
-      micro::OwnerAttr::get(ctx, *micro::symbolizeOwner(decisions.outerOwner));
-  micro::OwnerAttr fragmentOwner = micro::OwnerAttr::get(
-      ctx, *micro::symbolizeOwner(decisions.fragmentOwner));
+      micro::OwnerAttr::get(ctx, decisions.outerOwner);
+  micro::OwnerAttr fragmentOwner =
+      micro::OwnerAttr::get(ctx, decisions.fragmentOwner);
   micro::MemorySpaceAttr srcSpace = micro::MemorySpaceAttr::get(
       ctx, *micro::symbolizeMemorySpace(decisions.sourceSpace));
   micro::MemorySpaceAttr stageSpace = micro::MemorySpaceAttr::get(
@@ -490,15 +456,13 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   // --- spatial tiling ----------------------------------------------------
   auto openSpatialLoop = [&](int64_t extent, int64_t step, StringRef ownerName,
                              ValueRange carried) -> micro::SpatialForOp {
-    std::optional<micro::MappingTarget> target =
-        spatialTargetFor(*micro::symbolizeOwner(ownerName));
     Value lower = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
     Value upper =
         arith::ConstantIndexOp::create(builder, loc, extent).getResult();
     Value by = arith::ConstantIndexOp::create(builder, loc, step).getResult();
     auto loop = micro::SpatialForOp::create(
         builder, loc, carried.getTypes(), lower, upper, by,
-        micro::MappingTargetAttr::get(ctx, *target), carried);
+        micro::MappingTargetAttr::get(ctx, ownerName), carried);
     llvm::SmallVector<Type> bodyTypes{IndexType::get(ctx)};
     bodyTypes.append(carried.getTypes().begin(), carried.getTypes().end());
     startRegionBody(builder, loop.getBody(), loc, bodyTypes);

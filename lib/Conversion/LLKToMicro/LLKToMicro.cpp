@@ -199,38 +199,6 @@ ArrayAttr makeOwnerChoices(MLIRContext *context, StringRef outer,
                            {selected, "worker/lane", "worker/vector_engine"});
 }
 
-/// Returns the spatial mapping target of the same name as `owner`.
-///
-/// `MappingTarget` and `Owner` are independent vocabularies with different
-/// enumerator values, so this is a name match and not a numeric cast. Returns
-/// nullopt for the owner scopes that have no spatial axis.
-std::optional<micro::MappingTarget> spatialTargetFor(micro::Owner owner) {
-  switch (owner) {
-  case micro::Owner::cluster:
-    return micro::MappingTarget::cluster_x;
-  case micro::Owner::core:
-    return micro::MappingTarget::core_x;
-  case micro::Owner::pe:
-    return micro::MappingTarget::pe_x;
-  case micro::Owner::lane:
-    return micro::MappingTarget::lane;
-  case micro::Owner::worker:
-    return micro::MappingTarget::worker;
-  case micro::Owner::matrix_engine:
-    return micro::MappingTarget::matrix_engine;
-  case micro::Owner::vector_engine:
-    return micro::MappingTarget::vector_engine;
-  case micro::Owner::dma:
-    return micro::MappingTarget::dma;
-  case micro::Owner::warp:
-  case micro::Owner::wave:
-  case micro::Owner::subgroup:
-  case micro::Owner::pe_group:
-    return std::nullopt;
-  }
-  return std::nullopt;
-}
-
 /// Builds a `#micro.layout` attribute. `vectorWidth` is 0 when the layout makes
 /// no claim about vectorization.
 micro::LayoutAttr makeLayoutAttr(MLIRContext *context, micro::LayoutKind kind,
@@ -274,11 +242,16 @@ struct TilePlan {
   int64_t stages = 1;
   int64_t vectorWidth = 0;
   micro::LayoutKind layoutKind = micro::LayoutKind::row_major;
-  micro::Owner outerOwner = micro::Owner::worker;
-  micro::Owner innerOwner = micro::Owner::lane;
-  micro::Owner fragmentOwner = micro::Owner::vector_engine;
-  micro::MappingTarget outerMap = micro::MappingTarget::worker;
-  micro::MappingTarget innerMap = micro::MappingTarget::lane;
+  // Owner and spatial-axis spellings are target vocabulary, carried verbatim
+  // from the schedule and recorded in the IR as *symbols*. The export does not
+  // resolve them to a concrete class -- it has no target loaded -- so it
+  // neither normalizes nor rejects a spelling here; the owning target's machine
+  // model resolves it before execution. The defaults are the legacy schedule
+  // spellings the built-in conservative entry uses, preserved so an export
+  // without an explicit owner_mapping has the same owner path it always had.
+  std::string outerOwner = "worker";
+  std::string innerOwner = "lane";
+  std::string fragmentOwner = "vector_engine";
   micro::MemorySpace srcSpace = micro::MemorySpace::dram;
   micro::MemorySpace stagingSpace = micro::MemorySpace::sram;
   micro::MemorySpace accumulatorSpace = micro::MemorySpace::acc;
@@ -313,15 +286,20 @@ LogicalResult parseMemoryPath(Operation *root, const ScheduleEntry &schedule,
   return success();
 }
 
-/// Parses the schedule's owner hierarchy into at most two owner levels and
-/// their spatial mapping targets. A single owner names the tiled axis; the
-/// other tiled axis keeps the machine's innermost compute scope, which is what
-/// `lane` is for the AVX2 validation backend.
+/// Parses the schedule's owner hierarchy into at most two owner levels. A
+/// single owner names the tiled axis; the other tiled axis keeps the same
+/// legacy `lane` scope the export has always completed it with.
+///
+/// The levels are carried as *symbols*, not resolved to one of the dialect's
+/// abstract owner classes: the schedule is target-owned data whose spellings
+/// the owning target's machine model resolves before execution. The only
+/// structural claim checked here is the one the export itself depends on --
+/// at least one name, and no more than the two levels the two spatial loops
+/// implement. A spelling the dialect does not recognize is *not* an error; it
+/// is unresolved analysis data that target readiness later accepts or rejects.
 LogicalResult parseOwnerHierarchy(Operation *root,
                                   const ScheduleEntry &schedule,
-                                  micro::Owner &outer, micro::Owner &inner,
-                                  micro::MappingTarget &outerMap,
-                                  micro::MappingTarget &innerMap) {
+                                  std::string &outer, std::string &inner) {
   auto fail = [&](const Twine &message) {
     root->emitError() << message;
     return failure();
@@ -337,26 +315,9 @@ LogicalResult parseOwnerHierarchy(Operation *root,
     return fail("schedule owner_mapping '" + schedule.owner_mapping +
                 "' names more than two owner levels; the export emits one "
                 "spatial loop per tiled axis");
-  for (StringRef owner : owners)
-    if (!micro::symbolizeOwner(owner))
-      return fail("schedule owner_mapping '" + schedule.owner_mapping +
-                  "' names unknown owner '" + owner + "'");
 
-  outer = *micro::symbolizeOwner(owners[0]);
-  inner = *micro::symbolizeOwner(owners.size() > 1 ? owners[1] : "lane");
-
-  std::optional<micro::MappingTarget> outerTarget = spatialTargetFor(outer);
-  std::optional<micro::MappingTarget> innerTarget = spatialTargetFor(inner);
-  if (!outerTarget)
-    return fail("schedule owner_mapping owner '" +
-                micro::stringifyOwner(outer) +
-                "' has no spatial axis to map onto");
-  if (!innerTarget)
-    return fail("schedule owner_mapping owner '" +
-                micro::stringifyOwner(inner) +
-                "' has no spatial axis to map onto");
-  outerMap = *outerTarget;
-  innerMap = *innerTarget;
+  outer = owners[0].str();
+  inner = (owners.size() > 1 ? owners[1] : StringRef("lane")).str();
   return success();
 }
 
@@ -392,16 +353,12 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
 
   // --- owner hierarchy ---------------------------------------------------
   if (failed(parseOwnerHierarchy(root, schedule, plan.outerOwner,
-                                 plan.innerOwner, plan.outerMap,
-                                 plan.innerMap)))
+                                 plan.innerOwner)))
     return failure();
 
-  std::optional<micro::Owner> fragment =
-      micro::symbolizeOwner(schedule.fragment_owner);
-  if (!fragment)
-    return fail("schedule fragment_owner '" + schedule.fragment_owner +
-                "' is not a known owner");
-  plan.fragmentOwner = *fragment;
+  if (schedule.fragment_owner.empty())
+    return fail("schedule fragment_owner must name an owner");
+  plan.fragmentOwner = schedule.fragment_owner;
 
   // --- instruction fragment ---------------------------------------------
   FailureOr<SmallVector<int64_t, 3>> declared =
@@ -498,11 +455,8 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   // types and op attributes already hold shape, dtype, layout, memory space,
   // and owner.
   kernel->setAttr("memory_path", StringAttr::get(ctx, schedule.memory_path));
-  kernel->setAttr(
-      "owner_mapping",
-      StringAttr::get(ctx, (Twine(micro::stringifyOwner(plan.outerOwner)) +
-                            "/" + micro::stringifyOwner(plan.innerOwner))
-                               .str()));
+  kernel->setAttr("owner_mapping", StringAttr::get(ctx, plan.outerOwner + "/" +
+                                                            plan.innerOwner));
   kernel->setAttr("tile_layout", StringAttr::get(ctx, schedule.tile_layout));
   kernel->setAttr("mma_shape",
                   DenseI64ArrayAttr::get(ctx, plan.declaredFragment));
@@ -591,8 +545,7 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
       micro::TileAllocOp::create(builder, loc, outputTileType).getResult();
 
   // --- spatial tiling ----------------------------------------------------
-  auto openSpatialLoop = [&](int64_t extent, int64_t step,
-                             micro::MappingTarget target,
+  auto openSpatialLoop = [&](int64_t extent, int64_t step, llvm::StringRef axis,
                              ValueRange carried) -> micro::SpatialForOp {
     Value lower = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
     Value upper =
@@ -600,7 +553,7 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
     Value by = arith::ConstantIndexOp::create(builder, loc, step).getResult();
     auto loop = micro::SpatialForOp::create(
         builder, loc, carried.getTypes(), lower, upper, by,
-        micro::MappingTargetAttr::get(ctx, target), carried);
+        micro::MappingTargetAttr::get(ctx, axis), carried);
     llvm::SmallVector<Type> bodyTypes{IndexType::get(ctx)};
     bodyTypes.append(carried.getTypes().begin(), carried.getTypes().end());
     startRegionBody(builder, loop.getBody(), loc, bodyTypes);
@@ -608,12 +561,12 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   };
 
   micro::SpatialForOp bmLoop =
-      openSpatialLoop(plan.M, plan.BM, plan.outerMap, ValueRange{output});
+      openSpatialLoop(plan.M, plan.BM, plan.outerOwner, ValueRange{output});
   BlockArgument bm = bmLoop.getBody().front().getArgument(0);
   Value bmCarried = bmLoop.getBody().front().getArgument(1);
 
   micro::SpatialForOp bnLoop =
-      openSpatialLoop(plan.N, plan.BN, plan.innerMap, ValueRange{bmCarried});
+      openSpatialLoop(plan.N, plan.BN, plan.innerOwner, ValueRange{bmCarried});
   BlockArgument bn = bnLoop.getBody().front().getArgument(0);
   Value bnCarried = bnLoop.getBody().front().getArgument(1);
 
@@ -970,12 +923,9 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
   if (failed(parseMemoryPath(root, schedule, srcSpace, stagingSpace)))
     return failure();
 
-  micro::Owner outerOwner = micro::Owner::worker;
-  micro::Owner innerOwner = micro::Owner::lane;
-  micro::MappingTarget outerMap = micro::MappingTarget::worker;
-  micro::MappingTarget innerMap = micro::MappingTarget::lane;
-  if (failed(parseOwnerHierarchy(root, schedule, outerOwner, innerOwner,
-                                 outerMap, innerMap)))
+  std::string outerOwner;
+  std::string innerOwner;
+  if (failed(parseOwnerHierarchy(root, schedule, outerOwner, innerOwner)))
     return failure();
 
   if (!micro::symbolizeLayoutKind(schedule.tile_layout))
@@ -1052,8 +1002,7 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
            makeStringChoices(context, {schedule.memory_path, "dram:sram:acc",
                                        "dram:l2:sram:acc"}));
   addParam("owner_mapping", "owner_mapping",
-           makeOwnerChoices(context, micro::stringifyOwner(outerOwner),
-                            micro::stringifyOwner(innerOwner)));
+           makeOwnerChoices(context, outerOwner, innerOwner));
   addParam("fragment_shape", "fragment_shape",
            makeStringChoices(context,
                              {schedule.fragment_shape, "16x16x32", "8x8x32"}));

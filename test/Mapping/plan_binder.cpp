@@ -396,11 +396,13 @@ worker_threads: 2
 executors:
   - id: cluster.a
     kind: cluster
+    refines: [group]
   - id: worker.a
     kind: worker
     parent: cluster.a
   - id: cluster.b
     kind: cluster
+    refines: [group]
   - id: worker.b
     kind: worker
     parent: cluster.b
@@ -424,6 +426,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.a
     element_types: [f32]
     shapes: [[8]]
@@ -431,6 +434,7 @@ compute:
 transfer_engines:
   - id: dma.a
     kind: dma
+    refines: [transfer]
     attached_to: cluster.a
     count: 1
     max_outstanding: 1
@@ -517,11 +521,13 @@ worker_threads: 2
 executors:
   - id: cluster.a
     kind: cluster
+    refines: [group]
   - id: worker.a
     kind: worker
     parent: cluster.a
   - id: cluster.b
     kind: cluster
+    refines: [group]
   - id: worker.b
     kind: worker
     parent: cluster.b
@@ -553,6 +559,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.a
     element_types: [f32]
     shapes: [[8]]
@@ -560,6 +567,7 @@ compute:
 transfer_engines:
   - id: dma.a
     kind: dma
+    refines: [transfer]
     attached_to: cluster.a
     count: 1
     max_outstanding: 1
@@ -1028,11 +1036,13 @@ worker_threads: 2
 executors:
   - id: cluster.a
     kind: cluster
+    refines: [group]
   - id: worker.a
     kind: worker
     parent: cluster.a
   - id: cluster.b
     kind: cluster
+    refines: [group]
   - id: worker.b
     kind: worker
     parent: cluster.b
@@ -1064,6 +1074,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.a
     element_types: [f32]
     shapes: [[8]]
@@ -1071,6 +1082,7 @@ compute:
 transfer_engines:
   - id: dma.b
     kind: dma
+    refines: [transfer]
     attached_to: cluster.b
     count: 1
     max_outstanding: 1
@@ -1193,6 +1205,7 @@ worker_threads: 2
 executors:
   - id: cluster.c
     kind: cluster
+    refines: [group]
   - id: worker.vec
     kind: worker
     parent: cluster.c
@@ -1211,6 +1224,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.vec
     element_types: [f32]
     shapes: [[8]]
@@ -2541,11 +2555,13 @@ worker_threads: 2
 executors:
   - id: cluster.a
     kind: cluster
+    refines: [group]
   - id: worker.a
     kind: worker
     parent: cluster.a
   - id: cluster.b
     kind: cluster
+    refines: [group]
   - id: worker.b
     kind: worker
     parent: cluster.b
@@ -2577,6 +2593,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.a
     element_types: [f32]
     shapes: [[8]]
@@ -2584,6 +2601,7 @@ compute:
 transfer_engines:
   - id: dma.a
     kind: dma
+    refines: [transfer]
     attached_to: cluster.a
     count: 1
     max_outstanding: 1
@@ -3040,13 +3058,17 @@ worker_threads: 2
 executors:
   - id: cluster.a
     kind: cluster
+    refines: [group]
   - id: worker.a
     kind: core
+    refines: [worker]
     parent: cluster.a
   - id: cluster.b
     kind: cluster
+    refines: [group]
   - id: worker.b
     kind: pe
+    refines: [worker]
     parent: cluster.b
 memories:
   - id: sram.0
@@ -3068,6 +3090,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.a
     element_types: [f32]
     shapes: [[8]]
@@ -3078,6 +3101,7 @@ compute:
 transfer_engines:
   - id: dma.a
     kind: dma
+    refines: [transfer]
     attached_to: cluster.a
     count: 1
     max_outstanding: 1
@@ -3145,16 +3169,21 @@ worker_threads: 2
 executors:
   - id: cluster.a
     kind: cluster
+    refines: [group]
   - id: worker.a
     kind: core
+    refines: [worker]
     parent: cluster.a
   - id: cluster.b
     kind: cluster
+    refines: [group]
   - id: worker.b
     kind: pe
+    refines: [worker]
     parent: cluster.b
   - id: cluster.c
     kind: cluster
+    refines: [group]
   - id: worker.c
     kind: worker
     parent: cluster.c
@@ -3186,6 +3215,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.a
     element_types: [f32]
     shapes: [[8]]
@@ -3196,11 +3226,13 @@ compute:
 transfer_engines:
   - id: dma.a
     kind: dma
+    refines: [transfer]
     attached_to: cluster.a
     count: 1
     max_outstanding: 1
   - id: dma.c
     kind: dma
+    refines: [transfer]
     attached_to: cluster.c
     count: 1
     max_outstanding: 1

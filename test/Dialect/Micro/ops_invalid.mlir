@@ -25,13 +25,15 @@ func.func @bad_memory() attributes {bad = #micro.memory<invalid>} {
 
 // -----
 
-// Test that invalid mapping target spelling fails.
+// A mapping target is an open symbol: an unrecognized spelling is *unresolved
+// analysis data*, not a parse error. Whether a target accepts it is the owning
+// target's decision, made when it resolves the symbol against its machine
+// model, so the dialect keeps the text parseable. The rejection this used to
+// assert is now a target-readiness failure exercised by the mapping tests.
 
-func.func @bad_map() attributes {bad = #micro.map<unknown>} {
+func.func @open_map_symbol() attributes {sketchy = #micro.map<unknown>} {
   return
 }
-// expected-error @-3 {{expected ::mlir::micro::MappingTarget to be one of}}
-// expected-error @-4 {{failed to parse Micro_MappingTargetAttr}}
 
 // -----
 

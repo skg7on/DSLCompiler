@@ -12,11 +12,13 @@ worker_threads: 2
 executors:
   - id: cluster.a
     kind: cluster
+    refines: [group]
   - id: worker.a
     kind: worker
     parent: cluster.a
   - id: cluster.b
     kind: cluster
+    refines: [group]
   - id: worker.b
     kind: worker
     parent: cluster.b
@@ -40,6 +42,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.a
     element_types: [f32]
     shapes: [[8]]
@@ -47,6 +50,7 @@ compute:
 transfer_engines:
   - id: dma.a
     kind: dma
+    refines: [transfer]
     attached_to: cluster.a
     count: 1
     max_outstanding: 1

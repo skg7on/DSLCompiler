@@ -209,6 +209,7 @@ namespace {
 
 using mlir::llk::machine::ComputeNode;
 using mlir::llk::machine::MachineModel;
+using mlir::llk::machine::TransferEngineNode;
 
 MachineModel evalMachine() {
   MachineModel model;
@@ -219,11 +220,22 @@ MachineModel evalMachine() {
   ComputeNode vector;
   vector.id = "vec.0";
   vector.kind = "vector_engine";
+  vector.refines = {"vector"};
   vector.attachedTo = "e0";
   vector.elementTypes = {"f32"};
   vector.shapes = {{8}};
   vector.lanes = {{"f32", 8}, {"bf16", 16}};
   model.computes.push_back(vector);
+  // A movement engine names the `dma` label in the machine's alias data, which
+  // is what makes `executors("dma")` a known kind with no executors rather than
+  // an unrecognized spelling. The label reaches a class only through this
+  // declaration; the dialect does not know it.
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.refines = {"transfer"};
+  dma.attachedTo = "e0";
+  model.transferEngines.push_back(dma);
   return model;
 }
 

@@ -264,15 +264,21 @@ static int vectorOpArity(StringRef op) {
 
 // Verifies that an optional owner attribute is carried by and agrees with the
 // result tile's owner (shared by tile_partition and tile_async_copy).
+//
+// The comparison is on the recorded **symbol**. The dialect does not know
+// whether a spelling names an abstract class or a profile's own label -- that
+// is the target's business -- so the only thing it can check is that the two
+// agree, which is exactly the structural claim.
 template <typename OpTy>
-static LogicalResult verifyOwnerAttrMatches(OpTy op, std::optional<Owner> owner,
+static LogicalResult verifyOwnerAttrMatches(OpTy op,
+                                            std::optional<OwnerAttr> owner,
                                             TileType resultType) {
   if (!owner)
     return success();
   if (!resultType.getOwner())
     return op.emitOpError(
         "owner attribute requires the result tile to carry an owner");
-  if (*owner != resultType.getOwner().getValue())
+  if (*owner != resultType.getOwner())
     return op.emitOpError("owner attribute must match result tile owner");
   return success();
 }
@@ -1198,10 +1204,13 @@ static LogicalResult verifySymbolicChoice(Operation *op, StringRef kind,
     if (owners.size() < 2)
       return op->emitOpError("owner_mapping choice '")
              << choice << "' must join at least two owners with '/'";
+    // The spellings are *symbols*, not a fixed vocabulary: which concrete
+    // scopes they name is the owning target's machine model's business, so the
+    // dialect checks only the structure it depends on -- two named levels.
     for (StringRef owner : owners)
-      if (!symbolizeOwner(owner))
+      if (owner.empty())
         return op->emitOpError("owner_mapping choice '")
-               << choice << "' has unknown owner '" << owner << "'";
+               << choice << "' names an empty owner";
     return success();
   }
 

@@ -707,8 +707,9 @@ llvm::Error DAGBuilder::walkBlock(mlir::Block &block, State state,
     }
 
     if (auto spatialOp = llvm::dyn_cast<micro::SpatialForOp>(op)) {
-      std::string target =
-          micro::stringifyMappingTarget(spatialOp.getMap()).str();
+      // The spatial axis is an open symbol now, so the label is whatever the
+      // loop recorded -- a target's spelling, not a fixed enumerator.
+      std::string target = spatialOp.getMap().getSymbol().str();
       State outer = state;
       if (llvm::Error err =
               walkLoop(spatialOp.getBody().front(), spatialOp.getLowerBound(),
@@ -773,7 +774,10 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
   std::string owner = outer.owner;
   uint64_t storageFactor = outer.storageFactor;
   if (concurrent && !mapTarget.empty()) {
-    if (micro::symbolizeOwner(mapTarget)) {
+    // The spatial axis is an open symbol; whether it names an execution scope
+    // is the machine's answer, resolved through its alias data, not a fixed
+    // list of spellings the dialect happens to know.
+    if (machine.ownerClass(mapTarget)) {
       owner = mapTarget.str();
       // Each owner needs its own copy of the tiles the body materializes.
       storageFactor *= std::max<uint64_t>(1, machine.ownerCount(owner));
@@ -828,8 +832,8 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
 
   if (auto partition = llvm::dyn_cast<micro::TilePartitionOp>(op)) {
     std::optional<std::string> owner;
-    if (std::optional<micro::Owner> attr = partition.getOwner())
-      owner = micro::stringifyOwner(*attr).str();
+    if (std::optional<micro::OwnerAttr> attr = partition.getOwner())
+      owner = attr->getSymbol().str();
     return buildLogicalTileOp(op, partition.getSource(), partition.getResult(),
                               owner, EventKind::TilePartition, state);
   }

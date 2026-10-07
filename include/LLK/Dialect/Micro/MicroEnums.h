@@ -61,68 +61,10 @@ inline std::optional<MemorySpace> symbolizeMemorySpace(llvm::StringRef str) {
       .Default(std::nullopt);
 }
 
-//===----------------------------------------------------------------------===//
-// Mapping target enum
-//===----------------------------------------------------------------------===//
-
-enum MappingTarget : uint32_t {
-  cluster_x = 0,
-  cluster_y = 1,
-  core_x = 2,
-  core_y = 3,
-  pe_x = 4,
-  pe_y = 5,
-  lane = 6,
-  worker = 7,
-  matrix_engine = 8,
-  vector_engine = 9,
-  dma = 10,
-};
-
-inline llvm::StringRef stringifyMappingTarget(MappingTarget val) {
-  switch (val) {
-  case cluster_x:
-    return "cluster_x";
-  case cluster_y:
-    return "cluster_y";
-  case core_x:
-    return "core_x";
-  case core_y:
-    return "core_y";
-  case pe_x:
-    return "pe_x";
-  case pe_y:
-    return "pe_y";
-  case lane:
-    return "lane";
-  case worker:
-    return "worker";
-  case matrix_engine:
-    return "matrix_engine";
-  case vector_engine:
-    return "vector_engine";
-  case dma:
-    return "dma";
-  }
-  return "";
-}
-
-inline std::optional<MappingTarget>
-symbolizeMappingTarget(llvm::StringRef str) {
-  return llvm::StringSwitch<std::optional<MappingTarget>>(str)
-      .Case("cluster_x", cluster_x)
-      .Case("cluster_y", cluster_y)
-      .Case("core_x", core_x)
-      .Case("core_y", core_y)
-      .Case("pe_x", pe_x)
-      .Case("pe_y", pe_y)
-      .Case("lane", lane)
-      .Case("worker", worker)
-      .Case("matrix_engine", matrix_engine)
-      .Case("vector_engine", vector_engine)
-      .Case("dma", dma)
-      .Default(std::nullopt);
-}
+// `#micro.map` has no enumerators of its own. A spatial loop names its axis as
+// a symbol (`#micro.map<worker>`), exactly as a tile names its owner, and the
+// owning target resolves that spelling through its machine model. See the
+// `Micro_MappingTargetAttr` definition in MicroDialect.td.
 
 //===----------------------------------------------------------------------===//
 // DType enum
@@ -266,67 +208,49 @@ inline std::optional<BarrierScope> symbolizeBarrierScope(llvm::StringRef str) {
 // Owner enum (for #micro.owner)
 //===----------------------------------------------------------------------===//
 
-// Scoped enum: several owner names (lane, worker, matrix_engine, vector_engine,
-// dma) also appear as unscoped MappingTarget enumerators in this namespace.
+// The abstract classes a tile's owner belongs to: the whole of the owner
+// vocabulary the canonical dialect has. A *concrete* executor spelling --
+// whatever a target calls its execution units -- is that target's word for one
+// of these, and belongs in that target's machine model, which maps its own
+// labels onto them. Enumerating them here is what §5.4 forbids: it would put
+// one backend's hierarchy into the IR every backend shares.
+//
+// Scoped, because several of these names also appear as unscoped enumerators
+// elsewhere in this namespace.
 enum class Owner : uint32_t {
-  cluster = 0,
-  core = 1,
-  warp = 2,
-  wave = 3,
-  subgroup = 4,
-  pe_group = 5,
-  pe = 6,
-  lane = 7,
-  worker = 8,
-  matrix_engine = 9,
-  vector_engine = 10,
-  dma = 11,
+  group = 0,    // a cooperating group of workers
+  worker = 1,   // one worker
+  vector = 2,   // the vector engine
+  matrix = 3,   // the matrix engine
+  transfer = 4, // the data-movement engine
 };
 
 inline llvm::StringRef stringifyOwner(Owner val) {
   switch (val) {
-  case Owner::cluster:
-    return "cluster";
-  case Owner::core:
-    return "core";
-  case Owner::warp:
-    return "warp";
-  case Owner::wave:
-    return "wave";
-  case Owner::subgroup:
-    return "subgroup";
-  case Owner::pe_group:
-    return "pe_group";
-  case Owner::pe:
-    return "pe";
-  case Owner::lane:
-    return "lane";
+  case Owner::group:
+    return "group";
   case Owner::worker:
     return "worker";
-  case Owner::matrix_engine:
-    return "matrix_engine";
-  case Owner::vector_engine:
-    return "vector_engine";
-  case Owner::dma:
-    return "dma";
+  case Owner::vector:
+    return "vector";
+  case Owner::matrix:
+    return "matrix";
+  case Owner::transfer:
+    return "transfer";
   }
   return "";
 }
 
+/// The abstract class a spelling names *directly*. A profile's own label is not
+/// one of these: it reaches a class through the machine model's alias table,
+/// which is where a target's vocabulary lives.
 inline std::optional<Owner> symbolizeOwner(llvm::StringRef str) {
   return llvm::StringSwitch<std::optional<Owner>>(str)
-      .Case("cluster", Owner::cluster)
-      .Case("core", Owner::core)
-      .Case("warp", Owner::warp)
-      .Case("wave", Owner::wave)
-      .Case("subgroup", Owner::subgroup)
-      .Case("pe_group", Owner::pe_group)
-      .Case("pe", Owner::pe)
-      .Case("lane", Owner::lane)
+      .Case("group", Owner::group)
       .Case("worker", Owner::worker)
-      .Case("matrix_engine", Owner::matrix_engine)
-      .Case("vector_engine", Owner::vector_engine)
-      .Case("dma", Owner::dma)
+      .Case("vector", Owner::vector)
+      .Case("matrix", Owner::matrix)
+      .Case("transfer", Owner::transfer)
       .Default(std::nullopt);
 }
 

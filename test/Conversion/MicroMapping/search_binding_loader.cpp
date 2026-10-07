@@ -577,6 +577,7 @@ memories:
 compute:
   - id: vpu
     kind: vector_engine
+    refines: [vector]
     attached_to: worker.0
     element_types: [f32]
     shapes: [[8]]
@@ -657,6 +658,7 @@ memories:
 compute:
   - id: mxu
     kind: matrix_engine
+    refines: [matrix]
     attached_to: worker.0
     element_types: [f32, bf16]
     accumulator_dtypes: [f32]

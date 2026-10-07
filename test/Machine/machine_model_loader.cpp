@@ -54,6 +54,7 @@ memories:
 compute:
   - id: vec.0
     kind: vector_engine
+    refines: [vector]
     attached_to: core.0
     element_types: [f32]
     shapes: [[8]]
@@ -63,6 +64,7 @@ compute:
 transfer_engines:
   - id: dma.0
     kind: dma
+    refines: [transfer]
     attached_to: core.0
     count: 1
     max_outstanding: 8
@@ -368,6 +370,7 @@ executors:
 compute:
   - id: c0
     kind: vector_engine
+    refines: [vector]
     attached_to: e0
     element_types: [f32]
     shapes: [[8]]
@@ -463,6 +466,7 @@ memories:
 compute:
   - id: fma.0
     kind: matrix_engine
+    refines: [matrix]
     attached_to: e0
     element_types: [bf16]
     accumulator_dtypes: [f32]
@@ -470,6 +474,7 @@ compute:
 transfer_engines:
   - id: dma.0
     kind: dma
+    refines: [transfer]
     attached_to: e0
     setup_cycles: 16
 )yaml");
@@ -542,6 +547,7 @@ memories:
 compute:
   - id: c0
     kind: vector_engine
+    refines: [vector]
     attached_to: e0
     element_types: [f32]
     shapes: [[8]]
@@ -608,6 +614,7 @@ executors:
 compute:
   - id: c0
     kind: vector_engine
+    refines: [vector]
     attached_to: e0
     element_types: [f32]
     shapes: [[8]]

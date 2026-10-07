@@ -317,21 +317,27 @@ The memory hierarchy is architecture-parametric. A machine profile decides what 
 
 ### 4.2 Mapping Targets
 
+A `#micro.map` names the spatial axis a `micro.spatial_for` distributes over.
+Like a tile's owner, it is an **open symbol**, not a closed enumeration: the
+canonical dialect records the spelling and the owning target resolves it.
+
+The dialect's own vocabulary is the set of *abstract classes* a spelling can
+denote:
+
 ```text
-cluster.x
-cluster.y
-core.x
-core.y
-pe.x
-pe.y
-lane
-dma
-matrix_engine
-vector_engine
-worker
+group      a cooperating group of workers
+worker     one execution unit
+vector     the vector engine
+matrix     the matrix engine
+transfer   the data-movement engine
 ```
 
-`worker` exists so the current AVX2 thread pool can validate spatial mapping without pretending to be a systolic array.
+A target spells those classes its own way -- `cluster`/`core`/`pe`/`lane`, an
+x/y coordinate axis, `vector_engine` -- and declares the mapping in its own
+machine profile. Any other spelling still parses, as *unresolved analysis
+data*; only target execution requires it to be normalized. A kernel written for
+one backend therefore round-trips through the canonical IR without the dialect
+ever learning that backend's words.
 
 ### 4.3 DTypes
 
@@ -390,24 +396,29 @@ Layout reinterpretation is a logical tile transform only when byte order is unch
 
 ### 4.5 Owners
 
-Canonical owner scopes:
+A tile's owner is a `#micro.owner` **symbol**. The canonical vocabulary is the
+abstract classes a tile can belong to:
 
 ```text
-cluster
-core
-warp
-wave
-subgroup
-pe_group
-pe
-lane
-worker
-matrix_engine
-vector_engine
-dma
+group      a cooperating group of workers
+worker     one worker
+vector     the vector engine
+matrix     the matrix engine
+transfer   the data-movement engine
 ```
 
-The MachineModel maps these owner scopes to target resources. AVX2 can map `worker` to a thread-pool worker and `vector_engine` to AVX2 vector/FMA resources; an accelerator can map `core`, `pe_group`, `pe`, and `matrix_engine` to its array hierarchy.
+The MachineModel maps a target's own owner spellings onto these classes, and
+each profile declares that mapping in its own data: an executor whose `kind` is
+a target word (`lane`, `core`, `pe`, `vector_engine`, ...) declares the abstract
+class it `refines`, and a compute capability or movement engine does the same.
+AVX2's `worker` is its thread pool and its `vector_engine` the AVX2 vector/FMA
+unit; an accelerator maps `core`, `pe_group`, and `pe` onto its array hierarchy.
+
+The dialect never checks a spelling against a fixed list. A label is *known* to
+a target only when that target's data resolves it; a spelling no profile
+declares stays parseable as unresolved analysis data and is rejected when it
+would drive execution. Concrete executor IDs belong to selected-plan metadata,
+never to the tile type.
 
 ---
 

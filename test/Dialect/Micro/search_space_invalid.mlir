@@ -136,10 +136,13 @@ func.func @memory_path_single_space() {
   return
 }
 
-func.func @unknown_owner_mapping() {
+func.func @empty_owner_mapping_level() {
   micro.search_space @bad attributes {workload = "fused_swiglu"} {
-    // expected-error @+1 {{owner_mapping choice 'worker/bogus' has unknown owner 'bogus'}}
-    micro.param "owner" {kind = "owner_mapping", choices = ["worker/bogus"]}
+    // An owner spelling is unresolved target data, so `bogus` is *not* a
+    // dialect error; what the dialect still rejects is a structurally
+    // incomplete mapping -- here, an empty level.
+    // expected-error @+1 {{owner_mapping choice 'worker/' names an empty owner}}
+    micro.param "owner" {kind = "owner_mapping", choices = ["worker/"]}
   }
   return
 }
