@@ -538,25 +538,19 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   // `synchronization` and a connection's `storageIds` are all excluded from
   // `canonicalPlanString`, and the plan's score was already computed from the
   // search's synthesized step DAG. A plan whose physical footprint or
-  // live-range occupancy exceeds a memory's capacity -- or whose strict facts
-  // cannot be derived -- is a *legitimate rejection*: it is dropped with a
-  // stable diagnostic rather than bound with an unmet reservation.
+  // live-range occupancy exceeds a memory's capacity is a *legitimate
+  // rejection*: it is dropped with a stable diagnostic rather than bound with
+  // an unmet reservation.
   //
-  // Storage planning needs the target to say *where* each value lives, and a
-  // rule that binds no memory leaves every placement unbound -- the shipped
-  // AVX2 rules do exactly that. Finalizing such a plan would reject it for a
-  // missing fact rather than a real overflow, so it is skipped with an explicit
-  // note: the plan stays bindable, its storage fields stay empty, and a target
-  // that does model memory (the probe/barrier fixtures, and any future rules
-  // that declare `require memory`) gets the full capacity check.
-  auto storagePlannable = [](const mapping::CoveringPlan &plan) {
-    if (plan.placements.empty())
-      return false;
-    for (const mapping::PlanPlacement &placement : plan.placements)
-      if (placement.memories.empty() && placement.portMemoryBindings.empty())
-        return false;
-    return true;
-  };
+  // There is no "skip" any more (issue #129, task R3): the escape that let a
+  // target binding no memory at all bypass the whole reservation check is gone.
+  // Every retained plan is finalized, and a per-endpoint memory fact that does
+  // not resolve now fails the *strict* pass. A plan that is materializable but
+  // physically incomplete is kept only as an explicit analysis artifact -- the
+  // `report-only` contract needs to report what could not be completed rather
+  // than claim a fully executable plan -- and its `physicalComplete` verdict is
+  // recorded with its reasons. Binding such a plan under
+  // `BindContract::Executable` is refused by `bindPlan` itself.
   std::vector<mapping::CoveringPlan> finalized;
   finalized.reserve(run.result.plans.size());
   for (mapping::CoveringPlan &plan : run.result.plans) {
@@ -565,23 +559,30 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     // it is not lost.
     std::vector<std::string> priorNotes =
         std::move(plan.diagnostics.storageNotes);
-    if (!storagePlannable(plan)) {
-      priorNotes.push_back(
-          "storage plan: skipped -- the target binds no memory to every "
-          "placement, so no reservation can be checked");
-      plan.diagnostics.storageNotes = std::move(priorNotes);
-      finalized.push_back(std::move(plan));
-      continue;
-    }
     if (llvm::Error error =
             mapping::finalizeStoragePlan(*graph, plan, run.target->machine())) {
-      std::string reason = llvm::toString(std::move(error));
-      run.result.frontier
-          .codeCounts[mapping::DiagnosticCode::MemoryCapacityExceeded] += 1;
-      run.result.frontier.diagnostics.push_back(
-          {mapping::DiagnosticCode::MemoryCapacityExceeded,
-           "storage plan rejected: " + reason});
-      continue;
+      // The strict pass failed. Re-run the same analysis with the plan marked
+      // as non-materialized: when *only* the physical facts are incomplete the
+      // analysis pass succeeds and records `physicalComplete=false` plus its
+      // ordered reasons, which is what the report and the `report-only`
+      // workflow must state. A genuine rejection -- a capacity overflow, a
+      // cyclic graph, a coverage gap -- fails both passes and is dropped.
+      mapping::CoveringPlan analysis = plan;
+      analysis.materialized = false;
+      if (llvm::Error analysisError = mapping::finalizeStoragePlan(
+              *graph, analysis, run.target->machine())) {
+        std::string reason = llvm::toString(std::move(error));
+        std::string second = llvm::toString(std::move(analysisError));
+        if (second != reason)
+          reason += "; analysis: " + second;
+        run.result.frontier
+            .codeCounts[mapping::DiagnosticCode::MemoryCapacityExceeded] += 1;
+        run.result.frontier.diagnostics.push_back(
+            {mapping::DiagnosticCode::MemoryCapacityExceeded,
+             "storage plan rejected: " + reason});
+        continue;
+      }
+      plan = std::move(analysis);
     }
     if (!priorNotes.empty()) {
       std::vector<std::string> merged = std::move(priorNotes);

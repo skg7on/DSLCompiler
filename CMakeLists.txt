@@ -1080,6 +1080,16 @@ if(LLK_BUILD_TOOLS)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=probe machine=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/probe_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/unmaterialized_rules.llkmap emitters=e1 mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/micro_map_unmaterialized.mlir 2>&1 | grep -q 'micro.tile_async_copy'"
   )
 
+  # MicroMappingStrictMissingMemory: issue #129 task R3's negative. A shipped
+  # rule that declares no memory requirement over a tile whose kind the profile
+  # models no node for must fail a strict run -- the storage-skip escape that
+  # let it succeed with a "storage planning was skipped" note is gone, and the
+  # diagnostic names the missing memory fact. Raw add_test because the pass's
+  # diagnostic goes to stderr and FileCheck needs --check-prefix.
+  add_test(NAME MicroMappingStrictMissingMemory
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_missing_memory.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=MAP ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_missing_memory.mlir"
+  )
+
   # MicroMappingBarrier: the storage plan (task B3) is now run on the selected
   # plan (task C1), so a movement that needs more than one transfer engine is
   # barrier-synchronized and the canonical materializer emits a `micro.barrier`.

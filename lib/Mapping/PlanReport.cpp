@@ -283,6 +283,18 @@ std::string writePlanReport(const MappingSearchResult &result,
               for (const std::string &note : plan.diagnostics.storageNotes)
                 json.value(note);
             });
+            // The physical-memory verdict (issue #129, task R3). A plan that
+            // was analyzed and found incomplete records `physicalComplete:
+            // false` with its ordered reasons, so a `report-only` run states
+            // what could not be completed instead of presenting the plan as
+            // fully executable. A strict binding re-derives the facts and
+            // refuses such a plan whatever this says.
+            json.attribute("physicalComplete",
+                           plan.diagnostics.physicalComplete);
+            json.attributeArray("physicalReasons", [&] {
+              for (const std::string &reason : plan.diagnostics.physicalReasons)
+                json.value(reason);
+            });
           });
         });
       }

@@ -18,6 +18,7 @@
 #include "llvm/Support/Error.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -78,6 +79,19 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
   if (llvm::Error error = encodeSelectedPlan(*module, plan, target))
     return std::move(error);
 
+  // The pre-materialization source graph, needed by the executable contract's
+  // physical-fact check below (issue #129, task R3). An endpoint occurrence
+  // names a node of the *source* graph, and materialization inserts movement
+  // ops that shift every id, so the graph is captured here -- before any
+  // movement exists, and only when the contract actually checks it.
+  std::optional<WorkloadGraph> sourceGraph;
+  if (contract == BindContract::Executable) {
+    llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel);
+    if (!graph)
+      return graph.takeError();
+    sourceGraph = std::move(*graph);
+  }
+
   BoundPlan bound;
 
   // --- materialize the movement (design §18.2) -------------------------
@@ -115,6 +129,19 @@ llvm::Expected<BoundPlan> bindPlan(mlir::ModuleOp source,
     for (const std::string &reason : bound.unmaterialized)
       message += "\n  " + reason;
     return bindError(message);
+  }
+
+  // A plan can be materializable and still not *physically* bound: a value
+  // whose memory the plan never resolved cannot be stored anywhere. The
+  // executable contract refuses that too, re-deriving the facts here rather
+  // than trusting a recorded verdict, so a plan that was never analyzed and one
+  // whose analysis was incomplete both fail. The check runs after the
+  // materialization gate, so a plan that is both incomplete and
+  // unmaterializable keeps its more specific materialization diagnostic.
+  if (contract == BindContract::Executable) {
+    if (llvm::Error error = verifyPlanPhysicalCompleteness(*sourceGraph, plan,
+                                                           target.machine()))
+      return std::move(error);
   }
 
   // Record materialization completeness in the persisted selection, so a reader

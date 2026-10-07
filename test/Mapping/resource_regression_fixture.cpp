@@ -193,6 +193,112 @@ CaseSpec twoComputeSpec() {
 }
 
 //===----------------------------------------------------------------------===//
+// R3: `missing-memory`, `named-ports`
+//===----------------------------------------------------------------------===//
+
+/// One worker `e0` with a vector engine and *two* same-kind SRAM nodes, both
+/// visible from `e0`. Two nodes of one kind are the ambiguity endpoint-only
+/// resolution must detect: a rule that never names a port cannot say which of
+/// them an occurrence's value lives in.
+machine::MachineModel twoMemoryMachine() {
+  machine::MachineModel model;
+  model.target = "issue129.two-memory";
+  model.description = "one worker, two visible sram nodes";
+  model.executors = {{"e0", "worker", std::nullopt, {}, 1, {}}};
+  machine::ComputeNode vpu;
+  vpu.id = "vpu.a";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "e0";
+  vpu.concurrency = 1;
+  model.computes = {vpu};
+  machine::MemoryNode a;
+  a.id = "sram.a";
+  a.kind = "sram";
+  a.visibleFrom = "e0";
+  a.capacityBytes = 1u << 20;
+  a.alignmentBytes = 64;
+  machine::MemoryNode b;
+  b.id = "sram.b";
+  b.kind = "sram";
+  b.visibleFrom = "e0";
+  b.capacityBytes = 1u << 20;
+  b.alignmentBytes = 64;
+  model.memories = {a, b};
+  return model;
+}
+
+/// An `8x8xf32` elementwise add over SRAM tiles: one workload node, whose
+/// operand and result tiles both state `memory = #micro.memory<sram>`. The
+/// kernel is the same for both R3 cases; only the rule differs.
+constexpr llvm::StringLiteral kTwoMemorySource = R"mlir(
+module {
+  micro.kernel @two_memory {
+    %a = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// A rule that declares *no* memory requirement at all. The occurrence's tile
+/// states an SRAM kind, and the machine offers two SRAM nodes to the selected
+/// executor, so a strict binding has no fact that names one of them: the
+/// endpoint is ambiguous and must be refused rather than bound to the first.
+constexpr llvm::StringLiteral kMissingMemoryRules = R"llkmap(
+rule issue129.vector_add_nomem {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.vector.add.nomem";
+  emit "issue129_vector_add";
+  cost 4;
+}
+)llkmap";
+
+/// The same add, but every occurrence is named: both inputs and the result each
+/// carry their own `require memory ... kind sram`. The two same-kind nodes are
+/// then a *choice* the search enumerates and records per occurrence, so a
+/// strict binding is unambiguous and the selections must survive the round
+/// trip.
+constexpr llvm::StringLiteral kNamedPortMemoryRules = R"llkmap(
+rule issue129.vector_add_named {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require memory input "operand0" kind sram;
+  require memory input "operand1" kind sram;
+  require memory output "result" kind sram;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.vector.add.named";
+  emit "issue129_vector_add";
+  cost 4;
+}
+)llkmap";
+
+CaseSpec missingMemorySpec() {
+  CaseSpec spec;
+  spec.source = kTwoMemorySource;
+  spec.rules = kMissingMemoryRules;
+  spec.machine = twoMemoryMachine();
+  spec.emitters = {"issue129_vector_add"};
+  return spec;
+}
+
+CaseSpec namedPortsSpec() {
+  CaseSpec spec;
+  spec.source = kTwoMemorySource;
+  spec.rules = kNamedPortMemoryRules;
+  spec.machine = twoMemoryMachine();
+  spec.emitters = {"issue129_vector_add"};
+  return spec;
+}
+
+//===----------------------------------------------------------------------===//
 // Case table
 //===----------------------------------------------------------------------===//
 
@@ -207,9 +313,19 @@ llvm::Expected<ResourceCase> buildTwoCompute() {
   return buildCase(twoComputeSpec());
 }
 
+llvm::Expected<ResourceCase> buildMissingMemory() {
+  return buildCase(missingMemorySpec());
+}
+
+llvm::Expected<ResourceCase> buildNamedPorts() {
+  return buildCase(namedPortsSpec());
+}
+
 llvm::ArrayRef<CaseEntry> caseTable() {
   static const CaseEntry table[] = {
       {"two-compute", &buildTwoCompute},
+      {"missing-memory", &buildMissingMemory},
+      {"named-ports", &buildNamedPorts},
   };
   return table;
 }

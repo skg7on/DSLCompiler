@@ -783,3 +783,157 @@ TEST(StoragePlan, ModuleMetadataRoundTripsThePlanStepDag) {
   }
   EXPECT_EQ(decoded->stepEdges, plan.stepEdges);
 }
+
+//===----------------------------------------------------------------------===//
+// Endpoint memory resolution (issue #129, task R3)
+//===----------------------------------------------------------------------===//
+
+TEST(StoragePlan, ExplicitMemoryKindReadsATilesMemorySpace) {
+  mlir::MLIRContext context;
+  EXPECT_EQ(explicitMemoryKind(
+                tileType(context, "8x8xf32, memory = #micro.memory<sram>")),
+            std::optional<std::string>("sram"));
+  EXPECT_EQ(explicitMemoryKind(tileType(context,
+                                        "8x8xf32, memory = #micro.memory<acc>, "
+                                        "owner = #micro.owner<worker>")),
+            std::optional<std::string>("acc"));
+  // A tile that names no memory, a non-tile, and a null type state no kind.
+  EXPECT_EQ(explicitMemoryKind(tileType(context, "8x8xf32")), std::nullopt);
+  EXPECT_EQ(explicitMemoryKind(tileType(context, "8x8xf32, "
+                                                 "layout = #micro.layout<"
+                                                 "row_major>")),
+            std::nullopt);
+  EXPECT_EQ(explicitMemoryKind(mlir::Type{}), std::nullopt);
+}
+
+namespace {
+
+/// One `micro.vector` node whose single output is an 8x8 f32 tile stating
+/// `memory`, finalized, with the output occurrence it produces.
+struct EndpointFixture {
+  WorkloadGraph graph;
+  PortRef ref;
+};
+
+EndpointFixture endpointFixture(mlir::MLIRContext &context,
+                                llvm::StringRef memory) {
+  EndpointFixture fixture;
+  std::string inner = "8x8xf32, memory = #micro.memory<";
+  inner += memory.str();
+  inner += ">";
+  mlir::Type tile = tileType(context, inner);
+  WorkloadValueId out =
+      fixture.graph.addValue(WorkloadValue{0, tile, "out", false});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.sourceOrdinal = 0;
+  node.executionMultiplicity = 1;
+  node.outputs.push_back(WorkloadPort{out, tile, std::nullopt});
+  fixture.graph.addNode(std::move(node));
+  fixture.graph.finalize();
+  fixture.ref =
+      PortRef{fixture.graph.getNodes().front().id, PortDirection::Output, 0};
+  return fixture;
+}
+
+MachineModel machineWithSramNodes(unsigned count) {
+  MachineModel model = storageMachine();
+  model.memories.clear();
+  for (unsigned i = 0; i < count; ++i) {
+    MemoryNode sram;
+    sram.id = "sram." + std::to_string(i);
+    sram.kind = "sram";
+    sram.visibleFrom = "e0";
+    sram.capacityBytes = 1u << 20;
+    sram.alignmentBytes = 64;
+    model.memories.push_back(sram);
+  }
+  return model;
+}
+
+} // namespace
+
+// Exactly one compatible node binds; two nodes of the stated kind are an
+// *ambiguous* rejection naming both, and none is an *inaccessible* rejection
+// naming the kind -- never "the first memory of a class".
+TEST(StoragePlan,
+     EndpointMemoryResolutionDistinguishesUniqueAmbiguousAndAbsent) {
+  mlir::MLIRContext context;
+  EndpointFixture one = endpointFixture(context, "sram");
+  PlanPlacement unbound; // the rule binds no memory at all
+
+  llvm::Expected<MemoryNodeId> unique = resolveEndpointMemory(
+      one.graph, unbound, one.ref, machineWithSramNodes(1));
+  ASSERT_TRUE(bool(unique)) << llvm::toString(unique.takeError());
+  EXPECT_EQ(*unique, "sram.0");
+
+  llvm::Expected<MemoryNodeId> ambiguous = resolveEndpointMemory(
+      one.graph, unbound, one.ref, machineWithSramNodes(2));
+  ASSERT_FALSE(bool(ambiguous));
+  const std::string ambiguousText = llvm::toString(ambiguous.takeError());
+  EXPECT_NE(ambiguousText.find("sram.0"), std::string::npos) << ambiguousText;
+  EXPECT_NE(ambiguousText.find("sram.1"), std::string::npos) << ambiguousText;
+  EXPECT_NE(ambiguousText.find("ambiguous"), std::string::npos)
+      << ambiguousText;
+
+  llvm::Expected<MemoryNodeId> absent = resolveEndpointMemory(
+      one.graph, unbound, one.ref, machineWithSramNodes(0));
+  ASSERT_FALSE(bool(absent));
+  const std::string absentText = llvm::toString(absent.takeError());
+  EXPECT_NE(absentText.find("memory"), std::string::npos) << absentText;
+  EXPECT_NE(absentText.find("sram"), std::string::npos) << absentText;
+}
+
+// A named rule requirement recorded for the occurrence is the authority: it
+// decides even when the value's own kind would resolve elsewhere or not at all.
+TEST(StoragePlan, NamedPortBindingDecidesTheOccurrence) {
+  mlir::MLIRContext context;
+  EndpointFixture fixture = endpointFixture(context, "rf");
+  MachineModel machine = storageMachine();
+
+  PlanPlacement placement;
+  placement.portMemoryBindings.push_back(
+      PortMemoryBinding{fixture.ref, "dram.0"});
+  llvm::Expected<MemoryNodeId> memory =
+      resolveEndpointMemory(fixture.graph, placement, fixture.ref, machine);
+  ASSERT_TRUE(bool(memory)) << llvm::toString(memory.takeError());
+  EXPECT_EQ(*memory, "dram.0");
+
+  // The same occurrence with no named binding: the kind has no node, and the
+  // rule binds nothing, so the fact is missing rather than guessed.
+  PlanPlacement unbound;
+  llvm::Expected<MemoryNodeId> missing =
+      resolveEndpointMemory(fixture.graph, unbound, fixture.ref, machine);
+  EXPECT_FALSE(bool(missing));
+}
+
+// A rule's own (single) bare requirement is its memory fact for the operation
+// it placed, and decides an occurrence whose stated kind no node offers -- but
+// two bare bindings cannot both govern one occurrence, so that case is refused
+// rather than resolved to the first.
+TEST(StoragePlan, BareRequirementDecidesOnlyWhenItIsTheSoleOne) {
+  mlir::MLIRContext context;
+  EndpointFixture fixture = endpointFixture(context, "rf");
+  MachineModel machine = storageMachine();
+
+  PlanPlacement sole;
+  sole.memories["sram"] = "sram.0";
+  llvm::Expected<MemoryNodeId> bound =
+      resolveEndpointMemory(fixture.graph, sole, fixture.ref, machine);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  EXPECT_EQ(*bound, "sram.0");
+
+  // An occurrence that states no kind at all, so the placement's own bindings
+  // are the only facts: two of them cannot both govern it.
+  WorkloadGraph plain = chainGraph(context, tileType(context, "8x8xf32"), 1);
+  const WorkloadNodeId nodeId = plain.getNodes().front().id;
+  const PortRef ref{nodeId, PortDirection::Output, 0};
+  PlanPlacement several;
+  several.memories["sram"] = "sram.0";
+  several.memories["dram"] = "dram.0";
+  llvm::Expected<MemoryNodeId> refused =
+      resolveEndpointMemory(plain, several, ref, machine);
+  ASSERT_FALSE(bool(refused));
+  const std::string text = llvm::toString(refused.takeError());
+  EXPECT_NE(text.find("bare requirements"), std::string::npos) << text;
+}

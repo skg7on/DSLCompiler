@@ -1730,33 +1730,61 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
   }
   llvm::sort(plan.connections);
 
-  llvm::sort(plan.placements,
-             [](const PlanPlacement &lhs, const PlanPlacement &rhs) {
-               if (lhs.executor != rhs.executor)
-                 return lhs.executor < rhs.executor;
-               auto sorted = [](const llvm::StringMap<std::string> &map) {
-                 std::vector<std::string> parts;
-                 for (const auto &entry : map) {
-                   std::string text = entry.first().str();
-                   text += '=';
-                   text += entry.second;
-                   parts.push_back(std::move(text));
-                 }
-                 llvm::sort(parts);
-                 return parts;
-               };
-               std::vector<std::string> lhsMemories = sorted(lhs.memories);
-               std::vector<std::string> rhsMemories = sorted(rhs.memories);
-               if (lhsMemories != rhsMemories)
-                 return lhsMemories < rhsMemories;
-               std::vector<std::string> lhsLayouts = sorted(lhs.layouts);
-               std::vector<std::string> rhsLayouts = sorted(rhs.layouts);
-               if (lhsLayouts != rhsLayouts)
-                 return lhsLayouts < rhsLayouts;
-               if (lhs.node != rhs.node)
-                 return lhs.node < rhs.node;
-               return lhs.instance < rhs.instance;
-             });
+  llvm::sort(
+      plan.placements, [](const PlanPlacement &lhs, const PlanPlacement &rhs) {
+        if (lhs.executor != rhs.executor)
+          return lhs.executor < rhs.executor;
+        auto sorted = [](const llvm::StringMap<std::string> &map) {
+          std::vector<std::string> parts;
+          for (const auto &entry : map) {
+            std::string text = entry.first().str();
+            text += '=';
+            text += entry.second;
+            parts.push_back(std::move(text));
+          }
+          llvm::sort(parts);
+          return parts;
+        };
+        std::vector<std::string> lhsMemories = sorted(lhs.memories);
+        std::vector<std::string> rhsMemories = sorted(rhs.memories);
+        if (lhsMemories != rhsMemories)
+          return lhsMemories < rhsMemories;
+        // The named-port assignment is part of the canonical order for
+        // the same reason the kind-keyed map is: two placements that bind
+        // the same nodes to swapped occurrences are different work. A
+        // selection without it -- the search's `placementBefore` -- would
+        // decode a plan whose placements are ordered differently from the
+        // one that was encoded (issue #129, task R3).
+        auto sortedPorts = [](llvm::ArrayRef<PortMemoryBinding> ports) {
+          std::vector<std::string> parts;
+          parts.reserve(ports.size());
+          for (const PortMemoryBinding &binding : ports) {
+            std::string text = canonicalPortRefString(binding.port);
+            text += '=';
+            text += binding.memory;
+            parts.push_back(std::move(text));
+          }
+          llvm::sort(parts);
+          return parts;
+        };
+        std::vector<std::string> lhsPortMemories =
+            sortedPorts(lhs.portMemoryBindings);
+        std::vector<std::string> rhsPortMemories =
+            sortedPorts(rhs.portMemoryBindings);
+        if (lhsPortMemories != rhsPortMemories)
+          return lhsPortMemories < rhsPortMemories;
+        std::vector<std::string> lhsLayouts = sorted(lhs.layouts);
+        std::vector<std::string> rhsLayouts = sorted(rhs.layouts);
+        if (lhsLayouts != rhsLayouts)
+          return lhsLayouts < rhsLayouts;
+        std::vector<std::string> lhsComputes = sorted(lhs.computeBindings);
+        std::vector<std::string> rhsComputes = sorted(rhs.computeBindings);
+        if (lhsComputes != rhsComputes)
+          return lhsComputes < rhsComputes;
+        if (lhs.node != rhs.node)
+          return lhs.node < rhs.node;
+        return lhs.instance < rhs.instance;
+      });
   llvm::sort(plan.connectionPlans,
              [](const PlanConnection &lhs, const PlanConnection &rhs) {
                return lhs.id < rhs.id;

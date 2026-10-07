@@ -211,6 +211,18 @@ imageExtents(mlir::AffineMap map, llvm::ArrayRef<int64_t> shape) {
   return extents;
 }
 
+/// The keys of a kind-keyed memory map, sorted, so a diagnostic never depends
+/// on `StringMap` iteration order.
+std::vector<std::string>
+sortedMemoryKeys(const llvm::StringMap<MemoryNodeId> &map) {
+  std::vector<std::string> keys;
+  keys.reserve(map.size());
+  for (const auto &entry : map)
+    keys.push_back(entry.first().str());
+  llvm::sort(keys);
+  return keys;
+}
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -297,6 +309,166 @@ physicalFootprintFor(mlir::Type valueType, mlir::AffineMap map,
     return storageError("unsupported footprint: the physical byte count "
                         "overflows");
   return PhysicalFootprint{bytes, std::move(physicalShape), true};
+}
+
+//===----------------------------------------------------------------------===//
+// Endpoint memory resolution (issue #129, task R3)
+//===----------------------------------------------------------------------===//
+
+std::optional<std::string> explicitMemoryKind(mlir::Type type) {
+  if (!type)
+    return std::nullopt;
+  // Printed form, like `tileAsTensor`: the core links no dialect, so a
+  // `!micro.tile<..., memory = #micro.memory<sram>>` is read through its text.
+  const std::string printed = printType(type);
+  constexpr llvm::StringLiteral kMarker = "memory = #micro.memory<";
+  size_t start = printed.find(kMarker);
+  if (start == std::string::npos)
+    return std::nullopt;
+  size_t begin = start + kMarker.size();
+  size_t end = printed.find('>', begin);
+  if (end == std::string::npos || end == begin)
+    return std::nullopt;
+  return printed.substr(begin, end - begin);
+}
+
+llvm::Expected<MemoryNodeId>
+resolveEndpointMemory(const WorkloadGraph &graph,
+                      const PlanPlacement &placement, const PortRef &ref,
+                      const machine::MachineModel &machine) {
+  const WorkloadPort *port = lookupPort(graph, ref);
+  const std::string where =
+      "value at node " + std::to_string(ref.node) + " " +
+      (ref.direction == PortDirection::Input ? "input " : "output ") +
+      std::to_string(ref.index);
+
+  // 1. A named rule requirement's own recording for this very occurrence is the
+  //    authority: the search chose that node for this endpoint, so the fact is
+  //    a decision, not something to re-derive.
+  for (const PortMemoryBinding &binding : placement.portMemoryBindings) {
+    if (binding.port != ref)
+      continue;
+    if (!machine.findMemory(binding.memory))
+      return storageError("memory: " + where + " records memory '" +
+                          binding.memory +
+                          "', which the machine does not declare");
+    if (!placement.executor.empty() &&
+        !machine.isVisible(binding.memory, placement.executor))
+      return storageError("memory: " + where + " records memory '" +
+                          binding.memory + "', which executor '" +
+                          placement.executor + "' cannot see");
+    return binding.memory;
+  }
+
+  // The kind the occurrence states explicitly. The port's own type is read
+  // first: a logical view folds onto the value it reads, so the value's type
+  // can lose the tile a port still spells.
+  std::optional<std::string> kind;
+  if (port)
+    kind = explicitMemoryKind(port->type);
+  if (!kind)
+    if (const WorkloadValue *value =
+            port ? graph.findValue(port->value) : nullptr)
+      kind = explicitMemoryKind(value->type);
+
+  // The placement's *own* bare requirement, when it is the only one. A bare
+  // requirement governs the whole instance, so it can decide one occurrence's
+  // memory only while it is unambiguous; several bare bindings cannot all apply
+  // to one occurrence, and that case is refused rather than resolved to the
+  // first.
+  auto resolveBareRequirement = [&]() -> llvm::Expected<MemoryNodeId> {
+    if (placement.memories.empty())
+      return storageError("memory: " + where +
+                          " has no memory binding to resolve it against");
+    if (placement.memories.size() > 1) {
+      std::string keys;
+      for (const std::string &key : sortedMemoryKeys(placement.memories)) {
+        if (!keys.empty())
+          keys += ", ";
+        keys += "'" + key + "'";
+      }
+      return storageError(
+          "memory: " + where +
+          " has no single memory fact: the placement binds " +
+          std::to_string(placement.memories.size()) + " bare requirements (" +
+          keys +
+          "); a named port requirement must say which memory governs it");
+    }
+    const MemoryNodeId memory = placement.memories.begin()->second;
+    if (!machine.findMemory(memory))
+      return storageError("memory: " + where + " is bound to memory '" +
+                          memory + "', which the machine does not declare");
+    return memory;
+  };
+
+  if (!kind) {
+    // No explicit kind: the occurrence's only fact is the rule's own binding.
+    if (placement.memories.empty())
+      return storageError(
+          "memory: " + where +
+          " states no memory kind and its rule binds no memory, "
+          "so no physical memory fact exists for it");
+    return resolveBareRequirement();
+  }
+
+  // Resolve the explicit kind against the memories the executor can see and
+  // whose alignment admits the value. Exactly one node binds; several are
+  // ambiguous (a named port requirement must select one).
+  llvm::SmallVector<MemoryNodeId, 2> visibleOfKind;
+  llvm::SmallVector<MemoryNodeId, 2> compatible;
+  for (const machine::MemoryNode &node : machine.memories) {
+    if (node.kind != *kind)
+      continue;
+    if (!placement.executor.empty() &&
+        !machine.isVisible(node.id, placement.executor))
+      continue;
+    visibleOfKind.push_back(node.id);
+    if (port) {
+      TileFacts facts = tileFactsFor(port->type);
+      if (facts.known && facts.alignment > 0 &&
+          node.alignmentBytes % facts.alignment != 0)
+        continue;
+    }
+    compatible.push_back(node.id);
+  }
+  if (compatible.size() == 1)
+    return compatible.front();
+  if (compatible.empty() && placement.memories.size() == 1) {
+    // No node of the stated kind is reachable, but the rule declares exactly
+    // where its own operation's work lives, and that declaration is the
+    // compatibility fact placement already enforced. It decides before the
+    // occurrence is declared inaccessible; with no such declaration (or an
+    // ambiguous one) the stated kind genuinely cannot be satisfied.
+    return resolveBareRequirement();
+  }
+  if (compatible.empty()) {
+    std::string seen;
+    for (const MemoryNodeId &id : visibleOfKind) {
+      if (!seen.empty())
+        seen += ", ";
+      seen += "'" + id + "'";
+    }
+    return storageError(
+        "memory: " + where + " needs a '" + *kind +
+        "' memory the executor can address" +
+        (placement.executor.empty()
+             ? std::string()
+             : " through executor '" + placement.executor + "'") +
+        (seen.empty() ? std::string()
+                      : "; the visible nodes of that kind (" + seen +
+                            ") do not admit it"));
+  }
+  std::string names;
+  for (const MemoryNodeId &id : compatible) {
+    if (!names.empty())
+      names += ", ";
+    names += "'" + id + "'";
+  }
+  return storageError(
+      "memory: " + where + " states kind '" + *kind + "', which resolves to " +
+      std::to_string(compatible.size()) + " compatible nodes (" + names +
+      "); the binding is ambiguous, so a named port requirement must select "
+      "one");
 }
 
 //===----------------------------------------------------------------------===//
@@ -396,6 +568,12 @@ computePeakStorage(llvm::ArrayRef<StorageAllocation> allocations) {
 
 llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
                                 const machine::MachineModel &machine) {
+  // Physical completeness is a *verified* verdict: it is true only after this
+  // function resolved every materialized value's memory, footprint and live
+  // interval against the machine. An early failure leaves it false.
+  plan.diagnostics.physicalComplete = false;
+  plan.diagnostics.physicalReasons.clear();
+
   // --- placements cover every node ------------------------------------------
   llvm::DenseMap<WorkloadNodeId, const PlanPlacement *> placementFor;
   for (const PlanPlacement &placement : plan.placements)
@@ -583,55 +761,19 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   // so a failed finalization leaves the plan untouched rather than
   // half-annotated.
   std::vector<std::string> notes;
+  std::vector<std::string> physicalReasons;
   std::vector<std::vector<uint64_t>> connectionStorage(
       plan.connectionPlans.size());
 
-  auto sortedMemoryKeys = [](const llvm::StringMap<MemoryNodeId> &map) {
-    std::vector<std::string> keys;
-    for (const auto &entry : map)
-      keys.push_back(entry.first().str());
-    llvm::sort(keys);
-    return keys;
-  };
-
-  auto primaryMemoryOf =
-      [&](const PlanPlacement &placement) -> std::optional<MemoryNodeId> {
-    for (const PortMemoryBinding &binding : placement.portMemoryBindings)
-      return binding.memory;
-    std::vector<std::string> keys = sortedMemoryKeys(placement.memories);
-    if (!keys.empty())
-      return placement.memories.lookup(keys.front());
-    return std::nullopt;
-  };
-
-  auto outputValueAt = [&](WorkloadNodeId nodeId,
-                           unsigned index) -> std::optional<WorkloadValueId> {
-    const WorkloadNode *node = graph.findNode(nodeId);
-    if (!node || index >= node->outputs.size())
-      return std::nullopt;
-    return node->outputs[index].value;
-  };
-
-  auto outputMemoryOf =
-      [&](const PlanPlacement &placement, const PortRef &ref,
-          WorkloadValueId value) -> std::optional<MemoryNodeId> {
-    // The producing placement's own binding governs where the value is written;
-    // a connection's destination is only where a *copy* of it may move.
-    for (const PortMemoryBinding &binding : placement.portMemoryBindings)
-      if (binding.port == ref)
-        return binding.memory;
-    for (const PortMemoryBinding &binding : placement.portMemoryBindings)
-      if (binding.port.direction == PortDirection::Output) {
-        std::optional<WorkloadValueId> bound =
-            outputValueAt(placement.node, binding.port.index);
-        if (bound && *bound == value)
-          return binding.memory;
-      }
-    if (std::optional<MemoryNodeId> memory = primaryMemoryOf(placement))
-      return memory;
-    for (const PlanConnection &connection : plan.connectionPlans)
-      if (connection.value == value && !connection.route.empty())
-        return connection.route.back();
+  // A value whose physical memory cannot be resolved is a strict rejection and
+  // an analysis note: the analysis contract keeps the plan and states why it is
+  // not physically complete (issue #129, task R3).
+  auto recordIncomplete =
+      [&](std::string reason) -> std::optional<llvm::Error> {
+    physicalReasons.push_back(reason);
+    if (strict)
+      return storageError(reason);
+    notes.push_back(reason);
     return std::nullopt;
   };
 
@@ -747,13 +889,17 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     for (unsigned index = 0; index < node->outputs.size(); ++index) {
       const WorkloadValueId value = node->outputs[index].value;
       const PortRef ref{nodeId, PortDirection::Output, index};
-      std::optional<MemoryNodeId> memory =
-          outputMemoryOf(*placement, ref, value);
-      if (!memory)
-        return storageError("storage plan: no memory is bound to value " +
-                            std::to_string(value) + " written by node " +
-                            std::to_string(nodeId) + " output " +
-                            std::to_string(index));
+      llvm::Expected<MemoryNodeId> memory =
+          resolveEndpointMemory(graph, *placement, ref, machine);
+      if (!memory) {
+        if (std::optional<llvm::Error> rejected = recordIncomplete(
+                "storage plan: value " + std::to_string(value) +
+                " written by node " + std::to_string(nodeId) + " output " +
+                std::to_string(index) + ": " +
+                llvm::toString(memory.takeError())))
+          return std::move(*rejected);
+        continue;
+      }
       llvm::Expected<uint64_t> base = footprintBytes(value, ref, *placement);
       if (!base)
         return base.takeError();
@@ -791,13 +937,33 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
       memory = connection.route.back();
     else if (!connection.consumers.empty()) {
       auto node = nodeForInstance.find(connection.consumers.front());
-      if (node != nodeForInstance.end())
-        memory = primaryMemoryOf(*placementFor.lookup(node->second));
+      if (node != nodeForInstance.end()) {
+        const PlanPlacement *consumer = placementFor.lookup(node->second);
+        const WorkloadNode *consumerNode = graph.findNode(node->second);
+        if (consumer && consumerNode && !consumerNode->outputs.empty()) {
+          llvm::Expected<MemoryNodeId> resolved = resolveEndpointMemory(
+              graph, *consumer,
+              PortRef{consumerNode->id, PortDirection::Output, 0}, machine);
+          if (!resolved) {
+            if (std::optional<llvm::Error> rejected = recordIncomplete(
+                    "storage plan: connection " +
+                    std::to_string(connection.id) +
+                    " has no destination memory for its staged copy: " +
+                    llvm::toString(resolved.takeError())))
+              return std::move(*rejected);
+          } else {
+            memory = *resolved;
+          }
+        }
+      }
     }
-    if (!memory)
-      return storageError("storage plan: connection " +
-                          std::to_string(connection.id) +
-                          " has no destination memory for its staged copy");
+    if (!memory) {
+      if (std::optional<llvm::Error> rejected = recordIncomplete(
+              "storage plan: connection " + std::to_string(connection.id) +
+              " has no destination memory for its staged copy"))
+        return std::move(*rejected);
+      continue;
+    }
 
     mlir::AffineMap destinationMap;
     if (connection.transform)
@@ -847,6 +1013,8 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   }
 
   plan.diagnostics.storageNotes = std::move(notes);
+  plan.diagnostics.physicalComplete = physicalReasons.empty();
+  plan.diagnostics.physicalReasons = std::move(physicalReasons);
   for (size_t index = 0; index < plan.connectionPlans.size(); ++index)
     plan.connectionPlans[index].storageIds.assign(
         connectionStorage[index].begin(), connectionStorage[index].end());

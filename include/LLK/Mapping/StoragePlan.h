@@ -97,6 +97,43 @@ physicalFootprintFor(mlir::Type valueType, mlir::AffineMap map,
 llvm::Expected<std::map<MemoryNodeId, uint64_t>>
 computePeakStorage(llvm::ArrayRef<StorageAllocation> allocations);
 
+/// The memory kind a type states as its explicit memory space -- the `memory =
+/// #micro.memory<sram>` a `!micro.tile` carries -- or `std::nullopt` when it
+/// states none. Read through the type's printed form, the same way
+/// `tileAsTensor` reads a tile's head, because the mapping core deliberately
+/// links no dialect. A non-tile type (a bare `tensor`, an opaque type) states
+/// no memory and yields `std::nullopt`.
+std::optional<std::string> explicitMemoryKind(mlir::Type type);
+
+/// Resolves the memory node the value at occurrence `ref` occupies for
+/// `placement` (issue #129, task R3). Resolution is *by endpoint occurrence*,
+/// in this order:
+///
+///   1. a named rule requirement's recorded binding for this very occurrence
+///      (`PortMemoryBinding`), which is the rule's own authority;
+///   2. otherwise the occurrence's *explicit* memory kind (the `memory = ...`
+///      of the tile its port -- or failing that its value -- carries),
+///      resolved against the memories of that kind the placement's executor can
+///      see and whose alignment admits the value;
+///   3. otherwise -- no stated kind, or a stated kind no reachable node offers
+///      -- the placement's single bare requirement binding, which is the rule's
+///      own compatibility fact for the operation it placed.
+///
+/// Exactly one compatible node binds; several are an *ambiguous-memory* error
+/// that names the node ids and asks for a named port; none, with no bare
+/// requirement to fall back on, is an *inaccessible-memory* error naming the
+/// kind and the executor. A bare instance-wide requirement is a compatibility
+/// input, never authority for two occurrences that selected different nodes, so
+/// a placement with several bare bindings is refused rather than resolved to
+/// the first. This function never returns "the first memory of a class".
+///
+/// A placement that records no executor skips the visibility test (the fact is
+/// simply not known), exactly as the other nullable facts in the core do.
+llvm::Expected<MemoryNodeId>
+resolveEndpointMemory(const WorkloadGraph &graph,
+                      const PlanPlacement &placement, const PortRef &ref,
+                      const machine::MachineModel &machine);
+
 /// Builds and validates the selected plan's storage plan.
 ///
 /// It constructs a deterministic plan-step DAG (a compute step per placement

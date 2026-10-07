@@ -400,6 +400,21 @@ struct PlanDiagnostics {
   /// recomputes `plan.id` after `finalizeStoragePlan` gets the same id it had
   /// before.
   std::vector<std::string> storageNotes;
+  /// True only when every materialized value's physical memory, footprint and
+  /// live interval were resolved and validated (issue #129, task R3). The
+  /// default is `true`, the same optimistic default
+  /// `CoveringPlan::materialized` carries for a hand-built plan; a plan that
+  /// was actually analyzed and found incomplete records `false` here with its
+  /// reasons below, so an analysis artifact never claims physical completeness
+  /// it does not have. A strict
+  /// (`BindContract::Executable`) binding re-derives these facts and refuses a
+  /// plan whose endpoints do not resolve, whatever this flag says.
+  bool physicalComplete = true;
+  /// The ordered reasons `physicalComplete` is false: one entry per value whose
+  /// memory, footprint or live interval could not be resolved, in the
+  /// deterministic order the storage planner visits them. Empty when the plan
+  /// is complete.
+  std::vector<std::string> physicalReasons{};
 };
 
 /// One selected placement: which node an instance covers, and the target facts

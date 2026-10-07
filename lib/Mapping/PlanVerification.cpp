@@ -20,6 +20,7 @@
 #include "LLK/Mapping/MappingHelpers.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Mapping/TileFacts.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
@@ -693,6 +694,49 @@ bool kernelUsesSchemaV3(mlir::Operation *op) {
 }
 
 } // namespace
+
+llvm::Error
+verifyPlanPhysicalCompleteness(const WorkloadGraph &graph,
+                               const CoveringPlan &plan,
+                               const machine::MachineModel &machine) {
+  llvm::DenseMap<WorkloadNodeId, const PlanPlacement *> placementFor;
+  for (const PlanPlacement &placement : plan.placements)
+    placementFor[placement.node] = &placement;
+
+  // Reasons are collected in graph order -- the same canonical order every
+  // other stage visits nodes in -- so the message is deterministic regardless
+  // of how the plan's own vectors happen to be ordered.
+  std::vector<std::string> reasons;
+  for (const WorkloadNode &node : graph.getNodes()) {
+    auto found = placementFor.find(node.id);
+    if (found == placementFor.end()) {
+      reasons.push_back("node " + std::to_string(node.id) + " ('" +
+                        node.opName + "') has no placement");
+      continue;
+    }
+    const PlanPlacement &placement = *found->second;
+    for (unsigned index = 0; index < node.outputs.size(); ++index) {
+      const PortRef ref{node.id, PortDirection::Output, index};
+      llvm::Expected<MemoryNodeId> memory =
+          resolveEndpointMemory(graph, placement, ref, machine);
+      if (!memory) {
+        reasons.push_back("value " + std::to_string(node.outputs[index].value) +
+                          " written by node " + std::to_string(node.id) +
+                          " output " + std::to_string(index) + ": " +
+                          llvm::toString(memory.takeError()));
+        continue;
+      }
+    }
+  }
+  if (reasons.empty())
+    return llvm::Error::success();
+  std::string message = "bindPlan: the plan is not physically complete; " +
+                        std::to_string(reasons.size()) +
+                        " value(s) have no resolved physical memory:";
+  for (const std::string &reason : reasons)
+    message += "\n  " + reason;
+  return bindError(message);
+}
 
 llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                                 const MappingTarget &target) {

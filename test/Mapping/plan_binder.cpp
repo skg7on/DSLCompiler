@@ -4293,3 +4293,98 @@ TEST(PlanBinder, Issue129DifferingComputeInsideOneInstanceIsRejected) {
       llvm::toString(std::move(verified)).find("differing compute bindings"),
       std::string::npos);
 }
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R3: complete per-endpoint physical memory facts
+//===----------------------------------------------------------------------===//
+
+// A rule that binds no memory at all, over a tile whose kind the machine offers
+// twice: the endpoint is ambiguous, so no strict binding may pick one. The
+// analysis contract keeps the plan and states why it is incomplete; the
+// executable contract refuses it.
+TEST(PlanBinder, Issue129PhysicalMemoryAmbiguityRefusesStrictBinding) {
+  auto c = issue129::resourceCase("missing-memory");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  // Partial analysis: the plan is retained, and it records that it is not
+  // physically complete, naming the ambiguous memory rather than guessing.
+  CoveringPlan analysis = result->plans.front();
+  analysis.materialized = false;
+  llvm::Error finalized =
+      finalizeStoragePlan(c->graph, analysis, c->target->machine());
+  ASSERT_FALSE(bool(finalized)) << llvm::toString(std::move(finalized));
+  EXPECT_FALSE(analysis.diagnostics.physicalComplete);
+  bool namedSram = false;
+  for (const std::string &reason : analysis.diagnostics.physicalReasons)
+    namedSram |= reason.find("sram") != std::string::npos;
+  EXPECT_TRUE(namedSram);
+
+  // Strict executable binding: refused, with a memory diagnostic.
+  std::unique_ptr<PlanMaterializer> materializer =
+      mlir::llk::micro_mapping_detail::createCanonicalPlanMaterializer();
+  auto strict = bindPlan(*c->source, result->plans.front(), *c->target,
+                         BindContract::Executable, materializer.get());
+  EXPECT_FALSE(bool(strict));
+  if (!strict)
+    EXPECT_NE(llvm::toString(strict.takeError()).find("memory"),
+              std::string::npos);
+}
+
+// The control: with every occurrence named, the same ambiguous kind is a
+// decision the search makes per occurrence, so the strict binding succeeds and
+// the explicit selections survive the metadata round trip.
+TEST(PlanBinder, Issue129PhysicalMemoryNamedPortSelectionsSurvive) {
+  auto c = issue129::resourceCase("named-ports");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  const CoveringPlan &plan = result->plans.front();
+  ASSERT_EQ(plan.placements.size(), 1u);
+  const PlanPlacement &placement = plan.placements.front();
+  ASSERT_EQ(placement.portMemoryBindings.size(), 3u);
+  for (const PortMemoryBinding &binding : placement.portMemoryBindings)
+    EXPECT_FALSE(binding.memory.empty());
+
+  auto strict =
+      bindCanonical(*c->source, plan, *c->target, BindContract::Executable);
+  ASSERT_TRUE(bool(strict)) << llvm::toString(strict.takeError());
+
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*strict->module, *c->target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  ASSERT_EQ(decoded->placements.size(), 1u);
+  EXPECT_EQ(decoded->placements.front().portMemoryBindings,
+            placement.portMemoryBindings);
+}
+
+// The report is where a `report-only` run states an incomplete verdict: a plan
+// whose physical facts do not resolve is reported with `physicalComplete:
+// false` and its reasons, never presented as a fully executable plan.
+TEST(PlanBinder, Issue129PhysicalMemoryReportRecordsIncompleteStatus) {
+  auto c = issue129::resourceCase("missing-memory");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  result->plans.front().materialized = false;
+  ASSERT_FALSE(bool(finalizeStoragePlan(c->graph, result->plans.front(),
+                                        c->target->machine())));
+
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, /*moduleHash=*/0);
+  EXPECT_NE(report.find("\"physicalComplete\": false"), std::string::npos)
+      << report;
+  EXPECT_NE(report.find("\"physicalReasons\": ["), std::string::npos) << report;
+  EXPECT_NE(report.find("ambiguous"), std::string::npos) << report;
+}
