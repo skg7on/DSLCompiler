@@ -142,6 +142,15 @@ inline std::optional<LayoutKind> symbolizeLayoutKind(llvm::StringRef str) {
       .Default(std::nullopt);
 }
 
+/// True when a layout kind is well-formed only *with* an extra parameter: a
+/// `blocked` layout needs a block shape and a `swizzled` one a swizzle pattern,
+/// so neither is a legal bare `#micro.layout`. A producer that cannot supply
+/// the parameter must reject the kind with a diagnostic rather than build the
+/// attribute, whose verifier failure asserts.
+inline bool layoutKindNeedsParameters(LayoutKind kind) {
+  return kind == LayoutKind::blocked || kind == LayoutKind::swizzled;
+}
+
 //===----------------------------------------------------------------------===//
 // Gather semantics (for micro.gather)
 //===----------------------------------------------------------------------===//

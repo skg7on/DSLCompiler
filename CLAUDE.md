@@ -82,9 +82,9 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 
 M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, specialization/tuning, RoPE + Attention). M7 (Python frontend) deferred.
 
-**M9–M12 complete.** Search-space IR (#44), LLKToMicro + search export (#47/#48), MachineModel + `micro-perf` (#45/#46), tuning core + candidate binding/ranking (#49/#50), and the **epic #67 topology-aware mapping subsystem**: MachineModel v2 topology, deterministic routing, declarative LLKMap layouts and rules, placement and connection synthesis, deterministic/beam/exact covering search, AVX2 + generic-accelerator target packages, plan binding and emission, §22.3 diagnostics, §22.2 versioned plan report, and an optional `LatencyProvider`.
+**M9–M12 and the epic #67 mapping subsystem complete.** Search-space IR (#44), LLKToMicro + search export (#47/#48), MachineModel + `micro-perf` (#45/#46), tuning core + candidate binding/ranking (#49/#50), and the topology-aware mapping subsystem: MachineModel v2 topology, deterministic routing, declarative LLKMap layouts and rules, placement and connection synthesis, deterministic/beam/exact covering search, AVX2 + generic-accelerator target packages, plan binding and emission, §22.3 diagnostics, §22.2 versioned plan report, and an optional `LatencyProvider`. The 27-task improvement plan's A/B/C stages are merged: endpoint identity and layered verification (A), complete plan materialization, storage, synchronization and joint exact connection search (B), and explicit kernel ABI, target-owned emitter lowering, a descriptor-pointer `MappedExecutable`, shared mapped compilation, tuner integration, fused rules and acceptance chains (C1–C8); C9 removed backend owner vocabulary from generic Micro ODS. Revision-pinned evidence for every normative §29 criterion is published in `docs/reviews/issue67-final-acceptance.md`.
 
-**Remaining: M13 — measurement loop and calibration (#51/#52).** Blocked on a way to *execute* micro-IR, which does not exist; that is the deferred Micro emulator (#54), so it is a milestone, not a slice. Tracker: issue #41; epic #67.
+**Remaining: M13 — measurement loop and calibration (#51/#52).** The mapped compilation path (C4/C5) executes selected kernels and supplies the measurement callback, event keys and ABI identity #51/#52 need; delivering calibrated predictions remains separate work. A directly-interpreting Micro emulator (#54) stays deferred and is not a prerequisite. Tracker: issue #41; epic #67.
 
 ## Key Files
 
@@ -97,6 +97,7 @@ M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, sp
 | `docs/superpowers/specs/2026-08-13-micro-ir-tile-programming-model-spec.md` | Detailed tile programming model |
 | `docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md` | Epic #67 design: mapping engine, MachineModel v2, routing, LLKMap, covering search, plan binding (§-numbered throughout the code) |
 | `docs/design/micro-ir-mapping-workflow.md` | Contributor workflow: extract → match → place → connect → cover → bind → verify |
+| `docs/reviews/issue67-final-acceptance.md` | Revision-pinned §29 acceptance evidence: criterion → tests → result → limitation, and the #51/#52 handoff |
 | `docs/design/llkmap-layout-grammar.md`, `docs/design/llkmap-rule-grammar.md` | LLKMap declarative grammar: layouts, rules, target bundles |
 | `include/LLK/Machine/` + `lib/Machine/` | `MachineModel` v2 topology, loader, content hash |
 | `include/LLK/Mapping/` + `lib/Mapping/` | Mapping core: workload graph, routing, LLKMap, rules, placement, covering search, plan binder, cost/latency/diagnostics/report |

@@ -349,6 +349,13 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
   if (!layout)
     return fail("schedule tile_layout '" + schedule.tile_layout +
                 "' is not a known layout kind");
+  // A bare `blocked`/`swizzled` cannot be materialized: each needs a parameter
+  // the schedule and the tile attribute do not carry, so building the layout
+  // would fail its verifier and abort. A schedule asking for one is unsupported
+  // input, and unsupported input fails loudly.
+  if (micro::layoutKindNeedsParameters(*layout))
+    return fail("schedule tile_layout '" + schedule.tile_layout +
+                "' needs a block/swizzle parameter this export does not carry");
   plan.layoutKind = *layout;
 
   // --- owner hierarchy ---------------------------------------------------
@@ -995,9 +1002,12 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
       makeNumericChoices(context, kSearchPrefetch, schedule.prefetch_distance));
 
   // --- symbolic parameters ---
+  // The layout choices are the schedule's own value and the plain row-major
+  // fallback. A bare `blocked`/`swizzled` is *not* offered: each is well-formed
+  // only with a block/swizzle parameter the binding pipeline does not carry, so
+  // advertising one would offer a candidate nothing downstream can bind.
   addParam("tile_layout", "layout",
-           makeStringChoices(context,
-                             {schedule.tile_layout, "row_major", "blocked"}));
+           makeStringChoices(context, {schedule.tile_layout, "row_major"}));
   addParam("memory_path", "memory_path",
            makeStringChoices(context, {schedule.memory_path, "dram:sram:acc",
                                        "dram:l2:sram:acc"}));

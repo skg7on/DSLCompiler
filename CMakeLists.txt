@@ -1186,6 +1186,15 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> $<TARGET_FILE:micro-perf>
           ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/AcceptancePipeline
   )
+  # Stage C10: the workflow and acceptance documents must point at paths that
+  # exist and flags the tools accept, so an example a reader is told to run is
+  # one the tools can actually run.
+  add_test(NAME DocReferences
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Docs/check_doc_references.py
+          ${CMAKE_SOURCE_DIR}
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
+          $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
+  )
   # Stage C5: the shared mapped-compilation path, taken by the compiler. A
   # plan is searched, bound, verified, handed to the target's own emitters where
   # they implement it, lowered, bufferized and JIT-compiled -- and the compiler

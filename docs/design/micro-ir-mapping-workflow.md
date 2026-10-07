@@ -61,13 +61,22 @@ machine does not model, a copy path it does not declare.
 
 ```bash
 llk-tune --input swiglu.micro.mlir --machine machines/x86-avx2-v2.yaml \
-         --M 128 --N 4096 --K 4096
+         --M 8 --N 64 --K 64 --max-candidates 256
 ```
 
 `llk-tune` enumerates the search space, checks each candidate against the
 machine, ranks the legal ones by the space's `micro.objective`, and writes the
 winner as a schedule record. `--M/--N/--K` supply the problem shape, which the
 search space does not carry.
+
+The default enumerates the **whole** declared space (`--max-candidates 0`). A
+real GEMM shape makes that product large, so pass a cap while exploring; the
+example above is a small shape that finishes in well under a second. A candidate
+whose bound decisions cannot be realized — a `blocked`/`swizzled` tile layout,
+for instance, which needs a block/swizzle parameter the binder does not carry —
+is *rejected with a reason*, not a crash: the search space may legitimately offer
+alternatives this pipeline does not implement, and the tuner reports them and
+moves on.
 
 ## Describing your machine
 
@@ -85,12 +94,36 @@ clock_hz: 3000000000       # needed only for nanosecond estimates
 worker_threads: 8
 sync: {barrier_cycles: 200, wait_cycles: 0}
 executors: [...]           # each with a Micro owner kind, a parent, a concurrency,
-                           #   optional coordinates, and optional equivalent_to
+                           #   optional coordinates, optional equivalent_to, and
+                           #   `refines` when its kind is a target word
 memories: [...]            # capacity, alignment, access bandwidth and latency
 compute: [...]             # element types, accumulator types, shapes, lanes
 transfer_engines: [...]
 links: [...]               # transfer bandwidth, latency, engines
 ```
+
+A tile's owner (`#micro.owner`) and a spatial loop's axis (`#micro.map`) are
+**open symbols**: the canonical dialect records whatever spelling the IR carries
+and never checks it against a fixed list. Your profile is what turns a spelling
+into one of the abstract classes `group` / `worker` / `vector` / `matrix` /
+`transfer`. An executor whose `kind` is your own word — `lane`, `core`, `pe` —
+declares the class it stands for with `refines`:
+
+```yaml
+executors:
+  - id: lane.0
+    kind: lane
+    refines: [worker]      # this machine's `lane` is a worker
+  - id: veng.0
+    kind: vector_engine
+    refines: [vector]
+```
+
+Compute capabilities and transfer engines take the same `refines` list. A kind
+that is *already* an abstract class needs none. A spelling no node declares is
+unknown, and two nodes that declare it with conflicting classes are ambiguous —
+both are rejected rather than silently resolved, which is why legacy owner labels
+only migrate when the target actually says what they mean.
 
 Copy `machines/x86-avx2-v2.yaml` and calibrate it for your host before trusting
 any cycle estimate. The numbers in the shipped files are calibration seeds, not
@@ -201,6 +234,8 @@ describe the tensor-level movement and vector family.
 
 ## Where to go deeper
 
+- the design's acceptance criteria, with revision-pinned evidence for each:
+  `docs/reviews/issue67-final-acceptance.md`
 - tile model, ops, and verifier rules: `docs/design/m9-micro-ir-core-concepts.md`
 - layering and the redesign: `docs/design/m9-canonical-micro-ir-architecture.md`
 - the mapping design: `docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md`
