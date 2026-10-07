@@ -854,12 +854,10 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
         record.index = hop;
         record.srcMemory = connection.route[hop];
         record.dstMemory = connection.route[hop + 1];
-        // The engine the hop runs on, derived by the same rule routing
-        // legalized the hop with, so a costed hop and a materialized hop cannot
-        // disagree.
-        record.engine =
-            legalTransferEngine(machine, record.srcMemory, record.dstMemory)
-                .value_or(std::string());
+        // The engine is resolved below, once `recordIncomplete` exists, because
+        // a hop whose memories no machine link joins has no engine to record
+        // and that is an incomplete physical fact -- never an empty string
+        // (issue #129, task R7 review).
         record.movementStep = movement;
         record.waitStep = wait;
         connectionHops[index].push_back(std::move(record));
@@ -1004,6 +1002,34 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   auto recordDecision = [&](std::string decision) {
     physicalDecisions.push_back(std::move(decision));
   };
+
+  // The engine each movement hop runs on, derived by the same rule routing
+  // legalized the hop with, so a costed hop and a materialized hop cannot
+  // disagree (issue #129, task R4). A hop whose memories no machine link with a
+  // usable transfer engine joins has no engine to record: that is an incomplete
+  // physical fact, not an empty string. Recording it empty made the "an engine
+  // must be one its link offers" guarantee vacuous, because the movement
+  // verifier only checks a non-empty engine (issue #129, task R7 review). The
+  // router would not have produced such a route, so this is reachable only from
+  // a hand-built or decoded plan.
+  for (size_t index = 0; index < plan.connectionPlans.size(); ++index) {
+    for (PlanMovementHop &hop : connectionHops[index]) {
+      std::optional<ExecutorId> engine =
+          legalTransferEngine(machine, hop.srcMemory, hop.dstMemory);
+      if (!engine) {
+        if (std::optional<llvm::Error> rejected = recordIncomplete(
+                "storage plan: movement hop " + std::to_string(hop.index) +
+                " of connection " +
+                std::to_string(plan.connectionPlans[index].id) +
+                " moves between memories '" + hop.srcMemory + "' and '" +
+                hop.dstMemory +
+                "', which no machine link with a transfer engine joins"))
+          return std::move(*rejected);
+        continue;
+      }
+      hop.engine = *engine;
+    }
+  }
 
   auto layoutMapFor = [&](const PlanPlacement &placement, const PortRef &ref,
                           WorkloadValueId value) -> mlir::AffineMap {

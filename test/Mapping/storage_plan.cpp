@@ -61,6 +61,28 @@ MachineModel storageMachine() {
   dram.capacityBytes = 1u << 30;
   dram.alignmentBytes = 64;
   model.memories = {sram, dram};
+  // A transfer engine and a `sram.0 -> dram.0` link, so a hand-built plan that
+  // claims a hop between the two memories has a legal engine to record. A plan
+  // claiming a hop no link joins is incomplete, not silently engine-less (issue
+  // #129, task R7 review), so a fixture that routes between them must model the
+  // link the router would have used.
+  TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.refines = {"transfer"};
+  dma.attachedTo = "e0";
+  dma.count = 1;
+  dma.maxOutstanding = 1;
+  model.transferEngines = {dma};
+  LinkEdge sramToDram;
+  sramToDram.id = "link.sram_dram";
+  sramToDram.source = "sram.0";
+  sramToDram.destination = "dram.0";
+  sramToDram.bandwidthBytesPerCycle = 64;
+  sramToDram.latencyCycles = 10;
+  sramToDram.transactionBytes = 64;
+  sramToDram.transferEngines = {"dma.0"};
+  model.links = {sramToDram};
   return model;
 }
 
@@ -676,6 +698,82 @@ TEST(StoragePlan, ReportRoundTripsThePlanStepDag) {
     EXPECT_EQ(replay->steps[i].connection, plan.steps[i].connection);
   }
   EXPECT_EQ(replay->stepEdges, plan.stepEdges);
+}
+
+// Issue #129, task R7 review: a movement hop whose memories no machine link
+// joins has no engine to record. Recording the engine as an empty string left
+// the "an engine must be one its link offers" guarantee vacuous, because the
+// movement verifier only checks a non-empty engine. It is an incomplete
+// physical fact: a strict finalize rejects it, an analysis finalize keeps the
+// plan with a reason and an empty engine -- never a silent success.
+TEST(StoragePlan, AHopOnARouteNoLinkJoinsIsIncompleteNotEngineLess) {
+  mlir::MLIRContext context;
+  mlir::Type tile = tileType(context, "8x8xf32");
+
+  WorkloadGraph graph;
+  WorkloadValueId v0 =
+      graph.addValue(WorkloadValue{0, tile, "v0", /*external=*/false});
+  WorkloadValueId v1 =
+      graph.addValue(WorkloadValue{0, tile, "v1", /*external=*/false});
+  WorkloadNode producer;
+  producer.opName = "micro.vector";
+  producer.sourceOrdinal = 0;
+  producer.executionMultiplicity = 1;
+  producer.outputs.push_back(WorkloadPort{v0, tile, std::nullopt});
+  graph.addNode(std::move(producer));
+  WorkloadNode consumer;
+  consumer.opName = "micro.vector";
+  consumer.sourceOrdinal = 1;
+  consumer.executionMultiplicity = 1;
+  consumer.inputs.push_back(WorkloadPort{v0, tile, std::nullopt});
+  consumer.outputs.push_back(WorkloadPort{v1, tile, std::nullopt});
+  graph.addNode(std::move(consumer));
+  graph.finalize();
+
+  const WorkloadNode *producerNode = nullptr;
+  const WorkloadNode *consumerNode = nullptr;
+  for (const WorkloadNode &node : graph.getNodes())
+    (node.inputs.empty() ? producerNode : consumerNode) = &node;
+  ASSERT_NE(producerNode, nullptr);
+  ASSERT_NE(consumerNode, nullptr);
+
+  auto buildPlan = [&](bool materialized) {
+    CoveringPlan plan;
+    plan.materialized = materialized;
+    PlanPlacement producerPlacement;
+    producerPlacement.node = producerNode->id;
+    producerPlacement.instance = 10;
+    producerPlacement.memories["dram"] = "dram.0";
+    plan.placements.push_back(producerPlacement);
+    PlanPlacement consumerPlacement;
+    consumerPlacement.node = consumerNode->id;
+    consumerPlacement.instance = 20;
+    consumerPlacement.memories["sram"] = "sram.0";
+    plan.placements.push_back(consumerPlacement);
+    PlanConnection connection;
+    connection.id = 7;
+    connection.value = producerNode->outputs[0].value;
+    connection.kind = ConnectionKind::Transfer;
+    // `storageMachine()` models only the `sram.0 -> dram.0` link, so this
+    // reverse hop joins no link.
+    connection.route = {"dram.0", "sram.0"};
+    connection.consumers = {20};
+    plan.connectionPlans.push_back(connection);
+    return plan;
+  };
+
+  CoveringPlan strict = buildPlan(/*materialized=*/true);
+  llvm::Error rejected = finalizeStoragePlan(graph, strict, storageMachine());
+  ASSERT_TRUE(bool(rejected));
+  EXPECT_NE(llvm::toString(std::move(rejected)).find("dram.0"),
+            std::string::npos);
+
+  CoveringPlan analysis = buildPlan(/*materialized=*/false);
+  ASSERT_FALSE(bool(finalizeStoragePlan(graph, analysis, storageMachine())));
+  ASSERT_FALSE(analysis.connectionPlans.front().hops.empty());
+  EXPECT_TRUE(analysis.connectionPlans.front().hops.front().engine.empty());
+  EXPECT_FALSE(analysis.diagnostics.physicalComplete);
+  ASSERT_FALSE(analysis.diagnostics.physicalReasons.empty());
 }
 
 TEST(StoragePlan, ATransformedReplicaIsChargedToItsDestinationMemory) {
