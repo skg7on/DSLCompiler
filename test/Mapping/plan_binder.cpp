@@ -4389,6 +4389,44 @@ TEST(PlanBinder, Issue129PhysicalMemoryReportRecordsIncompleteStatus) {
       << report;
   EXPECT_NE(report.find("\"physicalReasons\": ["), std::string::npos) << report;
   EXPECT_NE(report.find("ambiguous"), std::string::npos) << report;
+
+  // ... and the verdict must survive the round trip (issue #129, task R7
+  // review). A plan found physically incomplete replayed as complete, because
+  // the field was written to the report but never read back and the in-memory
+  // default is optimistic.
+  llvm::Expected<CoveringPlan> replayed =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_TRUE(bool(replayed)) << llvm::toString(replayed.takeError());
+  EXPECT_FALSE(replayed->diagnostics.physicalComplete);
+  EXPECT_FALSE(replayed->diagnostics.physicalReasons.empty());
+}
+
+// The same verdict must survive the `micro.plan` metadata round trip (issue
+// #129, task R7 review), so a kernel decoded from the IR does not present an
+// incomplete analysis artifact as a complete plan.
+TEST(PlanBinder, Issue129PhysicalVerdictSurvivesMetadataRoundTrip) {
+  auto c = issue129::resourceCase("missing-memory");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  CoveringPlan plan = result->plans.front();
+  plan.materialized = false;
+  ASSERT_FALSE(bool(finalizeStoragePlan(c->graph, plan, c->target->machine())));
+  ASSERT_FALSE(plan.diagnostics.physicalComplete);
+  ASSERT_FALSE(plan.diagnostics.physicalReasons.empty());
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c->source, plan, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*bound->module, *c->target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  EXPECT_FALSE(decoded->diagnostics.physicalComplete);
+  EXPECT_FALSE(decoded->diagnostics.physicalReasons.empty());
 }
 
 // A boundary descriptor -- a value no node in the graph produces, here the

@@ -296,6 +296,25 @@ std::string writePlanReport(const MappingSearchResult &result,
       json.attribute("sourceBindingHash",
                      hexId(selected ? selected->sourceBindingHash : 0));
       json.attribute("materialized", selected ? selected->materialized : false);
+      // The physical-memory verdict is part of the replayed state, not merely a
+      // note in the plan's diagnostics (issue #129, task R7 review): a plan
+      // found physically incomplete must not replay as complete. It is
+      // provenance, so it stays out of the plan id.
+      json.attribute("physicalComplete",
+                     selected ? selected->diagnostics.physicalComplete : true);
+      json.attributeArray("physicalReasons", [&] {
+        if (!selected)
+          return;
+        for (const std::string &reason : selected->diagnostics.physicalReasons)
+          json.value(reason);
+      });
+      json.attributeArray("physicalDecisions", [&] {
+        if (!selected)
+          return;
+        for (const std::string &decision :
+             selected->diagnostics.physicalDecisions)
+          json.value(decision);
+      });
       json.attributeArray("placements", [&] {
         if (!selected)
           return;
@@ -736,6 +755,26 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
     plan.sourceBindingHash = parseHexId(*binding);
   if (std::optional<bool> materialized = state->getBoolean("materialized"))
     plan.materialized = *materialized;
+  // The physical-memory verdict replays with the plan (issue #129, task R7
+  // review), so a plan found incomplete does not come back claiming complete.
+  if (std::optional<bool> complete = state->getBoolean("physicalComplete"))
+    plan.diagnostics.physicalComplete = *complete;
+  for (llvm::StringRef key : {llvm::StringRef("physicalReasons"),
+                              llvm::StringRef("physicalDecisions")}) {
+    const llvm::json::Array *array = state->getArray(key);
+    if (!array)
+      continue;
+    std::vector<std::string> *out = key == "physicalReasons"
+                                        ? &plan.diagnostics.physicalReasons
+                                        : &plan.diagnostics.physicalDecisions;
+    for (const llvm::json::Value &element : *array) {
+      std::optional<llvm::StringRef> text = element.getAsString();
+      if (!text)
+        return reportError("plan report selectedState '" + key.str() +
+                           "' holds a non-string entry");
+      out->push_back(text->str());
+    }
+  }
   plan.targetHash = computeTargetContentHash(target);
   plan.machineHash = machine::computeContentHash(target.machine());
   plan.layoutHash = target.layouts().computeContentHash();

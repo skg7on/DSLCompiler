@@ -768,6 +768,26 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
   planFields.emplace_back(
       mlir::StringAttr::get(context, "truncated"),
       mlir::BoolAttr::get(context, plan.diagnostics.searchTruncated));
+  // The physical-memory verdict and its ordered reasons and decisions (issue
+  // #129, tasks R3/R7). They are provenance, not identity -- they stay out of
+  // `canonicalPlanString`, so persisting them cannot move a plan id -- but a
+  // plan found incomplete must keep that verdict across the `micro.plan`
+  // round-trip instead of reverting to the optimistic default (issue #129, task
+  // R7 review).
+  planFields.emplace_back(
+      mlir::StringAttr::get(context, "physical_complete"),
+      mlir::BoolAttr::get(context, plan.diagnostics.physicalComplete));
+  auto stringArray = [&](llvm::ArrayRef<std::string> values) {
+    llvm::SmallVector<mlir::Attribute> attrs;
+    attrs.reserve(values.size());
+    for (const std::string &value : values)
+      attrs.push_back(mlir::StringAttr::get(context, value));
+    return mlir::ArrayAttr::get(context, attrs);
+  };
+  planFields.emplace_back(mlir::StringAttr::get(context, "physical_reasons"),
+                          stringArray(plan.diagnostics.physicalReasons));
+  planFields.emplace_back(mlir::StringAttr::get(context, "physical_decisions"),
+                          stringArray(plan.diagnostics.physicalDecisions));
   // Concrete storage allocations and synchronization decisions (design §9.6).
   // B1 persists them; B3 populates them. Empty is legal today.
   llvm::SmallVector<mlir::Attribute> allocations;
@@ -1178,6 +1198,32 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
     plan.materialized = materialized.getValue();
   if (auto truncated = planAttr.getAs<mlir::BoolAttr>("truncated"))
     plan.diagnostics.searchTruncated = truncated.getValue();
+  // The physical-memory verdict and its reasons (issue #129, task R7 review).
+  // Restored so a plan found incomplete keeps that verdict across the round
+  // trip; a binding written before this field existed keeps the field's own
+  // optimistic default.
+  if (auto complete = planAttr.getAs<mlir::BoolAttr>("physical_complete"))
+    plan.diagnostics.physicalComplete = complete.getValue();
+  auto readStringArray = [&](llvm::StringRef key,
+                             std::vector<std::string> &out) -> llvm::Error {
+    auto array = planAttr.getAs<mlir::ArrayAttr>(key);
+    if (!array)
+      return llvm::Error::success();
+    for (mlir::Attribute element : array) {
+      auto text = mlir::dyn_cast<mlir::StringAttr>(element);
+      if (!text)
+        return metadataError("micro.plan '" + key.str() +
+                             "' holds a non-string entry");
+      out.push_back(text.getValue().str());
+    }
+    return llvm::Error::success();
+  };
+  if (llvm::Error error =
+          readStringArray("physical_reasons", plan.diagnostics.physicalReasons))
+    return std::move(error);
+  if (llvm::Error error = readStringArray("physical_decisions",
+                                          plan.diagnostics.physicalDecisions))
+    return std::move(error);
 
   if (v2) {
     llvm::Expected<std::string> graphHash =
