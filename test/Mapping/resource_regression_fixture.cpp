@@ -65,6 +65,9 @@ struct CaseSpec {
   llvm::StringRef rules;
   machine::MachineModel machine;
   std::vector<std::string> emitters;
+  /// The LLKMap layout text the target declares, empty for a case whose rules
+  /// require no layout (issue #129, task R5).
+  llvm::StringRef layouts{};
 };
 
 /// Parses `spec` and loads its target. The MLIR context owns `source`, and the
@@ -91,8 +94,16 @@ llvm::Expected<ResourceCase> buildCase(const CaseSpec &spec) {
   llvm::Expected<RuleRegistry> rules = parseRuleText(spec.rules, "<issue129>");
   if (!rules)
     return rules.takeError();
+  LayoutRegistry layouts;
+  if (!spec.layouts.empty()) {
+    llvm::Expected<LayoutRegistry> parsed =
+        parseLayoutText(spec.layouts, "<issue129 layouts>");
+    if (!parsed)
+      return parsed.takeError();
+    layouts = std::move(*parsed);
+  }
   c.target = std::make_unique<FileMappingTarget>(
-      "issue129", spec.machine, LayoutRegistry{}, std::move(*rules),
+      "issue129", spec.machine, std::move(layouts), std::move(*rules),
       spec.emitters);
   return c;
 }
@@ -455,6 +466,199 @@ CaseSpec twoHopSpec() {
 }
 
 //===----------------------------------------------------------------------===//
+// R5: `sequential`, `pipeline-four`, `parallel-overlap`, `padded-layout`
+//===----------------------------------------------------------------------===//
+
+/// One worker with a vector engine and a *small* L2 the 8x8xf32 results live
+/// in, plus a DRAM the operands are borrowed from. The two memories are told
+/// apart by the tiles' own stated kinds, so a result is charged to L2 and a
+/// borrowed operand to DRAM -- which is what lets a liveness assertion name one
+/// memory and mean it.
+///
+/// `l2CapacityBytes` is a parameter so a case can state the intermediate's
+/// capacity literally: 256 holds one 256-byte result and not two.
+machine::MachineModel livenessMachine(uint64_t l2CapacityBytes) {
+  machine::MachineModel model;
+  model.target = "issue129.liveness";
+  model.description = "one worker, a small l2 and a borrowed dram operand";
+  machine::ExecutorNode worker;
+  worker.id = "worker.0";
+  worker.kind = "worker";
+  worker.concurrency = 1;
+  model.executors = {worker};
+  machine::ComputeNode vpu;
+  vpu.id = "vpu.0";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "worker.0";
+  vpu.concurrency = 1;
+  model.computes = {vpu};
+  machine::MemoryNode l2;
+  l2.id = "l2.0";
+  l2.kind = "l2";
+  l2.visibleFrom = "worker.0";
+  l2.capacityBytes = l2CapacityBytes;
+  l2.alignmentBytes = 64;
+  machine::MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "worker.0";
+  dram.capacityBytes = 1u << 30;
+  dram.alignmentBytes = 64;
+  model.memories = {l2, dram};
+  return model;
+}
+
+/// The one rule every liveness case maps: an `8x8xf32` element-wise add whose
+/// operands are borrowed from DRAM and whose result lives in L2. Nothing
+/// declares how many times it runs -- the enclosing structural ops are what
+/// say that, and liveness is what turns them into residency.
+constexpr llvm::StringLiteral kLivenessRules = R"llkmap(
+rule issue129.liveness_add {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.liveness.add";
+  emit "issue129_vector_add";
+  cost 4;
+}
+)llkmap";
+
+/// A widened row-major layout: every logical column occupies every other
+/// physical column, so the physical image of an `8x8xf32` value is 8x15 -- 120
+/// elements, 480 bytes -- against the logical 64 elements, 256 bytes. A value's
+/// span is its physical image, never its index space, so that is what a live
+/// range must reserve. (A row *stride* that exceeds the row is a padding the
+/// layout map cannot express -- its image is bounded as a box, so only a
+/// genuinely wider image changes the byte count; a padding clause in the layout
+/// grammar is a separate change.)
+constexpr llvm::StringLiteral kLivenessLayouts = R"llkmap(
+layout issue129.padded_row_major(int S) {
+  param S in [1..4];
+  require rank == 2;
+  require S == 2;
+  implements row_major;
+  map (m, n) -> (m, n * S);
+}
+)llkmap";
+
+/// The same add with the padded layout required of its result, so the case's
+/// occupancy reflects the physical image.
+constexpr llvm::StringLiteral kPaddedLivenessRules = R"llkmap(
+rule issue129.liveness_add_padded {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout result satisfies issue129.padded_row_major;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.liveness.add.padded";
+  emit "issue129_vector_add";
+  cost 4;
+}
+)llkmap";
+
+/// Four *temporal* iterations of one add: the loop reuses the result buffer
+/// rather than keeping four of them, so the L2 peak is one 256-byte value.
+constexpr llvm::StringLiteral kSequentialSource = R"mlir(
+module {
+  micro.kernel @sequential {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %a = tensor.empty() : tensor<8x8xf32>
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<dram>>
+    micro.for %i = %c0 to %c4 step %c1 {
+      %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32, memory = #micro.memory<dram>>, !micro.tile<8x8xf32, memory = #micro.memory<dram>> -> !micro.tile<8x8xf32, memory = #micro.memory<l2>>
+    }
+    micro.yield
+  }
+}
+)mlir";
+
+/// The same four iterations, but the add runs inside a four-stage pipeline: the
+/// stages overlap, so four versions of the result are resident at once and the
+/// peak is four 256-byte values.
+constexpr llvm::StringLiteral kPipelineFourSource = R"mlir(
+module {
+  micro.kernel @pipeline_four {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %a = tensor.empty() : tensor<8x8xf32>
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<dram>>
+    micro.for %i = %c0 to %c4 step %c1 {
+      micro.pipeline stages = 4 {
+        %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32, memory = #micro.memory<dram>>, !micro.tile<8x8xf32, memory = #micro.memory<dram>> -> !micro.tile<8x8xf32, memory = #micro.memory<l2>>
+      }
+    }
+    micro.yield
+  }
+}
+)mlir";
+
+/// Two *spatial* occurrences of the add: the owners run side by side, so both
+/// 256-byte results are resident and the peak is 512 -- which a 256-byte L2
+/// cannot hold.
+constexpr llvm::StringLiteral kParallelOverlapSource = R"mlir(
+module {
+  micro.kernel @parallel_overlap {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %a = tensor.empty() : tensor<8x8xf32>
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<dram>>
+    micro.spatial_for %i = %c0 to %c2 step %c1 map = #micro.map<worker> {
+      %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32, memory = #micro.memory<dram>>, !micro.tile<8x8xf32, memory = #micro.memory<dram>> -> !micro.tile<8x8xf32, memory = #micro.memory<l2>>
+    }
+    micro.yield
+  }
+}
+)mlir";
+
+/// The padded case is the sequential kernel: one result, whose padded physical
+/// image is what its L2 reservation must cover.
+CaseSpec sequentialSpec() {
+  CaseSpec spec;
+  spec.source = kSequentialSource;
+  spec.rules = kLivenessRules;
+  spec.machine = livenessMachine(256);
+  spec.emitters = {"issue129_vector_add"};
+  return spec;
+}
+
+CaseSpec pipelineFourSpec() {
+  CaseSpec spec;
+  spec.source = kPipelineFourSource;
+  spec.rules = kLivenessRules;
+  spec.machine = livenessMachine(1024);
+  spec.emitters = {"issue129_vector_add"};
+  return spec;
+}
+
+CaseSpec parallelOverlapSpec() {
+  CaseSpec spec;
+  spec.source = kParallelOverlapSource;
+  spec.rules = kLivenessRules;
+  spec.machine = livenessMachine(512);
+  spec.emitters = {"issue129_vector_add"};
+  return spec;
+}
+
+CaseSpec paddedLayoutSpec() {
+  CaseSpec spec;
+  spec.source = kSequentialSource;
+  spec.rules = kPaddedLivenessRules;
+  spec.layouts = kLivenessLayouts;
+  spec.machine = livenessMachine(512);
+  spec.emitters = {"issue129_vector_add"};
+  return spec;
+}
+
+//===----------------------------------------------------------------------===//
 // Case table
 //===----------------------------------------------------------------------===//
 
@@ -479,12 +683,32 @@ llvm::Expected<ResourceCase> buildNamedPorts() {
 
 llvm::Expected<ResourceCase> buildTwoHop() { return buildCase(twoHopSpec()); }
 
+llvm::Expected<ResourceCase> buildSequential() {
+  return buildCase(sequentialSpec());
+}
+
+llvm::Expected<ResourceCase> buildPipelineFour() {
+  return buildCase(pipelineFourSpec());
+}
+
+llvm::Expected<ResourceCase> buildParallelOverlap() {
+  return buildCase(parallelOverlapSpec());
+}
+
+llvm::Expected<ResourceCase> buildPaddedLayout() {
+  return buildCase(paddedLayoutSpec());
+}
+
 llvm::ArrayRef<CaseEntry> caseTable() {
   static const CaseEntry table[] = {
       {"two-compute", &buildTwoCompute},
       {"missing-memory", &buildMissingMemory},
       {"named-ports", &buildNamedPorts},
       {"two-hop", &buildTwoHop},
+      {"sequential", &buildSequential},
+      {"pipeline-four", &buildPipelineFour},
+      {"parallel-overlap", &buildParallelOverlap},
+      {"padded-layout", &buildPaddedLayout},
   };
   return table;
 }

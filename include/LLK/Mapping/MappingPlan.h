@@ -280,6 +280,20 @@ struct StorageAllocation {
   /// scratch, so `computePeakStorage` refuses to alias one (issue #129, task
   /// R3).
   bool borrowed = false;
+  /// How many occurrences of this allocation are simultaneously resident
+  /// (issue #129, task R5): the producer's `simultaneousMultiplicity` -- the
+  /// product of the enclosing spatial-loop trip counts and pipeline stages.
+  /// `bytes` is the *per-occurrence* footprint, so the reservation this
+  /// allocation contributes while it is live is `bytes *
+  /// simultaneousOccurrences`; a serial loop reuses one buffer and therefore
+  /// contributes `1`.
+  ///
+  /// Derived from the enclosing structural ops, so it stays out of
+  /// `canonicalPlanString`: it is a projection of content the plan already
+  /// carries (the placements' nodes and the source graph they were extracted
+  /// from), never a decision. It *does* travel in the plan report, because a
+  /// reader of the report is what needs the real footprint.
+  uint64_t simultaneousOccurrences = 1;
 };
 
 /// One synchronization decision: a step that waits for a set of connections,

@@ -85,7 +85,12 @@ memories:
   - id: acc.0
     kind: acc
     visible_from: cluster.0
-    capacity_bytes: 4096
+    # Two 8x32xf32 accumulators resident at once, one per projection of the
+    # fused SwiGLU (each 2x2 spatial owners x 1024 B = 4096 B), is the true
+    # live peak a liveness-derived occupancy reports; 4096 holds only a single
+    # accumulator and rejected the second projection. The capacity is target
+    # policy, so it lives here rather than in the model (issue #129, task R5).
+    capacity_bytes: 8192
     alignment_bytes: 64
     supported_layouts: [row_major, vectorized]
     banks: 16

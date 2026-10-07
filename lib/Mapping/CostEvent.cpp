@@ -5,6 +5,7 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingPlan.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Mapping/TileFacts.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
@@ -240,9 +241,19 @@ PlanCostEvent makePlanCostEvent(CostEventKind kind, std::string resource,
   return normalized;
 }
 
+llvm::StringRef stringifyStorageAccess(StorageAccess access) {
+  switch (access) {
+  case StorageAccess::Read:
+    return "read";
+  case StorageAccess::Write:
+    return "write";
+  }
+  return "";
+}
+
 llvm::Expected<PlanEventDAG>
-buildPlanEvents(const CoveringPlan &plan,
-                const machine::MachineModel &machine) {
+buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
+                const WorkloadGraph *graph) {
   // The placement covering each node, and the placement for each instance, so a
   // compute step and a connection's consumers resolve without the workload
   // graph.
@@ -347,6 +358,84 @@ buildPlanEvents(const CoveringPlan &plan,
     return id;
   };
 
+  // --- storage facts (issue #129, task R5) ----------------------------------
+  //
+  // The allocations holding each value, in id order: a value can live in more
+  // than one memory at once (a producer's own buffer, a movement stage's copy,
+  // and one borrow per memory a boundary descriptor resolved to), and the
+  // occurrence's own resolved memory is what picks between them. The lowest-id
+  // match is the fallback when the memory cannot be resolved.
+
+  // The value whose storage `value` occupies: a carried loop value is the value
+  // the loop carries it from, followed transitively. Without a graph the value
+  // resolves to itself.
+  auto storageValueOf = [&](WorkloadValueId value) -> WorkloadValueId {
+    if (!graph)
+      return value;
+    for (unsigned guard = 0; guard < 64; ++guard) {
+      const WorkloadValue *entry = graph->findValue(value);
+      if (!entry || !entry->carriedFrom)
+        return value;
+      WorkloadValueId next = *entry->carriedFrom;
+      if (next == value)
+        return value;
+      value = next;
+    }
+    return value;
+  };
+
+  // One event's storage uses: every operand it reads and every result it
+  // writes, expanded once per simultaneously-live occurrence of that slot, so
+  // a consumer of a spatial loop's product sees the residency a serial loop
+  // would not have. Each occurrence is attributed to the allocation that holds
+  // its value *in the memory the occurrence resolved to*, so two same-kind
+  // nodes (or a producer's buffer and a staged copy) are never confused.
+  // `occurrenceBase` keeps the ids of two events distinct.
+  auto storageUsesFor =
+      [&](const PlanPlacement &placed, WorkloadNodeId node,
+          uint64_t occurrenceBase) -> std::vector<StorageUse> {
+    std::vector<StorageUse> uses;
+    if (!graph)
+      return uses;
+    const WorkloadNode *workloadNode = graph->findNode(node);
+    if (!workloadNode)
+      return uses;
+    auto emit = [&](const WorkloadPort &port, PortDirection direction,
+                    unsigned index, StorageAccess access) {
+      const WorkloadValueId value = storageValueOf(port.value);
+      std::optional<std::string> memory;
+      if (llvm::Expected<EndpointMemory> resolved = resolveEndpointMemory(
+              *graph, placed, PortRef{node, direction, index}, machine))
+        memory = resolved->memory;
+      else
+        llvm::consumeError(resolved.takeError());
+      const StorageAllocation *chosen = nullptr;
+      for (const StorageAllocation &allocation : plan.allocations) {
+        if (allocation.value != value)
+          continue;
+        if (!chosen)
+          chosen = &allocation;
+        if (memory && allocation.memory == *memory) {
+          chosen = &allocation;
+          break;
+        }
+      }
+      if (!chosen)
+        return;
+      for (uint64_t step = 0; step < chosen->simultaneousOccurrences; ++step)
+        uses.push_back(StorageUse{chosen->id, occurrenceBase + step, access});
+    };
+    // Reads first, writes second, each in port order: deterministic and
+    // independent of the allocation layout.
+    for (unsigned index = 0; index < workloadNode->inputs.size(); ++index)
+      emit(workloadNode->inputs[index], PortDirection::Input, index,
+           StorageAccess::Read);
+    for (unsigned index = 0; index < workloadNode->outputs.size(); ++index)
+      emit(workloadNode->outputs[index], PortDirection::Output, index,
+           StorageAccess::Write);
+    return uses;
+  };
+
   for (const PlanStep *step : steps) {
     std::vector<uint32_t> produced;
     switch (step->kind) {
@@ -388,9 +477,18 @@ buildPlanEvents(const CoveringPlan &plan,
       // for which both paths call one shared estimate -- agree cycle for cycle.
       // The divergence is intentional and pinned by
       // `L1ResourceDag.PlanComputeCyclesUseTheRuleEstimate`.
-      produced.push_back(add(makePlanCostEvent(
+      PlanCostEvent compute = makePlanCostEvent(
           CostEventKind::Compute, engine->id, placed.cost.latencyCycles,
-          placed.workItems, /*bytes=*/0)));
+          placed.workItems, /*bytes=*/0);
+      compute.owner = placed.executor;
+      compute.sourceNode = std::to_string(step->node);
+      compute.planStep = step->id;
+      // One occurrence namespace per node, so two steps' uses never collide.
+      compute.occurrence =
+          (static_cast<uint64_t>(step->node) << 32) | uint64_t{1};
+      compute.storageUses =
+          storageUsesFor(placed, step->node, compute.occurrence);
+      produced.push_back(add(std::move(compute)));
       break;
     }
     case PlanStepKind::Movement: {
@@ -450,13 +548,39 @@ buildPlanEvents(const CoveringPlan &plan,
           std::vector<uint32_t> deps;
           if (previousWait)
             deps.push_back(*previousWait);
-          uint32_t transfer = add(makePlanCostEvent(
+          PlanCostEvent transferEvent = makePlanCostEvent(
               CostEventKind::TransferHop, resource, static_cast<double>(cycles),
-              workItems, bytes, deps));
+              workItems, bytes, deps);
+          transferEvent.srcMemory = from->id;
+          transferEvent.dstMemory = to->id;
+          transferEvent.connectionId = connection.id;
+          transferEvent.hopIndex = hop - 1;
+          transferEvent.planStep = step->id;
+          // The storage the hop reads and writes, when the plan recorded the
+          // hop: a reader of the source slot and a writer of the destination
+          // one, each charged at the hop's own occurrence.
+          const uint64_t occurrenceBase =
+              (static_cast<uint64_t>(connection.id) << 32) | uint64_t{1};
+          if (hop - 1 < connection.hops.size()) {
+            const PlanMovementHop &recorded = connection.hops[hop - 1];
+            if (recorded.sourceStorageId != 0)
+              transferEvent.storageUses.push_back(
+                  StorageUse{recorded.sourceStorageId, occurrenceBase,
+                             StorageAccess::Read});
+            if (recorded.destinationStorageId != 0)
+              transferEvent.storageUses.push_back(
+                  StorageUse{recorded.destinationStorageId, occurrenceBase + 1,
+                             StorageAccess::Write});
+          }
+          uint32_t transfer = add(std::move(transferEvent));
           hops.push_back(transfer);
-          uint32_t wait = add(makePlanCostEvent(
+          PlanCostEvent waitEvent = makePlanCostEvent(
               CostEventKind::Synchronization, "sync",
-              static_cast<double>(machine.sync.waitCycles), 0, 0, {transfer}));
+              static_cast<double>(machine.sync.waitCycles), 0, 0, {transfer});
+          waitEvent.connectionId = connection.id;
+          waitEvent.hopIndex = hop - 1;
+          waitEvent.planStep = step->id;
+          uint32_t wait = add(std::move(waitEvent));
           hops.push_back(wait);
           previousWait = wait;
         }
@@ -580,9 +704,11 @@ buildPlanEvents(const CoveringPlan &plan,
         }
       if (!barrier)
         break;
-      produced.push_back(add(makePlanCostEvent(
+      PlanCostEvent barrierEvent = makePlanCostEvent(
           CostEventKind::Synchronization, "sync",
-          static_cast<double>(machine.sync.barrierCycles), 0, 0)));
+          static_cast<double>(machine.sync.barrierCycles), 0, 0);
+      barrierEvent.connectionId = step->connection;
+      produced.push_back(add(std::move(barrierEvent)));
       break;
     }
     }

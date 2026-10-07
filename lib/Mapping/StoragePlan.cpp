@@ -6,7 +6,10 @@
 
 #include "LLK/Mapping/StoragePlan.h"
 
+#include "LLK/Mapping/CostEvent.h"
+#include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/Routing.h"
+#include "LLK/Mapping/StorageLiveness.h"
 #include "LLK/Mapping/TileFacts.h"
 
 #include "LLK/Machine/MachineModel.h"
@@ -698,13 +701,33 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     nodeForInstance[placement.instance] = placement.node;
 
   // --- value producer / consumer tables -------------------------------------
+  //
+  // A carried value (a structural loop's iter arg or result) is the storage of
+  // the value the loop carries, so a reader of the carried value reads the
+  // *producing* occurrence: its live interval must reach the reader, and the
+  // reader must depend on that producer (issue #129, task R5). Both tables are
+  // therefore keyed by the storage value, resolved through `carriedFrom`.
+  auto storageValueOf = [&](WorkloadValueId value) -> WorkloadValueId {
+    for (unsigned guard = 0; guard < 64; ++guard) {
+      const WorkloadValue *entry = graph.findValue(value);
+      if (!entry || !entry->carriedFrom)
+        return value;
+      WorkloadValueId next = *entry->carriedFrom;
+      if (next == value)
+        return value;
+      value = next;
+    }
+    return value;
+  };
+
   llvm::DenseMap<WorkloadValueId, WorkloadNodeId> valueProducer;
   llvm::DenseMap<WorkloadValueId, std::vector<WorkloadNodeId>> valueConsumers;
   for (const WorkloadNode &node : graph.getNodes()) {
     for (const WorkloadPort &output : node.outputs)
       valueProducer[output.value] = node.id;
     for (const WorkloadPort &input : node.inputs) {
-      std::vector<WorkloadNodeId> &consumers = valueConsumers[input.value];
+      std::vector<WorkloadNodeId> &consumers =
+          valueConsumers[storageValueOf(input.value)];
       if (!llvm::is_contained(consumers, node.id))
         consumers.push_back(node.id);
     }
@@ -717,7 +740,7 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     indegree[node.id] = 0;
   for (const WorkloadNode &node : graph.getNodes()) {
     for (const WorkloadPort &input : node.inputs) {
-      auto it = valueProducer.find(input.value);
+      auto it = valueProducer.find(storageValueOf(input.value));
       if (it == valueProducer.end() || it->second == node.id)
         continue;
       successors[it->second].insert(node.id);
@@ -953,6 +976,9 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   std::vector<std::string> physicalDecisions;
   std::vector<std::vector<uint64_t>> connectionStorage(
       plan.connectionPlans.size());
+  // The node each produced allocation's value was written by, so the reuse
+  // pass can tell an in-place update from a staged copy.
+  llvm::DenseMap<uint64_t, WorkloadNodeId> allocationWriter;
 
   // A value whose physical memory cannot be resolved is a strict rejection and
   // an analysis note: the analysis contract keeps the plan and states why it is
@@ -1019,7 +1045,7 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
 
   auto lastReaderStep =
       [&](WorkloadValueId value) -> std::optional<PlanStepId> {
-    auto it = valueConsumers.find(value);
+    auto it = valueConsumers.find(storageValueOf(value));
     if (it == valueConsumers.end())
       return std::nullopt;
     std::optional<PlanStepId> best;
@@ -1035,7 +1061,7 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
 
   auto allocate = [&](WorkloadValueId value, const std::string &memory,
                       uint64_t bytes, PlanStepId begin, PlanStepId end,
-                      bool borrowed = false) {
+                      bool borrowed = false, uint64_t occurrences = 1) {
     StorageAllocation allocation;
     allocation.id = nextAllocationId++;
     allocation.value = value;
@@ -1044,8 +1070,30 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     allocation.beginStep = begin;
     allocation.endStep = end;
     allocation.borrowed = borrowed;
+    allocation.simultaneousOccurrences = occurrences;
     allocations.push_back(allocation);
     return allocation.id;
+  };
+
+  // How many occurrences of `node`'s work are simultaneously resident: the
+  // recovered spatial/pipeline factor, or -- when the node was built without
+  // structural facts -- the conservative whole execution multiplicity, which
+  // can only over-count.
+  auto occurrencesOf = [](const WorkloadNode *node) -> uint64_t {
+    if (node->simultaneousMultiplicity)
+      return *node->simultaneousMultiplicity;
+    return node->executionMultiplicity.value_or(1);
+  };
+
+  // The residential factor of the value `value`'s producer, for the staged
+  // copies a connection materializes: a copy inside a spatial loop is resident
+  // once per occurrence exactly as its producer is.
+  auto occurrencesForValue = [&](WorkloadValueId value) -> uint64_t {
+    auto producer = valueProducer.find(storageValueOf(value));
+    if (producer == valueProducer.end())
+      return 1;
+    const WorkloadNode *node = graph.findNode(producer->second);
+    return node ? occurrencesOf(node) : 1;
   };
 
   for (WorkloadNodeId nodeId : topo) {
@@ -1068,9 +1116,8 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     // guessing -- strict mode is the gate, and the note below names the node so
     // the under-report is never silent.
     const std::optional<uint64_t> multiplicity = node->executionMultiplicity;
-    uint64_t scale = 1;
     if (multiplicity) {
-      scale = *multiplicity;
+      (void)multiplicity;
     } else if (strict) {
       return storageError(
           "storage plan: node " + std::to_string(nodeId) + " ('" +
@@ -1108,14 +1155,18 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
       llvm::Expected<uint64_t> base = footprintBytes(value, ref, *placement);
       if (!base)
         return base.takeError();
-      uint64_t bytes = 0;
-      if (checkedMul(*base, scale, bytes))
-        return storageError("storage plan: the footprint of value " +
-                            std::to_string(value) + " overflows");
+      // `bytes` is the footprint of *one* occurrence; how many of them are
+      // resident at once is what liveness multiplies it by (issue #129, task
+      // R5). Scaling the bytes by the whole execution multiplicity -- the
+      // behaviour before this task -- charged a serial loop's every iteration
+      // as if all of them were live together.
+      const uint64_t bytes = *base;
       const PlanStepId begin = computeStep.lookup(nodeId);
       std::optional<PlanStepId> last = lastReaderStep(value);
       const PlanStepId end = last ? std::max(begin, *last) : begin;
-      const uint64_t id = allocate(value, resolvedMemory, bytes, begin, end);
+      const uint64_t id = allocate(value, resolvedMemory, bytes, begin, end,
+                                   /*borrowed=*/false, occurrencesOf(node));
+      allocationWriter[id] = nodeId;
       auto connections = connectionsByValue.find(value);
       if (connections != connectionsByValue.end())
         for (size_t connectionIndex : connections->second)
@@ -1211,7 +1262,8 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
         }
 
         const uint64_t id =
-            allocate(connection.value, hops[hop].dstMemory, *bytes, begin, end);
+            allocate(connection.value, hops[hop].dstMemory, *bytes, begin, end,
+                     /*borrowed=*/false, occurrencesForValue(connection.value));
         hops[hop].destinationStorageId = id;
 
         if (hop == 0) {
@@ -1317,7 +1369,9 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     const PlanStepId begin = connectionStep.lookup(connection.id);
     std::optional<PlanStepId> last = lastReaderStep(connection.value);
     const PlanStepId end = last ? std::max(begin, *last) : begin;
-    const uint64_t id = allocate(connection.value, *memory, bytes, begin, end);
+    const uint64_t id =
+        allocate(connection.value, *memory, bytes, begin, end,
+                 /*borrowed=*/false, occurrencesForValue(connection.value));
     if (!llvm::is_contained(connectionStorage[index], id))
       connectionStorage[index].push_back(id);
   }
@@ -1335,6 +1389,14 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   // borrows, never one class-default.
   for (const WorkloadValue &value : graph.getValues()) {
     if (!value.external)
+      continue;
+    // A *carried* value -- a structural loop's iter arg or result -- is not a
+    // boundary descriptor: it is the same storage as the value the loop
+    // carries, which the producing occurrence's own allocation already
+    // reserves. Recording a borrow for it would charge the accumulator's
+    // buffer twice, once as scratch and once as the caller's descriptor (issue
+    // #129, task R5).
+    if (value.loopCarried)
       continue;
     // Reads grouped by the memory they resolved to, in machine-node id order so
     // the allocation list never depends on node-id or iteration order.
@@ -1411,12 +1473,175 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     }
   }
 
+  // --- conservative storage reuse (issue #129, task R5) ---------------------
+  //
+  // Two allocations in one memory share a buffer only when the dependency
+  // order *proves* they do not overlap:
+  //
+  //   * an *in-place update* -- the later value's writer reads the earlier
+  //     allocation and no other reader follows, so the writer's own read
+  //     completes before its own write begins. This is the epilogue an
+  //     accumulating kernel runs over its accumulator, and it is the reuse that
+  //     keeps the accumulator's own buffer from being charged twice.
+  //   * a *disjoint range* -- the earlier allocation's last reader finishes,
+  //     in step order, before the later allocation's writer starts.
+  //
+  // The decision is recorded as `aliasOf`, which is derived state (outside the
+  // plan's content id and outside `canonicalPlanString`), and the ordering it
+  // relies on is reported by `analyzeStorageLiveness` as a required reuse edge
+  // for the caller to materialize. Nothing speculative is aliased: a buffer
+  // whose range is not proven dead is never reused.
+  {
+    llvm::DenseMap<uint64_t, size_t> indexById;
+    for (size_t index = 0; index < allocations.size(); ++index)
+      indexById[allocations[index].id] = index;
+
+    // The allocation holding each produced value, and the allocations each
+    // node's operands read.
+    std::map<WorkloadValueId, uint64_t> producedAllocation;
+    for (const StorageAllocation &allocation : allocations)
+      if (!allocation.borrowed)
+        producedAllocation.emplace(allocation.value, allocation.id);
+    std::map<WorkloadNodeId, std::vector<uint64_t>> nodeReads;
+    for (const WorkloadNode &node : graph.getNodes())
+      for (const WorkloadPort &input : node.inputs) {
+        auto held = producedAllocation.find(storageValueOf(input.value));
+        if (held != producedAllocation.end() &&
+            !llvm::is_contained(nodeReads[node.id], held->second))
+          nodeReads[node.id].push_back(held->second);
+      }
+
+    // Resolve an allocation to the root it currently reuses.
+    auto rootIndex = [&](size_t index) {
+      size_t current = index;
+      while (allocations[current].aliasOf) {
+        auto target = indexById.find(*allocations[current].aliasOf);
+        if (target == indexById.end())
+          break;
+        current = target->second;
+      }
+      return current;
+    };
+
+    for (size_t later = 0; later < allocations.size(); ++later) {
+      StorageAllocation &b = allocations[later];
+      if (b.borrowed)
+        continue;
+
+      // The node that writes `b`, when a placement's own output produced it (a
+      // movement stage's copy is not a node's output and reuses nothing here).
+      std::optional<WorkloadNodeId> writer = allocationWriter.lookup(b.id);
+      std::vector<uint64_t> readable;
+      if (writer) {
+        auto reads = nodeReads.find(*writer);
+        if (reads != nodeReads.end())
+          readable = reads->second;
+      }
+
+      std::optional<size_t> best;
+      for (size_t earlier = 0; earlier < allocations.size(); ++earlier) {
+        const size_t candidate = rootIndex(earlier);
+        if (candidate == later)
+          continue;
+        const StorageAllocation &a = allocations[candidate];
+        if (a.borrowed || a.memory != b.memory || a.bytes < b.bytes)
+          continue;
+        // The reuse must also fit the residency: a reuse of a buffer that is
+        // resident fewer times than the value needs cannot hold it.
+        if (b.simultaneousOccurrences > a.simultaneousOccurrences)
+          continue;
+        if (allocations[candidate].aliasOf)
+          continue; // keep reuse flat, so the chain cannot cycle
+        // In place: the writer reads this buffer and nothing reads it after
+        // the writer's step, so its read is the last use and completes before
+        // its own write begins. Disjoint: the last reader is strictly earlier,
+        // so the buffer is already dead.
+        const bool inPlace =
+            llvm::is_contained(readable, a.id) && a.endStep <= b.beginStep;
+        const bool disjoint = a.endStep < b.beginStep;
+        if (!inPlace && !disjoint)
+          continue;
+        if (!best || allocations[*best].id > a.id)
+          best = candidate;
+      }
+      if (!best)
+        continue;
+      b.aliasOf = allocations[*best].id;
+    }
+  }
+
   // --- capacity validation and occupancy report -----------------------------
-  llvm::Expected<std::map<MemoryNodeId, uint64_t>> peak =
-      computePeakStorage(allocations);
-  if (!peak)
-    return peak.takeError();
-  for (const auto &entry : *peak) {
+  //
+  // The peak comes from the *scheduled* event stream -- the same shared
+  // schedule the plan is scored on -- not from a serial topological index, so
+  // sequential occurrences reuse storage while simultaneous ones do not (issue
+  // #129, task R5).
+  CoveringPlan probe = plan;
+  probe.steps = steps;
+  probe.stepEdges = stepEdges;
+  probe.allocations = allocations;
+  probe.connectionPlans = plan.connectionPlans;
+  for (size_t index = 0; index < probe.connectionPlans.size(); ++index)
+    probe.connectionPlans[index].hops.assign(connectionHops[index].begin(),
+                                             connectionHops[index].end());
+
+  llvm::Expected<PlanEventDAG> planEvents =
+      buildPlanEvents(probe, machine, &graph);
+  std::map<MemoryNodeId, uint64_t> peak;
+  if (planEvents) {
+    const EventScheduleResult schedule =
+        scheduleNormalizedEvents(planEvents->events, machine);
+    llvm::Expected<StorageLivenessResult> liveness =
+        analyzeStorageLiveness(probe, *planEvents, schedule);
+    if (!liveness) {
+      // A plan whose live ranges cannot be established has no capacity verdict
+      // at all. That is a physical fact that does not resolve, so it is
+      // recorded exactly as R3 records the others: a strict plan is rejected,
+      // and an analysis artifact keeps the plan with `physicalComplete = false`
+      // and its reason, so it is never bound as if it were verified. Occupancy
+      // is *not* summarized from a guess.
+      std::string reason =
+          "storage plan: the plan's live ranges could not be established: " +
+          llvm::toString(liveness.takeError());
+      if (std::optional<llvm::Error> rejected = recordIncomplete(reason))
+        return std::move(*rejected);
+    } else {
+      peak = std::move(liveness->peakBytes);
+      // The reuse the analysis relied on needs its ordering materialized: the
+      // edge that puts the reused buffer's last use before the new writer's
+      // step enters the emitted step DAG, so a replay runs the reuse in the
+      // order the model assumed. Derived timing, so it stays outside the plan's
+      // content id.
+      stepEdges.insert(stepEdges.end(), liveness->requiredReuseEdges.begin(),
+                       liveness->requiredReuseEdges.end());
+    }
+  } else {
+    // The machine does not model the plan's event stream -- it declares no
+    // compute resource for a compute step, for instance -- so no schedule can
+    // be derived. Occupancy falls back to the plan-step DAG with each
+    // allocation weighted by its simultaneous residency: the same residency
+    // factor, summarized over the step order instead of the event order. The
+    // fallback is reported, never silent, and it still enforces capacity.
+    llvm::consumeError(planEvents.takeError());
+    std::vector<StorageAllocation> weighted = allocations;
+    for (StorageAllocation &allocation : weighted) {
+      uint64_t scaled = 0;
+      if (checkedMul(allocation.bytes, allocation.simultaneousOccurrences,
+                     scaled))
+        return storageError("storage plan: the footprint of allocation " +
+                            std::to_string(allocation.id) + " overflows");
+      allocation.bytes = scaled;
+    }
+    llvm::Expected<std::map<MemoryNodeId, uint64_t>> stepPeak =
+        computePeakStorage(weighted);
+    if (!stepPeak)
+      return stepPeak.takeError();
+    peak = std::move(*stepPeak);
+    notes.push_back("storage plan: occupancy summarized from the plan-step DAG "
+                    "(the machine does not model every event resource)");
+  }
+
+  for (const auto &entry : peak) {
     const machine::MemoryNode *memory = machine.findMemory(entry.first);
     if (!memory)
       return storageError("storage plan: the plan binds unknown memory '" +
@@ -1444,6 +1669,12 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     plan.connectionPlans[index].hops.assign(connectionHops[index].begin(),
                                             connectionHops[index].end());
   }
+  llvm::sort(stepEdges, [](const PlanStepEdge &lhs, const PlanStepEdge &rhs) {
+    return lhs.from != rhs.from ? lhs.from < rhs.from : lhs.to < rhs.to;
+  });
+  stepEdges.erase(std::unique(stepEdges.begin(), stepEdges.end()),
+                  stepEdges.end());
+
   plan.steps = std::move(steps);
   plan.stepEdges = std::move(stepEdges);
   plan.allocations = std::move(allocations);

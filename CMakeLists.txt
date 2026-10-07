@@ -293,6 +293,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/Diagnostics.cpp
     lib/Mapping/TileFacts.cpp
     lib/Mapping/StoragePlan.cpp
+    lib/Mapping/StorageLiveness.cpp
     lib/Mapping/CostModel.cpp
     lib/Mapping/CostEvent.cpp
     lib/Mapping/EventSchedule.cpp
@@ -941,6 +942,11 @@ add_llk_mapping_test(MappingCoveringSearchTest test/Mapping/covering_search.cpp)
 target_link_libraries(MappingCoveringSearchTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingStoragePlanTest test/Mapping/storage_plan.cpp)
 target_link_libraries(MappingStoragePlanTest PRIVATE LLKResourceRegressionFixture)
+# MappingStorageLivenessTest (issue #129, task R5): peak residency from the
+# scheduled event stream, over the `sequential` / `pipeline-four` /
+# `parallel-overlap` / `padded-layout` fixtures.
+add_llk_mapping_test(MappingStorageLivenessTest test/Mapping/storage_liveness.cpp)
+target_link_libraries(MappingStorageLivenessTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingAvx2TargetTest test/Mapping/avx2_target.cpp)
 add_llk_mapping_test(MappingGenericAcceleratorTargetTest test/Mapping/generic_accelerator_target.cpp)
 # MappingPlanBinderTest binds through the canonical PlanMaterializer, whose

@@ -578,6 +578,12 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attribute("value", static_cast<uint64_t>(allocation.value));
             json.attribute("memory", allocation.memory);
             json.attribute("bytes", allocation.bytes);
+            // Written only when greater than one, so an allocation whose work
+            // runs once keeps the report it had before this field existed
+            // (issue #129, task R5).
+            if (allocation.simultaneousOccurrences != 1)
+              json.attribute("simultaneousOccurrences",
+                             allocation.simultaneousOccurrences);
             if (allocation.aliasOf)
               json.attribute("aliasOf", hexId(*allocation.aliasOf));
             json.attribute("beginStep", allocation.beginStep);
@@ -1073,6 +1079,10 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         allocation.bytes = static_cast<uint64_t>(*bytes);
       if (std::optional<llvm::StringRef> alias = object->getString("aliasOf"))
         allocation.aliasOf = parseHexId(*alias);
+      if (std::optional<int64_t> occurrences =
+              object->getInteger("simultaneousOccurrences"))
+        allocation.simultaneousOccurrences =
+            static_cast<uint64_t>(*occurrences);
       if (std::optional<int64_t> begin = object->getInteger("beginStep"))
         allocation.beginStep = static_cast<uint64_t>(*begin);
       if (std::optional<int64_t> end = object->getInteger("endStep"))

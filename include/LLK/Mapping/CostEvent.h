@@ -50,11 +50,35 @@ struct CostEvent {
   Cost cost;
 };
 
+/// Which way one event touches one storage allocation (issue #129, task R5).
+enum class StorageAccess { Read, Write };
+
+llvm::StringRef stringifyStorageAccess(StorageAccess access);
+
+/// One storage slot one event touches: the allocation, the logical *occurrence*
+/// of it the access belongs to, and whether the event reads or writes it. An
+/// occurrence distinguishes loop iteration, owner and pipeline stage
+/// deterministically, which is what lets liveness tell sequential reuse (one
+/// buffer reused across occurrences) from simultaneous residency (several
+/// buffers live at once). Every field defaults, so an event that predates the
+/// storage relation is still a valid value.
+struct StorageUse {
+  uint64_t allocationId = 0;
+  uint64_t occurrence = 0;
+  StorageAccess access = StorageAccess::Read;
+};
+
 /// One normalized event with the structural facts a scheduler needs: the
 /// category/resource/cycle triple, how many work items and bytes it accounts
 /// for, and the events it depends on. The mapping search emits these from a
 /// selected plan; the performance DAG emits them from a scheduled kernel
 /// (task B8), so both sides are directly comparable.
+///
+/// The fields below the dependency list are the execution facts storage
+/// liveness reads (issue #129, task R5): who runs the work, which storage it
+/// touches, and which occurrence of the plan it belongs to. They are derived
+/// from the plan, so they stay out of every content id; a consumer that ignores
+/// them sees exactly the earlier event shape.
 struct PlanCostEvent {
   CostEvent event;
   /// MACs for a matrix event, elements otherwise -- the same convention
@@ -62,6 +86,29 @@ struct PlanCostEvent {
   uint64_t workItems = 0;
   uint64_t bytes = 0;
   std::vector<uint32_t> deps;
+  /// The executor the work runs on, when the plan records one.
+  std::string owner{};
+  /// The memory a movement reads from and writes to. Empty for an event that
+  /// moves nothing.
+  std::string srcMemory{};
+  std::string dstMemory{};
+  /// The workload node the event accounts for, rendered as its id. Empty for an
+  /// event that belongs to no node.
+  std::string sourceNode{};
+  /// A deterministic id of the logical execution occurrence this event's work
+  /// belongs to: loop iteration, owner and pipeline stage folded together.
+  /// `0` for an event that names no occurrence.
+  uint64_t occurrence = 0;
+  /// The plan step that produced this event, when it came from one.
+  std::optional<uint64_t> planStep{};
+  /// The connection a movement or wait event materializes, and which hop of it
+  /// the event is (`hopIndex` is `0` for a single-hop movement and for every
+  /// event that is not a hop).
+  std::optional<uint64_t> connectionId{};
+  uint64_t hopIndex = 0;
+  /// The storage slots this event touches, one entry per simultaneously-live
+  /// occurrence the event accounts for.
+  std::vector<StorageUse> storageUses{};
 };
 
 /// The normalized event stream of one selected plan, in dependency order.
@@ -78,6 +125,7 @@ PlanCostEvent makePlanCostEvent(CostEventKind kind, std::string resource,
                                 std::vector<uint32_t> deps = {});
 
 struct CoveringPlan;
+class WorkloadGraph;
 
 /// Builds the normalized event stream of a selected plan (task B8).
 ///
@@ -89,8 +137,19 @@ struct CoveringPlan;
 /// unknown strict fact (a movement with no route, a transform with no maps, a
 /// gather with no declared semantics, a missing step DAG) is an error rather
 /// than a silently charged single iteration.
+///
+/// When `graph` is given, each event also records the execution facts storage
+/// liveness reads (issue #129, task R5): the owner it runs under, the workload
+/// node it accounts for, the storage allocation each operand/result occurrence
+/// touches, and the connection and hop a movement belongs to. A carried value's
+/// access is attributed to the value the loop carries it from, so the
+/// accumulator's live interval reaches the epilogue that reads the loop's
+/// result. Without a graph those fields stay empty (the search's scoring path
+/// needs only the schedule); every derived field is outside any content id, so
+/// the two shapes score identically.
 llvm::Expected<PlanEventDAG>
-buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine);
+buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
+                const WorkloadGraph *graph = nullptr);
 
 /// Schedules a normalized plan-event stream with the *same* resource scheduler
 /// the performance evaluator uses (task B8): events share a resource pool by

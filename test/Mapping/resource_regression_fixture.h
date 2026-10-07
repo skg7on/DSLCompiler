@@ -49,9 +49,9 @@ struct ResourceCase {
 /// Builds the named case, or an error naming the ones that exist. The allowed
 /// names are owned by task: R1 `two-compute`; R3 `missing-memory`,
 /// `named-ports`; R4 `two-hop`; R5 `sequential`, `pipeline-four`,
-/// `parallel-overlap`; R7 `capacity-topk`; R8 `joint-oracle`. A case's own
-/// variants (R4's reduced-L2 intermediate, for instance) are built by the test
-/// from the case's literal machine rather than by adding a name.
+/// `parallel-overlap`, `padded-layout`; R7 `capacity-topk`; R8 `joint-oracle`.
+/// A case's own variants (R4's reduced-L2 intermediate, for instance) are built
+/// by the test from the case's literal machine rather than by adding a name.
 llvm::Expected<ResourceCase> resourceCase(llvm::StringRef name);
 
 /// Runs the *ordinary* mapping search over the case's extracted source graph

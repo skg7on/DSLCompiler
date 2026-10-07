@@ -236,6 +236,12 @@ SourceProjection buildSourceProjection(const WorkloadGraph &graph,
     if (const WorkloadValue *existing = graph.findValue(resolved))
       copy = *existing;
     copy.id = 0;
+    // The carried-value source is an id in the *source* graph's space, so it is
+    // meaningless here; the projection re-derives its own ids. Nothing in the
+    // projected identity reads it (it is not part of the canonical string), so
+    // it is dropped rather than carried across the renumbering (issue #129,
+    // task R5).
+    copy.carriedFrom.reset();
     WorkloadValueId id = projection.graph.addValue(std::move(copy));
     valueIds[resolved] = id;
     return id;
@@ -783,6 +789,12 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
     if (allocation.borrowed)
       fields.emplace_back(mlir::StringAttr::get(context, "borrowed"),
                           mlir::BoolAttr::get(context, true));
+    // Only written when greater than one, so every allocation recorded before
+    // this field existed keeps its bytes (issue #129, task R5).
+    if (allocation.simultaneousOccurrences != 1)
+      fields.emplace_back(
+          mlir::StringAttr::get(context, "simultaneous_occurrences"),
+          u64Attr(context, allocation.simultaneousOccurrences));
     fields.emplace_back(mlir::StringAttr::get(context, "begin_step"),
                         u64Attr(context, allocation.beginStep));
     fields.emplace_back(mlir::StringAttr::get(context, "end_step"),
@@ -1221,6 +1233,9 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         allocation.bytes = value.getValue().getZExtValue();
       if (auto value = dict.getAs<mlir::IntegerAttr>("alias_of"))
         allocation.aliasOf = value.getValue().getZExtValue();
+      if (auto value =
+              dict.getAs<mlir::IntegerAttr>("simultaneous_occurrences"))
+        allocation.simultaneousOccurrences = value.getValue().getZExtValue();
       if (auto value = dict.getAs<mlir::IntegerAttr>("begin_step"))
         allocation.beginStep = value.getValue().getZExtValue();
       if (auto value = dict.getAs<mlir::IntegerAttr>("end_step"))

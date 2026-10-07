@@ -130,6 +130,90 @@ std::optional<uint64_t> executionMultiplicityOf(Operation *op,
   return product;
 }
 
+/// True for the ops that enclose work without being work: a `micro.for` /
+/// `micro.spatial_for` / `micro.pipeline`. A node inside one of them executes
+/// more than once; the kind of loop decides whether those executions overlap
+/// (a spatial loop or a pipeline stage) or reuse the same storage (a temporal
+/// `micro.for`).
+bool isStructuralLoopName(llvm::StringRef name) {
+  return name == "micro.for" || name == "micro.spatial_for" ||
+         name == "micro.pipeline";
+}
+
+bool isStructuralLoopOp(Operation *op) {
+  return op && isStructuralLoopName(op->getName().getStringRef());
+}
+
+/// How many of a node's occurrences are *simultaneously* resident: the product
+/// of the enclosing `micro.spatial_for` trip counts and `micro.pipeline` stage
+/// counts. A `micro.for` is temporal -- each iteration reuses the storage the
+/// previous one used -- so it contributes no factor. `nullopt` when a bound is
+/// unknown, exactly as `executionMultiplicityOf` reports it (issue #129, task
+/// R5).
+std::optional<uint64_t> simultaneousMultiplicityOf(Operation *op,
+                                                   Operation *kernel) {
+  uint64_t product = 1;
+  for (Operation *parent = op->getParentOp(); parent && parent != kernel;
+       parent = parent->getParentOp()) {
+    llvm::StringRef name = parent->getName().getStringRef();
+    std::optional<uint64_t> factor;
+    if (name == "micro.spatial_for")
+      factor = loopTripCount(parent);
+    else if (name == "micro.pipeline")
+      factor = pipelineStages(parent);
+    else
+      continue; // a `micro.for` is serial reuse, not residency
+    if (!factor)
+      return std::nullopt;
+    uint64_t scaled = 0;
+    if (__builtin_mul_overflow(product, *factor, &scaled))
+      return std::nullopt;
+    product = scaled;
+  }
+  return product;
+}
+
+/// The value a structural loop's carried block argument or result is the same
+/// storage as, or `nullopt` when `value` does not name one:
+///
+///   * a carried *block argument* (any argument but the induction variable) is
+///     the loop's own `iter_args` operand at the matching position;
+///   * a loop *result* is the value the loop's terminator yields at the
+///     matching position.
+///
+/// A loop's carried value is one buffer it threads, so the yielded value and
+/// the matching argument are the same storage (issue #129, task R5). The
+/// induction variable -- an index -- carries nothing.
+std::optional<Value> carriedSourceOf(Value value) {
+  if (auto argument = dyn_cast<BlockArgument>(value)) {
+    Block *block = argument.getOwner();
+    Operation *loop = block->getParentOp();
+    if (!isStructuralLoopOp(loop))
+      return std::nullopt;
+    const unsigned index = argument.getArgNumber();
+    const unsigned argumentCount = block->getNumArguments();
+    // Argument 0 is the induction variable; the iter args follow it, in
+    // `iter_args` order, and are the loop's trailing operands.
+    if (index == 0 || index >= argumentCount)
+      return std::nullopt;
+    const unsigned iterCount = argumentCount - 1;
+    if (loop->getNumOperands() < iterCount)
+      return std::nullopt;
+    return loop->getOperand(loop->getNumOperands() - iterCount + (index - 1));
+  }
+  if (auto result = dyn_cast<OpResult>(value)) {
+    Operation *loop = result.getOwner();
+    if (!isStructuralLoopOp(loop) || loop->getNumRegions() == 0)
+      return std::nullopt;
+    Block &body = loop->getRegion(0).front();
+    Operation *terminator = body.getTerminator();
+    if (!terminator || result.getResultNumber() >= terminator->getNumOperands())
+      return std::nullopt;
+    return terminator->getOperand(result.getResultNumber());
+  }
+  return std::nullopt;
+}
+
 /// The affine relationship a chain of logical ops states between an operand's
 /// local index space and the value it ultimately resolves to, or nullopt when
 /// the chain states none (design §10.1/§10.2).
@@ -261,6 +345,14 @@ const WorkloadValue *WorkloadGraph::findValue(WorkloadValueId id) const {
   return &values[id];
 }
 
+void WorkloadGraph::markLoopCarried(
+    WorkloadValueId id, std::optional<WorkloadValueId> carriedFrom) {
+  if (id >= values.size())
+    return;
+  values[id].loopCarried = true;
+  values[id].carriedFrom = carriedFrom;
+}
+
 const WorkloadPort *lookupPort(const WorkloadGraph &graph, const PortRef &ref) {
   const WorkloadNode *node = graph.findNode(ref.node);
   if (!node)
@@ -325,10 +417,19 @@ void WorkloadGraph::finalize(
   llvm::SmallVector<WorkloadValueId> valueRemap(values.size());
   llvm::SmallVector<WorkloadValue> newValues;
   newValues.reserve(values.size());
-  for (unsigned newId = 0; newId < valueOrder.size(); ++newId) {
+  for (unsigned newId = 0; newId < valueOrder.size(); ++newId)
     valueRemap[valueOrder[newId]] = newId;
+  for (unsigned newId = 0; newId < valueOrder.size(); ++newId) {
     WorkloadValue value = values[valueOrder[newId]];
     value.id = newId;
+    // A carried value's source id is remapped with it, so the fact survives
+    // canonicalization. Both remaps are complete before any is applied, and a
+    // source that is not part of this graph (a re-projection that renumbered
+    // its values) is dropped rather than mis-indexed.
+    if (value.carriedFrom && *value.carriedFrom < valueRemap.size())
+      value.carriedFrom = valueRemap[*value.carriedFrom];
+    else
+      value.carriedFrom.reset();
     newValues.push_back(std::move(value));
   }
 
@@ -416,6 +517,9 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
   // source ordinal belongs to.
   llvm::DenseMap<WorkloadValueId, Value> pendingValues;
   llvm::DenseMap<unsigned, Operation *> ordinalOps;
+  // Structural-loop results and the value each carries, in the order the walk
+  // met them. Resolved after the walk, once every node result has an id.
+  llvm::SmallVector<std::pair<WorkloadValueId, Value>, 8> carriedResults;
   unsigned ordinal = 0;
 
   std::function<WorkloadValueId(Value)> resolve =
@@ -431,6 +535,21 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
         valueIds[value] = source;
         return source;
       }
+    }
+
+    // A structural loop's carried block argument is the storage the loop
+    // carries, not a boundary descriptor: it is marked so the storage planner
+    // neither reserves nor borrows it (issue #129, task R5).
+    if (std::optional<Value> source = carriedSourceOf(value)) {
+      WorkloadValueId carriedFrom = resolve(*source);
+      WorkloadValue record{0, value.getType(), nameFor(value),
+                           /*external=*/true};
+      record.loopCarried = true;
+      record.carriedFrom = carriedFrom;
+      WorkloadValueId id = graph.addValue(std::move(record));
+      valueIds[value] = id;
+      pendingValues[id] = value;
+      return id;
     }
 
     WorkloadValueId id = graph.addValue(
@@ -461,6 +580,9 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
       // ops, so a strict storage plan sees a real, statically-known loop bound
       // rather than an always-unknown node.
       node.executionMultiplicity = executionMultiplicityOf(op, kernel);
+      // The residential part of that count: a spatial loop or a pipeline stage
+      // multiplies live versions, a temporal loop reuses one buffer.
+      node.simultaneousMultiplicity = simultaneousMultiplicityOf(op, kernel);
       ordinalOps[ordinal] = op;
       ++ordinal;
       for (Value operand : op->getOperands()) {
@@ -496,8 +618,25 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
           0, result.getType(), nameFor(result), /*external=*/true});
       valueIds[result] = id;
       pendingValues[id] = result;
+      // A structural loop's result is the value the loop carries out of its
+      // body: it is that value's storage, not a boundary descriptor. Its
+      // source is resolved once the walk has registered every node result --
+      // the loop is visited before the ops that produce its carried value
+      // (issue #129, task R5).
+      if (isStructuralLoopOp(op)) {
+        if (std::optional<Value> source = carriedSourceOf(result))
+          carriedResults.push_back({id, *source});
+      }
     }
   });
+
+  // Carried-value facts, resolved now that every node result has an id.
+  for (const auto &entry : carriedResults) {
+    auto source = valueIds.find(entry.second);
+    WorkloadValueId carriedFrom =
+        source != valueIds.end() ? source->second : resolve(entry.second);
+    graph.markLoopCarried(entry.first, carriedFrom);
+  }
 
   llvm::DenseMap<WorkloadValueId, WorkloadValueId> remap;
   graph.finalize(&remap);

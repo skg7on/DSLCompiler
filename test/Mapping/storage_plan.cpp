@@ -349,17 +349,23 @@ TEST(StoragePlan, PipelineMultiplicityMultipliesTheFootprint) {
   std::optional<CoveringPlan> plan = searchOne(graph, *target, context);
   ASSERT_TRUE(plan.has_value());
   ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
-  // Owned values are scaled by the execution multiplicity. The borrowed
-  // boundary descriptor is not: it is not re-produced by an owner, so it keeps
-  // its own 256-byte span.
+  // Owned values are charged the execution multiplicity, but *as residency*:
+  // `bytes` is one occurrence's 256-byte span and `simultaneousOccurrences` is
+  // how many of them are live at once, so the reservation the allocation
+  // contributes is their product (issue #129, task R5). This graph is built
+  // without structural facts, so every occurrence the multiplicity names counts
+  // as resident -- the conservative direction.
   size_t borrowed = 0;
   for (const StorageAllocation &allocation : plan->allocations) {
     if (allocation.borrowed) {
       ++borrowed;
       EXPECT_EQ(allocation.bytes, 256u);
+      EXPECT_EQ(allocation.simultaneousOccurrences, 1u);
       continue;
     }
-    EXPECT_EQ(allocation.bytes, 1024u);
+    EXPECT_EQ(allocation.bytes, 256u);
+    EXPECT_EQ(allocation.simultaneousOccurrences, 4u);
+    EXPECT_EQ(allocation.bytes * allocation.simultaneousOccurrences, 1024u);
   }
   EXPECT_EQ(borrowed, 1u);
 }
@@ -535,8 +541,13 @@ TEST(StoragePlan, ExtractedKnownLoopMultiplicityFinalizesInStrictMode) {
   // The vector's own result, plus the `micro.tile_alloc` it reads, which is a
   // borrowed boundary descriptor.
   ASSERT_EQ(plan->allocations.size(), 2u);
-  // 8x8xf32 = 256 bytes per iteration, four iterations.
-  EXPECT_EQ(plan->allocations[0].bytes, 1024u);
+  // 8x8xf32 = 256 bytes. The enclosing loop is temporal (`micro.for`), so its
+  // four iterations *reuse* the buffer rather than multiplying it: the
+  // allocation's span is one iteration's 256 bytes and its residency is one,
+  // not the four the whole-multiplicity scaling used to charge (issue #129,
+  // task R5).
+  EXPECT_EQ(plan->allocations[0].bytes, 256u);
+  EXPECT_EQ(plan->allocations[0].simultaneousOccurrences, 1u);
   EXPECT_FALSE(plan->allocations[0].borrowed);
   EXPECT_TRUE(plan->allocations[1].borrowed);
   EXPECT_EQ(plan->allocations[1].bytes, 256u);
