@@ -112,6 +112,20 @@ rule r.vec {
 }
 )llkmap";
 
+/// The same `micro.vector`, bound to `dram` instead of `sram`: with a kernel
+/// whose tiles state a kind the machine does not model, the rule's one bare
+/// requirement is the only fact, so it decides every occurrence.
+constexpr llvm::StringLiteral kDramRules = R"llkmap(
+rule r.vec.dram {
+  match micro.vector();
+  require executor kind worker;
+  require memory kind dram;
+  bundle "b.vec.dram";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+
 std::unique_ptr<MappingTarget> storageTarget(MachineModel machine) {
   llvm::Expected<RuleRegistry> registry =
       parseRuleText(kStorageRules, "<test>");
@@ -134,6 +148,15 @@ std::optional<CoveringPlan> searchOne(const WorkloadGraph &graph,
   if (!result || result->plans.empty())
     return std::nullopt;
   return result->plans.front();
+}
+
+/// The id of `graph`'s first external value -- the chain fixtures' `in`, the
+/// boundary descriptor a plan borrows rather than allocates.
+WorkloadValueId externalValueId(const WorkloadGraph &graph) {
+  for (const WorkloadValue &value : graph.getValues())
+    if (value.external)
+      return value.id;
+  return 0;
 }
 
 StorageAllocation alloc(uint64_t id, llvm::StringRef memory, uint64_t bytes,
@@ -265,19 +288,24 @@ TEST(StoragePlan, BuildsAllocationsAndOccupancyForASelectedPlan) {
   llvm::Error error = finalizeStoragePlan(graph, *plan, storageMachine());
   ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
 
-  // v0, v1 and out each occupy one 256-byte buffer in sram.0.
-  ASSERT_EQ(plan->allocations.size(), 3u);
+  // v0, v1 and out each occupy one 256-byte buffer in sram.0, and the chain's
+  // external input `in` is recorded as one *borrowed* boundary descriptor of
+  // the same span in the same memory (issue #129, task R3).
+  ASSERT_EQ(plan->allocations.size(), 4u);
   for (const StorageAllocation &allocation : plan->allocations) {
     EXPECT_EQ(allocation.memory, "sram.0");
     EXPECT_EQ(allocation.bytes, 256u);
   }
-  // The chain's live ranges overlap only across a consumer step, so the peak is
-  // two buffers, not three.
+  ASSERT_EQ(plan->allocations.back().value, externalValueId(graph));
+  EXPECT_TRUE(plan->allocations.back().borrowed);
+  // The chain's live ranges overlap only across a consumer step. The borrowed
+  // descriptor is live through its reader, so the peak stays two buffers of
+  // 256 bytes: `in` and v0 at n0.
   auto peak = computePeakStorage(plan->allocations);
   ASSERT_TRUE(bool(peak)) << llvm::toString(peak.takeError());
   EXPECT_EQ((*peak)["sram.0"], 512u);
   // Ordered producers: v0 begins at n0, v1 at n1, out at n2, so their begin
-  // steps strictly increase.
+  // steps strictly increase. The borrowed descriptor is recorded after them.
   EXPECT_LT(plan->allocations[0].beginStep, plan->allocations[1].beginStep);
   EXPECT_LT(plan->allocations[1].beginStep, plan->allocations[2].beginStep);
   // The occupancy is recorded in the report, as an informational note that does
@@ -298,10 +326,15 @@ TEST(StoragePlan, ReleasesAProducerAllocationAfterItsLastReader) {
   ASSERT_TRUE(plan.has_value());
   ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
 
-  // The last value in the chain has no consumer, so it is released at its own
-  // producer step.
-  const StorageAllocation &last = plan->allocations.back();
-  EXPECT_EQ(last.beginStep, last.endStep);
+  // The last allocated value in the chain has no consumer, so it is released at
+  // its own producer step. (The borrowed boundary descriptor is recorded after
+  // the owned allocations, so it is not `back()`.)
+  const StorageAllocation *last = nullptr;
+  for (const StorageAllocation &allocation : plan->allocations)
+    if (!allocation.borrowed)
+      last = &allocation;
+  ASSERT_NE(last, nullptr);
+  EXPECT_EQ(last->beginStep, last->endStep);
 }
 
 TEST(StoragePlan, PipelineMultiplicityMultipliesTheFootprint) {
@@ -312,8 +345,19 @@ TEST(StoragePlan, PipelineMultiplicityMultipliesTheFootprint) {
   std::optional<CoveringPlan> plan = searchOne(graph, *target, context);
   ASSERT_TRUE(plan.has_value());
   ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
-  for (const StorageAllocation &allocation : plan->allocations)
+  // Owned values are scaled by the execution multiplicity. The borrowed
+  // boundary descriptor is not: it is not re-produced by an owner, so it keeps
+  // its own 256-byte span.
+  size_t borrowed = 0;
+  for (const StorageAllocation &allocation : plan->allocations) {
+    if (allocation.borrowed) {
+      ++borrowed;
+      EXPECT_EQ(allocation.bytes, 256u);
+      continue;
+    }
     EXPECT_EQ(allocation.bytes, 1024u);
+  }
+  EXPECT_EQ(borrowed, 1u);
 }
 
 TEST(StoragePlan, RejectsAPlanWhoseLiveRangeExceedsCapacity) {
@@ -484,9 +528,14 @@ TEST(StoragePlan, ExtractedKnownLoopMultiplicityFinalizesInStrictMode) {
 
   llvm::Error error = finalizeStoragePlan(*graph, *plan, storageMachine());
   ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
-  ASSERT_EQ(plan->allocations.size(), 1u);
+  // The vector's own result, plus the `micro.tile_alloc` it reads, which is a
+  // borrowed boundary descriptor.
+  ASSERT_EQ(plan->allocations.size(), 2u);
   // 8x8xf32 = 256 bytes per iteration, four iterations.
   EXPECT_EQ(plan->allocations[0].bytes, 1024u);
+  EXPECT_FALSE(plan->allocations[0].borrowed);
+  EXPECT_TRUE(plan->allocations[1].borrowed);
+  EXPECT_EQ(plan->allocations[1].bytes, 256u);
 }
 
 TEST(StoragePlan, AnUnresolvedLoopBoundStaysUnknownAndRefusesStrictPlanning) {
@@ -851,6 +900,42 @@ MachineModel machineWithSramNodes(unsigned count) {
   return model;
 }
 
+/// One `micro.vector` whose single output is an 8x8 f32 tile stating
+/// `outputMemory`, reading one input tile stating `inputMemory` (or none, when
+/// empty). Both inputs are the same external value, so the node has one
+/// boundary descriptor.
+EndpointFixture mixedEndpointFixture(mlir::MLIRContext &context,
+                                     llvm::StringRef inputMemory,
+                                     llvm::StringRef outputMemory) {
+  auto tileFor = [&](llvm::StringRef memory) {
+    if (memory.empty())
+      return tileType(context, "8x8xf32");
+    std::string inner = "8x8xf32, memory = #micro.memory<";
+    inner += memory.str();
+    inner += ">";
+    return tileType(context, inner);
+  };
+  mlir::Type in = tileFor(inputMemory);
+  mlir::Type out = tileFor(outputMemory);
+
+  EndpointFixture fixture;
+  WorkloadValueId input =
+      fixture.graph.addValue(WorkloadValue{0, in, "in", /*external=*/true});
+  WorkloadValueId result =
+      fixture.graph.addValue(WorkloadValue{0, out, "out", /*external=*/false});
+  WorkloadNode node;
+  node.opName = "micro.vector";
+  node.sourceOrdinal = 0;
+  node.executionMultiplicity = 1;
+  node.inputs.push_back(WorkloadPort{input, in, std::nullopt});
+  node.outputs.push_back(WorkloadPort{result, out, std::nullopt});
+  fixture.graph.addNode(std::move(node));
+  fixture.graph.finalize();
+  fixture.ref =
+      PortRef{fixture.graph.getNodes().front().id, PortDirection::Output, 0};
+  return fixture;
+}
+
 } // namespace
 
 // Exactly one compatible node binds; two nodes of the stated kind are an
@@ -862,12 +947,13 @@ TEST(StoragePlan,
   EndpointFixture one = endpointFixture(context, "sram");
   PlanPlacement unbound; // the rule binds no memory at all
 
-  llvm::Expected<MemoryNodeId> unique = resolveEndpointMemory(
+  llvm::Expected<EndpointMemory> unique = resolveEndpointMemory(
       one.graph, unbound, one.ref, machineWithSramNodes(1));
   ASSERT_TRUE(bool(unique)) << llvm::toString(unique.takeError());
-  EXPECT_EQ(*unique, "sram.0");
+  EXPECT_EQ(unique->memory, "sram.0");
+  EXPECT_FALSE(unique->fallbackReason.has_value());
 
-  llvm::Expected<MemoryNodeId> ambiguous = resolveEndpointMemory(
+  llvm::Expected<EndpointMemory> ambiguous = resolveEndpointMemory(
       one.graph, unbound, one.ref, machineWithSramNodes(2));
   ASSERT_FALSE(bool(ambiguous));
   const std::string ambiguousText = llvm::toString(ambiguous.takeError());
@@ -876,7 +962,7 @@ TEST(StoragePlan,
   EXPECT_NE(ambiguousText.find("ambiguous"), std::string::npos)
       << ambiguousText;
 
-  llvm::Expected<MemoryNodeId> absent = resolveEndpointMemory(
+  llvm::Expected<EndpointMemory> absent = resolveEndpointMemory(
       one.graph, unbound, one.ref, machineWithSramNodes(0));
   ASSERT_FALSE(bool(absent));
   const std::string absentText = llvm::toString(absent.takeError());
@@ -894,15 +980,15 @@ TEST(StoragePlan, NamedPortBindingDecidesTheOccurrence) {
   PlanPlacement placement;
   placement.portMemoryBindings.push_back(
       PortMemoryBinding{fixture.ref, "dram.0"});
-  llvm::Expected<MemoryNodeId> memory =
+  llvm::Expected<EndpointMemory> memory =
       resolveEndpointMemory(fixture.graph, placement, fixture.ref, machine);
   ASSERT_TRUE(bool(memory)) << llvm::toString(memory.takeError());
-  EXPECT_EQ(*memory, "dram.0");
+  EXPECT_EQ(memory->memory, "dram.0");
 
   // The same occurrence with no named binding: the kind has no node, and the
   // rule binds nothing, so the fact is missing rather than guessed.
   PlanPlacement unbound;
-  llvm::Expected<MemoryNodeId> missing =
+  llvm::Expected<EndpointMemory> missing =
       resolveEndpointMemory(fixture.graph, unbound, fixture.ref, machine);
   EXPECT_FALSE(bool(missing));
 }
@@ -918,10 +1004,10 @@ TEST(StoragePlan, BareRequirementDecidesOnlyWhenItIsTheSoleOne) {
 
   PlanPlacement sole;
   sole.memories["sram"] = "sram.0";
-  llvm::Expected<MemoryNodeId> bound =
+  llvm::Expected<EndpointMemory> bound =
       resolveEndpointMemory(fixture.graph, sole, fixture.ref, machine);
   ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
-  EXPECT_EQ(*bound, "sram.0");
+  EXPECT_EQ(bound->memory, "sram.0");
 
   // An occurrence that states no kind at all, so the placement's own bindings
   // are the only facts: two of them cannot both govern it.
@@ -931,9 +1017,137 @@ TEST(StoragePlan, BareRequirementDecidesOnlyWhenItIsTheSoleOne) {
   PlanPlacement several;
   several.memories["sram"] = "sram.0";
   several.memories["dram"] = "dram.0";
-  llvm::Expected<MemoryNodeId> refused =
+  llvm::Expected<EndpointMemory> refused =
       resolveEndpointMemory(plain, several, ref, machine);
   ASSERT_FALSE(bool(refused));
   const std::string text = llvm::toString(refused.takeError());
   EXPECT_NE(text.find("bare requirements"), std::string::npos) << text;
+}
+
+// The bare requirement standing in for a stated kind the executor cannot reach
+// is an *explicit* outcome: the same memory as before, plus a recorded reason,
+// so the override is never silent. The reason is what `finalizeStoragePlan`
+// copies into `physicalDecisions`.
+TEST(StoragePlan, BareRequirementFallbackRecordsWhyItDecided) {
+  mlir::MLIRContext context;
+  EndpointFixture fixture = endpointFixture(context, "rf");
+  MachineModel machine = storageMachine();
+
+  PlanPlacement placement;
+  placement.memories["dram"] = "dram.0";
+  llvm::Expected<EndpointMemory> resolved =
+      resolveEndpointMemory(fixture.graph, placement, fixture.ref, machine);
+  ASSERT_TRUE(bool(resolved)) << llvm::toString(resolved.takeError());
+  EXPECT_EQ(resolved->memory, "dram.0");
+  ASSERT_TRUE(resolved->fallbackReason.has_value());
+  EXPECT_NE(resolved->fallbackReason->find("'rf'"), std::string::npos)
+      << *resolved->fallbackReason;
+  EXPECT_NE(resolved->fallbackReason->find("dram.0"), std::string::npos)
+      << *resolved->fallbackReason;
+
+  // A stated kind the executor *can* reach needs no fallback, so nothing is
+  // recorded.
+  EndpointFixture reachable = endpointFixture(context, "sram");
+  PlanPlacement decided;
+  decided.memories["dram"] = "dram.0";
+  llvm::Expected<EndpointMemory> direct =
+      resolveEndpointMemory(reachable.graph, decided, reachable.ref, machine);
+  ASSERT_TRUE(bool(direct)) << llvm::toString(direct.takeError());
+  EXPECT_EQ(direct->memory, "sram.0");
+  EXPECT_FALSE(direct->fallbackReason.has_value());
+}
+
+// The fallback is refused when two occurrences of one node selected different
+// nodes: one bare requirement cannot be both. The input states `sram` (one
+// node) and the output states `rf` (none), so the bare `dram` would silently
+// override the input's decision.
+TEST(StoragePlan, BareRequirementCannotOverrideATwoNodeSelection) {
+  mlir::MLIRContext context;
+  EndpointFixture fixture = mixedEndpointFixture(context, "sram", "rf");
+  MachineModel machine = storageMachine();
+
+  PlanPlacement placement;
+  placement.memories["dram"] = "dram.0";
+  llvm::Expected<EndpointMemory> resolved =
+      resolveEndpointMemory(fixture.graph, placement, fixture.ref, machine);
+  ASSERT_FALSE(bool(resolved));
+  const std::string text = llvm::toString(resolved.takeError());
+  EXPECT_NE(text.find("bare requirement"), std::string::npos) << text;
+  EXPECT_NE(text.find("sram.0"), std::string::npos) << text;
+
+  // The control: with the input's kind unreachable too, both occurrences fall
+  // back to the same node, which one class-default can legitimately be.
+  EndpointFixture both = mixedEndpointFixture(context, "rf", "rf");
+  llvm::Expected<EndpointMemory> same =
+      resolveEndpointMemory(both.graph, placement, both.ref, machine);
+  ASSERT_TRUE(bool(same)) << llvm::toString(same.takeError());
+  EXPECT_EQ(same->memory, "dram.0");
+}
+
+// A borrowed boundary descriptor -- a value no node produces -- is never
+// reusable compiler scratch: it may not alias, and nothing may alias it. The
+// invariant is checked, so a future reuse pass cannot recycle a caller's
+// buffer.
+TEST(StoragePlan, BorrowedStorageIsNeverReusedAsScratch) {
+  std::vector<StorageAllocation> aliasing = {alloc(1, "sram.0", 256, 0, 5),
+                                             alloc(2, "sram.0", 256, 0, 5)};
+  aliasing[0].borrowed = true;
+  aliasing[1].aliasOf = 1;
+  llvm::Expected<std::map<MemoryNodeId, uint64_t>> borrowedRoot =
+      computePeakStorage(aliasing);
+  ASSERT_FALSE(bool(borrowedRoot));
+  const std::string aliasText = llvm::toString(borrowedRoot.takeError());
+  EXPECT_NE(aliasText.find("borrowed"), std::string::npos) << aliasText;
+  EXPECT_NE(aliasText.find("scratch"), std::string::npos) << aliasText;
+
+  // The mirror image: a borrowed allocation that itself aliases.
+  std::vector<StorageAllocation> borrowedAlias = {
+      alloc(1, "sram.0", 256, 0, 5), alloc(2, "sram.0", 256, 0, 5)};
+  borrowedAlias[1].borrowed = true;
+  borrowedAlias[1].aliasOf = 1;
+  llvm::Expected<std::map<MemoryNodeId, uint64_t>> rejected =
+      computePeakStorage(borrowedAlias);
+  ASSERT_FALSE(bool(rejected));
+  const std::string borrowedText = llvm::toString(rejected.takeError());
+  EXPECT_NE(borrowedText.find("borrowed"), std::string::npos) << borrowedText;
+}
+
+// End to end: a rule whose only memory fact is a class default over a kernel
+// whose tiles state an unreachable kind resolves -- and *records* that it did,
+// in `physicalDecisions`, rather than overriding silently. The plan is still
+// physically complete: the values do have a node.
+TEST(StoragePlan, AClassDefaultResolutionIsRecordedAsADecision) {
+  mlir::MLIRContext context;
+  // `rf` is a Micro memory space the storage machine models no node for, so
+  // every occurrence's stated kind is unreachable and the rule's bare `dram`
+  // decides.
+  WorkloadGraph graph = chainGraph(
+      context, tileType(context, "8x8xf32, memory = #micro.memory<rf>"), 1);
+  MachineModel machine = storageMachine();
+  llvm::Expected<RuleRegistry> rules = parseRuleText(kDramRules, "<test>");
+  ASSERT_TRUE(bool(rules)) << llvm::toString(rules.takeError());
+  FileMappingTarget target("test", machine, LayoutRegistry{}, std::move(*rules),
+                           std::vector<std::string>{"e1"});
+  std::optional<CoveringPlan> plan = searchOne(graph, target, context);
+  ASSERT_TRUE(plan.has_value());
+  ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, machine)));
+
+  EXPECT_TRUE(plan->diagnostics.physicalComplete);
+  EXPECT_TRUE(plan->diagnostics.physicalReasons.empty());
+  ASSERT_FALSE(plan->diagnostics.physicalDecisions.empty());
+  bool namedKind = false;
+  bool namedNode = false;
+  for (const std::string &decision : plan->diagnostics.physicalDecisions) {
+    EXPECT_NE(decision.find("bare requirement"), std::string::npos) << decision;
+    namedKind |= decision.find("'rf'") != std::string::npos;
+    namedNode |= decision.find("dram.0") != std::string::npos;
+  }
+  EXPECT_TRUE(namedKind);
+  EXPECT_TRUE(namedNode);
+  // Recorded once: the decision is not also copied into the occupancy notes, so
+  // one report never carries the same sentence twice.
+  for (const std::string &note : plan->diagnostics.storageNotes)
+    EXPECT_EQ(note.find("bare requirement"), std::string::npos) << note;
+  for (const StorageAllocation &allocation : plan->allocations)
+    EXPECT_EQ(allocation.memory, "dram.0");
 }

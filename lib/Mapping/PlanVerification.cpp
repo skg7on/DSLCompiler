@@ -717,7 +717,7 @@ verifyPlanPhysicalCompleteness(const WorkloadGraph &graph,
     const PlanPlacement &placement = *found->second;
     for (unsigned index = 0; index < node.outputs.size(); ++index) {
       const PortRef ref{node.id, PortDirection::Output, index};
-      llvm::Expected<MemoryNodeId> memory =
+      llvm::Expected<EndpointMemory> memory =
           resolveEndpointMemory(graph, placement, ref, machine);
       if (!memory) {
         reasons.push_back("value " + std::to_string(node.outputs[index].value) +

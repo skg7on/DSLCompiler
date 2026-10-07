@@ -777,6 +777,11 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
     if (allocation.aliasOf)
       fields.emplace_back(mlir::StringAttr::get(context, "alias_of"),
                           u64Attr(context, *allocation.aliasOf));
+    // Only written when set, so every allocation recorded before this field
+    // existed keeps its bytes (issue #129, task R3).
+    if (allocation.borrowed)
+      fields.emplace_back(mlir::StringAttr::get(context, "borrowed"),
+                          mlir::BoolAttr::get(context, true));
     fields.emplace_back(mlir::StringAttr::get(context, "begin_step"),
                         u64Attr(context, allocation.beginStep));
     fields.emplace_back(mlir::StringAttr::get(context, "end_step"),
@@ -1183,6 +1188,8 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         allocation.beginStep = value.getValue().getZExtValue();
       if (auto value = dict.getAs<mlir::IntegerAttr>("end_step"))
         allocation.endStep = value.getValue().getZExtValue();
+      if (auto value = dict.getAs<mlir::BoolAttr>("borrowed"))
+        allocation.borrowed = value.getValue();
       plan.allocations.push_back(std::move(allocation));
     }
   }

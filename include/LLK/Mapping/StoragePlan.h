@@ -105,6 +105,17 @@ computePeakStorage(llvm::ArrayRef<StorageAllocation> allocations);
 /// no memory and yields `std::nullopt`.
 std::optional<std::string> explicitMemoryKind(mlir::Type type);
 
+/// One endpoint occurrence's resolved memory, plus the decision it took.
+struct EndpointMemory {
+  MemoryNodeId memory;
+  /// Set when the binding was forced by a fact other than the occurrence's own
+  /// stated kind: a rule's single bare requirement standing in for a stated
+  /// kind the selected executor cannot reach. The caller records it, so the
+  /// override is never silent. Unset for a binding the occurrence's own kind
+  /// (or its rule's own named requirement) decided.
+  std::optional<std::string> fallbackReason{};
+};
+
 /// Resolves the memory node the value at occurrence `ref` occupies for
 /// `placement` (issue #129, task R3). Resolution is *by endpoint occurrence*,
 /// in this order:
@@ -117,19 +128,24 @@ std::optional<std::string> explicitMemoryKind(mlir::Type type);
 ///      see and whose alignment admits the value;
 ///   3. otherwise -- no stated kind, or a stated kind no reachable node offers
 ///      -- the placement's single bare requirement binding, which is the rule's
-///      own compatibility fact for the operation it placed.
+///      own compatibility fact for the operation it placed. When it stands in
+///      for a *stated* kind it returns a `fallbackReason`.
 ///
 /// Exactly one compatible node binds; several are an *ambiguous-memory* error
 /// that names the node ids and asks for a named port; none, with no bare
 /// requirement to fall back on, is an *inaccessible-memory* error naming the
-/// kind and the executor. A bare instance-wide requirement is a compatibility
-/// input, never authority for two occurrences that selected different nodes, so
-/// a placement with several bare bindings is refused rather than resolved to
-/// the first. This function never returns "the first memory of a class".
+/// kind and the executor. This function never returns "the first memory of a
+/// class".
+///
+/// A bare instance-wide requirement is a compatibility input, never authority
+/// for two occurrences that selected different nodes: a placement with several
+/// bare bindings is refused rather than resolved to the first, and the fallback
+/// above is refused when another occurrence of the same node resolves, from its
+/// own stated kind, to a *different* node.
 ///
 /// A placement that records no executor skips the visibility test (the fact is
 /// simply not known), exactly as the other nullable facts in the core do.
-llvm::Expected<MemoryNodeId>
+llvm::Expected<EndpointMemory>
 resolveEndpointMemory(const WorkloadGraph &graph,
                       const PlanPlacement &placement, const PortRef &ref,
                       const machine::MachineModel &machine);

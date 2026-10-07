@@ -4388,3 +4388,61 @@ TEST(PlanBinder, Issue129PhysicalMemoryReportRecordsIncompleteStatus) {
   EXPECT_NE(report.find("\"physicalReasons\": ["), std::string::npos) << report;
   EXPECT_NE(report.find("ambiguous"), std::string::npos) << report;
 }
+
+// A boundary descriptor -- a value no node in the graph produces, here the
+// `micro.tile_alloc` the add reads -- is recorded as a *borrowed* allocation:
+// the node its named requirement resolved it to, and its own 8x8xf32 span. It
+// is never counted as reusable scratch, and it is never bound to a
+// class-default memory.
+TEST(PlanBinder, Issue129PhysicalMemoryBorrowedBoundaryDescriptorsAreRecorded) {
+  auto c = issue129::resourceCase("named-ports");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  // Analysis mode, so the fixture's small machine is not asked to hold the
+  // plan's whole live set: this pins the boundary facts, not capacity.
+  CoveringPlan plan = result->plans.front();
+  plan.materialized = false;
+  ASSERT_FALSE(bool(finalizeStoragePlan(c->graph, plan, c->target->machine())));
+  EXPECT_TRUE(plan.diagnostics.physicalComplete);
+
+  // The add reads the one descriptor through two operand occurrences, and the
+  // named requirements bind them to the nodes the search selected. One borrow
+  // is recorded per distinct node, never one class-default for both.
+  std::set<std::string> inputMemories;
+  for (const PortMemoryBinding &binding :
+       plan.placements.front().portMemoryBindings)
+    if (binding.port.direction == PortDirection::Input)
+      inputMemories.insert(binding.memory);
+
+  std::set<std::string> borrowedMemories;
+  for (const StorageAllocation &allocation : plan.allocations) {
+    if (!allocation.borrowed)
+      continue;
+    // 8x8xf32 = 256 bytes: the descriptor's own known span, not an assumed one.
+    EXPECT_EQ(allocation.bytes, 256u);
+    borrowedMemories.insert(allocation.memory);
+  }
+  EXPECT_FALSE(borrowedMemories.empty());
+  EXPECT_EQ(borrowedMemories, inputMemories);
+  for (const std::string &memory : borrowedMemories)
+    EXPECT_NE(memory.find("sram."), std::string::npos) << memory;
+
+  // The borrow is durable: a replayed report keeps the flag, so a reader can
+  // still tell scratch from a caller's buffer.
+  result->plans.front() = plan;
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, /*moduleHash=*/0);
+  llvm::Expected<CoveringPlan> replayed =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_TRUE(bool(replayed)) << llvm::toString(replayed.takeError());
+  size_t replayedBorrowed = 0;
+  for (const StorageAllocation &allocation : replayed->allocations)
+    if (allocation.borrowed)
+      ++replayedBorrowed;
+  EXPECT_EQ(replayedBorrowed, borrowedMemories.size());
+}

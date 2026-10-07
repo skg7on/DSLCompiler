@@ -295,6 +295,15 @@ std::string writePlanReport(const MappingSearchResult &result,
               for (const std::string &reason : plan.diagnostics.physicalReasons)
                 json.value(reason);
             });
+            // The resolution decisions the occurrence's own stated kind did not
+            // force (a bare requirement standing in for an unreachable kind, a
+            // borrowed boundary bound by that class requirement). Recorded, so
+            // an override is visible in the report rather than silent.
+            json.attributeArray("physicalDecisions", [&] {
+              for (const std::string &decision :
+                   plan.diagnostics.physicalDecisions)
+                json.value(decision);
+            });
           });
         });
       }
@@ -552,6 +561,8 @@ std::string writePlanReport(const MappingSearchResult &result,
               json.attribute("aliasOf", hexId(*allocation.aliasOf));
             json.attribute("beginStep", allocation.beginStep);
             json.attribute("endStep", allocation.endStep);
+            if (allocation.borrowed)
+              json.attribute("borrowed", true);
           });
         }
       });
@@ -1006,6 +1017,10 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         allocation.beginStep = static_cast<uint64_t>(*begin);
       if (std::optional<int64_t> end = object->getInteger("endStep"))
         allocation.endStep = static_cast<uint64_t>(*end);
+      // Absent for every allocation written before the field existed, which
+      // decodes to the owned (non-borrowed) default (issue #129, task R3).
+      if (std::optional<bool> borrowed = object->getBoolean("borrowed"))
+        allocation.borrowed = *borrowed;
       plan.allocations.push_back(std::move(allocation));
     }
   }

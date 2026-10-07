@@ -273,6 +273,13 @@ struct StorageAllocation {
   std::optional<uint64_t> aliasOf;
   PlanStepId beginStep = 0;
   PlanStepId endStep = 0; // live through this step
+  /// True for a *borrowed* allocation: a boundary descriptor (a kernel
+  /// argument, a `micro.tile_alloc`, a captured constant) that the plan does
+  /// not allocate, but records to say which node the value lives in and how
+  /// many bytes the use spans. Borrowed storage is never reusable compiler
+  /// scratch, so `computePeakStorage` refuses to alias one (issue #129, task
+  /// R3).
+  bool borrowed = false;
 };
 
 /// One synchronization decision: a step that waits for a set of connections,
@@ -415,6 +422,13 @@ struct PlanDiagnostics {
   /// deterministic order the storage planner visits them. Empty when the plan
   /// is complete.
   std::vector<std::string> physicalReasons{};
+  /// The ordered decisions the physical resolution took that the occurrence's
+  /// own stated kind did not force -- today, a rule's single bare requirement
+  /// standing in for a stated kind the executor cannot reach, and a borrowed
+  /// boundary descriptor bound by that class requirement. A decision is still a
+  /// complete, legal binding, so it is deliberately *not* a `physicalReason`;
+  /// it is recorded so an override is never silent.
+  std::vector<std::string> physicalDecisions{};
 };
 
 /// One selected placement: which node an instance covers, and the target facts
