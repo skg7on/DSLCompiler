@@ -1448,6 +1448,15 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   plan.stepEdges = std::move(stepEdges);
   plan.allocations = std::move(allocations);
   plan.synchronization = std::move(synchronization);
+  // Storage planning completes the plan's durable identity. The hops just built
+  // are physical decisions -- which storage slot each hop reads and writes, on
+  // which engine -- and `canonicalPlanString` folds them, so the search's
+  // provisional id (computed before any hop existed) is replaced by the id of
+  // the plan that was actually decided. The step ids, allocation intervals and
+  // diagnostics the pass above built stay outside the identity, so finalizing
+  // an already-finalized plan rebuilds identical hops and yields an identical
+  // id (issue #129, task R4).
+  plan.id = computePlanId(plan);
   return llvm::Error::success();
 }
 

@@ -4665,6 +4665,46 @@ TEST(PlanBinder, Issue129MovementHopsRoundTripThroughMetadata) {
     EXPECT_EQ(decoded->steps[index].hop, plan.steps[index].hop);
 }
 
+// A hop's physical choices are identity-bearing. Re-pointing a hop at another
+// engine or another storage slot is a *different plan*, not the same plan with
+// a different annotation, so a tampered hop cannot pass as the plan it was
+// bound from. The derived timing around the hop is not identity.
+TEST(PlanBinder, Issue129HopPhysicalChoicesAreIdentityBearing) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  CoveringPlan &plan = built->second;
+  ASSERT_FALSE(plan.connectionPlans.empty());
+  ASSERT_FALSE(plan.connectionPlans.front().hops.empty());
+
+  // `finalizeStoragePlan` assigns the id from the decisions it built, so the
+  // plan it produced is the plan its id names.
+  const PlanId base = plan.id;
+  EXPECT_EQ(computePlanId(plan), base);
+
+  CoveringPlan otherEngine = plan;
+  otherEngine.connectionPlans.front().hops[0].engine = "dma.ghost";
+  EXPECT_NE(computePlanId(otherEngine), base)
+      << "a hop on a different engine is a different plan";
+
+  CoveringPlan otherStorage = plan;
+  otherStorage.connectionPlans.front().hops[0].destinationStorageId += 1000;
+  EXPECT_NE(computePlanId(otherStorage), base)
+      << "a hop into a different storage slot is a different plan";
+
+  CoveringPlan otherIntermediate = plan;
+  otherIntermediate.connectionPlans.front().hops[1].sourceStorageId += 1000;
+  EXPECT_NE(computePlanId(otherIntermediate), base)
+      << "the intermediate a hop reads is part of the decision";
+
+  // The steps that order the hops are derived timing: they are recorded for a
+  // reader but must not enter the identity.
+  CoveringPlan laterSteps = plan;
+  laterSteps.connectionPlans.front().hops[0].movementStep += 1000;
+  laterSteps.connectionPlans.front().hops[0].waitStep += 1000;
+  EXPECT_EQ(computePlanId(laterSteps), base);
+}
+
 // Mutating a hop's engine is rejected: the recorded hop must run on an engine
 // the machine declares, exactly as the route's engines do.
 TEST(PlanBinder, Issue129AMutatedHopEngineIsRejected) {

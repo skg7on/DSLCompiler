@@ -534,13 +534,20 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   // decisions and per-connection storage ids travel with whichever plan the
   // caller selects. It is the single call site: neither pass finalizes again.
   //
-  // Finalization never changes a plan id: `allocations`, `steps`, `stepEdges`,
-  // `synchronization` and a connection's `storageIds` are all excluded from
-  // `canonicalPlanString`, and the plan's score was already computed from the
-  // search's synthesized step DAG. A plan whose physical footprint or
-  // live-range occupancy exceeds a memory's capacity is a *legitimate
-  // rejection*: it is dropped with a stable diagnostic rather than bound with
-  // an unmet reservation.
+  // Finalization *assigns* the plan id, and does so deterministically: the
+  // movement hops it builds (each hop's memories, engine and storage slots) are
+  // identity-bearing physical decisions that `canonicalPlanString` folds, so
+  // the search's provisional id -- computed before any hop existed -- is
+  // replaced by the id of the plan actually decided. The derived timing around
+  // them
+  // (`steps`, `stepEdges`, the allocation intervals), `synchronization`,
+  // `storageIds` and every diagnostic stay outside the identity, so
+  // re-finalizing rebuilds identical hops and yields an identical id. The
+  // plan's score was already computed from the search's synthesized step DAG
+  // and is not recomputed here. A plan whose physical footprint or live-range
+  // occupancy exceeds a memory's capacity is a *legitimate rejection*: it is
+  // dropped with a stable diagnostic rather than bound with an unmet
+  // reservation.
   //
   // There is no "skip" any more (issue #129, task R3): the escape that let a
   // target binding no memory at all bypass the whole reservation check is gone.

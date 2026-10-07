@@ -576,17 +576,25 @@ TEST(StoragePlan, FinalizingTwiceIsIdempotentAndLeavesTheIdStable) {
   std::optional<CoveringPlan> plan = searchOne(graph, *target, context);
   ASSERT_TRUE(plan.has_value());
 
-  const PlanId before = computePlanId(*plan);
   ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
   const size_t notes = plan->diagnostics.storageNotes.size();
   EXPECT_FALSE(plan->steps.empty());
-  // Informational notes are excluded from the plan id, so finalizing does not
-  // change it.
-  EXPECT_EQ(computePlanId(*plan), before);
+  // Storage planning *assigns* the id: the physical decisions it makes are
+  // identity-bearing, so the id a caller reads off a finalized plan is the
+  // identity of the plan that was decided, not a provisional value computed
+  // before the hops existed (issue #129, task R4).
+  const PlanId finalized = plan->id;
+  EXPECT_EQ(computePlanId(*plan), finalized);
+  for (const PlanConnection &connection : plan->connectionPlans)
+    for (const PlanMovementHop &hop : connection.hops)
+      EXPECT_NE(hop.destinationStorageId, 0u);
 
+  // Re-finalizing rebuilds identical hops, so the id and the report are
+  // unchanged. Informational notes are excluded from the identity either way.
   ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
   EXPECT_EQ(plan->diagnostics.storageNotes.size(), notes);
-  EXPECT_EQ(computePlanId(*plan), before);
+  EXPECT_EQ(plan->id, finalized);
+  EXPECT_EQ(computePlanId(*plan), finalized);
 }
 
 TEST(StoragePlan, ReportRoundTripsThePlanStepDag) {
@@ -1297,22 +1305,22 @@ TEST(StoragePlan, TheIntermediateIsReservedOnceNotOncePerHop) {
 }
 
 // Re-finalizing is idempotent: the hop records, the steps that order them and
-// the allocations are rebuilt identically, and the plan id is unchanged. The
-// hop fields are deliberately outside `canonicalPlanString`, so storage
-// planning still never changes a plan id (issue #129, task R4).
+// the allocations are rebuilt identically, and the plan id -- which storage
+// planning assigns from the physical decisions it made -- is unchanged (issue
+// #129, task R4).
 TEST(StoragePlan, ReFinalizingTwoHopIsIdempotent) {
   llvm::Expected<TwoHopCase> built = twoHopCase();
   ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
   issue129::ResourceCase &c = built->c;
   CoveringPlan &plan = built->plan;
 
-  const PlanId before = computePlanId(plan);
   ASSERT_FALSE(bool(finalizeStoragePlan(c.graph, plan, c.target->machine())));
+  const PlanId finalized = plan.id;
+  EXPECT_EQ(computePlanId(plan), finalized);
   const std::vector<StorageAllocation> allocations = plan.allocations;
   const std::vector<PlanStep> steps = plan.steps;
   const llvm::SmallVector<PlanMovementHop, 2> hops =
       plan.connectionPlans.front().hops;
-  EXPECT_EQ(computePlanId(plan), before);
 
   ASSERT_FALSE(bool(finalizeStoragePlan(c.graph, plan, c.target->machine())));
   EXPECT_EQ(plan.allocations.size(), allocations.size());
@@ -1336,7 +1344,8 @@ TEST(StoragePlan, ReFinalizingTwoHopIsIdempotent) {
     EXPECT_EQ(plan.connectionPlans.front().hops[hop].destinationStorageId,
               hops[hop].destinationStorageId);
   }
-  EXPECT_EQ(computePlanId(plan), before);
+  EXPECT_EQ(plan.id, finalized);
+  EXPECT_EQ(computePlanId(plan), finalized);
 }
 
 // Two movements staged through one intermediate keep two distinct buffers:

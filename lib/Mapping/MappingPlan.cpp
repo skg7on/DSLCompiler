@@ -509,6 +509,38 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
         producerPorts.push_back(canonicalPortRefString(port));
       text += ":producerPorts=" + joinStrings(producerPorts, ",");
     }
+    // The physical movement hops join the identity (issue #129, task R4). The
+    // engine a hop runs on and the storage slot it reads and writes are
+    // *decisions*, so two plans that differ only in which buffer a hop uses are
+    // distinct plans rather than colliding on one id. Gated on presence, so a
+    // plan built without storage planning keeps the id it had. Order-bearing:
+    // the hop sequence is the route, so the hops are rendered in route order,
+    // never sorted. The steps that order the hops are derived timing and stay
+    // out, as do the allocation intervals and every diagnostic.
+    if (!connection.hops.empty()) {
+      std::vector<std::string> hopTexts;
+      hopTexts.reserve(connection.hops.size());
+      for (const PlanMovementHop &hop : connection.hops) {
+        // Length-delimited strings, so a memory or engine id containing the
+        // punctuation below cannot be confused with a different hop.
+        auto field = [](llvm::StringRef value) {
+          return std::to_string(value.size()) + ":" + value.str();
+        };
+        std::string hopText = std::to_string(hop.index);
+        hopText += ':';
+        hopText += field(hop.srcMemory);
+        hopText += '>';
+        hopText += field(hop.dstMemory);
+        hopText += ':';
+        hopText += field(hop.engine);
+        hopText += ':';
+        hopText += std::to_string(hop.sourceStorageId);
+        hopText += '>';
+        hopText += std::to_string(hop.destinationStorageId);
+        hopTexts.push_back(std::move(hopText));
+      }
+      text += ":hops=" + joinStrings(hopTexts, ",");
+    }
     connectionPlans.push_back(std::move(text));
   }
   llvm::sort(connectionPlans);
@@ -521,9 +553,12 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
   // diagnostic/truncation fields are deliberately absent: they are search
   // outcomes and provenance, not decisions, and folding them in made a plan
   // unable to acquire an id before it was scored. A plan's id therefore depends
-  // only on what it decided -- binding, selections, placements, routes and
-  // parameters -- so a preview has a complete identity before its final score
-  // exists.
+  // only on what it decided -- binding, selections, placements, routes,
+  // parameters and, once storage planning has run, the physical movement hops
+  // (their memories, engines and storage slots) that R4 added. The derived
+  // timing around those hops -- the plan-step DAG, the allocation intervals --
+  // stays out, so `finalizeStoragePlan` assigns the id exactly once, from the
+  // decisions it built, and re-finalizing reproduces it.
   std::string out = "v3|binding=";
   out += hexId(plan.sourceBindingHash);
   out += "|instances=";

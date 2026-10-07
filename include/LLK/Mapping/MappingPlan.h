@@ -339,13 +339,17 @@ struct PlanStepEdge {
 /// once per route. `hops` is the materialization authority; the connection's
 /// `storageIds` stays a compatibility projection of the same decision.
 ///
+/// The memories, engine and storage slots are identity-bearing:
+/// `canonicalPlanString` folds them, so a hop that is re-pointed at another
+/// buffer or another engine is a different plan rather than the same id.
+///
 /// `movementStep` and `waitStep` are the plan-step DAG nodes that order this
-/// hop -- the copy and the wait that ends it. They are derived from the
-/// step-graph the storage planner builds, so they are persisted for a reader
-/// but deliberately absent from `canonicalPlanString` (a plan id must not
-/// depend on storage planning; see `PlanStep`). Numeric members default to zero
-/// and strings to empty, so a hop that has not been allocated yet is still a
-/// valid value.
+/// hop -- the copy and the wait that ends it. They are derived timing: the
+/// step-graph the storage planner builds orders them, so they are persisted for
+/// a reader but deliberately absent from `canonicalPlanString` (the derived
+/// ordering is not a decision; the physical choices above are). Numeric members
+/// default to zero and strings to empty, so a hop that has not been allocated
+/// yet is still a valid value.
 struct PlanMovementHop {
   uint64_t index = 0;
   MemoryNodeId srcMemory;
@@ -442,9 +446,10 @@ struct PlanDiagnostics {
   /// Informational notes a post-search stage emits -- storage finalization's
   /// occupancy and analysis-fallback reports. Deliberately separate from
   /// `warnings`: `canonicalPlanString` does not fold this field, so a staged
-  /// note never changes a plan id and finalization is idempotent. A caller that
-  /// recomputes `plan.id` after `finalizeStoragePlan` gets the same id it had
-  /// before.
+  /// note never changes a plan id. `finalizeStoragePlan` *does* assign the plan
+  /// id (the movement hops it builds are identity-bearing physical decisions),
+  /// but this note is not part of that content, so finalizing an
+  /// already-finalized plan leaves both the hops and the id identical.
   std::vector<std::string> storageNotes;
   /// True only when every materialized value's physical memory, footprint and
   /// live interval were resolved and validated (issue #129, task R3). The
@@ -591,9 +596,15 @@ struct PlanConnection {
   /// the engine it runs on, and the copy/wait steps that order it.
   ///
   /// Only the *chosen* physical facts belong here, and they are what
-  /// `finalizeStoragePlan` reserves storage for. Like the allocations it
-  /// references, this field is excluded from `canonicalPlanString`: storage
-  /// planning must never change a plan id (see `PlanStep`).
+  /// `finalizeStoragePlan` reserves storage for. They are identity-bearing:
+  /// `canonicalPlanString` folds each hop's memories, engine and the storage
+  /// slots it reads and writes, so two plans that differ only in which buffer a
+  /// hop uses are distinct plans rather than the same id. That is why
+  /// `finalizeStoragePlan` assigns `CoveringPlan::id` once the hops exist --
+  /// the finalized plan's id names its physical decisions, and re-finalizing
+  /// rebuilds identical hops and therefore an identical id. The steps that
+  /// order a hop are derived timing and stay out of the identity; see
+  /// `PlanStep`.
   llvm::SmallVector<PlanMovementHop, 2> hops;
   /// The connection's synthesized cost (task B8): the transfer estimate the
   /// route carried, or the shared transform estimate for a conversion. A
@@ -697,9 +708,13 @@ struct CoveringPlan {
   std::vector<SynchronizationStep> synchronization;
   /// The deterministic plan-step DAG `finalizeStoragePlan` built (design §9.6):
   /// every step's kind and what it names, and the dependency edges between
-  /// them. B3 builds these; B4-B6 consume them to order materialization. Like
-  /// the allocations they annotate, they are deliberately excluded from
-  /// `canonicalPlanString`, so storage planning never changes a plan id.
+  /// them. B3 builds these; B4-B6 consume them to order materialization. They
+  /// -- and the allocation intervals they order -- are *derived timing*, so
+  /// they are deliberately excluded from `canonicalPlanString`. The physical
+  /// decisions `finalizeStoragePlan` makes are not: a connection's `hops` (the
+  /// storage slot each hop reads and writes, and its engine) do join the plan
+  /// id, which is why `finalizeStoragePlan` re-assigns `CoveringPlan::id` after
+  /// building them (issue #129, task R4).
   std::vector<PlanStep> steps;
   std::vector<PlanStepEdge> stepEdges;
 };
