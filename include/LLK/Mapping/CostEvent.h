@@ -53,6 +53,14 @@ struct CostEvent {
 /// Which way one event touches one storage allocation (issue #129, task R5).
 enum class StorageAccess { Read, Write };
 
+/// The largest number of simultaneous occurrences one event enumerates. The
+/// event stream spells out one `StorageUse` per resident occurrence so storage
+/// liveness can count them, and a residency beyond this bound would make the
+/// stream's size a function of a loop bound. Exceeding it is an explicit
+/// *incomplete* fact -- an error naming the allocation -- never a silently
+/// truncated expansion.
+inline constexpr uint64_t kMaxEnumeratedOccurrences = 1u << 12;
+
 llvm::StringRef stringifyStorageAccess(StorageAccess access);
 
 /// One storage slot one event touches: the allocation, the logical *occurrence*

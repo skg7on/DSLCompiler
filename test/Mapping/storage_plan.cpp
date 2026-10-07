@@ -390,6 +390,46 @@ TEST(StoragePlan, RejectsAPlanWhoseLiveRangeExceedsCapacity) {
   const std::string message = llvm::toString(std::move(error));
   EXPECT_NE(message.find("capacity"), std::string::npos);
   EXPECT_NE(message.find("sram.0"), std::string::npos);
+  // The diagnostic says *why* the peak is what it is: the simultaneous
+  // occurrence count (issue #129, task R5).
+  EXPECT_NE(message.find("simultaneous occurrence"), std::string::npos)
+      << message;
+}
+
+// Every alias a finalized plan chose is stated in the plan: its ordering edge
+// is merged into the step DAG the event stream is built from, so the schedule
+// -- and therefore the peak -- comes from the ordered graph rather than from an
+// ordering applied after the fact (issue #129, task R5).
+TEST(StoragePlan, AChosenReuseOrdersThePlanBeforeOccupancyIsTaken) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = chainGraph(context, tileType(context, "8x8xf32"), 1);
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+  std::optional<CoveringPlan> plan = searchOne(graph, *target, context);
+  ASSERT_TRUE(plan.has_value());
+  ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
+
+  const StorageAllocation *aliased = nullptr;
+  for (const StorageAllocation &allocation : plan->allocations)
+    if (allocation.aliasOf)
+      aliased = &allocation;
+  ASSERT_NE(aliased, nullptr) << "the chain reuse must produce an alias";
+  const StorageAllocation *root = nullptr;
+  for (const StorageAllocation &allocation : plan->allocations)
+    if (allocation.id == *aliased->aliasOf)
+      root = &allocation;
+  ASSERT_NE(root, nullptr);
+
+  const PlanStepEdge reuse{root->endStep, aliased->beginStep};
+  EXPECT_TRUE(llvm::is_contained(plan->stepEdges, reuse))
+      << "the reuse ordering must be in the emitted step DAG";
+  // And the two allocations are one buffer: the summarized occupancy counts the
+  // root once, however many of its aliases are live.
+  for (const StorageAllocation &allocation : plan->allocations)
+    EXPECT_EQ(allocation.memory, "sram.0");
+  auto peak = computePeakStorage(plan->allocations);
+  ASSERT_TRUE(bool(peak)) << llvm::toString(peak.takeError());
+  EXPECT_EQ((*peak)["sram.0"], 512u);
 }
 
 TEST(StoragePlan, RejectsUnknownExecutionMultiplicityInStrictPlanning) {

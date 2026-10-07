@@ -67,7 +67,7 @@ struct WorkloadValue {
   /// argument (its init operand is the loop's own `iter_args` operand, which no
   /// occurrence reads) and for every non-carried value. Derived, so likewise
   /// outside the identity.
-  std::optional<WorkloadValueId> carriedFrom;
+  std::optional<WorkloadValueId> carriedFrom = std::nullopt;
 };
 
 /// A value as seen from one node. `accessMap` is the affine relationship
@@ -146,7 +146,7 @@ struct WorkloadNode {
   /// Derived, so it stays out of every graph identity exactly as
   /// `executionMultiplicity`'s *rendering* is confined to
   /// `canonicalProjectedGraphString`.
-  std::optional<uint64_t> simultaneousMultiplicity;
+  std::optional<uint64_t> simultaneousMultiplicity = std::nullopt;
 };
 
 /// A target-independent view of one concrete `micro.kernel`'s work.

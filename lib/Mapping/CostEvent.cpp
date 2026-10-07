@@ -393,13 +393,14 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
   // `occurrenceBase` keeps the ids of two events distinct.
   auto storageUsesFor =
       [&](const PlanPlacement &placed, WorkloadNodeId node,
-          uint64_t occurrenceBase) -> std::vector<StorageUse> {
+          uint64_t occurrenceBase) -> llvm::Expected<std::vector<StorageUse>> {
     std::vector<StorageUse> uses;
     if (!graph)
       return uses;
     const WorkloadNode *workloadNode = graph->findNode(node);
     if (!workloadNode)
       return uses;
+    llvm::Error expansionError = llvm::Error::success();
     auto emit = [&](const WorkloadPort &port, PortDirection direction,
                     unsigned index, StorageAccess access) {
       const WorkloadValueId value = storageValueOf(port.value);
@@ -422,6 +423,20 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
       }
       if (!chosen)
         return;
+      // One use per simultaneously resident occurrence, so liveness can count
+      // them: an occurrence is what the event stream spells out. A residency
+      // beyond the enumeration bound is an explicit incomplete fact rather
+      // than a truncated stream (issue #129, task R5).
+      if (chosen->simultaneousOccurrences > kMaxEnumeratedOccurrences) {
+        if (expansionError)
+          return;
+        expansionError = planEventError(
+            "plan events: allocation " + llvm::Twine(chosen->id) +
+            " is resident " + llvm::Twine(chosen->simultaneousOccurrences) +
+            " times, more than the " + llvm::Twine(kMaxEnumeratedOccurrences) +
+            " occurrences the event stream enumerates");
+        return;
+      }
       for (uint64_t step = 0; step < chosen->simultaneousOccurrences; ++step)
         uses.push_back(StorageUse{chosen->id, occurrenceBase + step, access});
     };
@@ -433,6 +448,8 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
     for (unsigned index = 0; index < workloadNode->outputs.size(); ++index)
       emit(workloadNode->outputs[index], PortDirection::Output, index,
            StorageAccess::Write);
+    if (expansionError)
+      return std::move(expansionError);
     return uses;
   };
 
@@ -486,8 +503,11 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
       // One occurrence namespace per node, so two steps' uses never collide.
       compute.occurrence =
           (static_cast<uint64_t>(step->node) << 32) | uint64_t{1};
-      compute.storageUses =
+      llvm::Expected<std::vector<StorageUse>> uses =
           storageUsesFor(placed, step->node, compute.occurrence);
+      if (!uses)
+        return uses.takeError();
+      compute.storageUses = std::move(*uses);
       produced.push_back(add(std::move(compute)));
       break;
     }
@@ -558,19 +578,42 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
           transferEvent.planStep = step->id;
           // The storage the hop reads and writes, when the plan recorded the
           // hop: a reader of the source slot and a writer of the destination
-          // one, each charged at the hop's own occurrence.
+          // one. Each side is spelled out once per simultaneously resident
+          // occurrence of the slot it names, exactly as a compute event's uses
+          // are, so liveness counts one residency from the stream instead of
+          // trusting a field (issue #129, task R5).
           const uint64_t occurrenceBase =
               (static_cast<uint64_t>(connection.id) << 32) | uint64_t{1};
           if (hop - 1 < connection.hops.size()) {
             const PlanMovementHop &recorded = connection.hops[hop - 1];
-            if (recorded.sourceStorageId != 0)
-              transferEvent.storageUses.push_back(
-                  StorageUse{recorded.sourceStorageId, occurrenceBase,
-                             StorageAccess::Read});
-            if (recorded.destinationStorageId != 0)
-              transferEvent.storageUses.push_back(
-                  StorageUse{recorded.destinationStorageId, occurrenceBase + 1,
-                             StorageAccess::Write});
+            auto hopUses = [&](uint64_t storageId,
+                               StorageAccess access) -> llvm::Error {
+              if (storageId == 0)
+                return llvm::Error::success();
+              uint64_t occurrences = 1;
+              for (const StorageAllocation &allocation : plan.allocations)
+                if (allocation.id == storageId) {
+                  occurrences = allocation.simultaneousOccurrences;
+                  break;
+                }
+              if (occurrences > kMaxEnumeratedOccurrences)
+                return planEventError(
+                    "plan events: allocation " + llvm::Twine(storageId) +
+                    " is resident " + llvm::Twine(occurrences) +
+                    " times, more than the " +
+                    llvm::Twine(kMaxEnumeratedOccurrences) +
+                    " occurrences the event stream enumerates");
+              for (uint64_t index = 0; index < occurrences; ++index)
+                transferEvent.storageUses.push_back(
+                    StorageUse{storageId, occurrenceBase + index, access});
+              return llvm::Error::success();
+            };
+            if (llvm::Error error =
+                    hopUses(recorded.sourceStorageId, StorageAccess::Read))
+              return std::move(error);
+            if (llvm::Error error = hopUses(recorded.destinationStorageId,
+                                            StorageAccess::Write))
+              return std::move(error);
           }
           uint32_t transfer = add(std::move(transferEvent));
           hops.push_back(transfer);
@@ -716,8 +759,14 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
   }
 
   // Inter-step dependencies: every event of a dependent step follows the last
-  // event of each step it depends on.
+  // event of each step it depends on. A step cannot follow itself: a self-step
+  // edge -- the reuse edge an in-place update contributes -- states which
+  // single buffer two allocations share, and the step's own events are already
+  // ordered by their emission sequence, so imposing it would only make an event
+  // depend on itself (issue #129, task R5).
   for (const PlanStepEdge &edge : sourceEdges) {
+    if (edge.from == edge.to)
+      continue;
     auto from = stepEvents.find(edge.from);
     auto to = stepEvents.find(edge.to);
     if (from == stepEvents.end() || to == stepEvents.end() ||

@@ -13,8 +13,9 @@
 //                         peak is 512 and a 256-byte memory cannot hold it.
 //
 // `padded-layout` adds the footprint rule: what a value occupies is its
-// physical image, so an 8x8xf32 result under a row-major layout four elements
-// wider than logical is 384 bytes, not 256.
+// physical image, so an 8x8xf32 result under a row-major layout whose physical
+// row is twice the logical one occupies an 8x15 image -- 480 bytes, not the
+// logical 256.
 //
 //===----------------------------------------------------------------------===//
 
@@ -28,6 +29,7 @@
 #include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingTarget.h"
+#include "LLK/Mapping/StorageLiveness.h"
 #include "LLK/Mapping/StoragePlan.h"
 
 #include "llvm/Support/Error.h"
@@ -237,4 +239,46 @@ TEST(StorageLiveness, AChosenReuseReportsItsOrderingEdge) {
   ASSERT_EQ(live->requiredReuseEdges.size(), 1u);
   EXPECT_EQ(live->requiredReuseEdges[0].from, 5u);
   EXPECT_EQ(live->requiredReuseEdges[0].to, 9u);
+}
+
+// An *in-place* update -- an epilogue that consumes a buffer and writes its
+// result into it -- aliases at a single step, so its ordering edge is a
+// self-step edge. It is still reported: the peak relies on the two allocations
+// being one buffer, and a reader of the plan must be able to see that.
+TEST(StorageLiveness, AnInPlaceReuseReportsItsSelfStepEdge) {
+  CoveringPlan plan;
+  StorageAllocation accumulator;
+  accumulator.id = 1;
+  accumulator.memory = "acc.0";
+  accumulator.bytes = 1024;
+  accumulator.beginStep = 3;
+  accumulator.endStep = 5;
+  StorageAllocation epilogue;
+  epilogue.id = 2;
+  epilogue.memory = "acc.0";
+  epilogue.bytes = 512;
+  epilogue.beginStep = 5;
+  epilogue.endStep = 6;
+  epilogue.aliasOf = 1; // the epilogue writes into the accumulator it reads
+  plan.allocations = {accumulator, epilogue};
+
+  PlanEventDAG dag;
+  EventScheduleResult schedule;
+  addEvent(dag, schedule, 0, 10, 3, {StorageUse{1, 1, StorageAccess::Write}});
+  addEvent(dag, schedule, 20, 30, 5,
+           {StorageUse{1, 1, StorageAccess::Read},
+            StorageUse{2, 1, StorageAccess::Write}});
+  addEvent(dag, schedule, 40, 50, 6, {StorageUse{2, 1, StorageAccess::Read}});
+
+  llvm::Expected<StorageLivenessResult> live =
+      analyzeStorageLiveness(plan, dag, schedule);
+  ASSERT_TRUE(bool(live)) << llvm::toString(live.takeError());
+  // One buffer of 1024 bytes, not an accumulator plus an epilogue buffer.
+  EXPECT_EQ(live->peakBytes.at("acc.0"), 1024u);
+  ASSERT_EQ(live->requiredReuseEdges.size(), 1u);
+  EXPECT_EQ(live->requiredReuseEdges[0].from, 5u);
+  EXPECT_EQ(live->requiredReuseEdges[0].to, 5u);
+  // The same relation is what the caller merges into the plan's step DAG, so
+  // the ordering the peak assumes is the one the plan carries.
+  EXPECT_EQ(requiredReuseEdgesFor(plan.allocations), live->requiredReuseEdges);
 }

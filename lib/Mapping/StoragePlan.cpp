@@ -1570,6 +1570,25 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     }
   }
 
+  // --- the chosen reuse's ordering, in place before occupancy is taken ------
+  //
+  // Every alias the pass accepted contributes the edge from the reused buffer's
+  // last read to the new writer's step. The edges go into the step DAG *here*,
+  // so the event stream the peak is taken from is built from the ordered graph
+  // rather than from one ordering that is patched afterwards (issue #129, task
+  // R5). An in-place update reads and writes at one step, so its edge is a
+  // self-step edge: it states which single buffer the two allocations share,
+  // and imposes no ordering a single writer step did not already have.
+  {
+    std::vector<PlanStepEdge> reuseEdges = requiredReuseEdgesFor(allocations);
+    stepEdges.insert(stepEdges.end(), reuseEdges.begin(), reuseEdges.end());
+    llvm::sort(stepEdges, [](const PlanStepEdge &lhs, const PlanStepEdge &rhs) {
+      return lhs.from != rhs.from ? lhs.from < rhs.from : lhs.to < rhs.to;
+    });
+    stepEdges.erase(std::unique(stepEdges.begin(), stepEdges.end()),
+                    stepEdges.end());
+  }
+
   // --- capacity validation and occupancy report -----------------------------
   //
   // The peak comes from the *scheduled* event stream -- the same shared
@@ -1607,13 +1626,6 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
         return std::move(*rejected);
     } else {
       peak = std::move(liveness->peakBytes);
-      // The reuse the analysis relied on needs its ordering materialized: the
-      // edge that puts the reused buffer's last use before the new writer's
-      // step enters the emitted step DAG, so a replay runs the reuse in the
-      // order the model assumed. Derived timing, so it stays outside the plan's
-      // content id.
-      stepEdges.insert(stepEdges.end(), liveness->requiredReuseEdges.begin(),
-                       liveness->requiredReuseEdges.end());
     }
   } else {
     // The machine does not model the plan's event stream -- it declares no
@@ -1646,10 +1658,21 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     if (!memory)
       return storageError("storage plan: the plan binds unknown memory '" +
                           entry.first + "'");
+    // The most a single slot in this memory is resident, so the diagnostic says
+    // *why* the peak is what it is: a memory that is over capacity because one
+    // buffer is live four times over reads differently from one holding four
+    // distinct buffers (issue #129, task R5).
+    uint64_t mostResident = 0;
+    for (const StorageAllocation &allocation : allocations)
+      if (allocation.memory == entry.first)
+        mostResident =
+            std::max(mostResident, allocation.simultaneousOccurrences);
     if (entry.second > memory->capacityBytes)
       return storageError(
           "storage plan: memory '" + entry.first + "' over capacity (peak " +
-          std::to_string(entry.second) + " bytes live, " +
+          std::to_string(entry.second) + " bytes live over up to " +
+          std::to_string(mostResident) +
+          " simultaneous occurrence(s) per slot, " +
           std::to_string(memory->capacityBytes) + " byte capacity)");
     notes.push_back("storage plan: memory '" + entry.first + "' peak " +
                     std::to_string(entry.second) + " bytes of " +

@@ -57,6 +57,23 @@ struct StorageLivenessResult {
   std::vector<PlanStepEdge> requiredReuseEdges;
 };
 
+/// The dependency edges a plan's chosen storage reuse relies on: one per
+/// aliased allocation, from the step that last reads the reused buffer to the
+/// step that first writes the alias.
+///
+/// The in-place case aliases at the *same* step -- an operation that consumes a
+/// buffer and writes its result into it -- so its edge is a self-step edge. It
+/// is reported all the same, so `requiredReuseEdges` and the plan's `stepEdges`
+/// name every alias the peak relies on and a reader can see that the two
+/// allocations share one buffer. `finalizeStoragePlan` merges these into the
+/// step DAG *before* it schedules and takes the peak, so occupancy is measured
+/// on the ordered graph rather than on an ordering applied afterwards.
+///
+/// Exposed separately from `analyzeStorageLiveness` because the caller needs
+/// the ordering to build the event stream the analysis then runs on.
+std::vector<PlanStepEdge>
+requiredReuseEdgesFor(llvm::ArrayRef<StorageAllocation> allocations);
+
 /// Analyzes storage liveness over a plan's scheduled event stream.
 ///
 /// `events` must be the normalized stream of `plan` (built with the workload
