@@ -375,6 +375,38 @@ module {
                 std::to_string(sram->capacityBytes) + " bytes");
 }
 
+/// The complement to the two tests above (issue #129, task R7 review): a kernel
+/// that carries a plan whose allocations *cannot* be summarized must not be
+/// silently treated as if it carried no plan. The extraction accounting the
+/// code would otherwise fall back to is the inflated sum-of-all-buffers this
+/// same file calls wrong; the unreadable plan is reported instead.
+TEST(L0StaticBound, AnUnreadableRecordedPlanIsReportedNotSilentlyIgnored) {
+  auto parsed = parseKernel(R"MLIR(
+module {
+  micro.kernel @broken_plan attributes {micro.plan = {allocations = [
+      {begin_step = 0 : i64, bytes = 16384 : i64, end_step = 2 : i64,
+       id = 1 : i64, memory = "sram.0", value = 0 : i64},
+      {alias_of = 99 : i64, begin_step = 1 : i64, bytes = 16384 : i64,
+       end_step = 2 : i64, id = 2 : i64, memory = "sram.0", value = 1 : i64}
+    ]}} {
+    %a = micro.tile_alloc : !micro.tile<64x64xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = avx2Model();
+
+  auto report = analyzeKernel(parsed->kernel, model, /*level=*/0);
+  ASSERT_TRUE(static_cast<bool>(report)) << llvm::toString(report.takeError());
+  bool reported = false;
+  for (const std::string &warning : report->warnings)
+    if (warning.find("could not be read") != std::string::npos)
+      reported = true;
+  EXPECT_TRUE(reported)
+      << "the plan is present but unreadable; that must be reported";
+}
+
 //===----------------------------------------------------------------------===//
 // Machine-fit diagnostics
 //===----------------------------------------------------------------------===//
