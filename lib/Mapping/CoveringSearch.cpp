@@ -2255,9 +2255,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   //
   // Tally the feasible complete plans before the top-K cap drops the tail
   // (design §22.2). The top-K cap, when it bites, is a search truncation like
-  // any other; it is folded in *before* any plan's content id is computed, but
-  // the evaluated plans already carry their ids from finalization, so this only
-  // sets the flag.
+  // any other.
   result.planCount = retained.size();
   if (!unlimitedTopK && retained.size() > options_.topK) {
     result.searchTruncated = true;
@@ -2276,6 +2274,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   });
   if (!unlimitedTopK && retained.size() > options_.topK)
     retained.resize(options_.topK);
+  // A returned plan reports the cap that actually ended its search (issue #129,
+  // task R7 review): `result.searchTruncated` is final only here, after the
+  // top-K trim, so a per-plan snapshot taken while the walk was still running
+  // could miss the very trim that selected it. The flag is provenance, not a
+  // decision, so it stays out of the plan's content id and this assignment
+  // cannot move an id.
+  for (CoveringPlan &plan : retained)
+    plan.diagnostics.searchTruncated = result.searchTruncated;
   result.plans = std::move(retained);
 
   // §22.1/§22.3: the frontier's codes are the stable interface, so their order

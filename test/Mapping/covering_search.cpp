@@ -5405,6 +5405,26 @@ TEST(CoveringSearch, ChangingTopKDoesNotChangeTheBestFeasibleExactPlan) {
   EXPECT_EQ(wide->plans.front().placements.front().rule, "r.large");
 }
 
+// Issue #129, task R7 review: the top-K trim runs *after* the walk, so a plan
+// retained under a cap must report that cap in its own diagnostics. The plan's
+// `diagnostics.searchTruncated` was snapshotted while the proposal was built --
+// before `result.searchTruncated` was set by the trim -- so a trimmed plan
+// reported `false`. The `two-compute` fixture has two feasible plans (one per
+// attached engine), so `topK = 1` genuinely trims.
+TEST(CoveringSearch, ATrimmedPlanReportsTheTopKCapThatTrimmedIt) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 1u);
+  ASSERT_TRUE(result->searchTruncated)
+      << "the fixture must produce more than one feasible plan";
+  EXPECT_TRUE(result->plans.front().diagnostics.searchTruncated);
+}
+
 // A rejected cheap proposal must not end a deterministic search: the walk
 // continues and retains the first proposal the evaluator accepts.
 TEST(CoveringSearch, ARejectionContinuesADeterministicSearch) {
