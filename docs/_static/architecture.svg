@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 940" role="img" aria-labelledby="title desc">
+<title id="title">MicroIR compiler architecture</title>
+<desc id="desc">LLK semantic source feeds either the established CPU pipeline or the MicroIR exporter. Concrete MicroIR is mapped using machine facts and target policy, then analyzed or lowered through a portable reference bridge. Search IR currently feeds synthetic candidate analysis.</desc>
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#54738a"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,Segoe UI,sans-serif;fill:#19384d;font-size:20px} .title{font-weight:650;font-size:22px}.small{font-size:17px;fill:#4b6475}.edge{fill:none;stroke:#54738a;stroke-width:2.5;marker-end:url(#arrow)}.node{fill:#fff;stroke:#769ab4;stroke-width:1.5;rx:10}</style>
+<rect width="1120" height="940" rx="16" fill="#f3f7fa"/>
+<rect x="26" y="134" width="300" height="750" rx="14" fill="#e7eef4"/>
+<rect x="350" y="134" width="430" height="750" rx="14" fill="#e5f0f6"/>
+<rect x="804" y="134" width="290" height="750" rx="14" fill="#edf2ea"/>
+<text class="title" x="176" y="177" text-anchor="middle">Established CPU path</text>
+<text class="title" x="565" y="177" text-anchor="middle">Mapped MicroIR path</text>
+<text class="title" x="949" y="177" text-anchor="middle">Analysis and policy</text>
+<rect class="node" x="352" y="24" width="420" height="80"/>
+<text x="562.0" y="59.0" text-anchor="middle">LLK semantic source</text>
+<text x="562.0" y="83.0" text-anchor="middle">conversion support differs by operation</text>
+<path class="edge" d="M 430 104 V 118 H 36 V 244 H 48"/>
+<path class="edge" d="M 565 104 V 128 H 362 V 244 H 374"/>
+<rect class="node" x="48" y="210" width="256" height="68"/>
+<text x="176.0" y="239.0" text-anchor="middle">Structured tensors</text>
+<text x="176.0" y="263.0" text-anchor="middle">LLK → Linalg</text>
+<rect class="node" x="48" y="316" width="256" height="68"/>
+<text x="176.0" y="345.0" text-anchor="middle">Schedule selection</text>
+<text x="176.0" y="369.0" text-anchor="middle">tiling and fusion</text>
+<rect class="node" x="48" y="422" width="256" height="68"/>
+<text x="176.0" y="463.0" text-anchor="middle">Explicit Vector IR</text>
+<rect class="node" x="48" y="528" width="256" height="68"/>
+<text x="176.0" y="557.0" text-anchor="middle">Bufferization</text>
+<text x="176.0" y="581.0" text-anchor="middle">CPU runtime dispatch</text>
+<rect class="node" x="48" y="634" width="256" height="68"/>
+<text x="176.0" y="663.0" text-anchor="middle">LLVM lowering</text>
+<text x="176.0" y="687.0" text-anchor="middle">ORC JIT</text>
+<rect class="node" x="48" y="740" width="256" height="68"/>
+<text x="176.0" y="781.0" text-anchor="middle">Legacy CPU runtime</text>
+<path class="edge" d="M 176 278 V 316"/>
+<path class="edge" d="M 176 384 V 422"/>
+<path class="edge" d="M 176 490 V 528"/>
+<path class="edge" d="M 176 596 V 634"/>
+<path class="edge" d="M 176 702 V 740"/>
+<rect class="node" x="374" y="210" width="382" height="68"/>
+<text x="565.0" y="239.0" text-anchor="middle">LLKToMicro exporter</text>
+<text x="565.0" y="263.0" text-anchor="middle">matmul / fused SwiGLU</text>
+<rect class="node" x="374" y="316" width="382" height="68"/>
+<text x="565.0" y="345.0" text-anchor="middle">Concrete micro.kernel</text>
+<text x="565.0" y="369.0" text-anchor="middle">explicit tiles and schedule</text>
+<rect class="node" x="374" y="422" width="382" height="68"/>
+<text x="565.0" y="451.0" text-anchor="middle">Extract → match → place</text>
+<text x="565.0" y="475.0" text-anchor="middle">connect → cover</text>
+<rect class="node" x="374" y="528" width="382" height="68"/>
+<text x="565.0" y="557.0" text-anchor="middle">Bound kernel and plan metadata</text>
+<text x="565.0" y="581.0" text-anchor="middle">movement / sync materialization</text>
+<rect class="node" x="374" y="634" width="382" height="68"/>
+<text x="565.0" y="663.0" text-anchor="middle">Selected target emitter</text>
+<text x="565.0" y="687.0" text-anchor="middle">validation and lowering</text>
+<rect class="node" x="374" y="740" width="382" height="68"/>
+<text x="565.0" y="769.0" text-anchor="middle">MicroToLinalg reference bridge</text>
+<text x="565.0" y="793.0" text-anchor="middle">scalar loops → LLVM ORC</text>
+<rect class="node" x="374" y="830" width="382" height="42"/>
+<text x="565.0" y="858.0" text-anchor="middle">MappedExecutable</text>
+<path class="edge" d="M 565 278 V 316"/>
+<path class="edge" d="M 565 384 V 422"/>
+<path class="edge" d="M 565 490 V 528"/>
+<path class="edge" d="M 565 596 V 634"/>
+<path class="edge" d="M 565 702 V 740"/>
+<path class="edge" d="M 565 808 V 830"/>
+<rect class="node" x="826" y="210" width="246" height="68"/>
+<text x="949.0" y="251.0" text-anchor="middle">micro.search_space</text>
+<rect class="node" x="826" y="316" width="246" height="68"/>
+<text x="949.0" y="345.0" text-anchor="middle">Candidate generation</text>
+<text x="949.0" y="369.0" text-anchor="middle">synthetic kernel binding</text>
+<rect class="node" x="826" y="446" width="246" height="90"/>
+<text x="949.0" y="486.0" text-anchor="middle">MachineModel YAML</text>
+<text x="949.0" y="510.0" text-anchor="middle">LLKMap / target package</text>
+<rect class="node" x="826" y="634" width="246" height="68"/>
+<text x="949.0" y="663.0" text-anchor="middle">MicroDAG</text>
+<text x="949.0" y="687.0" text-anchor="middle">performance estimates</text>
+<path class="edge" d="M 756 244 H 826"/>
+<path class="edge" d="M 949 278 V 316"/>
+<path class="edge" d="M 1072 350 H 1082 V 614 H 949 V 634"/>
+<path class="edge" d="M 826 467 H 798 V 456 H 756"/>
+<path class="edge" d="M 949 536 V 634"/>
+<path class="edge" d="M 756 562 H 797 V 668 H 826"/>
+<text class="small" x="949" y="748" text-anchor="middle">Predictions are uncalibrated.</text>
+<text class="small" x="949" y="778" text-anchor="middle">A machine profile does not</text>
+<text class="small" x="949" y="802" text-anchor="middle">supply a hardware backend.</text>
+<text class="small" x="560" y="919" text-anchor="middle">Portable mapped execution does not establish selected AVX2 width, ISA, or hardware overlap.</text>
+</svg>

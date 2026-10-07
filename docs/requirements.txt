@@ -1,0 +1,3 @@
+# Python 3.12 or newer. Install in a virtual environment; no LLVM build needed.
+Sphinx==9.1.0
+furo==2025.12.19
