@@ -232,10 +232,23 @@ compiler-generated chains are AVX2-only, because the exported program uses the
 tile-level ops that only the AVX2 rule set covers; the accelerator's rules
 describe the tensor-level movement and vector family.
 
+These are four of the five chains the acceptance contract requires: a
+required-transform chain and frozen-report replay are still open, and the
+second-target chain does not yet exercise canonical tile/two-hop movement.
+`DocReferences` lints the repo paths and tool flags named in the workflow and
+acceptance documents; it does not run this runner or check its argument values.
+Mandatory issue #67 acceptance is **not** closed by these chains — see the
+[verified gap assessment](../reviews/2026-10-07-issue67-current-gap-assessment.md)
+and issue [#129](https://github.com/skg7on/DSLCompiler/issues/129).
+
 ## Where to go deeper
 
-- the design's acceptance criteria, with revision-pinned evidence for each:
+- the design's acceptance criteria — interim, revision-pinned evidence for each,
+  with mandatory rows still open under issue #129:
   `docs/reviews/issue67-final-acceptance.md`
+- the verified assessment of the remaining gaps, and what each release gate must
+  repair: `docs/reviews/2026-10-07-issue67-current-gap-assessment.md`,
+  `docs/superpowers/plans/2026-10-07-issue129-gap-closure.md`
 - tile model, ops, and verifier rules: `docs/design/m9-micro-ir-core-concepts.md`
 - layering and the redesign: `docs/design/m9-canonical-micro-ir-architecture.md`
 - the mapping design: `docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md`
