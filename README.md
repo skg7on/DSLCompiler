@@ -9,6 +9,8 @@ The project uses MLIR as the compiler infrastructure. High-level or structured M
 
 Intel CPU with AVX2 is the first validation backend and machine profile. It is not the final scope of the project; it is a concrete target used to prove the Micro-IR, performance model, lowering path, and tuning workflow before adding GPU, NPU, systolic-array, and custom AI accelerator profiles.
 
+**New to the project?** Start with the [developer guide](docs/index.rst), the [MicroIR concepts](docs/concepts.rst), and the [build instructions](docs/getting-started.rst). The guide includes architecture diagrams, current feature limits, five tool manuals, four practical tutorials, and a [contributor path](docs/contributing.rst).
+
 ## Project Mission
 
 Build an AI compiler and architecture-evaluation stack around one canonical artifact:
@@ -144,9 +146,25 @@ Future targets should reuse the same Micro-IR contract with different MachineMod
 | M10: MachineModel and performance evaluation | Complete | YAML profiles, `micro-perf`, L0/L1 simulator |
 | M11: MLIR to Micro lowering | Complete | `llk-compile --emit=micro`, `--emit=micro-search` |
 | M12: Micro-based auto-optimization | Complete | Candidate generation, legality, binding, ranking, plus topology-aware mapping, LLKMap rules/layouts, covering search, and plan binding |
-| M13: Feedback and calibration | In progress | Measurement loop and calibration; blocked on a way to execute Micro-IR |
+| M13: Feedback and calibration | Pending integration | Measurement loop and calibration (#51/#52); mapped compilation exists, but production measurement and calibration remain separate work |
+
+These milestone labels describe delivered infrastructure, not satisfaction of every end-to-end design contract. [Issue #129](https://github.com/skg7on/DSLCompiler/issues/129) tracks remaining physical resource, selected-target execution, tuner integration, and acceptance gaps. See [features and current limits](docs/features.rst) before interpreting a successful mapping or compilation as full target realization.
 
 ## Documentation
+
+The [developer guide](docs/index.rst) is the community entry point. Read the [concepts](docs/concepts.rst), [current architecture](docs/architecture.rst), and [features](docs/features.rst), then follow [build and setup](docs/getting-started.rst). The [tutorial sequence](docs/tutorials/01-first-kernel.rst) covers source export, mapping and replay, performance reports, and tuning. Detailed manuals cover [llk-compile](docs/tools/compiler.rst), [llk-opt](docs/tools/optimizer.rst), [micro-perf](docs/tools/performance.rst), [llk-tune](docs/tools/tuning.rst), and [llk-bench](docs/tools/benchmark.rst).
+
+The manual uses native reStructuredText and Sphinx, with sidebar navigation, search, downloadable MLIR examples, and an offline architecture diagram. Build the HTML with Python 3.12+; LLVM is not needed for this step:
+
+```bash
+python3 -m venv build/docs-venv
+build/docs-venv/bin/python -m pip install -r docs/requirements.txt
+build/docs-venv/bin/python -m sphinx -b html -n -W --keep-going docs build/docs/html
+```
+
+Open `build/docs/html/index.html`. See [building and maintaining the manual](docs/building-docs.rst) for preview commands, the optional `docs-html` CMake target, and documentation checks. CI uploads the HTML as a `developer-manual` artifact.
+
+The documents below preserve deeper design details and project history:
 
 | Document | Description |
 |----------|-------------|
@@ -157,7 +175,7 @@ Future targets should reuse the same Micro-IR contract with different MachineMod
 | [docs/design/m4-parallel-execution.md](docs/design/m4-parallel-execution.md) | M4 design: thread pool, parallel decomposition, dispatch thresholds |
 | [docs/design/m5-specialization-tuning.md](docs/design/m5-specialization-tuning.md) | M5 design: M-bucketing, JIT cache, schedule DB, autotuning foundation |
 | [docs/design/m6-multi-kernel.md](docs/design/m6-multi-kernel.md) | M6 design: RoPE, Attention, online softmax, shared infrastructure |
-| [docs/design/micro-ir-mapping-workflow.md](docs/design/micro-ir-mapping-workflow.md) | **Start here to use the compiler**: the tile-centric workflow, the tools, MachineModel customization, and the target-independent mapping chain |
+| [docs/design/micro-ir-mapping-workflow.md](docs/design/micro-ir-mapping-workflow.md) | Detailed mapping workflow and target-independent mapping chain |
 | [docs/design/llkmap-layout-grammar.md](docs/design/llkmap-layout-grammar.md) | LLKMap declarative layout grammar |
 | [docs/design/llkmap-rule-grammar.md](docs/design/llkmap-rule-grammar.md) | LLKMap mapping-rule and target-bundle grammar |
 | [docs/design/m9-canonical-micro-ir-architecture.md](docs/design/m9-canonical-micro-ir-architecture.md) | M9+ architecture: canonical Micro-IR, MachineModel, performance evaluation, auto-search |
@@ -262,17 +280,17 @@ llk-compile --emit=micro-search input.mlir
 # Search a mapping space, bind the best plan, and write a plan report
 llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml \
   layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap \
-  emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store report=plan.json" input.mlir
+  emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul report=plan.json" input.mlir
 
 # Bind a specific plan by its stable id (reproduce the search: same target keys
 # AND search options as the --micro-map run that reported the id)
 llk-opt --micro-bind-plan="plan-id=<id> target=x86-avx2 machine=... layouts=... rules=... emitters=... mode=beam beam-width=64 top-k=8" input.mlir
 
 # Evaluate concrete Micro-IR against a machine profile
-micro-perf --machine machines/x86-avx2-v2.yaml --level l1 input.micro.mlir
+micro-perf --machine machines/x86-avx2-v2.yaml --level 1 input.micro.mlir
 
 # Tune candidates from a Micro search space
-llk-tune --search-space swiglu.micro.mlir --machine machines/x86-avx2-v2.yaml
+llk-tune --input swiglu.search.mlir --machine machines/x86-avx2-v2.yaml -M=16 -N=64 -K=64 --max-candidates=8
 ```
 
 `--micro-map` writes a versioned JSON plan report when given `report=<path>` -- including in `report-only` mode, where it reports the selected plan without binding it onto the IR. The report carries input/machine/layout-library/rule-library hashes, search options and truncation flags, rejection counts by stable reason code, top-K plans with component costs, selected plan id, and compiler and cost-model version. `--micro-bind-plan` does not write a report: it re-runs the search to bind a plan by its id.

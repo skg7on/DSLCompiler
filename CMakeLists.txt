@@ -1195,6 +1195,17 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
           $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
   )
+  add_test(NAME DocReferencesUnit
+      COMMAND python3 -m unittest discover
+          -s ${CMAKE_SOURCE_DIR}/test/Docs -p test_*.py
+  )
+  # Run the community examples: help-name lint alone cannot validate pass
+  # option values, file arguments, or the artifacts shown in a tutorial.
+  add_test(NAME CommunityTutorials
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/docs/tutorials/run_tutorials.py
+          --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}/CommunityTutorials
+  )
   # Stage C5: the shared mapped-compilation path, taken by the compiler. A
   # plan is searched, bound, verified, handed to the target's own emitters where
   # they implement it, lowered, bufferized and JIT-compiled -- and the compiler
@@ -1555,10 +1566,27 @@ endif()
 if(TARGET llk-tune)
   list(APPEND _llk_check_deps llk-tune)
 endif()
+if(TARGET llk-compile)
+  list(APPEND _llk_check_deps llk-compile)
+endif()
+if(TARGET llk-bench)
+  list(APPEND _llk_check_deps llk-bench)
+endif()
 
 add_custom_target(check-llk
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     DEPENDS ${_llk_check_deps}
     USES_TERMINAL
     COMMENT "Running the LLK test suite"
+)
+
+# Documentation is opt-in: normal builds and compiler tests need no Sphinx.
+# Point this at a virtualenv with docs/requirements.txt installed.
+set(LLK_DOCS_PYTHON "python3" CACHE STRING "Python interpreter for the Sphinx manual")
+add_custom_target(docs-html
+    COMMAND ${LLK_DOCS_PYTHON} -m sphinx -b html -n -W --keep-going
+            ${CMAKE_SOURCE_DIR}/docs ${CMAKE_BINARY_DIR}/docs/html
+    USES_TERMINAL
+    VERBATIM
+    COMMENT "Building the MicroIR HTML developer manual"
 )
