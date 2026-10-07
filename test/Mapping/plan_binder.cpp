@@ -6,6 +6,7 @@
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/StoragePlan.h"
+#include "LLK/Perf/SelectedKernelAnalysis.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
 #include "MicroMappingCommon.h"
@@ -4822,4 +4823,225 @@ TEST(PlanBinder, Issue129AHopEngineItsLinkDoesNotOfferIsRejected) {
   EXPECT_NE(message.find("dma.b"), std::string::npos) << message;
   EXPECT_NE(message.find("its link does not offer"), std::string::npos)
       << message;
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R8: durable replay reproduces the same IR and decisions
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+std::string printed(mlir::ModuleOp module) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  module->print(stream);
+  return stream.str();
+}
+
+/// The selected decisions two plans share, as a comparable rendering: the
+/// content id (which names them), plus the per-placement rule/executor/compute
+/// selection and the per-connection route and hops. A decode that dropped or
+/// re-derived any of these would differ here.
+std::string decisionRendering(const CoveringPlan &plan) {
+  std::string text = "id=" + std::to_string(plan.id);
+  for (const PlanPlacement &placement : plan.placements) {
+    text += "|p=" + placement.rule + ":" + placement.executor + ":";
+    std::vector<std::string> computes;
+    for (const auto &entry : placement.computeBindings)
+      computes.push_back(entry.first().str() + "=" + entry.second);
+    llvm::sort(computes);
+    for (const std::string &compute : computes)
+      text += "[" + compute + "]";
+  }
+  for (const PlanConnection &connection : plan.connectionPlans) {
+    text += "|c=" + std::to_string(connection.id) + ":";
+    for (const MemoryNodeId &memory : connection.route)
+      text += memory + ">";
+    for (const PlanMovementHop &hop : connection.hops)
+      text += "{" + std::to_string(hop.index) + ":" + hop.srcMemory + ">" +
+              hop.dstMemory + "@" + hop.engine + "}";
+  }
+  return text;
+}
+
+} // namespace
+
+// A bound plan decoded from its own `micro.plan` and re-bound must reproduce
+// the same durable decisions and the same normalized IR (§29.12). Without this,
+// a replay could quietly re-derive a decision -- an engine from executor order,
+// a route from the machine default -- and still look like a success.
+TEST(PlanBinder, Issue129ReplayReproducesTheSameIrAndDecisions) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan original = result->plans.front();
+  ASSERT_FALSE(original.connectionPlans.front().hops.empty())
+      << "the fixture must materialize a multi-hop movement";
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c->source, original, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  const std::string firstIr = printed(*bound->module);
+
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*bound->module, *c->target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  EXPECT_EQ(decisionRendering(*decoded), decisionRendering(original));
+
+  // Re-binding the replayed plan reproduces byte-identical normalized IR.
+  llvm::Expected<BoundPlan> rebound =
+      bindCanonical(*c->source, *decoded, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(rebound)) << llvm::toString(rebound.takeError());
+  EXPECT_EQ(printed(*rebound->module), firstIr);
+}
+
+// The same replay, decoded in a *second, independent* MLIRContext: a decoded
+// plan that kept a borrowed affine map or attribute from the first context
+// would crash or render differently here.
+TEST(PlanBinder, Issue129ReplayInAFreshContextReproducesTheDecisions) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan original = result->plans.front();
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c->source, original, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  const std::string ir = printed(*bound->module);
+
+  // A fresh context and module, parsed from the bound IR's own text.
+  MLIRContext freshContext;
+  freshContext.getOrLoadDialect<micro::MicroDialect>();
+  freshContext.getOrLoadDialect<tensor::TensorDialect>();
+  OwningOpRef<ModuleOp> freshModule =
+      parseSourceString<ModuleOp>(ir, &freshContext);
+  ASSERT_TRUE(static_cast<bool>(freshModule));
+
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*freshModule, *c->target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  EXPECT_EQ(decisionRendering(*decoded), decisionRendering(original));
+}
+
+namespace {
+
+/// Reads `report` and binds the replayed plan; the error text when the replay
+/// is refused, or empty when it succeeded.
+std::string replayRefusal(const issue129::ResourceCase &c,
+                          const std::string &report) {
+  llvm::Expected<CoveringPlan> replayed =
+      readPlanReport(report, *c.target, c.graph);
+  if (!replayed)
+    return llvm::toString(replayed.takeError());
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, *replayed, *c.target, BindContract::Executable);
+  if (!bound)
+    return llvm::toString(bound.takeError());
+  // The replayed module is what a compile would verify next: a tampered
+  // decision must be refused here even when the binder itself accepts it.
+  if (llvm::Error error = verifyMappedMicroIR(*bound->module, *c.target))
+    return llvm::toString(std::move(error));
+  return {};
+}
+
+} // namespace
+
+// Review focus / task R8 step 4: altering exactly one selected decision in a
+// report must make it unreplayable. The control is the untampered report, which
+// must replay, so a fixture that simply stopped replaying could not pass.
+TEST(PlanBinder, Issue129ReplayRejectsEveryAlteredDecision) {
+  struct Tamper {
+    llvm::StringRef fixture;
+    llvm::StringRef from;
+    llvm::StringRef to;
+    llvm::StringRef what;
+  };
+  for (const Tamper &tamper : {Tamper{"two-compute", "\"vpu.a\"",
+                                      "\"vpu.unknown\"", "compute binding"},
+                               Tamper{"two-compute", "\"issue129.vector_add\"",
+                                      "\"issue129.absent\"", "rule"},
+                               Tamper{"capacity-topk", "\"dram\": \"dram.0\"",
+                                      "\"dram\": \"dram.9\"", "memory node"}}) {
+    auto c = issue129::resourceCase(tamper.fixture);
+    ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+    MappingSearchOptions options;
+    options.mode = SearchMode::Exact;
+    options.topK = 1;
+    auto result = issue129::searchCase(*c, options);
+    ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError()) << " for "
+                              << tamper.fixture.str();
+    ASSERT_FALSE(result->plans.empty());
+    const std::string report = writePlanReport(
+        *result, c->target->machine(), *c->target, options, /*moduleHash=*/0);
+    // The control: the untampered report replays and verifies, so a fixture
+    // that simply stopped replaying could not pass.
+    ASSERT_EQ(replayRefusal(*c, report), "")
+        << "the untampered " << tamper.fixture.str() << " report must replay";
+
+    const size_t at = report.find(tamper.from);
+    ASSERT_NE(at, std::string::npos)
+        << "the " << tamper.fixture.str() << " fixture must record "
+        << tamper.what.str();
+    std::string tampered = report;
+    tampered.replace(at, tamper.from.size(), tamper.to);
+    EXPECT_FALSE(replayRefusal(*c, tampered).empty())
+        << "an altered " << tamper.what.str() << " must not replay";
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R8 step 3: planner and performance model share one analysis
+//===----------------------------------------------------------------------===//
+
+// The planner's final cost is the performance model's own number for the
+// *bound* kernel -- one normalized analysis, not two estimates that happen to
+// be close. The concrete values pin the fields the acceptance parity table
+// reports (cycles, owner, per-memory peak), so a drift in any of them fails
+// here rather than being tolerated.
+TEST(PlanBinder, Issue129PlannerCostIsTheBoundKernelsAnalysis) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan plan = result->plans.front();
+  ASSERT_EQ(plan.placements.front().rule, "r.large")
+      << "the legal DRAM covering is the retained one";
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c->source, plan, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  llvm::Expected<mlir::llk::perf::SelectedKernelAnalysis> analysis =
+      mlir::llk::perf::analyzeSelectedKernel(
+          bound->kernel, c->target->machine(),
+          /*requireComplete=*/false, plan, c->graph);
+  ASSERT_TRUE(bool(analysis)) << llvm::toString(analysis.takeError());
+
+  // The planner's reported cost *is* the analysis's own scheduled cost.
+  EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, analysis->cost.latencyCycles);
+  EXPECT_GT(plan.totalCost.latencyCycles, 0.0);
+  // ... and the analysis names the plan's recorded compute selection and
+  // executor as the owner pool, so the two describe the same execution.
+  ASSERT_FALSE(analysis->events.events.empty());
+  const mlir::llk::mapping::PlanCostEvent &compute =
+      analysis->events.events.front();
+  EXPECT_EQ(compute.event.resource, "vpu.0");
+  EXPECT_EQ(compute.owner, "worker.0");
+  // DRAM holds the four simultaneously-live 256-byte result versions (1024)
+  // plus the 256-byte borrowed input descriptor the rule bound there: 1280
+  // bytes, the same number the plan's own capacity verdict used.
+  EXPECT_EQ(analysis->peakBytes.at("dram.0"), 1280u);
 }
