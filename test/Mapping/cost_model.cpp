@@ -447,8 +447,11 @@ TEST(CostEvent, LayoutTransformEventUsesTheSharedEstimate) {
   PlanConnection &connection = plan.connectionPlans.front();
   connection.kind = ConnectionKind::LayoutTransform;
   connection.route = {"s0"};
-  connection.valueType =
-      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context));
+  // An explicit upcast to `mlir::Type`: a value-semantic handle conversion, not
+  // slicing. Spelling it out keeps the analyzer from reading it as one (CodeQL
+  // review, PR #133).
+  connection.valueType = static_cast<mlir::Type>(
+      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context)));
   LayoutTransform transform;
   transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, &context);
   transform.dstMap = transposeMap(&context);
@@ -476,8 +479,11 @@ TEST(CostEvent, Issue129TransformEventUsesTheRecordedResource) {
   PlanConnection &connection = plan.connectionPlans.front();
   connection.kind = ConnectionKind::LayoutTransform;
   connection.route = {"s0"};
-  connection.valueType =
-      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context));
+  // An explicit upcast to `mlir::Type`: a value-semantic handle conversion, not
+  // slicing. Spelling it out keeps the analyzer from reading it as one (CodeQL
+  // review, PR #133).
+  connection.valueType = static_cast<mlir::Type>(
+      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context)));
 
   // A second vector engine declared *after* `vpu`, so the executor's first
   // attachment and the recorded resource disagree.

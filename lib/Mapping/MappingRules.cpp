@@ -2325,20 +2325,21 @@ llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
                           "' compute capability");
       continue;
     }
-    const mlir::llk::machine::ComputeNode *node =
+    const mlir::llk::machine::ComputeNode *compute =
         machine.findCompute(recorded->second);
-    if (!node)
+    if (!compute)
       return reject(DiagnosticCode::UnsupportedComputeFragment,
                     "unknown compute node '" + recorded->second + "'");
-    if (node->kind != requirement.kind)
+    if (compute->kind != requirement.kind)
       return reject(DiagnosticCode::UnsupportedComputeFragment,
                     "compute node '" + recorded->second + "' has kind '" +
-                        node->kind + "', not the required '" +
+                        compute->kind + "', not the required '" +
                         requirement.kind + "'");
-    if (node->attachedTo != selection.executor)
+    if (compute->attachedTo != selection.executor)
       return reject(DiagnosticCode::UnsupportedComputeFragment,
                     "compute node '" + recorded->second + "' is attached to '" +
-                        node->attachedTo + "', not to the recorded executor '" +
+                        compute->attachedTo +
+                        "', not to the recorded executor '" +
                         selection.executor + "'");
   }
 
