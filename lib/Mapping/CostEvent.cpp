@@ -568,15 +568,16 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
       // vector/mma events carry no bytes, so this one carries none either and
       // the two streams stay comparable.
       //
-      // `kPlanComputeUsesRuleEstimate` (named reason): the cycle input here is
-      // the selected instance's rule-local estimate, *not* the machine's
-      // elementwise formula the performance DAG charges. A mapping plan records
-      // a rule's declared cost and its output element count, never the
-      // operation kind (mma vs vector) the machine would need to pick a
-      // formula, so only the transform, transfer and synchronization events --
-      // for which both paths call one shared estimate -- agree cycle for cycle.
-      // The divergence is intentional and pinned by
-      // `L1ResourceDag.PlanComputeCyclesUseTheRuleEstimate`.
+      // The cycle input here is the selected instance's rule-local estimate.
+      // That is the *accumulation fallback*'s value: a plan scored before its
+      // kernel was bound has no operation kind (mma vs vector) to pick the
+      // machine's formula from, so it can only charge the rule's declared cost.
+      // The `AnalysisSnapshotEvents` path is what replaces it (issue #129, task
+      // R6): once the shared selected-kernel analysis has extracted the bound
+      // kernel, `buildPlanEvents` returns that stream and this estimate is
+      // never what a final plan is scored on. The two consumers therefore agree
+      // on every field of a finalized plan, and this estimate only ever
+      // describes a stream explicitly labelled `PlanEventSource::Accumulation`.
       PlanCostEvent compute = makePlanCostEvent(
           CostEventKind::Compute, engine->id, placed.cost.latencyCycles,
           placed.workItems, /*bytes=*/0);

@@ -18,12 +18,17 @@
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Mapping/CostEvent.h"
+#include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/MappingPlan.h"
+#include "LLK/Mapping/StorageLiveness.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Perf/MicroCostModel.h"
 #include "LLK/Perf/MicroDAG.h"
 #include "LLK/Perf/MicroPerfReport.h"
 #include "LLK/Perf/SelectedKernelAnalysis.h"
+
+#include "resource_regression_fixture.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -1535,6 +1540,40 @@ TEST(L1ResourceDag, MicroPerfReportDerivesFromTheSharedAnalysis) {
   }
 }
 
+// The analysis's `cost` is the *same* Cost `schedulePlanEvents` derives from
+// the same event stream, field for field. Checking only latency would hide a
+// cost whose byte totals and utilizations were never accumulated: the byte
+// total, the DRAM dimension and both load factors are what this pins.
+TEST(L1ResourceDag, AnalysisCostMatchesTheSharedPlanCost) {
+  auto parsed = parseKernel(kChainKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 2, 4));
+
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/false);
+  ASSERT_TRUE(static_cast<bool>(analysis))
+      << llvm::toString(analysis.takeError());
+
+  llvm::Expected<mapping::Cost> planned =
+      mapping::schedulePlanEvents(analysis->events, model);
+  ASSERT_TRUE(static_cast<bool>(planned))
+      << llvm::toString(planned.takeError());
+
+  EXPECT_DOUBLE_EQ(analysis->cost.latencyCycles, planned->latencyCycles);
+  EXPECT_EQ(analysis->cost.localBytes, planned->localBytes);
+  EXPECT_EQ(analysis->cost.dramBytes, planned->dramBytes);
+  EXPECT_DOUBLE_EQ(analysis->cost.computeUtilization,
+                   planned->computeUtilization);
+  EXPECT_DOUBLE_EQ(analysis->cost.transferUtilization,
+                   planned->transferUtilization);
+
+  // The chain moves four values through the hierarchy, so a byte total of zero
+  // would mean the loop never accumulated (the defect this test pins).
+  EXPECT_GT(analysis->cost.localBytes, 0u);
+  EXPECT_GT(analysis->cost.dramBytes, 0u);
+  EXPECT_GT(analysis->cost.transferUtilization, 0.0);
+}
+
 // The shared analysis is static and deterministic: the same kernel and machine
 // produce the same stream, schedule, cost and summaries every run. This is the
 // parity baseline -- measured estimates are a separate mode and are never
@@ -1667,6 +1706,54 @@ module {
   EXPECT_EQ(first.deps, (std::vector<uint32_t>{0, 1}));
   // The repeated operand is one dependency, not two.
   EXPECT_EQ(second.deps, (std::vector<uint32_t>{2}));
+}
+
+// A strict analysis of a bound kernel carries the *finalized plan's* R5 storage
+// liveness, not the extraction's own allocation accounting (issue #129, task
+// R6 step 4: R5 liveness runs for strict analysis). The fixture is the shared
+// `parallel-overlap` case, whose R5 peak is a literal the R5 suite states: two
+// spatial occurrences keep both 256-byte results resident, so L2 holds 512 --
+// a relation the kernel-side allocation accounting does not see at all.
+TEST(L1ResourceDag, StrictAnalysisCarriesTheFinalizedPlansStorageLiveness) {
+  llvm::Expected<issue129::ResourceCase> built =
+      issue129::resourceCase("parallel-overlap");
+  ASSERT_TRUE(bool(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &resource = *built;
+
+  mapping::MappingSearchOptions options;
+  options.mode = mapping::SearchMode::Exact;
+  llvm::Expected<mapping::MappingSearchResult> result =
+      issue129::searchCase(resource, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  mapping::CoveringPlan plan = result->plans.front();
+  if (llvm::Error error = mapping::finalizeStoragePlan(
+          resource.graph, plan, resource.target->machine()))
+    FAIL() << llvm::toString(std::move(error));
+
+  llvm::Expected<mlir::Operation *> kernel =
+      findMicroKernel(resource.source.get(), "");
+  ASSERT_TRUE(bool(kernel)) << llvm::toString(kernel.takeError());
+
+  // The kernel-only form runs no plan liveness and says so.
+  llvm::Expected<SelectedKernelAnalysis> kernelOnly = analyzeSelectedKernel(
+      *kernel, resource.target->machine(), /*requireComplete=*/false);
+  ASSERT_TRUE(bool(kernelOnly)) << llvm::toString(kernelOnly.takeError());
+  EXPECT_FALSE(kernelOnly->storageLivenessFromPlan);
+
+  // The strict form, given the plan and its graph, carries the plan's liveness.
+  llvm::Expected<SelectedKernelAnalysis> strict =
+      analyzeSelectedKernel(*kernel, resource.target->machine(),
+                            /*requireComplete=*/true, plan, resource.graph);
+  ASSERT_TRUE(bool(strict)) << llvm::toString(strict.takeError());
+  EXPECT_TRUE(strict->storageLivenessFromPlan);
+  ASSERT_TRUE(strict->peakBytes.count("l2.0"))
+      << "the plan's liveness peak names no l2.0";
+  EXPECT_EQ(strict->peakBytes.at("l2.0"), 512u);
+  EXPECT_NE(strict->peakBytes, kernelOnly->peakBytes);
+  // The ordering the peak relies on is the plan's own, verbatim.
+  EXPECT_EQ(strict->requiredReuseEdges,
+            mapping::requiredReuseEdgesFor(plan.allocations));
 }
 
 } // namespace mlir::llk::perf

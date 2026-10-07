@@ -8,6 +8,8 @@
 #include "LLK/Perf/SelectedKernelAnalysis.h"
 
 #include "LLK/Mapping/EventSchedule.h"
+#include "LLK/Mapping/StorageLiveness.h"
+#include "LLK/Mapping/WorkloadGraph.h"
 
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
@@ -26,6 +28,16 @@ namespace {
 llvm::Error analysisError(const llvm::Twine &message) {
   return llvm::make_error<llvm::StringError>(message.str(),
                                              llvm::inconvertibleErrorCode());
+}
+
+/// A checked accumulate: it adds `amount` to `value` and reports overflow. The
+/// guard and the accumulation are one operation, so a totalled count can never
+/// be left at zero by an overflow check that forgot to add.
+bool addChecked(uint64_t &value, uint64_t amount) {
+  if (amount > std::numeric_limits<uint64_t>::max() - value)
+    return true;
+  value += amount;
+  return false;
 }
 
 /// The cycles one normalized event occupies its resource, rounded up exactly as
@@ -66,6 +78,11 @@ analyzeSelectedDag(const MicroDAG &dag, const machine::MachineModel &machine,
   // uses, and it already fills the execution facts both paths share: the
   // owner-occupancy pool (the mapped executor's id, or the abstract owner
   // symbol for unmapped analysis) and the two memories a movement crosses.
+  // The stream this entry point produces *is* the materialized kernel's own:
+  // it was extracted from the concrete Micro-IR, not accumulated from a plan's
+  // rule estimates, so it carries the `Snapshot` label the plan path reserves
+  // for a stream that describes the work the kernel actually does.
+  analysis.events.source = mapping::PlanEventSource::Snapshot;
   std::vector<std::string> owners;
   analysis.events.events.reserve(dag.events.size());
   owners.reserve(dag.events.size());
@@ -125,16 +142,16 @@ analyzeSelectedDag(const MicroDAG &dag, const machine::MachineModel &machine,
   uint64_t transferBusy = 0;
   uint64_t totalBytes = 0;
   for (const mapping::PlanCostEvent &event : analysis.events.events) {
-    if (event.bytes > std::numeric_limits<uint64_t>::max() - totalBytes)
+    if (addChecked(totalBytes, event.bytes))
       return analysisError("selected-kernel analysis: the event stream's byte "
                            "total overflows a 64-bit count");
     const uint64_t cycles = eventCycles(event);
     if (event.event.kind == mapping::CostEventKind::Compute) {
-      if (cycles > std::numeric_limits<uint64_t>::max() - computeBusy)
+      if (addChecked(computeBusy, cycles))
         return analysisError("selected-kernel analysis: compute busy cycles "
                              "overflow a 64-bit count");
     } else if (event.event.kind == mapping::CostEventKind::TransferHop) {
-      if (cycles > std::numeric_limits<uint64_t>::max() - transferBusy)
+      if (addChecked(transferBusy, cycles))
         return analysisError("selected-kernel analysis: transfer busy cycles "
                              "overflow a 64-bit count");
     }
@@ -166,6 +183,66 @@ analyzeSelectedKernel(mlir::Operation *kernel,
   if (!dag)
     return dag.takeError();
   return analyzeSelectedDag(*dag, machine, requireComplete);
+}
+
+llvm::Error
+attachPlanStorageLiveness(SelectedKernelAnalysis &analysis,
+                          const mapping::CoveringPlan &finalizedPlan,
+                          const mapping::WorkloadGraph &graph,
+                          const machine::MachineModel &machine,
+                          bool requireComplete) {
+  // The occupancy probe is built the way `finalizeStoragePlan` builds its own:
+  // the plan's storage facts over its workload graph, on the plan's *own*
+  // schedule. That is deliberate -- this peak has to be the same number the
+  // plan's capacity verdict used, not a second relation that happens to be
+  // close. The graph-carrying `buildPlanEvents` call is what derives each
+  // allocation's uses from the plan, so it is the right one here.
+  auto unavailable = [&](std::string reason) -> llvm::Error {
+    analysis.incompleteReasons.push_back(reason);
+    analysis.complete = false;
+    if (!requireComplete)
+      return llvm::Error::success();
+    return analysisError("selected-kernel analysis: the finalized plan's "
+                         "storage liveness could not be established: " +
+                         reason);
+  };
+
+  llvm::Expected<mapping::PlanEventDAG> events =
+      mapping::buildPlanEvents(finalizedPlan, machine, &graph);
+  if (!events)
+    return unavailable("the plan's storage-fact event stream could not be "
+                       "built: " +
+                       llvm::toString(events.takeError()));
+
+  const mapping::EventScheduleResult schedule =
+      mapping::scheduleNormalizedEvents(events->events, machine);
+  llvm::Expected<mapping::StorageLivenessResult> live =
+      mapping::analyzeStorageLiveness(finalizedPlan, *events, schedule);
+  if (!live)
+    return unavailable("the plan's live ranges do not resolve: " +
+                       llvm::toString(live.takeError()));
+
+  analysis.peakBytes = live->peakBytes;
+  analysis.requiredReuseEdges = live->requiredReuseEdges;
+  analysis.storageLivenessFromPlan = true;
+  return llvm::Error::success();
+}
+
+llvm::Expected<SelectedKernelAnalysis> analyzeSelectedKernel(
+    mlir::Operation *kernel, const machine::MachineModel &machine,
+    bool requireComplete, const mapping::CoveringPlan &finalizedPlan,
+    const mapping::WorkloadGraph &graph) {
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedKernel(kernel, machine, requireComplete);
+  if (!analysis)
+    return analysis.takeError();
+  // R5 liveness for the strict analysis: the plan's own occupancy replaces the
+  // extraction's allocation accounting, so a strict caller reads the same peak
+  // the plan's capacity verdict did.
+  if (llvm::Error error = attachPlanStorageLiveness(
+          *analysis, finalizedPlan, graph, machine, requireComplete))
+    return std::move(error);
+  return analysis;
 }
 
 } // namespace mlir::llk::perf

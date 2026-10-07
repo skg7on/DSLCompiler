@@ -931,6 +931,10 @@ add_llk_mapping_test(MappingStableHashTest test/Mapping/stable_hash.cpp)
 target_link_libraries(MappingStableHashTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingCostModelTest test/Mapping/cost_model.cpp)
 target_link_libraries(MappingCostModelTest PRIVATE LLKResourceRegressionFixture)
+# The R6 strict-analysis test carries a plan's R5 storage liveness into the
+# shared selected-kernel analysis, so it needs a genuinely finalized plan and
+# its workload graph -- the fixture produces both.
+target_link_libraries(L1ResourceDAGTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingSearchBindingTest test/Mapping/search_binding.cpp)
 add_llk_mapping_test(MappingWorkloadGraphTest test/Mapping/workload_graph.cpp)
 add_llk_mapping_test(MappingTileFactsTest test/Mapping/tile_facts.cpp)

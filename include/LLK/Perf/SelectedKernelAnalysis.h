@@ -39,6 +39,7 @@
 #include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/EventSchedule.h"
+#include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Perf/MicroDAG.h"
 
 #include "llvm/Support/Error.h"
@@ -86,11 +87,23 @@ struct SelectedKernelAnalysis {
   /// `dram -> sram` copy counts against both levels. A compute event carries no
   /// bytes and charges nothing.
   std::map<std::string, uint64_t> trafficBytes;
-  /// Peak simultaneous live tile bytes per memory space, the kernel's own
-  /// reservation (the same relation the storage planner's liveness summary
-  /// reports for a plan), from `micro.alloc`/`micro.tile_alloc`, copy results
-  /// and conversion results.
+  /// Peak simultaneous live tile bytes per memory space. When the caller
+  /// supplied the finalized plan this kernel was bound to, this is the plan's
+  /// own *R5 storage-liveness* peak; otherwise it is the extraction's
+  /// allocation accounting (`MicroDAG::liveTileBytesByMemory`), the kernel-side
+  /// analogue. `storageLivenessFromPlan` says which.
   std::map<std::string, uint64_t> peakBytes;
+  /// The reuse ordering edges the plan's liveness analysis requires: one per
+  /// accepted alias, from the step that last reads the reused buffer to the
+  /// step that first writes the alias. Empty unless `storageLivenessFromPlan`.
+  std::vector<mapping::PlanStepEdge> requiredReuseEdges;
+  /// True when `peakBytes` and `requiredReuseEdges` came from the finalized
+  /// plan's R5 storage liveness rather than the extraction's own accounting.
+  /// A caller that needs the liveness-derived occupancy -- the strict analysis
+  /// the brief requires -- passes the finalized plan and graph to
+  /// `analyzeSelectedKernel`; a kernel-only caller gets the extraction's
+  /// accounting and can read this flag to see that no plan liveness was run.
+  bool storageLivenessFromPlan = false;
   /// True only when every fact the stream needed was resolved.
   bool complete = false;
   /// The ordered reasons `complete` is false. Empty exactly when `complete`.
@@ -115,10 +128,54 @@ std::map<std::string, uint64_t> dagTrafficByMemory(const MicroDAG &dag);
 /// reason rather than a partial analysis; when it is clear, the partial
 /// analysis is returned with `complete == false` and its reasons, which is what
 /// an explicit analysis artifact reports.
+///
+/// The stream is the materialized kernel's own, so `events.source` is
+/// `PlanEventSource::Snapshot`. This form is given no plan, so it runs no
+/// storage liveness: `peakBytes` is the extraction's own allocation accounting
+/// and `storageLivenessFromPlan` is false. Use the plan-carrying overload below
+/// when the liveness-derived occupancy is required.
 llvm::Expected<SelectedKernelAnalysis>
 analyzeSelectedKernel(mlir::Operation *kernel,
                       const machine::MachineModel &machine,
                       bool requireComplete);
+
+/// The strict form, with the finalized plan the kernel was bound to: the
+/// analysis additionally carries the plan's R5 *storage-liveness* occupancy.
+///
+/// `finalizedPlan` must be the plan whose kernel is `kernel` (already through
+/// `finalizeStoragePlan`, so it carries its allocations, step DAG and movement
+/// hops) and `graph` the workload graph it was planned from. The liveness is
+/// run over the plan's own storage facts -- `buildPlanEvents(plan, machine,
+/// &graph)` scheduled exactly as `finalizeStoragePlan` schedules its occupancy
+/// probe, then `analyzeStorageLiveness` -- so `peakBytes` is the plan's
+/// capacity-verdict peak and `requiredReuseEdges` is the ordering that peak
+/// relies on, and neither is a second, weaker relation invented here.
+///
+/// A plan whose liveness cannot be established is an error under
+/// `requireComplete` and an explicit incomplete reason otherwise: the analysis
+/// never reports the extraction's allocation accounting as if it were the
+/// verified occupancy.
+///
+/// R5's signature is deliberately untouched: `analyzeStorageLiveness` keeps
+/// taking a `CoveringPlan`, and this overload is where a plan's liveness meets
+/// the kernel's analysis.
+llvm::Expected<SelectedKernelAnalysis> analyzeSelectedKernel(
+    mlir::Operation *kernel, const machine::MachineModel &machine,
+    bool requireComplete, const mapping::CoveringPlan &finalizedPlan,
+    const mapping::WorkloadGraph &graph);
+
+/// Overlays the finalized plan's R5 storage-liveness occupancy onto `analysis`
+/// in place: the peak becomes `live.peakBytes`, `requiredReuseEdges` its
+/// ordering, and `storageLivenessFromPlan` is set. On failure the reason is
+/// recorded and, when `requireComplete` is set, an error is returned. Exposed
+/// so a caller that already has the analysis can attach the plan's liveness
+/// without re-extracting the kernel.
+llvm::Error
+attachPlanStorageLiveness(SelectedKernelAnalysis &analysis,
+                          const mapping::CoveringPlan &finalizedPlan,
+                          const mapping::WorkloadGraph &graph,
+                          const machine::MachineModel &machine,
+                          bool requireComplete);
 
 /// The shared core of `analyzeSelectedKernel` over an already-extracted DAG.
 /// Exposed so a caller that needs the raw `MicroDAG` too -- the report builder,
