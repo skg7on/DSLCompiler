@@ -294,6 +294,14 @@ struct RecordedRuleSelection {
   /// port records into `portMemories` instead, because a kind-keyed map cannot
   /// tell two same-kind requirements apart.
   llvm::StringMap<std::string> memories;
+  /// The concrete compute node recorded for each of the rule's compute
+  /// requirement kinds, as generation records it
+  /// (`instance.computeBindings[requirement.kind]`). When a kind is present
+  /// here, verification checks *that* node -- it must exist, have the required
+  /// kind, and be attached to the recorded executor -- and never falls back to
+  /// the executor's first attached capability. Absent (a binding that predates
+  /// compute persistence) keeps the older existential check.
+  llvm::StringMap<std::string> computeBindings;
   /// The port to memory id assignment of every requirement that named a port,
   /// as generation records it (`instance.portMemoryBindings`). A named
   /// requirement is re-checked against *this*, never the kind-keyed map.

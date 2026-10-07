@@ -61,6 +61,31 @@ portMemoryBindingsString(const std::vector<PortMemoryBinding> &bindings) {
   return joinStrings(entries, ",");
 }
 
+/// The concrete compute nodes an instance or placement selected, rendered
+/// `<keyLen>:<key>=<valueLen>:<value>` and sorted. Length-delimited so a
+/// requirement key or node id that itself contains a separator, a `|`, or a
+/// newline cannot be mistaken for a field boundary -- two different selections
+/// can never render alike (issue #129, task R1). Empty for a rule that requires
+/// no compute capability, so the canonical string of such a value keeps its
+/// shape.
+std::string
+computeBindingsString(const llvm::StringMap<std::string> &bindings) {
+  std::vector<std::string> entries;
+  entries.reserve(bindings.size());
+  for (const auto &entry : bindings) {
+    std::string text = std::to_string(entry.first().size());
+    text += ':';
+    text += entry.first().str();
+    text += '=';
+    text += std::to_string(entry.second.size());
+    text += ':';
+    text += entry.second;
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return joinStrings(entries, ",");
+}
+
 /// Renders numeric ids as a sorted, comma-separated list, so id order in the
 /// source vector never leaks into a canonical string.
 template <typename Container> std::string joinNumbers(const Container &input) {
@@ -308,7 +333,11 @@ std::string canonicalCandidateString(const MappingCandidate &candidate) {
 }
 
 std::string canonicalInstanceString(const CandidateInstance &instance) {
-  std::string out = "candidate=";
+  // The `v3` tag makes the identity explicitly versioned (issue #129, task R1):
+  // a change to what the string folds -- here, dropping the derived
+  // `localCost` and folding the selected compute nodes length-delimited -- must
+  // not silently hash to the same id as the older content.
+  std::string out = "v3|candidate=";
   out += std::to_string(instance.candidate);
   out += "|bundle=";
   out += bundleString(instance.bundle);
@@ -328,13 +357,14 @@ std::string canonicalInstanceString(const CandidateInstance &instance) {
   out += "|solvedlayout=";
   out += solvedLayoutsString(instance.layoutSolutions);
   out += "|compute=";
-  out += joinStrings(sortedEntries(instance.computeBindings), ",");
+  out += computeBindingsString(instance.computeBindings);
   out += "|slots=";
   out += std::to_string(instance.resourceUsage.executorSlots);
   out += "|membytes=";
   out += joinStrings(sortedEntries(instance.resourceUsage.memoryBytes), ",");
-  out += "|cost=";
-  out += canonicalCostString(instance.localCost);
+  // `localCost` is deliberately absent (issue #129, task R1): it is a derived
+  // ranking score, not a decision, and folding it in forced a plan to carry its
+  // final score before it could acquire an id.
   return out;
 }
 
@@ -433,6 +463,14 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
     text += joinStrings(sortedEntries(placement.layouts), ",");
     text += ":solvedlayout=";
     text += solvedLayoutsString(placement.layoutSolutions);
+    // The concrete compute node each requirement selected joins the identity
+    // (issue #129, task R1), so two placements that differ only in which
+    // attached engine of a kind ran are distinct plans rather than colliding on
+    // one id and collapsing to the machine's first engine. Length-delimited via
+    // `computeBindingsString`, and empty for a rule that requires no compute
+    // capability.
+    text += ":compute=";
+    text += computeBindingsString(placement.computeBindings);
     placements.push_back(std::move(text));
   }
   llvm::sort(placements);
@@ -476,12 +514,16 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
 
   llvm::SmallVector<InstanceId> instances(plan.instances);
   llvm::SmallVector<ConnectionId> connections(plan.connections);
-  std::vector<std::string> errors(plan.diagnostics.errors);
-  std::vector<std::string> warnings(plan.diagnostics.warnings);
-  llvm::sort(errors);
-  llvm::sort(warnings);
 
-  std::string out = "binding=";
+  // The `v3` tag makes the identity explicitly versioned (issue #129, task R1).
+  // The derived ranking score (`totalCost`/`accumulatedCost`) and the
+  // diagnostic/truncation fields are deliberately absent: they are search
+  // outcomes and provenance, not decisions, and folding them in made a plan
+  // unable to acquire an id before it was scored. A plan's id therefore depends
+  // only on what it decided -- binding, selections, placements, routes and
+  // parameters -- so a preview has a complete identity before its final score
+  // exists.
+  std::string out = "v3|binding=";
   out += hexId(plan.sourceBindingHash);
   out += "|instances=";
   out += joinNumbers(instances);
@@ -493,14 +535,6 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
   out += joinStrings(connectionPlans, ";");
   out += "|params=";
   out += canonicalSearchValueString(plan.globalParameters);
-  out += "|cost=";
-  out += canonicalCostString(plan.totalCost);
-  out += "|errors=";
-  out += joinStrings(errors, ";");
-  out += "|warnings=";
-  out += joinStrings(warnings, ";");
-  out += "|truncated=";
-  out += plan.diagnostics.searchTruncated ? "1" : "0";
   return out;
 }
 

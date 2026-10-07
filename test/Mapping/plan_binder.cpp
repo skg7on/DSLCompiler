@@ -11,6 +11,8 @@
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 
+#include "resource_regression_fixture.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -22,8 +24,10 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace mlir;
 using namespace mlir::llk::mapping;
@@ -1662,7 +1666,7 @@ TEST(PlanBinder, RoundTripsConnectionEndpointsAndResourceBindings) {
 
   auto decoded = decodeSelectedPlan(*b->module, **target);
   ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
-  EXPECT_EQ(decoded->schemaVersion, 2u);
+  EXPECT_EQ(decoded->schemaVersion, 3u);
   EXPECT_EQ(decoded->id, p->id);
 
   ASSERT_EQ(decoded->connectionPlans.size(), p->connectionPlans.size());
@@ -1800,7 +1804,7 @@ TEST(PlanBinder, DecodeRejectsAnUnsupportedSchemaVersion) {
   ASSERT_TRUE(plan);
   NamedAttrList updated(plan);
   updated.set("schema_version",
-              IntegerAttr::get(IntegerType::get(f.context.get(), 64), 3));
+              IntegerAttr::get(IntegerType::get(f.context.get(), 64), 4));
   b->kernel->setAttr("micro.plan", updated.getDictionary(f.context.get()));
 
   auto decoded = decodeSelectedPlan(*b->module, *f.target);
@@ -2028,7 +2032,11 @@ module {
 
 } // namespace
 
-TEST(PlanBinder, DecodesUnambiguousV1Metadata) {
+// Sub-v3 metadata records no concrete compute selection, so a replay cannot
+// know which attached capability was selected. It is rejected with an explicit
+// migration diagnostic -- regenerate the binding -- rather than recovered by
+// guessing an engine from executor order (issue #129, task R1).
+TEST(PlanBinder, RejectsSubV3MetadataWithAMigrationDiagnostic) {
   Fixture f = makeFixture();
   ASSERT_TRUE(f.target);
   MLIRContext context;
@@ -2039,21 +2047,17 @@ TEST(PlanBinder, DecodesUnambiguousV1Metadata) {
   ASSERT_TRUE(module);
 
   auto decoded = decodeSelectedPlan(*module, *f.target);
-  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
-  EXPECT_EQ(decoded->schemaVersion, 1u);
-  EXPECT_EQ(decoded->id, 7u);
-  ASSERT_EQ(decoded->placements.size(), 1u);
-  EXPECT_EQ(decoded->placements[0].rule, "avx2.vector_add");
-  ASSERT_EQ(decoded->placements[0].layoutSolutions.size(), 1u);
-  const SolvedLayout &solved =
-      decoded->placements[0].layoutSolutions.lookup("avx2.blocked_2d");
-  EXPECT_EQ(solved.parameters.size(), 3u);
-  ASSERT_TRUE(solved.port.has_value());
-  EXPECT_EQ(solved.port->direction, PortDirection::Input);
-  EXPECT_EQ(solved.port->index, 0u);
+  ASSERT_FALSE(bool(decoded));
+  const std::string text = llvm::toString(decoded.takeError());
+  EXPECT_NE(text.find("schema version 1"), std::string::npos) << text;
+  EXPECT_NE(text.find("Re-run"), std::string::npos) << text;
 }
 
-TEST(PlanBinder, RejectsAmbiguousV1ExecutableReplay) {
+// The same rule applies to a sub-v3 binding whose missing associations used to
+// be "ambiguous": it is now uniformly rejected as the older schema it is,
+// because guessing the compute selection is not more recoverable than guessing
+// an endpoint.
+TEST(PlanBinder, RejectsAmbiguousV1MetadataAsSubV3) {
   Fixture f = makeFixture();
   ASSERT_TRUE(f.target);
   MLIRContext context;
@@ -2065,8 +2069,8 @@ TEST(PlanBinder, RejectsAmbiguousV1ExecutableReplay) {
 
   auto decoded = decodeSelectedPlan(*module, *f.target);
   ASSERT_FALSE(bool(decoded));
-  EXPECT_NE(llvm::toString(decoded.takeError()).find("ambiguous"),
-            std::string::npos);
+  const std::string text = llvm::toString(decoded.takeError());
+  EXPECT_NE(text.find("schema version 1"), std::string::npos) << text;
 }
 
 //===----------------------------------------------------------------------===//
@@ -4006,4 +4010,198 @@ TEST(PlanBinder, RejectsMovementDisconnectedFromSelectedConsumer) {
   auto e = verifyMappedMicroIR(*b->module, **target);
   EXPECT_TRUE(bool(e));
   llvm::consumeError(std::move(e));
+}
+
+//=============================================================================//
+// Issue #129, task R1: the selected compute node survives metadata
+//=============================================================================//
+
+namespace {
+
+/// Binds `plan` against a fresh clone of the case's source module, so two plans
+/// of one search never share a stamped kernel.
+llvm::Expected<BoundPlan> bindCloned(issue129::ResourceCase &c,
+                                     const CoveringPlan &plan) {
+  OwningOpRef<ModuleOp> module = cast<ModuleOp>((*c.source)->clone());
+  std::unique_ptr<PlanMaterializer> materializer =
+      mlir::llk::micro_mapping_detail::createCanonicalPlanMaterializer();
+  return bindPlan(*module, plan, *c.target, BindContract::Partial,
+                  materializer.get());
+}
+
+/// Records `id` as the selected `vector_engine` on every mapped operation that
+/// records a compute selection.
+void rewriteRecordedCompute(ModuleOp module, MLIRContext &context,
+                            llvm::StringRef id) {
+  module->walk([&](Operation *op) {
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping || !mapping.get("compute_bindings"))
+      return;
+    NamedAttrList fields(mapping);
+    fields.set("compute_bindings",
+               DictionaryAttr::get(
+                   &context,
+                   {NamedAttribute(StringAttr::get(&context, "vector_engine"),
+                                   StringAttr::get(&context, id))}));
+    op->setAttr("micro.mapping", fields.getDictionary(&context));
+  });
+}
+
+/// Binds the first plan of a two-compute search against a clone of the case's
+/// module, ready for a recorded-selection tamper.
+llvm::Expected<BoundPlan> bindFirstTwoComputePlan(issue129::ResourceCase &c) {
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(c, options);
+  if (!result)
+    return result.takeError();
+  if (result->plans.empty())
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the two-compute search produced no plan");
+  return bindCloned(c, result->plans.front());
+}
+
+} // namespace
+
+/// Every engine the search selected survives the metadata round trip: the
+/// binding records it on the mapped operation, `decodeSelectedPlan` restores it
+/// per placement, and the decoded plan keeps the id the search computed --
+/// which it can only do if the selection is part of canonical identity.
+TEST(PlanBinder, Issue129SelectedComputeSurvivesMetadataRoundTrip) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 2u);
+
+  std::set<std::string> decodedSelections;
+  for (const CoveringPlan &plan : result->plans) {
+    auto bound = bindCloned(*c, plan);
+    ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+    auto decoded = decodeSelectedPlan(*bound->module, *c->target);
+    ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+    EXPECT_EQ(decoded->schemaVersion, kMappingMetadataVersion);
+    EXPECT_EQ(decoded->id, plan.id);
+    ASSERT_EQ(decoded->placements.size(), plan.placements.size());
+    EXPECT_EQ(
+        decoded->placements.front().computeBindings.lookup("vector_engine"),
+        plan.placements.front().computeBindings.lookup("vector_engine"));
+    decodedSelections.insert(
+        decoded->placements.front().computeBindings.lookup("vector_engine"));
+
+    // A freshly bound v3 kernel verifies.
+    llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+    EXPECT_FALSE(bool(verified)) << llvm::toString(std::move(verified));
+    llvm::consumeError(std::move(verified));
+  }
+  EXPECT_EQ(decodedSelections, (std::set<std::string>{"vpu.a", "vpu.b"}));
+}
+
+/// Deleting the recorded compute container must not let verification fall back
+/// to the executor's first attached engine.
+TEST(PlanBinder, Issue129DeletingComputeBindingsIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  auto bound = bindCloned(*c, result->plans.front());
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+
+  eraseFromVectorMapping(*bound->module, *c->context, "compute_bindings");
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("compute_bindings"), std::string::npos) << text;
+}
+
+/// A recorded engine the machine does not declare is rejected by verification,
+/// never silently replaced.
+TEST(PlanBinder, Issue129UnknownRecordedComputeNodeIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  rewriteRecordedCompute(*bound->module, *c->context, "vpu.unknown");
+
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("vpu.unknown"), std::string::npos) << text;
+}
+
+/// A recorded engine whose *kind* is not the one the rule requires is rejected:
+/// the requirement is a capability class, not merely a node id.
+TEST(PlanBinder, Issue129WrongKindRecordedComputeNodeIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  // `mxu.a` is a real capability of the machine, but a `matrix_engine` -- not
+  // the `vector_engine` the rule requires.
+  rewriteRecordedCompute(*bound->module, *c->context, "mxu.a");
+
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("mxu.a"), std::string::npos) << text;
+  EXPECT_NE(text.find("matrix_engine"), std::string::npos) << text;
+}
+
+/// A recorded engine that exists and has the right kind but is not attached to
+/// the placement's executor is rejected too.
+TEST(PlanBinder, Issue129UnattachedRecordedComputeNodeIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  // `vpu.c` is a `vector_engine`, but attached to `dsp.0`, not the selected
+  // `e0`.
+  rewriteRecordedCompute(*bound->module, *c->context, "vpu.c");
+
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("vpu.c"), std::string::npos) << text;
+  EXPECT_NE(text.find("attached"), std::string::npos) << text;
+}
+
+/// Two placements of one instance must agree on the selected engine: a fused
+/// instance cannot claim two different capabilities. Two mapped operations are
+/// forced to share an instance id while their recorded compute selections
+/// differ, which is exactly the inconsistency verification must reject.
+TEST(PlanBinder, Issue129DifferingComputeInsideOneInstanceIsRejected) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindCanonical(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  llvm::SmallVector<Operation *> mapped;
+  b->module->walk([&](Operation *op) {
+    if (op->getAttrOfType<DictionaryAttr>("micro.mapping"))
+      mapped.push_back(op);
+  });
+  ASSERT_GE(mapped.size(), 2u);
+  auto first = mapped.front()->getAttrOfType<DictionaryAttr>("micro.mapping");
+  ASSERT_TRUE(first);
+  auto instance = first.getAs<IntegerAttr>("instance");
+  ASSERT_TRUE(instance);
+  Operation *second = mapped[1];
+  NamedAttrList fields(second->getAttrOfType<DictionaryAttr>("micro.mapping"));
+  fields.set("instance", instance);
+  second->setAttr("micro.mapping", fields.getDictionary(f.context.get()));
+
+  llvm::Error verified = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(verified));
+  EXPECT_NE(
+      llvm::toString(std::move(verified)).find("differing compute bindings"),
+      std::string::npos);
 }

@@ -309,6 +309,19 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attribute("bundle", placement.bundle.name);
             json.attribute("emitter", placement.bundle.emitterKey);
             json.attribute("executor", placement.executor);
+            // The concrete compute node each requirement selected (issue #129,
+            // task R1), sorted by requirement kind so the report stays
+            // byte-identical across runs (§29.12). Recorded even when empty, so
+            // a v3 reader can require the container and a replay cannot have
+            // its selection dropped and re-derived from executor order.
+            json.attributeObject("compute", [&] {
+              std::vector<std::string> keys;
+              for (const auto &entry : placement.computeBindings)
+                keys.push_back(entry.first().str());
+              llvm::sort(keys);
+              for (const std::string &key : keys)
+                json.attribute(key, placement.computeBindings.lookup(key));
+            });
             // `StringMap` iteration order is not a contract; sort the keys so
             // the report stays byte-identical across runs (§29.12).
             json.attributeObject("memories", [&] {
@@ -650,7 +663,13 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
     return reportError("plan report is not a JSON object");
   std::optional<int64_t> version = root->getInteger("version");
   if (!version || *version != static_cast<int64_t>(kPlanReportVersion))
-    return reportError("plan report has an unsupported version");
+    return reportError(
+        "plan report has an unsupported version: this reader requires " +
+        std::to_string(kPlanReportVersion) +
+        " (issue #129, task R1). An older report records no concrete compute "
+        "selection, so which attached capability ran cannot be recovered from "
+        "it; re-run the mapping search to regenerate the report under the "
+        "current schema");
   std::optional<llvm::StringRef> targetHash = root->getString("targetHash");
   if (!targetHash || *targetHash != hexId(computeTargetContentHash(target)))
     return reportError(
@@ -668,7 +687,7 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
     return reportError("plan report has no selectedState");
 
   CoveringPlan plan;
-  plan.schemaVersion = 2;
+  plan.schemaVersion = kPlanReportVersion;
   if (std::optional<llvm::StringRef> id = state->getString("id"))
     plan.id = parseHexId(*id);
   if (std::optional<llvm::StringRef> binding =
@@ -714,6 +733,20 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
       if (std::optional<llvm::StringRef> executor =
               object->getString("executor"))
         placement.executor = executor->str();
+      // The concrete compute node each requirement selected (issue #129, task
+      // R1). A v3 report always records the container (it may be empty only for
+      // a rule that requires no compute capability), so deleting it cannot skip
+      // the selection and let a reader re-derive an engine from executor order.
+      const llvm::json::Object *compute = object->getObject("compute");
+      if (!compute)
+        return reportError(
+            "plan report placement records no compute selection");
+      for (const auto &entry : *compute) {
+        std::optional<llvm::StringRef> value = entry.second.getAsString();
+        if (!value)
+          return reportError("plan report compute selection is not a string");
+        placement.computeBindings[entry.first] = value->str();
+      }
       if (const llvm::json::Object *memories = object->getObject("memories"))
         for (const auto &entry : *memories)
           if (std::optional<llvm::StringRef> value = entry.second.getAsString())

@@ -8,10 +8,17 @@
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
+#include "resource_regression_fixture.h"
+
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
 
+#include "llvm/Support/Error.h"
+
 #include <gtest/gtest.h>
+
+#include <set>
+#include <string>
 
 using namespace mlir::llk::mapping;
 
@@ -684,4 +691,72 @@ TEST(CostEvent, ConnectionSignatureIsNotAmbiguousConcatenation) {
   OperationOnlyProvider provider;
   TargetContext context{"target", "machine", "rules", "layouts"};
   EXPECT_FALSE(provider.lookupCycles(first, context).has_value());
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R1: normalized events use the recorded compute selection
+//===----------------------------------------------------------------------===//
+
+/// The first-engine probe. Two attached vector engines produce two complete
+/// plans; each plan's compute event must name the engine *that plan selected*,
+/// not the executor's first attached capability. Before the repair both plans
+/// normalized their event resource as `vpu.a`.
+TEST(CostModel, Issue129PlanEventsNameTheRecordedComputeSelection) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 2u);
+
+  std::set<std::string> resources;
+  for (const CoveringPlan &plan : result->plans) {
+    llvm::Expected<PlanEventDAG> dag =
+        buildPlanEvents(plan, c->target->machine());
+    ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+    ASSERT_FALSE(dag->events.empty());
+    EXPECT_EQ(dag->events.front().event.kind, CostEventKind::Compute);
+    resources.insert(dag->events.front().event.resource);
+  }
+  EXPECT_EQ(resources, (std::set<std::string>{"vpu.a", "vpu.b"}));
+}
+
+/// A recorded selection that no longer resolves is an error, never silently
+/// replaced by the executor's first engine. The same plan with a tampered
+/// engine id must not normalize to a *different* engine.
+TEST(CostModel, Issue129AnUnknownRecordedComputeNodeIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  CoveringPlan plan = result->plans.front();
+  ASSERT_FALSE(plan.placements.empty());
+  plan.placements.front().computeBindings["vector_engine"] = "vpu.unknown";
+  llvm::Expected<PlanEventDAG> dag =
+      buildPlanEvents(plan, c->target->machine());
+  ASSERT_FALSE(bool(dag));
+  EXPECT_NE(llvm::toString(dag.takeError()).find("vpu.unknown"),
+            std::string::npos);
+}
+
+/// Two placements that differ only in the selected engine are different work,
+/// so a measured cost must not be reused across them: the operation signature's
+/// compute field is what separates the keys.
+TEST(CostModel, Issue129OperationSignatureSeparatesSelectedEngines) {
+  OperationSignature a;
+  a.operation = "micro.vector";
+  a.rule = "issue129.vector_add";
+  a.compute = "vector_engine=vpu.a";
+  OperationSignature b = a;
+  b.compute = "vector_engine=vpu.b";
+  EXPECT_NE(a.canonicalString(), b.canonicalString());
+  OperationSignature same = a;
+  EXPECT_EQ(a.canonicalString(), same.canonicalString());
 }

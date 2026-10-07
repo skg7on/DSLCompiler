@@ -368,8 +368,11 @@ std::string placementIdentity(const CandidateInstance &instance) {
 }
 
 /// Canonical placement order (design §22.1): the executor id, then the sorted
-/// memory bindings, then the sorted layout bindings. Node and instance ids
-/// break a tie so the order over a complete plan is total.
+/// memory bindings, then the sorted layout bindings, then the selected compute
+/// nodes. Node and instance ids break a tie so the order over a complete plan
+/// is total. Two placements that differ only in which attached engine of a kind
+/// they selected are ordered by that selection, not left to the order the
+/// instances happened to be enumerated in.
 bool placementBefore(const PlanPlacement &lhs, const PlanPlacement &rhs) {
   if (lhs.executor != rhs.executor)
     return lhs.executor < rhs.executor;
@@ -387,6 +390,10 @@ bool placementBefore(const PlanPlacement &lhs, const PlanPlacement &rhs) {
   std::vector<std::string> rhsLayouts = sortedBindings(rhs.layouts);
   if (lhsLayouts != rhsLayouts)
     return lhsLayouts < rhsLayouts;
+  std::vector<std::string> lhsComputes = sortedBindings(lhs.computeBindings);
+  std::vector<std::string> rhsComputes = sortedBindings(rhs.computeBindings);
+  if (lhsComputes != rhsComputes)
+    return lhsComputes < rhsComputes;
   if (lhs.node != rhs.node)
     return lhs.node < rhs.node;
   return lhs.instance < rhs.instance;
@@ -710,6 +717,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                     entry.instance.executorBindings.lookup("executor")))
               signature.placementClass = executor->kind;
             signature.placement = placementIdentity(entry.instance);
+            // The selected concrete compute nodes belong in the key too (issue
+            // #129, task R1): two placements of one rule on one executor that
+            // selected different attached engines are different work, so a
+            // measurement taken on one must not be reused for the other.
+            signature.compute =
+                llvm::join(sortedBindings(entry.instance.computeBindings), ",");
             // The target identity is more than the machine (task B8): a change
             // to the rule or layout library changes what a measurement means,
             // so both content hashes join the context.
@@ -2063,6 +2076,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // The solved parameterization travels with the binding, so a selected
       // plan says which one it chose rather than only naming the layout family.
       placement.layoutSolutions = instance->layoutSolutions;
+      // The concrete compute node each requirement selected travels with the
+      // placement too (issue #129, task R1). This is a *copy* of the selected
+      // instance's decision, never a fresh query against the machine: a fused
+      // instance produces one placement per covered node and every one of them
+      // carries the same selected engines, so a later stage cannot re-derive a
+      // different first engine from executor order.
+      placement.computeBindings = instance->computeBindings;
       plan.placements.push_back(std::move(placement));
     }
     llvm::sort(plan.placements, placementBefore);

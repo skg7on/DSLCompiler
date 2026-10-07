@@ -3,9 +3,12 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/LatencyProvider.h"
+#include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/TileFacts.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
+
+#include "resource_regression_fixture.h"
 
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/MLIRContext.h"
@@ -20,6 +23,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <variant>
 #include <vector>
@@ -1171,7 +1175,12 @@ values(std::initializer_list<std::pair<llvm::StringRef, SearchValue>> entries) {
 // connection's producer/consumer ports now join their content keys, so two uses
 // of one value are distinct. The plan id changed once when those were resolved
 // (task A2); from then on it is content-stable.
-constexpr PlanId kNoBindingPlanId = 16999786886447551871ULL;
+//
+// Re-baselined for issue #129 task R1 (schema v3): the canonical instance and
+// plan forms each gained a leading `v3|` schema tag and the selected compute
+// bindings, and lost the derived `localCost`/score and diagnostic fields. The
+// v3 form is what a plan id is computed from now, so this pin moves with it.
+constexpr PlanId kNoBindingPlanId = 11768839360329919068ULL;
 
 //===----------------------------------------------------------------------===//
 // Search bound fixtures
@@ -5192,4 +5201,129 @@ TEST(CoveringSearch, RejectsConflictingRequirementsOnOneEndpoint) {
   EXPECT_TRUE(result->plans.empty())
       << "conflicting endpoint requirements produced " << result->plans.size()
       << " plans";
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R1: the selected compute node survives the search
+//===----------------------------------------------------------------------===//
+
+/// Two attached vector engines of one kind are two legal placements of one
+/// rule. The selected engine must travel into every complete plan instead of
+/// collapsing to the executor's first attached capability: the two plans name
+/// `vpu.a` and `vpu.b`, and their ids differ because the decision differs.
+TEST(CoveringSearch, Issue129TwoComputePlansKeepTheirSelectedEngine) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 2u);
+  std::set<std::string> selected;
+  for (const auto &plan : result->plans)
+    selected.insert(
+        plan.placements.front().computeBindings.lookup("vector_engine"));
+  EXPECT_EQ(selected, (std::set<std::string>{"vpu.a", "vpu.b"}));
+  EXPECT_NE(result->plans[0].id, result->plans[1].id);
+}
+
+/// Reversing the machine's engine declaration order must not change which
+/// engines are selected, nor which plan ranks first: placement order is decided
+/// by the selected binding (`vpu.a` before `vpu.b`), never by the order the
+/// machine happened to list the capabilities in.
+TEST(CoveringSearch, Issue129ReversingEngineOrderKeepsTheSelections) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto forward = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(forward)) << llvm::toString(forward.takeError());
+  ASSERT_EQ(forward->plans.size(), 2u);
+
+  // The same machine with its two attached engines declared in the other order.
+  MachineModel reversed = c->target->machine();
+  std::reverse(reversed.computes.begin(), reversed.computes.end());
+  c->target = std::make_unique<FileMappingTarget>(
+      "issue129", reversed, LayoutRegistry(c->target->layouts()),
+      RuleRegistry(c->target->rules()),
+      std::vector<std::string>{"issue129_vector_add"});
+  auto backward = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(backward)) << llvm::toString(backward.takeError());
+  ASSERT_EQ(backward->plans.size(), 2u);
+
+  auto selections = [](const MappingSearchResult &result) {
+    std::set<std::string> engines;
+    for (const auto &plan : result.plans)
+      engines.insert(
+          plan.placements.front().computeBindings.lookup("vector_engine"));
+    return engines;
+  };
+  EXPECT_EQ(selections(*forward), selections(*backward));
+  EXPECT_EQ(selections(*backward), (std::set<std::string>{"vpu.a", "vpu.b"}));
+  EXPECT_EQ(forward->plans.front().placements.front().computeBindings.lookup(
+                "vector_engine"),
+            backward->plans.front().placements.front().computeBindings.lookup(
+                "vector_engine"));
+
+  // The reports are byte-identical too: node declaration order is normalized
+  // out of the machine content hash and out of every canonical plan id, so a
+  // reordering of equivalent capabilities changes neither a selection nor the
+  // bytes a reader compares.
+  ASSERT_FALSE(forward->plans.empty());
+  const std::string forwardReport =
+      writePlanReport(*forward, c->target->machine(), *c->target, options,
+                      forward->workloadHash);
+  const std::string backwardReport =
+      writePlanReport(*backward, c->target->machine(), *c->target, options,
+                      backward->workloadHash);
+  EXPECT_EQ(forwardReport, backwardReport);
+}
+
+/// The canonical identity depends on what a plan *decided*. Changing only the
+/// selected engine changes it; changing only a derived score, a diagnostic, or
+/// the truncation flag does not -- so a preview can acquire a valid id before
+/// it is scored, and a score can never be what distinguishes two plans.
+TEST(CoveringSearch, Issue129IdentityDependsOnDecisionsNotScores) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan plan = result->plans.front();
+  ASSERT_FALSE(plan.placements.empty());
+
+  // Change *only* the selected engine: the id must change.
+  CoveringPlan otherEngine = plan;
+  llvm::StringMap<std::string> &bindings =
+      otherEngine.placements.front().computeBindings;
+  const std::string selected = bindings.lookup("vector_engine");
+  bindings["vector_engine"] = selected == "vpu.a" ? "vpu.b" : "vpu.a";
+  EXPECT_NE(computePlanId(plan), computePlanId(otherEngine));
+
+  // Change only derived scores, diagnostics and the truncation flag: the id
+  // must not.
+  CoveringPlan scored = plan;
+  scored.totalCost.latencyCycles = 12345.0;
+  scored.accumulatedCost.latencyCycles = 999.0;
+  scored.scoreSource = PlanScoreSource::Schedule;
+  scored.diagnostics.errors.push_back("a diagnostic that is not a decision");
+  scored.diagnostics.warnings.push_back("a warning that is not a decision");
+  scored.diagnostics.searchTruncated = true;
+  EXPECT_EQ(computePlanId(plan), computePlanId(scored));
+
+  // The same rule holds for an instance's own identity.
+  CandidateInstance instance;
+  instance.candidate = 7;
+  instance.computeBindings["vector_engine"] = "vpu.a";
+  instance.localCost.latencyCycles = 4.0;
+  CandidateInstance rescored = instance;
+  rescored.localCost.latencyCycles = 4096.0;
+  EXPECT_EQ(computeInstanceId(instance), computeInstanceId(rescored));
+  rescored.computeBindings["vector_engine"] = "vpu.b";
+  EXPECT_NE(computeInstanceId(instance), computeInstanceId(rescored));
 }

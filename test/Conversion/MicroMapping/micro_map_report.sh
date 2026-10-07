@@ -31,10 +31,11 @@ KERNEL="$SRC/test/Conversion/MicroMapping/micro_map.mlir"
 "$LLK_OPT" "--micro-map=$OPTIONS" "$KERNEL" > "$WORK/without_report.mlir"
 
 # 1. The report exists and names the current schema version and a selected plan.
-# The version is pinned because A1/A2 moved every plan id; a report claiming an
-# older version would carry ids under the wrong semantics. The trailing
-# delimiter keeps `2` from matching `21`.
-grep -Eq '"version" *: *2[,}]' "$WORK/report_a.json"
+# The version is pinned because A1/A2 (and issue #129 task R1, which made the
+# form v3) moved every plan id; a report claiming an older version would carry
+# ids under the wrong semantics. The trailing delimiter keeps `3` from matching
+# `31`.
+grep -Eq '"version" *: *3[,}]' "$WORK/report_a.json"
 grep -q '"selectedPlanId"' "$WORK/report_a.json"
 grep -q '"compilerVersion"' "$WORK/report_a.json"
 

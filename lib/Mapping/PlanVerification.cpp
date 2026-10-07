@@ -681,6 +681,17 @@ bool kernelUsesSchemaV2(mlir::Operation *op) {
   return kernelMetadataIsSchemaV2(kernel);
 }
 
+/// True when the kernel's `micro.plan` records a schema-v3 (or newer) binding.
+/// Delegates to `kernelMetadataIsSchemaV3`, so a deleted `schema_version`
+/// cannot downgrade a binding that still records `compute_bindings` -- the
+/// v3-only field that proves a concrete compute selection was persisted.
+bool kernelUsesSchemaV3(mlir::Operation *op) {
+  mlir::Operation *kernel = enclosingKernel(op);
+  if (!kernel)
+    return false;
+  return kernelMetadataIsSchemaV3(kernel);
+}
+
 } // namespace
 
 llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
@@ -890,6 +901,14 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     return {found->second, {}};
   };
 
+  // The compute selection each instance recorded, so the different placements
+  // of one fused instance can be required to agree on it (issue #129, task R1).
+  // Keyed by (kernel, instance id): instance ids are content hashes, but two
+  // kernels in one module are separate bindings and must not be conflated.
+  llvm::DenseMap<std::pair<mlir::Operation *, uint64_t>,
+                 llvm::StringMap<std::string>>
+      instanceComputeBindings;
+
   module->walk([&](mlir::Operation *op) {
     if (failure)
       return;
@@ -904,6 +923,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       return;
     }
     const bool schemaV2 = kernelUsesSchemaV2(op);
+    const bool schemaV3 = kernelUsesSchemaV3(op);
 
     llvm::Expected<std::string> ruleId =
         readMetadataString(mapping, "rule", where);
@@ -1080,9 +1100,46 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       }
     }
 
+    // The concrete compute node each requirement selected (issue #129, task
+    // R1). A v3 binding records the container, so deleting it cannot let a
+    // reader re-derive an engine from executor order. Every recorded node must
+    // exist, have the required kind and be attached to the recorded executor --
+    // `verifyRuleSelection` re-checks that against the rule -- and every
+    // placement of one instance must record the *same* selection, so a fused
+    // instance cannot claim two different engines.
+    llvm::StringMap<std::string> computes;
+    if (mlir::Attribute rawComputes = mapping.get("compute_bindings")) {
+      llvm::Expected<llvm::StringMap<std::string>> read =
+          readMetadataStringMap(rawComputes, "compute_bindings", where);
+      if (!read) {
+        failMetadata(read.takeError());
+        return;
+      }
+      computes = std::move(*read);
+    } else if (schemaV3) {
+      failMetadata(bindError(
+          where + ": micro.mapping records no 'compute_bindings' for a v3 "
+                  "binding"));
+      return;
+    }
+    if (auto recordedInstance = mapping.getAs<mlir::IntegerAttr>("instance")) {
+      uint64_t instance = recordedInstance.getValue().getZExtValue();
+      std::pair<mlir::Operation *, uint64_t> key{enclosingKernel(op), instance};
+      auto entry = instanceComputeBindings.find(key);
+      if (entry == instanceComputeBindings.end())
+        instanceComputeBindings.insert({key, computes});
+      else if (entry->second != computes) {
+        fail(DiagnosticCode::UnsupportedComputeFragment,
+             where + ": instance " + std::to_string(instance) +
+                 " records differing compute bindings across its placements");
+        return;
+      }
+    }
+
     WorkloadNode endpoint = strippedWorkloadNode(*lookup.node);
     RecordedRuleSelection selection;
     selection.executor = *executor;
+    selection.computeBindings = std::move(computes);
     for (const auto &entry : memories)
       selection.memories[entry.first()] = entry.second;
     selection.portMemories = std::move(portMemories);

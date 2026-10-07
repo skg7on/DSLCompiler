@@ -84,6 +84,62 @@ const machine::LinkEdge *linkBetween(const machine::MachineModel &machine,
   return nullptr;
 }
 
+/// The compute node a placement *recorded* as selected, validated against the
+/// machine before its id is used (issue #129, task R1). Returns:
+///
+///   - null when the placement recorded no compute binding -- a hand-built or
+///     pre-#129 plan -- so the caller keeps the executor-based fallback;
+///   - the selected node otherwise, preferring a vector engine, then a matrix
+///     engine, then the first selection in sorted key order. That mirrors the
+///     priority `engineForExecutor` applies to an executor's attachments, so a
+///     single-capability placement normalizes exactly as it did before;
+///   - an error when a recorded node is unknown to the machine, or when it is
+///     not attached to the placement's executor. A recorded selection that no
+///     longer resolves is never silently replaced by executor order: that is
+///     the very re-derivation this task removes.
+llvm::Expected<const machine::ComputeNode *>
+recordedComputeNode(const machine::MachineModel &machine,
+                    const PlanPlacement &placement) {
+  if (placement.computeBindings.empty())
+    return static_cast<const machine::ComputeNode *>(nullptr);
+  // Sorted keys, so the choice is a function of the recorded content and never
+  // of `StringMap` iteration order.
+  std::vector<std::string> keys;
+  keys.reserve(placement.computeBindings.size());
+  for (const auto &entry : placement.computeBindings)
+    keys.push_back(entry.first().str());
+  llvm::sort(keys);
+  const machine::ComputeNode *vector = nullptr;
+  const machine::ComputeNode *matrix = nullptr;
+  const machine::ComputeNode *other = nullptr;
+  for (const std::string &key : keys) {
+    const std::string &id = placement.computeBindings.lookup(key);
+    const machine::ComputeNode *node = machine.findCompute(id);
+    if (!node)
+      return planEventError(
+          "plan events: placement for node " + llvm::Twine(placement.node) +
+          " records compute node '" + id + "', which machine '" +
+          machine.target + "' does not declare");
+    if (!placement.executor.empty() && node->attachedTo != placement.executor)
+      return planEventError("plan events: placement for node " +
+                            llvm::Twine(placement.node) +
+                            " records compute node '" + id +
+                            "', which is not attached to its executor '" +
+                            placement.executor + "'");
+    if (node->kind == "vector_engine" && !vector)
+      vector = node;
+    else if (node->kind == "matrix_engine" && !matrix)
+      matrix = node;
+    else if (!other)
+      other = node;
+  }
+  if (vector)
+    return vector;
+  if (matrix)
+    return matrix;
+  return other;
+}
+
 /// The node a connection serves, for the data dependency from a movement to the
 /// consumer that reads it: the first consumer instance's covered node.
 std::optional<WorkloadNodeId> consumerNodeOf(const CoveringPlan &plan,
@@ -245,8 +301,18 @@ buildPlanEvents(const CoveringPlan &plan,
                               llvm::Twine(step->node) +
                               ", which no placement covers");
       const PlanPlacement &placed = *placement->second;
-      const machine::ComputeNode *engine =
-          engineForExecutor(machine, placed.executor);
+      // The selected engine comes from the placement's *recorded* compute
+      // binding when it has one; only a placement that recorded no selection
+      // falls back to the executor's first attached engine (issue #129, task
+      // R1). A plan that recorded a selection which no longer resolves is an
+      // error, not a silent re-derivation.
+      llvm::Expected<const machine::ComputeNode *> recorded =
+          recordedComputeNode(machine, placed);
+      if (!recorded)
+        return recorded.takeError();
+      const machine::ComputeNode *engine = *recorded;
+      if (!engine)
+        engine = engineForExecutor(machine, placed.executor);
       if (!engine)
         return planEventError("plan events: machine '" + machine.target +
                               "' declares no compute resource for node " +
@@ -561,13 +627,17 @@ connectionSignatureFor(const ConnectionPlan &connection,
   }
   signature.maps = maps;
 
-  // The concrete parameters: the transform's layout families and, for a gather,
-  // its declared semantics and axis (execution-affecting content the canonical
-  // connection string already folds).
+  // The concrete parameters: the transform's layout families *and the concrete
+  // compute resource it runs on* (issue #129, task R1 -- a transform on two
+  // different engines is different work), plus, for a gather, its declared
+  // semantics and axis (execution-affecting content the canonical connection
+  // string already folds).
   std::string parameters;
   if (connection.transform) {
     parameters = connection.transform->srcLayout + "->" +
                  connection.transform->dstLayout;
+    if (!connection.transform->computeResource.empty())
+      parameters += ";compute=" + connection.transform->computeResource;
   }
   if (connection.gatherSemantics) {
     if (!parameters.empty())

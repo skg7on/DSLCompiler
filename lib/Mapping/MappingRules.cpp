@@ -2288,10 +2288,35 @@ llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
                         "' does not satisfy the rule's required kind '" +
                         requirement.kind + "'");
 
-  // 5. Attached compute capabilities.
+  // 5. Attached compute capabilities. When the binding records which concrete
+  // node it selected, verification checks *that* node -- it must exist, carry
+  // the required kind, and be attached to the recorded executor -- and never
+  // falls back to the executor's first attached capability (issue #129, task
+  // R1). A binding that records none keeps the older existential check, so a
+  // pre-v3 plan stays verifiable while a recorded selection is authoritative.
   for (const KindRequirement &requirement : rule.kindRequirements) {
     if (requirement.role != "compute")
       continue;
+    auto recorded = selection.computeBindings.find(requirement.kind);
+    if (recorded != selection.computeBindings.end()) {
+      const mlir::llk::machine::ComputeNode *node =
+          machine.findCompute(recorded->second);
+      if (!node)
+        return reject(DiagnosticCode::UnsupportedComputeFragment,
+                      "unknown compute node '" + recorded->second + "'");
+      if (node->kind != requirement.kind)
+        return reject(DiagnosticCode::UnsupportedComputeFragment,
+                      "compute node '" + recorded->second + "' has kind '" +
+                          node->kind + "', not the required '" +
+                          requirement.kind + "'");
+      if (node->attachedTo != selection.executor)
+        return reject(DiagnosticCode::UnsupportedComputeFragment,
+                      "compute node '" + recorded->second +
+                          "' is attached to '" + node->attachedTo +
+                          "', not to the recorded executor '" +
+                          selection.executor + "'");
+      continue;
+    }
     bool attached = false;
     for (const mlir::llk::machine::ComputeNode *compute :
          machine.computesFor(selection.executor))

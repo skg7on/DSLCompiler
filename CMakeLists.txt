@@ -905,8 +905,30 @@ function(add_llk_mapping_test test_name test_file)
   add_test(NAME ${test_name} COMMAND ${test_name})
 endfunction()
 
+# Issue #129 shared regression fixture. One constructor builds the small
+# mapping scenarios the resource/cost repair regresses against, from finite
+# MachineModel data, LLKMap text and parsed Micro-IR -- so a regression never
+# has to call production search or storage planning to know what to expect. It
+# links only the mapping core and the Micro dialect (no perf, runtime or JIT
+# library) and is linked into integration regression tests alone. As a plain
+# library it must carry LLVM's -fno-rtti/-fno-exceptions, or emitting the
+# llvm::Error vtable references a typeinfo LLVM's build does not contain.
+add_library(LLKResourceRegressionFixture STATIC
+    test/Mapping/resource_regression_fixture.cpp
+)
+target_include_directories(LLKResourceRegressionFixture PUBLIC
+    ${CMAKE_SOURCE_DIR}/test/Mapping
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+target_link_libraries(LLKResourceRegressionFixture PUBLIC LLKMapping)
+target_compile_options(LLKResourceRegressionFixture PRIVATE -fno-rtti -fno-exceptions)
+mlir_target_link_libraries(LLKResourceRegressionFixture PRIVATE MicroDialect)
+
 add_llk_mapping_test(MappingStableHashTest test/Mapping/stable_hash.cpp)
+target_link_libraries(MappingStableHashTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingCostModelTest test/Mapping/cost_model.cpp)
+target_link_libraries(MappingCostModelTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingSearchBindingTest test/Mapping/search_binding.cpp)
 add_llk_mapping_test(MappingWorkloadGraphTest test/Mapping/workload_graph.cpp)
 add_llk_mapping_test(MappingTileFactsTest test/Mapping/tile_facts.cpp)
@@ -916,6 +938,7 @@ add_llk_mapping_test(MappingRulesTest test/Mapping/mapping_rules.cpp)
 add_llk_mapping_test(MappingPlacementTest test/Mapping/placement.cpp)
 add_llk_mapping_test(MappingConnectionsTest test/Mapping/connections.cpp)
 add_llk_mapping_test(MappingCoveringSearchTest test/Mapping/covering_search.cpp)
+target_link_libraries(MappingCoveringSearchTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingStoragePlanTest test/Mapping/storage_plan.cpp)
 add_llk_mapping_test(MappingAvx2TargetTest test/Mapping/avx2_target.cpp)
 add_llk_mapping_test(MappingGenericAcceleratorTargetTest test/Mapping/generic_accelerator_target.cpp)
@@ -933,6 +956,7 @@ target_compile_definitions(MappingPlanBinderTest PRIVATE
     LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping"
     LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
     LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(MappingPlanBinderTest PRIVATE LLKResourceRegressionFixture)
 add_test(NAME MappingPlanBinderTest COMMAND MappingPlanBinderTest)
 # The workflow test also compiles a mapped kernel to a runnable executable
 # (stage C5), so it links the shared mapped-compilation library rather than the
@@ -948,6 +972,7 @@ target_compile_definitions(MappingE2EWorkflowTest PRIVATE
 add_test(NAME MappingE2EWorkflowTest COMMAND MappingE2EWorkflowTest)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
+target_link_libraries(MappingPlanReportTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingPropertiesTest test/Mapping/properties.cpp)
 
 # SearchBinding loader (phase-4 task 1): micro.candidate -> mapping::SearchBinding.

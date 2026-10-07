@@ -21,6 +21,8 @@
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 
+#include "resource_regression_fixture.h"
+
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -34,6 +36,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -147,7 +150,8 @@ TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
   ASSERT_TRUE(root);
 
   EXPECT_TRUE(root->getInteger("version").has_value());
-  EXPECT_EQ(*root->getInteger("version"), 2);
+  EXPECT_EQ(*root->getInteger("version"),
+            static_cast<int64_t>(kPlanReportVersion));
   EXPECT_TRUE(root->getString("compilerVersion").has_value());
   EXPECT_NE(*root->getString("compilerVersion"), "llk-compiler");
   EXPECT_TRUE(root->getInteger("costModelVersion").has_value());
@@ -417,8 +421,9 @@ TEST(MappingPlanReportTest, RegistryHashChangesWithContent) {
 // Versioned replay (task B1)
 //===----------------------------------------------------------------------===//
 
-// A v2 report round-trips the selected state: reading it back reconstructs the
-// same plan identity, endpoints, routes and solved-layout assignments.
+// A v3 report round-trips the selected state: reading it back reconstructs the
+// same plan identity, endpoints, routes, solved-layout assignments and selected
+// compute nodes.
 TEST(MappingPlanReportTest, ReplayReportRoundTripsSelectedState) {
   Parsed parsed = parseKernel(kKernel);
   ASSERT_TRUE(parsed.module);
@@ -442,7 +447,7 @@ TEST(MappingPlanReportTest, ReplayReportRoundTripsSelectedState) {
       readPlanReport(report, **target, *graph);
   ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
   EXPECT_EQ(replay->id, selected.id);
-  EXPECT_EQ(replay->schemaVersion, 2u);
+  EXPECT_EQ(replay->schemaVersion, 3u);
   EXPECT_EQ(replay->sourceBindingHash, selected.sourceBindingHash);
 
   ASSERT_EQ(replay->placements.size(), selected.placements.size());
@@ -451,6 +456,14 @@ TEST(MappingPlanReportTest, ReplayReportRoundTripsSelectedState) {
     EXPECT_EQ(replay->placements[i].instance, selected.placements[i].instance);
     EXPECT_EQ(replay->placements[i].rule, selected.placements[i].rule);
     EXPECT_EQ(replay->placements[i].executor, selected.placements[i].executor);
+    // The concrete compute node the placement selected survives the report
+    // (issue #129, task R1): a replay must read the recorded engine, not
+    // re-derive one from the executor.
+    EXPECT_EQ(replay->placements[i].computeBindings.size(),
+              selected.placements[i].computeBindings.size());
+    for (const auto &entry : selected.placements[i].computeBindings)
+      EXPECT_EQ(replay->placements[i].computeBindings.lookup(entry.first()),
+                entry.second);
     EXPECT_EQ(replay->placements[i].layoutSolutions.size(),
               selected.placements[i].layoutSolutions.size());
     // An `AffineMap` is context-bound and a replay re-derives it from the
@@ -663,5 +676,95 @@ TEST(MappingPlanReportTest, ReplayRejectsAChangedInputGraph) {
       readPlanReport(report, **target, *changedGraph);
   ASSERT_FALSE(static_cast<bool>(replay));
   EXPECT_NE(llvm::toString(replay.takeError()).find("graph"),
+            std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R1: the selected compute node survives the report
+//===----------------------------------------------------------------------===//
+
+/// Each attached engine the search selected survives the report read, so a
+/// caller holding only the report can tell which capability ran.
+TEST(MappingPlanReportTest, Issue129SelectedComputeSurvivesReportReplay) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &selected = result->plans.front();
+  ASSERT_FALSE(selected.placements.empty());
+
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, stableHash("case"));
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_TRUE(bool(replay)) << llvm::toString(replay.takeError());
+  ASSERT_FALSE(replay->placements.empty());
+  EXPECT_EQ(replay->id, selected.id);
+  EXPECT_EQ(
+      replay->placements.front().computeBindings.lookup("vector_engine"),
+      selected.placements.front().computeBindings.lookup("vector_engine"));
+  EXPECT_TRUE(replay->placements.front().computeBindings.lookup(
+                  "vector_engine") == "vpu.a" ||
+              replay->placements.front().computeBindings.lookup(
+                  "vector_engine") == "vpu.b");
+}
+
+/// A report written under an older schema records no compute selection, so it
+/// must be rejected with an unsupported-schema diagnostic and regeneration
+/// guidance rather than replayed with a guessed engine.
+TEST(MappingPlanReportTest, Issue129RejectsAnOlderReportSchema) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, stableHash("case"));
+
+  const std::string current =
+      "\"version\": " + std::to_string(kPlanReportVersion);
+  size_t position = report.find(current);
+  ASSERT_NE(position, std::string::npos);
+  report.replace(position, current.size(), "\"version\": 2");
+
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_FALSE(bool(replay));
+  const std::string text = llvm::toString(replay.takeError());
+  EXPECT_NE(text.find("unsupported"), std::string::npos) << text;
+  EXPECT_NE(text.find("re-run"), std::string::npos) << text;
+}
+
+/// A change to the *machine* content invalidates the report: a plan bound for a
+/// machine whose capabilities differ is not the same plan, so a fresh target
+/// rejects the replay.
+TEST(MappingPlanReportTest, Issue129ReplayRejectsChangedMachineContent) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, stableHash("case"));
+
+  // The same machine with one attached engine's concurrency changed: a real
+  // content difference, not a rename.
+  mlir::llk::machine::MachineModel changed = c->target->machine();
+  ASSERT_FALSE(changed.computes.empty());
+  changed.computes.front().concurrency += 1;
+  FileMappingTarget changedTarget(
+      "issue129", changed, LayoutRegistry(c->target->layouts()),
+      RuleRegistry(c->target->rules()), {"issue129_vector_add"});
+
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, changedTarget, c->graph);
+  ASSERT_FALSE(bool(replay));
+  EXPECT_NE(llvm::toString(replay.takeError()).find("target"),
             std::string::npos);
 }

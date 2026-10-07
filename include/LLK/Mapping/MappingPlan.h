@@ -416,6 +416,16 @@ struct PlanPlacement {
   /// The solved instantiation of each layout in `layouts`, so the selected
   /// plan states the parameterization it chose, not just the family name.
   llvm::StringMap<SolvedLayout> layoutSolutions;
+  /// The concrete capability node selected for each compute requirement the
+  /// rule declared, keyed by the requirement's kind (`vector_engine`), copied
+  /// from the selected instance's `computeBindings` -- never re-derived from
+  /// the executor. Two attached engines of one kind are two distinct
+  /// placements, and this is what lets that decision survive report, metadata
+  /// and replay instead of collapsing to the machine's first engine. Empty for
+  /// a rule that requires no compute capability. Part of the plan's canonical
+  /// identity when non-empty; a materializer and the normalized event stream
+  /// read the selected node from here (issue #129, task R1).
+  llvm::StringMap<std::string> computeBindings{};
   /// The resolved values of the rule's own declared parameters (the ones its
   /// `require` constraints derive), so the selected plan states the exact
   /// assignment generation solved rather than leaving a reader to re-derive
@@ -524,7 +534,7 @@ struct CoveringPlan {
   llvm::SmallVector<ConnectionId> connections;
   /// The same selections, resolved: which node each instance covers and how
   /// each connection runs. Placements are ordered by their (executor, memory,
-  /// layout) binding tuple, then node / instance id (design §22.1);
+  /// layout, compute) binding tuple, then node / instance id (design §22.1);
   /// `connectionPlans` by connection id.
   /// Explicit inline capacity: `PlanPlacement` carries the selected bundle,
   /// bindings and now its measured cost, so the default inlined-element
@@ -552,12 +562,14 @@ struct CoveringPlan {
   PlanScoreSource scoreSource = PlanScoreSource::Accumulation;
   PlanDiagnostics diagnostics;
 
-  // --- persisted selected state (schema v2, task B1) ------------------------
+  // --- persisted selected state (schema v3, tasks B1/R1) -------------------
   //
   // These are deliberately excluded from `canonicalPlanString`: they are
   // provenance and persisted selection metadata, not fields that change a
   // plan's content id. A plan decoded from metadata keeps the id it was encoded
-  // with.
+  // with. (Version 3 is current: it persists each placement's selected compute
+  // node, and its canonical identity is the `v3|`-tagged form that omits
+  // derived scores and diagnostics.)
   //
   // The metadata schema this plan was persisted under (0 when it was never
   // persisted -- an in-memory search result).

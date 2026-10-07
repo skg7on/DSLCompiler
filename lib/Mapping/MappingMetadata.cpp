@@ -671,6 +671,51 @@ bool kernelMetadataIsSchemaV2(mlir::Operation *kernel) {
   return v2;
 }
 
+bool planMetadataIsSchemaV3(mlir::DictionaryAttr plan) {
+  if (!plan)
+    return false;
+  if (auto version = plan.getAs<mlir::IntegerAttr>("schema_version"))
+    return version.getInt() >= 3;
+  return false;
+}
+
+bool kernelMetadataIsSchemaV3(mlir::Operation *kernel) {
+  if (!kernel)
+    return false;
+  if (planMetadataIsSchemaV3(
+          kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr)))
+    return true;
+  // The v3-only marker lives on the mapped operations: only a v3 encoder writes
+  // `compute_bindings`, so its presence proves the binding's version even when
+  // `schema_version` was deleted.
+  bool v3 = false;
+  kernel->walk([&](mlir::Operation *op) {
+    if (v3)
+      return;
+    auto mapping = op->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
+    if (mapping && mapping.get("compute_bindings"))
+      v3 = true;
+  });
+  return v3;
+}
+
+uint64_t kernelMetadataSchemaVersion(mlir::Operation *kernel) {
+  if (!kernel)
+    return 0;
+  auto plan = kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr);
+  if (!plan)
+    return 0;
+  uint64_t version = 1;
+  if (auto declared = plan.getAs<mlir::IntegerAttr>("schema_version"))
+    if (declared.getInt() > 0)
+      version = static_cast<uint64_t>(declared.getInt());
+  if (kernelMetadataIsSchemaV2(kernel))
+    version = std::max<uint64_t>(version, 2);
+  if (kernelMetadataIsSchemaV3(kernel))
+    version = std::max<uint64_t>(version, kMappingMetadataVersion);
+  return version;
+}
+
 //===----------------------------------------------------------------------===//
 // Encoding
 //===----------------------------------------------------------------------===//
@@ -810,6 +855,9 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
     llvm::StringMap<std::string> layouts;
     for (const auto &entry : placement.layouts)
       layouts[entry.first()] = entry.second;
+    llvm::StringMap<std::string> computes;
+    for (const auto &entry : placement.computeBindings)
+      computes[entry.first()] = entry.second;
 
     llvm::SmallVector<mlir::NamedAttribute> attributes;
     attributes.emplace_back(mlir::StringAttr::get(context, "schema_version"),
@@ -843,6 +891,13 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
         mlir::StringAttr::get(context, placement.bundle.emitterKey));
     attributes.emplace_back(mlir::StringAttr::get(context, "executor"),
                             mlir::StringAttr::get(context, placement.executor));
+    // The concrete compute node each requirement selected (issue #129, task
+    // R1). Always recorded (possibly empty), so a v3 reader can require the
+    // container: deleting it cannot let a reader re-derive the engine from
+    // executor order, and a v2 binding that never recorded one is rejected as
+    // the older schema it is.
+    attributes.emplace_back(mlir::StringAttr::get(context, "compute_bindings"),
+                            stringMapAttr(context, computes));
     attributes.emplace_back(mlir::StringAttr::get(context, "memories"),
                             stringMapAttr(context, memories));
     // The port-to-memory association of every named-port requirement, so the
@@ -1018,17 +1073,30 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       return metadataError("micro.plan schema_version is negative");
     schemaVersion = static_cast<uint64_t>(version.getInt());
   }
-  if (schemaVersion > kSupportedMappingMetadataVersion)
-    return metadataError("micro.plan records unsupported schema version " +
-                         std::to_string(schemaVersion) +
-                         "; this reader understands at most " +
-                         std::to_string(kSupportedMappingMetadataVersion));
-  // v2 is inferred from any v2-only field -- on the kernel's `micro.plan` or on
-  // any mapped operation -- so deleting `schema_version` (and even the hash
-  // fields) cannot silently downgrade the binding to v1.
-  const bool v2 = kernelMetadataIsSchemaV2(kernel);
-  if (v2)
-    schemaVersion = kMappingMetadataVersion;
+  // The effective version is the declared one raised to the highest version the
+  // binding's own recorded fields prove -- v2 from any v2-only field, v3 from
+  // `compute_bindings` -- so deleting `schema_version` (and even the hash
+  // fields) cannot silently downgrade the binding.
+  schemaVersion = std::max(schemaVersion, kernelMetadataSchemaVersion(kernel));
+  // Sub-v3 state is rejected, not reinterpreted (issue #129, task R1). A v1 or
+  // v2 binding records no concrete compute selection, so which attached
+  // capability ran cannot be recovered from it -- and guessing one from
+  // executor order is exactly the defect this repair removes.
+  if (schemaVersion != kMappingMetadataVersion)
+    return metadataError(
+        "micro.plan records unsupported mapping metadata schema version " +
+        std::to_string(schemaVersion) + "; this reader requires version " +
+        std::to_string(kMappingMetadataVersion) +
+        " (issue #129, task R1). A newer binding was written by a newer "
+        "compiler; an older one records no concrete compute selection, so the "
+        "attached capability it selected cannot be recovered from it. Re-run "
+        "the mapping search to regenerate the binding under the current "
+        "schema.");
+  // Every accepted binding is v3 or newer under these semantics, so its
+  // v2-or-newer requirements apply. (The v1 recovery paths below are therefore
+  // unreachable here; they are retained to document the older format this
+  // reader no longer accepts.)
+  const bool v2 = schemaVersion >= 2;
 
   WorkloadGraphBinding binding;
   llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel, &binding);
@@ -1256,6 +1324,23 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       }
       for (const auto &entry : *read)
         placement.memories[entry.first()] = entry.second;
+    }
+    // The concrete compute node each requirement selected (issue #129, task
+    // R1). A v3 binding always records the container (it may be empty only for
+    // a rule that requires no compute capability), so deleting it cannot skip
+    // the selection and let a reader re-derive an engine from executor order.
+    if (mlir::Attribute computes = mapping.get("compute_bindings")) {
+      llvm::Expected<llvm::StringMap<std::string>> read =
+          readMetadataStringMap(computes, "compute_bindings", where);
+      if (!read) {
+        sawUnrecoverable = true;
+        return;
+      }
+      for (const auto &entry : *read)
+        placement.computeBindings[entry.first()] = entry.second;
+    } else if (v2) {
+      sawUnrecoverable = true;
+      return;
     }
     // The named-port memory associations. Each recorded occurrence must resolve
     // in the source graph, so a tampered association cannot point at a made-up
