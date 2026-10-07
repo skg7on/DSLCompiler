@@ -30,6 +30,7 @@
 #include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
 #include "LLK/Mapping/MappingPlan.h"
@@ -968,16 +969,22 @@ TEST(MappingProperties, UnschedulablePlanScoreIsNamedNotSilentlyScheduled) {
   EXPECT_EQ(scheduled.plans[0].scoreSource, PlanScoreSource::Schedule);
 }
 
-/// The staged fan-out machine with a second DMA engine and a vector engine on
-/// each executor, so its two independent customer transfers can overlap and a
-/// normalized plan event can name a compute resource.
+/// The staged fan-out machine with two DMA engine slots and a vector engine on
+/// each executor, so its two independent customer transfers can genuinely
+/// overlap and a normalized plan event can name a compute resource.
+///
+/// The slots live on the node the links name (`dma.0`, `count: 2`), not on a
+/// second node: `legalEngine` records the *first* engine a link lists, and both
+/// customer connections share the `dram.0 -> stage.0` link for their first hop,
+/// so every movement event names `dma.0` and a `dma.1` node could never be
+/// assigned. Declaring the multiplicity on the named node is also how the
+/// shipped profiles express several DMA engines (`machines/*-v2.yaml`). A
+/// second node would only have widened `dma.0`'s pool through the machine-wide
+/// transfer count -- the pooling defect issue #129 finding 7 removed -- which
+/// is what made this fixture's overlap accidental rather than real.
 MachineModel twoEngineFanOutMachine(uint64_t stageCapacity) {
   MachineModel model = stagedFanOutMachine(stageCapacity);
-  TransferEngineNode second;
-  second.id = "dma.1";
-  second.kind = "dma";
-  second.attachedTo = "e0";
-  model.transferEngines.push_back(second);
+  model.transferEngines.front().count = 2;
   ComputeNode vpu0;
   vpu0.id = "vpu.0";
   vpu0.kind = "vector_engine";
@@ -1008,8 +1015,8 @@ TEST(MappingProperties, FinalScoreComesFromTheSharedSchedule) {
     EXPECT_EQ(plan.scoreSource, PlanScoreSource::Schedule);
 
     // The final score is what the shared scheduler produces, so two independent
-    // transfers on the machine's two engines overlap: the score is strictly
-    // below the additive accumulation the search's optimistic model keeps.
+    // transfers on the engine's two slots overlap: the score is strictly below
+    // the additive accumulation the search's optimistic model keeps.
     EXPECT_LT(plan.totalCost.latencyCycles, plan.accumulatedCost.latencyCycles);
     EXPECT_GT(plan.accumulatedCost.latencyCycles, 0.0);
 
@@ -1019,6 +1026,42 @@ TEST(MappingProperties, FinalScoreComesFromTheSharedSchedule) {
         buildPlanEvents(plan, target->machine());
     ASSERT_TRUE(static_cast<bool>(events))
         << llvm::toString(events.takeError());
+
+    // The overlap above is a property of the fixture, so pin its mechanism: the
+    // two slots sit on `dma.0` and every movement draws on them. A second
+    // engine no movement names would leave the claim resting on the pooling
+    // defect this repair removes, and would stop the assertion from detecting
+    // its return.
+    const TransferEngineNode *engine =
+        target->machine().findTransferEngine("dma.0");
+    ASSERT_NE(engine, nullptr);
+    ASSERT_EQ(engine->count, 2u);
+    ASSERT_EQ(target->machine().transferEngineCount(), 2u);
+    bool sawMovement = false;
+    for (const PlanCostEvent &event : events->events)
+      if (event.event.kind == CostEventKind::TransferHop) {
+        sawMovement = true;
+        EXPECT_EQ(event.event.resource, "dma.0");
+      }
+    ASSERT_TRUE(sawMovement);
+
+    // ... and the slots are genuinely shared: scheduling the same stream
+    // directly must place two movements on the pool at once. With a single slot
+    // every movement lands after the one before it and no two starts coincide.
+    EventScheduleResult schedule =
+        scheduleNormalizedEvents(events->events, target->machine());
+    std::vector<uint64_t> movementStarts;
+    for (const ScheduledEvent &entry : schedule.entries)
+      if (events->events[entry.id].event.kind == CostEventKind::TransferHop)
+        movementStarts.push_back(entry.start);
+    llvm::sort(movementStarts);
+    const bool sharedTheEngine =
+        std::adjacent_find(movementStarts.begin(), movementStarts.end()) !=
+        movementStarts.end();
+    EXPECT_TRUE(sharedTheEngine)
+        << "no two of the " << movementStarts.size()
+        << " engine movements share a start; the pool is not two slots wide";
+
     llvm::Expected<Cost> scheduled =
         schedulePlanEvents(*events, target->machine());
     ASSERT_TRUE(static_cast<bool>(scheduled))
