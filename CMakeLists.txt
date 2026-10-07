@@ -801,6 +801,7 @@ add_llk_test(ScheduleRegression benchmark/schedule_regression.cpp)
 add_llvm_executable(ThreadPoolStress test/Execution/thread_pool_stress.cpp)
 target_link_libraries(ThreadPoolStress PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME ThreadPoolStress COMMAND ThreadPoolStress)
+set_tests_properties(ThreadPoolStress PROPERTIES TIMEOUT 60)
 
 add_llvm_executable(SwiGLUParallelScaling test/Execution/swiglu_parallel_scaling.cpp)
 target_link_libraries(SwiGLUParallelScaling PRIVATE LLKRuntime GTest::gtest_main)
