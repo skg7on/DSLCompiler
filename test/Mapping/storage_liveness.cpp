@@ -278,7 +278,8 @@ TEST(StorageLiveness, AnInPlaceReuseReportsItsSelfStepEdge) {
   ASSERT_EQ(live->requiredReuseEdges.size(), 1u);
   EXPECT_EQ(live->requiredReuseEdges[0].from, 5u);
   EXPECT_EQ(live->requiredReuseEdges[0].to, 5u);
-  // The same relation is what the caller merges into the plan's step DAG, so
-  // the ordering the peak assumes is the one the plan carries.
-  EXPECT_EQ(requiredReuseEdgesFor(plan.allocations), live->requiredReuseEdges);
+  // `requiredReuseEdgesFor` is the helper `analyzeStorageLiveness` fills the
+  // field with, so comparing the field to a second call of it could never fail
+  // (issue #129, task R8 review); the literal assertions above are the
+  // coverage.
 }

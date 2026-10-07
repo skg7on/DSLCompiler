@@ -418,6 +418,47 @@ TEST(MappingPlanReportTest, RegistryHashChangesWithContent) {
   EXPECT_EQ(ruleBase.computeContentHash(), ruleBase.computeContentHash());
 }
 
+// Review focus #2 / task R8: a target *file* renamed or copied without a
+// content change must keep its content identity, so a report bound to the old
+// path still replays against the new one. The content hash is over the declared
+// content, not the file name it was read from -- only a content change (the
+// same name with a different body) may invalidate it.
+TEST(MappingPlanReportTest, ARenamedTargetFileKeepsItsContentIdentity) {
+  constexpr llvm::StringLiteral rules = R"llkmap(
+rule r.one {
+  match micro.vector();
+  require executor kind worker;
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+  constexpr llvm::StringLiteral changedRules = R"llkmap(
+rule r.one {
+  match micro.vector();
+  require executor kind worker;
+  bundle "b";
+  emit "e1";
+  cost 2;
+}
+)llkmap";
+
+  llvm::Expected<RuleRegistry> first =
+      parseRuleText(rules, "mapping/a/rules.llkmap");
+  ASSERT_TRUE(bool(first)) << llvm::toString(first.takeError());
+  llvm::Expected<RuleRegistry> renamed =
+      parseRuleText(rules, "mapping/b/rules.llkmap");
+  ASSERT_TRUE(bool(renamed)) << llvm::toString(renamed.takeError());
+  EXPECT_EQ(first->computeContentHash(), renamed->computeContentHash())
+      << "renaming the file must not change content identity";
+
+  llvm::Expected<RuleRegistry> edited =
+      parseRuleText(changedRules, "mapping/a/rules.llkmap");
+  ASSERT_TRUE(bool(edited)) << llvm::toString(edited.takeError());
+  EXPECT_NE(first->computeContentHash(), edited->computeContentHash())
+      << "a content change under the same file name must still fail";
+}
+
 //===----------------------------------------------------------------------===//
 // Versioned replay (task B1)
 //===----------------------------------------------------------------------===//

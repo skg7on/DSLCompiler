@@ -1254,19 +1254,20 @@ module {
   ASSERT_EQ(events->events.size(), analysis->events.events.size());
   EXPECT_EQ(events->source, mapping::PlanEventSource::Snapshot);
 
-  for (size_t i = 0; i < events->events.size(); ++i) {
-    const mapping::PlanCostEvent &planned = events->events[i];
-    const mapping::PlanCostEvent &materialized = analysis->events.events[i];
-    EXPECT_EQ(planned.event.kind, materialized.event.kind) << i;
-    EXPECT_EQ(planned.event.resource, materialized.event.resource) << i;
-    EXPECT_EQ(planned.workItems, materialized.workItems) << i;
-    EXPECT_EQ(planned.bytes, materialized.bytes) << i;
-    EXPECT_EQ(planned.deps, materialized.deps) << i;
-    EXPECT_EQ(planned.owner, materialized.owner) << i;
-    EXPECT_DOUBLE_EQ(planned.event.cost.latencyCycles,
-                     materialized.event.cost.latencyCycles)
-        << i;
-  }
+  // The plan's stream is the kernel's, field for field. These are asserted
+  // against *literal* values rather than against `analysis->events`, which
+  // `buildPlanEvents` returns verbatim once the snapshot is attached -- a
+  // comparison to itself could never fail (issue #129, task R8 review).
+  ASSERT_EQ(events->events.size(), 1u);
+  const mapping::PlanCostEvent &planned = events->events.front();
+  EXPECT_EQ(planned.event.kind, mapping::CostEventKind::Compute);
+  EXPECT_EQ(planned.event.resource, "vpu");
+  EXPECT_EQ(planned.owner, "worker.0");
+  EXPECT_EQ(planned.workItems, 64u);
+  // The machine's elementwise formula, not the placement's rule-local estimate
+  // of 5: the snapshot replaced the search's number.
+  EXPECT_DOUBLE_EQ(planned.event.cost.latencyCycles, 8.0);
+  EXPECT_EQ(planned.bytes, 0u);
 
   // The scheduled cost is the same schedule of the same stream.
   llvm::Expected<mapping::Cost> scheduled =
