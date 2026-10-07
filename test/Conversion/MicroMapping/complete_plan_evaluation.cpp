@@ -212,6 +212,42 @@ TEST(CompletePlanEvaluationTest, ACompleteAnalysisRecordsNoVerdict) {
   EXPECT_TRUE(plan.diagnostics.warnings.empty());
 }
 
+// Issue #129 review finding 6: a valid provider hit the search ranked on must
+// reach the plan's *final* cost, not be overwritten by the static machine
+// formula. Before the fix the search ranked a plan at the measured 1,000 cycles
+// (its `accumulatedCost`) while the completion analysis re-charged the static
+// estimate, so an enabled measurement stopped affecting final costs/ranking.
+TEST(CompletePlanEvaluationTest, AProviderHitReachesTheFinalCost) {
+  class FixedProvider : public LatencyProvider {
+  public:
+    using LatencyProvider::lookupCycles;
+    std::optional<double> lookupCycles(const OperationSignature &,
+                                       const TargetContext &) const override {
+      return 1000.0;
+    }
+  };
+  FixedProvider provider;
+  auto c = issue129::resourceCase("two-compute", &provider);
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  options.enableLatencyCache = true;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  for (const CoveringPlan &plan : result->plans) {
+    ASSERT_FALSE(plan.placements.empty());
+    EXPECT_TRUE(plan.placements.front().measuredCycles.has_value())
+        << "the measured value must travel with the placement";
+    EXPECT_DOUBLE_EQ(plan.accumulatedCost.latencyCycles, 1000.0);
+    EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, 1000.0)
+        << "the final schedule must charge the measured duration";
+  }
+}
+
 // Evaluation is deterministic and idempotent: two evaluations of one proposal
 // produce the same decisions and therefore the same decision-only id, and
 // re-finalizing a returned plan reproduces that id (the invariant the search's

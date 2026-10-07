@@ -40,6 +40,7 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CostEvent.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
@@ -185,11 +186,29 @@ struct PlannedRoute {
   std::vector<const machine::LinkEdge *> hops;
 };
 
+/// Measured durations a selected plan recorded for its own work, keyed by the
+/// identity the binder stamped on the mapped op (issue #129 review finding 6):
+/// `byInstance` on `micro.mapping.instance` for a placement's compute work,
+/// `byConnection` on the connection a routed copy records for its movement.
+///
+/// A hit replaces the static formula's duration for exactly that op's event --
+/// work, traffic and capacity are untouched -- so the analysis the planner and
+/// `micro-perf` share charges the same calibrated number the search ranked on,
+/// instead of overwriting it with the static estimate.
+struct MeasuredOverrides {
+  llvm::DenseMap<uint64_t, double> byInstance;
+  llvm::DenseMap<uint64_t, double> byConnection;
+};
+
 /// Builds the event DAG for `kernel` against `machine`. `kernel` must be a
 /// `micro.kernel`. Fails when the kernel uses a memory space the machine does
 /// not model, or expands past kMaxEvents.
-llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
-                                       const machine::MachineModel &machine);
+///
+/// When `measured` is given, an event whose op the plan recorded a measured
+/// duration for charges that duration instead of the machine formula.
+llvm::Expected<MicroDAG>
+buildMicroDAG(mlir::Operation *kernel, const machine::MachineModel &machine,
+              const MeasuredOverrides *measured = nullptr);
 
 /// The normalized view of one DAG event (task B8): the same
 /// `mapping::PlanCostEvent` shape `buildPlanEvents` produces, so a plan's

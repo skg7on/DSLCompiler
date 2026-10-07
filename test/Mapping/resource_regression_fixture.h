@@ -52,7 +52,12 @@ struct ResourceCase {
 /// `parallel-overlap`, `padded-layout`; R7 `capacity-topk`; R8 `joint-oracle`.
 /// A case's own variants (R4's reduced-L2 intermediate, for instance) are built
 /// by the test from the case's literal machine rather than by adding a name.
-llvm::Expected<ResourceCase> resourceCase(llvm::StringRef name);
+/// `provider`, when given, is attached to the case's target so a search over it
+/// exercises the measured-latency path. It is borrowed; the caller keeps it
+/// alive for the case's lifetime.
+llvm::Expected<ResourceCase>
+resourceCase(llvm::StringRef name,
+             const mlir::llk::mapping::LatencyProvider *provider = nullptr);
 
 /// Runs the *ordinary* mapping search over the case's extracted source graph
 /// with `options`. Once R7 defines the completion callback, this is where the

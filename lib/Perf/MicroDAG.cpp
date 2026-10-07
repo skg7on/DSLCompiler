@@ -117,6 +117,24 @@ llvm::StringRef mappedComputeEngine(mlir::Operation &op, llvm::StringRef kind) {
   return {};
 }
 
+/// The instance a mapped op recorded, or nullopt when it carries none. `0` is a
+/// legal instance id, so this is an optional rather than a sentinel.
+std::optional<uint64_t> mappedInstance(mlir::Operation &op) {
+  auto mapping = op.getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
+  if (!mapping)
+    return std::nullopt;
+  if (auto instance = mapping.getAs<mlir::IntegerAttr>("instance"))
+    return instance.getValue().getZExtValue();
+  return std::nullopt;
+}
+
+/// The connection a materialized copy records (`micro.connection`), or nullopt.
+std::optional<uint64_t> mappedConnection(mlir::Operation &op) {
+  if (auto connection = op.getAttrOfType<mlir::IntegerAttr>("micro.connection"))
+    return connection.getValue().getZExtValue();
+  return std::nullopt;
+}
+
 /// The executor a materialized `micro.transform` selected: stamped as
 /// `micro.engine` by the binder (task B8), because a conversion is not a
 /// covered workload node and carries no `micro.mapping`. A hand-written or
@@ -130,8 +148,9 @@ llvm::StringRef transformExecutor(mlir::Operation &op) {
 
 class DAGBuilder {
 public:
-  DAGBuilder(const machine::MachineModel &machine, llvm::StringRef kernelName)
-      : machine(machine), kernelName(kernelName.str()) {}
+  DAGBuilder(const machine::MachineModel &machine, llvm::StringRef kernelName,
+             const MeasuredOverrides *measured = nullptr)
+      : machine(machine), kernelName(kernelName.str()), measured(measured) {}
 
   llvm::Expected<MicroDAG> run(mlir::Operation *kernel);
 
@@ -261,6 +280,36 @@ private:
   llvm::SmallPtrSet<mlir::Operation *, 32> countedStorage;
   llvm::StringSet<> seenWarnings;
   std::map<std::string, uint64_t> liveBytes;
+  /// Measured durations the selected plan recorded, or null when none (issue
+  /// #129 review finding 6).
+  const MeasuredOverrides *measured = nullptr;
+
+  /// The measured duration the selected plan recorded for `op`'s work, when a
+  /// `LatencyProvider` hit: keyed by the instance a mapped compute op records,
+  /// or the connection a materialized copy records.
+  std::optional<double> measuredForOp(mlir::Operation &op) const {
+    if (!measured)
+      return std::nullopt;
+    if (std::optional<uint64_t> instance = mappedInstance(op))
+      if (auto found = measured->byInstance.find(*instance);
+          found != measured->byInstance.end())
+        return found->second;
+    if (std::optional<uint64_t> connection = mappedConnection(op))
+      if (auto found = measured->byConnection.find(*connection);
+          found != measured->byConnection.end())
+        return found->second;
+    return std::nullopt;
+  }
+
+  /// Overrides `event`'s duration with the measured value the plan recorded for
+  /// `op`, when one exists (issue #129 review finding 6). Only the duration
+  /// changes: work, traffic and capacity stay as the static extraction found
+  /// them, so a calibrated estimate can never erase the work or hide a capacity
+  /// fact.
+  void applyMeasuredDuration(mlir::Operation &op, MicroEvent &event) const {
+    if (std::optional<double> cycles = measuredForOp(op))
+      event.minCycles = static_cast<uint64_t>(std::ceil(*cycles));
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -988,6 +1037,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.ownerPool = mappedExecutor(op).str();
     event.workItems = macs;
     event.minCycles = mmaCycles(*engine, shape, 2 * macs);
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(shape);
     event.tileLayout = lhsInfo.layout.empty() ? accInfo.layout : lhsInfo.layout;
@@ -1019,6 +1069,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.workItems = resultInfo.elements();
     event.minCycles =
         vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(resultInfo.shape);
     event.tileLayout = resultInfo.layout;
@@ -1049,6 +1100,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.workItems = inputInfo.elements();
     event.minCycles =
         vectorCycles(engine, inputInfo.dtype, inputInfo.elements());
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(inputInfo.shape);
     event.tileLayout = inputInfo.layout;
@@ -1089,6 +1141,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.workItems = resultInfo.elements();
     event.minCycles =
         vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(resultInfo.shape);
     event.tileLayout = resultInfo.layout;
@@ -1172,6 +1225,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
         resultInfo.elements() ? resultInfo.elements() : sourceInfo.elements();
     event.bytes = cost->localBytes;
     event.minCycles = static_cast<uint64_t>(std::ceil(cost->latencyCycles));
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(resultInfo.shape.empty() ? sourceInfo.shape
                                                            : resultInfo.shape);
@@ -1269,6 +1323,7 @@ llvm::Error DAGBuilder::buildLogicalTileOp(
   event.bytes = resultInfo.bytes();
   event.minCycles =
       vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
+  applyMeasuredDuration(op, event);
   event.sourceOpName = op.getName().getStringRef().str();
   event.tileShape = shapeString(resultInfo.shape);
   event.tileLayout = resultInfo.layout;
@@ -1319,6 +1374,7 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
     event.workItems = shapeInfo.elements();
     event.bytes = bytes;
     event.minCycles = cycles;
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(shapeInfo.shape);
     event.tileLayout =
@@ -1363,6 +1419,7 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
       event.workItems = shapeInfo.elements();
       event.bytes = bytes;
       event.minCycles = copyCycles(srcMemory, dstMemory, bytes);
+      applyMeasuredDuration(op, event);
       event.sourceOpName = op.getName().getStringRef().str();
       event.tileShape = shapeString(shapeInfo.shape);
       event.tileLayout =
@@ -1495,13 +1552,14 @@ llvm::Expected<MicroDAG> DAGBuilder::run(mlir::Operation *kernel) {
 //===----------------------------------------------------------------------===//
 
 llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
-                                       const machine::MachineModel &machine) {
+                                       const machine::MachineModel &machine,
+                                       const MeasuredOverrides *measured) {
   auto kernelOp = llvm::dyn_cast<micro::KernelOp>(kernel);
   if (!kernelOp)
     return invalid("expected a micro.kernel, got '" +
                    kernel->getName().getStringRef() + "'");
 
-  DAGBuilder builder(machine, kernelOp.getSymName());
+  DAGBuilder builder(machine, kernelOp.getSymName(), measured);
   return builder.run(kernel);
 }
 

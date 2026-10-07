@@ -77,6 +77,10 @@ struct InstanceEntry {
   /// The instance's cost, after any measurement the target provides. Legality
   /// was decided before this and is not revisited.
   Cost cost;
+  /// The measured duration a provider returned for this instance, when one hit
+  /// (issue #129 review finding 6). Carried into the placement so the final
+  /// selected-kernel analysis charges it instead of the static formula.
+  std::optional<double> measuredCycles = std::nullopt;
   /// The resolved values of the rule's constraint-derived parameters, copied
   /// from the candidate so the selected plan can persist the assignment
   /// generation solved (task B1).
@@ -745,9 +749,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                 hexId(target_.rules().computeContentHash()),
                 hexId(target_.layouts().computeContentHash())};
             if (std::optional<double> measured =
-                    provider->lookupCycles(signature, context))
+                    provider->lookupCycles(signature, context)) {
               entry.cost.latencyCycles = *measured;
-            else
+              // Carry the hit so the final selected-kernel analysis charges the
+              // measured duration too (issue #129 review finding 6): without it
+              // the search ranks on calibrated numbers while the plan's
+              // reported cost is the static formula.
+              entry.measuredCycles = *measured;
+            } else
               report(DiagnosticCode::LatencyCacheMiss,
                      "rule '" + rule->id + "' (op '" + node->opName +
                          "'): no cached latency; static estimate retained");
@@ -1752,9 +1761,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (connectionProvider) {
         ConnectionSignature signature =
             connectionSignatureFor(effective, workload_, machine);
-        if (std::optional<double> measured =
-                connectionProvider->lookupCycles(signature, connectionContext))
+        if (std::optional<double> measured = connectionProvider->lookupCycles(
+                signature, connectionContext)) {
           effective.cost.latencyCycles = *measured;
+          // Carried into the plan so the final analysis charges the measured
+          // movement the search ranked on (issue #129 review finding 6).
+          effective.measuredCycles = *measured;
+        }
       }
       staged.push_back(effective);
       state.cost = addCost(state.cost, effective.cost);
@@ -1945,6 +1958,11 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         // normalized plan event charges this node the same estimate the
         // search ranked it on rather than re-deriving one.
         placement.cost = owner->cost;
+        // A provider hit travels with the placement too, so the final
+        // selected-kernel analysis charges the calibrated duration the search
+        // ranked on rather than the static machine formula (issue #129 review
+        // finding 6).
+        placement.measuredCycles = owner->measuredCycles;
         // The capability kinds the rule requires travel with the placement so a
         // later stage can tell "this rule needs no compute capability" from
         // "the recorded selection is missing" (issue #129, task R1). Sorted and
@@ -2004,6 +2022,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // charges the same movement the search ranked and can re-derive the same
       // transform estimate the materialized kernel uses.
       detail.cost = connection.cost;
+      // A measured movement travels with the connection, so the final analysis
+      // charges the calibrated duration the search ranked on (issue #129 review
+      // finding 6).
+      detail.measuredCycles = connection.measuredCycles;
       detail.workItems = elementsForValue(connection.value);
       if (const WorkloadValue *moved = workload_.findValue(connection.value))
         detail.valueType = moved->type;

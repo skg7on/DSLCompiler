@@ -232,8 +232,28 @@ llvm::Expected<SelectedKernelAnalysis> analyzeSelectedKernel(
     mlir::Operation *kernel, const machine::MachineModel &machine,
     bool requireComplete, const mapping::CoveringPlan &finalizedPlan,
     const mapping::WorkloadGraph &graph) {
+  // The plan's measured durations travel to the extraction, so the analysis
+  // charges the calibrated work the search ranked on instead of the static
+  // machine formula the search had already overridden (issue #129 review
+  // finding 6). Absent a provider hit the overrides are empty and the
+  // extraction is unchanged.
+  MeasuredOverrides measured;
+  for (const mapping::PlanPlacement &placement : finalizedPlan.placements)
+    if (placement.measuredCycles)
+      measured.byInstance[placement.instance] = *placement.measuredCycles;
+  for (const mapping::PlanConnection &connection :
+       finalizedPlan.connectionPlans)
+    if (connection.measuredCycles)
+      measured.byConnection[connection.id] = *connection.measuredCycles;
+  const bool haveMeasured =
+      !measured.byInstance.empty() || !measured.byConnection.empty();
+
+  llvm::Expected<MicroDAG> dag =
+      buildMicroDAG(kernel, machine, haveMeasured ? &measured : nullptr);
+  if (!dag)
+    return dag.takeError();
   llvm::Expected<SelectedKernelAnalysis> analysis =
-      analyzeSelectedKernel(kernel, machine, requireComplete);
+      analyzeSelectedDag(*dag, machine, requireComplete);
   if (!analysis)
     return analysis.takeError();
   // R5 liveness for the strict analysis: the plan's own occupancy replaces the

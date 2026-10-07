@@ -450,6 +450,11 @@ struct ConnectionPlan {
   llvm::SmallVector<AffineMap> consumerMaps;
   std::optional<LayoutTransform> transform;
   Cost cost;
+  /// The measured duration a target's `LatencyProvider` returned for this
+  /// connection, when one hit (issue #129 review finding 6). Carried into the
+  /// plan so the final selected-kernel analysis charges the calibrated duration
+  /// the search ranked on. Absent when no provider hit.
+  std::optional<double> measuredCycles;
 };
 
 /// Structured search outcome. `searchTruncated` is set whenever a cap ended
@@ -548,6 +553,13 @@ struct PlanPlacement {
   /// The node's output element count (MACs for a matrix op), copied from the
   /// extraction facts. Excluded from `canonicalPlanString`, like `cost`.
   uint64_t workItems = 0;
+  /// The measured duration a target's `LatencyProvider` returned for this
+  /// placement's work, when one hit (issue #129 review finding 6). The search
+  /// ranked on it, so the final selected-kernel analysis must charge the same
+  /// calibrated duration instead of overwriting it with the static machine
+  /// formula. Absent when no provider hit. Derived, not a decision: it stays
+  /// out of `canonicalPlanString`.
+  std::optional<double> measuredCycles;
 };
 
 /// One selected connection, with the route it takes.
@@ -633,6 +645,13 @@ struct PlanConnection {
   /// from the shared conversion estimate exactly as the materialized kernel's
   /// is. A derived execution fact, excluded from `canonicalPlanString`.
   mlir::Type valueType;
+  /// The measured duration a target's `LatencyProvider` returned for this
+  /// connection's movement, when one hit (issue #129 review finding 6). The
+  /// search ranked on it, so the final selected-kernel analysis must charge the
+  /// same calibrated duration rather than the static link estimate. Absent when
+  /// no provider hit. A derived execution fact, excluded from
+  /// `canonicalPlanString`.
+  std::optional<double> measuredCycles;
 };
 
 /// Where a plan's final score came from (task B8). A score is only a schedule

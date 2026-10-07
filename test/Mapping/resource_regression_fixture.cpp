@@ -75,7 +75,8 @@ struct CaseSpec {
 /// Parses `spec` and loads its target. The MLIR context owns `source`, and the
 /// graph is extracted from the parsed kernel -- so `ResourceCase::graph` is the
 /// fixture's *actual* source graph, not a hand-built stand-in.
-llvm::Expected<ResourceCase> buildCase(const CaseSpec &spec) {
+llvm::Expected<ResourceCase>
+buildCase(const CaseSpec &spec, const LatencyProvider *provider = nullptr) {
   ResourceCase c;
   c.context = std::make_unique<MLIRContext>();
   c.context->getOrLoadDialect<micro::MicroDialect>();
@@ -106,7 +107,7 @@ llvm::Expected<ResourceCase> buildCase(const CaseSpec &spec) {
   }
   c.target = std::make_unique<FileMappingTarget>(
       "issue129", spec.machine, std::move(layouts), std::move(*rules),
-      spec.emitters);
+      spec.emitters, provider);
   return c;
 }
 
@@ -944,49 +945,57 @@ CaseSpec jointOracleSpec(bool reversed = false) {
 /// add; the constructor below stays unchanged.
 struct CaseEntry {
   llvm::StringLiteral name;
-  llvm::Expected<ResourceCase> (*build)();
+  llvm::Expected<ResourceCase> (*build)(const LatencyProvider *provider);
 };
 
-llvm::Expected<ResourceCase> buildTwoCompute() {
-  return buildCase(twoComputeSpec());
+llvm::Expected<ResourceCase> buildTwoCompute(const LatencyProvider *provider) {
+  return buildCase(twoComputeSpec(), provider);
 }
 
-llvm::Expected<ResourceCase> buildMissingMemory() {
-  return buildCase(missingMemorySpec());
+llvm::Expected<ResourceCase>
+buildMissingMemory(const LatencyProvider *provider) {
+  return buildCase(missingMemorySpec(), provider);
 }
 
-llvm::Expected<ResourceCase> buildNamedPorts() {
-  return buildCase(namedPortsSpec());
+llvm::Expected<ResourceCase> buildNamedPorts(const LatencyProvider *provider) {
+  return buildCase(namedPortsSpec(), provider);
 }
 
-llvm::Expected<ResourceCase> buildTwoHop() { return buildCase(twoHopSpec()); }
-
-llvm::Expected<ResourceCase> buildSequential() {
-  return buildCase(sequentialSpec());
+llvm::Expected<ResourceCase> buildTwoHop(const LatencyProvider *provider) {
+  return buildCase(twoHopSpec(), provider);
 }
 
-llvm::Expected<ResourceCase> buildPipelineFour() {
-  return buildCase(pipelineFourSpec());
+llvm::Expected<ResourceCase> buildSequential(const LatencyProvider *provider) {
+  return buildCase(sequentialSpec(), provider);
 }
 
-llvm::Expected<ResourceCase> buildParallelOverlap() {
-  return buildCase(parallelOverlapSpec());
+llvm::Expected<ResourceCase>
+buildPipelineFour(const LatencyProvider *provider) {
+  return buildCase(pipelineFourSpec(), provider);
 }
 
-llvm::Expected<ResourceCase> buildPaddedLayout() {
-  return buildCase(paddedLayoutSpec());
+llvm::Expected<ResourceCase>
+buildParallelOverlap(const LatencyProvider *provider) {
+  return buildCase(parallelOverlapSpec(), provider);
 }
 
-llvm::Expected<ResourceCase> buildCapacityTopK() {
-  return buildCase(capacityTopKSpec());
+llvm::Expected<ResourceCase>
+buildPaddedLayout(const LatencyProvider *provider) {
+  return buildCase(paddedLayoutSpec(), provider);
 }
 
-llvm::Expected<ResourceCase> buildJointOracle() {
-  return buildCase(jointOracleSpec(/*reversed=*/false));
+llvm::Expected<ResourceCase>
+buildCapacityTopK(const LatencyProvider *provider) {
+  return buildCase(capacityTopKSpec(), provider);
 }
 
-llvm::Expected<ResourceCase> buildJointOracleReversed() {
-  return buildCase(jointOracleSpec(/*reversed=*/true));
+llvm::Expected<ResourceCase> buildJointOracle(const LatencyProvider *provider) {
+  return buildCase(jointOracleSpec(/*reversed=*/false), provider);
+}
+
+llvm::Expected<ResourceCase>
+buildJointOracleReversed(const LatencyProvider *provider) {
+  return buildCase(jointOracleSpec(/*reversed=*/true), provider);
 }
 
 llvm::ArrayRef<CaseEntry> caseTable() {
@@ -1008,10 +1017,11 @@ llvm::ArrayRef<CaseEntry> caseTable() {
 
 } // namespace
 
-llvm::Expected<ResourceCase> resourceCase(llvm::StringRef name) {
+llvm::Expected<ResourceCase> resourceCase(llvm::StringRef name,
+                                          const LatencyProvider *provider) {
   for (const CaseEntry &entry : caseTable())
     if (entry.name == name)
-      return entry.build();
+      return entry.build(provider);
   std::string known;
   for (const CaseEntry &entry : caseTable()) {
     if (!known.empty())
