@@ -887,3 +887,50 @@ TEST(PlanReport, Issue129MovementHopsRoundTripWithTheirStorageDecisions) {
   // The replayed allocations are the same buffers the hops name.
   EXPECT_EQ(replay->allocations.size(), selected.allocations.size());
 }
+
+// Issue #129, task R7: a plan's diagnostics carry their *text*, not only a
+// count. The completion evaluator records a reason when a derived fact could
+// not be established -- an event snapshot the machine cannot model, for
+// instance -- and a reader of the report must be able to see *why*, not merely
+// that something was refused.
+TEST(MappingPlanReportTest, PlanDiagnosticsEmitTheirText) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult result =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  ASSERT_FALSE(result.plans.empty());
+
+  const std::string reason =
+      "plan evaluation: the derived event snapshot could not be attached: "
+      "event 0 names transfer engine 'dma', which machine 'test' does not "
+      "model";
+  result.plans.front().diagnostics.warnings.push_back(reason);
+
+  const std::string report = writePlanReport(
+      result, (**target).machine(), **target, options, stableHash(kKernel));
+  EXPECT_NE(report.find("could not be attached"), std::string::npos);
+
+  llvm::Expected<llvm::json::Value> json = llvm::json::parse(report);
+  ASSERT_TRUE(static_cast<bool>(json)) << llvm::toString(json.takeError());
+  const llvm::json::Object *root = json->getAsObject();
+  ASSERT_TRUE(root);
+  const llvm::json::Array *plans = root->getArray("plans");
+  ASSERT_TRUE(plans);
+  ASSERT_FALSE(plans->empty());
+  const llvm::json::Object *diagnostics =
+      (*plans)[0].getAsObject()->getObject("diagnostics");
+  ASSERT_TRUE(diagnostics);
+  // The count and the text cohere, so a reader sees both how many and why.
+  ASSERT_TRUE(diagnostics->getInteger("warningCount").has_value());
+  EXPECT_EQ(*diagnostics->getInteger("warningCount"), 1);
+  const llvm::json::Array *warnings = diagnostics->getArray("warnings");
+  ASSERT_TRUE(warnings);
+  ASSERT_EQ(warnings->size(), 1u);
+  EXPECT_EQ(*warnings->front().getAsString(), reason);
+}

@@ -1334,21 +1334,44 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
 
   uint32_t id = 0;
   if (hops.empty()) {
-    MicroEvent event;
-    event.kind = kind;
-    event.resource = ResourceKind::Dma;
-    event.resourceName = "dma";
-    event.workItems = shapeInfo.elements();
-    event.bytes = bytes;
-    event.minCycles = copyCycles(srcMemory, dstMemory, bytes);
-    event.sourceOpName = op.getName().getStringRef().str();
-    event.tileShape = shapeString(shapeInfo.shape);
-    event.tileLayout =
-        resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
-    event.tileMemory = dstMemory.str();
-    event.srcMemory = srcMemory.str();
-    event.tileOwner = resultInfo.owner;
-    id = addEvent(std::move(event), state);
+    // A *mapped*, unrouted movement still crosses a concrete link when the
+    // machine joins the two endpoint kinds: a boundary copy a rule placed (the
+    // `dram -> sram` stage that feeds a compute node) carries no routed hop
+    // identity, but the placement is a decision, and the machine declares the
+    // link its endpoints are carried over. Charging that link names its
+    // transfer engine, so the event's resource is one the machine -- and the
+    // strict stream validator -- models, instead of the abstract `dma` pool no
+    // node declares. The cost is unchanged either way: `copyCycles` already
+    // reads this very link for its latency and bandwidth.
+    //
+    // A hand-written kernel with no `micro.mapping` keeps the abstract pool: an
+    // unmapped analysis has not chosen an engine, and naming one it was never
+    // told would be a claim the plan does not support.
+    const machine::LinkEdge *link =
+        op.getAttrOfType<mlir::DictionaryAttr>("micro.mapping") &&
+                srcMemory != dstMemory
+            ? machine.findLinkByKinds(srcMemory, dstMemory)
+            : nullptr;
+    if (link) {
+      id = addEvent(describe(*link, copyCycles(srcMemory, dstMemory, bytes)),
+                    state);
+    } else {
+      MicroEvent event;
+      event.kind = kind;
+      event.resource = ResourceKind::Dma;
+      event.resourceName = "dma";
+      event.workItems = shapeInfo.elements();
+      event.bytes = bytes;
+      event.minCycles = copyCycles(srcMemory, dstMemory, bytes);
+      event.sourceOpName = op.getName().getStringRef().str();
+      event.tileShape = shapeString(shapeInfo.shape);
+      event.tileLayout =
+          resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
+      event.tileMemory = dstMemory.str();
+      event.srcMemory = srcMemory.str();
+      event.tileOwner = resultInfo.owner;
+      id = addEvent(std::move(event), state);
+    }
   } else {
     for (size_t hop = 0; hop < hops.size(); ++hop) {
       const machine::LinkEdge &link = *hops[hop];

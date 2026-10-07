@@ -11,6 +11,7 @@
 #include "LLK/Mapping/Diagnostics.h"
 
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/Support/ErrorHandling.h"
 
 namespace mlir::llk::mapping {
 
@@ -81,6 +82,34 @@ bool diagnosticLess(const Diagnostic &lhs, const Diagnostic &rhs) {
   if (lhs.code != rhs.code)
     return static_cast<int>(lhs.code) < static_cast<int>(rhs.code);
   return lhs.message < rhs.message;
+}
+
+bool isRejection(DiagnosticCode code) {
+  switch (code) {
+  // Notices: a cap, a provider gap, or an advisory assumption. None is a
+  // refusal the search made.
+  case DiagnosticCode::SearchTruncated:
+  case DiagnosticCode::LatencyCacheMiss:
+  case DiagnosticCode::AssumedValueSize:
+  case DiagnosticCode::ConnectionChoiceUnexplored:
+    return false;
+  // Rejections: the search refused a rule, a placement, a pair, a layout, a
+  // global constraint, a bundle, or a plan.
+  case DiagnosticCode::NoMatchingRule:
+  case DiagnosticCode::NoLegalLayout:
+  case DiagnosticCode::NoLegalExecutor:
+  case DiagnosticCode::MemoryCapacityExceeded:
+  case DiagnosticCode::UnsupportedComputeFragment:
+  case DiagnosticCode::NoMemoryRoute:
+  case DiagnosticCode::NoLayoutTransform:
+  case DiagnosticCode::GlobalConstraintFailed:
+  case DiagnosticCode::TargetBundleInvalid:
+  case DiagnosticCode::InvalidMappingMetadata:
+  case DiagnosticCode::InvalidGatherDeclaration:
+  case DiagnosticCode::UnsupportedMaterialization:
+    return true;
+  }
+  llvm_unreachable("unclassified DiagnosticCode");
 }
 
 } // namespace mlir::llk::mapping

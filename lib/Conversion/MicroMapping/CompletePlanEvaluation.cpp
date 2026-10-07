@@ -144,15 +144,26 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
   // the executable contract the preview *is* the executable binding: a decision
   // the binder cannot materialize, or a value whose physical memory does not
   // resolve, is refused here exactly as `bindPlan` refuses it for the caller.
-  // That refusal is an `llvm::Error`, not a candidate rejection: it is the
-  // invocation's contract being unsatisfiable, and the search stops and reports
-  // it rather than silently retaining a plan the caller will not accept.
+  //
+  // That refusal is a *candidate* rejection (issue #129, task R7): it is a
+  // property of this proposal, so the search records it with its stable code
+  // and keeps enumerating -- some other covering may be executable, and a
+  // cheap non-executable one must not end the search. The message is the
+  // binder's own, so a caller that ends up with no plan reads exactly the
+  // refusal a direct `bindPlan` under the executable contract would give. The
+  // direct (outside-search) `bindPlan` keeps failing hard; only the search
+  // context turns it into a rejection.
   std::unique_ptr<PlanMaterializer> materializer =
       micro_mapping_detail::createCanonicalPlanMaterializer();
   llvm::Expected<BoundPlan> bound =
       bindPlan(source, plan, target, contract, materializer.get());
-  if (!bound)
-    return bound.takeError();
+  if (!bound) {
+    std::string reason = llvm::toString(bound.takeError());
+    if (strict)
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      std::move(reason));
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), reason);
+  }
 
   // --- 4. selected static analysis ----------------------------------------
   //

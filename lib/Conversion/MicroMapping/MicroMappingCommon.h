@@ -534,10 +534,31 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     // rules, and their reasons -- so the failure is diagnosable rather than a
     // bare "no plan". A truncated search is called out separately: no plan
     // under a cap does not mean the graph is unmappable (design §16.2).
-    std::string message =
-        (passName + ": the search produced no complete plan").str();
+    //
+    // Under the executable contract every candidate was *refused* rather than
+    // simply never completed, and the first refusal's own words are the most
+    // useful primary message: a binding refusal names the decision that could
+    // not be materialized, exactly as a direct `bindPlan` under that contract
+    // would (issue #129, task R7). The notices -- a cache miss, a cap -- stay
+    // in the diagnostic list below it rather than leading.
+    const mapping::Diagnostic *refusal = nullptr;
+    if (contract == mapping::BindContract::Executable)
+      for (const mapping::Diagnostic &detail : run.result.frontier.diagnostics)
+        if (mapping::isRejection(detail.code)) {
+          refusal = &detail;
+          break;
+        }
+
+    std::string message;
+    if (refusal)
+      message = refusal->message;
+    else
+      message = (passName + ": the search produced no complete plan").str();
     if (run.result.searchTruncated)
-      message += " (a search cap was hit)";
+      message += "\n  (a search cap was hit)";
+    if (refusal)
+      message +=
+          "\n  " + (passName + ": the search produced no complete plan").str();
     for (const mapping::Diagnostic &detail : run.result.frontier.diagnostics)
       message += "\n  " + mapping::stringifyDiagnosticCode(detail.code).str() +
                  ": " + detail.message;

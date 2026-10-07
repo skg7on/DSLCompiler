@@ -159,6 +159,109 @@ TEST(CompletePlanEvaluationTest, IsDeterministicAndIdempotent) {
   EXPECT_EQ(probe.id, first->plan->id);
 }
 
+// A positive attach: a proposal whose bound kernel the machine can model
+// carries the derived event snapshot, and `buildPlanEvents` consumes it as the
+// plan's own stream rather than accumulating rule-local estimates. This is the
+// path the shipped acceptance fixtures cannot reach (their boundary copy names
+// an engine the machine does not model), so it is proven here on a kernel whose
+// compute event names the engine the plan selected.
+TEST(CompletePlanEvaluationTest,
+     AttachesTheDerivedEventSnapshotWhenItVerifies) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  std::vector<CoveringPlan> proposals = proposalsFor(*c);
+  ASSERT_FALSE(proposals.empty());
+
+  const CoveringPlan &proposal = proposals.front();
+  const std::string selected =
+      proposal.placements.front().computeBindings.lookup("vector_engine");
+  ASSERT_FALSE(selected.empty());
+
+  llvm::Expected<CompletePlanEvaluation> evaluated = evaluateCompletePlan(
+      *c->source, c->graph, *c->target, proposal, BindContract::Partial);
+  ASSERT_TRUE(static_cast<bool>(evaluated))
+      << llvm::toString(evaluated.takeError());
+  ASSERT_TRUE(evaluated->plan.has_value());
+  ASSERT_TRUE(evaluated->plan->analysisEvents.has_value());
+  EXPECT_FALSE(evaluated->plan->analysisEvents->events.empty());
+
+  llvm::Expected<PlanEventDAG> events =
+      buildPlanEvents(*evaluated->plan, c->target->machine());
+  ASSERT_TRUE(static_cast<bool>(events)) << llvm::toString(events.takeError());
+  EXPECT_EQ(events->source, PlanEventSource::Snapshot);
+  ASSERT_FALSE(events->events.empty());
+  // The consumed stream is the materialized work's: the event names the engine
+  // this plan selected, not the executor's first attachment.
+  EXPECT_EQ(events->events.front().event.kind, CostEventKind::Compute);
+  EXPECT_EQ(events->events.front().event.resource, selected);
+}
+
+// The two binding contexts are deliberately different (issue #129, task R7). A
+// *proposal* that is not executable under `BindContract::Executable` is a
+// candidate rejection -- the search records it and keeps enumerating, so a
+// legal covering of the same graph is still found. A direct `bindPlan` under
+// the same contract keeps failing hard; that behaviour is pinned by
+// `PlanBinder.ExecutableContractRefusesAPlanThatOmitsADecision` and
+// `PlanBinder.ExecutableWithoutAMaterializerIsRejected`.
+TEST(CompletePlanEvaluationTest, ExecutableRefusalIsACandidateRejection) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 0;
+  options.requireCompleteEvaluation = true;
+  options.evaluateCompletePlan = [&c](const CoveringPlan &proposal) {
+    return evaluateCompletePlan(*c->source, c->graph, *c->target, proposal,
+                                BindContract::Executable);
+  };
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "f32";
+  CoveringSearch search(c->graph, *c->target, *c->context, layoutContext,
+                        options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  // The over-capacity proposal was rejected, not fatal: the search continued
+  // and retained the executable covering.
+  ASSERT_EQ(result->plans.size(), 1u);
+  EXPECT_EQ(result->plans.front().placements.front().rule, "r.large");
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+  EXPECT_FALSE(result->searchTruncated);
+}
+
+// The complementary shape: when *every* proposal is refused, the search still
+// returns a result (with no plans and the refusal on the frontier) rather than
+// an `llvm::Error`. `missing-memory`'s rule binds no memory over an occurrence
+// the machine offers two same-kind nodes for, so the plan can never be
+// physically complete and the executable binding refuses it.
+TEST(CompletePlanEvaluationTest, ARefusedProposalIsNotASearchError) {
+  auto c = issue129::resourceCase("missing-memory");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 0;
+  options.requireCompleteEvaluation = true;
+  options.evaluateCompletePlan = [&c](const CoveringPlan &proposal) {
+    return evaluateCompletePlan(*c->source, c->graph, *c->target, proposal,
+                                BindContract::Executable);
+  };
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "f32";
+  CoveringSearch search(c->graph, *c->target, *c->context, layoutContext,
+                        options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_FALSE(result->frontier.diagnostics.empty());
+  bool refused = false;
+  for (const Diagnostic &diagnostic : result->frontier.diagnostics)
+    refused |= diagnostic.code == DiagnosticCode::UnsupportedMaterialization;
+  EXPECT_TRUE(refused);
+}
+
 // The evaluation binds a preview onto a *private clone*: the source module is
 // byte-identical before and after, however many times a proposal is evaluated.
 TEST(CompletePlanEvaluationTest, LeavesTheSourceModuleUnchanged) {

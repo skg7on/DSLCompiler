@@ -61,13 +61,22 @@ namespace mlir::llk::mapping {
 /// `contract` is the binding contract the caller will bind the selected plan
 /// under. Under `BindContract::Executable` the preview is an executable
 /// binding: a decision the binder cannot materialize, or a value whose physical
-/// memory does not resolve, is refused by `bindPlan`, and that refusal is
-/// surfaced as an `llvm::Error` (the invocation's contract is unsatisfiable)
-/// rather than a candidate rejection. Under `BindContract::Partial` an
-/// incomplete plan is kept as an explicit analysis artifact -- its
-/// `physicalComplete` verdict and ordered reasons are recorded -- which is what
-/// the `report-only` workflow needs. Either way the strict finalize attempt
-/// runs first, so a physically complete plan is always preferred.
+/// memory does not resolve, is refused by `bindPlan`. That refusal is a
+/// **candidate rejection** -- a property of this proposal -- so the search
+/// records it with a stable code and keeps enumerating: some other covering may
+/// be executable, and a cheap non-executable one must not end the search. The
+/// rejection carries the binder's own message, so a caller that ends up with no
+/// plan reads exactly the refusal a direct `bindPlan` under the executable
+/// contract would give. Under `BindContract::Partial` an incomplete plan is
+/// kept as an explicit analysis artifact -- its `physicalComplete` verdict and
+/// ordered reasons are recorded -- which is what the `report-only` workflow
+/// needs. Either way the strict finalize attempt runs first, so a physically
+/// complete plan is always preferred.
+///
+/// An `llvm::Error` is reserved for a malformed invocation and for
+/// infrastructure failures (a structural binder failure under the partial
+/// contract, an unbuildable stream): those stop the search, because they are
+/// properties of the run rather than of one candidate.
 llvm::Expected<CompletePlanEvaluation>
 evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
                      const MappingTarget &target, const CoveringPlan &proposal,

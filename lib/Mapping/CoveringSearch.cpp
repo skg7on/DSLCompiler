@@ -2196,20 +2196,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     }
   } else {
     // Deterministic and exact share a depth-first walk; they differ in when
-    // they stop and in whether the bound prunes.
+    // they stop.
     bool exact = options_.mode == SearchMode::Exact;
-    // Best complete costs for the exact-minimize prune, ranked by the declared
-    // objective (best first, so the worst kept plan is `back()`). Only the
-    // prune reads it, and only a minimize objective arms that prune, so a
-    // maximize or deterministic run skips this bookkeeping along with the
-    // prune block below. With an evaluator set, the prune is disabled entirely:
-    // its bound is the additive rule cost while the retained plans are ranked
-    // by the *scheduled* objective, which is not a monotone function of the
-    // additive cost, so the bound is inadmissible and could drop a plan the
-    // evaluator would have accepted.
-    const bool pruneOnBound =
-        exact && options_.objective.minimize && !hasEvaluator && !unlimitedTopK;
-    std::vector<Cost> bestCosts;
+    // The additive top-K bound prune is *gone* (issue #129, task R7). Its bound
+    // was the additive rule-local cost while the plans a caller retains are
+    // ranked by the *scheduled* objective (the shared resource scheduler's
+    // overlapped latency, assigned in `retain`), and the scheduled objective is
+    // not a monotone function of the additive cost. A bound built on one and
+    // applied to the other is inadmissible: it can drop a completion the
+    // evaluator would have accepted and the ranking would have kept. That holds
+    // with or without a completion evaluator -- the evaluator only widens the
+    // gap, because it replaces the attribute cost with physical feasibility and
+    // the kernel's own schedule -- so the walk explores the space in full and
+    // relies on the *reported* caps (topK, instance, candidate, route and
+    // connection caps) for its bounds. A run that hits one sets
+    // `searchTruncated`; a run that does not is exhaustive.
     std::function<void(Partial &, bool &)> visit = [&](Partial &partial,
                                                        bool &stop) {
       if (stop)
@@ -2225,14 +2226,6 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         }
         if (!exact && accepted)
           stop = true; // deterministic: the first *feasible* complete plan
-        if (pruneOnBound) {
-          bestCosts.push_back(partial.cost);
-          llvm::sort(bestCosts, [&](const Cost &lhs, const Cost &rhs) {
-            return costLess(lhs, rhs, options_.objective);
-          });
-          if (!unlimitedTopK && bestCosts.size() > options_.topK)
-            bestCosts.resize(options_.topK);
-        }
         return;
       }
       for (const InstanceEntry &entry : tables[*node].instances) {
@@ -2242,36 +2235,6 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         for (Partial &branch : states) {
           if (stop)
             return;
-          // Bound-based pruning is sound only for a minimize objective. The
-          // bound omits connection costs (a connection is synthesized only once
-          // both endpoints are chosen), and that term is non-negative: for
-          // minimize an omitted term can only raise a completion, so the bound
-          // stays at or below it; for maximize the same omission makes the
-          // bound too small, and a branch whose real completion would be
-          // largest can look poor. Maximize therefore explores fully -- the
-          // caps (topK, instance, candidate, route, and connection caps) still
-          // bound the run and report `searchTruncated`, so it never silently
-          // returns a non-best plan.
-          if (pruneOnBound) {
-            branch.lowerBound = boundCost(branch);
-            if (bestCosts.size() >= options_.topK &&
-                !boundIsBetterThan(branch.lowerBound, bestCosts.back(),
-                                   options_.objective)) {
-              // A full top-K list makes this prune exact for a *strictly
-              // better* cost: it cannot drop a completion strictly cheaper than
-              // the worst kept plan. On an exact cost *tie* it is not exact --
-              // the bound compares against `bestCosts.back()`, which is
-              // cost-only, while the final top-K trim keys on `(cost,
-              // plan.id)`, so a tie can prune a plan whose smaller id the trim
-              // would have kept. Either way the space was not exhausted, and
-              // the caller is told so (`searchTruncated`).
-              result.searchTruncated = true;
-              report(DiagnosticCode::SearchTruncated,
-                     "exact search pruned by the top-K bound (topK=" +
-                         std::to_string(options_.topK) + ")");
-              continue;
-            }
-          }
           visit(branch, stop);
           if (stop)
             return;

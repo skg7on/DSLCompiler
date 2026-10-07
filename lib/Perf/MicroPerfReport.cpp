@@ -114,15 +114,23 @@ std::string joinCounters(const std::map<std::string, uint64_t> &counters) {
 /// A mapped kernel's `micro.plan` records the storage allocations the selected
 /// plan reserved (`finalizeStoragePlan`'s decisions). Their live peak -- the
 /// bytes each memory must hold simultaneously, honoring the aliases the plan
-/// proved and the simultaneous residency it recorded -- is the same relation
-/// the planner validated the plan's capacity against (`computePeakStorage`),
-/// and it is *not* `MicroDAG::liveTileBytesByMemory`: that accounting sums
-/// every buffer the kernel materializes, which charges loop-nested and reused
-/// buffers as if they were all live at once, and so reports a footprint far
-/// above the plan's proven peak. The plan is the authority for a kernel that
-/// carries one, so the simulator reads it rather than re-deriving a weaker
-/// relation. An empty map means "no plan recorded": the caller keeps the
-/// extraction's own accounting (issue #129, task R7 occupancy reconciliation).
+/// proved and the simultaneous residency it recorded -- is *not*
+/// `MicroDAG::liveTileBytesByMemory`: that accounting sums every buffer the
+/// kernel materializes, charging loop-nested and reused buffers as if they were
+/// all live at once, and so reports a footprint far above the plan's proven
+/// peak. The plan is the authority for a kernel that carries one.
+///
+/// The relation used is `computePeakStorage` over the recorded allocations,
+/// which is the *fallback* relation `finalizeStoragePlan` summarizes occupancy
+/// with when the machine does not model every event resource -- not the primary
+/// event-schedule liveness. The two are not structurally the same (live
+/// intervals versus scheduled events), though they agree here because the
+/// plan's aliases and per-slot residency are exactly what both read. Re-running
+/// the primary liveness from the IR alone is not possible: it needs each
+/// event's `StorageUse` occurrences, which carry the planner's own allocation
+/// identities and are not persisted (that is R8's durable-replay work). An
+/// empty map means "no plan recorded": the caller keeps the extraction's own
+/// accounting (issue #129, task R7 occupancy reconciliation).
 std::map<mapping::MemoryNodeId, uint64_t>
 planRecordedLivePeak(mlir::Operation *kernel,
                      const machine::MachineModel &machine) {

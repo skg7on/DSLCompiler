@@ -118,6 +118,17 @@ struct Diagnostic {
 /// failure (design §22.1).
 bool diagnosticLess(const Diagnostic &lhs, const Diagnostic &rhs);
 
+/// True when `code` classifies a *rejection* -- a refusal the search made --
+/// rather than a notice. A cap hit, a provider gap or an advisory assumption
+/// (an assumed value size) is a notice: it must not inflate a rejection tally,
+/// and a caller reporting "no plan" wants the first *refusal* as its primary
+/// reason rather than a cache miss.
+///
+/// Every code is classified explicitly and there is deliberately no `default`:
+/// a code added to the enum without a case here is a compile error
+/// (`-Wswitch`), rather than silently defaulting into the rejection bucket.
+bool isRejection(DiagnosticCode code);
+
 } // namespace mlir::llk::mapping
 
 #endif // LLK_MAPPING_DIAGNOSTICS_H

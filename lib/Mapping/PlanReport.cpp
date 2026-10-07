@@ -53,43 +53,6 @@ llvm::StringRef stringifySearchMode(SearchMode mode) {
   return "unknown";
 }
 
-/// True when `code` names a *rejection* -- something the search refused -- as
-/// opposed to a notice. §22.2 asks for "rejected counts", so a notice never
-/// inflates the rejection tally.
-///
-/// Every code is classified explicitly and there is deliberately no `default`:
-/// a code added to the enum without a case here makes this switch incomplete
-/// (`-Wswitch`), rather than silently defaulting into the rejection bucket.
-/// `AssumedValueSize` is the case that motivated it -- its own documentation
-/// says it is not an error, so it must land under notices.
-bool isRejection(DiagnosticCode code) {
-  switch (code) {
-  // Notices: a cap, a provider gap, or an advisory assumption. None is a
-  // refusal the search made.
-  case DiagnosticCode::SearchTruncated:
-  case DiagnosticCode::LatencyCacheMiss:
-  case DiagnosticCode::AssumedValueSize:
-  case DiagnosticCode::ConnectionChoiceUnexplored:
-    return false;
-  // Rejections: the search refused a rule, a placement, a pair, a layout, a
-  // global constraint, a bundle, or a plan.
-  case DiagnosticCode::NoMatchingRule:
-  case DiagnosticCode::NoLegalLayout:
-  case DiagnosticCode::NoLegalExecutor:
-  case DiagnosticCode::MemoryCapacityExceeded:
-  case DiagnosticCode::UnsupportedComputeFragment:
-  case DiagnosticCode::NoMemoryRoute:
-  case DiagnosticCode::NoLayoutTransform:
-  case DiagnosticCode::GlobalConstraintFailed:
-  case DiagnosticCode::TargetBundleInvalid:
-  case DiagnosticCode::InvalidMappingMetadata:
-  case DiagnosticCode::InvalidGatherDeclaration:
-  case DiagnosticCode::UnsupportedMaterialization:
-    return true;
-  }
-  llvm_unreachable("unclassified DiagnosticCode");
-}
-
 /// Fixed six-decimal rendering of a double, matching `canonicalCostString`, so
 /// a cost component is byte-stable and never printed in exponent form.
 /// `snprintf`'s `%f` honours the C locale's decimal separator; the report
@@ -268,14 +231,27 @@ std::string writePlanReport(const MappingSearchResult &result,
           });
           json.attributeObject("diagnostics", [&] {
             json.attribute("searchTruncated", plan.diagnostics.searchTruncated);
-            // `errors`/`warnings` are never written by the search, so these
-            // counts are always 0 today; they are emitted so the report shape
-            // is stable for a future producer rather than silently omitted.
+            // The plan's error and warning lists. The search itself produces
+            // neither today, but the completion evaluator (issue #129, task R7)
+            // records a *reason* here when a derived fact could not be
+            // established -- an event snapshot the machine cannot model, for
+            // instance -- so both the counts and the ordered text are emitted.
+            // A count alone would leave a reader unable to see what was
+            // refused. These lists are provenance, not content: they never fold
+            // into a plan id.
             json.attribute("errorCount", static_cast<uint64_t>(
                                              plan.diagnostics.errors.size()));
+            json.attributeArray("errors", [&] {
+              for (const std::string &error : plan.diagnostics.errors)
+                json.value(error);
+            });
             json.attribute(
                 "warningCount",
                 static_cast<uint64_t>(plan.diagnostics.warnings.size()));
+            json.attributeArray("warnings", [&] {
+              for (const std::string &warning : plan.diagnostics.warnings)
+                json.value(warning);
+            });
             // Storage finalization's informational notes: occupancy and
             // analysis-mode reports. They are deliberately separate from the
             // identity-bearing warnings, so a staged note never changes a plan
