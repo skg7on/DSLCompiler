@@ -4621,6 +4621,39 @@ TEST(MappingDiagnostics, DistinctFailuresCarryDistinctCodes) {
   }
 }
 
+// Issue #129, task R7 review: the "no plan" primary message must be the
+// plan-level refusal -- the one the completion evaluator produced, which names
+// the decision that could not be materialized -- not whichever rejection
+// happens to carry the lowest enum code. `UnsupportedMaterialization` is the
+// last enumerator, so an enum-ordered scan would always report an earlier
+// rule-level rejection instead.
+TEST(MappingDiagnostics, PrimaryRefusalPrefersThePlanLevelRefusal) {
+  std::vector<Diagnostic> diagnostics = {
+      {DiagnosticCode::NoMatchingRule, "no rule names this node"},
+      {DiagnosticCode::UnsupportedMaterialization,
+       "placement for node 3 records compute node 'vpu.x'"},
+      {DiagnosticCode::SearchTruncated, "a cap is a notice, not a refusal"},
+  };
+  const Diagnostic *primary = primaryRefusal(diagnostics);
+  ASSERT_NE(primary, nullptr);
+  EXPECT_EQ(primary->code, DiagnosticCode::UnsupportedMaterialization);
+}
+
+TEST(MappingDiagnostics, PrimaryRefusalFallsBackToTheFirstRejection) {
+  std::vector<Diagnostic> diagnostics = {
+      {DiagnosticCode::SearchTruncated, "a cap is a notice"},
+      {DiagnosticCode::NoMemoryRoute, "no route"},
+      {DiagnosticCode::NoLegalLayout, "no layout"},
+  };
+  const Diagnostic *primary = primaryRefusal(diagnostics);
+  ASSERT_NE(primary, nullptr);
+  EXPECT_EQ(primary->code, DiagnosticCode::NoMemoryRoute);
+  EXPECT_EQ(primaryRefusal(std::vector<Diagnostic>{}), nullptr);
+  std::vector<Diagnostic> noticesOnly = {
+      {DiagnosticCode::SearchTruncated, "only a notice"}};
+  EXPECT_EQ(primaryRefusal(noticesOnly), nullptr);
+}
+
 //===----------------------------------------------------------------------===//
 // Physical (layout-image) capacity charging (task B3)
 //===----------------------------------------------------------------------===//

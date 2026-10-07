@@ -543,11 +543,7 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     // in the diagnostic list below it rather than leading.
     const mapping::Diagnostic *refusal = nullptr;
     if (contract == mapping::BindContract::Executable)
-      for (const mapping::Diagnostic &detail : run.result.frontier.diagnostics)
-        if (mapping::isRejection(detail.code)) {
-          refusal = &detail;
-          break;
-        }
+      refusal = mapping::primaryRefusal(run.result.frontier.diagnostics);
 
     std::string message;
     if (refusal)

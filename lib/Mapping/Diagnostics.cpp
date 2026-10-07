@@ -112,4 +112,21 @@ bool isRejection(DiagnosticCode code) {
   llvm_unreachable("unclassified DiagnosticCode");
 }
 
+const Diagnostic *primaryRefusal(llvm::ArrayRef<Diagnostic> diagnostics) {
+  const Diagnostic *first = nullptr;
+  for (const Diagnostic &detail : diagnostics) {
+    if (!isRejection(detail.code))
+      continue;
+    if (!first)
+      first = &detail;
+    // A plan-level refusal outranks a rule-level one whichever order the codes
+    // sort in: it is the one that names the decision the search got as far as
+    // choosing and then could not materialize.
+    if (detail.code == DiagnosticCode::UnsupportedMaterialization ||
+        detail.code == DiagnosticCode::MemoryCapacityExceeded)
+      return &detail;
+  }
+  return first;
+}
+
 } // namespace mlir::llk::mapping

@@ -18,6 +18,7 @@
 #ifndef LLK_MAPPING_DIAGNOSTICS_H
 #define LLK_MAPPING_DIAGNOSTICS_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
@@ -128,6 +129,21 @@ bool diagnosticLess(const Diagnostic &lhs, const Diagnostic &rhs);
 /// a code added to the enum without a case here is a compile error
 /// (`-Wswitch`), rather than silently defaulting into the rejection bucket.
 bool isRejection(DiagnosticCode code);
+
+/// The rejection whose words should lead a "no plan" report. A *plan-level*
+/// refusal -- one the completion evaluator produced because a chosen decision
+/// could not be materialized -- is the most useful primary message, because it
+/// names the exact decision that failed; a rule-level rejection (no matching
+/// rule, no legal executor, no route) only says a node never had a candidate,
+/// which the rest of the frontier already lists.
+///
+/// This prefers the plan-level codes over the rule-level ones *regardless of
+/// their numeric order* -- `UnsupportedMaterialization` is the last enumerator,
+/// so an enum-ordered scan would always report an earlier rule-level rejection
+/// instead -- and otherwise returns the first rejection in `diagnostics`, which
+/// is stable because the frontier is sorted by `diagnosticLess`. Returns null
+/// when `diagnostics` holds no rejection at all (only notices, or nothing).
+const Diagnostic *primaryRefusal(llvm::ArrayRef<Diagnostic> diagnostics);
 
 } // namespace mlir::llk::mapping
 
