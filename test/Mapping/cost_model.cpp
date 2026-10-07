@@ -805,6 +805,201 @@ TEST(CostModel, Issue129AnUnknownRecordedComputeNodeIsRejected) {
             std::string::npos);
 }
 
+//===----------------------------------------------------------------------===//
+// Issue #129, task R2: each named transfer engine pools its own concurrency
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// A machine with one worker and the named DMA engine nodes the caller asks
+/// for. No links are needed: the scheduler resolves an event's resource to its
+/// engine node by id alone.
+mlir::llk::machine::MachineModel
+dmaPoolMachine(llvm::ArrayRef<std::pair<llvm::StringRef, uint32_t>> engines) {
+  using namespace mlir::llk::machine;
+  MachineModel machine;
+  machine.target = "dma-pool";
+  machine.workerThreads = 1;
+  ExecutorNode worker;
+  worker.id = "e0";
+  worker.kind = "worker";
+  machine.executors.push_back(worker);
+  for (const auto &[id, count] : engines) {
+    TransferEngineNode engine;
+    engine.id = id.str();
+    engine.kind = "dma";
+    engine.attachedTo = "e0";
+    engine.count = count;
+    machine.transferEngines.push_back(engine);
+  }
+  return machine;
+}
+} // namespace
+
+// Two ten-cycle transfers that both name `dma.a`. The machine also declares an
+// unused `dma.b`; that second node must not widen `dma.a`'s pool. Before the
+// repair the pool took the whole machine's transfer-engine count, so the mere
+// presence of another engine doubled this one's slots and both transfers
+// started at zero.
+TEST(CostModel, Issue129DmaNamedEngineUsesOnlyItsOwnCount) {
+  mlir::llk::machine::MachineModel machine =
+      dmaPoolMachine({{"dma.a", 1}, {"dma.b", 1}});
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256)};
+
+  EventScheduleResult withUnused = scheduleNormalizedEvents(events, machine);
+  machine.transferEngines.pop_back(); // removes dma.b, not dma.a
+  EventScheduleResult alone = scheduleNormalizedEvents(events, machine);
+
+  EXPECT_EQ(alone.predictedCycles, 20u);
+  EXPECT_EQ(withUnused.predictedCycles, alone.predictedCycles);
+  EXPECT_EQ(withUnused.entries[1].start, 10u);
+}
+
+// The flip side of the same rule: the *named* node's own count is what buys
+// overlap. Two transfers on one engine that declares two slots run together.
+TEST(CostModel, Issue129DmaNodeCountIsItsOwnConcurrency) {
+  mlir::llk::machine::MachineModel machine = dmaPoolMachine({{"dma.a", 2}});
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256)};
+
+  EventScheduleResult result = scheduleNormalizedEvents(events, machine);
+  EXPECT_EQ(result.entries[0].start, 0u);
+  EXPECT_EQ(result.entries[1].start, 0u);
+  EXPECT_EQ(result.predictedCycles, 10u);
+}
+
+// Two events that name two different engines occupy two different pools, so
+// they overlap whatever each node's own count is.
+TEST(CostModel, Issue129DmaDistinctEnginesOverlap) {
+  mlir::llk::machine::MachineModel machine =
+      dmaPoolMachine({{"dma.a", 1}, {"dma.b", 1}});
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.b", 10, 0, 256)};
+
+  EventScheduleResult result = scheduleNormalizedEvents(events, machine);
+  EXPECT_EQ(result.entries[0].start, 0u);
+  EXPECT_EQ(result.entries[1].start, 0u);
+  EXPECT_EQ(result.predictedCycles, 10u);
+}
+
+// A data dependency still serializes two independent engines: more slots never
+// license starting a consumer before its producer finished.
+TEST(CostModel, Issue129DmaDependencySerializesAcrossEngines) {
+  mlir::llk::machine::MachineModel machine =
+      dmaPoolMachine({{"dma.a", 4}, {"dma.b", 4}});
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.b", 10, 0, 256, {0})};
+
+  EventScheduleResult result = scheduleNormalizedEvents(events, machine);
+  EXPECT_EQ(result.entries[1].start, 10u);
+  EXPECT_EQ(result.predictedCycles, 20u);
+}
+
+// The schedule is a function of the machine's *content*, not of the order its
+// engine nodes happen to be listed in.
+TEST(CostModel, Issue129DmaInsertionOrderDoesNotAlterTheSchedule) {
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.b", 7, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 4, 0, 256)};
+
+  mlir::llk::machine::MachineModel forward =
+      dmaPoolMachine({{"dma.a", 1}, {"dma.b", 1}});
+  mlir::llk::machine::MachineModel reversed =
+      dmaPoolMachine({{"dma.b", 1}, {"dma.a", 1}});
+
+  EventScheduleResult first = scheduleNormalizedEvents(events, forward);
+  EventScheduleResult second = scheduleNormalizedEvents(events, reversed);
+  EXPECT_EQ(first.predictedCycles, second.predictedCycles);
+  ASSERT_EQ(first.entries.size(), second.entries.size());
+  for (size_t i = 0; i < first.entries.size(); ++i) {
+    EXPECT_EQ(first.entries[i].start, second.entries[i].start) << i;
+    EXPECT_EQ(first.entries[i].finish, second.entries[i].finish) << i;
+  }
+}
+
+// An unnamed legacy pool ("dma", not a modelled node) is scheduled on a single
+// slot -- a partial answer that never claims the whole machine. Strict
+// validation rejects it rather than accept the partial cost as complete.
+TEST(CostModel, Issue129DmaUnnamedLegacyPoolStaysPartial) {
+  mlir::llk::machine::MachineModel machine =
+      dmaPoolMachine({{"dma.a", 1}, {"dma.b", 2}});
+  ASSERT_EQ(machine.transferEngineCount(), 3u);
+
+  PlanEventDAG dag;
+  dag.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma", 10, 0, 256)};
+  EventScheduleResult result = scheduleNormalizedEvents(dag.events, machine);
+  EXPECT_EQ(result.predictedCycles, 20u); // one slot, so the two serialize
+
+  llvm::Error strict = validateEventResources(dag, machine);
+  EXPECT_TRUE(static_cast<bool>(strict));
+  if (strict)
+    EXPECT_NE(llvm::toString(std::move(strict)).find("dma"), std::string::npos);
+}
+
+// Strict validation accepts a fully modelled stream and rejects the ways it can
+// be incomplete: an engine the machine does not name, a zero slot count, and
+// dependency edges that are self, out of range, duplicated, or cyclic.
+TEST(CostModel, Issue129DmaStrictValidationChecksResourcesAndDependencies) {
+  mlir::llk::machine::MachineModel machine = dmaPoolMachine({{"dma.a", 1}});
+
+  PlanEventDAG valid;
+  valid.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {0})};
+  EXPECT_FALSE(static_cast<bool>(validateEventResources(valid, machine)));
+
+  PlanEventDAG unknownEngine;
+  unknownEngine.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.ghost", 10, 0, 256)};
+  llvm::Error missing = validateEventResources(unknownEngine, machine);
+  ASSERT_TRUE(static_cast<bool>(missing));
+  EXPECT_NE(llvm::toString(std::move(missing)).find("dma.ghost"),
+            std::string::npos);
+
+  mlir::llk::machine::MachineModel zero = dmaPoolMachine({{"dma.a", 0}});
+  PlanEventDAG oneEvent;
+  oneEvent.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256)};
+  llvm::Error zeroCount = validateEventResources(oneEvent, zero);
+  ASSERT_TRUE(static_cast<bool>(zeroCount));
+  EXPECT_NE(llvm::toString(std::move(zeroCount)).find("count 0"),
+            std::string::npos);
+
+  PlanEventDAG selfDep;
+  selfDep.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {0})};
+  EXPECT_TRUE(static_cast<bool>(validateEventResources(selfDep, machine)));
+
+  PlanEventDAG outOfRange;
+  outOfRange.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {7})};
+  EXPECT_TRUE(static_cast<bool>(validateEventResources(outOfRange, machine)));
+
+  // `makePlanCostEvent` sorts and de-duplicates its edges, so a repeated
+  // dependency only reaches the validator from a directly built stream.
+  PlanEventDAG duplicated;
+  duplicated.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256)};
+  duplicated.events[1].deps = {0, 0};
+  EXPECT_TRUE(static_cast<bool>(validateEventResources(duplicated, machine)));
+
+  PlanEventDAG cyclic;
+  cyclic.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {1}),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {0})};
+  llvm::Error cycle = validateEventResources(cyclic, machine);
+  ASSERT_TRUE(static_cast<bool>(cycle));
+  EXPECT_NE(llvm::toString(std::move(cycle)).find("cycle"), std::string::npos);
+}
+
 /// Two placements that differ only in the selected engine are different work,
 /// so a measured cost must not be reused across them: the operation signature's
 /// compute field is what separates the keys.

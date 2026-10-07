@@ -55,18 +55,36 @@ struct EventScheduleResult {
 /// Schedules `events` on `machine`. Among the events whose dependencies have
 /// finished, the lowest event id goes first; it starts when both its
 /// dependencies and its resource slots allow. Events that name the same
-/// resource pool each other's slots (a machine with N DMA engines runs N copies
-/// at once); two engine ids of one class are two pools. `owners`, when it is
-/// parallel to `events` and non-empty, adds an owner-occupancy pool per owner,
-/// bounded by the machine's owner count -- the constraint a `micro.spatial_for`
-/// puts on concurrent tiles.
+/// resource pool each other's slots -- but a pool is only ever as wide as the
+/// one node it names: a transfer engine's own `count` (and equally a compute
+/// node's own `concurrency`) is its concurrency, so an engine id is never
+/// widened by another engine the machine happens to declare. Two engine ids of
+/// one class are two pools. `owners`, when it is parallel to `events` and
+/// non-empty, adds an owner-occupancy pool per owner, bounded by the machine's
+/// owner count -- the constraint a `micro.spatial_for` puts on concurrent
+/// tiles.
 ///
 /// A resource the machine does not model is scheduled on a single slot rather
 /// than rejected: scheduling produces a cost, and cost never decides legality.
+/// That single slot is a deliberately partial answer -- it never claims the
+/// whole machine's multiplicity for an unnamed pool. A caller that needs the
+/// stream to be fully modelled calls `validateEventResources` first.
 EventScheduleResult
 scheduleNormalizedEvents(llvm::ArrayRef<PlanCostEvent> events,
                          const machine::MachineModel &machine,
                          llvm::ArrayRef<std::string> owners = {});
+
+/// The strict counterpart to `scheduleNormalizedEvents`: every event must name
+/// a resource the machine models, with a positive slot count, and its
+/// dependency edges must form a real acyclic order over the stream. Returns an
+/// error naming the first event that fails.
+///
+/// This is the check a caller uses when a zero-cost or single-slot fallback
+/// would hide a modelling gap -- plan evaluation (R6) and any strict analysis
+/// path call it before scheduling. `scheduleNormalizedEvents` itself stays
+/// lenient, because a cost is not a legality verdict.
+llvm::Error validateEventResources(const PlanEventDAG &dag,
+                                   const machine::MachineModel &machine);
 
 } // namespace mlir::llk::mapping
 

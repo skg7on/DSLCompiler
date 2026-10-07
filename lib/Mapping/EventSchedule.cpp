@@ -24,10 +24,17 @@ uint64_t eventCycles(const PlanCostEvent &event) {
 }
 
 /// The resource pool an event occupies and how many slots that pool offers.
-/// Each engine id is a separate pool, so two events that name the same engine
-/// share its slots rather than each getting the whole machine; a conversion
+/// Each engine id is a separate pool, sized by *that* node's own multiplicity:
+/// two events that name the same engine share its slots rather than each
+/// getting the whole machine. A machine-wide count would let one named engine
+/// claim slots it does not own -- an unused second engine would double the
+/// first one's, hiding a serialization the machine really has. A conversion
 /// shares the vector pool of the engine it runs on, exactly as the performance
 /// DAG's transform events did before both paths normalized.
+///
+/// An event whose resource the machine does not model gets a single slot: a
+/// partial, conservative claim, never the whole machine's count. Strict callers
+/// reject such an event through `validateEventResources` instead.
 struct PoolInfo {
   std::string key;
   uint32_t slots = 1;
@@ -38,6 +45,8 @@ PoolInfo poolFor(const PlanCostEvent &event,
   switch (event.event.kind) {
   case CostEventKind::Compute:
   case CostEventKind::Transform: {
+    // The recorded compute node supplies the concurrency; an unmodelled
+    // resource keeps one slot.
     const machine::ComputeNode *engine =
         machine.findCompute(event.event.resource);
     const bool matrix = engine && engine->kind == "matrix_engine";
@@ -46,9 +55,15 @@ PoolInfo poolFor(const PlanCostEvent &event,
     info.slots = std::max<uint32_t>(1, engine ? engine->concurrency : 1);
     return info;
   }
-  case CostEventKind::TransferHop:
+  case CostEventKind::TransferHop: {
+    // The named engine node's own count governs its pool. Every engine id is
+    // its own pool, so `dma.a` is never widened by the machine declaring
+    // `dma.b` (or by `dma.a`'s own count being summed across nodes).
+    const machine::TransferEngineNode *engine =
+        machine.findTransferEngine(event.event.resource);
     return {"dma/" + event.event.resource,
-            std::max<uint32_t>(1, machine.transferEngineCount())};
+            std::max<uint32_t>(1, engine ? engine->count : 1)};
+  }
   case CostEventKind::Synchronization:
   case CostEventKind::Capacity:
     return {"sync/" + event.event.resource, 1};
@@ -216,6 +231,114 @@ llvm::Expected<Cost> schedulePlanEvents(const PlanEventDAG &dag,
                               machine.transferEngineCount()))
     cost.transferUtilization = *utilization;
   return cost;
+}
+
+namespace {
+
+llvm::Error resourceError(const llvm::Twine &message) {
+  return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
+}
+
+} // namespace
+
+llvm::Error validateEventResources(const PlanEventDAG &dag,
+                                   const machine::MachineModel &machine) {
+  const size_t count = dag.events.size();
+
+  for (size_t id = 0; id < count; ++id) {
+    const PlanCostEvent &event = dag.events[id];
+
+    // The named pool must exist and be usable. The scheduler clamps a missing
+    // or zero engine to one slot so a cost can still be produced; a strict
+    // caller wants the fact reported instead, because a silently clamped pool
+    // would understate the schedule.
+    switch (event.event.kind) {
+    case CostEventKind::Compute:
+    case CostEventKind::Transform: {
+      const machine::ComputeNode *node =
+          machine.findCompute(event.event.resource);
+      if (!node)
+        return resourceError("event schedule: event " + llvm::Twine(id) +
+                             " names compute resource '" +
+                             event.event.resource + "', which machine '" +
+                             machine.target + "' does not model");
+      if (node->concurrency == 0)
+        return resourceError("event schedule: event " + llvm::Twine(id) +
+                             " names compute resource '" +
+                             event.event.resource +
+                             "', which declares concurrency 0; a pool needs at "
+                             "least one slot");
+      break;
+    }
+    case CostEventKind::TransferHop: {
+      const machine::TransferEngineNode *node =
+          machine.findTransferEngine(event.event.resource);
+      if (!node)
+        return resourceError("event schedule: event " + llvm::Twine(id) +
+                             " names transfer engine '" + event.event.resource +
+                             "', which machine '" + machine.target +
+                             "' does not model");
+      if (node->count == 0)
+        return resourceError("event schedule: event " + llvm::Twine(id) +
+                             " names transfer engine '" + event.event.resource +
+                             "', which declares count 0; a pool needs at least "
+                             "one slot");
+      break;
+    }
+    case CostEventKind::Synchronization:
+    case CostEventKind::Capacity:
+      break;
+    }
+
+    // Every dependency must be a real, distinct, other event. The scheduler
+    // drops a self or out-of-range edge rather than let it corrupt the score;
+    // strict input must supply edges that mean something.
+    for (size_t index = 0; index < event.deps.size(); ++index) {
+      const uint32_t dep = event.deps[index];
+      if (dep == id)
+        return resourceError("event schedule: event " + llvm::Twine(id) +
+                             " depends on itself");
+      if (dep >= count)
+        return resourceError("event schedule: event " + llvm::Twine(id) +
+                             " depends on event " + llvm::Twine(dep) +
+                             ", but the stream has " + llvm::Twine(count) +
+                             " events");
+      for (size_t prior = 0; prior < index; ++prior)
+        if (event.deps[prior] == dep)
+          return resourceError("event schedule: event " + llvm::Twine(id) +
+                               " lists dependency " + llvm::Twine(dep) +
+                               " more than once");
+    }
+  }
+
+  // A cycle leaves its events unready forever; the scheduler would silently
+  // start them at zero, so a strict caller rejects the stream instead.
+  std::vector<size_t> indegree(count, 0);
+  std::vector<std::vector<size_t>> dependents(count);
+  for (size_t id = 0; id < count; ++id)
+    for (uint32_t dep : dag.events[id].deps) {
+      ++indegree[id];
+      dependents[dep].push_back(id);
+    }
+
+  std::vector<size_t> ready;
+  for (size_t id = 0; id < count; ++id)
+    if (indegree[id] == 0)
+      ready.push_back(id);
+  size_t visited = 0;
+  while (!ready.empty()) {
+    const size_t id = ready.back();
+    ready.pop_back();
+    ++visited;
+    for (size_t dependent : dependents[id])
+      if (--indegree[dependent] == 0)
+        ready.push_back(dependent);
+  }
+  if (visited != count)
+    return resourceError("event schedule: dependency cycle among the " +
+                         llvm::Twine(count) + " events");
+
+  return llvm::Error::success();
 }
 
 } // namespace mlir::llk::mapping

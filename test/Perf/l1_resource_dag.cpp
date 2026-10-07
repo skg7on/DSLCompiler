@@ -18,6 +18,7 @@
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Mapping/CostEvent.h"
+#include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Perf/MicroCostModel.h"
 #include "LLK/Perf/MicroDAG.h"
@@ -75,9 +76,13 @@ std::unique_ptr<Parsed> parseKernel(llvm::StringRef source,
 /// A machine with one flop per cycle per matrix engine, a wide accumulator, and
 /// DMA slots the caller chooses. Only the parts the scheduler reads are set.
 ///
-/// Built in the v2 shape: `workers` are executors, `matrixEngines` and
-/// `dmaEngines` are counts of concrete capability and transfer nodes, which is
-/// what the scheduler's slot arithmetic reads.
+/// Built in the v2 shape: `workers` are executors, and `matrixEngines` /
+/// `dmaEngines` are the *multiplicity* of the one capability/transfer node that
+/// carries them -- a node's own `concurrency` (compute) or `count` (transfer)
+/// is its concurrency, which is what the scheduler's slot arithmetic reads.
+/// Declaring the engines as one node with a count is what the shipped machine
+/// profiles do (`machines/*-v2.yaml`), and it keeps a link that names `dma.0`
+/// able to use every engine the machine offers.
 std::string testMachine(unsigned dmaEngines, unsigned workers,
                         unsigned matrixEngines) {
   std::string yaml =
@@ -126,11 +131,10 @@ std::string testMachine(unsigned dmaEngines, unsigned workers,
           "    latency_cycles: 1\n    supported_layouts: [row_major]\n";
 
   yaml += "transfer_engines:\n";
-  for (unsigned i = 0; i < dmaEngines; ++i)
-    yaml += "  - id: dma." + std::to_string(i) +
-            "\n    kind: dma\n    refines: [transfer]\n"
-            "    attached_to: cluster.0\n"
-            "    count: 1\n    max_outstanding: 1\n";
+  yaml += "  - id: dma.0\n    kind: dma\n    refines: [transfer]\n"
+          "    attached_to: cluster.0\n"
+          "    count: " +
+          std::to_string(dmaEngines) + "\n    max_outstanding: 1\n";
 
   yaml += "links:\n";
   const char *paths[6][2] = {{"dram", "sram"}, {"sram", "dram"},
@@ -180,6 +184,23 @@ module {
     %b_ext = tensor.empty() : tensor<32x16xbf16>
     %a_tile, %a_tok = micro.async_copy %a_ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<16x32xbf16> -> tensor<16x32xbf16>, !micro.async_token
     %b_tile, %b_tok = micro.async_copy %b_ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<32x16xbf16> -> tensor<32x16xbf16>, !micro.async_token
+    micro.wait %a_tok, %b_tok
+    micro.yield
+  }
+}
+)MLIR";
+
+/// The bound form of `kCopiesKernel`: the same two independent `dram.0 ->
+/// sram.0` copies, each carrying the route its plan selected. A bound copy
+/// names the engine of the link it travels; an unrouted copy is unmapped
+/// analysis and only names the abstract `dma` pool.
+constexpr const char *kRoutedCopiesKernel = R"MLIR(
+module {
+  micro.kernel @routed_copies attributes {micro.routes = [{value = 0 : i64, kind = "transfer", route = ["dram.0", "sram.0"]}, {value = 1 : i64, kind = "transfer", route = ["dram.0", "sram.0"]}]} {
+    %a_ext = tensor.empty() : tensor<8x8xf32>
+    %b_ext = tensor.empty() : tensor<8x8xf32>
+    %a_tile, %a_tok = micro.async_copy %a_ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>, micro.value = 0 : i64, micro.dst_node = "sram.0"} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    %b_tile, %b_tok = micro.async_copy %b_ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>, micro.value = 1 : i64, micro.dst_node = "sram.0"} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
     micro.wait %a_tok, %b_tok
     micro.yield
   }
@@ -266,7 +287,7 @@ TEST(L1ResourceDag, CopyWaitMmaIsScheduledInOrder) {
 }
 
 TEST(L1ResourceDag, IndependentCopiesOverlapWithMoreDmaEngines) {
-  auto parsed = parseKernel(kCopiesKernel);
+  auto parsed = parseKernel(kRoutedCopiesKernel);
   ASSERT_TRUE(parsed);
 
   machine::MachineModel serialMachine =
@@ -276,16 +297,144 @@ TEST(L1ResourceDag, IndependentCopiesOverlapWithMoreDmaEngines) {
 
   auto dag = buildMicroDAG(parsed->kernel, serialMachine);
   ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 3u);
+  // Both copies name the engine their link selects; task R2 sizes that engine's
+  // pool by the node's own `count`, which is what `dmaEngines` sets here.
+  ASSERT_EQ(dag->events[0].resourceName, "dma.0");
+  ASSERT_EQ(dag->events[1].resourceName, "dma.0");
 
   L1Report serial = scheduleL1(*dag, serialMachine);
   L1Report parallel = scheduleL1(*dag, parallelMachine);
 
-  // With one engine the second copy waits for the first; with two they start
-  // together, because neither depends on the other.
+  // With one slot on the named engine the second copy waits for the first; with
+  // two they start together, because neither depends on the other.
   EXPECT_EQ(serial.schedule[1].start, serial.schedule[0].finish);
   EXPECT_EQ(parallel.schedule[0].start, 0u);
   EXPECT_EQ(parallel.schedule[1].start, 0u);
   EXPECT_LT(parallel.predictedCycles, serial.predictedCycles);
+}
+
+// Unmapped analysis: a hand-written kernel that declares no route names the
+// abstract `dma` pool, which is deliberately partial -- a single slot. It must
+// not silently claim every engine the machine declares, so a second engine does
+// not widen it. A strict caller rejects such a stream through
+// `mapping::validateEventResources` instead of trusting the partial cost.
+TEST(L1ResourceDag, UnmappedCopiesShareOnePartialTransferPool) {
+  auto parsed = parseKernel(kCopiesKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model =
+      parseMachine(testMachine(/*dmaEngines=*/2, 2, 4));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 3u);
+  EXPECT_EQ(dag->events[0].resourceName, "dma");
+  EXPECT_EQ(dag->events[1].resourceName, "dma");
+
+  L1Report report = scheduleL1(*dag, model);
+  EXPECT_EQ(report.schedule[1].start, report.schedule[0].finish);
+
+  mapping::PlanEventDAG normalized;
+  for (const MicroEvent &event : dag->events)
+    normalized.events.push_back(normalizedPlanEvent(event));
+  EXPECT_TRUE(
+      static_cast<bool>(mapping::validateEventResources(normalized, model)));
+}
+
+namespace {
+/// One worker, one `dram.0 -> sram.0` link whose transfers run on `dma.a`, and
+/// a second engine `dma.b` that no link names -- the "unused sibling" the
+/// pooling repair must ignore.
+constexpr llvm::StringLiteral kOneNamedLinkMachine = R"yaml(
+schema: llk.machine.v2
+target: named-dma
+clock_hz: 1000000000
+worker_threads: 1
+executors:
+  - id: cluster.0
+    kind: cluster
+    refines: [group]
+memories:
+  - id: dram.0
+    kind: dram
+    visible_from: cluster.0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 0
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.0
+    capacity_bytes: 65536
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 0
+transfer_engines:
+  - id: dma.a
+    kind: dma
+    refines: [transfer]
+    attached_to: cluster.0
+    count: 1
+    max_outstanding: 1
+  - id: dma.b
+    kind: dma
+    refines: [transfer]
+    attached_to: cluster.0
+    count: 1
+    max_outstanding: 1
+links:
+  - id: dram_to_sram.0
+    source: dram.0
+    destination: sram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 10
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+)yaml";
+} // namespace
+
+// Issue #129, task R2: the materialized-kernel path resolves a transfer to the
+// engine its *link* names and pools it by that node's own count, exactly as the
+// plan path does. Two independent copies name `dma.a`; the machine also
+// declares an unused `dma.b`, whose presence must not widen `dma.a`'s pool.
+// Before the repair the pool took the whole machine's engine count, so the
+// unused node made the two copies overlap when the engine they name has a
+// single slot.
+TEST(L1ResourceDag, NamedTransferEngineCountIsItsOwnConcurrency) {
+  auto parsed = parseKernel(kRoutedCopiesKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(kOneNamedLinkMachine);
+  ASSERT_EQ(model.transferEngineCount(), 2u);
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 3u);
+  ASSERT_EQ(dag->events[0].resourceName, "dma.a");
+  ASSERT_EQ(dag->events[1].resourceName, "dma.a");
+  const uint64_t copyCycles = dag->events[0].minCycles;
+  ASSERT_GT(copyCycles, 0u);
+
+  L1Report alone = scheduleL1(*dag, model);
+  EXPECT_EQ(alone.schedule[0].start, 0u);
+  EXPECT_EQ(alone.schedule[1].start, copyCycles);
+  EXPECT_EQ(alone.schedule[1].finish, 2 * copyCycles);
+
+  // Removing the engine no link names cannot change the schedule: `dma.a` was
+  // never entitled to `dma.b`'s slot.
+  model.transferEngines.pop_back();
+  L1Report withoutUnused = scheduleL1(*dag, model);
+  EXPECT_EQ(withoutUnused.schedule[1].start, alone.schedule[1].start);
+  EXPECT_EQ(withoutUnused.predictedCycles, alone.predictedCycles);
+
+  // Doubling the *named* node's own count is what buys overlap.
+  model.transferEngines.front().count = 2;
+  L1Report doubled = scheduleL1(*dag, model);
+  EXPECT_EQ(doubled.schedule[0].start, 0u);
+  EXPECT_EQ(doubled.schedule[1].start, 0u);
+  EXPECT_EQ(doubled.schedule[1].finish, copyCycles);
+  EXPECT_LT(doubled.predictedCycles, alone.predictedCycles);
 }
 
 TEST(L1ResourceDag, PipeliningOverlapsMovementWithCompute) {
