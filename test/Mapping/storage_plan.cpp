@@ -8,6 +8,8 @@
 
 #include "LLK/Mapping/StoragePlan.h"
 
+#include "resource_regression_fixture.h"
+
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/MappingPlan.h"
@@ -24,6 +26,7 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 
 #include <gtest/gtest.h>
@@ -32,6 +35,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1150,4 +1154,212 @@ TEST(StoragePlan, AClassDefaultResolutionIsRecordedAsADecision) {
     EXPECT_EQ(note.find("bare requirement"), std::string::npos) << note;
   for (const StorageAllocation &allocation : plan->allocations)
     EXPECT_EQ(allocation.memory, "dram.0");
+}
+
+//===----------------------------------------------------------------------===//
+// Every movement hop is allocated and bound (issue #129, task R4)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The `two-hop` fixture, searched exactly: a 256-byte `8x8xf32` value crossing
+/// sram.0 -> l2.0 -> dram.0 on two distinct DMA engines. The caller's
+/// `ASSERT_*` guards the returned error, so the case and its best plan are the
+/// test's own.
+struct TwoHopCase {
+  issue129::ResourceCase c;
+  CoveringPlan plan;
+};
+
+llvm::Expected<TwoHopCase> twoHopCase() {
+  llvm::Expected<issue129::ResourceCase> c = issue129::resourceCase("two-hop");
+  if (!c)
+    return c.takeError();
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  llvm::Expected<MappingSearchResult> result =
+      issue129::searchCase(*c, options);
+  if (!result)
+    return result.takeError();
+  if (result->plans.empty())
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the two-hop fixture searched no plan");
+  TwoHopCase built{std::move(*c), result->plans.front()};
+  return std::move(built);
+}
+
+} // namespace
+
+// The defect issue #129 finding 6 records: the selected plan reserved only the
+// route's *destination* memory, so an SRAM -> L2 -> DRAM movement had a
+// materialized copy per hop but no allocatable intermediate. Every hop now gets
+// its own destination allocation, and the intermediate is one buffer shared by
+// the two hops rather than one per hop.
+TEST(StoragePlan, ReservesEveryMovementHopAndSharesTheIntermediate) {
+  llvm::Expected<TwoHopCase> built = twoHopCase();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->c;
+  CoveringPlan &plan = built->plan;
+
+  ASSERT_FALSE(bool(finalizeStoragePlan(c.graph, plan, c.target->machine())));
+
+  ASSERT_FALSE(plan.connectionPlans.empty());
+  const PlanConnection &movement = plan.connectionPlans.front();
+  ASSERT_EQ(movement.route.size(), 3u) << "the only legal route is two hops";
+  ASSERT_EQ(movement.hops.size(), 2u);
+  EXPECT_EQ(movement.hops[0].index, 0u);
+  EXPECT_EQ(movement.hops[1].index, 1u);
+
+  // Hop 0 crosses into L2, hop 1 reads that same buffer and lands in DRAM.
+  EXPECT_EQ(movement.hops[0].srcMemory, "sram.0");
+  EXPECT_EQ(movement.hops[0].dstMemory, "l2.0");
+  EXPECT_EQ(movement.hops[1].srcMemory, "l2.0");
+  EXPECT_EQ(movement.hops[1].dstMemory, "dram.0");
+  EXPECT_EQ(movement.hops[1].sourceStorageId,
+            movement.hops[0].destinationStorageId);
+  EXPECT_NE(movement.hops[0].destinationStorageId, 0u);
+  EXPECT_NE(movement.hops[1].destinationStorageId, 0u);
+  EXPECT_NE(movement.hops[0].sourceStorageId, 0u);
+
+  // Each link names its own engine, so the two hops run on two engines.
+  EXPECT_EQ(movement.hops[0].engine, "dma.a");
+  EXPECT_EQ(movement.hops[1].engine, "dma.b");
+
+  // The intermediate is a real 256-byte reservation in the intermediate memory,
+  // and the staged destination is reserved too.
+  EXPECT_TRUE(llvm::any_of(plan.allocations, [](const StorageAllocation &a) {
+    return a.memory == "l2.0" && a.bytes == 256;
+  })) << "the L2 intermediate must be reserved";
+  EXPECT_TRUE(llvm::any_of(plan.allocations, [](const StorageAllocation &a) {
+    return a.memory == "dram.0" && a.bytes == 256;
+  }));
+
+  // Hop 0's destination allocation is live from its own copy through the next
+  // hop's read; hop 1's wait is what releases the value to the store.
+  const StorageAllocation *intermediate = nullptr;
+  for (const StorageAllocation &allocation : plan.allocations)
+    if (allocation.id == movement.hops[0].destinationStorageId)
+      intermediate = &allocation;
+  ASSERT_NE(intermediate, nullptr);
+  EXPECT_EQ(intermediate->beginStep, movement.hops[0].movementStep);
+  EXPECT_EQ(intermediate->endStep, movement.hops[1].movementStep);
+  EXPECT_LT(movement.hops[0].movementStep, movement.hops[0].waitStep);
+  EXPECT_LT(movement.hops[0].waitStep, movement.hops[1].movementStep);
+  EXPECT_LT(movement.hops[1].movementStep, movement.hops[1].waitStep);
+  bool ordersNextHop = false;
+  for (const PlanStepEdge &edge : plan.stepEdges)
+    ordersNextHop |= edge.from == movement.hops[0].waitStep &&
+                     edge.to == movement.hops[1].movementStep;
+  EXPECT_TRUE(ordersNextHop) << "the intermediate's last use must order the "
+                                "next hop's read";
+  // Every Movement/Synchronization step of a two-hop movement names its hop.
+  for (const PlanStep &step : plan.steps)
+    if (step.connection == movement.id)
+      EXPECT_TRUE(step.hop.has_value())
+          << "a movement or wait step of a two-hop route must name its hop";
+}
+
+// Routing checks the intermediate's capacity for the *copy* it enumerates; the
+// storage plan is what proves the reservation fits. Reducing L2 below the
+// value's 256 bytes must be refused by the reservation, naming the memory.
+TEST(StoragePlan, RejectsAMovementWhoseIntermediateCannotHoldTheValue) {
+  llvm::Expected<TwoHopCase> built = twoHopCase();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->c;
+  CoveringPlan &plan = built->plan;
+
+  MachineModel small = c.target->machine();
+  for (MemoryNode &memory : small.memories)
+    if (memory.id == "l2.0")
+      memory.capacityBytes = 128;
+
+  llvm::Error error = finalizeStoragePlan(c.graph, plan, small);
+  ASSERT_TRUE(bool(error));
+  const std::string message = llvm::toString(std::move(error));
+  EXPECT_NE(message.find("l2.0"), std::string::npos) << message;
+  EXPECT_NE(message.find("capacity"), std::string::npos) << message;
+}
+
+// A hop allocation is not a second copy of the producer's storage: two hops
+// that meet at one intermediate share it, so the L2 peak is one 256-byte buffer
+// rather than two.
+TEST(StoragePlan, TheIntermediateIsReservedOnceNotOncePerHop) {
+  llvm::Expected<TwoHopCase> built = twoHopCase();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->c;
+  CoveringPlan &plan = built->plan;
+  ASSERT_FALSE(bool(finalizeStoragePlan(c.graph, plan, c.target->machine())));
+
+  llvm::Expected<std::map<MemoryNodeId, uint64_t>> peak =
+      computePeakStorage(plan.allocations);
+  ASSERT_TRUE(bool(peak)) << llvm::toString(peak.takeError());
+  EXPECT_EQ((*peak)["l2.0"], 256u);
+}
+
+// Re-finalizing is idempotent: the hop records, the steps that order them and
+// the allocations are rebuilt identically, and the plan id is unchanged. The
+// hop fields are deliberately outside `canonicalPlanString`, so storage
+// planning still never changes a plan id (issue #129, task R4).
+TEST(StoragePlan, ReFinalizingTwoHopIsIdempotent) {
+  llvm::Expected<TwoHopCase> built = twoHopCase();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->c;
+  CoveringPlan &plan = built->plan;
+
+  const PlanId before = computePlanId(plan);
+  ASSERT_FALSE(bool(finalizeStoragePlan(c.graph, plan, c.target->machine())));
+  const std::vector<StorageAllocation> allocations = plan.allocations;
+  const std::vector<PlanStep> steps = plan.steps;
+  const llvm::SmallVector<PlanMovementHop, 2> hops =
+      plan.connectionPlans.front().hops;
+  EXPECT_EQ(computePlanId(plan), before);
+
+  ASSERT_FALSE(bool(finalizeStoragePlan(c.graph, plan, c.target->machine())));
+  EXPECT_EQ(plan.allocations.size(), allocations.size());
+  for (size_t index = 0; index < allocations.size(); ++index) {
+    EXPECT_EQ(plan.allocations[index].id, allocations[index].id);
+    EXPECT_EQ(plan.allocations[index].memory, allocations[index].memory);
+    EXPECT_EQ(plan.allocations[index].bytes, allocations[index].bytes);
+    EXPECT_EQ(plan.allocations[index].beginStep, allocations[index].beginStep);
+    EXPECT_EQ(plan.allocations[index].endStep, allocations[index].endStep);
+  }
+  ASSERT_EQ(plan.steps.size(), steps.size());
+  for (size_t index = 0; index < steps.size(); ++index) {
+    EXPECT_EQ(plan.steps[index].id, steps[index].id);
+    EXPECT_EQ(plan.steps[index].hop, steps[index].hop);
+  }
+  ASSERT_EQ(plan.connectionPlans.front().hops.size(), hops.size());
+  for (size_t hop = 0; hop < hops.size(); ++hop) {
+    EXPECT_EQ(plan.connectionPlans.front().hops[hop].engine, hops[hop].engine);
+    EXPECT_EQ(plan.connectionPlans.front().hops[hop].sourceStorageId,
+              hops[hop].sourceStorageId);
+    EXPECT_EQ(plan.connectionPlans.front().hops[hop].destinationStorageId,
+              hops[hop].destinationStorageId);
+  }
+  EXPECT_EQ(computePlanId(plan), before);
+}
+
+// Two movements staged through one intermediate keep two distinct buffers:
+// sharing an allocation is a reuse decision nobody has proved, so neither hop
+// may quietly alias the other's.
+TEST(StoragePlan, TwoRoutesThroughOneIntermediateKeepDistinctAllocations) {
+  llvm::Expected<TwoHopCase> built = twoHopCase();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->c;
+  CoveringPlan &plan = built->plan;
+
+  // A second movement along the same route: its own connection, its own
+  // storage. (The same-kind L2 nodes stay separate memories.)
+  PlanConnection duplicate = plan.connectionPlans.front();
+  duplicate.id = duplicate.id + 1;
+  plan.connectionPlans.push_back(duplicate);
+  plan.connections.push_back(duplicate.id);
+
+  ASSERT_FALSE(bool(finalizeStoragePlan(c.graph, plan, c.target->machine())));
+  std::set<uint64_t> l2Allocations;
+  for (const StorageAllocation &allocation : plan.allocations)
+    if (allocation.memory == "l2.0")
+      l2Allocations.insert(allocation.id);
+  EXPECT_EQ(l2Allocations.size(), 2u)
+      << "each movement stages through its own L2 buffer";
 }

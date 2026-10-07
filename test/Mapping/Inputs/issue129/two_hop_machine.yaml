@@ -1,0 +1,91 @@
+# Issue #129, task R4: the machine a two-hop movement is checked against.
+#
+# SRAM lives in cluster.a (where the vector engine runs) and L2/DRAM in
+# cluster.b, so the store placed in DRAM cannot read the vector's SRAM tile: the
+# edge is a real movement, and the only route between the two memories is
+# sram.0 -> l2.0 -> dram.0. Each link names its *own* transfer engine -- routing
+# records only the first engine a link lists, so one link naming both would
+# collapse the two hops onto one engine.
+#
+# L2 holds exactly the 8x8xf32 value's 256 bytes. The intermediate is a real
+# reservation, not a formality: reserving only the route's destination -- the
+# defect issue #129 finding 6 records -- would leave this memory with no
+# allocation at all.
+schema: llk.machine.v2
+target: issue129-two-hop
+clock_hz: 1000000000
+worker_threads: 2
+executors:
+  - id: cluster.a
+    kind: cluster
+    refines: [group]
+  - id: worker.a
+    kind: worker
+    parent: cluster.a
+  - id: cluster.b
+    kind: cluster
+    refines: [group]
+  - id: worker.b
+    kind: worker
+    parent: cluster.b
+memories:
+  - id: sram.0
+    kind: sram
+    visible_from: cluster.a
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+  - id: l2.0
+    kind: l2
+    visible_from: cluster.b
+    capacity_bytes: 256
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+  - id: dram.0
+    kind: dram
+    visible_from: cluster.b
+    capacity_bytes: 1073741824
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+compute:
+  - id: vpu
+    kind: vector_engine
+    refines: [vector]
+    attached_to: worker.a
+    element_types: [f32]
+    shapes: [[8]]
+    lanes: {f32: 8}
+transfer_engines:
+  - id: dma.a
+    kind: dma
+    refines: [transfer]
+    attached_to: cluster.a
+    count: 1
+    max_outstanding: 1
+  - id: dma.b
+    kind: dma
+    refines: [transfer]
+    attached_to: cluster.b
+    count: 1
+    max_outstanding: 1
+links:
+  - id: sram_to_l2.0
+    source: sram.0
+    destination: l2.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+  - id: l2_to_dram.0
+    source: l2.0
+    destination: dram.0
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.b]

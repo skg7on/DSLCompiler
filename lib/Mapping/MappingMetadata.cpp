@@ -50,7 +50,8 @@ bool isBookkeepingAttribute(llvm::StringRef name) {
   return name == "micro.mapping" || name == "micro.routes" ||
          name == "micro.plan" || name == "micro.value" ||
          name == "micro.dst_node" || name == "micro.connection" ||
-         name == "micro.hop";
+         name == "micro.hop" || name == "micro.src_storage" ||
+         name == "micro.dst_storage";
 }
 
 llvm::Error metadataError(std::string message) {
@@ -826,6 +827,11 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
                         u64Attr(context, step.node));
     fields.emplace_back(mlir::StringAttr::get(context, "connection"),
                         u64Attr(context, step.connection));
+    // Which hop of a multi-hop movement a copy or wait step orders (issue #129,
+    // task R4). Written only where the step is hop-scoped.
+    if (step.hop)
+      fields.emplace_back(mlir::StringAttr::get(context, "hop"),
+                          u64Attr(context, *step.hop));
     steps.push_back(mlir::DictionaryAttr::get(context, fields));
   }
   planFields.emplace_back(mlir::StringAttr::get(context, "steps"),
@@ -997,6 +1003,37 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
       storageIds.push_back(u64Attr(context, id));
     attributes.emplace_back(mlir::StringAttr::get(context, "storage_ids"),
                             mlir::ArrayAttr::get(context, storageIds));
+    // The physical movement hops (issue #129, task R4), in route order. Written
+    // only when the plan has them, so a plan that was never storage-planned
+    // keeps exactly the bytes it always had; a connection whose route crosses
+    // several memories and that carries no hop container is a plan that made no
+    // storage decision, not one whose decisions were dropped.
+    if (!connection.hops.empty()) {
+      llvm::SmallVector<mlir::Attribute> hops;
+      for (const PlanMovementHop &hop : connection.hops) {
+        llvm::SmallVector<mlir::NamedAttribute> fields;
+        fields.emplace_back(mlir::StringAttr::get(context, "index"),
+                            u64Attr(context, hop.index));
+        fields.emplace_back(mlir::StringAttr::get(context, "src_memory"),
+                            mlir::StringAttr::get(context, hop.srcMemory));
+        fields.emplace_back(mlir::StringAttr::get(context, "dst_memory"),
+                            mlir::StringAttr::get(context, hop.dstMemory));
+        fields.emplace_back(mlir::StringAttr::get(context, "engine"),
+                            mlir::StringAttr::get(context, hop.engine));
+        fields.emplace_back(mlir::StringAttr::get(context, "source_storage"),
+                            u64Attr(context, hop.sourceStorageId));
+        fields.emplace_back(
+            mlir::StringAttr::get(context, "destination_storage"),
+            u64Attr(context, hop.destinationStorageId));
+        fields.emplace_back(mlir::StringAttr::get(context, "movement_step"),
+                            u64Attr(context, hop.movementStep));
+        fields.emplace_back(mlir::StringAttr::get(context, "wait_step"),
+                            u64Attr(context, hop.waitStep));
+        hops.push_back(mlir::DictionaryAttr::get(context, fields));
+      }
+      attributes.emplace_back(mlir::StringAttr::get(context, "hops"),
+                              mlir::ArrayAttr::get(context, hops));
+    }
     // A gather's declared semantics, axis and producer occurrences (task B6).
     // Absent for every non-gather connection, so a plan with none encodes the
     // same route it always did.
@@ -1246,6 +1283,10 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       if (auto value = dict.getAs<mlir::IntegerAttr>("connection"))
         step.connection =
             static_cast<ConnectionId>(value.getValue().getZExtValue());
+      // Which hop of a multi-hop movement the step orders (issue #129, task
+      // R4); absent for a compute step and for a single-hop movement.
+      if (auto value = dict.getAs<mlir::IntegerAttr>("hop"))
+        step.hop = value.getValue().getZExtValue();
       plan.steps.push_back(std::move(step));
     }
   }
@@ -1647,6 +1688,44 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
           if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(id))
             connection.storageIds.push_back(
                 static_cast<uint64_t>(integer.getInt()));
+      // The physical movement hops (issue #129, task R4). A recorded hop that
+      // is not a well-formed dictionary is rejected rather than decoded with a
+      // guessed memory or storage.
+      if (auto hops = route.getAs<mlir::ArrayAttr>("hops")) {
+        for (mlir::Attribute element : hops) {
+          auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+          if (!dict)
+            return metadataError("micro.routes 'hops' entry is not a "
+                                 "dictionary");
+          PlanMovementHop hop;
+          if (auto value = dict.getAs<mlir::IntegerAttr>("index"))
+            hop.index = value.getValue().getZExtValue();
+          llvm::Expected<std::string> src =
+              readMetadataString(dict, "src_memory", where);
+          if (!src)
+            return src.takeError();
+          hop.srcMemory = *src;
+          llvm::Expected<std::string> dst =
+              readMetadataString(dict, "dst_memory", where);
+          if (!dst)
+            return dst.takeError();
+          hop.dstMemory = *dst;
+          llvm::Expected<std::string> engine =
+              readMetadataString(dict, "engine", where);
+          if (!engine)
+            return engine.takeError();
+          hop.engine = *engine;
+          if (auto value = dict.getAs<mlir::IntegerAttr>("source_storage"))
+            hop.sourceStorageId = value.getValue().getZExtValue();
+          if (auto value = dict.getAs<mlir::IntegerAttr>("destination_storage"))
+            hop.destinationStorageId = value.getValue().getZExtValue();
+          if (auto value = dict.getAs<mlir::IntegerAttr>("movement_step"))
+            hop.movementStep = value.getValue().getZExtValue();
+          if (auto value = dict.getAs<mlir::IntegerAttr>("wait_step"))
+            hop.waitStep = value.getValue().getZExtValue();
+          connection.hops.push_back(std::move(hop));
+        }
+      }
       // The gather's declared semantics, axis and producer occurrences (task
       // B6). A recorded semantics that is not one of the three known words is
       // rejected rather than silently downgrading the connection to a

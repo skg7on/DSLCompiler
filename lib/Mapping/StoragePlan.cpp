@@ -6,6 +6,7 @@
 
 #include "LLK/Mapping/StoragePlan.h"
 
+#include "LLK/Mapping/Routing.h"
 #include "LLK/Mapping/TileFacts.h"
 
 #include "LLK/Machine/MachineModel.h"
@@ -767,16 +768,31 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   llvm::DenseMap<WorkloadNodeId, PlanStepId> computeStep;
   llvm::DenseMap<ConnectionId, PlanStepId> connectionStep;
   llvm::DenseMap<ConnectionId, PlanStepId> syncStep;
+  // The movement hops of each connection, in route order (issue #129, task
+  // R4). Their steps are known here; their storage decisions are filled in by
+  // the allocation pass below, once the destinations are sized.
+  std::vector<std::vector<PlanMovementHop>> connectionHops(
+      plan.connectionPlans.size());
   std::vector<char> emitted(plan.connectionPlans.size(), 0);
   std::vector<SynchronizationStep> synchronization;
   std::vector<PlanStep> steps;
   uint64_t nextSyncId = 0;
 
   auto addStep = [&](PlanStepKind kind, WorkloadNodeId node,
-                     ConnectionId connection) {
+                     ConnectionId connection,
+                     std::optional<uint64_t> hop = std::nullopt) {
     const PlanStepId id = nextStep++;
-    steps.push_back(PlanStep{id, kind, node, connection});
+    steps.push_back(PlanStep{id, kind, node, connection, hop});
     return id;
+  };
+
+  /// The number of physical hops a connection's route materializes: one per
+  /// transition between consecutive memories. A route that names fewer than two
+  /// memories moves nothing (a transform-only connection converts the value
+  /// where its producer already wrote it), so it keeps the single pair of
+  /// steps a route-less movement always had and records no hop.
+  auto hopCountFor = [](const PlanConnection &connection) {
+    return connection.route.size() > 1 ? connection.route.size() - 1 : 0;
   };
 
   auto emitConnection = [&](size_t index) {
@@ -784,18 +800,50 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     // A Direct connection materializes nothing, so it gets no Movement step.
     if (!materializesMovement(connection))
       return;
-    connectionStep[connection.id] =
-        addStep(PlanStepKind::Movement, 0, connection.id);
-    SynchronizationStep sync;
-    sync.id = nextSyncId++;
-    sync.waitsFor.push_back(connection.id);
-    sync.precedes.assign(connection.consumerPorts.begin(),
-                         connection.consumerPorts.end());
-    sync.requiresBarrier = connection.engines.size() > 1;
-    synchronization.push_back(std::move(sync));
-    // A wait occupies its own step, so a consumer's compute step follows it.
-    syncStep[connection.id] =
-        addStep(PlanStepKind::Synchronization, 0, connection.id);
+    const size_t hopCount = hopCountFor(connection);
+    const size_t stepPairs = hopCount > 0 ? hopCount : 1;
+    for (size_t hop = 0; hop < stepPairs; ++hop) {
+      const bool finalHop = hop + 1 == stepPairs;
+      const PlanStepId movement =
+          addStep(PlanStepKind::Movement, 0, connection.id,
+                  hopCount > 0 ? std::optional<uint64_t>(hop) : std::nullopt);
+      SynchronizationStep sync;
+      sync.id = nextSyncId++;
+      sync.waitsFor.push_back(connection.id);
+      // Only the movement's *final* wait releases the value to the selected
+      // consumers; an intermediate hop's wait orders the next hop's read
+      // instead (issue #129, task R4).
+      if (finalHop)
+        sync.precedes.assign(connection.consumerPorts.begin(),
+                             connection.consumerPorts.end());
+      sync.requiresBarrier = connection.engines.size() > 1;
+      synchronization.push_back(std::move(sync));
+      // A wait occupies its own step, so the next hop's movement -- or a
+      // consumer's compute step -- follows it.
+      const PlanStepId wait =
+          addStep(PlanStepKind::Synchronization, 0, connection.id,
+                  hopCount > 0 ? std::optional<uint64_t>(hop) : std::nullopt);
+      if (hopCount > 0) {
+        PlanMovementHop record;
+        record.index = hop;
+        record.srcMemory = connection.route[hop];
+        record.dstMemory = connection.route[hop + 1];
+        // The engine the hop runs on, derived by the same rule routing
+        // legalized the hop with, so a costed hop and a materialized hop cannot
+        // disagree.
+        record.engine =
+            legalTransferEngine(machine, record.srcMemory, record.dstMemory)
+                .value_or(std::string());
+        record.movementStep = movement;
+        record.waitStep = wait;
+        connectionHops[index].push_back(std::move(record));
+      }
+      // The consumer's compute step follows the movement's final wait; the
+      // first movement step is what the producer's compute step precedes.
+      if (hop == 0)
+        connectionStep[connection.id] = movement;
+      syncStep[connection.id] = wait;
+    }
   };
 
   for (WorkloadNodeId nodeId : topo) {
@@ -827,11 +875,45 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
 
   // Dependency edges: every movement follows its producer's compute step and
   // precedes each consumer's compute step (through the wait when one exists).
+  // A multi-hop movement is a chain -- producer, copy(0), wait(0), copy(1),
+  // wait(1), ... -- so an intermediate allocation's last use is the *next*
+  // hop's read rather than the whole movement's final wait (issue #129, task
+  // R4). A route-less movement keeps the single copy-then-wait pair.
   std::vector<PlanStepEdge> stepEdges;
-  for (const PlanConnection &connection : plan.connectionPlans) {
+  for (size_t index = 0; index < plan.connectionPlans.size(); ++index) {
+    const PlanConnection &connection = plan.connectionPlans[index];
     auto movement = connectionStep.find(connection.id);
     if (movement == connectionStep.end())
       continue;
+    const std::vector<PlanMovementHop> &hops = connectionHops[index];
+    if (!hops.empty()) {
+      for (size_t hop = 0; hop < hops.size(); ++hop) {
+        if (hop == 0) {
+          auto producer = valueProducer.find(connection.value);
+          if (producer != valueProducer.end()) {
+            auto step = computeStep.find(producer->second);
+            if (step != computeStep.end())
+              stepEdges.push_back(
+                  PlanStepEdge{step->second, hops[hop].movementStep});
+          }
+        } else {
+          // The previous hop's wait orders this hop's read.
+          stepEdges.push_back(
+              PlanStepEdge{hops[hop - 1].waitStep, hops[hop].movementStep});
+        }
+        stepEdges.push_back(
+            PlanStepEdge{hops[hop].movementStep, hops[hop].waitStep});
+      }
+      auto consumers = valueConsumers.find(connection.value);
+      if (consumers == valueConsumers.end())
+        continue;
+      for (WorkloadNodeId consumer : consumers->second) {
+        auto step = computeStep.find(consumer);
+        if (step != computeStep.end())
+          stepEdges.push_back(PlanStepEdge{hops.back().waitStep, step->second});
+      }
+      continue;
+    }
     auto producer = valueProducer.find(connection.value);
     if (producer != valueProducer.end()) {
       auto step = computeStep.find(producer->second);
@@ -1042,9 +1124,37 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     }
   }
 
-  // A movement the plan materializes stages a copy in its destination memory,
-  // distinct from the producer's storage (a transform preserves its immutable
-  // source), so the copy is charged its own interval.
+  // The solved layout map the connection's carried value keeps before any
+  // transform runs: the producing occurrence's own layout solution. An
+  // intermediate hop holds the value exactly as its producer wrote it, so its
+  // footprint is the producer's physical image -- never the destination image
+  // of a transform that has not run yet (issue #129, task R4).
+  auto producerMapFor =
+      [&](const PlanConnection &connection) -> mlir::AffineMap {
+    auto producer = valueProducer.find(connection.value);
+    if (producer == valueProducer.end())
+      return {};
+    const PlanPlacement *placement = placementFor.lookup(producer->second);
+    const WorkloadNode *node = graph.findNode(producer->second);
+    if (!placement || !node)
+      return {};
+    for (unsigned occurrence = 0; occurrence < node->outputs.size();
+         ++occurrence) {
+      if (node->outputs[occurrence].value != connection.value)
+        continue;
+      return layoutMapFor(*placement,
+                          PortRef{node->id, PortDirection::Output, occurrence},
+                          connection.value);
+    }
+    return {};
+  };
+
+  // A movement the plan materializes stages a copy in every hop's destination
+  // memory, distinct from the producer's storage (a transform preserves its
+  // immutable source), so each hop's destination is charged its own interval.
+  // Reserving only the route's final memory -- the behavior before issue #129,
+  // task R4 -- left an SRAM -> L2 -> DRAM movement with no allocatable
+  // intermediate at all.
   for (size_t index = 0; index < plan.connectionPlans.size(); ++index) {
     PlanConnection &connection = plan.connectionPlans[index];
     if (!materializesMovement(connection))
@@ -1054,6 +1164,90 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
       return storageError(
           "storage plan: connection " + std::to_string(connection.id) +
           " carries unknown value " + std::to_string(connection.value));
+
+    /// The physical bytes a hop's destination holds: the value's image under
+    /// the layout it carries there. An unsupported footprint is a strict
+    /// rejection and a reported analysis fallback, exactly as the producer's
+    /// own allocation is sized.
+    auto bytesForHop = [&](mlir::AffineMap map) -> llvm::Expected<uint64_t> {
+      llvm::Expected<PhysicalFootprint> footprint =
+          physicalFootprintFor(workloadValue->type, map, {});
+      if (footprint)
+        return footprint->bytes;
+      llvm::Error error = footprint.takeError();
+      if (strict)
+        return error;
+      notes.push_back(
+          "storage plan: connection " + std::to_string(connection.id) +
+          " stage: " + llvm::toString(std::move(error)) + "; assuming " +
+          std::to_string(kAssumedValueBytes) + " bytes for analysis");
+      return kAssumedValueBytes;
+    };
+
+    std::vector<PlanMovementHop> &hops = connectionHops[index];
+    if (!hops.empty()) {
+      const mlir::AffineMap producerMap = producerMapFor(connection);
+      for (size_t hop = 0; hop < hops.size(); ++hop) {
+        const bool finalHop = hop + 1 == hops.size();
+        // The value keeps its producer's layout until the connection's
+        // transform runs, which is at the movement's end.
+        mlir::AffineMap map = producerMap;
+        if (finalHop && connection.transform)
+          map = connection.transform->dstMap;
+        llvm::Expected<uint64_t> bytes = bytesForHop(map);
+        if (!bytes)
+          return bytes.takeError();
+
+        const PlanStepId begin = hops[hop].movementStep;
+        PlanStepId end = begin;
+        if (!finalHop) {
+          // The intermediate's last use is the *next* hop's read, not the whole
+          // movement's final wait; `computePeakStorage` counts the interval
+          // inclusively, so the two hops meet at that step.
+          end = hops[hop + 1].movementStep;
+        } else {
+          std::optional<PlanStepId> last = lastReaderStep(connection.value);
+          end = last ? std::max(begin, *last) : begin;
+        }
+
+        const uint64_t id =
+            allocate(connection.value, hops[hop].dstMemory, *bytes, begin, end);
+        hops[hop].destinationStorageId = id;
+
+        if (hop == 0) {
+          // The first hop reads the storage the producing occurrence occupies:
+          // that occurrence's own allocation, found by value *and* memory.
+          // Nothing new is allocated for a source -- a buffer that merely names
+          // the same memory kind is not the producer's storage.
+          for (const StorageAllocation &allocation : allocations)
+            if (allocation.value == connection.value &&
+                allocation.memory == hops[hop].srcMemory) {
+              hops[hop].sourceStorageId = allocation.id;
+              break;
+            }
+          if (hops[hop].sourceStorageId == 0) {
+            // No allocation holds the value in the route's source memory, so
+            // the hop's read has no storage decision. Analysis records it and
+            // keeps the plan; a strict pass refuses to invent one, and the
+            // executable binder refuses the plan in any case.
+            if (std::optional<llvm::Error> rejected = recordIncomplete(
+                    "storage plan: connection " +
+                    std::to_string(connection.id) + " hop 0 reads memory '" +
+                    hops[hop].srcMemory +
+                    "', but no allocation holds carrying value " +
+                    std::to_string(connection.value) + " there"))
+              return std::move(*rejected);
+          }
+        } else {
+          // The intermediate is the previous hop's destination, allocated
+          // once: the route names one buffer, not one per hop.
+          hops[hop].sourceStorageId = hops[hop - 1].destinationStorageId;
+        }
+        if (!llvm::is_contained(connectionStorage[index], id))
+          connectionStorage[index].push_back(id);
+      }
+      continue;
+    }
 
     std::optional<MemoryNodeId> memory;
     if (!connection.route.empty())
@@ -1241,9 +1435,15 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   plan.diagnostics.physicalComplete = physicalReasons.empty();
   plan.diagnostics.physicalReasons = std::move(physicalReasons);
   plan.diagnostics.physicalDecisions = std::move(physicalDecisions);
-  for (size_t index = 0; index < plan.connectionPlans.size(); ++index)
+  for (size_t index = 0; index < plan.connectionPlans.size(); ++index) {
     plan.connectionPlans[index].storageIds.assign(
         connectionStorage[index].begin(), connectionStorage[index].end());
+    // The hop records -- engine, memories, per-hop storage and the steps that
+    // order them -- become the materialization authority. `storageIds` above
+    // stays the compatibility projection.
+    plan.connectionPlans[index].hops.assign(connectionHops[index].begin(),
+                                            connectionHops[index].end());
+  }
   plan.steps = std::move(steps);
   plan.stepEdges = std::move(stepEdges);
   plan.allocations = std::move(allocations);

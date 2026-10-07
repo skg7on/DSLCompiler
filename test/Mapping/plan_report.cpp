@@ -17,6 +17,7 @@
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
@@ -816,4 +817,73 @@ TEST(MappingPlanReportTest, Issue129TransformResourceSurvivesReportReplay) {
       replayed = &candidate;
   ASSERT_NE(replayed, nullptr) << "the replayed plan records no transform";
   EXPECT_EQ(replayed->transform->computeResource, "vpu");
+}
+
+namespace {
+
+/// A fresh identical write of the report already produced for `result`. The two
+/// strings must be byte-identical (§29.12): the hop records are part of the
+/// serialized plan and must not depend on iteration order.
+std::string secondReport(const MappingSearchResult &result,
+                         const mlir::llk::machine::MachineModel &model,
+                         const MappingTarget &target,
+                         const MappingSearchOptions &options) {
+  return writePlanReport(result, model, target, options, result.workloadHash);
+}
+
+} // namespace
+
+// The physical movement hops travel with the plan: a replayed report states the
+// same per-hop memories, engine, storage allocations and ordering steps the
+// selected plan made, and two identical runs write byte-identical bytes.
+TEST(PlanReport, Issue129MovementHopsRoundTripWithTheirStorageDecisions) {
+  llvm::Expected<issue129::ResourceCase> c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  llvm::Expected<MappingSearchResult> result =
+      issue129::searchCase(*c, options);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_FALSE(bool(finalizeStoragePlan(c->graph, result->plans.front(),
+                                        c->target->machine())));
+  const CoveringPlan &selected = result->plans.front();
+  ASSERT_FALSE(selected.connectionPlans.empty());
+  ASSERT_FALSE(selected.connectionPlans.front().hops.empty());
+
+  std::string report = writePlanReport(
+      *result, c->target->machine(), *c->target, options, result->workloadHash);
+  EXPECT_NE(report.find("\"hops\""), std::string::npos)
+      << "the report must record the movement hops";
+  EXPECT_EQ(secondReport(*result, c->target->machine(), *c->target, options),
+            report)
+      << "two identical runs must write identical bytes";
+
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+
+  ASSERT_EQ(replay->connectionPlans.size(), selected.connectionPlans.size());
+  for (size_t index = 0; index < replay->connectionPlans.size(); ++index) {
+    const PlanConnection &stated = selected.connectionPlans[index];
+    const PlanConnection &replayed = replay->connectionPlans[index];
+    ASSERT_EQ(replayed.hops.size(), stated.hops.size());
+    for (size_t hop = 0; hop < stated.hops.size(); ++hop) {
+      EXPECT_EQ(replayed.hops[hop].index, stated.hops[hop].index);
+      EXPECT_EQ(replayed.hops[hop].srcMemory, stated.hops[hop].srcMemory);
+      EXPECT_EQ(replayed.hops[hop].dstMemory, stated.hops[hop].dstMemory);
+      EXPECT_EQ(replayed.hops[hop].engine, stated.hops[hop].engine);
+      EXPECT_EQ(replayed.hops[hop].sourceStorageId,
+                stated.hops[hop].sourceStorageId);
+      EXPECT_EQ(replayed.hops[hop].destinationStorageId,
+                stated.hops[hop].destinationStorageId);
+      EXPECT_EQ(replayed.hops[hop].movementStep, stated.hops[hop].movementStep);
+      EXPECT_EQ(replayed.hops[hop].waitStep, stated.hops[hop].waitStep);
+    }
+  }
+  ASSERT_EQ(replay->steps.size(), selected.steps.size());
+  for (size_t index = 0; index < replay->steps.size(); ++index)
+    EXPECT_EQ(replay->steps[index].hop, selected.steps[index].hop);
+  // The replayed allocations are the same buffers the hops name.
+  EXPECT_EQ(replay->allocations.size(), selected.allocations.size());
 }

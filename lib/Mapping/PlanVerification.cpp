@@ -54,6 +54,10 @@ constexpr llvm::StringLiteral kSrcNodeAttr = "micro.src_node";
 constexpr llvm::StringLiteral kDstNodeAttr = "micro.dst_node";
 constexpr llvm::StringLiteral kConnectionAttr = "micro.connection";
 constexpr llvm::StringLiteral kHopAttr = "micro.hop";
+/// The storage allocation a materialized movement hop reads and writes (issue
+/// #129, task R4).
+constexpr llvm::StringLiteral kSrcStorageAttr = "micro.src_storage";
+constexpr llvm::StringLiteral kDstStorageAttr = "micro.dst_storage";
 
 /// The Micro operations the canonical materializer emits to materialize a
 /// connection's movement: the generic `micro.async_copy` for a shaped value and
@@ -87,7 +91,8 @@ WorkloadNode strippedWorkloadNode(const WorkloadNode &node) {
   for (mlir::NamedAttribute attribute : node.attributes) {
     llvm::StringRef name = attribute.getName().getValue();
     if (name == kMappingAttr || name == kValueAttr || name == kSrcNodeAttr ||
-        name == kDstNodeAttr || name == kConnectionAttr || name == kHopAttr) {
+        name == kDstNodeAttr || name == kConnectionAttr || name == kHopAttr ||
+        name == kSrcStorageAttr || name == kDstStorageAttr) {
       stripped = true;
       continue;
     }
@@ -455,6 +460,97 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
                          where + ": op '" + name.str() + "' hop '" + fromNode +
                              "' -> '" + toNode +
                              "' names no transfer engine its link offers");
+  }
+
+  // The physical hop records (issue #129, task R4). A plan that recorded hops
+  // must describe its route exactly -- one hop per transition, in order, each
+  // naming an engine its link offers -- and the movement materialized for a hop
+  // must name the storage that hop reserved. A mutated hop engine or storage
+  // id, or a hop set that does not match the route, is rejected rather than
+  // replayed as if it had been decided.
+  if (mlir::Attribute rawHops = route.get("hops")) {
+    auto hopList = mlir::dyn_cast<mlir::ArrayAttr>(rawHops);
+    if (!hopList)
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": connection " +
+                             std::to_string(*connectionId) +
+                             " 'hops' is not an array");
+    if (hopList.size() + 1 != nodes->size())
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": connection " +
+                             std::to_string(*connectionId) + " records " +
+                             std::to_string(hopList.size()) +
+                             " movement hops for a route of " +
+                             std::to_string(nodes->size()) + " memories");
+    for (size_t index = 0; index < hopList.size(); ++index) {
+      auto entry = mlir::dyn_cast<mlir::DictionaryAttr>(hopList[index]);
+      if (!entry)
+        return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                           where + ": connection " +
+                               std::to_string(*connectionId) +
+                               " hop entry is not a dictionary");
+      auto hopIndex = entry.getAs<mlir::IntegerAttr>("index");
+      if (!hopIndex || hopIndex.getValue().getZExtValue() != index)
+        return verifyError(
+            DiagnosticCode::InvalidMappingMetadata,
+            where + ": connection " + std::to_string(*connectionId) + " hop " +
+                std::to_string(index) + " records a different index");
+      llvm::Expected<std::string> src =
+          readMetadataString(entry, "src_memory", where);
+      if (!src)
+        return metadataError(src.takeError());
+      llvm::Expected<std::string> dst =
+          readMetadataString(entry, "dst_memory", where);
+      if (!dst)
+        return metadataError(dst.takeError());
+      if (*src != (*nodes)[index] || *dst != (*nodes)[index + 1])
+        return verifyError(
+            DiagnosticCode::InvalidMappingMetadata,
+            where + ": connection " + std::to_string(*connectionId) + " hop " +
+                std::to_string(index) + " crosses '" + *src + "' -> '" + *dst +
+                "', which its route does not describe");
+      llvm::Expected<std::string> engine =
+          readMetadataString(entry, "engine", where);
+      if (!engine)
+        return metadataError(engine.takeError());
+      if (!engine->empty() && !machine.findTransferEngine(*engine))
+        return verifyError(
+            DiagnosticCode::InvalidMappingMetadata,
+            where + ": connection " + std::to_string(*connectionId) + " hop " +
+                std::to_string(index) + " names unsupported transfer engine '" +
+                *engine + "'");
+      if (index + 1 != *hop)
+        continue;
+      // The movement materialized for this hop reads and writes the storage the
+      // hop reserved. Both are optional in the plan's record, so the check
+      // applies exactly when the plan made the decision.
+      if (mlir::Attribute rawSource = entry.get("source_storage")) {
+        auto reserved = mlir::dyn_cast<mlir::IntegerAttr>(rawSource);
+        llvm::Expected<uint64_t> stated =
+            movementUintAttr(op, kSrcStorageAttr, where);
+        if (!stated)
+          return stated.takeError();
+        if (!reserved || reserved.getValue().getActiveBits() > 64 ||
+            reserved.getValue().getZExtValue() != *stated)
+          return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                             where +
+                                 ": movement does not read the storage hop " +
+                                 std::to_string(index) + " reserved");
+      }
+      if (mlir::Attribute rawDestination = entry.get("destination_storage")) {
+        auto reserved = mlir::dyn_cast<mlir::IntegerAttr>(rawDestination);
+        llvm::Expected<uint64_t> stated =
+            movementUintAttr(op, kDstStorageAttr, where);
+        if (!stated)
+          return stated.takeError();
+        if (!reserved || reserved.getValue().getActiveBits() > 64 ||
+            reserved.getValue().getZExtValue() != *stated)
+          return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                             where +
+                                 ": movement does not write the storage hop " +
+                                 std::to_string(index) + " reserved");
+      }
+    }
   }
 
   // Source/destination kind equality is not node identity. A same-kind hop is

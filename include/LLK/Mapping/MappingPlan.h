@@ -304,11 +304,19 @@ std::optional<PlanStepKind> symbolizePlanStepKind(llvm::StringRef text);
 /// `Compute` step and the `connection` for a `Movement` or `Synchronization`
 /// step; the other is left 0. A storage allocation's `beginStep`/`endStep` and
 /// every dependency edge name these stable ids.
+///
+/// `hop` narrows a `Movement`/`Synchronization` step to one hop of a multi-hop
+/// connection (issue #129, task R4): a route of `n` memories gets one copy step
+/// and one wait step per hop rather than one pair for the whole route, and this
+/// is which hop the step orders. Unset for a compute step and for a connection
+/// whose movement is a single step. It is the `PlanMovementHop::index` of the
+/// hop the step belongs to.
 struct PlanStep {
   PlanStepId id = 0;
   PlanStepKind kind = PlanStepKind::Compute;
   WorkloadNodeId node = 0;
   ConnectionId connection = 0;
+  std::optional<uint64_t> hop = std::nullopt;
 };
 
 /// A dependency edge in the plan-step DAG: `to` must follow `from`.
@@ -316,6 +324,37 @@ struct PlanStepEdge {
   PlanStepId from = 0;
   PlanStepId to = 0;
   bool operator==(const PlanStepEdge &) const = default;
+};
+
+/// One physical movement hop of a selected connection (issue #129, task R4):
+/// the value crosses `srcMemory` -> `dstMemory` on transfer engine `engine`,
+/// reading the storage `sourceStorageId` and writing the storage
+/// `destinationStorageId`.
+///
+/// A route of `n` memories has `n - 1` hops, in route order, and `index` is the
+/// hop's position in that sequence (`hops[h]` joins `route[h]` to
+/// `route[h + 1]`). Consecutive hops share the intermediate: `hops[h + 1]`'s
+/// `sourceStorageId` *is* `hops[h]`'s `destinationStorageId`, so a value staged
+/// through an intermediate is allocated once per hop destination rather than
+/// once per route. `hops` is the materialization authority; the connection's
+/// `storageIds` stays a compatibility projection of the same decision.
+///
+/// `movementStep` and `waitStep` are the plan-step DAG nodes that order this
+/// hop -- the copy and the wait that ends it. They are derived from the
+/// step-graph the storage planner builds, so they are persisted for a reader
+/// but deliberately absent from `canonicalPlanString` (a plan id must not
+/// depend on storage planning; see `PlanStep`). Numeric members default to zero
+/// and strings to empty, so a hop that has not been allocated yet is still a
+/// valid value.
+struct PlanMovementHop {
+  uint64_t index = 0;
+  MemoryNodeId srcMemory;
+  MemoryNodeId dstMemory;
+  ExecutorId engine;
+  uint64_t sourceStorageId = 0;
+  uint64_t destinationStorageId = 0;
+  PlanStepId movementStep = 0;
+  PlanStepId waitStep = 0;
 };
 
 enum class ConnectionKind {
@@ -537,7 +576,25 @@ struct PlanConnection {
   /// The storage allocations (design §9.6) this connection reads or writes,
   /// by `StorageAllocation::id`. B1 persists the ids; B3 populates them. Empty
   /// for a plan built before storage planning.
+  ///
+  /// A compatibility projection: it says *which* allocations participate in the
+  /// connection, but not which hop reads or writes one. `hops` becomes the
+  /// materialization authority as soon as it is populated (issue #129, task
+  /// R4); this stays recorded so a reader written against the earlier shape
+  /// still resolves.
   llvm::SmallVector<uint64_t> storageIds;
+  /// The physical movement hops this connection materializes, in route order
+  /// (issue #129, task R4). Empty for a connection that moves nothing (a
+  /// `Direct` connection, a transform-only connection with no route) and for a
+  /// plan that has not been storage-finalized. When non-empty it is the
+  /// materialization authority: each hop names the storage it reads and writes,
+  /// the engine it runs on, and the copy/wait steps that order it.
+  ///
+  /// Only the *chosen* physical facts belong here, and they are what
+  /// `finalizeStoragePlan` reserves storage for. Like the allocations it
+  /// references, this field is excluded from `canonicalPlanString`: storage
+  /// planning must never change a plan id (see `PlanStep`).
+  llvm::SmallVector<PlanMovementHop, 2> hops;
   /// The connection's synthesized cost (task B8): the transfer estimate the
   /// route carried, or the shared transform estimate for a conversion. A
   /// derived execution fact, deliberately excluded from `canonicalPlanString`

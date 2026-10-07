@@ -940,6 +940,7 @@ add_llk_mapping_test(MappingConnectionsTest test/Mapping/connections.cpp)
 add_llk_mapping_test(MappingCoveringSearchTest test/Mapping/covering_search.cpp)
 target_link_libraries(MappingCoveringSearchTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingStoragePlanTest test/Mapping/storage_plan.cpp)
+target_link_libraries(MappingStoragePlanTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingAvx2TargetTest test/Mapping/avx2_target.cpp)
 add_llk_mapping_test(MappingGenericAcceleratorTargetTest test/Mapping/generic_accelerator_target.cpp)
 # MappingPlanBinderTest binds through the canonical PlanMaterializer, whose
@@ -1088,6 +1089,19 @@ if(LLK_BUILD_TOOLS)
   # diagnostic goes to stderr and FileCheck needs --check-prefix.
   add_test(NAME MicroMappingStrictMissingMemory
       COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_missing_memory.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=MAP ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_missing_memory.mlir"
+  )
+
+  # PhysicalTwoHop: issue #129 task R4's end-to-end fixture. A movement whose
+  # route crosses an intermediate memory (SRAM -> L2 -> DRAM, one DMA engine per
+  # link) is materialized as one awaited copy per hop, and *every* hop's
+  # destination -- including the L2 intermediate, whose capacity holds exactly
+  # the value's 256 bytes -- is a storage allocation the selected plan made.
+  # Before R4 the plan reserved only the route's destination, so this fixture's
+  # L2 copy had no buffer to run in and its copies carried no storage stamp.
+  # Raw add_test (not add_llk_filecheck_test) because the pass's diagnostics go
+  # to stderr and FileCheck needs --check-prefix.
+  add_test(NAME PhysicalTwoHop
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=issue129-two-hop machine=${CMAKE_SOURCE_DIR}/test/Mapping/Inputs/issue129/two_hop_machine.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/test/Mapping/Inputs/issue129/two_hop_rules.llkmap emitters=e1 mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/physical_two_hop.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=MAP ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/physical_two_hop.mlir"
   )
 
   # MicroMappingBarrier: the storage plan (task B3) is now run on the selected

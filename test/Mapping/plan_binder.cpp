@@ -5,6 +5,7 @@
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Mapping/PlanReport.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
 #include "MicroMappingCommon.h"
@@ -19,6 +20,7 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 
 #include <gtest/gtest.h>
@@ -4445,4 +4447,261 @@ TEST(PlanBinder, Issue129PhysicalMemoryBorrowedBoundaryDescriptorsAreRecorded) {
     if (allocation.borrowed)
       ++replayedBorrowed;
   EXPECT_EQ(replayedBorrowed, borrowedMemories.size());
+}
+
+//===----------------------------------------------------------------------===//
+// Materializing every movement hop (issue #129, task R4)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The `two-hop` fixture, searched exactly and storage-finalized: one 256-byte
+/// value moving sram.0 -> l2.0 -> dram.0 on two distinct DMA engines, with a
+/// reserved allocation for each hop destination.
+llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> twoHopBound() {
+  llvm::Expected<issue129::ResourceCase> c = issue129::resourceCase("two-hop");
+  if (!c)
+    return c.takeError();
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  llvm::Expected<MappingSearchResult> result =
+      issue129::searchCase(*c, options);
+  if (!result)
+    return result.takeError();
+  if (result->plans.empty())
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the two-hop fixture searched no plan");
+  CoveringPlan plan = result->plans.front();
+  if (llvm::Error error =
+          finalizeStoragePlan(c->graph, plan, c->target->machine()))
+    return std::move(error);
+  return std::make_pair(std::move(*c), std::move(plan));
+}
+
+/// The `micro.tile_async_copy` operations in `module`, in walk order.
+llvm::SmallVector<Operation *> materializedCopies(ModuleOp module) {
+  llvm::SmallVector<Operation *> copies;
+  module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.tile_async_copy")
+      copies.push_back(op);
+  });
+  return copies;
+}
+
+/// Rewrites the kernel's `micro.routes` with `mutate` applied to each route
+/// dictionary, so a test can tamper with one recorded decision.
+void mutateRoutes(Operation *kernel, MLIRContext &context,
+                  llvm::function_ref<DictionaryAttr(DictionaryAttr)> mutate) {
+  auto routes = kernel->getAttrOfType<ArrayAttr>("micro.routes");
+  llvm::SmallVector<Attribute> rewritten;
+  for (Attribute element : routes)
+    rewritten.push_back(mutate(cast<DictionaryAttr>(element)));
+  kernel->setAttr("micro.routes", ArrayAttr::get(&context, rewritten));
+}
+
+/// Replaces `micro.routes`' `hops` array with `hops` on every route.
+DictionaryAttr withHops(DictionaryAttr route, MLIRContext &context,
+                        ArrayRef<Attribute> hops) {
+  llvm::SmallVector<NamedAttribute> fields;
+  for (NamedAttribute attribute : route)
+    if (attribute.getName() != "hops")
+      fields.push_back(attribute);
+  fields.emplace_back(StringAttr::get(&context, "hops"),
+                      ArrayAttr::get(&context, hops));
+  return DictionaryAttr::get(&context, fields);
+}
+
+} // namespace
+
+// Every movement hop becomes one awaited copy that reads the storage its hop
+// resourced and writes its destination's, so the emitted IR states the storage
+// decision each copy materializes rather than leaving a reader to re-derive one
+// from the memory kind.
+TEST(PlanBinder, Issue129MaterializesEveryHopIntoItsReservedStorage) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+
+  ASSERT_FALSE(plan.connectionPlans.empty());
+  const PlanConnection &movement = plan.connectionPlans.front();
+  ASSERT_EQ(movement.hops.size(), 2u);
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  for (const std::string &note : bound->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(bound->unmaterialized.empty());
+
+  llvm::SmallVector<Operation *> copies = materializedCopies(*bound->module);
+  ASSERT_EQ(copies.size(), 2u) << "one copy per hop";
+  for (size_t hop = 0; hop < copies.size(); ++hop) {
+    Operation *copy = copies[hop];
+    EXPECT_EQ(copy->getAttrOfType<IntegerAttr>("micro.hop").getInt(),
+              static_cast<int64_t>(hop + 1));
+    EXPECT_EQ(copy->getAttrOfType<StringAttr>("micro.dst_node").getValue(),
+              movement.hops[hop].dstMemory);
+    EXPECT_EQ(copy->getAttrOfType<IntegerAttr>("micro.src_storage").getInt(),
+              static_cast<int64_t>(movement.hops[hop].sourceStorageId));
+    EXPECT_EQ(copy->getAttrOfType<IntegerAttr>("micro.dst_storage").getInt(),
+              static_cast<int64_t>(movement.hops[hop].destinationStorageId));
+  }
+  // Every stamped storage id is a buffer this plan actually reserved.
+  for (Operation *copy : copies) {
+    const int64_t source =
+        copy->getAttrOfType<IntegerAttr>("micro.src_storage").getInt();
+    const int64_t destination =
+        copy->getAttrOfType<IntegerAttr>("micro.dst_storage").getInt();
+    EXPECT_TRUE(llvm::any_of(plan.allocations, [&](const StorageAllocation &a) {
+      return static_cast<int64_t>(a.id) == source;
+    }));
+    EXPECT_TRUE(llvm::any_of(plan.allocations, [&](const StorageAllocation &a) {
+      return static_cast<int64_t>(a.id) == destination;
+    }));
+  }
+
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  EXPECT_FALSE(static_cast<bool>(verification))
+      << llvm::toString(std::move(verification));
+}
+
+// A movement that reads or writes a storage other than the one its hop
+// reserved is rejected: the copy no longer materializes the decision the plan
+// made, and re-deriving one is exactly what the hop record exists to prevent.
+TEST(PlanBinder, Issue129AMutatedHopStorageIdIsRejected) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  llvm::SmallVector<Operation *> copies = materializedCopies(*bound->module);
+  ASSERT_EQ(copies.size(), 2u);
+
+  // The copy keeps claiming its hop, but writes a storage the hop never
+  // reserved.
+  const int64_t reserved =
+      copies[0]->getAttrOfType<IntegerAttr>("micro.dst_storage").getInt();
+  copies[0]->setAttr(
+      "micro.dst_storage",
+      IntegerAttr::get(IntegerType::get(c.context.get(), 64), reserved + 1000));
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(verification));
+  const std::string message = llvm::toString(std::move(verification));
+  EXPECT_NE(message.find("does not write the storage"), std::string::npos)
+      << message;
+}
+
+// A hop set that does not describe the route is rejected rather than replayed:
+// the plan's storage decisions and its route must be the same movement.
+TEST(PlanBinder, Issue129AHopSetThatDoesNotMatchItsRouteIsRejected) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  // Drop the last hop: one hop cannot describe a three-memory route.
+  mlir::Operation *kernel = findKernel(*bound->module);
+  ASSERT_NE(kernel, nullptr);
+  mutateRoutes(kernel, *c.context, [&](DictionaryAttr route) {
+    auto hops = route.getAs<ArrayAttr>("hops");
+    llvm::SmallVector<Attribute> kept(hops.begin(), hops.end() - 1);
+    return withHops(route, *c.context, kept);
+  });
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(verification));
+  const std::string message = llvm::toString(std::move(verification));
+  EXPECT_NE(message.find("movement hops for a route"), std::string::npos)
+      << message;
+}
+
+// The hop records survive `micro.mapping`/`micro.routes` exactly: a decoded
+// plan states the same per-hop engine, storage allocations and ordering steps
+// the selected plan made.
+TEST(PlanBinder, Issue129MovementHopsRoundTripThroughMetadata) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+  const PlanConnection &stated = plan.connectionPlans.front();
+  ASSERT_EQ(stated.hops.size(), 2u);
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(decoded))
+      << llvm::toString(decoded.takeError());
+
+  ASSERT_EQ(decoded->connectionPlans.size(), 1u);
+  const PlanConnection &replayed = decoded->connectionPlans.front();
+  ASSERT_EQ(replayed.hops.size(), stated.hops.size());
+  for (size_t hop = 0; hop < stated.hops.size(); ++hop) {
+    EXPECT_EQ(replayed.hops[hop].index, stated.hops[hop].index);
+    EXPECT_EQ(replayed.hops[hop].srcMemory, stated.hops[hop].srcMemory);
+    EXPECT_EQ(replayed.hops[hop].dstMemory, stated.hops[hop].dstMemory);
+    EXPECT_EQ(replayed.hops[hop].engine, stated.hops[hop].engine);
+    EXPECT_EQ(replayed.hops[hop].sourceStorageId,
+              stated.hops[hop].sourceStorageId);
+    EXPECT_EQ(replayed.hops[hop].destinationStorageId,
+              stated.hops[hop].destinationStorageId);
+    EXPECT_EQ(replayed.hops[hop].movementStep, stated.hops[hop].movementStep);
+    EXPECT_EQ(replayed.hops[hop].waitStep, stated.hops[hop].waitStep);
+  }
+  ASSERT_EQ(decoded->steps.size(), plan.steps.size());
+  for (size_t index = 0; index < decoded->steps.size(); ++index)
+    EXPECT_EQ(decoded->steps[index].hop, plan.steps[index].hop);
+}
+
+// Mutating a hop's engine is rejected: the recorded hop must run on an engine
+// the machine declares, exactly as the route's engines do.
+TEST(PlanBinder, Issue129AMutatedHopEngineIsRejected) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  mlir::Operation *kernel = findKernel(*bound->module);
+  ASSERT_NE(kernel, nullptr);
+  mutateRoutes(kernel, *c.context, [&](DictionaryAttr route) {
+    auto hops = route.getAs<ArrayAttr>("hops");
+    llvm::SmallVector<Attribute> rewritten;
+    for (size_t index = 0; index < hops.size(); ++index) {
+      if (index != 0) {
+        rewritten.push_back(hops[index]);
+        continue;
+      }
+      llvm::SmallVector<NamedAttribute> fields;
+      for (NamedAttribute attribute : cast<DictionaryAttr>(hops[index]))
+        if (attribute.getName() != "engine")
+          fields.push_back(attribute);
+      fields.emplace_back(StringAttr::get(c.context.get(), "engine"),
+                          StringAttr::get(c.context.get(), "dma.ghost"));
+      rewritten.push_back(DictionaryAttr::get(c.context.get(), fields));
+    }
+    return withHops(route, *c.context, rewritten);
+  });
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(verification));
+  const std::string message = llvm::toString(std::move(verification));
+  EXPECT_NE(message.find("dma.ghost"), std::string::npos) << message;
+  EXPECT_NE(message.find("unsupported transfer engine"), std::string::npos)
+      << message;
 }

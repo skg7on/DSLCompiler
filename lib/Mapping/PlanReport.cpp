@@ -477,6 +477,27 @@ std::string writePlanReport(const MappingSearchResult &result,
               for (uint64_t id : connection.storageIds)
                 json.value(hexId(id));
             });
+            // The physical movement hops (issue #129, task R4), in route
+            // order: each hop's memories, engine and the storage it reads and
+            // writes, plus the copy/wait steps that order it. Written only
+            // when the plan has them, so a plan that was never storage-planned
+            // keeps the report bytes it always had.
+            if (!connection.hops.empty())
+              json.attributeArray("hops", [&] {
+                for (const PlanMovementHop &hop : connection.hops)
+                  json.object([&] {
+                    json.attribute("index", hop.index);
+                    json.attribute("srcMemory", hop.srcMemory);
+                    json.attribute("dstMemory", hop.dstMemory);
+                    json.attribute("engine", hop.engine);
+                    json.attribute("sourceStorageId",
+                                   hexId(hop.sourceStorageId));
+                    json.attribute("destinationStorageId",
+                                   hexId(hop.destinationStorageId));
+                    json.attribute("movementStep", hop.movementStep);
+                    json.attribute("waitStep", hop.waitStep);
+                  });
+              });
             if (connection.producerPort)
               json.attributeObject("producerPort", [&] {
                 json.attribute("node", static_cast<uint64_t>(
@@ -602,6 +623,11 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attribute("kind", stringifyPlanStepKind(step.kind));
             json.attribute("node", static_cast<uint64_t>(step.node));
             json.attribute("connection", hexId(step.connection));
+            // Which hop of a multi-hop movement a copy or wait step orders
+            // (issue #129, task R4). Absent where the step is not hop-scoped,
+            // so a single-hop plan's report is unchanged.
+            if (step.hop)
+              json.attribute("hop", static_cast<uint64_t>(*step.hop));
           });
         }
       });
@@ -922,6 +948,40 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         for (const llvm::json::Value &id : *storageIds)
           if (std::optional<llvm::StringRef> value = id.getAsString())
             connection.storageIds.push_back(parseHexId(*value));
+      // The physical movement hops (issue #129, task R4), read back checked:
+      // a hop the report cannot describe completely is rejected rather than
+      // decoded with a guessed memory or storage.
+      if (const llvm::json::Array *hops = object->getArray("hops")) {
+        for (const llvm::json::Value &element : *hops) {
+          const llvm::json::Object *hopObject = element.getAsObject();
+          if (!hopObject)
+            return reportError("plan report movement hop is not an object");
+          PlanMovementHop hop;
+          if (std::optional<int64_t> index = hopObject->getInteger("index"))
+            hop.index = static_cast<uint64_t>(*index);
+          if (std::optional<llvm::StringRef> memory =
+                  hopObject->getString("srcMemory"))
+            hop.srcMemory = memory->str();
+          if (std::optional<llvm::StringRef> memory =
+                  hopObject->getString("dstMemory"))
+            hop.dstMemory = memory->str();
+          if (std::optional<llvm::StringRef> engine =
+                  hopObject->getString("engine"))
+            hop.engine = engine->str();
+          if (std::optional<llvm::StringRef> id =
+                  hopObject->getString("sourceStorageId"))
+            hop.sourceStorageId = parseHexId(*id);
+          if (std::optional<llvm::StringRef> id =
+                  hopObject->getString("destinationStorageId"))
+            hop.destinationStorageId = parseHexId(*id);
+          if (std::optional<int64_t> step =
+                  hopObject->getInteger("movementStep"))
+            hop.movementStep = static_cast<uint64_t>(*step);
+          if (std::optional<int64_t> step = hopObject->getInteger("waitStep"))
+            hop.waitStep = static_cast<uint64_t>(*step);
+          connection.hops.push_back(std::move(hop));
+        }
+      }
       if (const llvm::json::Object *producer =
               object->getObject("producerPort")) {
         llvm::Expected<PortRef> ref = jsonPortRef(producer, "producerPort");
@@ -1071,6 +1131,8 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
       if (std::optional<llvm::StringRef> connection =
               object->getString("connection"))
         step.connection = static_cast<ConnectionId>(parseHexId(*connection));
+      if (std::optional<int64_t> hop = object->getInteger("hop"))
+        step.hop = static_cast<uint64_t>(*hop);
       plan.steps.push_back(step);
     }
   }

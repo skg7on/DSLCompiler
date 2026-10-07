@@ -299,6 +299,162 @@ CaseSpec namedPortsSpec() {
 }
 
 //===----------------------------------------------------------------------===//
+// R4: `two-hop`
+//===----------------------------------------------------------------------===//
+
+/// Two visibility scopes, so the value the vector writes in `sram.0` cannot be
+/// read by the store placed where `dram.0` lives: the edge is a real transfer,
+/// and the only legal route from SRAM to DRAM is sram.0 -> l2.0 -> dram.0.
+///
+/// Each link names its *own* transfer engine (`dma.a` for the first hop,
+/// `dma.b` for the second), because routing records only the first engine a
+/// link lists -- an engine no link names is dead, and one link naming both
+/// would collapse the two hops onto a single engine.
+///
+/// `l2CapacityBytes` is a parameter so the same fixture can state the
+/// intermediate's capacity literally: 256 bytes holds the 8x8xf32 value, 128
+/// does not.
+machine::MachineModel twoHopMachine(uint64_t l2CapacityBytes) {
+  machine::MachineModel model;
+  model.target = "issue129.two-hop";
+  model.description = "sram and dram in two scopes, l2 between them";
+  machine::ExecutorNode clusterA;
+  clusterA.id = "cluster.a";
+  clusterA.kind = "cluster";
+  clusterA.refines = {"group"};
+  clusterA.concurrency = 1;
+  machine::ExecutorNode workerA;
+  workerA.id = "worker.a";
+  workerA.kind = "worker";
+  workerA.parent = "cluster.a";
+  workerA.concurrency = 1;
+  machine::ExecutorNode clusterB;
+  clusterB.id = "cluster.b";
+  clusterB.kind = "cluster";
+  clusterB.refines = {"group"};
+  clusterB.concurrency = 1;
+  machine::ExecutorNode workerB;
+  workerB.id = "worker.b";
+  workerB.kind = "worker";
+  workerB.parent = "cluster.b";
+  workerB.concurrency = 1;
+  model.executors = {clusterA, workerA, clusterB, workerB};
+
+  machine::ComputeNode vpu;
+  vpu.id = "vpu.a";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "worker.a";
+  vpu.concurrency = 1;
+  model.computes = {vpu};
+
+  machine::MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "cluster.a";
+  sram.capacityBytes = 1u << 20;
+  sram.alignmentBytes = 64;
+  machine::MemoryNode l2;
+  l2.id = "l2.0";
+  l2.kind = "l2";
+  l2.visibleFrom = "cluster.b";
+  l2.capacityBytes = l2CapacityBytes;
+  l2.alignmentBytes = 64;
+  machine::MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "cluster.b";
+  dram.capacityBytes = 1u << 30;
+  dram.alignmentBytes = 64;
+  model.memories = {sram, l2, dram};
+
+  machine::TransferEngineNode dmaA;
+  dmaA.id = "dma.a";
+  dmaA.kind = "dma";
+  dmaA.refines = {"transfer"};
+  dmaA.attachedTo = "cluster.a";
+  dmaA.count = 1;
+  dmaA.maxOutstanding = 1;
+  machine::TransferEngineNode dmaB;
+  dmaB.id = "dma.b";
+  dmaB.kind = "dma";
+  dmaB.refines = {"transfer"};
+  dmaB.attachedTo = "cluster.b";
+  dmaB.count = 1;
+  dmaB.maxOutstanding = 1;
+  model.transferEngines = {dmaA, dmaB};
+
+  machine::LinkEdge toL2;
+  toL2.id = "sram_to_l2.0";
+  toL2.source = "sram.0";
+  toL2.destination = "l2.0";
+  toL2.bandwidthBytesPerCycle = 64;
+  toL2.latencyCycles = 12;
+  toL2.transactionBytes = 64;
+  toL2.transferEngines = {"dma.a"};
+  machine::LinkEdge toDram;
+  toDram.id = "l2_to_dram.0";
+  toDram.source = "l2.0";
+  toDram.destination = "dram.0";
+  toDram.bandwidthBytesPerCycle = 32;
+  toDram.latencyCycles = 220;
+  toDram.transactionBytes = 64;
+  toDram.transferEngines = {"dma.b"};
+  model.links = {toL2, toDram};
+  return model;
+}
+
+/// A vector add in SRAM whose result is consumed by a store placed in DRAM: one
+/// `8x8xf32` value (256 bytes) crossing the hierarchy. The store's own
+/// `dst_memory` is L2 so that the rewired operand (which the movement lands in
+/// DRAM) and the store's destination stay two distinct memories, as the dialect
+/// requires.
+constexpr llvm::StringLiteral kTwoHopSource = R"mlir(
+module {
+  micro.kernel @two_hop {
+    %a = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.tile_store %r {dst_memory = #micro.memory<l2>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// The vector's work lives in SRAM and the store's in DRAM, so the value
+/// between them must move.
+constexpr llvm::StringLiteral kTwoHopRules = R"llkmap(
+rule issue129.vector_add_sram {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require memory kind sram;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.two-hop.vector";
+  emit "issue129_vector_add";
+  cost 4;
+}
+rule issue129.store_dram {
+  match micro.tile_store();
+  require executor kind worker;
+  require memory kind dram;
+  input "source";
+  bundle "issue129.two-hop.store";
+  emit "issue129_store";
+  cost 4;
+}
+)llkmap";
+
+CaseSpec twoHopSpec() {
+  CaseSpec spec;
+  spec.source = kTwoHopSource;
+  spec.rules = kTwoHopRules;
+  spec.machine = twoHopMachine(256);
+  spec.emitters = {"issue129_vector_add", "issue129_store"};
+  return spec;
+}
+
+//===----------------------------------------------------------------------===//
 // Case table
 //===----------------------------------------------------------------------===//
 
@@ -321,11 +477,14 @@ llvm::Expected<ResourceCase> buildNamedPorts() {
   return buildCase(namedPortsSpec());
 }
 
+llvm::Expected<ResourceCase> buildTwoHop() { return buildCase(twoHopSpec()); }
+
 llvm::ArrayRef<CaseEntry> caseTable() {
   static const CaseEntry table[] = {
       {"two-compute", &buildTwoCompute},
       {"missing-memory", &buildMissingMemory},
       {"named-ports", &buildNamedPorts},
+      {"two-hop", &buildTwoHop},
   };
   return table;
 }

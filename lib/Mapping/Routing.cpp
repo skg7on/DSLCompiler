@@ -149,6 +149,18 @@ bool memorySupportsLayout(const MemoryNode &memory, llvm::StringRef layout) {
   return llvm::is_contained(memory.supportedLayouts, layout);
 }
 
+std::optional<ExecutorId>
+legalTransferEngine(const MachineModel &model, llvm::StringRef sourceMemory,
+                    llvm::StringRef destinationMemory) {
+  for (const LinkEdge &link : model.links) {
+    if (link.source != sourceMemory || link.destination != destinationMemory)
+      continue;
+    if (std::optional<ExecutorId> engine = legalEngine(model, link))
+      return engine;
+  }
+  return std::nullopt;
+}
+
 TopologyService::TopologyService(const MachineModel &model,
                                  RouteOptions options)
     : model_(model), options_(options) {}
