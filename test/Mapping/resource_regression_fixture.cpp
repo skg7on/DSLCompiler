@@ -770,6 +770,173 @@ CaseSpec capacityTopKSpec() {
 }
 
 //===----------------------------------------------------------------------===//
+// R8: `joint-oracle`
+//===----------------------------------------------------------------------===//
+
+/// One worker with two attached vector engines (`vpu.a`/`vpu.b`), an SRAM, an
+/// undersized L2 and a DRAM, with a direct `sram.0 -> dram.0` link and an
+/// `sram.0 -> l2.0 -> dram.0` alternative. The three dimensions the R8 oracle
+/// enumerates are exactly these (issue #129, task R8):
+///   * compute -- which attached engine runs the vector;
+///   * memory  -- which memory holds the store's staged result;
+///   * route   -- direct, or via the 128-byte L2 an `8x8xf32` (256-byte) value
+///                cannot traverse.
+machine::MachineModel jointOracleMachine(bool reversed = false) {
+  machine::MachineModel model;
+  model.target = "issue129.joint-oracle";
+  model.description = "two vector engines, sram/l2/dram, direct and via-l2";
+  machine::ExecutorNode worker;
+  worker.id = "worker.0";
+  worker.kind = "worker";
+  worker.concurrency = 1;
+  model.executors = {worker};
+  machine::ComputeNode vpuA;
+  vpuA.id = "vpu.a";
+  vpuA.kind = "vector_engine";
+  vpuA.attachedTo = "worker.0";
+  vpuA.concurrency = 1;
+  vpuA.elementTypes = {"f32"};
+  vpuA.lanes = {{"f32", 8}};
+  vpuA.issueCycles = 1;
+  machine::ComputeNode vpuB = vpuA;
+  vpuB.id = "vpu.b";
+  // The declaration order of two same-kind engines is not a decision: a caller
+  // may reverse it and must get the same selected set (issue #129, task R8).
+  model.computes = reversed ? std::vector<machine::ComputeNode>{vpuB, vpuA}
+                            : std::vector<machine::ComputeNode>{vpuA, vpuB};
+  machine::MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "worker.0";
+  sram.capacityBytes = 512; // holds the 256-byte add result, not 1024
+  sram.alignmentBytes = 64;
+  machine::MemoryNode l2;
+  l2.id = "l2.0";
+  l2.kind = "l2";
+  l2.visibleFrom = "worker.0";
+  l2.capacityBytes = 128; // too small for the 256-byte value
+  l2.alignmentBytes = 64;
+  machine::MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "worker.0";
+  dram.capacityBytes = 4096; // holds the 1024-byte four-live-version peak
+  dram.alignmentBytes = 64;
+  model.memories = {sram, l2, dram};
+  machine::TransferEngineNode dmaA;
+  dmaA.id = "dma.a";
+  dmaA.kind = "dma";
+  dmaA.refines = {"transfer"};
+  dmaA.attachedTo = "worker.0";
+  dmaA.count = 1;
+  dmaA.maxOutstanding = 1;
+  machine::TransferEngineNode dmaB = dmaA;
+  dmaB.id = "dma.b";
+  model.transferEngines = {dmaA, dmaB};
+  machine::LinkEdge direct;
+  direct.id = "sram_to_dram";
+  direct.source = "sram.0";
+  direct.destination = "dram.0";
+  direct.bandwidthBytesPerCycle = 64;
+  direct.latencyCycles = 20;
+  direct.transactionBytes = 64;
+  direct.transferEngines = {"dma.a"};
+  machine::LinkEdge toL2;
+  toL2.id = "sram_to_l2";
+  toL2.source = "sram.0";
+  toL2.destination = "l2.0";
+  toL2.bandwidthBytesPerCycle = 64;
+  toL2.latencyCycles = 8;
+  toL2.transactionBytes = 64;
+  toL2.transferEngines = {"dma.a"};
+  machine::LinkEdge fromL2;
+  fromL2.id = "l2_to_dram";
+  fromL2.source = "l2.0";
+  fromL2.destination = "dram.0";
+  fromL2.bandwidthBytesPerCycle = 64;
+  fromL2.latencyCycles = 12;
+  fromL2.transactionBytes = 64;
+  fromL2.transferEngines = {"dma.b"};
+  model.links = {direct, toL2, fromL2};
+  return model;
+}
+
+/// Two chained `8x8xf32` vectors inside a four-stage pipeline. Each holds four
+/// simultaneous 256-byte versions -- 1024 bytes -- so the *first* vector's
+/// result (whose memory the rule chooses) is the capacity decision: SRAM (512)
+/// cannot hold it, DRAM (4096) can. The second vector is fixed in DRAM, so the
+/// first-to-second edge is the direct dependent edge and, when the first lands
+/// in SRAM, the movement between them is the two-hop route decision.
+constexpr llvm::StringLiteral kJointOracleSource = R"mlir(
+module {
+  micro.kernel @joint_oracle {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %a = tensor.empty() : tensor<8x8xf32>
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32>
+    micro.for %i = %c0 to %c4 step %c1 {
+      micro.pipeline stages = 4 {
+        %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32>, !micro.tile<8x8xf32> -> !micro.tile<8x8xf32>
+        %s = micro.vector "mul" %r, %r : !micro.tile<8x8xf32>, !micro.tile<8x8xf32> -> !micro.tile<8x8xf32>
+      }
+    }
+    micro.yield
+  }
+}
+)mlir";
+
+/// The add's result memory is the rule's choice -- SRAM (512: cannot hold 1024)
+/// or DRAM (4096: can) -- and it needs a vector engine, so its one rule is
+/// matched by a candidate per attached engine. The multiply is fixed in DRAM.
+constexpr llvm::StringLiteral kJointOracleRules = R"llkmap(
+rule r.add.small {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require memory kind sram;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.joint.add.small";
+  emit "issue129_vector_add";
+  cost 1;
+}
+rule r.add.large {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require memory kind dram;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.joint.add.large";
+  emit "issue129_vector_add";
+  cost 2;
+}
+rule r.mul {
+  match micro.vector(op = "mul");
+  require executor kind worker;
+  require memory kind dram;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.joint.mul";
+  emit "issue129_vector_mul";
+  cost 1;
+}
+)llkmap";
+
+CaseSpec jointOracleSpec(bool reversed = false) {
+  CaseSpec spec;
+  spec.source = kJointOracleSource;
+  spec.rules = kJointOracleRules;
+  spec.machine = jointOracleMachine(reversed);
+  spec.emitters = {"issue129_vector_add", "issue129_vector_mul"};
+  return spec;
+}
+
+//===----------------------------------------------------------------------===//
 // Case table
 //===----------------------------------------------------------------------===//
 
@@ -814,6 +981,14 @@ llvm::Expected<ResourceCase> buildCapacityTopK() {
   return buildCase(capacityTopKSpec());
 }
 
+llvm::Expected<ResourceCase> buildJointOracle() {
+  return buildCase(jointOracleSpec(/*reversed=*/false));
+}
+
+llvm::Expected<ResourceCase> buildJointOracleReversed() {
+  return buildCase(jointOracleSpec(/*reversed=*/true));
+}
+
 llvm::ArrayRef<CaseEntry> caseTable() {
   static const CaseEntry table[] = {
       {"two-compute", &buildTwoCompute},
@@ -825,6 +1000,8 @@ llvm::ArrayRef<CaseEntry> caseTable() {
       {"parallel-overlap", &buildParallelOverlap},
       {"padded-layout", &buildPaddedLayout},
       {"capacity-topk", &buildCapacityTopK},
+      {"joint-oracle", &buildJointOracle},
+      {"joint-oracle-reversed", &buildJointOracleReversed},
   };
   return table;
 }

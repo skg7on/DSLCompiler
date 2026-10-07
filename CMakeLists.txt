@@ -912,10 +912,9 @@ endfunction()
 # mapping scenarios the resource/cost repair regresses against, from finite
 # MachineModel data, LLKMap text and parsed Micro-IR -- so a regression never
 # has to call production search or storage planning to know what to expect. It
-# links only the mapping core and the Micro dialect (no perf, runtime or JIT
-# library) and is linked into integration regression tests alone. As a plain
-# library it must carry LLVM's -fno-rtti/-fno-exceptions, or emitting the
-# llvm::Error vtable references a typeinfo LLVM's build does not contain.
+# is linked into integration regression tests alone. As a plain library it must
+# carry LLVM's -fno-rtti/-fno-exceptions, or emitting the llvm::Error vtable
+# references a typeinfo LLVM's build does not contain.
 add_library(LLKResourceRegressionFixture STATIC
     test/Mapping/resource_regression_fixture.cpp
 )
@@ -997,6 +996,12 @@ add_llk_mapping_test(MappingPropertiesTest test/Mapping/properties.cpp)
 # R7's K-independence property runs over the shared `capacity-topk` fixture,
 # whose `searchCase` supplies the completion evaluator.
 target_link_libraries(MappingPropertiesTest PRIVATE LLKResourceRegressionFixture)
+
+# ExactResourceOracleTest (issue #129, task R8): an independent enumeration of
+# the `joint-oracle` fixture's finite assignment space, with fixture arithmetic
+# alone, compared against the exact search's retained plans.
+add_llk_mapping_test(ExactResourceOracleTest test/Mapping/exact_resource_oracle.cpp)
+target_link_libraries(ExactResourceOracleTest PRIVATE LLKResourceRegressionFixture)
 
 # CompletePlanEvaluationTest (issue #129, task R7): the completion evaluator --
 # the stage that turns a cheap search proposal into a physically validated,
