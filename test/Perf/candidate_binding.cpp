@@ -196,6 +196,24 @@ TEST(CandidateBinding, ResolvesTheCandidateIntoConcreteTileDecisions) {
   EXPECT_EQ(decisions.vectorWidth, 8);
 }
 
+TEST(CandidateBinding, RejectsALayoutTheBinderCannotRealize) {
+  // `blocked` is a legal layout *kind*, but a `#micro.layout<blocked>` is only
+  // well-formed with a block parameter the binder does not carry. Binding it
+  // must be a rejected candidate: building the attribute anyway fails its
+  // verifier and aborts the process -- which is exactly how `llk-tune` crashed
+  // on a compiler-generated search space before this was checked.
+  SearchSpace space = swigluSpace();
+  Candidate candidate = preferred();
+  candidate.symbolicValues["tile_layout"] = "blocked";
+
+  auto scratch = makeScratch();
+  auto bound = bindCandidateToMicroKernel(scratch->module.get(), space,
+                                          candidate, swigluShape());
+  ASSERT_FALSE(static_cast<bool>(bound));
+  EXPECT_NE(llvm::toString(bound.takeError()).find("block/swizzle parameter"),
+            std::string::npos);
+}
+
 TEST(CandidateBinding, ExtendsAKnownFragmentFromTheMemoryPath) {
   SearchSpace space = swigluSpace();
   Candidate candidate = preferred();

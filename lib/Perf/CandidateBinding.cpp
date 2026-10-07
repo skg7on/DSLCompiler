@@ -312,6 +312,15 @@ resolveDecisions(MLIRContext *context, const SearchSpace &space,
       micro::symbolizeLayoutKind(layoutName);
   if (!layout)
     return invalid("tile_layout '" + layoutName + "' is not a known layout");
+  // `blocked` and `swizzled` are well-formed only with a block/swizzle
+  // parameter, and the binder carries neither: building the attribute anyway
+  // fails its verifier and aborts the process. A candidate the binder cannot
+  // realize is a *rejected candidate*, not a crash -- a search space may
+  // legitimately offer alternatives this pipeline does not implement.
+  if (micro::layoutKindNeedsParameters(*layout))
+    return invalid("tile_layout '" + layoutName +
+                   "' requires a block/swizzle parameter the binder does not "
+                   "carry");
   decisions.tileLayout = layoutName.str();
 
   // --- memory path -------------------------------------------------------

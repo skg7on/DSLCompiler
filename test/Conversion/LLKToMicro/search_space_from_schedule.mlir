@@ -101,8 +101,9 @@ func.func @fused_swiglu(%x: tensor<8x64xbf16>, %wg: tensor<64x64xbf16>,
 
 // The entry keeps the pre-M11 `owner_mapping = "worker"`, a single owner. The
 // export completes it with the machine's innermost scope so the choice is a
-// legal two-level mapping, and the default tile layout is offered.
-// CHECK: micro.param "tile_layout" {choices = ["row_major", "blocked"], kind = "layout"}
+// legal two-level mapping, and offers the default tile layout alone: a bare
+// `blocked` is not offered because nothing downstream can realize it.
+// CHECK: micro.param "tile_layout" {choices = ["row_major"], kind = "layout"}
 // CHECK: micro.param "memory_path" {choices = ["dram:sram:acc", "dram:l2:sram:acc"], kind = "memory_path"}
 // CHECK: micro.param "owner_mapping" {choices = ["worker/lane", "worker/vector_engine"], kind = "owner_mapping"}
 // CHECK: micro.param "fragment_shape" {choices = ["16x16x32", "8x8x32"], kind = "fragment_shape"}
