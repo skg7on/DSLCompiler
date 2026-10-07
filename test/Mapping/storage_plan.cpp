@@ -6,6 +6,7 @@
 // ranges, and `finalizeStoragePlan` builds the dependency-aware intervals and
 // checks per-memory capacity against real occupancy.
 
+#include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/StoragePlan.h"
 
 #include "resource_regression_fixture.h"
@@ -1129,6 +1130,44 @@ TEST(StoragePlan,
   const std::string absentText = llvm::toString(absent.takeError());
   EXPECT_NE(absentText.find("memory"), std::string::npos) << absentText;
   EXPECT_NE(absentText.find("sram"), std::string::npos) << absentText;
+}
+
+// Issue #129, task R7 review: an occurrence whose memory cannot be resolved
+// must not have its storage use attributed to the value's lowest-id allocation
+// -- possibly the wrong memory -- with the resolution error swallowed. The
+// event stream refuses instead, so the wrong peak can never reach a capacity
+// verdict.
+TEST(StoragePlan, AnUnresolvableOccurrenceMemoryIsReportedNotGuessed) {
+  mlir::MLIRContext context;
+  // The output's stated kind ('sram') has two nodes, and the placement binds no
+  // port, so the occurrence resolves neither uniquely nor by name.
+  EndpointFixture one = endpointFixture(context, "sram");
+  MachineModel machine = machineWithSramNodes(2);
+  ComputeNode vpu;
+  vpu.id = "vpu.0";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "e0";
+  vpu.concurrency = 1;
+  vpu.elementTypes = {"f32"};
+  vpu.lanes = {{"f32", 8}};
+  vpu.issueCycles = 1;
+  machine.computes = {vpu};
+
+  const WorkloadNodeId nodeId = one.graph.getNodes().front().id;
+  CoveringPlan plan;
+  PlanPlacement placement;
+  placement.node = nodeId;
+  placement.instance = 1;
+  placement.executor = "e0";
+  plan.placements.push_back(placement);
+  plan.steps.push_back(PlanStep{/*id=*/1, PlanStepKind::Compute, nodeId,
+                                /*connection=*/0, std::nullopt});
+
+  llvm::Expected<PlanEventDAG> events =
+      buildPlanEvents(plan, machine, &one.graph);
+  ASSERT_FALSE(bool(events));
+  EXPECT_NE(llvm::toString(events.takeError()).find("could not be resolved"),
+            std::string::npos);
 }
 
 // A named rule requirement recorded for the occurrence is the authority: it

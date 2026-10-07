@@ -499,20 +499,33 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
     llvm::Error expansionError = llvm::Error::success();
     auto emit = [&](const WorkloadPort &port, PortDirection direction,
                     unsigned index, StorageAccess access) {
+      if (expansionError)
+        return;
       const WorkloadValueId value = storageValueOf(port.value);
       std::optional<std::string> memory;
       if (llvm::Expected<EndpointMemory> resolved = resolveEndpointMemory(
               *graph, placed, PortRef{node, direction, index}, machine))
         memory = resolved->memory;
-      else
-        llvm::consumeError(resolved.takeError());
+      else {
+        // The memory this occurrence resolves to is what picks between a
+        // producer's own buffer and a staged copy of the same value. When it
+        // cannot be resolved, attributing the use to the lowest-id allocation
+        // would silently guess -- possibly the wrong memory, feeding the wrong
+        // peak into the capacity verdict (issue #129, task R7 review). It is an
+        // incomplete fact, reported like the residency bound below.
+        expansionError = planEventError(
+            "plan events: the memory of value " + llvm::Twine(value) +
+            " read or written by node " + llvm::Twine(node) +
+            " could not be resolved, so its storage use cannot be "
+            "attributed: " +
+            llvm::toString(resolved.takeError()));
+        return;
+      }
       const StorageAllocation *chosen = nullptr;
       for (const StorageAllocation &allocation : plan.allocations) {
         if (allocation.value != value)
           continue;
-        if (!chosen)
-          chosen = &allocation;
-        if (memory && allocation.memory == *memory) {
+        if (allocation.memory == *memory) {
           chosen = &allocation;
           break;
         }
