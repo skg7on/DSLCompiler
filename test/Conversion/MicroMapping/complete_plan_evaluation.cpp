@@ -119,6 +119,40 @@ TEST(CompletePlanEvaluationTest, RejectsAnOverCapacityProposal) {
   EXPECT_NE(evaluated->rejection->message.find("sram.0"), std::string::npos);
 }
 
+// The whole-plan byte budget (design §9.3) is enforced on the *finalized*
+// plan's live bytes (issue #129, task R7 review). The search's per-partial
+// charge is an over-estimate it deliberately no longer rejects on, so the
+// budget -- which the plan report still prints -- must be checked where the
+// honest peak exists, otherwise it is silently unenforced on every
+// evaluator-backed run.
+TEST(CompletePlanEvaluationTest, EnforcesTheWholePlanByteBudget) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  std::vector<CoveringPlan> proposals = proposalsFor(*c);
+  std::optional<CoveringPlan> dram;
+  for (const CoveringPlan &proposal : proposals)
+    if (proposal.placements.front().rule == "r.large")
+      dram = proposal;
+  ASSERT_TRUE(dram.has_value());
+
+  // The DRAM binding's live peak is 1024 bytes: a 512-byte budget rejects it, a
+  // 2048-byte budget admits it.
+  llvm::Expected<CompletePlanEvaluation> tight = evaluateCompletePlan(
+      *c->source, c->graph, *c->target, *dram, BindContract::Partial,
+      /*memoryBudgetBytes=*/512);
+  ASSERT_TRUE(static_cast<bool>(tight)) << llvm::toString(tight.takeError());
+  ASSERT_TRUE(tight->rejection.has_value());
+  EXPECT_EQ(tight->rejection->code, DiagnosticCode::MemoryCapacityExceeded);
+  EXPECT_NE(tight->rejection->message.find("budget"), std::string::npos);
+
+  llvm::Expected<CompletePlanEvaluation> roomy = evaluateCompletePlan(
+      *c->source, c->graph, *c->target, *dram, BindContract::Partial,
+      /*memoryBudgetBytes=*/2048);
+  ASSERT_TRUE(static_cast<bool>(roomy)) << llvm::toString(roomy.takeError());
+  EXPECT_FALSE(roomy->rejection.has_value());
+  ASSERT_TRUE(roomy->plan.has_value());
+}
+
 // Evaluation is deterministic and idempotent: two evaluations of one proposal
 // produce the same decisions and therefore the same decision-only id, and
 // re-finalizing a returned plan reproduces that id (the invariant the search's

@@ -31,6 +31,9 @@
 
 #include "llvm/Support/Error.h"
 
+#include <cstdint>
+#include <optional>
+
 namespace mlir::llk::mapping {
 
 /// Evaluates one complete proposal against `target`, in the context of the
@@ -77,10 +80,20 @@ namespace mlir::llk::mapping {
 /// infrastructure failures (a structural binder failure under the partial
 /// contract, an unbuildable stream): those stop the search, because they are
 /// properties of the run rather than of one candidate.
+///
+/// `memoryBudgetBytes`, when set, is the whole-plan live-byte budget (design
+/// §9.3). It is checked against the *finalized* plan's honest live peak -- the
+/// sum of the analysis's per-memory peak bytes -- not the search's optimistic
+/// partial-state sum, which the search deliberately no longer rejects on
+/// because aliasing and reuse can only lower it. A budget the search can no
+/// longer enforce is therefore enforced here, where the real footprint exists;
+/// over it is a candidate rejection, so a search keeps enumerating other
+/// coverings.
 llvm::Expected<CompletePlanEvaluation>
 evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
                      const MappingTarget &target, const CoveringPlan &proposal,
-                     BindContract contract);
+                     BindContract contract,
+                     std::optional<uint64_t> memoryBudgetBytes = std::nullopt);
 
 } // namespace mlir::llk::mapping
 

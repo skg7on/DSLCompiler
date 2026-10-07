@@ -862,10 +862,11 @@ searchCase(ResourceCase &c, const MappingSearchOptions &options) {
   // is supplied. The evaluator reads the module (binding a plan clones it) and
   // never mutates it, so a case's source IR is unchanged by the search.
   MappingSearchOptions effective = options;
-  effective.evaluateCompletePlan = [&c](const CoveringPlan &proposal)
+  const uint64_t budget = effective.memoryBudgetBytes;
+  effective.evaluateCompletePlan = [&c, budget](const CoveringPlan &proposal)
       -> llvm::Expected<CompletePlanEvaluation> {
     return evaluateCompletePlan(*c.source, c.graph, *c.target, proposal,
-                                BindContract::Partial);
+                                BindContract::Partial, budget);
   };
   CoveringSearch search(c.graph, *c.target, *c.context, layoutContext,
                         effective);

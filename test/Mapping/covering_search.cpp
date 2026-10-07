@@ -5458,6 +5458,25 @@ TEST(CoveringSearch, ATrimmedPlanReportsTheTopKCapThatTrimmedIt) {
   EXPECT_TRUE(result->plans.front().diagnostics.searchTruncated);
 }
 
+// Issue #129, task R7 review: with an evaluator installed the search's own
+// partial-state budget check is disabled (its sum is an over-estimate), so the
+// whole-plan budget must still be enforced -- on the finalized plan's live peak
+// -- or the option is silently ignored on every evaluator-backed run.
+TEST(CoveringSearch, TheWholePlanBudgetIsEnforcedThroughTheEvaluator) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 0; // no cap: any accepted plan would be returned
+  // The legal DRAM binding's live peak is 1024 bytes; a 512-byte budget refuses
+  // it, so no covering is feasible and the refusal carries the capacity code.
+  options.memoryBudgetBytes = 512;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
 // A rejected cheap proposal must not end a deterministic search: the walk
 // continues and retains the first proposal the evaluator accepts.
 TEST(CoveringSearch, ARejectionContinuesADeterministicSearch) {

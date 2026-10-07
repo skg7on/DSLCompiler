@@ -73,6 +73,24 @@ std::string occupancyOverflow(const perf::SelectedKernelAnalysis &analysis,
   return {};
 }
 
+/// Sums the analysis's per-memory live peaks into the whole-plan resident
+/// footprint the global byte budget bounds (design §9.3), or an empty string
+/// when the total is within `budget`. The sum is checked, so an overflow is a
+/// reported condition rather than a wrapped total that silently passes.
+std::string budgetOverflow(const perf::SelectedKernelAnalysis &analysis,
+                           uint64_t budget) {
+  uint64_t total = 0;
+  for (const auto &entry : analysis.peakBytes) {
+    if (__builtin_add_overflow(total, entry.second, &total))
+      return "the plan's live bytes overflow a 64-bit total";
+  }
+  if (total > budget)
+    return "the plan requires " + std::to_string(total) +
+           " bytes live, over the whole-plan budget of " +
+           std::to_string(budget) + " bytes";
+  return {};
+}
+
 /// The fallback score used when the selected static analysis cannot run: the
 /// plan's own synthesized events, scheduled by the shared scheduler. This is
 /// the score every plan had before the analysis existed, so a modelling gap
@@ -104,7 +122,8 @@ void scoreFromOwnEvents(CoveringPlan &plan,
 llvm::Expected<CompletePlanEvaluation>
 evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
                      const MappingTarget &target, const CoveringPlan &proposal,
-                     BindContract contract) {
+                     BindContract contract,
+                     std::optional<uint64_t> memoryBudgetBytes) {
   const machine::MachineModel &machine = target.machine();
   const bool strict = contract == BindContract::Executable;
 
@@ -202,6 +221,18 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
       !overflow.empty())
     return rejected(DiagnosticCode::MemoryCapacityExceeded,
                     std::move(overflow));
+
+  // The whole-plan byte budget, on the same honest peak (issue #129, task R7
+  // review). The search's own partial-state budget check is disabled once an
+  // evaluator is installed -- its sum is an over-estimate it must not reject on
+  // -- so without this the option would be silently unenforced on every
+  // evaluator-backed run while the report still printed it.
+  if (memoryBudgetBytes) {
+    if (std::string overflow = budgetOverflow(*analysis, *memoryBudgetBytes);
+        !overflow.empty())
+      return rejected(DiagnosticCode::MemoryCapacityExceeded,
+                      std::move(overflow));
+  }
 
   // --- 6. attach the derived snapshot and final cost ----------------------
   //

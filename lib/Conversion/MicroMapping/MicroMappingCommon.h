@@ -513,11 +513,14 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   const mapping::BindContract contract = options.requireExecutable
                                              ? mapping::BindContract::Executable
                                              : mapping::BindContract::Partial;
+  // Captured by value: `searchOptions` is moved into the search below, and the
+  // budget must not be read from a moved-from object.
+  const uint64_t memoryBudgetBytes = searchOptions.memoryBudgetBytes;
   searchOptions.evaluateCompletePlan =
-      [&](const mapping::CoveringPlan &proposal)
+      [&, memoryBudgetBytes](const mapping::CoveringPlan &proposal)
       -> llvm::Expected<mapping::CompletePlanEvaluation> {
     return mapping::evaluateCompletePlan(module, *graph, *run.target, proposal,
-                                         contract);
+                                         contract, memoryBudgetBytes);
   };
   searchOptions.requireCompleteEvaluation = true;
 
