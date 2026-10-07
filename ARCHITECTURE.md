@@ -1,6 +1,6 @@
 # Domain-Specific LLM Kernel Compiler — Architecture
 
-This document preserves the original CPU compiler design and milestone rationale. For the current project-wide MicroIR architecture, mapping/target boundaries, source map, and implementation limits, start with the [community architecture guide](docs/architecture.rst) and [feature guide](docs/features.rst). Some components and performance goals below are design intent rather than current end-to-end guarantees.
+This document preserves the original CPU compiler design and milestone rationale. For the current project-wide MicroIR architecture, mapping/target boundaries, source map, and implementation limits, start with the [community architecture guide](docs/manual/source/architecture.rst) and [feature guide](docs/manual/source/features.rst). Some components and performance goals below are design intent rather than current end-to-end guarantees.
 
 ## 1. Core Concept
 

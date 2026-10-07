@@ -9,7 +9,7 @@ The project uses MLIR as the compiler infrastructure. High-level or structured M
 
 Intel CPU with AVX2 is the first validation backend and machine profile. It is not the final scope of the project; it is a concrete target used to prove the Micro-IR, performance model, lowering path, and tuning workflow before adding GPU, NPU, systolic-array, and custom AI accelerator profiles.
 
-**New to the project?** Start with the [developer guide](docs/index.rst), the [MicroIR concepts](docs/concepts.rst), and the [build instructions](docs/getting-started.rst). The guide includes architecture diagrams, current feature limits, five tool manuals, four practical tutorials, and a [contributor path](docs/contributing.rst).
+**New to the project?** Start with the [developer manual](docs/manual/README.md), the [MicroIR concepts](docs/manual/source/concepts.rst), and the [build instructions](docs/manual/source/getting-started.rst). The guide includes architecture diagrams, current feature limits, five tool manuals, four practical tutorials, and a [contributor path](docs/manual/source/contributing.rst).
 
 ## Project Mission
 
@@ -148,21 +148,21 @@ Future targets should reuse the same Micro-IR contract with different MachineMod
 | M12: Micro-based auto-optimization | Complete | Candidate generation, legality, binding, ranking, plus topology-aware mapping, LLKMap rules/layouts, covering search, and plan binding |
 | M13: Feedback and calibration | Pending integration | Measurement loop and calibration (#51/#52); mapped compilation exists, but production measurement and calibration remain separate work |
 
-These milestone labels describe delivered infrastructure, not satisfaction of every end-to-end design contract. [Issue #129](https://github.com/skg7on/DSLCompiler/issues/129) tracks remaining physical resource, selected-target execution, tuner integration, and acceptance gaps. See [features and current limits](docs/features.rst) before interpreting a successful mapping or compilation as full target realization.
+These milestone labels describe delivered infrastructure, not satisfaction of every end-to-end design contract. [Issue #129](https://github.com/skg7on/DSLCompiler/issues/129) tracks remaining physical resource, selected-target execution, tuner integration, and acceptance gaps. See [features and current limits](docs/manual/source/features.rst) before interpreting a successful mapping or compilation as full target realization.
 
 ## Documentation
 
-The [developer guide](docs/index.rst) is the community entry point. Read the [concepts](docs/concepts.rst), [current architecture](docs/architecture.rst), and [features](docs/features.rst), then follow [build and setup](docs/getting-started.rst). The [tutorial sequence](docs/tutorials/01-first-kernel.rst) covers source export, mapping and replay, performance reports, and tuning. Detailed manuals cover [llk-compile](docs/tools/compiler.rst), [llk-opt](docs/tools/optimizer.rst), [micro-perf](docs/tools/performance.rst), [llk-tune](docs/tools/tuning.rst), and [llk-bench](docs/tools/benchmark.rst).
+The [developer manual](docs/manual/README.md) is the community entry point. Read the [concepts](docs/manual/source/concepts.rst), [current architecture](docs/manual/source/architecture.rst), and [features](docs/manual/source/features.rst), then follow [build and setup](docs/manual/source/getting-started.rst). The [tutorial sequence](docs/manual/source/tutorials/01-first-kernel.rst) covers source export, mapping and replay, performance reports, and tuning. Detailed manuals cover [llk-compile](docs/manual/source/tools/compiler.rst), [llk-opt](docs/manual/source/tools/optimizer.rst), [micro-perf](docs/manual/source/tools/performance.rst), [llk-tune](docs/manual/source/tools/tuning.rst), and [llk-bench](docs/manual/source/tools/benchmark.rst).
 
 The manual uses native reStructuredText and Sphinx, with sidebar navigation, search, downloadable MLIR examples, and an offline architecture diagram. Build the HTML with Python 3.12+; LLVM is not needed for this step:
 
 ```bash
 python3 -m venv build/docs-venv
-build/docs-venv/bin/python -m pip install -r docs/requirements.txt
-build/docs-venv/bin/python -m sphinx -b html -n -W --keep-going docs build/docs/html
+build/docs-venv/bin/python -m pip install -r docs/manual/requirements.txt
+build/docs-venv/bin/python -m sphinx -b html -n -W --keep-going -d build/docs/doctrees docs/manual/source docs/manual/html
 ```
 
-Open `build/docs/html/index.html`. See [building and maintaining the manual](docs/building-docs.rst) for preview commands, the optional `docs-html` CMake target, and documentation checks. CI uploads the HTML as a `developer-manual` artifact.
+Open `docs/manual/html/index.html`. See [building and maintaining the manual](docs/manual/source/building-docs.rst) for preview commands, the optional `docs-html` CMake target, and documentation checks. CI uploads the HTML as a `developer-manual` artifact.
 
 The documents below preserve deeper design details and project history:
 

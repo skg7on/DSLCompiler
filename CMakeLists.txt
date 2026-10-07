@@ -801,6 +801,7 @@ add_llk_test(ScheduleRegression benchmark/schedule_regression.cpp)
 add_llvm_executable(ThreadPoolStress test/Execution/thread_pool_stress.cpp)
 target_link_libraries(ThreadPoolStress PRIVATE LLKRuntime GTest::gtest_main)
 add_test(NAME ThreadPoolStress COMMAND ThreadPoolStress)
+set_tests_properties(ThreadPoolStress PROPERTIES TIMEOUT 60)
 
 add_llvm_executable(SwiGLUParallelScaling test/Execution/swiglu_parallel_scaling.cpp)
 target_link_libraries(SwiGLUParallelScaling PRIVATE LLKRuntime GTest::gtest_main)
@@ -1202,7 +1203,7 @@ if(LLK_BUILD_TOOLS)
   # Run the community examples: help-name lint alone cannot validate pass
   # option values, file arguments, or the artifacts shown in a tutorial.
   add_test(NAME CommunityTutorials
-      COMMAND python3 ${CMAKE_SOURCE_DIR}/docs/tutorials/run_tutorials.py
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/docs/manual/source/tutorials/run_tutorials.py
           --build-dir ${CMAKE_CURRENT_BINARY_DIR}
           --output-dir ${CMAKE_CURRENT_BINARY_DIR}/CommunityTutorials
   )
@@ -1581,11 +1582,12 @@ add_custom_target(check-llk
 )
 
 # Documentation is opt-in: normal builds and compiler tests need no Sphinx.
-# Point this at a virtualenv with docs/requirements.txt installed.
+# Point this at a virtualenv with docs/manual/requirements.txt installed.
 set(LLK_DOCS_PYTHON "python3" CACHE STRING "Python interpreter for the Sphinx manual")
 add_custom_target(docs-html
     COMMAND ${LLK_DOCS_PYTHON} -m sphinx -b html -n -W --keep-going
-            ${CMAKE_SOURCE_DIR}/docs ${CMAKE_BINARY_DIR}/docs/html
+            -d ${CMAKE_BINARY_DIR}/docs/doctrees
+            ${CMAKE_SOURCE_DIR}/docs/manual/source ${CMAKE_SOURCE_DIR}/docs/manual/html
     USES_TERMINAL
     VERBATIM
     COMMENT "Building the MicroIR HTML developer manual"

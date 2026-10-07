@@ -21,9 +21,9 @@ class DocReferencesTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.write("docs/index.rst", "Manual\n======\n")
-        self.write("docs/tools/compiler.rst", "Compiler\n========\n")
-        self.write("docs/examples/input.mlir", "module {}\n")
+        self.write("docs/manual/source/index.rst", "Manual\n======\n")
+        self.write("docs/manual/source/tools/compiler.rst", "Compiler\n========\n")
+        self.write("docs/manual/source/examples/input.mlir", "module {}\n")
         self.write("tools/llk-opt/main.cpp", "// source\n")
         self.tool_paths = {
             name: self.make_tool(name) for name in
@@ -47,14 +47,14 @@ class DocReferencesTest(unittest.TestCase):
         path.chmod(0o755)
         return str(path)
 
-    def path_problems(self, text, doc="docs/tools/compiler.rst"):
+    def path_problems(self, text, doc="docs/manual/source/tools/compiler.rst"):
         problems = []
         checker.check_paths(str(self.root), doc, text, problems)
         return problems
 
     def flag_problems(self, text, tool_paths=None):
         problems = []
-        checker.check_flags(str(self.root), "docs/tools/compiler.rst", text,
+        checker.check_flags(str(self.root), "docs/manual/source/tools/compiler.rst", text,
                             self.tool_paths if tool_paths is None else tool_paths,
                             problems)
         return problems
@@ -83,7 +83,7 @@ class DocReferencesTest(unittest.TestCase):
         self.assertIn("tools/deleted.cpp", problems[0])
 
     def test_rst_images_and_figures_must_exist(self):
-        self.write("docs/images/pipeline.svg", "<svg/>\n")
+        self.write("docs/manual/source/images/pipeline.svg", "<svg/>\n")
         text = (".. image:: /images/pipeline.svg\n\n"
                 ".. figure:: ../images/pipeline.svg\n\n"
                 ".. image:: https://example.com/remote.svg\n")
@@ -162,15 +162,15 @@ class DocReferencesTest(unittest.TestCase):
 
     def test_cli_checks_rst_corpus_and_infers_sibling_benchmark(self):
         docs = [
-            "README.md", "docs/index.rst", "docs/getting-started.rst",
-            "docs/concepts.rst", "docs/architecture.rst", "docs/features.rst",
-            "docs/contributing.rst", "docs/building-docs.rst",
-            "docs/examples/index.rst", "docs/tools/index.rst",
-            "docs/tools/compiler.rst", "docs/tools/optimizer.rst",
-            "docs/tools/performance.rst", "docs/tools/tuning.rst",
-            "docs/tools/benchmark.rst", "docs/tutorials/index.rst",
-            "docs/tutorials/01-first-kernel.rst", "docs/tutorials/02-mapping.rst",
-            "docs/tutorials/03-performance.rst", "docs/tutorials/04-tuning.rst",
+            "README.md", "docs/README.md", "docs/manual/README.md", "docs/manual/source/index.rst", "docs/manual/source/getting-started.rst",
+            "docs/manual/source/concepts.rst", "docs/manual/source/architecture.rst", "docs/manual/source/features.rst",
+            "docs/manual/source/contributing.rst", "docs/manual/source/building-docs.rst",
+            "docs/manual/source/examples/index.rst", "docs/manual/source/tools/index.rst",
+            "docs/manual/source/tools/compiler.rst", "docs/manual/source/tools/optimizer.rst",
+            "docs/manual/source/tools/performance.rst", "docs/manual/source/tools/tuning.rst",
+            "docs/manual/source/tools/benchmark.rst", "docs/manual/source/tutorials/index.rst",
+            "docs/manual/source/tutorials/01-first-kernel.rst", "docs/manual/source/tutorials/02-mapping.rst",
+            "docs/manual/source/tutorials/03-performance.rst", "docs/manual/source/tutorials/04-tuning.rst",
             "docs/design/micro-ir-mapping-workflow.md",
             "docs/reviews/issue67-final-acceptance.md",
         ]
@@ -182,7 +182,7 @@ class DocReferencesTest(unittest.TestCase):
         ]
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(0, result.returncode, result.stderr)
-        self.write("docs/tools/benchmark.rst",
+        self.write("docs/manual/source/tools/benchmark.rst",
                    ".. code-block:: sh\n\n   build/llk-bench --bad\n")
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(1, result.returncode)
