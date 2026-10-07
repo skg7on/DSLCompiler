@@ -27,6 +27,23 @@ import sys
 # The documents whose commands and links a reader is expected to be able to
 # follow literally.
 DOCS = [
+    "README.md",
+    "docs/README.md",
+    "docs/getting-started.md",
+    "docs/concepts.md",
+    "docs/architecture.md",
+    "docs/features.md",
+    "docs/contributing.md",
+    "docs/examples/README.md",
+    "docs/tools/compiler.md",
+    "docs/tools/optimizer.md",
+    "docs/tools/performance.md",
+    "docs/tools/tuning.md",
+    "docs/tools/benchmark.md",
+    "docs/tutorials/01-first-kernel.md",
+    "docs/tutorials/02-mapping.md",
+    "docs/tutorials/03-performance.md",
+    "docs/tutorials/04-tuning.md",
     "docs/design/micro-ir-mapping-workflow.md",
     "docs/reviews/issue67-final-acceptance.md",
 ]

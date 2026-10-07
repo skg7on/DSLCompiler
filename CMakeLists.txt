@@ -1195,6 +1195,13 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
           $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
   )
+  # Run the community examples: help-name lint alone cannot validate pass
+  # option values, file arguments, or the artifacts shown in a tutorial.
+  add_test(NAME CommunityTutorials
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/docs/tutorials/run_tutorials.py
+          --build-dir ${CMAKE_CURRENT_BINARY_DIR}
+          --output-dir ${CMAKE_CURRENT_BINARY_DIR}/CommunityTutorials
+  )
   # Stage C5: the shared mapped-compilation path, taken by the compiler. A
   # plan is searched, bound, verified, handed to the target's own emitters where
   # they implement it, lowered, bufferized and JIT-compiled -- and the compiler
@@ -1554,6 +1561,12 @@ if(TARGET micro-perf)
 endif()
 if(TARGET llk-tune)
   list(APPEND _llk_check_deps llk-tune)
+endif()
+if(TARGET llk-compile)
+  list(APPEND _llk_check_deps llk-compile)
+endif()
+if(TARGET llk-bench)
+  list(APPEND _llk_check_deps llk-bench)
 endif()
 
 add_custom_target(check-llk

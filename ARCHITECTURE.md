@@ -1,5 +1,7 @@
 # Domain-Specific LLM Kernel Compiler — Architecture
 
+This document preserves the original CPU compiler design and milestone rationale. For the current project-wide MicroIR architecture, mapping/target boundaries, source map, and implementation limits, start with the [community architecture guide](docs/architecture.md) and [feature guide](docs/features.md). Some components and performance goals below are design intent rather than current end-to-end guarantees.
+
 ## 1. Core Concept
 
 **What it is:** An out-of-tree MLIR compiler that takes a single, computationally dense LLM operation (SwiGLU, RoPE, Attention) and aggressively optimizes its memory and compute lowering to produce high-performance CPU kernels — essentially a miniature, CPU-focused version of Triton.
