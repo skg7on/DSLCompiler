@@ -30,25 +30,27 @@ import sys
 # follow literally.
 DOCS = [
     "README.md",
-    "docs/index.rst",
-    "docs/getting-started.rst",
-    "docs/concepts.rst",
-    "docs/architecture.rst",
-    "docs/features.rst",
-    "docs/contributing.rst",
-    "docs/building-docs.rst",
-    "docs/examples/index.rst",
-    "docs/tools/index.rst",
-    "docs/tools/compiler.rst",
-    "docs/tools/optimizer.rst",
-    "docs/tools/performance.rst",
-    "docs/tools/tuning.rst",
-    "docs/tools/benchmark.rst",
-    "docs/tutorials/index.rst",
-    "docs/tutorials/01-first-kernel.rst",
-    "docs/tutorials/02-mapping.rst",
-    "docs/tutorials/03-performance.rst",
-    "docs/tutorials/04-tuning.rst",
+    "docs/README.md",
+    "docs/manual/README.md",
+    "docs/manual/source/index.rst",
+    "docs/manual/source/getting-started.rst",
+    "docs/manual/source/concepts.rst",
+    "docs/manual/source/architecture.rst",
+    "docs/manual/source/features.rst",
+    "docs/manual/source/contributing.rst",
+    "docs/manual/source/building-docs.rst",
+    "docs/manual/source/examples/index.rst",
+    "docs/manual/source/tools/index.rst",
+    "docs/manual/source/tools/compiler.rst",
+    "docs/manual/source/tools/optimizer.rst",
+    "docs/manual/source/tools/performance.rst",
+    "docs/manual/source/tools/tuning.rst",
+    "docs/manual/source/tools/benchmark.rst",
+    "docs/manual/source/tutorials/index.rst",
+    "docs/manual/source/tutorials/01-first-kernel.rst",
+    "docs/manual/source/tutorials/02-mapping.rst",
+    "docs/manual/source/tutorials/03-performance.rst",
+    "docs/manual/source/tutorials/04-tuning.rst",
     "docs/design/micro-ir-mapping-workflow.md",
     "docs/reviews/issue67-final-acceptance.md",
 ]
@@ -99,7 +101,7 @@ def check_paths(source_dir, doc, text, problems):
     :source: paths are relative to the repository root.
     """
     doc_dir = os.path.dirname(os.path.join(source_dir, doc))
-    docs_dir = os.path.join(source_dir, "docs")
+    docs_dir = os.path.join(source_dir, "docs", "manual", "source")
 
     def check_target(target, base, description, document=False):
         target = target.split("#", 1)[0].strip()
