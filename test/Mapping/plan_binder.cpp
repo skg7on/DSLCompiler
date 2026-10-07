@@ -731,6 +731,47 @@ TEST(PlanBinder, MaterializesALayoutTransformAsATransformOp) {
       static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
 }
 
+// The concrete resource the plan recorded for a layout conversion survives the
+// metadata round trip (issue #129, task R1), so a replay normalizes the same
+// transform event instead of re-deriving one from executor order.
+TEST(PlanBinder, Issue129TransformResourceSurvivesMetadataRoundTrip) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+
+  mlir::MLIRContext *context = fixture.context.get();
+  PlanConnection &connection = plan->connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route.resize(1); // same memory: nothing to move
+  LayoutTransform transform;
+  transform.srcLayout = "t.plain";
+  transform.dstLayout = "t.blocked";
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  transform.dstMap = mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  // The machine's own vector engine, recorded as the conversion's resource.
+  transform.computeResource = "vpu";
+  connection.transform = transform;
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  auto decoded = decodeSelectedPlan(*bound->module, **target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  const PlanConnection *replayed = nullptr;
+  for (const PlanConnection &candidate : decoded->connectionPlans)
+    if (candidate.transform)
+      replayed = &candidate;
+  ASSERT_NE(replayed, nullptr) << "the replayed plan records no transform";
+  EXPECT_EQ(replayed->transform->computeResource, "vpu");
+}
+
 // Task B8 (closes A9's parked finding): the emitted `micro.transform` carries
 // the plan-selected resource as `micro.engine`, so the performance model
 // charges that executor's vector unit instead of the machine's default.
@@ -4047,6 +4088,20 @@ void rewriteRecordedCompute(ModuleOp module, MLIRContext &context,
   });
 }
 
+/// Empties the recorded compute container on every mapped operation that has
+/// one -- present but recording nothing, which is what a dropped or tampered
+/// selection looks like.
+void emptyRecordedCompute(ModuleOp module, MLIRContext &context) {
+  module->walk([&](Operation *op) {
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping || !mapping.get("compute_bindings"))
+      return;
+    NamedAttrList fields(mapping);
+    fields.set("compute_bindings", DictionaryAttr::get(&context, {}));
+    op->setAttr("micro.mapping", fields.getDictionary(&context));
+  });
+}
+
 /// Binds the first plan of a two-compute search against a clone of the case's
 /// module, ready for a recorded-selection tamper.
 llvm::Expected<BoundPlan> bindFirstTwoComputePlan(issue129::ResourceCase &c) {
@@ -4169,6 +4224,39 @@ TEST(PlanBinder, Issue129UnattachedRecordedComputeNodeIsRejected) {
   const std::string text = llvm::toString(std::move(verified));
   EXPECT_NE(text.find("vpu.c"), std::string::npos) << text;
   EXPECT_NE(text.find("attached"), std::string::npos) << text;
+}
+
+/// A container that is *present but empty* is not "nothing was recorded": the
+/// rule requires a `vector_engine`, so the missing entry is a dropped selection
+/// and verification must reject it rather than fall through to the existential
+/// check (which would let the executor's first engine stand in).
+TEST(PlanBinder, Issue129EmptyComputeContainerIsRejectedNotFallenBack) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  emptyRecordedCompute(*bound->module, *c->context);
+
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("vector_engine"), std::string::npos) << text;
+  EXPECT_NE(text.find("records no concrete node"), std::string::npos) << text;
+}
+
+/// The same tamper is not recoverable by the metadata reader either: a replay
+/// refuses to invent a selection rather than re-deriving one.
+TEST(PlanBinder, Issue129EmptyComputeContainerIsNotDecodable) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  emptyRecordedCompute(*bound->module, *c->context);
+
+  auto decoded = decodeSelectedPlan(*bound->module, *c->target);
+  ASSERT_FALSE(bool(decoded));
+  const std::string text = llvm::toString(decoded.takeError());
+  EXPECT_NE(text.find("vector_engine"), std::string::npos) << text;
 }
 
 /// Two placements of one instance must agree on the selected engine: a fused

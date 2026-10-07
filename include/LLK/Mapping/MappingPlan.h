@@ -426,6 +426,19 @@ struct PlanPlacement {
   /// identity when non-empty; a materializer and the normalized event stream
   /// read the selected node from here (issue #129, task R1).
   llvm::StringMap<std::string> computeBindings{};
+  /// The compute capability kinds this placement's rule requires
+  /// (`vector_engine`), sorted and unique. It is what lets a stage reading
+  /// `computeBindings` tell "the rule requires no capability" -- a copy or
+  /// store placement -- from "the recorded selection is missing", which is a
+  /// dropped or tampered decision and must be diagnosed rather than re-derived
+  /// from the executor's first attachment.
+  ///
+  /// Derived from `rule`, exactly as a layout solution's parameters are: it is
+  /// a projection of content the plan already carries, so it is deliberately
+  /// *not* folded into `canonicalPlanString` (two placements of one rule cannot
+  /// differ in it) and a decoder re-derives it from the target's rule registry.
+  std::vector<std::string> computeRequirements{};
+
   /// The resolved values of the rule's own declared parameters (the ones its
   /// `require` constraints derive), so the selected plan states the exact
   /// assignment generation solved rather than leaving a reader to re-derive
@@ -625,6 +638,28 @@ PlanId computePlanId(const CoveringPlan &plan);
 /// placement.
 std::string transformExecutorFor(const CoveringPlan &plan,
                                  const PlanConnection &connection);
+
+/// Length-delimited, sorted canonical rendering of a selected-compute map
+/// (`<keyLen>:<key>=<valueLen>:<value>`), the identical encoding the instance
+/// and plan content keys fold. Exported so a measurement key renders the same
+/// decision the same way -- a plain separator-joined form would let a key or
+/// node id containing the separator collide with a different selection (issue
+/// #129, task R1).
+std::string
+canonicalComputeBindingsString(const llvm::StringMap<std::string> &bindings);
+
+/// The first compute capability kind `placement`'s rule requires but for which
+/// `placement.computeBindings` records no concrete node, or `nullopt` when the
+/// placement is complete.
+///
+/// A recorded selection is authoritative: a rule that requires a capability but
+/// whose plan records no node for it has had that decision dropped or tampered
+/// with, so it is a defect -- never a licence to re-derive an engine from the
+/// executor's declaration order (issue #129, task R1). Shared by the
+/// normalizer, the report reader and the metadata decoder so all three reach
+/// the same verdict.
+std::optional<std::string>
+missingComputeBinding(const PlanPlacement &placement);
 
 std::string canonicalCandidateString(const MappingCandidate &candidate);
 std::string canonicalInstanceString(const CandidateInstance &instance);

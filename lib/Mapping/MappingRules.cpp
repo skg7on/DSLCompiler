@@ -2298,36 +2298,48 @@ llvm::Error verifyRuleSelection(const RuleDef &rule, const WorkloadNode &node,
     if (requirement.role != "compute")
       continue;
     auto recorded = selection.computeBindings.find(requirement.kind);
-    if (recorded != selection.computeBindings.end()) {
-      const mlir::llk::machine::ComputeNode *node =
-          machine.findCompute(recorded->second);
-      if (!node)
+    if (recorded == selection.computeBindings.end()) {
+      // A binding that recorded a selection container but no node for a kind
+      // the rule requires has had that decision dropped or tampered with. It is
+      // rejected rather than passed by the existential check, which would let
+      // whichever attached capability the executor lists first stand in for the
+      // selected one (issue #129, task R1).
+      if (selection.computeBindingsRecorded)
         return reject(DiagnosticCode::UnsupportedComputeFragment,
-                      "unknown compute node '" + recorded->second + "'");
-      if (node->kind != requirement.kind)
+                      "rule '" + rule.id + "' requires a '" + requirement.kind +
+                          "' compute capability, but the mapping records no "
+                          "concrete node for it");
+      // No container was recorded at all: keep generation's existential check,
+      // so a binding that predates compute persistence stays verifiable.
+      bool attached = false;
+      for (const mlir::llk::machine::ComputeNode *compute :
+           machine.computesFor(selection.executor))
+        if (compute->kind == requirement.kind) {
+          attached = true;
+          break;
+        }
+      if (!attached)
         return reject(DiagnosticCode::UnsupportedComputeFragment,
-                      "compute node '" + recorded->second + "' has kind '" +
-                          node->kind + "', not the required '" +
-                          requirement.kind + "'");
-      if (node->attachedTo != selection.executor)
-        return reject(DiagnosticCode::UnsupportedComputeFragment,
-                      "compute node '" + recorded->second +
-                          "' is attached to '" + node->attachedTo +
-                          "', not to the recorded executor '" +
-                          selection.executor + "'");
+                      "executor '" + selection.executor +
+                          "' has no attached '" + requirement.kind +
+                          "' compute capability");
       continue;
     }
-    bool attached = false;
-    for (const mlir::llk::machine::ComputeNode *compute :
-         machine.computesFor(selection.executor))
-      if (compute->kind == requirement.kind) {
-        attached = true;
-        break;
-      }
-    if (!attached)
+    const mlir::llk::machine::ComputeNode *node =
+        machine.findCompute(recorded->second);
+    if (!node)
       return reject(DiagnosticCode::UnsupportedComputeFragment,
-                    "executor '" + selection.executor + "' has no attached '" +
-                        requirement.kind + "' compute capability");
+                    "unknown compute node '" + recorded->second + "'");
+    if (node->kind != requirement.kind)
+      return reject(DiagnosticCode::UnsupportedComputeFragment,
+                    "compute node '" + recorded->second + "' has kind '" +
+                        node->kind + "', not the required '" +
+                        requirement.kind + "'");
+    if (node->attachedTo != selection.executor)
+      return reject(DiagnosticCode::UnsupportedComputeFragment,
+                    "compute node '" + recorded->second + "' is attached to '" +
+                        node->attachedTo + "', not to the recorded executor '" +
+                        selection.executor + "'");
   }
 
   // 6. Memory kinds and visibility. A requirement that named a port is checked

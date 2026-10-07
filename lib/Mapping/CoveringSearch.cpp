@@ -720,9 +720,12 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             // The selected concrete compute nodes belong in the key too (issue
             // #129, task R1): two placements of one rule on one executor that
             // selected different attached engines are different work, so a
-            // measurement taken on one must not be reused for the other.
+            // measurement taken on one must not be reused for the other. The
+            // rendering is the same length-delimited one the plan's content key
+            // folds, so a key or node id containing a separator cannot collide
+            // with a different selection inside this field.
             signature.compute =
-                llvm::join(sortedBindings(entry.instance.computeBindings), ",");
+                canonicalComputeBindingsString(entry.instance.computeBindings);
             // The target identity is more than the machine (task B8): a change
             // to the rule or layout library changes what a measurement means,
             // so both content hashes join the context.
@@ -2062,6 +2065,18 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         // normalized plan event charges this node the same estimate the
         // search ranked it on rather than re-deriving one.
         placement.cost = owner->cost;
+        // The capability kinds the rule requires travel with the placement so a
+        // later stage can tell "this rule needs no compute capability" from
+        // "the recorded selection is missing" (issue #129, task R1). Sorted and
+        // unique, so it is a function of the recorded rule alone.
+        for (const KindRequirement &requirement : owner->rule->kindRequirements)
+          if (requirement.role == "compute")
+            placement.computeRequirements.push_back(requirement.kind);
+        llvm::sort(placement.computeRequirements);
+        placement.computeRequirements.erase(
+            std::unique(placement.computeRequirements.begin(),
+                        placement.computeRequirements.end()),
+            placement.computeRequirements.end());
       }
       if (const WorkloadNode *node = tables[index].workload)
         if (!node->outputs.empty())

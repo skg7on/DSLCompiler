@@ -61,31 +61,6 @@ portMemoryBindingsString(const std::vector<PortMemoryBinding> &bindings) {
   return joinStrings(entries, ",");
 }
 
-/// The concrete compute nodes an instance or placement selected, rendered
-/// `<keyLen>:<key>=<valueLen>:<value>` and sorted. Length-delimited so a
-/// requirement key or node id that itself contains a separator, a `|`, or a
-/// newline cannot be mistaken for a field boundary -- two different selections
-/// can never render alike (issue #129, task R1). Empty for a rule that requires
-/// no compute capability, so the canonical string of such a value keeps its
-/// shape.
-std::string
-computeBindingsString(const llvm::StringMap<std::string> &bindings) {
-  std::vector<std::string> entries;
-  entries.reserve(bindings.size());
-  for (const auto &entry : bindings) {
-    std::string text = std::to_string(entry.first().size());
-    text += ':';
-    text += entry.first().str();
-    text += '=';
-    text += std::to_string(entry.second.size());
-    text += ':';
-    text += entry.second;
-    entries.push_back(std::move(text));
-  }
-  llvm::sort(entries);
-  return joinStrings(entries, ",");
-}
-
 /// Renders numeric ids as a sorted, comma-separated list, so id order in the
 /// source vector never leaks into a canonical string.
 template <typename Container> std::string joinNumbers(const Container &input) {
@@ -193,6 +168,32 @@ std::string bundleString(const TargetBundle &bundle) {
 }
 
 } // namespace
+
+std::string
+canonicalComputeBindingsString(const llvm::StringMap<std::string> &bindings) {
+  std::vector<std::string> entries;
+  entries.reserve(bindings.size());
+  for (const auto &entry : bindings) {
+    std::string text = std::to_string(entry.first().size());
+    text += ':';
+    text += entry.first().str();
+    text += '=';
+    text += std::to_string(entry.second.size());
+    text += ':';
+    text += entry.second;
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return joinStrings(entries, ",");
+}
+
+std::optional<std::string>
+missingComputeBinding(const PlanPlacement &placement) {
+  for (const std::string &kind : placement.computeRequirements)
+    if (!placement.computeBindings.count(kind))
+      return kind;
+  return std::nullopt;
+}
 
 llvm::StringRef stringifyConnectionKind(ConnectionKind kind) {
   switch (kind) {
@@ -357,7 +358,7 @@ std::string canonicalInstanceString(const CandidateInstance &instance) {
   out += "|solvedlayout=";
   out += solvedLayoutsString(instance.layoutSolutions);
   out += "|compute=";
-  out += computeBindingsString(instance.computeBindings);
+  out += canonicalComputeBindingsString(instance.computeBindings);
   out += "|slots=";
   out += std::to_string(instance.resourceUsage.executorSlots);
   out += "|membytes=";
@@ -467,10 +468,10 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
     // (issue #129, task R1), so two placements that differ only in which
     // attached engine of a kind ran are distinct plans rather than colliding on
     // one id and collapsing to the machine's first engine. Length-delimited via
-    // `computeBindingsString`, and empty for a rule that requires no compute
-    // capability.
+    // `canonicalComputeBindingsString`, and empty for a rule that requires no
+    // compute capability.
     text += ":compute=";
-    text += computeBindingsString(placement.computeBindings);
+    text += canonicalComputeBindingsString(placement.computeBindings);
     placements.push_back(std::move(text));
   }
   llvm::sort(placements);

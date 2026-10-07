@@ -1026,6 +1026,15 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
         transform.emplace_back(
             mlir::StringAttr::get(context, "dst_map"),
             mlir::AffineMapAttr::get(connection.transform->dstMap));
+      // The concrete compute resource the transformation runs on (issue #129,
+      // task R1), so a decoded plan normalizes the same transform event the
+      // search selected instead of falling back to executor order. Recorded
+      // only when the plan resolved one; empty for a plan that never did.
+      if (!connection.transform->computeResource.empty())
+        transform.emplace_back(
+            mlir::StringAttr::get(context, "compute"),
+            mlir::StringAttr::get(context,
+                                  connection.transform->computeResource));
       attributes.emplace_back(mlir::StringAttr::get(context, "transform"),
                               mlir::DictionaryAttr::get(context, transform));
     }
@@ -1254,6 +1263,10 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
     sourceNodeForOp[entry.second] = entry.first;
 
   bool sawUnrecoverable = false;
+  // A short, specific cause to append to the generic unrecoverable diagnostic,
+  // so a dropped compute selection is named rather than lumped in with every
+  // other ambiguous legacy shape (issue #129, task R1).
+  std::string unrecoverableReason;
   module->walk([&](mlir::Operation *op) {
     if (sawUnrecoverable)
       return;
@@ -1297,6 +1310,19 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       return;
     }
     placement.rule = *rule;
+    // The capability kinds the recorded rule requires, re-derived from the
+    // target's rule registry, so a decoded plan still knows which kinds must
+    // have a concrete recorded selection (issue #129, task R1).
+    if (const RuleDef *def = target.rules().find(placement.rule)) {
+      for (const KindRequirement &requirement : def->kindRequirements)
+        if (requirement.role == "compute")
+          placement.computeRequirements.push_back(requirement.kind);
+      llvm::sort(placement.computeRequirements);
+      placement.computeRequirements.erase(
+          std::unique(placement.computeRequirements.begin(),
+                      placement.computeRequirements.end()),
+          placement.computeRequirements.end());
+    }
     llvm::Expected<std::string> executor =
         readMetadataString(mapping, "executor", where);
     if (!executor) {
@@ -1338,6 +1364,17 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       }
       for (const auto &entry : *read)
         placement.computeBindings[entry.first()] = entry.second;
+      // A container that omits a kind the recorded rule requires is an
+      // incomplete selection: the concrete node was dropped or tampered with,
+      // and the reader must not fall back to executor order to invent one
+      // (issue #129, task R1).
+      if (std::optional<std::string> missing =
+              missingComputeBinding(placement)) {
+        unrecoverableReason = where + " records no concrete '" + *missing +
+                              "' compute selection, which its rule requires";
+        sawUnrecoverable = true;
+        return;
+      }
     } else if (v2) {
       sawUnrecoverable = true;
       return;
@@ -1524,10 +1561,14 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
 
     plan.placements.push_back(std::move(placement));
   });
-  if (sawUnrecoverable)
-    return metadataError(
+  if (sawUnrecoverable) {
+    std::string message =
         "legacy or malformed micro.mapping is not uniquely recoverable for "
-        "executable replay");
+        "executable replay";
+    if (!unrecoverableReason.empty())
+      message += ": " + unrecoverableReason;
+    return metadataError(message);
+  }
 
   // --- routes ------------------------------------------------------------
   if (auto routes = kernel->getAttrOfType<mlir::ArrayAttr>(kRoutesAttr)) {
@@ -1639,6 +1680,10 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
           layoutTransform.srcMap = srcMap.getValue();
         if (auto dstMap = transform.getAs<mlir::AffineMapAttr>("dst_map"))
           layoutTransform.dstMap = dstMap.getValue();
+        // The concrete compute resource the transformation runs on (issue #129,
+        // task R1), restored so a decoded plan normalizes the recorded engine.
+        if (auto compute = transform.getAs<mlir::StringAttr>("compute"))
+          layoutTransform.computeResource = compute.getValue().str();
         connection.transform = layoutTransform;
       }
 

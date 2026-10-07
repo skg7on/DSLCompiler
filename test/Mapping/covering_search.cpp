@@ -5241,6 +5241,12 @@ TEST(CoveringSearch, Issue129ReversingEngineOrderKeepsTheSelections) {
   auto forward = issue129::searchCase(*c, options);
   ASSERT_TRUE(bool(forward)) << llvm::toString(forward.takeError());
   ASSERT_EQ(forward->plans.size(), 2u);
+  // Written while `c->target` is still the forward target, so the two reports
+  // below really compare the two machine declaration orders.
+  ASSERT_FALSE(forward->plans.empty());
+  const std::string forwardReport =
+      writePlanReport(*forward, c->target->machine(), *c->target, options,
+                      forward->workloadHash);
 
   // The same machine with its two attached engines declared in the other order.
   MachineModel reversed = c->target->machine();
@@ -5270,11 +5276,8 @@ TEST(CoveringSearch, Issue129ReversingEngineOrderKeepsTheSelections) {
   // The reports are byte-identical too: node declaration order is normalized
   // out of the machine content hash and out of every canonical plan id, so a
   // reordering of equivalent capabilities changes neither a selection nor the
-  // bytes a reader compares.
-  ASSERT_FALSE(forward->plans.empty());
-  const std::string forwardReport =
-      writePlanReport(*forward, c->target->machine(), *c->target, options,
-                      forward->workloadHash);
+  // bytes a reader compares. `forwardReport` was written from the forward
+  // target and `backwardReport` from the reversed one.
   const std::string backwardReport =
       writePlanReport(*backward, c->target->machine(), *c->target, options,
                       backward->workloadHash);

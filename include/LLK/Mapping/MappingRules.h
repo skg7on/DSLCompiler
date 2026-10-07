@@ -299,9 +299,16 @@ struct RecordedRuleSelection {
   /// (`instance.computeBindings[requirement.kind]`). When a kind is present
   /// here, verification checks *that* node -- it must exist, have the required
   /// kind, and be attached to the recorded executor -- and never falls back to
-  /// the executor's first attached capability. Absent (a binding that predates
-  /// compute persistence) keeps the older existential check.
+  /// the executor's first attached capability.
   llvm::StringMap<std::string> computeBindings;
+  /// True when the binding recorded a compute-selection *container* (v3 writes
+  /// it on every mapped operation, possibly empty). It is what distinguishes
+  /// "the rule requires no capability, so the container is legitimately empty"
+  /// from "the container was emptied or never recorded the required kind" --
+  /// the latter is a dropped selection and is rejected rather than passed by
+  /// the existential check. False for a binding that never recorded one, so a
+  /// pre-v3 or hand-built selection keeps the older behaviour.
+  bool computeBindingsRecorded = false;
   /// The port to memory id assignment of every requirement that named a port,
   /// as generation records it (`instance.portMemoryBindings`). A named
   /// requirement is re-checked against *this*, never the kind-keyed map.

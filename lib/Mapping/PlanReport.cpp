@@ -511,6 +511,15 @@ std::string writePlanReport(const MappingSearchResult &result,
                 if (connection.transform->dstMap)
                   json.attribute(
                       "dstMap", printedMapString(connection.transform->dstMap));
+                // The concrete compute resource the transformation runs on
+                // (issue #129, task R1): the decision `selectTransformResource`
+                // made by memory visibility, persisted so a replay normalizes
+                // the same event instead of re-deriving it from executor order.
+                // Recorded only when the plan has one, so a transform without a
+                // resolved resource keeps the report bytes it always had.
+                if (!connection.transform->computeResource.empty())
+                  json.attribute("compute",
+                                 connection.transform->computeResource);
               });
             }
           });
@@ -721,10 +730,22 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         placement.instance = static_cast<InstanceId>(parseHexId(*instance));
       if (std::optional<llvm::StringRef> rule = object->getString("rule")) {
         placement.rule = rule->str();
-        if (const RuleDef *def = target.rules().find(placement.rule))
+        if (const RuleDef *def = target.rules().find(placement.rule)) {
           if (def->matchOp != workloadNode->opName)
             return reportError("plan report placement rule does not implement "
                                "the source graph's operation");
+          // Re-derived from the recorded rule id, so a replayed plan still
+          // knows which capability kinds must have a recorded selection (issue
+          // #129, task R1).
+          for (const KindRequirement &requirement : def->kindRequirements)
+            if (requirement.role == "compute")
+              placement.computeRequirements.push_back(requirement.kind);
+          llvm::sort(placement.computeRequirements);
+          placement.computeRequirements.erase(
+              std::unique(placement.computeRequirements.begin(),
+                          placement.computeRequirements.end()),
+              placement.computeRequirements.end());
+        }
       }
       if (std::optional<llvm::StringRef> bundle = object->getString("bundle"))
         placement.bundle.name = bundle->str();
@@ -747,6 +768,14 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
           return reportError("plan report compute selection is not a string");
         placement.computeBindings[entry.first] = value->str();
       }
+      // A container that omits a kind the rule requires is an incomplete
+      // selection, not a licence to re-derive an engine from executor order
+      // (issue #129, task R1).
+      if (std::optional<std::string> missing = missingComputeBinding(placement))
+        return reportError("plan report placement records no concrete '" +
+                           *missing +
+                           "' compute selection, which its rule "
+                           "requires");
       if (const llvm::json::Object *memories = object->getObject("memories"))
         for (const auto &entry : *memories)
           if (std::optional<llvm::StringRef> value = entry.second.getAsString())
@@ -929,6 +958,13 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
           layoutTransform.srcLayout = src->str();
         if (std::optional<llvm::StringRef> dst = transform->getString("dst"))
           layoutTransform.dstLayout = dst->str();
+        // The concrete compute resource the transformation runs on (issue #129,
+        // task R1). Restored verbatim, so re-normalizing the replayed plan
+        // names the recorded engine rather than re-deriving one from executor
+        // order.
+        if (std::optional<llvm::StringRef> compute =
+                transform->getString("compute"))
+          layoutTransform.computeResource = compute->str();
         // The transform's maps are context-bound and re-derived by a
         // materializer from the declaration and parameters; the report records
         // them for inspection only.

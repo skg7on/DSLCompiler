@@ -768,3 +768,52 @@ TEST(MappingPlanReportTest, Issue129ReplayRejectsChangedMachineContent) {
   EXPECT_NE(llvm::toString(replay.takeError()).find("target"),
             std::string::npos);
 }
+
+/// The concrete compute resource a layout conversion runs on survives the
+/// report round trip (issue #129, task R1): the search picked it by memory
+/// visibility, which can disagree with the executor's declaration order, so a
+/// replay must read it rather than re-derive one.
+TEST(MappingPlanReportTest, Issue129TransformResourceSurvivesReportReplay) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult result =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  ASSERT_FALSE(result.plans.empty());
+  CoveringPlan &plan = result.plans.front();
+  if (plan.connectionPlans.empty()) {
+    // The plan content id is written verbatim by the report, so adding the
+    // connection this test needs does not disturb the replayed identity.
+    PlanConnection connection;
+    connection.id = 4242;
+    connection.kind = ConnectionKind::LayoutTransform;
+    plan.connectionPlans.push_back(connection);
+  }
+  PlanConnection &connection = plan.connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  LayoutTransform transform;
+  transform.srcLayout = "avx2.row_major";
+  transform.dstLayout = "avx2.blocked_2d";
+  transform.computeResource = "vpu";
+  connection.transform = transform;
+
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, result.workloadHash);
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, **target, *graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+  const PlanConnection *replayed = nullptr;
+  for (const PlanConnection &candidate : replay->connectionPlans)
+    if (candidate.transform)
+      replayed = &candidate;
+  ASSERT_NE(replayed, nullptr) << "the replayed plan records no transform";
+  EXPECT_EQ(replayed->transform->computeResource, "vpu");
+}

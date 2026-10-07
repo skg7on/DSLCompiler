@@ -1108,6 +1108,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     // placement of one instance must record the *same* selection, so a fused
     // instance cannot claim two different engines.
     llvm::StringMap<std::string> computes;
+    bool computeContainerRecorded = false;
     if (mlir::Attribute rawComputes = mapping.get("compute_bindings")) {
       llvm::Expected<llvm::StringMap<std::string>> read =
           readMetadataStringMap(rawComputes, "compute_bindings", where);
@@ -1116,6 +1117,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         return;
       }
       computes = std::move(*read);
+      computeContainerRecorded = true;
     } else if (schemaV3) {
       failMetadata(bindError(
           where + ": micro.mapping records no 'compute_bindings' for a v3 "
@@ -1140,6 +1142,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     RecordedRuleSelection selection;
     selection.executor = *executor;
     selection.computeBindings = std::move(computes);
+    selection.computeBindingsRecorded = computeContainerRecorded;
     for (const auto &entry : memories)
       selection.memories[entry.first()] = entry.second;
     selection.portMemories = std::move(portMemories);

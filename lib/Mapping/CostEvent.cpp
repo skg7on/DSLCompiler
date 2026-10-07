@@ -140,6 +140,63 @@ recordedComputeNode(const machine::MachineModel &machine,
   return other;
 }
 
+/// The engine a compute event for `placement` runs on, with the "a required
+/// kind must be recorded" diagnosis applied before any fallback is even
+/// considered (issue #129, task R1).
+///
+/// A placement whose rule requires a compute kind but which records no concrete
+/// node for it has had its selection dropped or tampered with. Returning null
+/// there would let the caller re-derive an engine from the executor's first
+/// attachment -- the exact silent substitution this task removes -- so it is an
+/// error instead. Null is returned only for a placement that genuinely records
+/// nothing to select: a rule that requires no capability (a copy or store
+/// placement) or a hand-built plan.
+llvm::Expected<const machine::ComputeNode *>
+recordedEngineForPlacement(const machine::MachineModel &machine,
+                           const PlanPlacement &placement) {
+  if (std::optional<std::string> missing = missingComputeBinding(placement))
+    return planEventError(
+        "plan events: placement for node " + llvm::Twine(placement.node) +
+        " requires a '" + *missing +
+        "' compute capability but the plan records no concrete node for it; "
+        "refusing to re-derive one from executor order");
+  return recordedComputeNode(machine, placement);
+}
+
+/// The engine a connection's transform runs on: the concrete resource the
+/// plan *recorded* for it (the same one `selectTransformResource` chose), never
+/// a re-derivation from executor order. Falls back to the executor's first
+/// attached engine only for a connection that recorded no resource at all
+/// (issue #129, task R1).
+llvm::Expected<const machine::ComputeNode *>
+transformEngineFor(const PlanConnection &connection,
+                   const machine::MachineModel &machine,
+                   const CoveringPlan &plan) {
+  if (connection.transform && !connection.transform->computeResource.empty()) {
+    const std::string &recorded = connection.transform->computeResource;
+    const machine::ComputeNode *node = machine.findCompute(recorded);
+    if (!node)
+      return planEventError(
+          "plan events: transform connection " + llvm::Twine(connection.id) +
+          " records compute resource '" + recorded + "', which machine '" +
+          machine.target + "' does not declare");
+    return node;
+  }
+  return engineForExecutor(machine, transformExecutorFor(plan, connection));
+}
+
+/// The first placement serving one of `connection`'s consumer instances, in
+/// placement order -- the same placement `transformExecutorFor` takes the
+/// executor from. Null when no recorded consumer instance resolves to a
+/// placement.
+const PlanPlacement *consumerPlacementOf(const CoveringPlan &plan,
+                                         const PlanConnection &connection) {
+  for (const PlanPlacement &placement : plan.placements)
+    if (llvm::is_contained(connection.consumers, placement.instance))
+      return &placement;
+  return nullptr;
+}
+
 /// The node a connection serves, for the data dependency from a movement to the
 /// consumer that reads it: the first consumer instance's covered node.
 std::optional<WorkloadNodeId> consumerNodeOf(const CoveringPlan &plan,
@@ -302,12 +359,13 @@ buildPlanEvents(const CoveringPlan &plan,
                               ", which no placement covers");
       const PlanPlacement &placed = *placement->second;
       // The selected engine comes from the placement's *recorded* compute
-      // binding when it has one; only a placement that recorded no selection
-      // falls back to the executor's first attached engine (issue #129, task
-      // R1). A plan that recorded a selection which no longer resolves is an
-      // error, not a silent re-derivation.
+      // binding when it has one; only a placement that recorded nothing to
+      // select -- a rule requiring no compute capability, or a hand-built plan
+      // -- falls back to the executor's first attached engine (issue #129, task
+      // R1). A required kind with no recorded node, or a recorded node that no
+      // longer resolves, is an error, never a silent re-derivation.
       llvm::Expected<const machine::ComputeNode *> recorded =
-          recordedComputeNode(machine, placed);
+          recordedEngineForPlacement(machine, placed);
       if (!recorded)
         return recorded.takeError();
       const machine::ComputeNode *engine = *recorded;
@@ -429,8 +487,22 @@ buildPlanEvents(const CoveringPlan &plan,
           if (!hops->empty())
             feedTails.push_back(hops->back());
         }
-        const machine::ComputeNode *engine =
-            engineForExecutor(machine, transformExecutorFor(plan, connection));
+        // A gather's combination is compute on the engine the *serving
+        // placement* recorded, not on whatever the executor happens to list
+        // first: the same selection rule the compute and transform events use
+        // (issue #129, task R1).
+        const machine::ComputeNode *engine = nullptr;
+        if (const PlanPlacement *consumer =
+                consumerPlacementOf(plan, connection)) {
+          llvm::Expected<const machine::ComputeNode *> recorded =
+              recordedEngineForPlacement(machine, *consumer);
+          if (!recorded)
+            return recorded.takeError();
+          engine = *recorded;
+        }
+        if (!engine)
+          engine = engineForExecutor(machine,
+                                     transformExecutorFor(plan, connection));
         if (!engine)
           return planEventError(
               "plan events: machine '" + machine.target +
@@ -457,8 +529,15 @@ buildPlanEvents(const CoveringPlan &plan,
       // materialized kernel's event also uses, so the two paths cannot
       // disagree.
       if (connection.transform) {
-        const machine::ComputeNode *engine =
-            engineForExecutor(machine, transformExecutorFor(plan, connection));
+        // The conversion runs on the resource the plan *recorded* for it --
+        // `selectTransformResource` picked it by memory visibility, which can
+        // disagree with the executor's declaration order. Only a connection
+        // that recorded none falls back (issue #129, task R1).
+        llvm::Expected<const machine::ComputeNode *> recorded =
+            transformEngineFor(connection, machine, plan);
+        if (!recorded)
+          return recorded.takeError();
+        const machine::ComputeNode *engine = *recorded;
         if (!engine)
           return planEventError(
               "plan events: machine '" + machine.target +
@@ -632,20 +711,31 @@ connectionSignatureFor(const ConnectionPlan &connection,
   // different engines is different work), plus, for a gather, its declared
   // semantics and axis (execution-affecting content the canonical connection
   // string already folds).
+  //
+  // Every component is length-delimited (`<name>=<len>:<bytes>`), so a layout
+  // id or resource id that itself contains the `;` or `=` separator cannot be
+  // mistaken for a component boundary and collide two different connections on
+  // one key.
   std::string parameters;
+  auto component = [&](llvm::StringRef name, llvm::StringRef value) {
+    if (!parameters.empty())
+      parameters += ';';
+    parameters += name.str();
+    parameters += '=';
+    parameters += std::to_string(value.size());
+    parameters += ':';
+    parameters.append(value.begin(), value.end());
+  };
   if (connection.transform) {
-    parameters = connection.transform->srcLayout + "->" +
-                 connection.transform->dstLayout;
+    component("src", connection.transform->srcLayout);
+    component("dst", connection.transform->dstLayout);
     if (!connection.transform->computeResource.empty())
-      parameters += ";compute=" + connection.transform->computeResource;
+      component("compute", connection.transform->computeResource);
   }
   if (connection.gatherSemantics) {
-    if (!parameters.empty())
-      parameters += ";";
-    parameters += "gather=";
-    parameters += stringifyGatherSemantics(*connection.gatherSemantics);
+    component("gather", stringifyGatherSemantics(*connection.gatherSemantics));
     if (connection.concatAxis)
-      parameters += ":axis=" + std::to_string(*connection.concatAxis);
+      component("axis", std::to_string(*connection.concatAxis));
   }
   signature.parameters = parameters;
 

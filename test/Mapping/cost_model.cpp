@@ -468,6 +468,65 @@ TEST(CostEvent, LayoutTransformEventUsesTheSharedEstimate) {
   EXPECT_DOUBLE_EQ(transformEvent.event.cost.latencyCycles, 2.0);
 }
 
+// Issue #129, task R1: the transform event names the resource the plan
+// *recorded* for the conversion, not the executor's first attached engine.
+TEST(CostEvent, Issue129TransformEventUsesTheRecordedResource) {
+  mlir::MLIRContext context;
+  CoveringPlan plan = twoHopPlan();
+  PlanConnection &connection = plan.connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route = {"s0"};
+  connection.valueType =
+      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context));
+
+  // A second vector engine declared *after* `vpu`, so the executor's first
+  // attachment and the recorded resource disagree.
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+  mlir::llk::machine::ComputeNode second = machine.computes.front();
+  second.id = "vpu.z";
+  machine.computes.push_back(second);
+
+  LayoutTransform transform;
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, &context);
+  transform.dstMap = transposeMap(&context);
+  transform.computeResource = "vpu.z";
+  connection.transform = transform;
+  plan.placements[0].executor = "w0";
+
+  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 3u);
+  EXPECT_EQ(dag->events[1].event.kind, CostEventKind::Transform);
+  EXPECT_EQ(dag->events[1].event.resource, "vpu.z");
+}
+
+// Issue #129, task R1: a dropped compute selection is diagnosed, never
+// replaced by the executor's first attached engine.
+TEST(CostEvent, Issue129DroppedComputeSelectionIsDiagnosed) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  CoveringPlan plan = result->plans.front();
+  ASSERT_FALSE(plan.placements.empty());
+  ASSERT_FALSE(plan.placements.front().computeRequirements.empty());
+  ASSERT_EQ(plan.placements.front().computeBindings.size(), 1u);
+
+  // The container survives but its entry is gone -- a dropped or tampered
+  // selection, indistinguishable from "no capability required" by the map
+  // alone.
+  plan.placements.front().computeBindings.clear();
+  llvm::Expected<PlanEventDAG> dag =
+      buildPlanEvents(plan, c->target->machine());
+  ASSERT_FALSE(static_cast<bool>(dag));
+  const std::string text = llvm::toString(dag.takeError());
+  EXPECT_NE(text.find("vector_engine"), std::string::npos) << text;
+  EXPECT_NE(text.find("executor order"), std::string::npos) << text;
+}
+
 TEST(CostEvent, PlanEventsNormalizeAGather) {
   mlir::MLIRContext context;
   CoveringPlan plan;
