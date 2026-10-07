@@ -407,6 +407,41 @@ module {
       << "the plan is present but unreadable; that must be reported";
 }
 
+/// Issue #129 review finding 4: reconstructing the reported occupancy dropped
+/// each allocation's recorded live interval, leaving every allocation at [0,0]
+/// -- live at step 0 -- so disjoint buffers were summed. Two 20,000-byte SRAM
+/// allocations live at `[0,1]` and `[2,3]` are never simultaneous: the peak is
+/// 20,000, not the 40,000 an interval-less reconstruction reports.
+TEST(L0StaticBound, AMappedKernelsDisjointIntervalsAreNotSummed) {
+  auto parsed = parseKernel(R"MLIR(
+module {
+  micro.kernel @disjoint_plan attributes {micro.plan = {allocations = [
+      {begin_step = 0 : i64, bytes = 20000 : i64, end_step = 1 : i64, id = 1 : i64, memory = "sram.0", value = 0 : i64},
+      {begin_step = 2 : i64, bytes = 20000 : i64, end_step = 3 : i64, id = 2 : i64, memory = "sram.0", value = 1 : i64}
+    ]}} {
+    %a = micro.tile_alloc : !micro.tile<64x64xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = avx2Model();
+  const machine::MemoryNode *sram = model.findMemory("sram.0");
+  ASSERT_NE(sram, nullptr);
+  // Premise: the true peak fits, but the interval-less sum of both does not --
+  // so the test discriminates the two accountings rather than passing either
+  // way.
+  ASSERT_LT(20000u, sram->capacityBytes) << "one buffer must fit";
+  ASSERT_GT(2u * 20000u, sram->capacityBytes)
+      << "the naive sum must overflow, or the test proves nothing";
+
+  auto report = analyzeKernel(parsed->kernel, model, /*level=*/0);
+  ASSERT_TRUE(static_cast<bool>(report)) << llvm::toString(report.takeError());
+  ASSERT_EQ(report->l0.liveTileBytesByMemory.count("sram"), 1u);
+  EXPECT_EQ(report->l0.liveTileBytesByMemory.at("sram"), 20000u);
+  EXPECT_TRUE(report->capacityViolations.empty());
+}
+
 //===----------------------------------------------------------------------===//
 // Machine-fit diagnostics
 //===----------------------------------------------------------------------===//

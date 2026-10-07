@@ -177,6 +177,21 @@ planRecordedLivePeak(mlir::Operation *kernel,
       allocation.simultaneousOccurrences = occurrences.getInt();
     if (auto borrowed = object.getAs<mlir::BoolAttr>("borrowed"))
       allocation.borrowed = borrowed.getValue();
+    // The recorded live interval is what makes two disjoint buffers occupy the
+    // same slot without summing: dropping it left every allocation at `[0, 0]`
+    // -- live at step 0 together -- so the reported peak was the sum of every
+    // buffer rather than the simultaneous peak (issue #129 review finding 4).
+    // `computePeakStorage` treats the interval as closed, so both ends are
+    // required and ordered.
+    auto beginStep = object.getAs<mlir::IntegerAttr>("begin_step");
+    auto endStep = object.getAs<mlir::IntegerAttr>("end_step");
+    if (!beginStep || !endStep)
+      return malformed("an entry is missing begin_step or end_step");
+    allocation.beginStep = static_cast<uint64_t>(beginStep.getInt());
+    allocation.endStep = static_cast<uint64_t>(endStep.getInt());
+    if (allocation.beginStep > allocation.endStep)
+      return malformed("allocation " + llvm::Twine(allocation.id) +
+                       " ends before it begins");
     // A memory the kernel does not materialize is not charged: the same rule
     // `MicroDAG::noteStorage` applies, so the two accountings agree on what a
     // live byte *is*.
