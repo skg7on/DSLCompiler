@@ -22,6 +22,8 @@
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Perf/MicroCostModel.h"
 #include "LLK/Perf/MicroDAG.h"
+#include "LLK/Perf/MicroPerfReport.h"
+#include "LLK/Perf/SelectedKernelAnalysis.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
@@ -1192,54 +1194,84 @@ TEST(L1ResourceDag, SelectedPlanEventsMatchItsMaterializedKernel) {
   }
 }
 
-// The plan's compute-cycle input is the search's rule-local estimate, while the
-// materialized kernel charges the machine's elementwise formula. The two agree
-// on kind/resource/work/bytes, and on the transform/transfer/synchronization
-// cycles they share one estimate for; the compute *cycle* is intentionally
-// different because a plan does not carry the operation kind the machine would
-// need (mma vs vector). This test pins the divergence so it is not accidental.
-TEST(L1ResourceDag, PlanComputeCyclesUseTheRuleEstimate) {
+// The selected plan and its bound kernel are one analysis (issue #129, task
+// R6). The plan's final events are the derived snapshot the shared
+// selected-kernel analysis produced from the materialized kernel, so *every*
+// normalized field agrees -- kind, resource, work, bytes, dependencies and the
+// owner-occupancy pool -- and the plan schedules to the same cost. Before the
+// repair the plan charged its own rule-local estimate (five cycles) while the
+// kernel charged the machine's elementwise formula (eight), and a plan carried
+// no owner pool at all.
+TEST(L1ResourceDag, SelectedPlanEventsMatchItsBoundKernel) {
   auto parsed = parseKernel(R"mlir(
 module {
-  micro.kernel @one_vector {
+  micro.kernel @selected_add {
     %t = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
-    %r = micro.vector "add" %t, %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %t, %t {micro.mapping = {executor = "worker.0"}} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     micro.yield
   }
 }
 )mlir");
   ASSERT_TRUE(parsed);
   machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
-  auto kernelDag = buildMicroDAG(parsed->kernel, model);
-  ASSERT_TRUE(static_cast<bool>(kernelDag))
-      << llvm::toString(kernelDag.takeError());
-  ASSERT_EQ(kernelDag->events.size(), 1u);
 
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/true);
+  ASSERT_TRUE(static_cast<bool>(analysis))
+      << llvm::toString(analysis.takeError());
+  ASSERT_EQ(analysis->events.events.size(), 1u);
+  // The mapped op names the executor the plan selected as its owner pool, and
+  // the whole stream is complete.
+  EXPECT_EQ(analysis->events.events[0].owner, "worker.0");
+  EXPECT_TRUE(analysis->complete) << analysis->incompleteReasons.front();
+
+  // The plan the analysis describes: one placement of the add on the executor
+  // the kernel recorded, with the search's *rule-local* estimate (5) -- which
+  // the derived snapshot must replace with the kernel's own work (8).
   mapping::CoveringPlan plan;
   mapping::PlanPlacement placement;
   placement.node = 0;
   placement.instance = 100;
   placement.executor = "worker.0";
+  placement.computeRequirements = {"vector_engine"};
+  placement.computeBindings["vector_engine"] = "vpu";
   placement.cost.latencyCycles = 5.0;
   placement.workItems = 64;
   plan.placements.push_back(placement);
   plan.steps = {mapping::PlanStep{0, mapping::PlanStepKind::Compute, 0, 0}};
 
-  llvm::Expected<mapping::PlanEventDAG> planDag =
-      mapping::buildPlanEvents(plan, model);
-  ASSERT_TRUE(static_cast<bool>(planDag))
-      << llvm::toString(planDag.takeError());
-  ASSERT_EQ(planDag->events.size(), 1u);
+  ASSERT_FALSE(
+      bool(mapping::attachPlanAnalysisEvents(plan, analysis->events, model)));
 
-  mapping::PlanCostEvent normalized = normalizedPlanEvent(kernelDag->events[0]);
-  EXPECT_EQ(planDag->events[0].event.kind, normalized.event.kind);
-  EXPECT_EQ(planDag->events[0].event.resource, normalized.event.resource);
-  EXPECT_EQ(planDag->events[0].workItems, normalized.workItems);
-  EXPECT_EQ(planDag->events[0].bytes, normalized.bytes);
-  // The rule-local estimate ...
-  EXPECT_DOUBLE_EQ(planDag->events[0].event.cost.latencyCycles, 5.0);
-  // ... versus the machine's elementwise formula (64 elements / 8 lanes).
-  EXPECT_DOUBLE_EQ(normalized.event.cost.latencyCycles, 8.0);
+  llvm::Expected<mapping::PlanEventDAG> events =
+      mapping::buildPlanEvents(plan, model);
+  ASSERT_TRUE(static_cast<bool>(events)) << llvm::toString(events.takeError());
+  ASSERT_EQ(events->events.size(), analysis->events.events.size());
+  EXPECT_EQ(events->source, mapping::PlanEventSource::Snapshot);
+
+  for (size_t i = 0; i < events->events.size(); ++i) {
+    const mapping::PlanCostEvent &planned = events->events[i];
+    const mapping::PlanCostEvent &materialized = analysis->events.events[i];
+    EXPECT_EQ(planned.event.kind, materialized.event.kind) << i;
+    EXPECT_EQ(planned.event.resource, materialized.event.resource) << i;
+    EXPECT_EQ(planned.workItems, materialized.workItems) << i;
+    EXPECT_EQ(planned.bytes, materialized.bytes) << i;
+    EXPECT_EQ(planned.deps, materialized.deps) << i;
+    EXPECT_EQ(planned.owner, materialized.owner) << i;
+    EXPECT_DOUBLE_EQ(planned.event.cost.latencyCycles,
+                     materialized.event.cost.latencyCycles)
+        << i;
+  }
+
+  // The scheduled cost is the same schedule of the same stream.
+  llvm::Expected<mapping::Cost> scheduled =
+      mapping::schedulePlanEvents(*events, model);
+  ASSERT_TRUE(static_cast<bool>(scheduled))
+      << llvm::toString(scheduled.takeError());
+  EXPECT_EQ(scheduled->latencyCycles,
+            double(analysis->schedule.predictedCycles));
+  // The machine's elementwise formula: 64 elements over 8 f32 lanes.
+  EXPECT_DOUBLE_EQ(events->events[0].event.cost.latencyCycles, 8.0);
 }
 
 // Normalized plan events are scheduled by the *same* resource scheduler the
@@ -1308,6 +1340,333 @@ module {
       << llvm::toString(unstampedDag.takeError());
   ASSERT_EQ(unstampedDag->events.size(), 1u);
   EXPECT_EQ(unstampedDag->events[0].resourceName, "vpu.a");
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R6: the shared selected-kernel analysis
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// One worker with two matrix engines of its own and a `concurrency` the caller
+/// picks, so an event's owner pool and its resource pool vary independently.
+/// Two engines attached to one single-count executor is the case a scheduler
+/// that dropped or aggregated owner constraints would let overlap.
+std::string ownerPoolMachineYaml(unsigned workerConcurrency) {
+  std::string yaml =
+      "schema: llk.machine.v2\n"
+      "target: owner-pool\n"
+      "clock_hz: 1000000000\n"
+      "worker_threads: 1\n"
+      "sync:\n  barrier_cycles: 1\n  wait_cycles: 0\n"
+      "executors:\n"
+      "  - id: cluster.0\n    kind: cluster\n    refines: [group]\n"
+      "  - id: worker.0\n    kind: worker\n    parent: cluster.0\n"
+      "    concurrency: " +
+      std::to_string(workerConcurrency) + "\nmemories:\n";
+  for (const auto &level :
+       {std::pair<const char *, const char *>{"sram", "sram"},
+        {"acc", "acc"}}) {
+    yaml += "  - id: " + std::string(level.first) +
+            ".0\n    kind: " + level.second +
+            "\n    visible_from: cluster.0\n    capacity_bytes: 1048576\n"
+            "    alignment_bytes: 64\n    supported_layouts: [row_major]\n"
+            "    bandwidth_bytes_per_cycle: 64\n    latency_cycles: 1\n";
+  }
+  yaml += "compute:\n";
+  yaml += "  - id: mxu.a\n    kind: matrix_engine\n    refines: [matrix]\n"
+          "    attached_to: worker.0\n"
+          "    element_types: [bf16]\n    accumulator_dtypes: [f32]\n"
+          "    shapes: [[1, 1, 1]]\n    issue_cycles: 1\n"
+          "    latency_cycles: 1\n    throughput_per_cycle: 1\n"
+          "    concurrency: 1\n    supported_layouts: [row_major]\n"
+          "  - id: mxu.b\n    kind: matrix_engine\n    refines: [matrix]\n"
+          "    attached_to: worker.0\n"
+          "    element_types: [bf16]\n    accumulator_dtypes: [f32]\n"
+          "    shapes: [[1, 1, 1]]\n    issue_cycles: 1\n"
+          "    latency_cycles: 1\n    throughput_per_cycle: 1\n"
+          "    concurrency: 1\n    supported_layouts: [row_major]\n";
+  return yaml;
+}
+
+/// Two independent MMAs on one executor, each naming a different engine, so the
+/// only constraint that can serialize them is the owner-occupancy pool.
+constexpr const char *kTwoEngineMappedKernel = R"mlir(
+module {
+  micro.kernel @two_engine_mapped {
+    %a = micro.tile_alloc : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>
+    %b = micro.tile_alloc : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>
+    %c0 = micro.tile_alloc : !micro.tile<1x1xf32, memory = #micro.memory<acc>>
+    %c1 = micro.tile_alloc : !micro.tile<1x1xf32, memory = #micro.memory<acc>>
+    %r0 = micro.mma %a, %b, %c0 {shape = array<i64: 1, 1, 1>, input = #micro.dtype<bf16>, accumulator = #micro.dtype<f32>, engine = "mxu.a", micro.mapping = {executor = "worker.0"}} : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xf32, memory = #micro.memory<acc>> -> !micro.tile<1x1xf32, memory = #micro.memory<acc>>
+    %r1 = micro.mma %a, %b, %c1 {shape = array<i64: 1, 1, 1>, input = #micro.dtype<bf16>, accumulator = #micro.dtype<f32>, engine = "mxu.b", micro.mapping = {executor = "worker.0"}} : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xf32, memory = #micro.memory<acc>> -> !micro.tile<1x1xf32, memory = #micro.memory<acc>>
+    micro.yield
+  }
+}
+)mlir";
+} // namespace
+
+// Two engines of one executor are two resource pools, but one owner pool: a
+// single-count executor runs them one at a time however many engines it owns.
+// A scheduler that ignored the owner, or widened it to the machine's worker
+// count, would run both at once -- which is not this machine.
+TEST(L1ResourceDag, OwnerPoolIsTheSelectedExecutorNotItsEngineCount) {
+  auto parsed = parseKernel(kTwoEngineMappedKernel);
+  ASSERT_TRUE(parsed);
+
+  machine::MachineModel serial =
+      parseMachine(ownerPoolMachineYaml(/*workerConcurrency=*/1));
+  llvm::Expected<SelectedKernelAnalysis> narrow =
+      analyzeSelectedKernel(parsed->kernel, serial, /*requireComplete=*/true);
+  ASSERT_TRUE(static_cast<bool>(narrow)) << llvm::toString(narrow.takeError());
+  ASSERT_EQ(narrow->events.events.size(), 2u);
+  // Both events name the selected executor as their owner-occupancy pool.
+  EXPECT_EQ(narrow->events.events[0].owner, "worker.0");
+  EXPECT_EQ(narrow->events.events[1].owner, "worker.0");
+  EXPECT_EQ(narrow->events.events[0].event.resource, "mxu.a");
+  EXPECT_EQ(narrow->events.events[1].event.resource, "mxu.b");
+
+  const uint64_t perEngine = narrow->events.events[0].event.cost.latencyCycles;
+  EXPECT_EQ(perEngine, 2u); // 2 flops over one flop per cycle
+  EXPECT_EQ(narrow->schedule.predictedCycles, 2 * perEngine);
+
+  machine::MachineModel wide =
+      parseMachine(ownerPoolMachineYaml(/*workerConcurrency=*/2));
+  llvm::Expected<SelectedKernelAnalysis> broad =
+      analyzeSelectedKernel(parsed->kernel, wide, /*requireComplete=*/true);
+  ASSERT_TRUE(static_cast<bool>(broad)) << llvm::toString(broad.takeError());
+  EXPECT_EQ(broad->schedule.predictedCycles, perEngine);
+}
+
+// An incomplete stream is reported, never silently approximated: a loop whose
+// trip count is unknown is charged a single iteration, which the lenient
+// analysis labels and the strict analysis refuses.
+TEST(L1ResourceDag, IncompleteStreamIsLabelledAndStrictAnalysisRefusesIt) {
+  auto parsed = parseKernel(R"mlir(
+module {
+  micro.kernel @unknown_trip {
+    %c0 = arith.constant 0 : index
+    %c4 = arith.constant 4 : index
+    %c1 = arith.constant 1 : index
+    %n = arith.addi %c4, %c1 : index
+    %a = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.for %i = %c0 to %n step %c1 {
+      %r = micro.vector "add" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    }
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+
+  llvm::Expected<SelectedKernelAnalysis> lenient =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/false);
+  ASSERT_TRUE(static_cast<bool>(lenient))
+      << llvm::toString(lenient.takeError());
+  EXPECT_FALSE(lenient->complete);
+  ASSERT_FALSE(lenient->incompleteReasons.empty());
+  EXPECT_NE(lenient->incompleteReasons.front().find("non-static bounds"),
+            std::string::npos)
+      << lenient->incompleteReasons.front();
+
+  llvm::Expected<SelectedKernelAnalysis> strict =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/true);
+  EXPECT_FALSE(static_cast<bool>(strict));
+  if (!strict) {
+    const std::string text = llvm::toString(strict.takeError());
+    EXPECT_NE(text.find("incomplete"), std::string::npos) << text;
+    EXPECT_NE(text.find("non-static bounds"), std::string::npos) << text;
+  }
+}
+
+// The traffic and peak summaries are the analysis's own, and the L0 block reads
+// the same traffic rule, so a plan consumer and the report cannot disagree.
+TEST(L1ResourceDag, TrafficAndPeakSummariesMatchTheStaticBound) {
+  auto parsed = parseKernel(kTwoHopKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/false);
+  ASSERT_TRUE(static_cast<bool>(analysis))
+      << llvm::toString(analysis.takeError());
+
+  L0Report bound = computeL0StaticBound(*dag, model);
+  EXPECT_EQ(analysis->trafficBytes, bound.bytesByMemory);
+  EXPECT_EQ(analysis->peakBytes, dag->liveTileBytesByMemory);
+  // The two-hop dram.0 -> l2.0 -> sram.0 movement of 256 bytes touches all
+  // three levels; the intermediate sees the value once on each hop, so it
+  // carries 512.
+  EXPECT_EQ(analysis->trafficBytes.at("dram"), 256u);
+  EXPECT_EQ(analysis->trafficBytes.at("l2"), 512u);
+  EXPECT_EQ(analysis->trafficBytes.at("sram"), 256u);
+}
+
+// `micro-perf` and the planner are two consumers of one analysis (issue #129,
+// task R6): the report's L0 byte block, live peak and L1 timeline are the
+// shared analysis's own, not a second scheduling of the same stream.
+TEST(L1ResourceDag, MicroPerfReportDerivesFromTheSharedAnalysis) {
+  auto parsed = parseKernel(kChainKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 2, 4));
+
+  llvm::Expected<MicroPerfReport> report =
+      analyzeKernel(parsed->kernel, model, 1);
+  ASSERT_TRUE(static_cast<bool>(report)) << llvm::toString(report.takeError());
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/false);
+  ASSERT_TRUE(static_cast<bool>(analysis))
+      << llvm::toString(analysis.takeError());
+
+  ASSERT_TRUE(report->l1.has_value());
+  EXPECT_EQ(report->l1->predictedCycles, analysis->schedule.predictedCycles);
+  EXPECT_EQ(report->l0.bytesByMemory, analysis->trafficBytes);
+  EXPECT_EQ(report->l0.liveTileBytesByMemory, analysis->peakBytes);
+  ASSERT_EQ(report->l1->schedule.size(), analysis->schedule.entries.size());
+  for (size_t i = 0; i < report->l1->schedule.size(); ++i) {
+    EXPECT_EQ(report->l1->schedule[i].start,
+              analysis->schedule.entries[i].start)
+        << i;
+    EXPECT_EQ(report->l1->schedule[i].finish,
+              analysis->schedule.entries[i].finish)
+        << i;
+  }
+}
+
+// The shared analysis is static and deterministic: the same kernel and machine
+// produce the same stream, schedule, cost and summaries every run. This is the
+// parity baseline -- measured estimates are a separate mode and are never
+// applied inside this analysis.
+TEST(L1ResourceDag, SelectedKernelAnalysisIsStaticAndDeterministic) {
+  auto parsed = parseKernel(kChainKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 2, 4));
+
+  llvm::Expected<SelectedKernelAnalysis> first =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/false);
+  llvm::Expected<SelectedKernelAnalysis> second =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/false);
+  ASSERT_TRUE(static_cast<bool>(first)) << llvm::toString(first.takeError());
+  ASSERT_TRUE(static_cast<bool>(second)) << llvm::toString(second.takeError());
+
+  EXPECT_EQ(first->complete, second->complete);
+  EXPECT_EQ(first->incompleteReasons, second->incompleteReasons);
+  EXPECT_EQ(first->trafficBytes, second->trafficBytes);
+  EXPECT_EQ(first->peakBytes, second->peakBytes);
+  EXPECT_EQ(first->schedule.predictedCycles, second->schedule.predictedCycles);
+  EXPECT_EQ(first->schedule.sequentialCycles,
+            second->schedule.sequentialCycles);
+  EXPECT_DOUBLE_EQ(first->cost.latencyCycles, second->cost.latencyCycles);
+  ASSERT_EQ(first->events.events.size(), second->events.events.size());
+  for (size_t i = 0; i < first->events.events.size(); ++i) {
+    EXPECT_EQ(first->events.events[i].event.resource,
+              second->events.events[i].event.resource)
+        << i;
+    EXPECT_EQ(first->events.events[i].deps, second->events.events[i].deps) << i;
+    EXPECT_EQ(first->events.events[i].owner, second->events.events[i].owner)
+        << i;
+    EXPECT_DOUBLE_EQ(first->events.events[i].event.cost.latencyCycles,
+                     second->events.events[i].event.cost.latencyCycles)
+        << i;
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R6: strict unknown / cap controls
+//===----------------------------------------------------------------------===//
+
+// An unknown compute node is a hard error at extraction, never a silently
+// dropped or re-derived engine.
+TEST(L1ResourceDag, UnknownComputeNodeIsRejected) {
+  auto parsed = parseKernel(R"mlir(
+module {
+  micro.kernel @ghost_engine {
+    %a = micro.tile_alloc : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>
+    %b = micro.tile_alloc : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>
+    %c = micro.tile_alloc : !micro.tile<1x1xf32, memory = #micro.memory<acc>>
+    %r = micro.mma %a, %b, %c {shape = array<i64: 1, 1, 1>, input = #micro.dtype<bf16>, accumulator = #micro.dtype<f32>, engine = "mxu.ghost"} : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xf32, memory = #micro.memory<acc>> -> !micro.tile<1x1xf32, memory = #micro.memory<acc>>
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/false);
+  EXPECT_FALSE(static_cast<bool>(analysis));
+  if (!analysis) {
+    const std::string text = llvm::toString(analysis.takeError());
+    EXPECT_NE(text.find("mxu.ghost"), std::string::npos) << text;
+  }
+}
+
+// A kernel that unrolls past the event cap is a cap error -- never a silent
+// single-iteration score.
+TEST(L1ResourceDag, UnrollingPastTheEventCapIsACapError) {
+  std::string source =
+      "module {\n  micro.kernel @too_big {\n"
+      "    %c0 = arith.constant 0 : index\n"
+      "    %cN = arith.constant 200000 : index\n"
+      "    %c1 = arith.constant 1 : index\n"
+      "    %a = micro.tile_alloc : !micro.tile<8x8xf32, memory = "
+      "#micro.memory<sram>>\n"
+      "    micro.for %i = %c0 to %cN step %c1 {\n"
+      "      %r = micro.vector \"add\" %a, %a : !micro.tile<8x8xf32, memory = "
+      "#micro.memory<sram>>, !micro.tile<8x8xf32, memory = "
+      "#micro.memory<sram>> -> !micro.tile<8x8xf32, memory = "
+      "#micro.memory<sram>>\n"
+      "    }\n"
+      "    micro.yield\n  }\n}\n";
+  auto parsed = parseKernel(source);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/false);
+  EXPECT_FALSE(static_cast<bool>(analysis));
+  if (!analysis) {
+    const std::string text = llvm::toString(analysis.takeError());
+    EXPECT_NE(text.find("too large"), std::string::npos) << text;
+  }
+}
+
+// A repeated operand and a producer chain keep their dependency edges: the
+// consumer of a value depends on the event that produced it, however many times
+// it reads it, and a chain orders end to end.
+TEST(L1ResourceDag, RepeatedOperandsAndChainsKeepTheirDependencies) {
+  auto parsed = parseKernel(R"mlir(
+module {
+  micro.kernel @chain {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %t, %tok = micro.async_copy %a {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    micro.wait %tok
+    %tv = micro.tile_view %t {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r1 = micro.vector "add" %tv, %tv : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r2 = micro.vector "add" %r1, %r1 : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/false);
+  ASSERT_TRUE(static_cast<bool>(analysis))
+      << llvm::toString(analysis.takeError());
+  // copy, wait, vector, vector: the tile_view is zero-cost metadata.
+  ASSERT_EQ(analysis->events.events.size(), 4u);
+
+  // 0 copy, 1 wait, 2 first add, 3 second add.
+  const mapping::PlanCostEvent &wait = analysis->events.events[1];
+  const mapping::PlanCostEvent &first = analysis->events.events[2];
+  const mapping::PlanCostEvent &second = analysis->events.events[3];
+  EXPECT_EQ(wait.deps, (std::vector<uint32_t>{0}));
+  // The first add depends both on its data producer (the copy, which the
+  // zero-cost tile view forwarded) and on the wait that orders that copy.
+  EXPECT_EQ(first.deps, (std::vector<uint32_t>{0, 1}));
+  // The repeated operand is one dependency, not two.
+  EXPECT_EQ(second.deps, (std::vector<uint32_t>{2}));
 }
 
 } // namespace mlir::llk::perf

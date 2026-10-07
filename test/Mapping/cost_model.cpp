@@ -1000,6 +1000,179 @@ TEST(CostModel, Issue129DmaStrictValidationChecksResourcesAndDependencies) {
   EXPECT_NE(llvm::toString(std::move(cycle)).find("cycle"), std::string::npos);
 }
 
+//===----------------------------------------------------------------------===//
+// Issue #129, task R6: the owner-occupancy pool of a schedule
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// A machine with the executor ids and per-executor concurrency the caller
+/// names, each carrying its own vector engine, so an event's owner pool and its
+/// resource pool can be varied independently.
+mlir::llk::machine::MachineModel ownerPoolMachine(
+    llvm::ArrayRef<std::pair<llvm::StringRef, uint32_t>> executors) {
+  using namespace mlir::llk::machine;
+  MachineModel machine;
+  machine.target = "owner-pool";
+  machine.workerThreads = 1;
+  uint32_t index = 0;
+  for (const auto &[id, concurrency] : executors) {
+    ExecutorNode worker;
+    worker.id = id.str();
+    worker.kind = "worker";
+    worker.concurrency = concurrency;
+    machine.executors.push_back(worker);
+    ComputeNode engine;
+    engine.id = "vpu." + std::to_string(index++);
+    engine.kind = "vector_engine";
+    engine.attachedTo = id.str();
+    engine.concurrency = 1;
+    machine.computes.push_back(engine);
+  }
+  return machine;
+}
+} // namespace
+
+// Two events that name two *different* engine pools but the *same* executor
+// must still serialize when that executor has one slot: the owner-occupancy
+// pool is a real constraint, not an aggregate of the owner kinds (task R6).
+// Dropping the owner edge, or widening it to the machine's whole worker count,
+// lets the two overlap -- so this test cannot pass a scheduler that fails to
+// honour the selected executor.
+TEST(CostEvent, Issue129OwnerPoolUsesOnlyTheSelectedExecutorsCount) {
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::Compute, "vpu.0", 10, 8, 0),
+      makePlanCostEvent(CostEventKind::Compute, "vpu.1", 10, 8, 0)};
+  // Two distinct *resource* pools (vpu.0 on e0, vpu.1 on e1), so only the owner
+  // can serialize them.
+  std::vector<std::string> sharedOwner = {"e0", "e0"};
+
+  EventScheduleResult serial = scheduleNormalizedEvents(
+      events, ownerPoolMachine({{"e0", 1}, {"e1", 1}}), sharedOwner);
+  EXPECT_EQ(serial.entries[1].start, 10u);
+  EXPECT_EQ(serial.predictedCycles, 20u);
+
+  // Two independent executors of one slot each is what buys the overlap.
+  std::vector<std::string> splitOwners = {"e0", "e1"};
+  EventScheduleResult split = scheduleNormalizedEvents(
+      events, ownerPoolMachine({{"e0", 1}, {"e1", 1}}), splitOwners);
+  EXPECT_EQ(split.entries[0].start, 0u);
+  EXPECT_EQ(split.entries[1].start, 0u);
+  EXPECT_EQ(split.predictedCycles, 10u);
+
+  // A single executor that declares two slots runs both at once.
+  EventScheduleResult widened = scheduleNormalizedEvents(
+      events, ownerPoolMachine({{"e0", 2}, {"e1", 1}}), sharedOwner);
+  EXPECT_EQ(widened.entries[1].start, 0u);
+  EXPECT_EQ(widened.predictedCycles, 10u);
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R6: the derived analysis snapshot
+//===----------------------------------------------------------------------===//
+
+// A plan scored before its kernel was bound has no snapshot, so its stream is
+// the accumulation fallback and says so. The label is what stops a reader from
+// treating a rule-local estimate as the materialized kernel's schedule.
+TEST(CostEvent, PlanEventsWithoutASnapshotAreLabelledAccumulation) {
+  CoveringPlan plan = twoHopPlan();
+  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, planEventMachine());
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  EXPECT_EQ(dag->source, PlanEventSource::Accumulation);
+  EXPECT_EQ(stringifyPlanEventSource(dag->source), "accumulation");
+}
+
+// The snapshot is a *derived* execution fact, so attaching it must not move the
+// plan: the content id and the canonical string are unchanged.
+TEST(CostEvent, AnalysisSnapshotIsExcludedFromThePlanIdentity) {
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+  CoveringPlan plan = twoHopPlan();
+  const PlanId idBefore = computePlanId(plan);
+  const std::string textBefore = canonicalPlanString(plan);
+
+  llvm::Expected<PlanEventDAG> events = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(events)) << llvm::toString(events.takeError());
+  ASSERT_FALSE(bool(attachPlanAnalysisEvents(plan, *events, machine)));
+  ASSERT_TRUE(plan.analysisEvents.has_value());
+
+  EXPECT_EQ(computePlanId(plan), idBefore);
+  EXPECT_EQ(canonicalPlanString(plan), textBefore);
+}
+
+// Attaching the shared analysis's stream makes the plan's events *that* stream:
+// a compute event's rule-local estimate is replaced by the bound kernel's own
+// work, and the plan reports the snapshot as its source.
+TEST(CostEvent, PlanEventsUseTheAttachedAnalysisSnapshot) {
+  CoveringPlan plan = twoHopPlan();
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+
+  llvm::Expected<PlanEventDAG> accumulated = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(accumulated))
+      << llvm::toString(accumulated.takeError());
+  ASSERT_EQ(accumulated->events.size(), 6u);
+  // The producer's rule-local estimate is 8; the bound kernel's own work would
+  // be 16 over the machine's 8 lanes.
+  PlanEventDAG snapshot = *accumulated;
+  snapshot.events[0].event.cost.latencyCycles = 2.0;
+  snapshot.events[0].workItems = 16;
+
+  ASSERT_FALSE(bool(attachPlanAnalysisEvents(plan, snapshot, machine)));
+  llvm::Expected<PlanEventDAG> events = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(events)) << llvm::toString(events.takeError());
+  EXPECT_EQ(events->source, PlanEventSource::Snapshot);
+  ASSERT_EQ(events->events.size(), 6u);
+  EXPECT_DOUBLE_EQ(events->events[0].event.cost.latencyCycles, 2.0);
+  EXPECT_EQ(events->events[0].workItems, 16u);
+}
+
+// A snapshot is a claim about the plan's own work, so it is verified: a stream
+// naming a connection the plan does not record, an empty stream, or a stream
+// with an unmodelled resource is refused rather than silently scored.
+TEST(CostEvent, AttachedAnalysisSnapshotIsVerified) {
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+
+  CoveringPlan unknownConnection = twoHopPlan();
+  llvm::Expected<PlanEventDAG> good =
+      buildPlanEvents(unknownConnection, machine);
+  ASSERT_TRUE(static_cast<bool>(good)) << llvm::toString(good.takeError());
+  PlanEventDAG foreign = *good;
+  foreign.events[0].connectionId = 9999;
+  llvm::Error mismatch =
+      attachPlanAnalysisEvents(unknownConnection, foreign, machine);
+  ASSERT_TRUE(static_cast<bool>(mismatch));
+  EXPECT_NE(llvm::toString(std::move(mismatch)).find("9999"),
+            std::string::npos);
+
+  CoveringPlan empty = twoHopPlan();
+  PlanEventDAG nothing;
+  EXPECT_TRUE(
+      static_cast<bool>(attachPlanAnalysisEvents(empty, nothing, machine)));
+
+  CoveringPlan unmodelled = twoHopPlan();
+  PlanEventDAG badResource = *good;
+  badResource.events[0].event.resource = "ghost-engine";
+  llvm::Error missing =
+      attachPlanAnalysisEvents(unmodelled, badResource, machine);
+  ASSERT_TRUE(static_cast<bool>(missing));
+  EXPECT_NE(llvm::toString(std::move(missing)).find("ghost-engine"),
+            std::string::npos);
+}
+
+// A plan decoded from persisted metadata is a replay: it carries no derived
+// facts, so a snapshot handed to it would describe a kernel it has not
+// re-derived. It is refused rather than trusted.
+TEST(CostEvent, AttachedAnalysisSnapshotIsNeverTrustedOnReplay) {
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+  CoveringPlan plan = twoHopPlan();
+  llvm::Expected<PlanEventDAG> good = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(good)) << llvm::toString(good.takeError());
+
+  plan.schemaVersion = 3; // decoded from metadata
+  llvm::Error replay = attachPlanAnalysisEvents(plan, *good, machine);
+  ASSERT_TRUE(static_cast<bool>(replay));
+  EXPECT_NE(llvm::toString(std::move(replay)).find("replay"),
+            std::string::npos);
+}
+
 /// Two placements that differ only in the selected engine are different work,
 /// so a measured cost must not be reused across them: the operation signature's
 /// compute field is what separates the keys.

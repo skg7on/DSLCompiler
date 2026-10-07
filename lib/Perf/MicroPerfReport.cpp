@@ -14,8 +14,11 @@
 
 #include "LLK/Perf/MicroPerfReport.h"
 
+#include "LLK/Perf/SelectedKernelAnalysis.h"
+
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Operation.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 
@@ -119,6 +122,16 @@ analyzeKernel(mlir::Operation *kernel, const machine::MachineModel &machine,
   if (!dag)
     return dag.takeError();
 
+  // The one static analysis (issue #129, task R6): the same normalized stream,
+  // schedule and summaries the mapping planner reads. The report derives its
+  // L0 byte block and its L1 schedule from it rather than scheduling a second
+  // time, so `micro-perf` and the planner cannot disagree about one selected
+  // kernel. The DAG is extracted once and handed to the shared analysis.
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedDag(*dag, machine, /*requireComplete=*/false);
+  if (!analysis)
+    return analysis.takeError();
+
   MicroPerfReport report;
   report.machine = machine.target;
   report.level = level;
@@ -129,10 +142,28 @@ analyzeKernel(mlir::Operation *kernel, const machine::MachineModel &machine,
     report.kernel = "<anonymous>";
 
   report.l0 = computeL0StaticBound(*dag, machine);
+  // The byte totals and the live peak are the analysis's own summaries, so the
+  // report and a plan consumer read one traffic/occupancy relation.
+  report.l0.bytesByMemory = analysis->trafficBytes;
+  report.l0.totalBytesDram = analysis->trafficBytes.count("dram")
+                                 ? analysis->trafficBytes.at("dram")
+                                 : 0;
+  report.l0.totalBytesSram = analysis->trafficBytes.count("sram")
+                                 ? analysis->trafficBytes.at("sram")
+                                 : 0;
+  report.l0.liveTileBytesByMemory = analysis->peakBytes;
   if (level == 1)
-    report.l1 = scheduleL1(*dag, machine);
+    report.l1 = reportL1FromSchedule(*dag, machine, analysis->schedule);
   report.capacityViolations = checkCapacity(*dag, machine);
   report.warnings = dag->warnings;
+  // The analysis's own completeness verdict, made visible (issue #129, task
+  // R6): a reason the extraction already warns about is not repeated, but a
+  // strict-modelling gap the stream has (an event resource the machine does not
+  // model -- the abstract `dma` pool an unrouted movement names) is reported
+  // rather than left to a reader to infer from the numbers.
+  for (const std::string &reason : analysis->incompleteReasons)
+    if (!llvm::is_contained(report.warnings, reason))
+      report.warnings.push_back(reason);
   report.layoutWarnings = dag->layoutWarnings;
   report.ownerWarnings = dag->ownerWarnings;
 

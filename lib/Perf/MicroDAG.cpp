@@ -127,6 +127,10 @@ private:
     ResourceKind previousKind = ResourceKind::Dma;
     std::vector<uint32_t> pending;
     std::string owner;
+    /// The concrete executor a mapped op selected, inherited by the events a
+    /// region builds so a nested compute event names the same owner pool its
+    /// enclosing scope did (issue #129, task R6). Empty for unmapped analysis.
+    std::string ownerPool;
     /// Buffers a body must hold at once: pipeline stages, times the owners a
     /// spatial loop spreads its iterations over.
     uint64_t storageFactor = 1;
@@ -155,6 +159,10 @@ private:
                     llvm::ArrayRef<uint32_t> extraDeps = {});
   void noteDiagnostics(const MicroEvent &event);
   void noteWarning(std::string message);
+  /// Records a fact that makes the event stream incomplete: it is a warning
+  /// *and* an incompleteness reason, so a strict analysis can refuse the stream
+  /// without string-matching diagnostics (issue #129, task R6).
+  void noteIncomplete(std::string message);
   void noteLayoutUsage(llvm::StringRef engineName,
                        const std::vector<std::string> &supported,
                        llvm::StringRef layout);
@@ -245,6 +253,13 @@ void DAGBuilder::noteWarning(std::string message) {
     dag.warnings.push_back(std::move(message));
 }
 
+void DAGBuilder::noteIncomplete(std::string message) {
+  if (seenWarnings.insert(message).second) {
+    dag.incompleteReasons.push_back(message);
+    dag.warnings.push_back(std::move(message));
+  }
+}
+
 void DAGBuilder::noteDiagnostics(const MicroEvent &event) {
   if (!event.tileOwner.empty() && !machine.hasOwnerKind(event.tileOwner)) {
     std::string message = "owner '" + event.tileOwner +
@@ -286,13 +301,13 @@ void DAGBuilder::noteUnsizable(const TileInfo &info, mlir::Operation &op) {
   // dtype vocabulary, which an f64 load would otherwise move for free.
   llvm::StringRef opName = op.getName().getStringRef();
   if (info.hasDynamicShape())
-    noteWarning(opName.str() +
-                " moves or allocates a value with a dynamic extent; its bytes "
-                "are charged as zero");
+    noteIncomplete(opName.str() +
+                   " moves or allocates a value with a dynamic extent; its "
+                   "bytes are charged as zero");
   else if (info.elements() > 0 && info.bytes() == 0)
-    noteWarning(opName.str() +
-                " moves or allocates a value whose element type is not a micro "
-                "dtype; its bytes are charged as zero");
+    noteIncomplete(opName.str() +
+                   " moves or allocates a value whose element type is not a "
+                   "micro dtype; its bytes are charged as zero");
 }
 
 void DAGBuilder::noteStorage(mlir::Operation &op, llvm::StringRef space,
@@ -653,6 +668,10 @@ uint32_t DAGBuilder::addEvent(MicroEvent event, State &state,
                               llvm::ArrayRef<uint32_t> extraDeps) {
   if (event.tileOwner.empty())
     event.tileOwner = state.owner;
+  // The owner-occupancy pool the mapped placement selected is inherited from
+  // the enclosing region when the op itself named none (issue #129, task R6).
+  if (event.ownerPool.empty())
+    event.ownerPool = state.ownerPool;
 
   // Every event carries its shared cost category, so a report and a plan can
   // be compared category by category rather than event by event.
@@ -753,8 +772,8 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
   if (std::optional<uint64_t> count = staticTripCount(lower, upper, step))
     trips = *count;
   else
-    noteWarning("a loop has non-static bounds; the simulator runs a single "
-                "iteration for it");
+    noteIncomplete("a loop has non-static bounds; the simulator runs a single "
+                   "iteration for it");
 
   if (trips == 0)
     return llvm::Error::success();
@@ -782,9 +801,9 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
       // Each owner needs its own copy of the tiles the body materializes.
       storageFactor *= std::max<uint64_t>(1, machine.ownerCount(owner));
     } else {
-      noteWarning("micro.spatial_for maps to '" + mapTarget.str() +
-                  "', which is not an owner scope; owner occupancy is not "
-                  "modeled for it");
+      noteIncomplete("micro.spatial_for maps to '" + mapTarget.str() +
+                     "', which is not an owner scope; owner occupancy is not "
+                     "modeled for it");
     }
   }
 
@@ -792,6 +811,10 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
   for (uint64_t iteration = 0; iteration < trips; ++iteration) {
     State inner;
     inner.owner = owner;
+    // A mapped op's executor pool is inherited through the loop nest, so a
+    // compute event the body builds names the placement that selected it
+    // (issue #129, task R6).
+    inner.ownerPool = outer.ownerPool;
     inner.storageFactor = storageFactor;
     if (iteration == 0) {
       inner.hasPrevious = outer.hasPrevious;
@@ -929,6 +952,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     // pool, so two events naming the same engine share its slots instead of
     // each being handed the whole machine.
     event.resourceName = engine->id;
+    event.ownerPool = mappedExecutor(op).str();
     event.workItems = macs;
     event.minCycles = mmaCycles(*engine, shape, 2 * macs);
     event.sourceOpName = op.getName().getStringRef().str();
@@ -958,6 +982,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.kind = EventKind::Vector;
     event.resource = ResourceKind::VectorEngine;
     event.resourceName = engine->id;
+    event.ownerPool = mappedExecutor(op).str();
     event.workItems = resultInfo.elements();
     event.minCycles =
         vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
@@ -987,6 +1012,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.kind = EventKind::Reduce;
     event.resource = ResourceKind::VectorEngine;
     event.resourceName = engine->id;
+    event.ownerPool = mappedExecutor(op).str();
     event.workItems = inputInfo.elements();
     event.minCycles =
         vectorCycles(engine, inputInfo.dtype, inputInfo.elements());
@@ -1026,6 +1052,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.kind = EventKind::Reduce;
     event.resource = ResourceKind::VectorEngine;
     event.resourceName = engine->id;
+    event.ownerPool = mappedExecutor(op).str();
     event.workItems = resultInfo.elements();
     event.minCycles =
         vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
@@ -1107,6 +1134,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.kind = EventKind::Transform;
     event.resource = ResourceKind::VectorEngine;
     event.resourceName = engine->id;
+    event.ownerPool = transformExecutor(op).str();
     event.workItems =
         resultInfo.elements() ? resultInfo.elements() : sourceInfo.elements();
     event.bytes = cost->localBytes;
@@ -1474,10 +1502,22 @@ mapping::PlanCostEvent normalizedPlanEvent(const MicroEvent &event) {
   // cannot differ in their normalized fields (task B8). The event's own
   // `resourceName` is the machine resource both paths name.
   std::vector<uint32_t> deps(event.deps.begin(), event.deps.end());
-  return mapping::makePlanCostEvent(
+  mapping::PlanCostEvent normalized = mapping::makePlanCostEvent(
       costEventKindOf(event.kind), event.resourceName,
       static_cast<double>(event.minCycles), event.workItems, event.bytes,
       std::move(deps));
+  // The execution facts the plan path also records (issue #129, task R6): the
+  // owner-occupancy pool the event runs under -- the mapped executor's id when
+  // the op was placed, otherwise the tile's abstract owner symbol -- and the
+  // two memories a movement crosses. Only an event with traffic charges them
+  // (a compute event's `bytes` is zero), but the owner joins every event's
+  // normalized shape so a plan event and its materialized counterpart occupy
+  // the same pool.
+  normalized.owner =
+      event.ownerPool.empty() ? event.tileOwner : event.ownerPool;
+  normalized.srcMemory = event.srcMemory;
+  normalized.dstMemory = event.tileMemory;
+  return normalized;
 }
 
 mapping::CostEventKind costEventKindOf(EventKind kind) {

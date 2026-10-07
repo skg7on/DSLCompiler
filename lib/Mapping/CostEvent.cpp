@@ -3,6 +3,7 @@
 #include "LLK/Mapping/CostEvent.h"
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/StoragePlan.h"
@@ -209,7 +210,67 @@ std::optional<WorkloadNodeId> consumerNodeOf(const CoveringPlan &plan,
   return std::nullopt;
 }
 
+/// Checks a derived analysis stream before it is trusted (issue #129, task R6).
+///
+/// A snapshot is a claim about the plan's own work: the event stream the kernel
+/// this plan bound actually does. It is accepted only when that claim is
+/// internally consistent with the plan -- a non-empty stream, every resource
+/// modelled by the machine, a real acyclic dependency order, and every
+/// step/connection it names present in the plan. Anything else is an error
+/// rather than a silently scored stream, because a stale or foreign snapshot
+/// would make the plan's score describe work it does not do.
+llvm::Error verifyPlanAnalysisStream(const CoveringPlan &plan,
+                                     const PlanEventDAG &events,
+                                     const machine::MachineModel &machine) {
+  if (events.events.empty())
+    return planEventError(
+        "plan events: the plan's analysis snapshot carries no events");
+  if (llvm::Error error = validateEventResources(events, machine))
+    return planEventError("plan events: the plan's analysis snapshot is not a "
+                          "valid stream: " +
+                          llvm::toString(std::move(error)));
+
+  std::vector<uint64_t> stepIds;
+  stepIds.reserve(plan.steps.size());
+  for (const PlanStep &step : plan.steps)
+    stepIds.push_back(step.id);
+  llvm::sort(stepIds);
+  std::vector<uint64_t> connectionIds;
+  connectionIds.reserve(plan.connectionPlans.size());
+  for (const PlanConnection &connection : plan.connectionPlans)
+    connectionIds.push_back(connection.id);
+  llvm::sort(connectionIds);
+
+  for (size_t index = 0; index < events.events.size(); ++index) {
+    const PlanCostEvent &event = events.events[index];
+    if (event.planStep &&
+        !std::binary_search(stepIds.begin(), stepIds.end(), *event.planStep))
+      return planEventError("plan events: the plan's analysis snapshot event " +
+                            llvm::Twine(index) + " names plan step " +
+                            llvm::Twine(*event.planStep) +
+                            ", which the plan does not record");
+    if (event.connectionId &&
+        !std::binary_search(connectionIds.begin(), connectionIds.end(),
+                            *event.connectionId))
+      return planEventError("plan events: the plan's analysis snapshot event " +
+                            llvm::Twine(index) + " names connection " +
+                            llvm::Twine(*event.connectionId) +
+                            ", which the plan does not record");
+  }
+  return llvm::Error::success();
+}
+
 } // namespace
+
+llvm::StringRef stringifyPlanEventSource(PlanEventSource source) {
+  switch (source) {
+  case PlanEventSource::Accumulation:
+    return "accumulation";
+  case PlanEventSource::Snapshot:
+    return "snapshot";
+  }
+  return "";
+}
 
 llvm::StringRef stringifyCostEventKind(CostEventKind kind) {
   for (const KindInfo &info : kKinds)
@@ -254,6 +315,28 @@ llvm::StringRef stringifyStorageAccess(StorageAccess access) {
 llvm::Expected<PlanEventDAG>
 buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
                 const WorkloadGraph *graph) {
+  // A plan whose kernel has been bound and analyzed carries the derived
+  // normalized snapshot the shared selected-kernel analysis produced from that
+  // kernel (issue #129, task R6). It is the materialized work's own event
+  // stream -- machine formulas, owner pools, movement memories, dependency
+  // edges -- so the planner's score and `micro-perf`'s prediction are one
+  // analysis of one kernel rather than two estimates of the same work.
+  //
+  // The snapshot is used only for the *schedule-level* call. The graph-carrying
+  // call is the storage-liveness path: it needs each allocation's identity and
+  // access, which the kernel-side extraction does not record (a plan's
+  // allocation ids are the planner's own), so it always derives the stream from
+  // the plan's storage facts. A snapshot is never silently substituted where it
+  // would be the wrong shape; it is verified or it is an error.
+  if (plan.analysisEvents && graph == nullptr) {
+    if (llvm::Error error =
+            verifyPlanAnalysisStream(plan, *plan.analysisEvents, machine))
+      return std::move(error);
+    PlanEventDAG snapshot = *plan.analysisEvents;
+    snapshot.source = PlanEventSource::Snapshot;
+    return snapshot;
+  }
+
   // The placement covering each node, and the placement for each instance, so a
   // compute step and a connection's consumers resolve without the workload
   // graph.
@@ -808,6 +891,24 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
                      event.deps.end());
   }
   return dag;
+}
+
+llvm::Error attachPlanAnalysisEvents(CoveringPlan &plan, PlanEventDAG events,
+                                     const machine::MachineModel &machine) {
+  // A plan decoded from persisted metadata is a replay: its derived execution
+  // facts were deliberately not persisted, so a snapshot handed to it would be
+  // describing a kernel it has not re-derived. Reject rather than attach one
+  // that a caller assumed was trustworthy.
+  if (plan.schemaVersion != 0)
+    return planEventError(
+        "plan events: refusing to attach an analysis snapshot to a plan "
+        "decoded from metadata; a replay must re-derive its events");
+
+  events.source = PlanEventSource::Snapshot;
+  if (llvm::Error error = verifyPlanAnalysisStream(plan, events, machine))
+    return error;
+  plan.analysisEvents = std::move(events);
+  return llvm::Error::success();
 }
 
 ConnectionSignature

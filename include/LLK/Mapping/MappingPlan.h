@@ -24,6 +24,7 @@
 #ifndef LLK_MAPPING_MAPPINGPLAN_H
 #define LLK_MAPPING_MAPPINGPLAN_H
 
+#include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/SearchBinding.h"
 #include "LLK/Mapping/WorkloadGraph.h"
@@ -686,6 +687,22 @@ struct CoveringPlan {
   /// Whether `totalCost` is the shared schedule's latency or the accumulation
   /// fallback. A reader must not treat an `Accumulation` score as scheduled.
   PlanScoreSource scoreSource = PlanScoreSource::Accumulation;
+  /// The derived normalized analysis-event snapshot the shared selected-kernel
+  /// analysis produced from the kernel this plan was bound to (issue #129, task
+  /// R6), attached through `attachPlanAnalysisEvents`. When present and
+  /// verified, `buildPlanEvents` returns exactly this stream -- the
+  /// materialized work's own events, owner pools and dependency edges --
+  /// instead of accumulating rule-local estimates, which is what makes the
+  /// planner's final score and `micro-perf`'s prediction one analysis of one
+  /// kernel.
+  ///
+  /// Excluded from `canonicalPlanString`: it is a derived view of content the
+  /// plan already names (its placements, connections and engine selections), so
+  /// attaching it must never move a plan id. A plan decoded from metadata never
+  /// carries one -- the metadata codec neither writes nor reads it -- so a
+  /// replay re-derives it (or refuses to rank) rather than trusting a snapshot
+  /// that may no longer describe the kernel it would be bound to.
+  std::optional<PlanEventDAG> analysisEvents;
   PlanDiagnostics diagnostics;
 
   // --- persisted selected state (schema v3, tasks B1/R1) -------------------

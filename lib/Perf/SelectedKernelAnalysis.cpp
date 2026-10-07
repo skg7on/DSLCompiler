@@ -1,0 +1,171 @@
+//===- SelectedKernelAnalysis.cpp - One static analysis of a selected kernel
+//==//
+//
+// Implements analyzeSelectedKernel() / analyzeSelectedDag(): the single
+// extraction both the mapping planner and the performance report read (issue
+// #129, task R6). See the header for the contract and the library boundary.
+
+#include "LLK/Perf/SelectedKernelAnalysis.h"
+
+#include "LLK/Mapping/EventSchedule.h"
+
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <limits>
+
+#include <cmath>
+#include <optional>
+#include <string>
+#include <utility>
+
+namespace mlir::llk::perf {
+namespace {
+
+llvm::Error analysisError(const llvm::Twine &message) {
+  return llvm::make_error<llvm::StringError>(message.str(),
+                                             llvm::inconvertibleErrorCode());
+}
+
+/// The cycles one normalized event occupies its resource, rounded up exactly as
+/// the shared scheduler charges it, so the reported busy totals and the
+/// schedule's own `sequentialCycles` cannot disagree.
+uint64_t eventCycles(const mapping::PlanCostEvent &event) {
+  return static_cast<uint64_t>(std::ceil(event.event.cost.latencyCycles));
+}
+
+} // namespace
+
+//===----------------------------------------------------------------------===//
+// Shared analysis over one extracted DAG
+//===----------------------------------------------------------------------===//
+
+std::map<std::string, uint64_t> dagTrafficByMemory(const MicroDAG &dag) {
+  std::map<std::string, uint64_t> traffic;
+  for (const MicroEvent &event : dag.events) {
+    if (event.bytes == 0)
+      continue;
+    // A movement crosses two levels; both see the traffic.
+    if (!event.srcMemory.empty())
+      traffic[event.srcMemory] += event.bytes;
+    if (!event.tileMemory.empty())
+      traffic[event.tileMemory] += event.bytes;
+  }
+  return traffic;
+}
+
+llvm::Expected<SelectedKernelAnalysis>
+analyzeSelectedDag(const MicroDAG &dag, const machine::MachineModel &machine,
+                   bool requireComplete) {
+  SelectedKernelAnalysis analysis;
+
+  // --- normalize every event through the one shared construction point ------
+  //
+  // `normalizedPlanEvent` is the same function the scheduler's normalized view
+  // uses, and it already fills the execution facts both paths share: the
+  // owner-occupancy pool (the mapped executor's id, or the abstract owner
+  // symbol for unmapped analysis) and the two memories a movement crosses.
+  std::vector<std::string> owners;
+  analysis.events.events.reserve(dag.events.size());
+  owners.reserve(dag.events.size());
+  for (const MicroEvent &event : dag.events) {
+    mapping::PlanCostEvent normalized = normalizedPlanEvent(event);
+    owners.push_back(normalized.owner);
+    analysis.events.events.push_back(std::move(normalized));
+  }
+
+  // --- traffic, under the one documented convention -------------------------
+  //
+  // The same named rule `computeL0StaticBound` reads its byte totals from, so
+  // the L0 block and this summary cannot drift.
+  analysis.trafficBytes = dagTrafficByMemory(dag);
+
+  analysis.peakBytes = dag.liveTileBytesByMemory;
+
+  // --- completeness ---------------------------------------------------------
+  //
+  // The extraction's own incompleteness facts first (an unknown trip count, an
+  // uncomputable footprint, an unmodelled owner scope), then the strict
+  // resource/dependency verdict: a stream that names a machine resource the
+  // model does not have, or whose dependency edges are self, out-of-range,
+  // duplicated or cyclic, cannot be scheduled as if it were complete.
+  for (const std::string &reason : dag.incompleteReasons)
+    analysis.incompleteReasons.push_back(reason);
+  if (llvm::Error error =
+          mapping::validateEventResources(analysis.events, machine))
+    analysis.incompleteReasons.push_back(llvm::toString(std::move(error)));
+  analysis.complete = analysis.incompleteReasons.empty();
+
+  if (requireComplete && !analysis.complete) {
+    std::string message =
+        "selected-kernel analysis: the event stream is incomplete";
+    for (const std::string &reason : analysis.incompleteReasons)
+      message += "\n  " + reason;
+    return analysisError(message);
+  }
+
+  // --- schedule -------------------------------------------------------------
+  //
+  // The same shared scheduler and the same owner constraints `scheduleL1` and
+  // `schedulePlanEvents` apply, so all three are one schedule of one stream. It
+  // runs even for an incomplete stream: a partial analysis still reports the
+  // numbers an artifact is expected to carry, alongside its explicit reasons.
+  analysis.schedule = mapping::scheduleNormalizedEvents(analysis.events.events,
+                                                        machine, owners);
+
+  // --- cost, derived from that one schedule ---------------------------------
+  //
+  // The identical formula `schedulePlanEvents` uses: the overlapped critical
+  // path, the stream's byte total, and the aggregate compute/transfer load over
+  // one shared machine window.
+  mapping::Cost cost;
+  cost.latencyCycles = static_cast<double>(analysis.schedule.predictedCycles);
+  uint64_t computeBusy = 0;
+  uint64_t transferBusy = 0;
+  uint64_t totalBytes = 0;
+  for (const mapping::PlanCostEvent &event : analysis.events.events) {
+    if (event.bytes > std::numeric_limits<uint64_t>::max() - totalBytes)
+      return analysisError("selected-kernel analysis: the event stream's byte "
+                           "total overflows a 64-bit count");
+    const uint64_t cycles = eventCycles(event);
+    if (event.event.kind == mapping::CostEventKind::Compute) {
+      if (cycles > std::numeric_limits<uint64_t>::max() - computeBusy)
+        return analysisError("selected-kernel analysis: compute busy cycles "
+                             "overflow a 64-bit count");
+    } else if (event.event.kind == mapping::CostEventKind::TransferHop) {
+      if (cycles > std::numeric_limits<uint64_t>::max() - transferBusy)
+        return analysisError("selected-kernel analysis: transfer busy cycles "
+                             "overflow a 64-bit count");
+    }
+  }
+  cost.localBytes = totalBytes;
+  // The DRAM dimension of the same run, through the shared helper, so this cost
+  // and `schedulePlanEvents`'s cost of the same stream are one Cost.
+  cost.dramBytes = mapping::dramTrafficBytes(analysis.events.events, machine);
+  if (std::optional<double> utilization = mapping::utilizationEstimate(
+          static_cast<double>(computeBusy), machine, machine.workerThreads))
+    cost.computeUtilization = *utilization;
+  if (std::optional<double> utilization =
+          mapping::utilizationEstimate(static_cast<double>(transferBusy),
+                                       machine, machine.transferEngineCount()))
+    cost.transferUtilization = *utilization;
+  analysis.cost = cost;
+  return analysis;
+}
+
+//===----------------------------------------------------------------------===//
+// Entry point
+//===----------------------------------------------------------------------===//
+
+llvm::Expected<SelectedKernelAnalysis>
+analyzeSelectedKernel(mlir::Operation *kernel,
+                      const machine::MachineModel &machine,
+                      bool requireComplete) {
+  llvm::Expected<MicroDAG> dag = buildMicroDAG(kernel, machine);
+  if (!dag)
+    return dag.takeError();
+  return analyzeSelectedDag(*dag, machine, requireComplete);
+}
+
+} // namespace mlir::llk::perf

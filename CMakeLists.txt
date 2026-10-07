@@ -237,6 +237,7 @@ mlir_target_link_libraries(MicroDialect PUBLIC
 add_library(LLKPerf STATIC
     lib/Perf/MicroDAG.cpp
     lib/Perf/MicroCostModel.cpp
+    lib/Perf/SelectedKernelAnalysis.cpp
     lib/Perf/MicroPerfReport.cpp
     lib/Perf/SearchSpace.cpp
     lib/Perf/Candidate.cpp

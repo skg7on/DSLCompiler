@@ -74,6 +74,16 @@ scheduleNormalizedEvents(llvm::ArrayRef<PlanCostEvent> events,
                          const machine::MachineModel &machine,
                          llvm::ArrayRef<std::string> owners = {});
 
+/// Bytes a normalized stream moves through the DRAM level, under the one
+/// traffic convention (issue #129, task R6): an event with traffic charges its
+/// bytes to the memory it reads and the memory it writes, so a `dram -> sram`
+/// hop counts against DRAM once on each movement that touches it. A movement
+/// names its memories by machine node id or by abstract kind; both resolve to
+/// the node's declared kind, so a plan-derived event and a kernel-derived one
+/// are counted the same way.
+uint64_t dramTrafficBytes(llvm::ArrayRef<PlanCostEvent> events,
+                          const machine::MachineModel &machine);
+
 /// The strict counterpart to `scheduleNormalizedEvents`: every event must name
 /// a resource the machine models, with a positive slot count, and its
 /// dependency edges must form a real acyclic order over the stream. Returns an

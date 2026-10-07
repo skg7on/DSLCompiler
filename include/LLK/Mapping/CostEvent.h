@@ -119,9 +119,24 @@ struct PlanCostEvent {
   std::vector<StorageUse> storageUses{};
 };
 
+/// Where a plan's normalized event stream came from (issue #129, task R6). A
+/// plan whose kernel was bound and analyzed carries the *derived snapshot* the
+/// shared selected-kernel analysis produced from that kernel, so its events are
+/// the materialized work's own; a plan scored before it was bound -- the
+/// search's partial-cost candidate, or a hand-built analysis fixture -- has no
+/// snapshot, and its stream is the accumulation fallback. The distinction is
+/// reported, never silent: a reader must not treat a fallback stream as the
+/// materialized kernel's.
+enum class PlanEventSource { Accumulation, Snapshot };
+
+llvm::StringRef stringifyPlanEventSource(PlanEventSource source);
+
 /// The normalized event stream of one selected plan, in dependency order.
 struct PlanEventDAG {
   std::vector<PlanCostEvent> events;
+  /// Which of the two construction paths produced `events`. Defaults to the
+  /// accumulation fallback, the shape every pre-R6 caller assumed.
+  PlanEventSource source = PlanEventSource::Accumulation;
 };
 
 /// The single construction point both event paths use, so a plan event and its
@@ -158,6 +173,28 @@ class WorkloadGraph;
 llvm::Expected<PlanEventDAG>
 buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
                 const WorkloadGraph *graph = nullptr);
+
+/// Verifies and attaches `events` to `plan` as its derived analysis snapshot
+/// (issue #129, task R6): the normalized stream the shared selected-kernel
+/// analysis (`analyzeSelectedKernel`) produced from the kernel this plan was
+/// bound to. The stage that binds a plan's kernel -- the search evaluation
+/// (task R7) -- calls this; `buildPlanEvents` then reads the snapshot instead
+/// of accumulating rule-local estimates, so the plan's final score is the
+/// schedule of the work the materialized kernel actually does.
+///
+/// The snapshot is a *derived* execution fact: it is excluded from
+/// `canonicalPlanString`, so attaching it never changes a plan id, and a plan
+/// decoded from metadata never carries one -- replay re-derives it or refuses
+/// to rank, exactly as it re-derives every other derived fact.
+///
+/// The attachment is checked, not trusted. The stream must be non-empty, every
+/// resource it names must be one the machine models, its dependency edges must
+/// be a real acyclic order, and every `planStep`/`connectionId` it records must
+/// name a step/connection the plan itself records. A stream that fails any of
+/// these is rejected here rather than silently scored as if the kernel did
+/// different work.
+llvm::Error attachPlanAnalysisEvents(CoveringPlan &plan, PlanEventDAG events,
+                                     const machine::MachineModel &machine);
 
 /// Schedules a normalized plan-event stream with the *same* resource scheduler
 /// the performance evaluator uses (task B8): events share a resource pool by
