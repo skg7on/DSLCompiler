@@ -1357,8 +1357,11 @@ TEST(StoragePlan, TwoRoutesThroughOneIntermediateKeepDistinctAllocations) {
   issue129::ResourceCase &c = built->c;
   CoveringPlan &plan = built->plan;
 
-  // A second movement along the same route: its own connection, its own
-  // storage. (The same-kind L2 nodes stay separate memories.)
+  // A second movement along the same route: its own connection, and therefore
+  // its own intermediate slot. The two movements stage through the *same* L2
+  // node (`l2.0`), so the assertion below is about distinct allocations within
+  // one memory -- a reuse would only be legal if a dependency proof said the
+  // first movement's last use precedes the second's first write.
   PlanConnection duplicate = plan.connectionPlans.front();
   duplicate.id = duplicate.id + 1;
   plan.connectionPlans.push_back(duplicate);

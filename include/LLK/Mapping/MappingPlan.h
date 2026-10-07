@@ -657,9 +657,11 @@ struct CoveringPlan {
   llvm::StringMap<SearchValue> globalParameters;
   /// The final candidate score (task B8): the overlapped latency the *shared*
   /// resource scheduler produces from the plan's normalized events, not the
-  /// additive sum of rule and connection costs. It folds into
-  /// `canonicalPlanString`, so a plan's id reflects the score a reader ranks it
-  /// by. Falls back to `accumulatedCost` only when the plan's events cannot be
+  /// additive sum of rule and connection costs. It is a derived ranking
+  /// outcome, so it is deliberately excluded from `canonicalPlanString` -- a
+  /// plan must be able to acquire an id before it is scored, and two plans
+  /// whose events schedule identically are not for that reason the same plan.
+  /// Falls back to `accumulatedCost` only when the plan's events cannot be
   /// built (an unknown strict fact), which is reported.
   Cost totalCost;
   /// The additive accumulation of rule-local and connection costs over the

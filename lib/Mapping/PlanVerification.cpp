@@ -513,12 +513,39 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
           readMetadataString(entry, "engine", where);
       if (!engine)
         return metadataError(engine.takeError());
-      if (!engine->empty() && !machine.findTransferEngine(*engine))
-        return verifyError(
-            DiagnosticCode::InvalidMappingMetadata,
-            where + ": connection " + std::to_string(*connectionId) + " hop " +
-                std::to_string(index) + " names unsupported transfer engine '" +
-                *engine + "'");
+      if (!engine->empty()) {
+        if (!machine.findTransferEngine(*engine))
+          return verifyError(
+              DiagnosticCode::InvalidMappingMetadata,
+              where + ": connection " + std::to_string(*connectionId) +
+                  " hop " + std::to_string(index) +
+                  " names unsupported transfer engine '" + *engine + "'");
+        // A real engine the machine declares is not enough: the hop must run on
+        // one *its link* offers. Two engine pools of one machine are not
+        // interchangeable -- the router legalized the hop with the link's own
+        // engines -- so a hop re-pointed at another pool is a tampered decision
+        // even though the engine exists.
+        const machine::LinkEdge *hopLink = nullptr;
+        for (const machine::LinkEdge &edge : machine.links)
+          if (edge.source == (*nodes)[index] &&
+              edge.destination == (*nodes)[index + 1]) {
+            hopLink = &edge;
+            break;
+          }
+        if (!hopLink)
+          return verifyError(
+              DiagnosticCode::InvalidMappingMetadata,
+              where + ": connection " + std::to_string(*connectionId) +
+                  " hop " + std::to_string(index) + " crosses '" +
+                  (*nodes)[index] + "' -> '" + (*nodes)[index + 1] +
+                  "', which no machine link joins");
+        if (!llvm::is_contained(hopLink->transferEngines, *engine))
+          return verifyError(
+              DiagnosticCode::InvalidMappingMetadata,
+              where + ": connection " + std::to_string(*connectionId) +
+                  " hop " + std::to_string(index) + " names transfer engine '" +
+                  *engine + "', which its link does not offer");
+      }
       if (index + 1 != *hop)
         continue;
       // The movement materialized for this hop reads and writes the storage the

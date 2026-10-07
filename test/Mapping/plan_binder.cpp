@@ -4511,6 +4511,30 @@ DictionaryAttr withHops(DictionaryAttr route, MLIRContext &context,
   return DictionaryAttr::get(&context, fields);
 }
 
+/// Rewrites `micro.routes` so the hop at `hopIndex` of every route records
+/// `engine` as the transfer engine it runs on.
+void setRouteHopEngine(mlir::Operation *kernel, MLIRContext &context,
+                       size_t hopIndex, llvm::StringRef engine) {
+  mutateRoutes(kernel, context, [&](DictionaryAttr route) {
+    auto hops = route.getAs<ArrayAttr>("hops");
+    llvm::SmallVector<Attribute> rewritten;
+    for (size_t index = 0; index < hops.size(); ++index) {
+      if (index != hopIndex) {
+        rewritten.push_back(hops[index]);
+        continue;
+      }
+      llvm::SmallVector<NamedAttribute> fields;
+      for (NamedAttribute attribute : cast<DictionaryAttr>(hops[index]))
+        if (attribute.getName() != "engine")
+          fields.push_back(attribute);
+      fields.emplace_back(StringAttr::get(&context, "engine"),
+                          StringAttr::get(&context, engine));
+      rewritten.push_back(DictionaryAttr::get(&context, fields));
+    }
+    return withHops(route, context, rewritten);
+  });
+}
+
 } // namespace
 
 // Every movement hop becomes one awaited copy that reads the storage its hop
@@ -4720,28 +4744,44 @@ TEST(PlanBinder, Issue129AMutatedHopEngineIsRejected) {
 
   mlir::Operation *kernel = findKernel(*bound->module);
   ASSERT_NE(kernel, nullptr);
-  mutateRoutes(kernel, *c.context, [&](DictionaryAttr route) {
-    auto hops = route.getAs<ArrayAttr>("hops");
-    llvm::SmallVector<Attribute> rewritten;
-    for (size_t index = 0; index < hops.size(); ++index) {
-      if (index != 0) {
-        rewritten.push_back(hops[index]);
-        continue;
-      }
-      llvm::SmallVector<NamedAttribute> fields;
-      for (NamedAttribute attribute : cast<DictionaryAttr>(hops[index]))
-        if (attribute.getName() != "engine")
-          fields.push_back(attribute);
-      fields.emplace_back(StringAttr::get(c.context.get(), "engine"),
-                          StringAttr::get(c.context.get(), "dma.ghost"));
-      rewritten.push_back(DictionaryAttr::get(c.context.get(), fields));
-    }
-    return withHops(route, *c.context, rewritten);
-  });
+  setRouteHopEngine(kernel, *c.context, /*hopIndex=*/0, "dma.ghost");
   llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
   ASSERT_TRUE(static_cast<bool>(verification));
   const std::string message = llvm::toString(std::move(verification));
   EXPECT_NE(message.find("dma.ghost"), std::string::npos) << message;
   EXPECT_NE(message.find("unsupported transfer engine"), std::string::npos)
+      << message;
+}
+
+// A hop re-pointed at an engine the machine *does* declare, but its link does
+// not offer, is rejected too. `dma.a` and `dma.b` are both real engines of the
+// fixture's machine; only `dma.a` serves the sram.0 -> l2.0 link, so recording
+// `dma.b` for that hop is a tampered decision even though the engine exists.
+// (Verification must not fall back to "some engine of this machine can carry
+// it": two engine pools are not interchangeable.)
+TEST(PlanBinder, Issue129AHopEngineItsLinkDoesNotOfferIsRejected) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+  ASSERT_EQ(plan.connectionPlans.front().hops.size(), 2u);
+  ASSERT_EQ(plan.connectionPlans.front().hops[0].engine, "dma.a");
+  ASSERT_EQ(plan.connectionPlans.front().hops[1].engine, "dma.b");
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  mlir::Operation *kernel = findKernel(*bound->module);
+  ASSERT_NE(kernel, nullptr);
+  // The first hop's link offers `dma.a` only; `dma.b` exists but serves the
+  // second link.
+  setRouteHopEngine(kernel, *c.context, /*hopIndex=*/0, "dma.b");
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(verification));
+  const std::string message = llvm::toString(std::move(verification));
+  EXPECT_NE(message.find("dma.b"), std::string::npos) << message;
+  EXPECT_NE(message.find("its link does not offer"), std::string::npos)
       << message;
 }
