@@ -218,3 +218,38 @@ TEST(ExactResourceOracleTest, BoundedBeamOnlyReportsEnumeratedFeasiblePlans) {
     EXPECT_TRUE(beam->searchTruncated) << "a shortfall must be reported as "
                                           "truncation, not as the feasible set";
 }
+
+// Task R8 step 2: sequential temporaries whose *summed* sizes exceed the memory
+// but whose true live peak fits must be retained. The search's own
+// partial-state accounting charges every materialized output until its last
+// consumer -- an over-estimate that reuse can only lower -- so a plan rejected
+// on that sum would be an unsafe capacity rejection. The `sequential` fixture
+// runs four iterations of one 256-byte temporary in a 256-byte L2: the peak is
+// one buffer, the naive sum is four.
+TEST(ExactResourceOracleTest, SequentialTemporariesAreJudgedByTheirLivePeak) {
+  auto c = issue129::resourceCase("sequential");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 0;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->plans.empty())
+      << "the live peak fits; rejecting on the summed size would be unsound";
+
+  const CoveringPlan &plan = result->plans.front();
+  // Exactly one 256-byte L2 buffer, resident once: the four sequential
+  // iterations reuse it. A model that charged every iteration a fresh buffer
+  // (4 x 256 = 1024, over the 256-byte L2) would reject a plan whose live peak
+  // is 256 -- the unsound partial-state rejection this case guards.
+  uint64_t l2Allocations = 0;
+  for (const StorageAllocation &allocation : plan.allocations) {
+    if (allocation.memory != "l2.0")
+      continue;
+    ++l2Allocations;
+    EXPECT_EQ(allocation.bytes, 256u);
+    EXPECT_EQ(allocation.simultaneousOccurrences, 1u)
+        << "a serial loop reuses one buffer; four live versions would not fit";
+  }
+  EXPECT_EQ(l2Allocations, 1u);
+}
