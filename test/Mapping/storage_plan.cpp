@@ -1455,6 +1455,35 @@ TEST(StoragePlan, ReservesEveryMovementHopAndSharesTheIntermediate) {
           << "a movement or wait step of a two-hop route must name its hop";
 }
 
+// Issue #129 review finding 3: R4 creates one `Movement` step per route hop,
+// but the event builder emitted the *whole* route for every such step, so a
+// two-hop movement produced four transfer events (hops 0 and 1, twice) and its
+// storage uses were attributed twice. The stream must carry one transfer per
+// hop -- matching the two copies canonical materialization emits -- so storage
+// finalization and plan liveness do not analyze duplicated movement.
+TEST(StoragePlan, APerHopMovementEmitsOneTransferEventPerHop) {
+  llvm::Expected<TwoHopCase> built = twoHopCase();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->c;
+  CoveringPlan &plan = built->plan;
+  ASSERT_FALSE(bool(finalizeStoragePlan(c.graph, plan, c.target->machine())));
+  ASSERT_EQ(plan.connectionPlans.front().hops.size(), 2u);
+
+  llvm::Expected<PlanEventDAG> events =
+      buildPlanEvents(plan, c.target->machine());
+  ASSERT_TRUE(static_cast<bool>(events)) << llvm::toString(events.takeError());
+  size_t transfers = 0;
+  std::set<uint64_t> hopsSeen;
+  for (const PlanCostEvent &event : events->events)
+    if (event.event.kind == CostEventKind::TransferHop) {
+      ++transfers;
+      hopsSeen.insert(event.hopIndex);
+    }
+  EXPECT_EQ(transfers, plan.connectionPlans.front().hops.size())
+      << "one transfer event per materialized hop";
+  EXPECT_EQ(hopsSeen.size(), transfers) << "each hop must appear exactly once";
+}
+
 // Routing checks the intermediate's capacity for the *copy* it enumerates; the
 // storage plan is what proves the reservation fits. Reducing L2 below the
 // value's 256 bytes must be refused by the reservation, naming the memory.

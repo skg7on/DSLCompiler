@@ -650,7 +650,26 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
           -> llvm::Expected<std::vector<uint32_t>> {
         std::vector<uint32_t> hops;
         std::optional<uint32_t> previousWait = chainFrom;
-        for (size_t hop = 1; hop < connection.route.size(); ++hop) {
+        // A per-hop `Movement` step (R4) names exactly one hop of the route and
+        // must emit only that hop; a single-step movement carries no `hop` and
+        // emits the whole route chained. Emitting the whole route for every
+        // per-hop step duplicated a multi-hop movement -- four transfer events
+        // for a two-hop route, and each storage use attributed twice -- so
+        // storage finalization and plan liveness analyzed the same movement
+        // twice (issue #129 review finding 3).
+        const size_t routeHops =
+            connection.route.size() > 1 ? connection.route.size() - 1 : 0;
+        const size_t firstHop = step->hop ? *step->hop + 1 : 1;
+        const size_t hopCount = step->hop ? 1 : routeHops;
+        if (hopCount > 0 && firstHop + hopCount > connection.route.size()) {
+          const std::string hopName =
+              step->hop ? std::to_string(*step->hop) : std::string("(none)");
+          return planEventError(
+              "plan events: movement step " + llvm::Twine(step->id) +
+              " names hop " + hopName + ", which connection " +
+              llvm::Twine(connection.id) + "'s route does not have");
+        }
+        for (size_t hop = firstHop; hop < firstHop + hopCount; ++hop) {
           const machine::MemoryNode *from =
               machine.findMemory(connection.route[hop - 1]);
           const machine::MemoryNode *to =
