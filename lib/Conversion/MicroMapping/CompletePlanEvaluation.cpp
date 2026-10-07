@@ -119,6 +119,16 @@ void scoreFromOwnEvents(CoveringPlan &plan,
 
 } // namespace
 
+void recordAnalysisCompleteness(const perf::SelectedKernelAnalysis &analysis,
+                                CoveringPlan &plan) {
+  if (analysis.complete)
+    return;
+  for (const std::string &reason : analysis.incompleteReasons)
+    plan.diagnostics.warnings.push_back(
+        "plan evaluation: the selected static analysis is incomplete: " +
+        reason);
+}
+
 llvm::Expected<CompletePlanEvaluation>
 evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
                      const MappingTarget &target, const CoveringPlan &proposal,
@@ -201,9 +211,10 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
   // The plan-carrying overload attaches R5 storage liveness, so `peakBytes` is
   // the plan's own capacity-verdict peak and not a second, weaker relation. The
   // analysis is taken leniently: a stream the machine does not fully model is
-  // *reported* (its reasons travel with the plan), never a rejection -- a
-  // `micro-perf` run on the same kernel reports the same incompleteness, so the
-  // planner and the simulator stay one analysis rather than two verdicts.
+  // *reported*, never a rejection -- a `micro-perf` run on the same kernel
+  // reports the same incompleteness, so the planner and the simulator stay one
+  // analysis rather than two verdicts. The reasons must actually travel with
+  // the plan (issue #129, task R7 review); they used to be discarded.
   llvm::Expected<perf::SelectedKernelAnalysis> analysis =
       perf::analyzeSelectedKernel(bound->kernel, machine, /*requireComplete=*/
                                   false, plan, graph);
@@ -222,6 +233,13 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
     evaluation.plan = std::move(plan);
     return evaluation;
   }
+
+  // The analysis ran. If it declared itself incomplete, record its ordered
+  // reasons on the plan rather than scoring it as if it were exact (issue #129,
+  // task R7 review). This is not a rejection: the plan's physical facts are
+  // what decide executable readiness, and the perf model's own incompleteness
+  // is the same one `micro-perf` reports.
+  recordAnalysisCompleteness(*analysis, plan);
 
   // --- 5. validate occupancy ----------------------------------------------
   //

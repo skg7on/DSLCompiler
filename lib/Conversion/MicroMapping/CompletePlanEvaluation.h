@@ -26,6 +26,7 @@
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Mapping/WorkloadGraph.h"
+#include "LLK/Perf/SelectedKernelAnalysis.h"
 
 #include "mlir/IR/BuiltinOps.h"
 
@@ -94,6 +95,24 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
                      const MappingTarget &target, const CoveringPlan &proposal,
                      BindContract contract,
                      std::optional<uint64_t> memoryBudgetBytes = std::nullopt);
+
+/// Applies a selected-kernel analysis's completeness verdict to `plan` (issue
+/// #129, task R7 review): a **complete** analysis records nothing; an
+/// **incomplete** one -- a loop with non-static bounds the extractor charged
+/// one iteration, a value it charged zero bytes, an operation whose owner scope
+/// it does not model -- appends one warning per ordered reason, so the verdict
+/// travels with the plan instead of a score being presented as if it were
+/// exact.
+///
+/// An incomplete *analysis* is deliberately not a rejection. The planner and
+/// the performance model are separate consumers of one kernel: a plan whose
+/// physical facts are complete is still a legal, executable mapping even when
+/// the *perf* model cannot describe every event of it, and `micro-perf` on the
+/// same kernel reports the same reasons. Recording them keeps the two honest
+/// and keeps them agreeing; refusing the plan would conflate a modelling gap in
+/// the simulator with a physical incompleteness in the plan.
+void recordAnalysisCompleteness(const perf::SelectedKernelAnalysis &analysis,
+                                CoveringPlan &plan);
 
 } // namespace mlir::llk::mapping
 

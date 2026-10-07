@@ -15,6 +15,7 @@
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/StoragePlan.h"
+#include "LLK/Perf/SelectedKernelAnalysis.h"
 
 #include "resource_regression_fixture.h"
 
@@ -178,6 +179,37 @@ TEST(CompletePlanEvaluationTest, AStructuralFailureIsNotLabelledCapacity) {
   ASSERT_TRUE(evaluated->rejection.has_value());
   EXPECT_EQ(evaluated->rejection->code,
             DiagnosticCode::UnsupportedMaterialization);
+}
+
+// Issue #129, task R7 review: a selected-kernel analysis that declares itself
+// incomplete must not be scored as if it were complete. Its ordered reasons are
+// recorded on the plan -- one warning each -- so the verdict travels with the
+// plan instead of being discarded, exactly as `micro-perf` reports them on the
+// same kernel.
+TEST(CompletePlanEvaluationTest, AnIncompleteAnalysisIsRecordedNotSwallowed) {
+  mlir::llk::perf::SelectedKernelAnalysis analysis;
+  analysis.complete = false;
+  analysis.incompleteReasons = {"a loop has non-static bounds",
+                                "a value is charged as zero"};
+
+  CoveringPlan plan;
+  recordAnalysisCompleteness(analysis, plan);
+  ASSERT_EQ(plan.diagnostics.warnings.size(), 2u);
+  EXPECT_NE(plan.diagnostics.warnings[0].find("non-static bounds"),
+            std::string::npos);
+  EXPECT_NE(plan.diagnostics.warnings[1].find("charged as zero"),
+            std::string::npos);
+}
+
+// The complement: a complete analysis records nothing, so the recording never
+// adds noise to a plan whose work the extractor described exactly.
+TEST(CompletePlanEvaluationTest, ACompleteAnalysisRecordsNoVerdict) {
+  mlir::llk::perf::SelectedKernelAnalysis analysis;
+  analysis.complete = true;
+
+  CoveringPlan plan;
+  recordAnalysisCompleteness(analysis, plan);
+  EXPECT_TRUE(plan.diagnostics.warnings.empty());
 }
 
 // Evaluation is deterministic and idempotent: two evaluations of one proposal
