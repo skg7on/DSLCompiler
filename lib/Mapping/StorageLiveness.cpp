@@ -74,17 +74,34 @@ requiredReuseEdgesFor(llvm::ArrayRef<StorageAllocation> allocations) {
     }
     return index;
   };
+  // Each root's occupants -- the root itself and every allocation that reuses
+  // it -- ordered by the step they begin. The edge a reuse relies on is the
+  // *previous occupant's* last use preceding the next occupant's first write,
+  // not merely the root's own: ordering only the root before each occupant let
+  // two occupants overlap, so one buffer appeared to hold two simultaneous
+  // values (issue #129 review finding 1).
+  //
+  // A root with a single occupant whose last use is exactly the occupant's
+  // first write (an in-place update that reads and writes at one step) still
+  // contributes a self-step edge -- reported all the same, because it is the
+  // statement that the two allocations are one buffer (issue #129, task R5).
+  std::map<size_t, std::vector<size_t>> membersByRoot;
+  for (size_t index = 0; index < allocations.size(); ++index)
+    membersByRoot[rootOf(index)].push_back(index);
+
   std::vector<PlanStepEdge> edges;
-  for (size_t index = 0; index < allocations.size(); ++index) {
-    if (!allocations[index].aliasOf)
+  for (const auto &entry : membersByRoot) {
+    std::vector<size_t> members = entry.second;
+    if (members.size() < 2)
       continue;
-    const StorageAllocation &reused = allocations[rootOf(index)];
-    const StorageAllocation &alias = allocations[index];
-    // The edge the reuse relies on: the reused buffer's last read precedes the
-    // new writer's step. An in-place update reads and writes at one step, so
-    // its edge is a self-step edge -- reported all the same, because it is the
-    // statement that the two allocations are one buffer (issue #129, task R5).
-    edges.push_back(PlanStepEdge{reused.endStep, alias.beginStep});
+    llvm::sort(members, [&](size_t lhs, size_t rhs) {
+      if (allocations[lhs].beginStep != allocations[rhs].beginStep)
+        return allocations[lhs].beginStep < allocations[rhs].beginStep;
+      return allocations[lhs].id < allocations[rhs].id;
+    });
+    for (size_t i = 1; i < members.size(); ++i)
+      edges.push_back(PlanStepEdge{allocations[members[i - 1]].endStep,
+                                   allocations[members[i]].beginStep});
   }
   llvm::sort(edges, [](const PlanStepEdge &lhs, const PlanStepEdge &rhs) {
     return lhs.from != rhs.from ? lhs.from < rhs.from : lhs.to < rhs.to;

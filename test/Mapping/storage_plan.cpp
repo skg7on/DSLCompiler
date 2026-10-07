@@ -7,6 +7,7 @@
 // checks per-memory capacity against real occupancy.
 
 #include "LLK/Mapping/CostEvent.h"
+#include "LLK/Mapping/StorageLiveness.h"
 #include "LLK/Mapping/StoragePlan.h"
 
 #include "resource_regression_fixture.h"
@@ -33,6 +34,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1591,4 +1593,74 @@ TEST(StoragePlan, TwoRoutesThroughOneIntermediateKeepDistinctAllocations) {
       l2Allocations.insert(allocation.id);
   EXPECT_EQ(l2Allocations.size(), 2u)
       << "each movement stages through its own L2 buffer";
+}
+
+// Issue #129 review finding 1: after one allocation aliased a root, a later
+// one was checked only against the root's own end step, ignoring the first
+// alias's lifetime -- so two allocations could share one buffer while both were
+// live (here `[2,4]` and `[3,3]` on one root), and the peak counted a single
+// buffer for two live values. Reuse must be ordered against *every* current
+// occupant of the root.
+TEST(StoragePlan, RejectsReuseThatOverlapsAnExistingOccupant) {
+  mlir::MLIRContext context;
+  mlir::Type tile = tileType(context, "8x8xf32");
+  WorkloadGraph graph;
+  WorkloadValueId a = graph.addValue(WorkloadValue{0, tile, "a", false});
+  WorkloadValueId b = graph.addValue(WorkloadValue{0, tile, "b", false});
+  WorkloadValueId c = graph.addValue(WorkloadValue{0, tile, "c", false});
+  WorkloadValueId d = graph.addValue(WorkloadValue{0, tile, "d", false});
+  WorkloadValueId e = graph.addValue(WorkloadValue{0, tile, "e", false});
+  auto addNode = [&](unsigned ordinal, std::vector<WorkloadValueId> inputs,
+                     WorkloadValueId output) {
+    WorkloadNode node;
+    node.opName = "micro.vector";
+    node.sourceOrdinal = ordinal;
+    node.executionMultiplicity = 1;
+    for (WorkloadValueId value : inputs)
+      node.inputs.push_back(WorkloadPort{value, tile, std::nullopt});
+    node.outputs.push_back(WorkloadPort{output, tile, std::nullopt});
+    graph.addNode(std::move(node));
+  };
+  // a -> {b, c}; b -> d; c -> e. `b` and `c` are forks of `a`, so their
+  // lifetimes interleave and both are candidates to reuse an earlier root.
+  addNode(0, {}, a);
+  addNode(1, {a}, b);
+  addNode(2, {a}, c);
+  addNode(3, {b}, d);
+  addNode(4, {c}, e);
+  graph.finalize();
+
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+  std::optional<CoveringPlan> plan = searchOne(graph, *target, context);
+  ASSERT_TRUE(plan.has_value());
+  ASSERT_FALSE(bool(finalizeStoragePlan(graph, *plan, storageMachine())));
+
+  // The root of each allocation's reuse chain, followed transitively.
+  std::function<uint64_t(uint64_t)> rootOf = [&](uint64_t id) -> uint64_t {
+    for (const StorageAllocation &allocation : plan->allocations)
+      if (allocation.id == id)
+        return allocation.aliasOf ? rootOf(*allocation.aliasOf) : allocation.id;
+    return id;
+  };
+  bool sawReuse = false;
+  for (size_t i = 0; i < plan->allocations.size(); ++i)
+    for (size_t j = i + 1; j < plan->allocations.size(); ++j) {
+      const StorageAllocation &x = plan->allocations[i];
+      const StorageAllocation &y = plan->allocations[j];
+      // Only two *occupants* -- allocations that reuse a root -- are compared.
+      // An occupant may share the root's own boundary step (an in-place update
+      // reads and writes there), but two occupants may never be live at once:
+      // the one buffer holds one value.
+      if (!x.aliasOf || !y.aliasOf || rootOf(x.id) != rootOf(y.id))
+        continue;
+      sawReuse = true;
+      // `computePeakStorage` treats the interval as closed.
+      const bool overlap = x.beginStep <= y.endStep && y.beginStep <= x.endStep;
+      EXPECT_FALSE(overlap)
+          << "allocations " << x.id << " [" << x.beginStep << "," << x.endStep
+          << "] and " << y.id << " [" << y.beginStep << "," << y.endStep
+          << "] share one buffer while both live";
+    }
+  EXPECT_TRUE(sawReuse) << "the fixture must exercise a shared root";
 }

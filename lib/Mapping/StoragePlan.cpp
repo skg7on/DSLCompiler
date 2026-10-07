@@ -1581,13 +1581,22 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
           continue;
         if (allocations[candidate].aliasOf)
           continue; // keep reuse flat, so the chain cannot cycle
+        // The buffer the candidate provides is shared by *every* allocation
+        // already reusing it, so a new occupant must follow the last use of all
+        // of them -- not just the root's own recorded end. Checking only the
+        // root let two occupants be live at once, so the peak counted one
+        // buffer for two simultaneous values (issue #129 review finding 1).
+        uint64_t rootLastUse = a.endStep;
+        for (size_t other = 0; other < allocations.size(); ++other)
+          if (other != later && rootIndex(other) == candidate)
+            rootLastUse = std::max(rootLastUse, allocations[other].endStep);
         // In place: the writer reads this buffer and nothing reads it after
         // the writer's step, so its read is the last use and completes before
         // its own write begins. Disjoint: the last reader is strictly earlier,
         // so the buffer is already dead.
         const bool inPlace =
-            llvm::is_contained(readable, a.id) && a.endStep <= b.beginStep;
-        const bool disjoint = a.endStep < b.beginStep;
+            llvm::is_contained(readable, a.id) && rootLastUse <= b.beginStep;
+        const bool disjoint = rootLastUse < b.beginStep;
         if (!inPlace && !disjoint)
           continue;
         if (!best || allocations[*best].id > a.id)
