@@ -1132,6 +1132,14 @@ if(LLK_BUILD_TOOLS)
       COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_missing_memory.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=MAP ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_missing_memory.mlir"
   )
 
+  # MicroMappingStrictIncompleteLoop: issue #129 review finding 2's regression.
+  # A loop bound the planner cannot recover as a constant is a strict refusal
+  # under `require-executable=1`, not a partial artifact scored at one
+  # iteration. Raw add_test for the same stderr/FileCheck reason as above.
+  add_test(NAME MicroMappingStrictIncompleteLoop
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_incomplete_loop.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=MAP ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_incomplete_loop.mlir"
+  )
+
   # PhysicalTwoHop: issue #129 task R4's end-to-end fixture. A movement whose
   # route crosses an intermediate memory (SRAM -> L2 -> DRAM, one DMA engine per
   # link) is materialized as one awaited copy per hop, and *every* hop's

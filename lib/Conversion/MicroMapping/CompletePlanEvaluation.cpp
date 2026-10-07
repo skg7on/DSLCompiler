@@ -146,16 +146,25 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
   // This resolves the maps/compute/ports the placement decided, decides the
   // movement hops and their storage slots and steps, validates occupancy
   // against each memory's capacity, and assigns the decision-only v3 id (the
-  // hops are identity-bearing decisions). The strict attempt runs first; when
-  // *only* a physical fact is incomplete it is re-run as an analysis artifact,
-  // which succeeds and records `physicalComplete=false` plus its ordered
-  // reasons. A genuine rejection -- a capacity overflow, a cyclic graph, a
+  // hops are identity-bearing decisions). The strict attempt runs first. Under
+  // the *partial* contract, when only a physical fact is incomplete it is
+  // re-run as an analysis artifact, which succeeds and records
+  // `physicalComplete=false` plus its ordered reasons. Under the *executable*
+  // contract there is no such fallback: a plan whose strict finalize refused a
+  // physical fact is not an executable plan, and accepting the artifact would
+  // offer one whose `micro.plan` is `materialized=false` (issue #129 review
+  // finding 2). A genuine rejection -- a capacity overflow, a cyclic graph, a
   // coverage gap -- fails both passes and is dropped.
   plan.materialized = true;
   bool strictCapacity = false;
   if (llvm::Error error =
           finalizeStoragePlan(graph, plan, machine, &strictCapacity)) {
     std::string reason = llvm::toString(std::move(error));
+    if (strict)
+      return rejected(strictCapacity
+                          ? DiagnosticCode::MemoryCapacityExceeded
+                          : DiagnosticCode::UnsupportedMaterialization,
+                      std::move(reason));
     CoveringPlan analysis = proposal;
     analysis.materialized = false;
     recordProvenance(analysis, graph, target);
@@ -209,12 +218,13 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
   // --- 4. selected static analysis ----------------------------------------
   //
   // The plan-carrying overload attaches R5 storage liveness, so `peakBytes` is
-  // the plan's own capacity-verdict peak and not a second, weaker relation. The
-  // analysis is taken leniently: a stream the machine does not fully model is
-  // *reported*, never a rejection -- a `micro-perf` run on the same kernel
-  // reports the same incompleteness, so the planner and the simulator stay one
-  // analysis rather than two verdicts. The reasons must actually travel with
-  // the plan (issue #129, task R7 review); they used to be discarded.
+  // the plan's own capacity-verdict peak and not a second, weaker relation.
+  // Under the executable contract the analysis must be *complete* (issue #129
+  // review finding 2): a plan whose final cost is a schedule of a kernel the
+  // extractor admitted it approximated -- a non-static loop bound charged one
+  // iteration, a value charged zero bytes -- must not be offered as executable.
+  // Under the partial contract it is taken leniently and its incompleteness is
+  // recorded on the plan below.
   llvm::Expected<perf::SelectedKernelAnalysis> analysis =
       perf::analyzeSelectedKernel(bound->kernel, machine, /*requireComplete=*/
                                   false, plan, graph);

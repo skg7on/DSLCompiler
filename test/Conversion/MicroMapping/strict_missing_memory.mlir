@@ -28,9 +28,11 @@ module {
 }
 
 // The strict run is refused, and the reason names the memory fact that is
-// missing rather than a bare "no plan".
-// MAP: error: bindPlan: the plan is not physically complete
-// MAP: value 0 written by node 0 output 0
+// missing rather than a bare "no plan". Under the executable contract the
+// refusal is the strict finalize's own reason (issue #129 review finding 2):
+// there is no lenient fallback to a partial artifact, so the refusal comes from
+// the storage plan rather than from a later binder re-check.
+// MAP: error: storage plan: value 0 written by node 0 output 0
 // MAP-SAME: needs a 'rf' memory the executor can address
 // MAP-SAME: worker.0
 //
