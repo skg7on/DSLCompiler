@@ -84,6 +84,7 @@ bool isRejection(DiagnosticCode code) {
   case DiagnosticCode::TargetBundleInvalid:
   case DiagnosticCode::InvalidMappingMetadata:
   case DiagnosticCode::InvalidGatherDeclaration:
+  case DiagnosticCode::UnsupportedMaterialization:
     return true;
   }
   llvm_unreachable("unclassified DiagnosticCode");

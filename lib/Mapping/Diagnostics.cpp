@@ -46,6 +46,8 @@ llvm::StringRef stringifyDiagnosticCode(DiagnosticCode code) {
     return "connection_choice_unexplored";
   case DiagnosticCode::InvalidGatherDeclaration:
     return "invalid_gather_declaration";
+  case DiagnosticCode::UnsupportedMaterialization:
+    return "unsupported_materialization";
   }
   return "";
 }
@@ -70,6 +72,8 @@ std::optional<DiagnosticCode> symbolizeDiagnosticCode(llvm::StringRef name) {
             DiagnosticCode::ConnectionChoiceUnexplored)
       .Case("invalid_gather_declaration",
             DiagnosticCode::InvalidGatherDeclaration)
+      .Case("unsupported_materialization",
+            DiagnosticCode::UnsupportedMaterialization)
       .Default(std::nullopt);
 }
 

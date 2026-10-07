@@ -41,6 +41,8 @@
 #include "LLK/Mapping/StableHash.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
+#include "resource_regression_fixture.h"
+
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
@@ -1162,5 +1164,33 @@ TEST(MappingProperties, ConnectionIdentitySeparatesEveryDecision) {
     genuine.valueType = "value_type=" + forged.valueType;
     forged.kind = "transfer;value_type=" + forged.valueType;
     EXPECT_NE(forged.canonicalString(), genuine.canonicalString());
+  }
+}
+
+// Review gate (issue #129, task R7): with feasibility evaluated *before*
+// retention, raising K can never change the best feasible exact plan when
+// enumeration is untruncated -- the retained set is a prefix of one ranked
+// feasible set. The `capacity-topk` fixture has exactly one feasible complete
+// plan (the DRAM binding); its cheap SRAM proposal overflows its memory, so the
+// best plan must be the DRAM one for every K.
+TEST(MappingProperties, ChangingTopKDoesNotChangeTheBestFeasiblePlan) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+
+  PlanId best = 0;
+  for (unsigned k = 1; k <= 8; ++k) {
+    MappingSearchOptions options;
+    options.mode = SearchMode::Exact;
+    options.topK = k;
+    auto result = issue129::searchCase(*c, options);
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    ASSERT_FALSE(result->plans.empty()) << "K=" << k;
+    EXPECT_EQ(result->plans.front().placements.front().rule, "r.large")
+        << "K=" << k;
+    if (k == 1)
+      best = result->plans.front().id;
+    else
+      EXPECT_EQ(result->plans.front().id, best) << "K=" << k;
   }
 }

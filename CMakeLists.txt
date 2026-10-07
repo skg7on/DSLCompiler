@@ -477,6 +477,7 @@ add_library(LLKMicroMapping STATIC
     lib/Conversion/MicroMapping/MicroVerifyMappingPass.cpp
     lib/Conversion/MicroMapping/SearchBindingLoader.cpp
     lib/Conversion/MicroMapping/PlanMaterialization.cpp
+    lib/Conversion/MicroMapping/CompletePlanEvaluation.cpp
 )
 target_include_directories(LLKMicroMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -923,7 +924,14 @@ target_include_directories(LLKResourceRegressionFixture PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
 )
-target_link_libraries(LLKResourceRegressionFixture PUBLIC LLKMapping)
+# R7: `searchCase` supplies the completion evaluator, whose implementation lives
+# in the Micro mapping pass library (above both LLKMapping and LLKPerf). The
+# evaluator reads the case's module, graph and target, so the fixture is the
+# layer that owns all three together.
+target_include_directories(LLKResourceRegressionFixture PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+)
+target_link_libraries(LLKResourceRegressionFixture PUBLIC LLKMapping LLKMicroMapping)
 target_compile_options(LLKResourceRegressionFixture PRIVATE -fno-rtti -fno-exceptions)
 mlir_target_link_libraries(LLKResourceRegressionFixture PRIVATE MicroDialect)
 
@@ -986,6 +994,23 @@ add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
 target_link_libraries(MappingPlanReportTest PRIVATE LLKResourceRegressionFixture)
 add_llk_mapping_test(MappingPropertiesTest test/Mapping/properties.cpp)
+# R7's K-independence property runs over the shared `capacity-topk` fixture,
+# whose `searchCase` supplies the completion evaluator.
+target_link_libraries(MappingPropertiesTest PRIVATE LLKResourceRegressionFixture)
+
+# CompletePlanEvaluationTest (issue #129, task R7): the completion evaluator --
+# the stage that turns a cheap search proposal into a physically validated,
+# scored plan. Its implementation lives in the Micro mapping pass library (above
+# LLKMapping and LLKPerf), so the test links that library and the shared
+# regression fixture, which is where `searchCase` supplies the evaluator.
+add_llvm_executable(CompletePlanEvaluationTest
+    test/Conversion/MicroMapping/complete_plan_evaluation.cpp)
+target_link_libraries(CompletePlanEvaluationTest PRIVATE
+    LLKMicroMapping LLKMapping LLKTargetMapping MicroDialect
+    LLKResourceRegressionFixture GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_include_directories(CompletePlanEvaluationTest PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping)
+add_test(NAME CompletePlanEvaluationTest COMMAND CompletePlanEvaluationTest)
 
 # SearchBinding loader (phase-4 task 1): micro.candidate -> mapping::SearchBinding.
 # The loader lives in the pass library, not LLKMapping, because it reuses

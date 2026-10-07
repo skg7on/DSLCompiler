@@ -99,6 +99,24 @@ llvm::StringRef mappedExecutor(mlir::Operation &op) {
   return {};
 }
 
+/// The concrete capability node a mapped op *selected* for the compute
+/// requirement of `kind` (`vector_engine`, `matrix_engine`), read from its
+/// `micro.mapping` `compute_bindings` map, or empty when the op carries none.
+/// R1 made this selection identity-bearing; the simulator must honour it rather
+/// than resolving the executor's first attached engine of the kind, or two
+/// plans that selected different engines of one kind would be charged as one.
+llvm::StringRef mappedComputeEngine(mlir::Operation &op, llvm::StringRef kind) {
+  auto mapping = op.getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
+  if (!mapping)
+    return {};
+  auto bindings = mapping.getAs<mlir::DictionaryAttr>("compute_bindings");
+  if (!bindings)
+    return {};
+  if (auto engine = bindings.getAs<mlir::StringAttr>(kind))
+    return engine.getValue();
+  return {};
+}
+
 /// The executor a materialized `micro.transform` selected: stamped as
 /// `micro.engine` by the binder (task B8), because a conversion is not a
 /// covered workload node and carries no `micro.mapping`. A hand-written or
@@ -190,7 +208,8 @@ private:
   pickMatrixEngine(llvm::StringRef requested, std::string &reason,
                    llvm::StringRef executor = "") const;
   const machine::ComputeNode *
-  pickVectorEngine(std::string &reason, llvm::StringRef executor = "") const;
+  pickVectorEngine(llvm::StringRef requested, std::string &reason,
+                   llvm::StringRef executor = "") const;
 
   llvm::SmallVector<uint32_t, 4> producerDeps(mlir::ValueRange values) const;
   void inheritProducer(mlir::Value result, mlir::Value source);
@@ -610,8 +629,20 @@ DAGBuilder::pickMatrixEngine(llvm::StringRef requested, std::string &reason,
 }
 
 const machine::ComputeNode *
-DAGBuilder::pickVectorEngine(std::string &reason,
+DAGBuilder::pickVectorEngine(llvm::StringRef requested, std::string &reason,
                              llvm::StringRef executor) const {
+  // A recorded selection wins outright (issue #129, task R1): the mapped op
+  // says which attached engine ran, so two plans of one rule that selected two
+  // engines of a kind are charged two engines rather than both collapsing onto
+  // the executor's first. A selection the machine does not declare is an error,
+  // never silently replaced.
+  if (!requested.empty()) {
+    if (const machine::ComputeNode *engine = machine.findCompute(requested))
+      return engine;
+    reason = "engine '" + requested.str() + "' is not declared by machine '" +
+             machine.target + "'";
+    return nullptr;
+  }
   // As above: the mapped executor's own vector engine wins over the machine's
   // first, so two engines on two executors are not conflated.
   if (!executor.empty())
@@ -915,8 +946,10 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     if (auto engineAttr = mma.getEngine())
       requested = *engineAttr;
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickMatrixEngine(requested, reason, mappedExecutor(op));
+    const machine::ComputeNode *engine = pickMatrixEngine(
+        requested.empty() ? mappedComputeEngine(op, "matrix_engine")
+                          : requested,
+        reason, mappedExecutor(op));
     if (!engine)
       return invalid("kernel '" + kernelName + "' uses micro.mma: " + reason);
 
@@ -971,8 +1004,8 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
 
   if (auto vector = llvm::dyn_cast<micro::VectorOp>(op)) {
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickVectorEngine(reason, mappedExecutor(op));
+    const machine::ComputeNode *engine = pickVectorEngine(
+        mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.vector: " + reason);
@@ -1001,8 +1034,8 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
 
   if (auto reduce = llvm::dyn_cast<micro::ReduceOp>(op)) {
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickVectorEngine(reason, mappedExecutor(op));
+    const machine::ComputeNode *engine = pickVectorEngine(
+        mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.reduce: " + reason);
@@ -1041,8 +1074,8 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
                      "gather kind '" +
                      gather.getKind().str() + "'");
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickVectorEngine(reason, mappedExecutor(op));
+    const machine::ComputeNode *engine = pickVectorEngine(
+        mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.gather: " + reason);
@@ -1086,7 +1119,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
       if (!engine || engine->kind != "vector_engine")
         return invalid("micro.transform selects an invalid vector resource");
     } else {
-      engine = pickVectorEngine(reason, transformExecutor(op));
+      engine = pickVectorEngine("", reason, transformExecutor(op));
     }
     if (!engine)
       return invalid("kernel '" + kernelName +
@@ -1222,8 +1255,8 @@ llvm::Error DAGBuilder::buildLogicalTileOp(
     return llvm::Error::success();
 
   std::string reason;
-  const machine::ComputeNode *engine =
-      pickVectorEngine(reason, mappedExecutor(op));
+  const machine::ComputeNode *engine = pickVectorEngine(
+      mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
   if (!engine)
     return invalid("kernel '" + kernelName +
                    "' performs a layout transform but " + reason);

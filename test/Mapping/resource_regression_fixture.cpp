@@ -10,6 +10,8 @@
 
 #include "resource_regression_fixture.h"
 
+#include "CompletePlanEvaluation.h"
+
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CoveringSearch.h"
@@ -659,6 +661,115 @@ CaseSpec paddedLayoutSpec() {
 }
 
 //===----------------------------------------------------------------------===//
+// R7: `capacity-topk`
+//===----------------------------------------------------------------------===//
+
+/// One worker with a vector engine, a *small* SRAM and a larger DRAM, both
+/// visible from the worker. A rule that binds the result to SRAM cannot hold
+/// the four simultaneously-live 256-byte result versions (1024 bytes) in 512; a
+/// rule that binds it to DRAM can. The two memories are told apart by the
+/// rules' own `require memory kind ...`, so the search enumerates both and the
+/// evaluation is what tells them apart.
+machine::MachineModel capacityMachine() {
+  machine::MachineModel model;
+  model.target = "issue129.capacity";
+  model.description = "one worker, a small sram and a dram";
+  machine::ExecutorNode worker;
+  worker.id = "worker.0";
+  worker.kind = "worker";
+  worker.concurrency = 1;
+  model.executors = {worker};
+  machine::ComputeNode vpu;
+  vpu.id = "vpu.0";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "worker.0";
+  vpu.concurrency = 1;
+  vpu.elementTypes = {"f32"};
+  vpu.lanes = {{"f32", 8}};
+  vpu.issueCycles = 1;
+  model.computes = {vpu};
+  machine::MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "worker.0";
+  // 512 bytes: two 256-byte results fit, the four live versions (1024) do not.
+  sram.capacityBytes = 512;
+  sram.alignmentBytes = 64;
+  machine::MemoryNode dram;
+  dram.id = "dram.0";
+  dram.kind = "dram";
+  dram.visibleFrom = "worker.0";
+  dram.capacityBytes = 4096;
+  dram.alignmentBytes = 64;
+  model.memories = {sram, dram};
+  return model;
+}
+
+/// Four *temporal* iterations of one 8x8xf32 add inside a four-stage pipeline:
+/// the stages overlap, so four 256-byte result versions are resident at once
+/// and the result allocation's footprint is `256 x 4 = 1024` bytes. No
+/// occurrence states a memory, so which memory holds them is the *rule's*
+/// decision -- the SRAM rule and the DRAM rule are two candidates of one node,
+/// and only the evaluation can tell the legal one from the overflowing one.
+constexpr llvm::StringLiteral kCapacitySource = R"mlir(
+module {
+  micro.kernel @capacity_topk {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c4 = arith.constant 4 : index
+    %a = tensor.empty() : tensor<8x8xf32>
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32>
+    micro.for %i = %c0 to %c4 step %c1 {
+      micro.pipeline stages = 4 {
+        %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32>, !micro.tile<8x8xf32> -> !micro.tile<8x8xf32>
+      }
+    }
+    micro.yield
+  }
+}
+)mlir";
+
+/// The cheap rule (`r.small`, cost 1) binds the result to SRAM; the larger rule
+/// (`r.large`, cost 2) binds it to DRAM. Cost order alone would keep `r.small`
+/// first; only the evaluation knows its 1024-byte footprint cannot fit the
+/// 512-byte SRAM.
+constexpr llvm::StringLiteral kCapacityRules = R"llkmap(
+rule r.small v1 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require memory kind sram;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.capacity.small";
+  emit "issue129_vector_add";
+  cost 1;
+}
+rule r.large v1 {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require memory kind dram;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.capacity.large";
+  emit "issue129_vector_add";
+  cost 2;
+}
+)llkmap";
+
+CaseSpec capacityTopKSpec() {
+  CaseSpec spec;
+  spec.source = kCapacitySource;
+  spec.rules = kCapacityRules;
+  spec.machine = capacityMachine();
+  spec.emitters = {"issue129_vector_add"};
+  return spec;
+}
+
+//===----------------------------------------------------------------------===//
 // Case table
 //===----------------------------------------------------------------------===//
 
@@ -699,6 +810,10 @@ llvm::Expected<ResourceCase> buildPaddedLayout() {
   return buildCase(paddedLayoutSpec());
 }
 
+llvm::Expected<ResourceCase> buildCapacityTopK() {
+  return buildCase(capacityTopKSpec());
+}
+
 llvm::ArrayRef<CaseEntry> caseTable() {
   static const CaseEntry table[] = {
       {"two-compute", &buildTwoCompute},
@@ -709,6 +824,7 @@ llvm::ArrayRef<CaseEntry> caseTable() {
       {"pipeline-four", &buildPipelineFour},
       {"parallel-overlap", &buildParallelOverlap},
       {"padded-layout", &buildPaddedLayout},
+      {"capacity-topk", &buildCapacityTopK},
   };
   return table;
 }
@@ -740,7 +856,19 @@ searchCase(ResourceCase &c, const MappingSearchOptions &options) {
   LayoutContext layoutContext;
   layoutContext.rank = 2;
   layoutContext.elementType = "f32";
-  CoveringSearch search(c.graph, *c.target, *c.context, layoutContext, options);
+  // R7: the completion evaluator lives above the mapping core -- it needs the
+  // dialect conversion and the performance model -- so the fixture, which owns
+  // the source module, its extracted graph and the target together, is where it
+  // is supplied. The evaluator reads the module (binding a plan clones it) and
+  // never mutates it, so a case's source IR is unchanged by the search.
+  MappingSearchOptions effective = options;
+  effective.evaluateCompletePlan = [&c](const CoveringPlan &proposal)
+      -> llvm::Expected<CompletePlanEvaluation> {
+    return evaluateCompletePlan(*c.source, c.graph, *c.target, proposal,
+                                BindContract::Partial);
+  };
+  CoveringSearch search(c.graph, *c.target, *c.context, layoutContext,
+                        effective);
   return search.search();
 }
 

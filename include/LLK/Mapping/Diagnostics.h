@@ -90,6 +90,14 @@ enum class DiagnosticCode {
   /// consumer declared none. Nothing is inferred -- a guessed axis would
   /// materialize a different tile -- so the connection is refused.
   InvalidGatherDeclaration,
+  /// A selected plan cannot be materialized as executable code: a decision it
+  /// makes has no material form (a connection the binder reports as
+  /// unmaterializable under an executable contract). This is a candidate
+  /// *rejection* raised by the completion evaluator (issue #129, task R7) --
+  /// the plan is physically legal but cannot be turned into code, so a search
+  /// that requires executable plans must not retain it. Distinct from
+  /// `NoLayoutTransform`, which names one specific unmaterializable decision.
+  UnsupportedMaterialization,
 };
 
 /// The stable string for `code` (for example `no_matching_rule`). Never empty.

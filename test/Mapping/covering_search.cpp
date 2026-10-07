@@ -5330,3 +5330,256 @@ TEST(CoveringSearch, Issue129IdentityDependsOnDecisionsNotScores) {
   rescored.computeBindings["vector_engine"] = "vpu.b";
   EXPECT_NE(computeInstanceId(instance), computeInstanceId(rescored));
 }
+
+//===----------------------------------------------------------------------===//
+// R7: evaluate complete proposals before exact/beam retention
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A completion evaluator that accepts every proposal, counting the calls, so a
+/// test can learn how many complete proposals a search found.
+struct CountingEvaluator {
+  unsigned calls = 0;
+  unsigned rejectFirst = 0;
+  llvm::Expected<CompletePlanEvaluation> operator()(const CoveringPlan &plan) {
+    ++calls;
+    CompletePlanEvaluation evaluation;
+    if (calls <= rejectFirst) {
+      evaluation.rejection = Diagnostic{
+          DiagnosticCode::MemoryCapacityExceeded,
+          "test evaluator: candidate " + std::to_string(calls) + " rejected"};
+      return evaluation;
+    }
+    evaluation.plan = plan;
+    return evaluation;
+  }
+};
+
+} // namespace
+
+// Issue #129 finding 2 / task R7: exact search could trim to top-K *before*
+// physical storage was validated, so a cheap proposal that fails its capacity
+// was retained and a more expensive legal covering was discarded. The fixture
+// states an `8x8xf32` result with four live versions (pipeline stages four), so
+// its 1024-byte footprint does not fit the 512-byte SRAM the cheap `r.small`
+// rule binds, while it fits the 4096-byte DRAM `r.large` binds.
+TEST(CoveringSearch, EvaluatesFeasibilityBeforeRetainingTopK) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  options.requireCompleteEvaluation = true;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 1u);
+  EXPECT_EQ(result->plans.front().placements.front().rule, "r.large");
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+  EXPECT_FALSE(result->searchTruncated);
+}
+
+// The same fixture proves the two levers are *not* interchangeable: raising K
+// does not recover the legal plan unless feasibility is evaluated before the
+// trim, because the trim's key is the additive rule cost (r.small = 1) and the
+// legal plan is never kept in the first place. With the evaluator, K=1 and K=64
+// select the same best feasible plan.
+TEST(CoveringSearch, ChangingTopKDoesNotChangeTheBestFeasibleExactPlan) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+
+  MappingSearchOptions one;
+  one.mode = SearchMode::Exact;
+  one.topK = 1;
+  auto narrow = issue129::searchCase(*c, one);
+  ASSERT_TRUE(static_cast<bool>(narrow)) << llvm::toString(narrow.takeError());
+  ASSERT_EQ(narrow->plans.size(), 1u);
+
+  MappingSearchOptions many;
+  many.mode = SearchMode::Exact;
+  many.topK = 64;
+  auto wide = issue129::searchCase(*c, many);
+  ASSERT_TRUE(static_cast<bool>(wide)) << llvm::toString(wide.takeError());
+  ASSERT_FALSE(wide->plans.empty());
+  EXPECT_EQ(wide->plans.front().id, narrow->plans.front().id);
+  EXPECT_EQ(wide->plans.front().placements.front().rule, "r.large");
+}
+
+// A rejected cheap proposal must not end a deterministic search: the walk
+// continues and retains the first proposal the evaluator accepts.
+TEST(CoveringSearch, ARejectionContinuesADeterministicSearch) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  CountingEvaluator counting;
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  options.topK = 0; // no cap: keep every accepted plan
+  options.evaluateCompletePlan = [&counting](const CoveringPlan &plan) {
+    return counting(plan);
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // The deterministic walk stops at the first accepted plan, so it evaluated
+  // exactly one proposal and retained it.
+  EXPECT_EQ(counting.calls, 1u);
+  EXPECT_EQ(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// A candidate rejection is a property of one proposal, never a cap: it is
+// tallied under its category and does not set `searchTruncated`.
+TEST(CoveringSearch, ACandidateRejectionDoesNotReportTruncation) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  CountingEvaluator counting;
+  counting.rejectFirst = 1;
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 0;
+  options.evaluateCompletePlan = [&counting](const CoveringPlan &plan) {
+    return counting(plan);
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->searchTruncated);
+  EXPECT_EQ(result->frontier.plansRejectedByCapacity, 1u);
+  // The four complete coverings minus the one rejected.
+  EXPECT_EQ(result->plans.size(), 3u);
+}
+
+// An `llvm::Error` from the evaluator is an infrastructure failure, not a
+// candidate property: it stops the search and is surfaced to the caller.
+TEST(CoveringSearch, ACompletionErrorStopsTheSearch) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.evaluateCompletePlan =
+      [](const CoveringPlan &) -> llvm::Expected<CompletePlanEvaluation> {
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "test evaluator: infrastructure failure");
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_FALSE(static_cast<bool>(result));
+  EXPECT_NE(llvm::toString(result.takeError()).find("infrastructure failure"),
+            std::string::npos);
+}
+
+// The callback contract: exactly one of plan/rejection. Both, or neither, is an
+// invalid callback and stops the search rather than being silently interpreted.
+TEST(CoveringSearch, ACompletionReturningBothPlanAndRejectionIsAnError) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.evaluateCompletePlan =
+      [](const CoveringPlan &plan) -> llvm::Expected<CompletePlanEvaluation> {
+    CompletePlanEvaluation evaluation;
+    evaluation.plan = plan;
+    evaluation.rejection =
+        Diagnostic{DiagnosticCode::MemoryCapacityExceeded, "both"};
+    return evaluation;
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_FALSE(static_cast<bool>(result));
+  EXPECT_NE(llvm::toString(result.takeError()).find("both a plan and"),
+            std::string::npos);
+}
+
+TEST(CoveringSearch, ACompletionReturningNeitherIsAnError) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.evaluateCompletePlan =
+      [](const CoveringPlan &) -> llvm::Expected<CompletePlanEvaluation> {
+    return CompletePlanEvaluation{};
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_FALSE(static_cast<bool>(result));
+  EXPECT_NE(llvm::toString(result.takeError()).find("neither a plan nor"),
+            std::string::npos);
+}
+
+// Requiring validated complete plans without supplying an evaluator is a
+// configuration error, reported before any work is done -- never a silent
+// fallback to the unvalidated path.
+TEST(CoveringSearch, RequiringEvaluationWithoutACallbackIsAConfigurationError) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.requireCompleteEvaluation = true;
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_FALSE(static_cast<bool>(result));
+  EXPECT_NE(
+      llvm::toString(result.takeError()).find("requireCompleteEvaluation"),
+      std::string::npos);
+}
+
+// `topK == 0` is no cap: every feasible complete plan is returned, and the
+// result is not reported as truncated. A finite K still truncates and reports.
+TEST(CoveringSearch, ZeroTopKReturnsEveryFeasibleCompletePlan) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  CountingEvaluator counting;
+  MappingSearchOptions unlimited;
+  unlimited.mode = SearchMode::Exact;
+  unlimited.topK = 0;
+  unlimited.evaluateCompletePlan = [&counting](const CoveringPlan &plan) {
+    return counting(plan);
+  };
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, unlimited);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_FALSE(result->plans.empty());
+    EXPECT_FALSE(result->searchTruncated);
+    EXPECT_EQ(result->plans.size(), static_cast<size_t>(counting.calls));
+  }
+
+  MappingSearchOptions capped = unlimited;
+  capped.topK = 1;
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, capped);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_EQ(result->plans.size(), 1u);
+    EXPECT_TRUE(result->searchTruncated);
+  }
+}

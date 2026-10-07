@@ -14,6 +14,8 @@
 
 #include "LLK/Perf/MicroPerfReport.h"
 
+#include "LLK/Mapping/MappingPlan.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Perf/SelectedKernelAnalysis.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -24,8 +26,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mlir::llk::perf {
@@ -104,6 +108,78 @@ std::string joinCounters(const std::map<std::string, uint64_t> &counters) {
   return text;
 }
 
+/// The live-storage occupancy a *mapped* kernel's own plan recorded, when the
+/// kernel carries one, or an empty map otherwise.
+///
+/// A mapped kernel's `micro.plan` records the storage allocations the selected
+/// plan reserved (`finalizeStoragePlan`'s decisions). Their live peak -- the
+/// bytes each memory must hold simultaneously, honoring the aliases the plan
+/// proved and the simultaneous residency it recorded -- is the same relation
+/// the planner validated the plan's capacity against (`computePeakStorage`),
+/// and it is *not* `MicroDAG::liveTileBytesByMemory`: that accounting sums
+/// every buffer the kernel materializes, which charges loop-nested and reused
+/// buffers as if they were all live at once, and so reports a footprint far
+/// above the plan's proven peak. The plan is the authority for a kernel that
+/// carries one, so the simulator reads it rather than re-deriving a weaker
+/// relation. An empty map means "no plan recorded": the caller keeps the
+/// extraction's own accounting (issue #129, task R7 occupancy reconciliation).
+std::map<mapping::MemoryNodeId, uint64_t>
+planRecordedLivePeak(mlir::Operation *kernel,
+                     const machine::MachineModel &machine) {
+  auto plan = kernel->getAttrOfType<mlir::DictionaryAttr>("micro.plan");
+  if (!plan)
+    return {};
+  auto recorded = plan.getAs<mlir::ArrayAttr>("allocations");
+  if (!recorded)
+    return {};
+
+  std::vector<mapping::StorageAllocation> allocations;
+  allocations.reserve(recorded.size());
+  for (mlir::Attribute entry : recorded) {
+    auto object = mlir::dyn_cast<mlir::DictionaryAttr>(entry);
+    if (!object)
+      return {};
+    mapping::StorageAllocation allocation;
+    auto id = object.getAs<mlir::IntegerAttr>("id");
+    auto bytes = object.getAs<mlir::IntegerAttr>("bytes");
+    auto memory = object.getAs<mlir::StringAttr>("memory");
+    if (!id || !bytes || !memory)
+      return {};
+    allocation.id = id.getInt();
+    allocation.bytes = bytes.getInt();
+    allocation.memory = memory.getValue().str();
+    if (auto alias = object.getAs<mlir::IntegerAttr>("alias_of"))
+      allocation.aliasOf = alias.getInt();
+    if (auto occurrences =
+            object.getAs<mlir::IntegerAttr>("simultaneous_occurrences"))
+      allocation.simultaneousOccurrences = occurrences.getInt();
+    if (auto borrowed = object.getAs<mlir::BoolAttr>("borrowed"))
+      allocation.borrowed = borrowed.getValue();
+    // A memory the kernel does not materialize is not charged: the same rule
+    // `MicroDAG::noteStorage` applies, so the two accountings agree on what a
+    // live byte *is*.
+    const machine::MemoryNode *level = machine.findMemory(allocation.memory);
+    if (!level || level->kind == "dram")
+      continue;
+    // Each allocation contributes its footprint once per simultaneously-live
+    // occurrence, exactly as `finalizeStoragePlan`'s occupancy probe charges
+    // it.
+    if (allocation.simultaneousOccurrences != 0 &&
+        allocation.bytes > std::numeric_limits<uint64_t>::max() /
+                               allocation.simultaneousOccurrences)
+      return {};
+    allocation.bytes *= allocation.simultaneousOccurrences;
+    allocations.push_back(std::move(allocation));
+  }
+  llvm::Expected<std::map<mapping::MemoryNodeId, uint64_t>> peak =
+      mapping::computePeakStorage(allocations);
+  if (!peak) {
+    llvm::consumeError(peak.takeError());
+    return {};
+  }
+  return std::move(*peak);
+}
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -151,10 +227,33 @@ analyzeKernel(mlir::Operation *kernel, const machine::MachineModel &machine,
   report.l0.totalBytesSram = analysis->trafficBytes.count("sram")
                                  ? analysis->trafficBytes.at("sram")
                                  : 0;
-  report.l0.liveTileBytesByMemory = analysis->peakBytes;
   if (level == 1)
     report.l1 = reportL1FromSchedule(*dag, machine, analysis->schedule);
-  report.capacityViolations = checkCapacity(*dag, machine);
+  // Occupancy and the capacity verdict (issue #129, task R7). A mapped kernel
+  // carries its plan's own storage decisions, whose live peak is the relation
+  // the planner already validated; a kernel without one keeps the extraction's
+  // accounting. The verdict is taken against the same number that is reported,
+  // so `live_bytes` and `capacity_violations` can never disagree.
+  std::map<mapping::MemoryNodeId, uint64_t> planPeak =
+      planRecordedLivePeak(kernel, machine);
+  if (planPeak.empty()) {
+    report.l0.liveTileBytesByMemory = analysis->peakBytes;
+    report.capacityViolations = checkCapacity(*dag, machine);
+  } else {
+    std::map<std::string, uint64_t> byKind;
+    for (const auto &[node, bytes] : planPeak) {
+      const machine::MemoryNode *memory = machine.findMemory(node);
+      if (!memory)
+        continue;
+      byKind[memory->kind.empty() ? node : memory->kind] += bytes;
+      if (bytes > memory->capacityBytes)
+        report.capacityViolations.push_back(
+            "memory " + node + " requires " + std::to_string(bytes) +
+            " bytes but machine has " + std::to_string(memory->capacityBytes) +
+            " bytes");
+    }
+    report.l0.liveTileBytesByMemory = std::move(byKind);
+  }
   report.warnings = dag->warnings;
   // The analysis's own completeness verdict, made visible (issue #129, task
   // R6): a reason the extraction already warns about is not repeated, but a

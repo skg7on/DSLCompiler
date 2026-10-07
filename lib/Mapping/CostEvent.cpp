@@ -230,6 +230,19 @@ llvm::Error verifyPlanAnalysisStream(const CoveringPlan &plan,
                           "valid stream: " +
                           llvm::toString(std::move(error)));
 
+  // The recorded compute selection each placement claims (issue #129, task
+  // R1) is part of what the snapshot is a snapshot *of*: a plan whose required
+  // capability has no concrete recorded node, or whose recorded node the
+  // machine does not declare, must be refused here exactly as the accumulation
+  // path refuses it -- otherwise a tampered plan would quietly present the
+  // materialized kernel's stream as if it were its own. Reusing
+  // `recordedEngineForPlacement` keeps one wording for one defect.
+  for (const PlanPlacement &placement : plan.placements)
+    if (llvm::Expected<const machine::ComputeNode *> engine =
+            recordedEngineForPlacement(machine, placement);
+        !engine)
+      return engine.takeError();
+
   std::vector<uint64_t> stepIds;
   stepIds.reserve(plan.steps.size());
   for (const PlanStep &step : plan.steps)
