@@ -19,6 +19,7 @@
 
 #include "resource_regression_fixture.h"
 
+#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/MLIRContext.h"
 
 #include "llvm/Support/Error.h"
@@ -60,7 +61,89 @@ std::string printed(mlir::ModuleOp module) {
   return stream.str();
 }
 
+// Keep the placement/routing fixture fixed and vary only the store destination
+// the bound-kernel analyzer must validate. No memory node models `acc`.
+void setStoreDestination(issue129::ResourceCase &c, llvm::StringRef memory) {
+  auto destination = mlir::parseAttribute("#micro.memory<" + memory.str() + ">",
+                                          c.context.get());
+  ASSERT_TRUE(destination);
+  mlir::Operation *kernel = nullptr;
+  c.source->walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+    if (op->getName().getStringRef() == "micro.tile_store")
+      op->setAttr("dst_memory", destination);
+  });
+  ASSERT_NE(kernel, nullptr);
+  auto graph = extractWorkloadGraph(kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+  c.graph = std::move(*graph);
+}
+
 } // namespace
+
+TEST(CompletePlanEvaluationTest, ExecutableRejectsSelectedAnalysisFailure) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  setStoreDestination(*c, "acc");
+  const auto proposals = proposalsFor(*c);
+  ASSERT_EQ(proposals.size(), 1u);
+  auto evaluated =
+      evaluateCompletePlan(*c->source, c->graph, *c->target, proposals.front(),
+                           BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(evaluated))
+      << llvm::toString(evaluated.takeError());
+  EXPECT_FALSE(evaluated->plan.has_value());
+  ASSERT_TRUE(evaluated->rejection.has_value());
+  EXPECT_EQ(evaluated->rejection->code,
+            DiagnosticCode::UnsupportedMaterialization);
+  EXPECT_NE(evaluated->rejection->message.find("acc"), std::string::npos);
+}
+
+TEST(CompletePlanEvaluationTest, ExecutableRejectsIncompleteSelectedAnalysis) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  const auto proposals = proposalsFor(*c);
+  ASSERT_EQ(proposals.size(), 1u);
+  auto evaluated =
+      evaluateCompletePlan(*c->source, c->graph, *c->target, proposals.front(),
+                           BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(evaluated))
+      << llvm::toString(evaluated.takeError());
+  EXPECT_FALSE(evaluated->plan.has_value());
+  ASSERT_TRUE(evaluated->rejection.has_value());
+  EXPECT_EQ(evaluated->rejection->code,
+            DiagnosticCode::UnsupportedMaterialization);
+  EXPECT_NE(evaluated->rejection->message.find("incomplete"),
+            std::string::npos);
+}
+
+TEST(CompletePlanEvaluationTest, PartialAnalysisFailureStillEnforcesBudget) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  setStoreDestination(*c, "acc");
+  const auto proposals = proposalsFor(*c);
+  ASSERT_EQ(proposals.size(), 1u);
+  auto tight = evaluateCompletePlan(*c->source, c->graph, *c->target,
+                                    proposals.front(), BindContract::Partial,
+                                    /*memoryBudgetBytes=*/1);
+  ASSERT_TRUE(static_cast<bool>(tight)) << llvm::toString(tight.takeError());
+  EXPECT_FALSE(tight->plan.has_value());
+  ASSERT_TRUE(tight->rejection.has_value());
+  EXPECT_EQ(tight->rejection->code, DiagnosticCode::MemoryCapacityExceeded);
+  EXPECT_NE(tight->rejection->message.find("budget"), std::string::npos);
+
+  // Model incompleteness still permits an explicit partial artifact when its
+  // actual finalized live footprint fits. Do not ban the fallback to hide the
+  // missing budget check.
+  auto roomy = evaluateCompletePlan(*c->source, c->graph, *c->target,
+                                    proposals.front(), BindContract::Partial,
+                                    /*memoryBudgetBytes=*/2048);
+  ASSERT_TRUE(static_cast<bool>(roomy)) << llvm::toString(roomy.takeError());
+  EXPECT_FALSE(roomy->rejection.has_value());
+  ASSERT_TRUE(roomy->plan.has_value());
+  EXPECT_FALSE(roomy->plan->diagnostics.warnings.empty());
+}
 
 // A physically legal proposal evaluates into a finalized plan: storage decided
 // (allocations and movement hops), the physical verdict recorded, and a cost

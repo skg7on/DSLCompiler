@@ -23,6 +23,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace mlir::llk::mapping {
 
@@ -227,17 +228,46 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
   // recorded on the plan below.
   llvm::Expected<perf::SelectedKernelAnalysis> analysis =
       perf::analyzeSelectedKernel(bound->kernel, machine, /*requireComplete=*/
-                                  false, plan, graph);
+                                  strict, plan, graph);
   if (!analysis) {
-    // The analysis could not run at all -- the machine does not model a memory
-    // the bound kernel names, for instance. That is a modelling gap, not a
-    // property of this candidate: the plan is kept and scored from its own
-    // synthesized events, exactly as it was before this stage existed, and the
-    // reason is reported. (`micro-perf` on the same kernel reports the same
-    // gap, so the two never disagree about a kernel neither can model.)
+    std::string reason = llvm::toString(analysis.takeError());
+    if (strict)
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      "selected analysis refused the executable plan: " +
+                          reason);
+    // Only an explicitly partial artifact may retain a modeling failure and
+    // fall back to the plan's own synthesized events.
     plan.diagnostics.warnings.push_back(
         "plan evaluation: the selected static analysis could not run: " +
-        llvm::toString(analysis.takeError()));
+        reason);
+    if (memoryBudgetBytes) {
+      perf::SelectedKernelAnalysis storage;
+      if (llvm::Error error = perf::attachPlanStorageLiveness(
+              storage, plan, graph, machine, /*requireComplete=*/false))
+        return std::move(error);
+      if (!storage.storageLivenessFromPlan) {
+        // Match finalization's explicit plan-step fallback when scheduled
+        // liveness is unavailable. Weight slots by simultaneous residency;
+        // temporal instances still share the same slot and aliases are counted
+        // once by computePeakStorage. Never bypass a budget on a modeling gap.
+        std::vector<StorageAllocation> weighted = plan.allocations;
+        for (StorageAllocation &allocation : weighted)
+          if (__builtin_mul_overflow(allocation.bytes,
+                                     allocation.simultaneousOccurrences,
+                                     &allocation.bytes))
+            return rejected(DiagnosticCode::MemoryCapacityExceeded,
+                            "the plan's live bytes overflow the byte budget");
+        auto peak = computePeakStorage(weighted);
+        if (!peak)
+          return rejected(DiagnosticCode::UnsupportedMaterialization,
+                          llvm::toString(peak.takeError()));
+        storage.peakBytes = std::move(*peak);
+      }
+      if (std::string overflow = budgetOverflow(storage, *memoryBudgetBytes);
+          !overflow.empty())
+        return rejected(DiagnosticCode::MemoryCapacityExceeded,
+                        std::move(overflow));
+    }
     scoreFromOwnEvents(plan, machine);
     CompletePlanEvaluation evaluation;
     evaluation.plan = std::move(plan);
@@ -246,9 +276,8 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
 
   // The analysis ran. If it declared itself incomplete, record its ordered
   // reasons on the plan rather than scoring it as if it were exact (issue #129,
-  // task R7 review). This is not a rejection: the plan's physical facts are
-  // what decide executable readiness, and the perf model's own incompleteness
-  // is the same one `micro-perf` reports.
+  // task R7 review). Strict analysis has already refused incompleteness;
+  // partial analysis records the same reasons `micro-perf` reports.
   recordAnalysisCompleteness(*analysis, plan);
 
   // --- 5. validate occupancy ----------------------------------------------

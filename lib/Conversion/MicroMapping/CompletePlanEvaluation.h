@@ -76,6 +76,9 @@ namespace mlir::llk::mapping {
 /// ordered reasons are recorded -- which is what the `report-only` workflow
 /// needs. Either way the strict finalize attempt runs first, so a physically
 /// complete plan is always preferred.
+/// Executable evaluation also requires successful, complete selected-kernel
+/// analysis; failed or incomplete analysis is a candidate rejection. Only the
+/// partial contract permits modeling warnings and fallback scoring.
 ///
 /// An `llvm::Error` is reserved for a malformed invocation and for
 /// infrastructure failures (a structural binder failure under the partial
@@ -89,7 +92,9 @@ namespace mlir::llk::mapping {
 /// because aliasing and reuse can only lower it. A budget the search can no
 /// longer enforce is therefore enforced here, where the real footprint exists;
 /// over it is a candidate rejection, so a search keeps enumerating other
-/// coverings.
+/// coverings. Analysis-error fallback also enforces the budget using finalized
+/// storage liveness, or the same weighted plan-step peak used by finalization
+/// when the event model is unavailable.
 llvm::Expected<CompletePlanEvaluation>
 evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
                      const MappingTarget &target, const CoveringPlan &proposal,
@@ -104,13 +109,9 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
 /// travels with the plan instead of a score being presented as if it were
 /// exact.
 ///
-/// An incomplete *analysis* is deliberately not a rejection. The planner and
-/// the performance model are separate consumers of one kernel: a plan whose
-/// physical facts are complete is still a legal, executable mapping even when
-/// the *perf* model cannot describe every event of it, and `micro-perf` on the
-/// same kernel reports the same reasons. Recording them keeps the two honest
-/// and keeps them agreeing; refusing the plan would conflate a modelling gap in
-/// the simulator with a physical incompleteness in the plan.
+/// This helper records diagnostics for partial artifacts. Executable evaluation
+/// requires complete analysis and refuses such artifacts before this helper is
+/// called.
 void recordAnalysisCompleteness(const perf::SelectedKernelAnalysis &analysis,
                                 CoveringPlan &plan);
 

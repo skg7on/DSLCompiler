@@ -89,3 +89,13 @@ links:
     latency_cycles: 220
     transaction_bytes: 64
     transfer_engines: [dma.b]
+  # After the routed value arrives in DRAM, the fixture's tile_store writes it
+  # back to L2. Model that operation as well: strict selected analysis must not
+  # accept the abstract, unmodeled DMA fallback for this store.
+  - id: dram_to_l2.0
+    source: dram.0
+    destination: l2.0
+    bandwidth_bytes_per_cycle: 32
+    latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.b]

@@ -89,3 +89,19 @@ links:
     latency_cycles: 220
     transaction_bytes: 64
     transfer_engines: [dma.b]
+  # Model the source kernel's input copy and its final store after binding.
+  # These reverse links leave SRAM -> L2 -> DRAM as the only forward route.
+  - id: dram_to_sram.0
+    source: dram.0
+    destination: sram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+  - id: dram_to_l2.0
+    source: dram.0
+    destination: l2.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
+    transaction_bytes: 64
+    transfer_engines: [dma.b]
