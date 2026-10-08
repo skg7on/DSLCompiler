@@ -284,31 +284,56 @@ private:
   /// #129 review finding 6).
   const MeasuredOverrides *measured = nullptr;
 
-  /// The measured duration the selected plan recorded for `op`'s work, when a
-  /// `LatencyProvider` hit: keyed by the instance a mapped compute op records,
-  /// or the connection a materialized copy records.
-  std::optional<double> measuredForOp(mlir::Operation &op) const {
+  // Each stamped operation's nth execution belongs to the connection's nth
+  // occurrence. This joins distinct hop/transform/consumer operations while
+  // keeping repeated loop executions separate.
+  llvm::DenseMap<mlir::Operation *, uint64_t> opOccurrences;
+  std::map<std::pair<uint64_t, uint64_t>, std::vector<uint32_t>>
+      measuredConnectionEvents;
+
+  void applyMeasuredDuration(mlir::Operation &op, MicroEvent &event) {
     if (!measured)
-      return std::nullopt;
+      return;
     if (std::optional<uint64_t> instance = mappedInstance(op))
       if (auto found = measured->byInstance.find(*instance);
-          found != measured->byInstance.end())
-        return found->second;
+          found != measured->byInstance.end()) {
+        event.minCycles = static_cast<uint64_t>(std::ceil(found->second));
+        return;
+      }
     if (std::optional<uint64_t> connection = mappedConnection(op))
-      if (auto found = measured->byConnection.find(*connection);
-          found != measured->byConnection.end())
-        return found->second;
-    return std::nullopt;
+      if (measured->byConnection.count(*connection))
+        measuredConnectionEvents[{*connection, opOccurrences.lookup(&op)}]
+            .push_back(static_cast<uint32_t>(dag.events.size()));
   }
 
-  /// Overrides `event`'s duration with the measured value the plan recorded for
-  /// `op`, when one exists (issue #129 review finding 6). Only the duration
-  /// changes: work, traffic and capacity stay as the static extraction found
-  /// them, so a calibrated estimate can never erase the work or hide a capacity
-  /// fact.
-  void applyMeasuredDuration(mlir::Operation &op, MicroEvent &event) const {
-    if (std::optional<double> cycles = measuredForOp(op))
-      event.minCycles = static_cast<uint64_t>(std::ceil(*cycles));
+  /// A provider measures the whole connection, so its hops and transforms
+  /// share one duration. Retain their static proportions to distribute that
+  /// aggregate across the same resource events. Cumulative rounding keeps the
+  /// sum exactly ceil(measured), even for fractional or sub-hop durations.
+  void applyMeasuredConnections() {
+    for (const auto &[key, events] : measuredConnectionEvents) {
+      const uint64_t cycles = static_cast<uint64_t>(
+          std::ceil(measured->byConnection.lookup(key.first)));
+      long double totalWeight = 0;
+      for (uint32_t id : events)
+        totalWeight += dag.events[id].minCycles;
+      long double prefixWeight = 0;
+      uint64_t previousCycles = 0;
+      for (size_t index = 0; index < events.size(); ++index) {
+        MicroEvent &event = dag.events[events[index]];
+        prefixWeight += event.minCycles;
+        const long double fraction =
+            totalWeight > 0
+                ? prefixWeight / totalWeight
+                : static_cast<long double>(index + 1) / events.size();
+        const uint64_t prefixCycles =
+            index + 1 == events.size()
+                ? cycles
+                : static_cast<uint64_t>(std::floor(cycles * fraction));
+        event.minCycles = prefixCycles - previousCycles;
+        previousCycles = prefixCycles;
+      }
+    }
   }
 };
 
@@ -929,6 +954,7 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
 //===----------------------------------------------------------------------===//
 
 llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
+  ++opOccurrences[&op];
   if (auto view = llvm::dyn_cast<micro::TileViewOp>(op))
     return buildLogicalTileOp(op, view.getSource(), view.getResult(),
                               std::nullopt, EventKind::TileView, state);
@@ -1536,6 +1562,8 @@ llvm::Expected<MicroDAG> DAGBuilder::run(mlir::Operation *kernel) {
   std::vector<uint32_t> created;
   if (llvm::Error err = walkBlock(kernel->getRegion(0).front(), state, created))
     return std::move(err);
+
+  applyMeasuredConnections();
 
   if (dag.events.empty())
     noteWarning("kernel '" + kernelName +

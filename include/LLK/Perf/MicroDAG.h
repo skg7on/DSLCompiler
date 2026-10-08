@@ -191,10 +191,11 @@ struct PlannedRoute {
 /// `byInstance` on `micro.mapping.instance` for a placement's compute work,
 /// `byConnection` on the connection a routed copy records for its movement.
 ///
-/// A hit replaces the static formula's duration for exactly that op's event --
-/// work, traffic and capacity are untouched -- so the analysis the planner and
-/// `micro-perf` share charges the same calibrated number the search ranked on,
-/// instead of overwriting it with the static estimate.
+/// An instance hit replaces its compute event's duration. A connection hit is
+/// one aggregate duration per execution, shared across its hops, transforms
+/// and consumers in proportion to their static event durations. Repeated loop
+/// executions each charge the aggregate again. Work, traffic, dependencies and
+/// capacity are untouched.
 struct MeasuredOverrides {
   llvm::DenseMap<uint64_t, double> byInstance;
   llvm::DenseMap<uint64_t, double> byConnection;

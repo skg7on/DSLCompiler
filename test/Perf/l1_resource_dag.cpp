@@ -1151,6 +1151,122 @@ module {
 }
 )mlir";
 
+// A connection measurement describes the complete routed movement, not each
+// hop separately. Charging 1,000 cycles to both copies doubled this duration.
+TEST(L1ResourceDag, MeasuredConnectionDurationIsSharedByItsHops) {
+  auto parsed = parseKernel(kTwoHopKernel);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  MeasuredOverrides measured;
+  measured.byConnection[500] = 999.25;
+  auto dag = buildMicroDAG(parsed->kernel, model, &measured);
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  uint64_t cycles = 0, bytes = 0, work = 0;
+  for (const MicroEvent &event : dag->events) {
+    if (event.kind != EventKind::AsyncCopy)
+      continue;
+    cycles += event.minCycles;
+    bytes += event.bytes;
+    work += event.workItems;
+  }
+  EXPECT_EQ(cycles, 1000u); // One rounded measurement across two hops.
+  EXPECT_EQ(bytes, 512u);   // The 256-byte tile still traverses both links.
+  EXPECT_EQ(work, 128u);
+}
+
+// Sharing the aggregate must not turn repeated executions into one charge:
+// four serial iterations perform the same two-hop movement four times.
+TEST(L1ResourceDag, MeasuredConnectionDurationRepeatsForEachLoopIteration) {
+  std::string source = kTwoHopKernel.str();
+  const size_t begin = source.find("    %ext =");
+  const size_t end = source.find("    micro.yield", begin);
+  source.insert(end, "    }\n");
+  source.insert(begin, "    %c0 = arith.constant 0 : index\n"
+                       "    %c1 = arith.constant 1 : index\n"
+                       "    %c4 = arith.constant 4 : index\n"
+                       "    micro.for %i = %c0 to %c4 step %c1 {\n");
+  auto parsed = parseKernel(source);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  MeasuredOverrides measured;
+  measured.byConnection[500] = 1000.0;
+  auto dag = buildMicroDAG(parsed->kernel, model, &measured);
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  uint64_t cycles = 0, bytes = 0;
+  for (const MicroEvent &event : dag->events)
+    if (event.kind == EventKind::AsyncCopy) {
+      cycles += event.minCycles;
+      bytes += event.bytes;
+    }
+  EXPECT_EQ(cycles, 4000u);
+  EXPECT_EQ(bytes, 2048u);
+}
+
+// A movement shared by consumers and its layout conversion are still one
+// measured connection. Preserve all work/traffic while sharing its duration.
+TEST(L1ResourceDag, MeasuredConnectionIncludesTransformAndSharedConsumers) {
+  std::string source = kTwoHopKernel.str();
+  source.insert(
+      source.find("    micro.yield"),
+      "    %t3, %tok3 = micro.async_copy %t1 {src_memory = #micro.memory<l2>, "
+      "dst_memory = #micro.memory<sram>, micro.value = 7 : i64, micro.dst_node "
+      "= \"sram.0\", micro.connection = 500 : i64, micro.hop = 2 : i64} : "
+      "tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token\n"
+      "    micro.wait %tok3\n"
+      "    %tr = micro.transform %t2 {src_map = affine_map<(d0,d1)->(d0,d1)>, "
+      "dst_map = affine_map<(d0,d1)->(d1,d0)>, micro.connection = 500 : i64, "
+      "micro.memory_node = \"sram.0\"} : tensor<8x8xf32> -> tensor<8x8xf32>\n");
+  auto parsed = parseKernel(source);
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+  MeasuredOverrides measured;
+  measured.byConnection[500] = 1000.0;
+  auto dag = buildMicroDAG(parsed->kernel, model, &measured);
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  uint64_t cycles = 0, copyBytes = 0, transformWork = 0;
+  for (const MicroEvent &event : dag->events)
+    if (event.kind == EventKind::AsyncCopy ||
+        event.kind == EventKind::Transform) {
+      cycles += event.minCycles;
+      if (event.kind == EventKind::AsyncCopy)
+        copyBytes += event.bytes;
+      else
+        transformWork += event.workItems;
+    }
+  EXPECT_EQ(cycles, 1000u);
+  EXPECT_EQ(copyBytes, 768u);
+  EXPECT_EQ(transformWork, 64u);
+}
+
+TEST(L1ResourceDag, MeasuredRoutedConnectionReachesTheEvaluatedCostOnce) {
+  class ConnectionProvider : public mapping::LatencyProvider {
+  public:
+    std::optional<double>
+    lookupCycles(const mapping::OperationSignature &,
+                 const mapping::TargetContext &) const override {
+      return std::nullopt;
+    }
+    std::optional<double>
+    lookupCycles(const mapping::ConnectionSignature &,
+                 const mapping::TargetContext &) const override {
+      return 1000.0;
+    }
+  } provider;
+  auto c = issue129::resourceCase("two-hop", &provider);
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  mapping::MappingSearchOptions options;
+  options.mode = mapping::SearchMode::Exact;
+  options.topK = 0;
+  options.enableLatencyCache = true;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  for (const mapping::CoveringPlan &plan : result->plans)
+    // The vector takes 64 cycles, the connection 1,000, and the destination
+    // store has no modeled endpoint latency. The route is serial with compute.
+    EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, 1064.0);
+}
+
 // A selected plan and its materialized kernel account for the same normalized
 // events: kind, resource, work, bytes, latency and dependency edges agree. The
 // plan path builds the stream from the plan's step DAG; the perf path builds it
