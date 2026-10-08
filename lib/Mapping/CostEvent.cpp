@@ -821,10 +821,12 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
       if (!hops->empty())
         chainFrom = hops->back();
 
-      // A layout conversion is real work; its cost is the *shared* estimate the
-      // materialized kernel's event also uses, so the two paths cannot
-      // disagree.
-      if (connection.transform) {
+      // Canonical materialization converts once after the entire copy chain,
+      // in the final destination memory. A per-hop movement converts only at
+      // its final hop; earlier hops carry the unchanged source layout.
+      const bool finalMovement =
+          !step->hop || *step->hop + 2 == connection.route.size();
+      if (connection.transform && finalMovement) {
         // The conversion runs on the resource the plan *recorded* for it --
         // `selectTransformResource` picked it by memory visibility, which can
         // disagree with the executor's declaration order. Only a connection
@@ -874,8 +876,18 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
           barrier = true;
           break;
         }
-      if (!barrier)
+      if (!barrier) {
+        // The movement already emitted its wait. This step still carries that
+        // event frontier so an edge through the wait orders the next hop even
+        // when the DMA pool has spare channels and no barrier is necessary.
+        auto movement = movementStep.find(step->connection);
+        if (movement != movementStep.end()) {
+          auto events = stepEvents.find(movement->second);
+          if (events != stepEvents.end() && !events->second.empty())
+            produced.push_back(events->second.back());
+        }
         break;
+      }
       PlanCostEvent barrierEvent = makePlanCostEvent(
           CostEventKind::Synchronization, "sync",
           static_cast<double>(machine.sync.barrierCycles), 0, 0);
@@ -902,6 +914,11 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
         from->second.empty() || to->second.empty())
       continue;
     uint32_t predecessor = from->second.back();
+    // A wait step can forward its movement's already emitted tail. The edge
+    // between these two steps then connects one event to itself and is already
+    // satisfied; retaining it would introduce a cycle into the event DAG.
+    if (predecessor == to->second.front())
+      continue;
     uint32_t &head = dag.events[to->second.front()].deps.emplace_back();
     head = predecessor;
   }

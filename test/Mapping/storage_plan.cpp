@@ -13,6 +13,7 @@
 #include "resource_regression_fixture.h"
 
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingTarget.h"
@@ -1484,6 +1485,97 @@ TEST(StoragePlan, APerHopMovementEmitsOneTransferEventPerHop) {
   EXPECT_EQ(transfers, plan.connectionPlans.front().hops.size())
       << "one transfer event per materialized hop";
   EXPECT_EQ(hopsSeen.size(), transfers) << "each hop must appear exactly once";
+}
+
+// A shared DMA pool can issue unrelated copies concurrently. The two hops of
+// this copy still need the intermediate's write-before-read dependency, even
+// when their synchronization steps do not emit an additional barrier.
+TEST(StoragePlan, APerHopWaitOrdersAMultichannelDmaWithoutABarrier) {
+  auto built = twoHopCase();
+  ASSERT_TRUE(bool(built)) << llvm::toString(built.takeError());
+  CoveringPlan &plan = built->plan;
+  MachineModel machine = built->c.target->machine();
+  for (LinkEdge &link : machine.links)
+    link.transferEngines = {"dma.a"};
+  for (MemoryNode &memory : machine.memories)
+    if (memory.id == "l2.0")
+      memory.visibleFrom = "cluster.a"; // dma.a sees both hop sources
+  machine.transferEngines.front().count = 2;
+  machine.transferEngines.front().maxOutstanding = 2;
+  plan.connectionPlans.front().engines = {"dma.a"};
+  llvm::Error error = finalizeStoragePlan(built->c.graph, plan, machine);
+  ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
+  ASSERT_FALSE(plan.synchronization.empty());
+  for (const SynchronizationStep &sync : plan.synchronization)
+    ASSERT_FALSE(sync.requiresBarrier);
+
+  auto events = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(bool(events)) << llvm::toString(events.takeError());
+  const EventScheduleResult schedule =
+      scheduleNormalizedEvents(events->events, machine);
+  std::optional<uint32_t> firstHop, secondHop;
+  for (uint32_t id = 0; id < events->events.size(); ++id) {
+    const PlanCostEvent &event = events->events[id];
+    if (event.event.kind != CostEventKind::TransferHop)
+      continue;
+    if (event.hopIndex == 0)
+      firstHop = id;
+    else if (event.hopIndex == 1)
+      secondHop = id;
+  }
+  ASSERT_TRUE(firstHop.has_value());
+  ASSERT_TRUE(secondHop.has_value());
+  EXPECT_GE(schedule.entries[*secondHop].start,
+            schedule.entries[*firstHop].finish);
+}
+
+// A conversion applies to the fully delivered value, once in the destination
+// memory. Applying it after every hop duplicates work and converts before the
+// value has arrived at the resource the plan selected.
+TEST(StoragePlan, AMultihopTransformRunsOnceAfterTheFinalTransfer) {
+  auto built = twoHopCase();
+  ASSERT_TRUE(bool(built)) << llvm::toString(built.takeError());
+  CoveringPlan &plan = built->plan;
+  PlanConnection &connection = plan.connectionPlans.front();
+  mlir::MLIRContext *context = connection.valueType.getContext();
+  const mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, context);
+  const mlir::AffineExpr d1 = mlir::getAffineDimExpr(1, context);
+  LayoutTransform transform;
+  transform.srcLayout = "plain";
+  transform.dstLayout = "transpose";
+  transform.srcMap = mlir::AffineMap::get(2, 0, {d0, d1}, context);
+  transform.dstMap = mlir::AffineMap::get(2, 0, {d1, d0}, context);
+  transform.computeResource = "vpu.b";
+  connection.kind = ConnectionKind::TransferAndTransform;
+  connection.transform = transform;
+  MachineModel machine = built->c.target->machine();
+  ComputeNode destinationEngine = machine.computes.front();
+  destinationEngine.id = "vpu.b";
+  destinationEngine.attachedTo = "worker.b";
+  machine.computes.push_back(destinationEngine);
+  llvm::Error error = finalizeStoragePlan(built->c.graph, plan, machine);
+  ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
+
+  auto events = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(bool(events)) << llvm::toString(events.takeError());
+  const EventScheduleResult schedule =
+      scheduleNormalizedEvents(events->events, machine);
+  std::optional<uint32_t> finalHop;
+  std::vector<uint32_t> conversions;
+  for (uint32_t id = 0; id < events->events.size(); ++id) {
+    const PlanCostEvent &event = events->events[id];
+    if (event.event.kind == CostEventKind::TransferHop && event.hopIndex == 1)
+      finalHop = id;
+    if (event.event.kind == CostEventKind::Transform)
+      conversions.push_back(id);
+  }
+  ASSERT_TRUE(finalHop.has_value());
+  EXPECT_EQ(conversions.size(), 1u);
+  for (uint32_t conversion : conversions) {
+    EXPECT_EQ(events->events[conversion].event.resource, "vpu.b");
+    EXPECT_GE(schedule.entries[conversion].start,
+              schedule.entries[*finalHop].finish);
+  }
 }
 
 // Routing checks the intermediate's capacity for the *copy* it enumerates; the
