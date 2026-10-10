@@ -76,7 +76,8 @@ def main():
         llk_compile, "--mapping-target=x86-avx2",
         "--mapping-root=" + source_dir, "--mapping-mode=exact",
         "--mapping-stop=target-lowered", "--emit=mlir", fixture])
-    assert "target-lowered-ops=3" in lowered
+    assert "target-lowered-ops=4" in lowered
+    assert "reference-lowered-ops=0" in lowered
     assert "vector = 8" in lowered
 
 

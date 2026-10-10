@@ -1361,6 +1361,11 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
           ${CMAKE_CURRENT_BINARY_DIR}/SelectedVectorWidth
   )
+  add_test(NAME SelectedContraction
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/selected_contraction.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/SelectedContraction
+  )
   # A target nobody registered is a diagnostic naming the ones that are, not a
   # silent fallback to a different backend.
   add_test(NAME MicroMappingCompileRejectsUnknownTarget

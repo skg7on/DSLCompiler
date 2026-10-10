@@ -211,11 +211,16 @@ void promoteUnitRowArithmetic(ModuleOp module, IRRewriter &rewriter) {
     SmallVector<Value> operands;
     for (Value operand : op->getOperands()) {
       auto operandType = dyn_cast<VectorType>(operand.getType());
-      if (operandType && operandType == oldType)
-        operands.push_back(vector::ShapeCastOp::create(rewriter, op->getLoc(),
-                                                       flatType, operand));
-      else
+      if (operandType && operandType.getRank() == 2 &&
+          operandType.getShape()[0] == 1 &&
+          operandType.getShape()[1] == oldType.getShape()[1]) {
+        auto flatOperandType = VectorType::get({operandType.getShape()[1]},
+                                               operandType.getElementType());
+        operands.push_back(vector::ShapeCastOp::create(
+            rewriter, op->getLoc(), flatOperandType, operand));
+      } else {
         operands.push_back(operand);
+      }
     }
 
     OperationState state(op->getLoc(), op->getName());
@@ -234,10 +239,17 @@ struct AVX2BackendLoweringPass
     : PassWrapper<AVX2BackendLoweringPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AVX2BackendLoweringPass)
 
+  AVX2BackendLoweringPass() = default;
+  AVX2BackendLoweringPass(int64_t f32Width, int64_t bf16Width)
+      : f32VectorWidth(f32Width), bf16VectorWidth(bf16Width) {}
+
   StringRef getArgument() const final { return "llk-avx2-selected-lowering"; }
   StringRef getDescription() const final {
     return "Realize selected AVX2 elementwise bundles in Vector IR";
   }
+
+  int64_t f32VectorWidth = 0;
+  int64_t bf16VectorWidth = 0;
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, linalg::LinalgDialect,
@@ -253,13 +265,175 @@ struct AVX2BackendLoweringPass
       return;
     }
 
+    llvm::SmallDenseSet<int64_t> realizedInstances;
+    SmallVector<linalg::MatmulOp> selectedMatmuls;
+    module.walk([&](linalg::MatmulOp matmul) {
+      if (matmul->hasAttr("micro.mapping"))
+        selectedMatmuls.push_back(matmul);
+    });
+    for (linalg::MatmulOp matmul : selectedMatmuls) {
+      auto mapping = matmul->getAttrOfType<DictionaryAttr>("micro.mapping");
+      auto emitter = mapping.getAs<StringAttr>("emitter");
+      auto bundle = mapping.getAs<StringAttr>("bundle");
+      auto instance = mapping.getAs<IntegerAttr>("instance");
+      auto microOp = matmul->getAttrOfType<StringAttr>("micro.op");
+      const std::string context =
+          "bundle '" + (bundle ? bundle.getValue().str() : "<unknown>") +
+          "' instance " +
+          (instance ? std::to_string(instance.getInt()) : "<unknown>");
+      auto fail = [&](llvm::Twine reason) {
+        matmul.emitError("AVX2 selected lowering rejected ")
+            << context << ": " << reason;
+        signalPassFailure();
+      };
+      if (!emitter || emitter.getValue() != "avx2_mma" || !instance ||
+          !microOp || microOp.getValue() != "mma") {
+        fail("Linalg matmul has unsupported or missing selected mapping "
+             "provenance");
+        return;
+      }
+      std::optional<int64_t> width = selectedWidth(mapping);
+      if (!width || (*width != 4 && *width != 8)) {
+        fail("selected VW is missing, conflicting, or unsupported");
+        return;
+      }
+      auto resultType =
+          dyn_cast<RankedTensorType>(matmul.getResult(0).getType());
+      if (!resultType || resultType.getRank() != 2 ||
+          !resultType.hasStaticShape() ||
+          resultType.getShape()[1] % *width != 0 ||
+          !resultType.getElementType().isF32()) {
+        fail("selected contraction needs a static f32 accumulator tile "
+             "divisible by VW");
+        return;
+      }
+      SmallVector<int64_t> tileSizes{1, *width, 0};
+      linalg::LinalgTilingOptions tiling;
+      tiling.setTileSizes(tileSizes);
+      rewriter.setInsertionPoint(matmul);
+      FailureOr<linalg::TiledLinalgOp> tiled =
+          linalg::tileLinalgOp(rewriter, matmul, tiling);
+      if (failed(tiled)) {
+        fail("Linalg matmul tiling failed for the selected vector width");
+        return;
+      }
+      auto lhsType = cast<RankedTensorType>(matmul.getInputs()[0].getType());
+      SmallVector<int64_t> vectorSizes{1, *width, lhsType.getShape()[1]};
+      SmallVector<bool> scalableVecDims(3, false);
+      FailureOr<linalg::VectorizationResult> vectorized = linalg::vectorize(
+          rewriter, tiled->op.getOperation(), vectorSizes, scalableVecDims,
+          /*vectorizeNDExtract=*/false,
+          /*flatten1DDepthwiseConv=*/false,
+          /*assumeDynamicDimsMatchVecSizes=*/false,
+          /*createNamedContraction=*/true);
+      if (failed(vectorized)) {
+        fail("Linalg matmul vectorization failed for the selected width");
+        return;
+      }
+      rewriter.replaceOp(tiled->op, vectorized->replacements);
+      rewriter.replaceOp(matmul, tiled->tensorResults);
+      realizedInstances.insert(instance.getInt());
+    }
+
+    SmallVector<linalg::ReduceOp> selectedReductions;
+    module.walk([&](linalg::ReduceOp reduction) {
+      if (reduction->hasAttr("micro.mapping"))
+        selectedReductions.push_back(reduction);
+    });
+    for (linalg::ReduceOp reduction : selectedReductions) {
+      auto mapping = reduction->getAttrOfType<DictionaryAttr>("micro.mapping");
+      auto emitter = mapping.getAs<StringAttr>("emitter");
+      auto bundle = mapping.getAs<StringAttr>("bundle");
+      auto instance = mapping.getAs<IntegerAttr>("instance");
+      auto microOp = reduction->getAttrOfType<StringAttr>("micro.op");
+      auto reduceKind =
+          reduction->getAttrOfType<StringAttr>("micro.reduce_kind");
+      const std::string context =
+          "bundle '" + (bundle ? bundle.getValue().str() : "<unknown>") +
+          "' instance " +
+          (instance ? std::to_string(instance.getInt()) : "<unknown>");
+      auto fail = [&](llvm::Twine reason) {
+        reduction.emitError("AVX2 selected lowering rejected ")
+            << context << ": " << reason;
+        signalPassFailure();
+      };
+      if (!emitter || emitter.getValue() != "avx2_reduce" || !instance ||
+          !microOp || microOp.getValue() != "reduce" || !reduceKind ||
+          reduceKind.getValue() != "sum") {
+        fail("selected reduction has unsupported or missing provenance or "
+             "semantics");
+        return;
+      }
+      std::optional<int64_t> width = selectedWidth(mapping);
+      if (!width || (*width != 4 && *width != 8)) {
+        fail("selected VW is missing, conflicting, or unsupported");
+        return;
+      }
+      if (reduction.getInputs().size() != 1 ||
+          reduction->getNumOperands() != 2 || reduction->getNumResults() != 1) {
+        fail("selected sum reduction needs one input and one accumulator");
+        return;
+      }
+      auto inputType =
+          dyn_cast<RankedTensorType>(reduction.getInputs()[0].getType());
+      auto resultType =
+          dyn_cast<RankedTensorType>(reduction.getResult(0).getType());
+      auto dimensions =
+          reduction->getAttrOfType<DenseI64ArrayAttr>("dimensions");
+      if (!inputType || !resultType || !inputType.hasStaticShape() ||
+          !resultType.hasStaticShape() || inputType.getRank() != 2 ||
+          resultType.getRank() != 1 || !inputType.getElementType().isF32() ||
+          !resultType.getElementType().isF32() || !dimensions ||
+          dimensions.size() != 1 || dimensions[0] < 0 || dimensions[0] >= 2) {
+        fail("selected sum needs static rank-two f32 input and rank-one "
+             "f32 output with one reduction axis");
+        return;
+      }
+      int64_t reductionAxis = dimensions[0];
+      int64_t parallelAxis = reductionAxis == 0 ? 1 : 0;
+      if (inputType.getShape()[parallelAxis] % *width != 0) {
+        fail("selected VW does not divide the reduction output tile");
+        return;
+      }
+      SmallVector<int64_t> tileSizes{0, 0};
+      tileSizes[parallelAxis] = *width;
+      linalg::LinalgTilingOptions tiling;
+      tiling.setTileSizes(tileSizes);
+      rewriter.setInsertionPoint(reduction);
+      FailureOr<linalg::TiledLinalgOp> tiled =
+          linalg::tileLinalgOp(rewriter, reduction, tiling);
+      if (failed(tiled)) {
+        fail("Linalg sum tiling failed for the selected vector width");
+        return;
+      }
+      SmallVector<int64_t> vectorSizes(inputType.getShape().begin(),
+                                       inputType.getShape().end());
+      vectorSizes[parallelAxis] = *width;
+      SmallVector<bool> scalableVecDims(2, false);
+      FailureOr<linalg::VectorizationResult> vectorized = linalg::vectorize(
+          rewriter, tiled->op.getOperation(), vectorSizes, scalableVecDims);
+      if (failed(vectorized)) {
+        fail("Linalg sum vectorization failed for the selected vector width");
+        return;
+      }
+      rewriter.replaceOp(tiled->op, vectorized->replacements);
+      rewriter.replaceOp(reduction, tiled->tensorResults);
+      realizedInstances.insert(instance.getInt());
+    }
+
     SmallVector<linalg::GenericOp> selected;
+    SmallVector<linalg::GenericOp> selectedTransforms;
     module.walk([&](linalg::GenericOp generic) {
-      if (generic->hasAttr("micro.mapping"))
+      if (generic->hasAttr("micro.mapping")) {
         selected.push_back(generic);
+        return;
+      }
+      auto microOp = generic->getAttrOfType<StringAttr>("micro.op");
+      if (microOp && microOp.getValue() == "transform" &&
+          generic->hasAttr("micro.engine"))
+        selectedTransforms.push_back(generic);
     });
 
-    llvm::SmallDenseSet<int64_t> realizedInstances;
     std::map<int64_t, unsigned> fusedGroupSizes;
     for (linalg::GenericOp generic : selected) {
       auto mapping = generic->getAttrOfType<DictionaryAttr>("micro.mapping");
@@ -366,18 +540,82 @@ struct AVX2BackendLoweringPass
       realizedInstances.insert(instance.getInt());
     }
 
+    llvm::SmallDenseSet<int64_t> realizedConnections;
+    unsigned anonymousTransformsRealized = 0;
+    for (linalg::GenericOp generic : selectedTransforms) {
+      auto engine = generic->getAttrOfType<StringAttr>("micro.engine");
+      auto connection = generic->getAttrOfType<IntegerAttr>("micro.connection");
+      auto resultType =
+          dyn_cast<RankedTensorType>(generic.getResult(0).getType());
+      int64_t width = 0;
+      if (resultType && resultType.getElementType().isF32())
+        width = f32VectorWidth;
+      else if (resultType && resultType.getElementType().isBF16())
+        width = bf16VectorWidth;
+      const std::string context =
+          "selected layout transform connection " +
+          (connection ? std::to_string(connection.getInt()) : "<unknown>");
+      auto fail = [&](llvm::Twine reason) {
+        generic.emitError("AVX2 selected lowering rejected ")
+            << context << " on engine '"
+            << (engine ? engine.getValue() : StringRef("<unknown>"))
+            << "': " << reason;
+        signalPassFailure();
+      };
+      if (!engine || engine.getValue().empty() || !resultType ||
+          !resultType.hasStaticShape() || resultType.getRank() != 2 ||
+          width <= 0) {
+        fail("layout transform needs a selected engine, static rank-two tile, "
+             "and a declared AVX2 lane width");
+        return;
+      }
+      SmallVector<int64_t> tileSizes{1, width};
+      linalg::LinalgTilingOptions tiling;
+      tiling.setTileSizes(tileSizes);
+      rewriter.setInsertionPoint(generic);
+      FailureOr<linalg::TiledLinalgOp> tiled =
+          linalg::tileLinalgOp(rewriter, generic, tiling);
+      if (failed(tiled)) {
+        fail("layout transform tiling failed for the selected width");
+        return;
+      }
+      SmallVector<bool> scalableVecDims(2, false);
+      FailureOr<linalg::VectorizationResult> vectorized = linalg::vectorize(
+          rewriter, tiled->op.getOperation(), tileSizes, scalableVecDims);
+      if (failed(vectorized)) {
+        fail("layout transform vectorization failed for the selected width");
+        return;
+      }
+      rewriter.replaceOp(tiled->op, vectorized->replacements);
+      rewriter.replaceOp(generic, tiled->tensorResults);
+      if (connection)
+        realizedConnections.insert(connection.getInt());
+      else
+        ++anonymousTransformsRealized;
+    }
+
     promoteUnitRowArithmetic(module, rewriter);
 
+    unsigned realizedGroupCount = realizedInstances.size() +
+                                  realizedConnections.size() +
+                                  anonymousTransformsRealized;
     module->setAttr("llk.backend_groups_realized",
                     IntegerAttr::get(IntegerType::get(&getContext(), 64),
-                                     realizedInstances.size()));
+                                     realizedGroupCount));
+    module->setAttr("llk.backend_connections_realized",
+                    IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                                     realizedConnections.size() +
+                                         anonymousTransformsRealized));
   }
 };
 
 } // namespace
 
-void buildAVX2SelectedBackendPipeline(mlir::OpPassManager &pm) {
-  pm.addPass(std::make_unique<AVX2BackendLoweringPass>());
+void buildAVX2SelectedBackendPipeline(mlir::OpPassManager &pm,
+                                      int64_t f32VectorWidth,
+                                      int64_t bf16VectorWidth) {
+  pm.addPass(std::make_unique<AVX2BackendLoweringPass>(f32VectorWidth,
+                                                       bf16VectorWidth));
 }
 
 } // namespace mlir::llk::target::avx2

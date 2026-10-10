@@ -781,14 +781,14 @@ TEST(Avx2Target, LowersAWholeFusedGroupInOneBundle) {
             std::string::npos);
 }
 
-TEST(Avx2Target, ReportsEmitterKeysItHasNoLoweringFor) {
+TEST(Avx2Target, RejectsMmaHandoffForNonMmaOps) {
   llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
   ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
   mlir::MLIRContext context;
   context.loadDialect<mlir::micro::MicroDialect, mlir::tensor::TensorDialect>();
 
-  // `avx2_mma` is declared and its bundles verify; that is not the same as
-  // having an implementation, and the emitter says so rather than pretending.
+  // MMA bundles hand off to the selected Vector backend, but only when the
+  // covered operation is actually an MMA.
   std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter("avx2_mma");
   ASSERT_TRUE(emitter);
 
@@ -806,6 +806,7 @@ TEST(Avx2Target, ReportsEmitterKeysItHasNoLoweringFor) {
   llvm::Error error =
       emitter->lower(coveredVectorOps(*module), bundle, lowering, rewriter);
   ASSERT_TRUE(static_cast<bool>(error));
-  EXPECT_NE(llvm::toString(std::move(error)).find("no lowering implementation"),
+  EXPECT_NE(llvm::toString(std::move(error))
+                .find("cannot hand off covered operation"),
             std::string::npos);
 }

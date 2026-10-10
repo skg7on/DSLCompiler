@@ -40,7 +40,18 @@ public:
   }
   llvm::Error
   buildSelectedBackendPipeline(mlir::OpPassManager &pm) const override {
-    buildAVX2SelectedBackendPipeline(pm);
+    const machine::ComputeNode *vectorEngine = machine().findCompute("vpu");
+    if (!vectorEngine)
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "AVX2 selected backend has no vector_engine capability 'vpu'");
+    auto f32 = vectorEngine->lanes.find("f32");
+    auto bf16 = vectorEngine->lanes.find("bf16");
+    if (f32 == vectorEngine->lanes.end() || bf16 == vectorEngine->lanes.end())
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "AVX2 selected backend needs f32 and bf16 vector lane widths");
+    buildAVX2SelectedBackendPipeline(pm, f32->second, bf16->second);
     return llvm::Error::success();
   }
 

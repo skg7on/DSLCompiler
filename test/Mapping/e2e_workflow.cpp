@@ -287,11 +287,10 @@ TEST(E2EWorkflow, CompilesAMappedKernelToARunnableExecutable) {
   EXPECT_EQ(compiled->executable->abi().inputs[0].shape,
             (std::vector<int64_t>{8, 8}));
 
-  // The vector add is the one operation the AVX2 package lowers itself; the
-  // staged copy is carried by the reference bridge. Reporting the two apart is
-  // what keeps "the target ran this" from being claimed for both.
-  EXPECT_GE(compiled->targetLowered, 1u);
-  EXPECT_GE(compiled->referenceLowered, 1u);
+  // Both selected groups are handed to their concrete consumers: vector
+  // arithmetic to the AVX2 Vector pass and the copy to the host movement ABI.
+  EXPECT_EQ(compiled->targetLowered, 2u);
+  EXPECT_EQ(compiled->referenceLowered, 0u);
 
   // The source module is untouched: binding clones.
   EXPECT_FALSE(parsed.kernel->hasAttr("micro.plan"));
@@ -368,7 +367,8 @@ TEST(E2EWorkflow, StopsBeforeExecutingWhenAsked) {
     ASSERT_TRUE(static_cast<bool>(compiled))
         << llvm::toString(compiled.takeError());
     EXPECT_EQ(compiled->stopped, ::llk::MappedStop::TargetLowered);
-    EXPECT_EQ(compiled->targetLowered, 1u);
+    EXPECT_EQ(compiled->targetLowered, 2u);
+    EXPECT_EQ(compiled->referenceLowered, 0u);
 
     std::string text;
     llvm::raw_string_ostream stream(text);
