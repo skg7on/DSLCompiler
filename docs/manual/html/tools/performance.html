@@ -283,14 +283,14 @@ calibration work tracked by #51/#52 is separate from the simulator.</p>
 <section id="first-report">
 <span id="tools-performance-first-report"></span><h2>First report<a class="headerlink" href="#first-report" title="Link to this heading">¶</a></h2>
 <p>Run these commands from the repository root after building the tools. Paths
-such as <code class="docutils literal notranslate"><span class="pre">build/micro-perf</span></code> refer to your local build; profile and fixture paths
+such as <code class="docutils literal notranslate"><span class="pre">build/bin/micro-perf</span></code> refer to your local build; profile and fixture paths
 refer to the source checkout.</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/micro-perf<span class="w"> </span>--help
-build/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>--level<span class="o">=</span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/micro-perf<span class="w"> </span>--help
+build/bin/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>--level<span class="o">=</span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>test/Perf/micro_perf_cli.mlir
-build/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>--level<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+build/bin/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>--level<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>test/Perf/micro_perf_cli.mlir
-build/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>--format<span class="o">=</span>text<span class="w"> </span><span class="se">\</span>
+build/bin/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>--format<span class="o">=</span>text<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--kernel<span class="o">=</span>gemm_tile<span class="w"> </span>test/Perf/micro_perf_cli.mlir
 </pre></div>
 </div>
@@ -302,7 +302,7 @@ bytes, and 1,024 accumulator bytes. L0 reports 316 predicted cycles; L1 reports
 results or a claim about a particular processor.</p>
 <p>Reports go to standard output. Redirect stdout to keep YAML for comparison;
 diagnostic errors go to standard error.</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>--level<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>--level<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>test/Perf/micro_perf_cli.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/gemm-perf.yaml
 </pre></div>
 </div>
@@ -492,7 +492,7 @@ host to have AVX2 and does not prove that the kernel’s <code class="docutils l
 the selected model. For a comparison, keep IR, machine profile, compiler revision,
 analysis level, and warnings together.</p>
 <p>The same small fixture can be analyzed against the accelerator model:</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/generic-ai-accel-v2.yaml<span class="w"> </span>--level<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/generic-ai-accel-v2.yaml<span class="w"> </span>--level<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>test/Perf/micro_perf_cli.mlir
 </pre></div>
 </div>
@@ -543,7 +543,7 @@ establish numerical correctness or executable target support.</p>
 </table>
 </div>
 <p>To make modeled capacity a shell gate:</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/micro-perf<span class="w"> </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--fail-on-capacity-violation<span class="w"> </span>test/Perf/micro_perf_cli.mlir
 </pre></div>
 </div>

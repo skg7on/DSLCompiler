@@ -98,11 +98,11 @@ Check the build
 
 .. code-block:: bash
 
-   build/llk-opt --help
-   build/llk-compile --help
-   build/micro-perf --help
-   build/llk-tune --help
-   build/llk-bench --help
+   build/bin/llk-opt --help
+   build/bin/llk-compile --help
+   build/bin/micro-perf --help
+   build/bin/llk-tune --help
+   build/bin/llk-bench --help
    cmake --build build --target check-llk --parallel 4
 
 ``check-llk`` builds the registered test binaries and runs CTest. After building them, ``ctest --test-dir build --output-on-failure`` runs the suite again without building. Use ``ctest --test-dir build -N`` to see what your configuration registered. Some legacy tests may skip; report the actual skips when sharing evidence. A green suite with skips is not proof of selected AVX2 execution.
@@ -115,8 +115,8 @@ First useful result
 .. code-block:: bash
 
    mkdir -p build/tutorial
-   build/llk-opt docs/manual/source/examples/matmul.mlir > build/tutorial/matmul.parsed.mlir
-   build/llk-compile --emit=micro docs/manual/source/examples/matmul.mlir \
+   build/bin/llk-opt docs/manual/source/examples/matmul.mlir > build/tutorial/matmul.parsed.mlir
+   build/bin/llk-compile --emit=micro docs/manual/source/examples/matmul.mlir \
      > build/tutorial/matmul.micro.mlir
 
 The first output is parsed and printed semantic MLIR. The second includes a concrete ``micro.kernel`` beside the original function. Neither command invokes the kernel on input tensors. Continue with :doc:`your first kernel </tutorials/01-first-kernel>`, then :doc:`mapping </tutorials/02-mapping>`.

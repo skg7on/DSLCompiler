@@ -20,17 +20,17 @@ First report
 ------------
 
 Run these commands from the repository root after building the tools. Paths
-such as ``build/micro-perf`` refer to your local build; profile and fixture paths
+such as ``build/bin/micro-perf`` refer to your local build; profile and fixture paths
 refer to the source checkout.
 
 .. code-block:: sh
 
-   build/micro-perf --help
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml --level=0 \
+   build/bin/micro-perf --help
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=0 \
      test/Perf/micro_perf_cli.mlir
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
      test/Perf/micro_perf_cli.mlir
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml --format=text \
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --format=text \
      --kernel=gemm_tile test/Perf/micro_perf_cli.mlir
 
 The fixture models a ``16×16×32`` BF16 MMA, two copies into SRAM, a wait,
@@ -45,7 +45,7 @@ diagnostic errors go to standard error.
 
 .. code-block:: sh
 
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
      test/Perf/micro_perf_cli.mlir > build/gemm-perf.yaml
 
 .. _tools-performance-options-and-defaults:
@@ -212,7 +212,7 @@ The same small fixture can be analyzed against the accelerator model:
 
 .. code-block:: sh
 
-   build/micro-perf --machine=machines/generic-ai-accel-v2.yaml --level=1 \
+   build/bin/micro-perf --machine=machines/generic-ai-accel-v2.yaml --level=1 \
      test/Perf/micro_perf_cli.mlir
 
 This is useful for checking sensitivity to modeled hardware. It does not
@@ -254,7 +254,7 @@ To make modeled capacity a shell gate:
 
 .. code-block:: sh
 
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml \
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml \
      --fail-on-capacity-violation test/Perf/micro_perf_cli.mlir
 
 This checked fixture fits the model and returns zero. A capacity violation

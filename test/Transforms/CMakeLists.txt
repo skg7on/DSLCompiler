@@ -1,0 +1,9 @@
+add_llk_test_category(Transforms
+    SOURCES
+        schedule_loader.cpp
+    LIBRARIES
+        LLKCommon
+        ${LLK_MLIR_EXEC_LIBS}
+    DEFINITIONS
+        LLK_SCHEDULE_DB="${CMAKE_SOURCE_DIR}/schedules/schedule_db.json"
+)

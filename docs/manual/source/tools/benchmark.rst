@@ -23,8 +23,8 @@ Run from the repository root after building:
 
 .. code-block:: sh
 
-   build/llk-bench --help
-   build/llk-bench -M=2 -N=16 -K=16 --threads=1 \
+   build/bin/llk-bench --help
+   build/bin/llk-bench -M=2 -N=16 -K=16 --threads=1 \
      --warmup-ms=10 --measure-ms=20 --reps=2
 
 This bounded command exercises the harness without the large default shape.
@@ -40,7 +40,7 @@ measurements. To keep a log:
 
 .. code-block:: sh
 
-   build/llk-bench -M=2 -N=16 -K=16 --threads=1 \
+   build/bin/llk-bench -M=2 -N=16 -K=16 --threads=1 \
      --warmup-ms=10 --measure-ms=20 --reps=2 > build/bench-small.txt
 
 .. _tools-benchmark-options-and-defaults:

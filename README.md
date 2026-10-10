@@ -81,6 +81,10 @@ cmake --build build --target check-llk --parallel 4
 
 Each worktree needs its own project build directory; the LLVM build can be shared. `check-llk` builds the registered tests and runs CTest.
 
+Libraries are written to `build/lib`; tools and category test executables are written to `build/bin`. Test configuration lives under [`test/`](test/CMakeLists.txt), with GTest sources combined by category and individual cases labeled in CTest. For example, run mapping tests with `ctest --test-dir build -L Mapping --output-on-failure` or `build/bin/LLKMappingTests --gtest_filter='MappingPlan.*'`.
+
+Use `-DBUILD_TESTING=OFF` to omit tests and GoogleTest, or `-DLLK_BUILD_E2E_TESTS=OFF` to exclude JIT execution tests. Configure emits `build/compile_commands.json` for editors unless `-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF` is set.
+
 ## Use
 
 Run these commands from the worktree root after building:
@@ -89,20 +93,20 @@ Run these commands from the worktree root after building:
 mkdir -p build/examples
 
 # Parse and inspect a semantic kernel.
-build/llk-opt docs/manual/source/examples/matmul.mlir
+build/bin/llk-opt docs/manual/source/examples/matmul.mlir
 
 # Export a concrete execution kernel and a tunable search space.
-build/llk-compile --emit=micro docs/manual/source/examples/matmul.mlir \
+build/bin/llk-compile --emit=micro docs/manual/source/examples/matmul.mlir \
   > build/examples/matmul.micro.mlir
-build/llk-compile --emit=micro-search docs/manual/source/examples/swiglu.mlir \
+build/bin/llk-compile --emit=micro-search docs/manual/source/examples/swiglu.mlir \
   > build/examples/swiglu.search.mlir
 
 # Estimate a concrete tile kernel against a machine profile.
-build/micro-perf --machine machines/x86-avx2-v2.yaml --level 1 \
+build/bin/micro-perf --machine machines/x86-avx2-v2.yaml --level 1 \
   docs/manual/source/examples/gemm-tile.micro.mlir
 
 # Explore a small parameter space and save ranked schedules.
-build/llk-tune --input=test/Perf/llk_tune_search_space.mlir \
+build/bin/llk-tune --input=test/Perf/llk_tune_search_space.mlir \
   --machine=machines/x86-avx2-v2.yaml -M=8 -N=64 -K=64 \
   --search=grid --max-candidates=4 --top-k=2 \
   --output=build/examples/schedules.yaml
@@ -123,7 +127,7 @@ Exporting IR does not execute a kernel. The current tuning CLI constructs compat
 Read [CLAUDE.md](CLAUDE.md) and the [contributor guide](docs/manual/source/contributing.rst). Create a worktree under `.claude/worktrees/` with a branch such as **feat/tile-operation**, **fix/mapping-route**, or **docs/tutorial-update**.
 
 - Keep computation semantics, schedules, machine data, and target lowering separate. Add target policy through YAML/LLKMap and target emitters.
-- For behavior changes, start with a reproducible failing test. Register GTest/FileCheck tests in the root `CMakeLists.txt`; `// RUN:` comments are not executed by a lit runner.
+- For behavior changes, start with a reproducible failing test. Register GTest sources in the category `test/*/CMakeLists.txt` files and FileCheck tests in `test/FileCheck.cmake`; `// RUN:` comments are not executed by a lit runner.
 - Run affected checks and `check-llk`, update relevant documentation, and report toolchain details and skips. Commit focused changes and open a PR explaining the problem, result, and validation.
 
 ## Future plan

@@ -20,11 +20,13 @@ ninja llk-opt                    # Build IR tool only
 ninja check-llk                  # Build the test binaries + run the whole suite
 ctest --output-on-failure        # Same suite, without building first
 ctest -R MicroDialectTileOps     # Run a single FileCheck test
-./llk-opt input.mlir             # Parse + print IR
-./llk-opt --llk-to-linalg input.mlir  # Run a specific pass
-./llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store" input.mlir  # Search, bind best plan
-./<TestName>                     # Run a single GTest
+./bin/llk-opt input.mlir             # Parse + print IR
+./bin/llk-opt --llk-to-linalg input.mlir  # Run a specific pass
+./bin/llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store" input.mlir  # Search, bind best plan
+./bin/LLKMappingTests --gtest_filter=MappingPlan.*  # Run selected GTest cases
 ```
+
+Root `CMakeLists.txt` builds libraries/tools; `test/CMakeLists.txt` and category subdirectories build one `LLK<Category>Tests` binary per category, with individual CTest cases. FileCheck/verifier registrations live in `test/FileCheck.cmake`; libraries go to `build/lib`, all executables to `build/bin`. `BUILD_TESTING=OFF` disables tests and GoogleTest; `LLK_BUILD_E2E_TESTS=OFF` omits JIT execution tests.
 
 Configure writes a compilation database to `build/compile_commands.json` for clangd and other editors; pass `-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF` to suppress it.
 
@@ -75,7 +77,7 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 - Error handling: MLIR `emitError()` for verifier failures, `llvm::Expected<T>` for JIT ops
 - ABI: C structs (`Tensor2D`, `KernelContext`) — not MLIR memref descriptors
 - TDD: every task starts with a failing test, then minimal code; commit per task
-- FileCheck tests are plain `add_test` entries in the root `CMakeLists.txt` — there is no lit runner, and `// RUN:` lines are comments only. Register new `.mlir` tests by hand with `add_llk_filecheck_test(Name test/Dialect/Micro/foo.mlir)` (an optional trailing argument is passed through to the tool, e.g. pass options), or use a raw `add_test` with `--verify-diagnostics --split-input-file` for invalid-IR tests
+- FileCheck tests are plain `add_test` entries in `test/FileCheck.cmake` — there is no lit runner, and `// RUN:` lines are comments only. Register new `.mlir` tests by hand with `add_llk_filecheck_test(Name test/Dialect/Micro/foo.mlir)` (an optional trailing argument is passed through to the tool, e.g. pass options), or use a raw `add_test` with `--verify-diagnostics --split-input-file` for invalid-IR tests
 - Mapping/target boundary: generic `lib/Mapping` + `lib/Machine` stay target-neutral; target policy is data (`mapping/*.llkmap`, `machines/*.yaml`). `LLKMapping` takes `-fno-rtti -fno-exceptions` and links only `LLVMSupport`/`LLKMachine` (+ `MLIRIR`/`MLIRAsmParser` via `mlir_target_link_libraries`)
 
 ## Milestone Sequence

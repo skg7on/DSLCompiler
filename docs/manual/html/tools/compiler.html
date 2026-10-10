@@ -275,8 +275,8 @@
 <p>Start with the <a class="reference internal" href="../tutorials/01-first-kernel.html"><span class="doc">first-kernel tutorial</span></a> and <a class="reference internal" href="../tutorials/02-mapping.html"><span class="doc">mapping tutorial</span></a>. All commands below run from the repository root after the <a class="reference internal" href="../getting-started.html"><span class="doc">build instructions</span></a>; <code class="docutils literal notranslate"><span class="pre">build/</span></code> is the chosen build directory. See the <a class="reference internal" href="../index.html"><span class="doc">documentation index</span></a> for the other tools.</p>
 <section id="invocation-and-outputs">
 <span id="tools-compiler-invocation-and-outputs"></span><h2>Invocation and outputs<a class="headerlink" href="#invocation-and-outputs" title="Link to this heading">¶</a></h2>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span><span class="o">[</span>options<span class="o">]</span><span class="w"> </span>input.mlir
-build/llk-compile<span class="w"> </span>--help
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span><span class="o">[</span>options<span class="o">]</span><span class="w"> </span>input.mlir
+build/bin/llk-compile<span class="w"> </span>--help
 mkdir<span class="w"> </span>-p<span class="w"> </span>build/tutorial
 </pre></div>
 </div>
@@ -377,13 +377,13 @@ mkdir<span class="w"> </span>-p<span class="w"> </span>build/tutorial
 <section id="export-a-concrete-kernel-and-a-search-space">
 <span id="tools-compiler-export-a-concrete-kernel-and-a-search-space"></span><h2>Export a concrete kernel and a search space<a class="headerlink" href="#export-a-concrete-kernel-and-a-search-space" title="Link to this heading">¶</a></h2>
 <p>The tutorial sources use static BF16 matrices and FP32 accumulation. The matmul source exports one kernel; SwiGLU exports two projection MMAs followed by the SiLU/multiply/conversion epilogue.</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/matmul.micro.mlir
 
-build/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro-search<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
+build/bin/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro-search<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/swiglu.search.mlir
 
-build/llk-opt<span class="w"> </span>build/tutorial/matmul.micro.mlir<span class="w"> </span>-o<span class="w"> </span>build/tutorial/matmul.roundtrip.mlir
+build/bin/llk-opt<span class="w"> </span>build/tutorial/matmul.micro.mlir<span class="w"> </span>-o<span class="w"> </span>build/tutorial/matmul.roundtrip.mlir
 </pre></div>
 </div>
 <p>The first artifact contains <code class="docutils literal notranslate"><span class="pre">micro.kernel</span> <span class="pre">&#64;matmul_M16_N64_K64</span></code>. The second contains a search space around the schedule selected for the SwiGLU workload. Neither command runs a mapping search, lowers to machine code, or invokes a kernel. The original <code class="docutils literal notranslate"><span class="pre">func.func</span></code> remains beside the export, so seeing <code class="docutils literal notranslate"><span class="pre">llk.*</span></code> in the module is expected; the generated concrete kernel itself contains Micro execution operations.</p>
@@ -403,10 +403,10 @@ build/llk-opt<span class="w"> </span>build/tutorial/matmul.micro.mlir<span class
 <section id="legacy-cpu-compilation">
 <span id="tools-compiler-legacy-cpu-compilation"></span><h2>Legacy CPU compilation<a class="headerlink" href="#legacy-cpu-compilation" title="Link to this heading">¶</a></h2>
 <p>Use the SwiGLU source for this path:</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--emit<span class="o">=</span>mlir<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--emit<span class="o">=</span>mlir<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/swiglu.llvm.mlir
 
-build/llk-compile<span class="w"> </span>docs/manual/source/examples/swiglu.mlir
+build/bin/llk-compile<span class="w"> </span>docs/manual/source/examples/swiglu.mlir
 </pre></div>
 </div>
 <p>The first command saves MLIR LLVM-dialect IR. The second prints <code class="docutils literal notranslate"><span class="pre">Compilation</span> <span class="pre">successful</span></code> after the native JIT has compiled an exported function. The JIT and its cache live only for this process; the command does not leave a callable executable file behind.</p>
@@ -426,12 +426,12 @@ build/llk-compile<span class="w"> </span>docs/manual/source/examples/swiglu.mlir
 </section>
 <section id="map-through-a-registered-package">
 <span id="tools-compiler-map-through-a-registered-package"></span><h2>Map through a registered package<a class="headerlink" href="#map-through-a-registered-package" title="Link to this heading">¶</a></h2>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--mapping-mode<span class="o">=</span>exact<span class="w"> </span>--mapping-stop<span class="o">=</span>mapped-micro<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.mapped.log
 
 sed<span class="w"> </span><span class="s1">'1d'</span><span class="w"> </span>build/tutorial/matmul.mapped.log<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.mapped.mlir
-build/llk-opt<span class="w"> </span>build/tutorial/matmul.mapped.mlir<span class="w"> </span>-o<span class="w"> </span>build/tutorial/matmul.mapped.roundtrip.mlir
+build/bin/llk-opt<span class="w"> </span>build/tutorial/matmul.mapped.mlir<span class="w"> </span>-o<span class="w"> </span>build/tutorial/matmul.mapped.roundtrip.mlir
 </pre></div>
 </div>
 <p>The compiler exports a concrete kernel if the input does not already contain one, extracts its workload graph, selects a covering plan, binds and verifies it, and stops at the requested stage. When it exports, it removes the LLK source function from the mapped compilation module. It uses the first selected plan returned by the search.</p>
@@ -465,11 +465,11 @@ build/llk-opt<span class="w"> </span>build/tutorial/matmul.mapped.mlir<span clas
 </table>
 </div>
 <p>For example:</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--mapping-mode<span class="o">=</span>exact<span class="w"> </span>--mapping-stop<span class="o">=</span>lowered<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.lowered.log
 
-build/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
+build/bin/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--mapping-mode<span class="o">=</span>exact<span class="w"> </span>docs/manual/source/examples/matmul.mlir
 </pre></div>
 </div>
@@ -502,7 +502,7 @@ build/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span
 <span id="tools-compiler-replay-a-saved-selection"></span><h2>Replay a saved selection<a class="headerlink" href="#replay-a-saved-selection" title="Link to this heading">¶</a></h2>
 <p>The compiler reads a report; it does not write one. Produce a versioned JSON report with <a class="reference internal" href="optimizer.html#tools-optimizer-save-an-analysis-report-without-binding"><span class="std std-ref">llk-opt –micro-map report=…</span></a>, then compile the <strong>original concrete Micro input</strong> it searched:</p>
 <div class="highlight-sh notranslate"><div class="highlight"><pre><span></span><span class="c1"># Files created by the optimizer manual's report-only example:</span>
-build/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
+build/bin/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--plan-report<span class="o">=</span>build/tutorial/matmul.plan.json<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--mapping-stop<span class="o">=</span>mapped-micro<span class="w"> </span>build/tutorial/matmul.micro.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/matmul.replayed.log

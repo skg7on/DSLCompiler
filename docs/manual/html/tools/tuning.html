@@ -311,14 +311,14 @@ under #51/#52 are not delivered by the workflows documented here.</p>
 </div>
 <p>The accepted search-space file option is <strong>``–input``</strong>. <code class="docutils literal notranslate"><span class="pre">--search-space</span></code> is not an
 alias in this revision. Some older prose used that spelling; check
-<code class="docutils literal notranslate"><span class="pre">build/llk-tune</span> <span class="pre">--help</span></code> when adapting an example. This is distinct from the <code class="docutils literal notranslate"><span class="pre">llk-opt</span></code> pass named
+<code class="docutils literal notranslate"><span class="pre">build/bin/llk-tune</span> <span class="pre">--help</span></code> when adapting an example. This is distinct from the <code class="docutils literal notranslate"><span class="pre">llk-opt</span></code> pass named
 <code class="docutils literal notranslate"><span class="pre">--llk-to-micro-search-space</span></code>.</p>
 </section>
 <section id="a-small-micro-run">
 <span id="tools-tuning-a-small-micro-run"></span><h2>A small Micro run<a class="headerlink" href="#a-small-micro-run" title="Link to this heading">¶</a></h2>
-<p>Run from the repository root with a built <code class="docutils literal notranslate"><span class="pre">build/llk-tune</span></code>:</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-tune<span class="w"> </span>--help
-build/llk-tune<span class="w"> </span>--input<span class="o">=</span>test/Perf/llk_tune_search_space.mlir<span class="w"> </span><span class="se">\</span>
+<p>Run from the repository root with a built <code class="docutils literal notranslate"><span class="pre">build/bin/llk-tune</span></code>:</p>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-tune<span class="w"> </span>--help
+build/bin/llk-tune<span class="w"> </span>--input<span class="o">=</span>test/Perf/llk_tune_search_space.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>-M<span class="o">=</span><span class="m">8</span><span class="w"> </span>-N<span class="o">=</span><span class="m">64</span><span class="w"> </span>-K<span class="o">=</span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--search<span class="o">=</span>grid<span class="w"> </span>--max-candidates<span class="o">=</span><span class="m">4</span><span class="w"> </span>--top-k<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--output<span class="o">=</span>build/tune-grid.yaml
@@ -335,7 +335,7 @@ output path. Inspect the file:</p>
 <p>The record includes <code class="docutils literal notranslate"><span class="pre">workload:</span> <span class="pre">fused_swiglu</span></code>, <code class="docutils literal notranslate"><span class="pre">M_bucket:</span> <span class="pre">2</span></code>, <code class="docutils literal notranslate"><span class="pre">M:</span> <span class="pre">8</span></code>, the
 candidate’s tile decisions and predicted cost, and <code class="docutils literal notranslate"><span class="pre">measurement:</span> <span class="pre">{measured:</span> <span class="pre">false}</span></code> in block form. <code class="docutils literal notranslate"><span class="pre">--top-k=2</span></code> is a maximum, not a promise of two records.</p>
 <p>Use seeded random generation with the same supported options:</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-tune<span class="w"> </span>--input<span class="o">=</span>test/Perf/llk_tune_search_space.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-tune<span class="w"> </span>--input<span class="o">=</span>test/Perf/llk_tune_search_space.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>-M<span class="o">=</span><span class="m">8</span><span class="w"> </span>-N<span class="o">=</span><span class="m">64</span><span class="w"> </span>-K<span class="o">=</span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--search<span class="o">=</span>random<span class="w"> </span>--seed<span class="o">=</span><span class="m">42</span><span class="w"> </span>--max-candidates<span class="o">=</span><span class="m">4</span><span class="w"> </span>--top-k<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--output<span class="o">=</span>build/tune-random.yaml
@@ -593,7 +593,7 @@ file rather than extending the shipped database.</p>
 </section>
 <section id="legacy-grid-behavior">
 <span id="tools-tuning-legacy-grid-behavior"></span><h2>Legacy grid behavior<a class="headerlink" href="#legacy-grid-behavior" title="Link to this heading">¶</a></h2>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-tune<span class="w"> </span>-M<span class="o">=</span><span class="m">8</span><span class="w"> </span>-N<span class="o">=</span><span class="m">64</span><span class="w"> </span>-K<span class="o">=</span><span class="m">64</span><span class="w"> </span>--dry-run<span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-tune<span class="w"> </span>-M<span class="o">=</span><span class="m">8</span><span class="w"> </span>-N<span class="o">=</span><span class="m">64</span><span class="w"> </span>-K<span class="o">=</span><span class="m">64</span><span class="w"> </span>--dry-run<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-o<span class="o">=</span>build/tune-legacy.json
 </pre></div>
 </div>

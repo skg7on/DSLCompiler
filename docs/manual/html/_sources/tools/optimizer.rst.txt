@@ -15,10 +15,10 @@ Parse, print, and select passes
 .. code-block:: sh
 
    mkdir -p build/tutorial
-   build/llk-opt docs/manual/source/examples/matmul.mlir
-   build/llk-opt docs/manual/source/examples/matmul.mlir -o build/tutorial/matmul.parsed.mlir
-   build/llk-opt --show-dialects
-   build/llk-opt --help
+   build/bin/llk-opt docs/manual/source/examples/matmul.mlir
+   build/bin/llk-opt docs/manual/source/examples/matmul.mlir -o build/tutorial/matmul.parsed.mlir
+   build/bin/llk-opt --show-dialects
+   build/bin/llk-opt --help
 
 With no passes, the tool checks the input and prints normalized MLIR. It reads stdin when no file is supplied or the input is ``-``. ``-o <file>`` saves IR; omitted output goes to stdout. Errors and remarks go to stderr, and failed parsing, verification, or passes return a nonzero exit status.
 
@@ -26,14 +26,14 @@ Pass-specific options belong inside one quoted argument, separated by spaces:
 
 .. code-block:: sh
 
-   build/llk-opt --llk-to-micro="schedule-db=schedules/schedule_db.json target=x86-avx2-cpu" \
+   build/bin/llk-opt --llk-to-micro="schedule-db=schedules/schedule_db.json target=x86-avx2-cpu" \
      docs/manual/source/examples/matmul.mlir -o build/tutorial/matmul.micro.mlir
 
 Do not separate pass option keys with commas. Commas are used **inside** values such as an emitter CSV, and between passes in textual pipelines. Multiple pass flags run in command-line order. The equivalent explicit pipeline syntax is:
 
 .. code-block:: sh
 
-   build/llk-opt --pass-pipeline='builtin.module(llk-to-linalg,canonicalize)' \
+   build/bin/llk-opt --pass-pipeline='builtin.module(llk-to-linalg,canonicalize)' \
      docs/manual/source/examples/swiglu.mlir -o build/tutorial/swiglu.linalg.mlir
 
 The tool also registers the Linalg Transform-dialect extension, including operations such as ``transform.structured.match``. Registration makes syntax and passes available; it does not apply a transform schedule automatically.
@@ -98,10 +98,10 @@ To make experiments independent of the shipped database, point at an intentional
 
 .. code-block:: sh
 
-   build/llk-opt --llk-to-micro="schedule-db=build/tutorial/absent-schedule.json" \
+   build/bin/llk-opt --llk-to-micro="schedule-db=build/tutorial/absent-schedule.json" \
      docs/manual/source/examples/matmul.mlir -o build/tutorial/matmul.micro.mlir
 
-   build/llk-opt --llk-to-micro-search-space="schedule-db=build/tutorial/absent-schedule.json" \
+   build/bin/llk-opt --llk-to-micro-search-space="schedule-db=build/tutorial/absent-schedule.json" \
      docs/manual/source/examples/swiglu.mlir -o build/tutorial/swiglu.search.mlir
 
 Both commands warn and use the conservative fallback. The matmul artifact contains ``@matmul_M16_N64_K64``, spatial loops, staged tile copies, an accumulator-carrying K loop, ``micro.mma``, and writeback. The search artifact describes parameters and legality/objective metadata; exporting it does not create a mapped executable.
@@ -177,7 +177,7 @@ For scalar loop IR, lower a supported semantic workload and omit the vectorizati
 
 .. code-block:: sh
 
-   build/llk-opt --llk-to-linalg \
+   build/bin/llk-opt --llk-to-linalg \
      --one-shot-bufferize="bufferize-function-boundaries" \
      --convert-linalg-to-loops docs/manual/source/examples/swiglu.mlir \
      -o build/tutorial/swiglu.scalar.mlir
@@ -188,7 +188,7 @@ For the legacy vector stage:
 
 .. code-block:: sh
 
-   build/llk-opt --tile-and-vectorize docs/manual/source/examples/swiglu.mlir \
+   build/bin/llk-opt --tile-and-vectorize docs/manual/source/examples/swiglu.mlir \
      -o build/tutorial/swiglu.vector.mlir
 
 Expect tiled SCF structure and operations such as ``vector.transfer_read``, ``vector.contract``, and ``vector.transfer_write``. Use SwiGLU or a real Linalg matmul here: ``llk.matmul`` is left unchanged by the current LLK-to-Linalg pass. The full legacy compiler always schedules its own passes; there is no ``llk-compile --scalar`` switch.
@@ -197,7 +197,7 @@ For the Micro reference bridge:
 
 .. code-block:: sh
 
-   build/llk-opt --micro-to-linalg build/tutorial/matmul.micro.mlir \
+   build/bin/llk-opt --micro-to-linalg build/tutorial/matmul.micro.mlir \
      -o build/tutorial/matmul.reference.mlir
 
 The generated kernel becomes an ordinary function with the signature declared by the kernel. The source LLK function may still be present. Micro spatial loops become serial SCF structure, pipeline overlap is not realized, and tiles become tensors. This is useful for inspecting numerical lowering, but it is not evidence that selected hardware concurrency or AVX2 width reached machine code. The :ref:`mapped compiler <tools-compiler-map-through-a-registered-package>` owns target emitter dispatch and backend compilation.
@@ -279,7 +279,7 @@ After creating ``build/tutorial/matmul.micro.mlir`` above:
 
 .. code-block:: sh
 
-   build/llk-opt "--micro-map=$AVX2_MAP $SEARCH report=build/tutorial/matmul.plan.json report-only=1" \
+   build/bin/llk-opt "--micro-map=$AVX2_MAP $SEARCH report=build/tutorial/matmul.plan.json report-only=1" \
      build/tutorial/matmul.micro.mlir -o build/tutorial/matmul.analysis.mlir
 
    diff build/tutorial/matmul.micro.mlir build/tutorial/matmul.analysis.mlir
@@ -308,11 +308,11 @@ Bind and verify a plan
 
 .. code-block:: sh
 
-   build/llk-opt "--micro-map=$AVX2_MAP $SEARCH require-executable=1 report=build/tutorial/matmul.bound.plan.json" \
+   build/bin/llk-opt "--micro-map=$AVX2_MAP $SEARCH require-executable=1 report=build/tutorial/matmul.bound.plan.json" \
      --verify-each build/tutorial/matmul.micro.mlir \
      -o build/tutorial/matmul.mapped.mlir
 
-   build/llk-opt "--micro-verify-mapping=$AVX2_MAP" \
+   build/bin/llk-opt "--micro-verify-mapping=$AVX2_MAP" \
      build/tutorial/matmul.mapped.mlir -o build/tutorial/matmul.verified.mlir
 
    diff build/tutorial/matmul.mapped.mlir build/tutorial/matmul.verified.mlir
@@ -345,7 +345,7 @@ Reproduce a plan id with ``micro-bind-plan``
    PY
    )
 
-   build/llk-opt "--micro-bind-plan=$AVX2_MAP $SEARCH plan-id=$PLAN_ID require-executable=1" \
+   build/bin/llk-opt "--micro-bind-plan=$AVX2_MAP $SEARCH plan-id=$PLAN_ID require-executable=1" \
      build/tutorial/matmul.micro.mlir -o build/tutorial/matmul.bound-again.mlir
 
    diff build/tutorial/matmul.mapped.mlir build/tutorial/matmul.bound-again.mlir
@@ -365,7 +365,7 @@ The candidate must exist in the same module as the concrete kernel. The fixture 
 
 .. code-block:: sh
 
-   build/llk-opt "--micro-map=$AVX2_MAP mode=deterministic candidate=candidate_17 report=build/tutorial/candidate.plan.json" \
+   build/bin/llk-opt "--micro-map=$AVX2_MAP mode=deterministic candidate=candidate_17 report=build/tutorial/candidate.plan.json" \
      test/Conversion/MicroMapping/micro_map_candidate.mlir \
      -o build/tutorial/candidate.mapped.mlir
 
@@ -377,7 +377,7 @@ The generic accelerator's shipped policy can also be inspected with a workload i
 
 .. code-block:: sh
 
-   build/llk-opt --micro-map="target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_mxu,accel_copy mode=exact" \
+   build/bin/llk-opt --micro-map="target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_mxu,accel_copy mode=exact" \
      test/Conversion/MicroMapping/micro_map.mlir \
      -o build/tutorial/add.accelerator.mlir
 

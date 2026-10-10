@@ -1,0 +1,12 @@
+add_llk_test_category(Conversion
+    SOURCES
+        MicroMapping/search_binding_loader.cpp
+    LIBRARIES
+        LLKMicroMapping
+        MicroDialect
+        ${LLK_MLIR_EXEC_LIBS}
+    DEFINITIONS
+        LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    INCLUDE_DIRECTORIES
+        ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+)

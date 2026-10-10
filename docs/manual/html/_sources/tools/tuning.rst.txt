@@ -42,7 +42,7 @@ Choose a workflow
 
 The accepted search-space file option is **``--input``**. ``--search-space`` is not an
 alias in this revision. Some older prose used that spelling; check
-``build/llk-tune --help`` when adapting an example. This is distinct from the ``llk-opt`` pass named
+``build/bin/llk-tune --help`` when adapting an example. This is distinct from the ``llk-opt`` pass named
 ``--llk-to-micro-search-space``.
 
 .. _tools-tuning-a-small-micro-run:
@@ -50,12 +50,12 @@ alias in this revision. Some older prose used that spelling; check
 A small Micro run
 -----------------
 
-Run from the repository root with a built ``build/llk-tune``:
+Run from the repository root with a built ``build/bin/llk-tune``:
 
 .. code-block:: sh
 
-   build/llk-tune --help
-   build/llk-tune --input=test/Perf/llk_tune_search_space.mlir \
+   build/bin/llk-tune --help
+   build/bin/llk-tune --input=test/Perf/llk_tune_search_space.mlir \
      --machine=machines/x86-avx2-v2.yaml -M=8 -N=64 -K=64 \
      --search=grid --max-candidates=4 --top-k=2 \
      --output=build/tune-grid.yaml
@@ -77,7 +77,7 @@ Use seeded random generation with the same supported options:
 
 .. code-block:: sh
 
-   build/llk-tune --input=test/Perf/llk_tune_search_space.mlir \
+   build/bin/llk-tune --input=test/Perf/llk_tune_search_space.mlir \
      --machine=machines/x86-avx2-v2.yaml -M=8 -N=64 -K=64 \
      --search=random --seed=42 --max-candidates=4 --top-k=2 \
      --output=build/tune-random.yaml
@@ -313,7 +313,7 @@ Legacy grid behavior
 
 .. code-block:: sh
 
-   build/llk-tune -M=8 -N=64 -K=64 --dry-run \
+   build/bin/llk-tune -M=8 -N=64 -K=64 --dry-run \
      -o=build/tune-legacy.json
 
 ``--dry-run`` adds a preview of the first five generated configurations. It still

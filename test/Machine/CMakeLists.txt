@@ -1,0 +1,9 @@
+add_llk_test_category(Machine
+    SOURCES
+        machine_model.cpp
+        machine_model_loader.cpp
+    LIBRARIES
+        LLKMachine
+    DEFINITIONS
+        LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
+)

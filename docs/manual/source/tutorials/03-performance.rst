@@ -15,9 +15,9 @@ Tutorial 3: read a performance prediction
 .. code-block:: bash
 
    mkdir -p build/tutorial
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml --level=0 \
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=0 \
      docs/manual/source/examples/gemm-tile.micro.mlir > build/tutorial/gemm.l0.yaml
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
      docs/manual/source/examples/gemm-tile.micro.mlir > build/tutorial/gemm.l1.yaml
 
 L0 computes static compute/memory bounds. L1 also schedules modeled dependencies and resources. Use numeric ``0`` and ``1``, not ``l0``/``l1``, for the current CLI's level values.
@@ -69,7 +69,7 @@ For a compact human-readable report:
 
 .. code-block:: bash
 
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 --format=text \
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 --format=text \
      docs/manual/source/examples/gemm-tile.micro.mlir
 
 .. _tutorials-03-performance-3-analyze-a-whole-exported-workload:
@@ -79,9 +79,9 @@ For a compact human-readable report:
 
 .. code-block:: bash
 
-   build/llk-compile --emit=micro docs/manual/source/examples/swiglu.mlir \
+   build/bin/llk-compile --emit=micro docs/manual/source/examples/swiglu.mlir \
      > build/tutorial/swiglu.micro.mlir
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
      build/tutorial/swiglu.micro.mlir > build/tutorial/swiglu.perf.yaml
 
 Two projections give ``2 × M × N × K × 2 = 262,144`` FLOPs for ``M=16,N=64,K=64``, before epilogue work. The model also expands loop/spatial multiplicity. Inspect storage diagnostics: the current owner-count/liveness model can overestimate concurrency. A reported violation is an actionable model result, not a independently proven physical footprint.
@@ -97,7 +97,7 @@ After :doc:`Tutorial 2 </tutorials/02-mapping>`:
 
 .. code-block:: bash
 
-   build/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
+   build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
      build/tutorial/matmul.mapped.mlir > build/tutorial/matmul.mapped.perf.yaml
 
 Keep this report beside ``matmul.plan.json``. They currently use shared infrastructure but do **not** guarantee equal planner/perf cycles, DRAM traffic, or complete physical resource accounting. The :source:`gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>` explains the disagreement and `#129 <https://github.com/skg7on/DSLCompiler/issues/129>`__ plans common bound-kernel analysis.
