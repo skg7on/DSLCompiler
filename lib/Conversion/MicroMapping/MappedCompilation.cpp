@@ -357,7 +357,6 @@ lowerSelectedOperations(mlir::ModuleOp module, const MappingTarget &target,
                           " rule '" + group.rule + "' lowering failed: " +
                           llvm::toString(std::move(error)));
     compilation.targetLowered += group.operations.size();
-    ++compilation.backendGroupsRealized;
   }
   return llvm::Error::success();
 }
@@ -381,10 +380,19 @@ void registerBufferizationInterfaces(mlir::MLIRContext *context) {
 
 /// Buffers the mapped kernel and rolls its loops: the Linalg form the existing
 /// backend pipeline already consumes.
-mlir::LogicalResult lowerToBackendForm(mlir::ModuleOp module) {
+llvm::Error lowerToBackendForm(mlir::ModuleOp module,
+                               const MappingTarget *target,
+                               MappedBackend backend) {
   registerBufferizationInterfaces(module.getContext());
   mlir::PassManager pm(module.getContext());
   pm.addPass(mlir::llk::createMicroToLinalgPass());
+  if (backend == MappedBackend::SelectedTarget) {
+    if (!target)
+      return compileError(
+          "selected-target backend lowering needs its mapping target");
+    if (llvm::Error error = target->buildSelectedBackendPipeline(pm))
+      return error;
+  }
   BufOpts options;
   options.bufferizeFunctionBoundaries = true;
   // The calling convention is a row-major descriptor, so a function boundary
@@ -396,7 +404,9 @@ mlir::LogicalResult lowerToBackendForm(mlir::ModuleOp module) {
       mlir::bufferization::LayoutMapOption::IdentityLayoutMap;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(options));
   pm.addPass(mlir::createConvertLinalgToLoopsPass());
-  return pm.run(module);
+  if (mlir::failed(pm.run(module)))
+    return compileError("selected/reference backend pass pipeline failed");
+  return llvm::Error::success();
 }
 
 } // namespace
@@ -414,7 +424,7 @@ lowerSelectedOperationsForTest(mlir::ModuleOp module,
 /// The tail every compilation shares: Linalg and loops, then the calling
 /// convention, then the code.
 llvm::Expected<MappedCompilation>
-finishCompilation(MappedCompilation compilation,
+finishCompilation(MappedCompilation compilation, const MappingTarget *target,
                   const MappedCompileOptions &options) {
   // A source that came from the LLK export carries the semantic function
   // beside the kernel it produced. Only the kernel is compiled: the semantic
@@ -436,9 +446,17 @@ finishCompilation(MappedCompilation compilation,
   for (mlir::Operation *op : semanticSources)
     op->erase();
 
-  if (mlir::failed(lowerToBackendForm(*compilation.module)))
+  if (llvm::Error error =
+          lowerToBackendForm(*compilation.module, target, options.backend))
+    return std::move(error);
+  if (auto realized =
+          compilation.module->getOperation()->getAttrOfType<mlir::IntegerAttr>(
+              "llk.backend_groups_realized"))
+    compilation.backendGroupsRealized = realized.getInt();
+  if (options.backend == MappedBackend::SelectedTarget &&
+      compilation.backendGroupsRealized == 0)
     return compileError(
-        "lowering the mapped kernel to Linalg and loops failed");
+        "selected-target backend realized no selected compute groups");
   compilation.stopped = MappedStop::Lowered;
   if (options.stop == MappedStop::Lowered)
     return compilation;
@@ -469,9 +487,6 @@ llvm::Expected<MappedCompilation>
 compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
                     const mlir::llk::mapping::CoveringPlan &plan,
                     const MappedCompileOptions &options) {
-  if (options.backend != MappedBackend::Reference)
-    return compileError("selected-target backend is not available yet");
-
   MappedCompilation compilation;
 
   // Binding clones the source and writes the selected state onto the clone, so
@@ -502,7 +517,7 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
   if (options.stop == MappedStop::TargetLowered)
     return compilation;
 
-  return finishCompilation(std::move(compilation), options);
+  return finishCompilation(std::move(compilation), &target, options);
 }
 
 llvm::Expected<MappedCompilation>
@@ -519,7 +534,7 @@ compileConcreteMicroKernel(mlir::ModuleOp source,
 
   MappedCompilation compilation;
   compilation.module = source.clone();
-  return finishCompilation(std::move(compilation), options);
+  return finishCompilation(std::move(compilation), nullptr, options);
 }
 
 } // namespace llk

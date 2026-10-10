@@ -220,6 +220,54 @@ Value buildElementwiseCast(ConversionPatternRewriter &rewriter, Location loc,
   return cast.getResult(0);
 }
 
+/// Record selected identity conversions that do not need a Linalg operation.
+/// Keep the mapping fact opaque here; target backends can account for the
+/// structural member when validating a fused instance.
+void recordStructuralMapping(Operation *source, StringRef microOp,
+                             Attribute mathMode) {
+  if (!source)
+    return;
+  auto mapping = source->getAttrOfType<DictionaryAttr>("micro.mapping");
+  if (!mapping)
+    return;
+  ModuleOp module = source->getParentOfType<ModuleOp>();
+  if (!module)
+    return;
+
+  NamedAttrList record;
+  record.set("mapping", mapping);
+  record.set("op", StringAttr::get(source->getContext(), microOp));
+  if (mathMode)
+    record.set("math_mode", mathMode);
+  SmallVector<Attribute> records;
+  if (auto existing =
+          module->getAttrOfType<ArrayAttr>("micro.structural_mappings"))
+    records.append(existing.begin(), existing.end());
+  DictionaryAttr next = DictionaryAttr::get(source->getContext(), record);
+  if (llvm::is_contained(records, Attribute(next)))
+    return;
+  records.push_back(next);
+  module->setAttr("micro.structural_mappings",
+                  ArrayAttr::get(source->getContext(), records));
+}
+
+/// Preserve opaque mapping provenance on the Linalg operation that replaces a
+/// selected Micro compute op. The generic bridge copies facts; only a target
+/// backend interprets their target-specific meaning.
+void copyMappingMetadata(Operation *source, Operation *replacement,
+                         StringRef microOp, Attribute mathMode) {
+  if (!source || !replacement || !isa<linalg::GenericOp>(replacement))
+    return;
+  for (StringRef name :
+       {"micro.mapping", "micro.routes", "micro.op", "micro.math_mode"})
+    if (Attribute value = source->getAttr(name))
+      replacement->setAttr(name, value);
+  replacement->setAttr("micro.op",
+                       StringAttr::get(source->getContext(), microOp));
+  if (mathMode)
+    replacement->setAttr("micro.math_mode", mathMode);
+}
+
 Value buildElementwise(OpBuilder &builder, Location loc, ElementwiseKind kind,
                        ValueRange args, Type elementType) {
   const bool floating = llvm::isa<FloatType>(elementType);
@@ -437,6 +485,10 @@ struct VectorOpLowering : OpConversionPattern<micro::VectorOp> {
       if (!converted)
         return rewriter.notifyMatchFailure(op,
                                            "convert needs a shaped operand");
+      if (converted == adaptor.getInputs()[0])
+        recordStructuralMapping(op, name, op.getMathModeAttr());
+      copyMappingMetadata(op, converted.getDefiningOp(), name,
+                          op.getMathModeAttr());
       rewriter.replaceOp(op, converted);
       return success();
     }
@@ -477,6 +529,7 @@ struct VectorOpLowering : OpConversionPattern<micro::VectorOp> {
                                   : sigmoid;
             linalg::YieldOp::create(nested, nestedLoc, result);
           });
+      copyMappingMetadata(op, generic, name, op.getMathModeAttr());
       rewriter.replaceOp(op, generic.getResult(0));
       return success();
     }
@@ -502,6 +555,7 @@ struct VectorOpLowering : OpConversionPattern<micro::VectorOp> {
               builder, loc,
               buildElementwise(builder, loc, *kind, args, elementType));
         });
+    copyMappingMetadata(op, generic, name, op.getMathModeAttr());
     rewriter.replaceOp(op, generic.getResult(0));
     return success();
   }

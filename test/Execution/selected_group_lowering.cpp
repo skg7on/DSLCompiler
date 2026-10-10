@@ -175,7 +175,7 @@ TEST(SelectedGroupLowering, SendsOneTopologicalGroupWithSelectedContext) {
   EXPECT_EQ(calls.front().connections, 1u);
   EXPECT_EQ(calls.front().computeId, "vpu.b");
   EXPECT_EQ(compilation.selectedGroupsVerified, 1u);
-  EXPECT_EQ(compilation.backendGroupsRealized, 1u);
+  EXPECT_EQ(compilation.backendGroupsRealized, 0u);
   EXPECT_EQ(compilation.targetLowered, 3u);
 }
 
@@ -200,7 +200,7 @@ TEST(SelectedGroupLowering, CallsIndependentInstancesSeparately) {
   EXPECT_EQ(calls[1].instance, 90u);
   EXPECT_EQ(calls[0].placements, 1u);
   EXPECT_EQ(calls[1].placements, 1u);
-  EXPECT_EQ(compilation.backendGroupsRealized, 2u);
+  EXPECT_EQ(compilation.backendGroupsRealized, 0u);
 }
 
 TEST(SelectedGroupLowering, PreflightsEveryGroupBeforeLoweringAny) {

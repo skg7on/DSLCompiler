@@ -474,6 +474,7 @@ add_library(LLKTargetMapping STATIC
     lib/Target/MappingTargets.cpp
     lib/Target/X86/Mapping/AVX2MappingTarget.cpp
     lib/Target/X86/Mapping/AVX2BundleLowering.cpp
+    lib/Target/X86/Mapping/AVX2BackendLowering.cpp
     lib/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.cpp
 )
 target_include_directories(LLKTargetMapping PUBLIC
@@ -1354,6 +1355,11 @@ if(LLK_BUILD_TOOLS)
       COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/fused_selected_lowering.py
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
           ${CMAKE_CURRENT_BINARY_DIR}/FusedSelectedLowering
+  )
+  add_test(NAME SelectedVectorWidth
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/selected_vector_width.py
+          $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/SelectedVectorWidth
   )
   # A target nobody registered is a diagnostic naming the ones that are, not a
   # silent fallback to a different backend.

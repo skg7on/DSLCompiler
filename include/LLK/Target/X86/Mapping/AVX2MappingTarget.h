@@ -35,6 +35,11 @@ llvm::ArrayRef<llvm::StringLiteral> emitterKeys();
 /// lowered as AVX2 rather than rejected as unsupported.
 std::unique_ptr<mapping::TargetEmitter> createAVX2Emitter(llvm::StringRef key);
 
+/// Adds the AVX2 selected-code lowering after generic Micro to Linalg
+/// conversion. The pass interprets only opaque mapping metadata carried by the
+/// generated Linalg operations.
+void buildAVX2SelectedBackendPipeline(mlir::OpPassManager &pm);
+
 /// Loads the AVX2 mapping target from a configuration root, which must contain
 /// `machines/x86-avx2-v2.yaml`, `mapping/x86-avx2/layouts.llkmap`, and
 /// `mapping/x86-avx2/rules.llkmap`. The target is verified before it is

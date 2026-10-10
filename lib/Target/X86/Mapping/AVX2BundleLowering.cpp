@@ -302,6 +302,9 @@ llvm::Error AVX2Emitter::lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
     auto replacement = micro::VectorOp::create(
         rewriter, vector.getLoc(), loweredType, vector.getOp(),
         vector.getInputs(), vector.getMathModeAttr());
+    // The target-owned physical rewrite must retain the selected instance and
+    // bundle provenance for the later AVX2 Linalg/Vector backend pass.
+    replacement->setAttrs(vector->getAttrs());
     rewriter.replaceOp(vector, replacement.getResult());
   }
 

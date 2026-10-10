@@ -38,6 +38,11 @@ public:
   const mapping::LatencyProvider *latencyProvider() const override {
     return configuration_->latencyProvider();
   }
+  llvm::Error
+  buildSelectedBackendPipeline(mlir::OpPassManager &pm) const override {
+    buildAVX2SelectedBackendPipeline(pm);
+    return llvm::Error::success();
+  }
 
   std::unique_ptr<mapping::TargetEmitter>
   createEmitter(llvm::StringRef key) const override {

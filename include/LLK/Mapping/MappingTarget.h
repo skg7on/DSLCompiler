@@ -33,6 +33,7 @@
 
 namespace mlir {
 class Operation;
+class OpPassManager;
 class RewriterBase;
 } // namespace mlir
 
@@ -151,6 +152,16 @@ public:
   /// (design §17.3). Defaulting to null keeps a target that predates
   /// measurement working unchanged.
   virtual const LatencyProvider *latencyProvider() const { return nullptr; }
+
+  /// Add this target's post-MicroToLinalg selected-code passes. A target with
+  /// no selected backend rejects the request instead of inheriting reference
+  /// lowering and being reported as target execution.
+  virtual llvm::Error
+  buildSelectedBackendPipeline(mlir::OpPassManager &) const {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "selected backend is unsupported by target '" + name().str() + "'");
+  }
 };
 
 /// A target built from already-loaded registries. `loadMappingTarget` is the
