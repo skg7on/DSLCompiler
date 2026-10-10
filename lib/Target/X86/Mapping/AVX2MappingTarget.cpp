@@ -35,6 +35,10 @@ public:
   bool isKnownEmitter(llvm::StringRef key) const override {
     return configuration_->isKnownEmitter(key);
   }
+  std::optional<mapping::TargetCodegenRequirements>
+  codegenRequirements() const override {
+    return mapping::TargetCodegenRequirements{"x86_64", "generic", {"avx2"}};
+  }
   const mapping::LatencyProvider *latencyProvider() const override {
     return configuration_->latencyProvider();
   }

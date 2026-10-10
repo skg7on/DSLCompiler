@@ -41,6 +41,7 @@
 #include "mlir/Pass/PassManager.h"
 
 #include "llvm/Support/Error.h"
+#include "llvm/TargetParser/Host.h"
 
 #include <gtest/gtest.h>
 
@@ -131,7 +132,8 @@ mlir::DialectRegistry buildRegistry() {
 /// plan the search selected.
 llvm::Expected<std::unique_ptr<llk::MappedExecutable>>
 compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
-             llvm::StringRef entrySymbol) {
+             llvm::StringRef entrySymbol,
+             llk::MappedBackend backend = llk::MappedBackend::Reference) {
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::parseSourceString<mlir::ModuleOp>(sourceText, &context);
   if (!module)
@@ -180,6 +182,7 @@ compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
 
   llk::MappedCompileOptions compileOptions;
   compileOptions.entrySymbol = entrySymbol.str();
+  compileOptions.backend = backend;
   llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
       *module, **target, result->plans.front(), compileOptions);
   if (!compiled)
@@ -218,6 +221,12 @@ TEST(MappedAcceptance, InvokesTheCompilerGeneratedMatmulAndChecksEveryElement) {
       compileChain(context, kMatmulSource, "matmul_M16_N64_K64");
   ASSERT_TRUE(static_cast<bool>(executable))
       << llvm::toString(executable.takeError());
+  EXPECT_NE((*executable)->executionIdentity().find("backend=reference"),
+            llvm::StringRef::npos);
+  EXPECT_NE((*executable)->executionIdentity().find("abi="),
+            llvm::StringRef::npos);
+  EXPECT_NE((*executable)->executionIdentity().find("lowered-ir-sha256="),
+            llvm::StringRef::npos);
 
   // The exported contract: the two operands and the output tile.
   const llk::KernelAbi &abi = (*executable)->abi();
@@ -311,4 +320,43 @@ TEST(MappedAcceptance, LeavesTheCallersBuffersOwnedByTheCaller) {
   EXPECT_EQ(fromBf16(storage[lead - 1]), -7.0f);
   EXPECT_EQ(fromBf16(storage[lead + static_cast<size_t>(rows * columns)]),
             -7.0f);
+}
+
+TEST(MappedAcceptance, SelectedAvx2BackendExecutesNumerically) {
+  const std::string hostTriple = llvm::sys::getDefaultTargetTriple();
+  if (hostTriple.rfind("x86_64-", 0) != 0) {
+    GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
+  }
+  const auto hostFeatures = llvm::sys::getHostCPUFeatures();
+  auto avx2 = hostFeatures.find("avx2");
+  if (avx2 == hostFeatures.end() || !avx2->second) {
+    GTEST_SKIP() << "selected AVX2 invocation requires host AVX2";
+  }
+
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      compileChain(context, kMatmulSource, "matmul_M16_N64_K64",
+                   llk::MappedBackend::SelectedTarget);
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+  EXPECT_NE((*executable)->executionIdentity().find("backend=selected-target"),
+            llvm::StringRef::npos);
+  EXPECT_NE((*executable)->executionIdentity().find("features=avx2"),
+            llvm::StringRef::npos);
+
+  const int64_t rows = 16, columns = 64;
+  std::vector<uint16_t> output(static_cast<size_t>(rows * columns), 0);
+  MemRef2D out{output.data(), output.data(), 0, rows, columns, columns, 1};
+  Buffer a(rows, columns, 1.0f);
+  Buffer b(64, 64, 1.0f);
+  llk::InvocationBuffer2D checkedOut{out, llk::InvocationElementType::BF16,
+                                     output.size() * sizeof(uint16_t)};
+  llvm::Error error =
+      (*executable)->invoke({a.checked(), b.checked()}, {checkedOut});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+  for (uint16_t value : output)
+    EXPECT_EQ(fromBf16(value), 64.0f);
 }

@@ -505,6 +505,38 @@ static int runMappedCompilation(mlir::ModuleOp module,
   // generation, and saying so is the difference between the two claims.
   llvm::outs() << "mapping: target=" << mappingTargetName
                << " backend=" << mappingBackend
+               << " stop=" << mappingStop.getValue() << " executable="
+               << (compiled->stopped == llk::MappedStop::Executable
+                       ? "ready"
+                       : "not-built")
+               << " invocation=not-run"
+               << " target-identity="
+               << (compiled->codegenRequirements ? mappingTargetName.getValue()
+                                                 : "native-host")
+               << " architecture="
+               << (compiled->codegenRequirements
+                       ? compiled->codegenRequirements->architecture
+                       : "native")
+               << " cpu="
+               << (compiled->codegenRequirements
+                       ? compiled->codegenRequirements->cpu
+                       : "host")
+               << " features=";
+  if (compiled->codegenRequirements) {
+    for (size_t i = 0;
+         i < compiled->codegenRequirements->requiredFeatures.size(); ++i) {
+      if (i)
+        llvm::outs() << ',';
+      llvm::outs() << compiled->codegenRequirements->requiredFeatures[i];
+    }
+  } else {
+    llvm::outs() << "host";
+  }
+  llvm::outs() << " identity=" << compiled->executionIdentity;
+  if (compiled->executable)
+    llvm::outs() << " abi-hash=" << compiled->executable->abiHash();
+  llvm::outs() << " selected-groups-verified="
+               << compiled->selectedGroupsVerified
                << " target-lowered-ops=" << compiled->targetLowered
                << " reference-lowered-ops=" << compiled->referenceLowered
                << " backend-groups-realized=" << compiled->backendGroupsRealized

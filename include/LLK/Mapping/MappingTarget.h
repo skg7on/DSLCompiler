@@ -18,6 +18,7 @@
 #define LLK_MAPPING_MAPPINGTARGET_H
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/CodegenRequirements.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
 #include "LLK/Mapping/MappingLowering.h"
@@ -28,6 +29,7 @@
 #include "llvm/Support/Error.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -126,6 +128,12 @@ public:
   virtual const LayoutRegistry &layouts() const = 0;
   virtual const RuleRegistry &rules() const = 0;
   virtual bool isKnownEmitter(llvm::StringRef key) const = 0;
+
+  /// ISA and architecture required when invoking this target's selected code.
+  /// Targets without a native code-generation contract leave it unset.
+  virtual std::optional<TargetCodegenRequirements> codegenRequirements() const {
+    return std::nullopt;
+  }
 
   /// The emitter for `key`, or null when the target does not declare that key.
   /// A target that declares several emitter keys exposes each one here; the

@@ -17,6 +17,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MappedCompilation.h"
+#include "LLK/Conversion/MappedKernelAbi.h"
+#include "LLK/Version.h"
 
 #include "LLK/Conversion/MicroToLinalg.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
@@ -31,6 +33,7 @@
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -41,6 +44,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <map>
 #include <string>
@@ -372,6 +376,7 @@ void registerBufferizationInterfaces(mlir::MLIRContext *context) {
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::linalg::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::tensor::registerBufferizableOpInterfaceExternalModels(registry);
+  mlir::vector::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::scf::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(
       registry);
@@ -446,6 +451,47 @@ finishCompilation(MappedCompilation compilation, const MappingTarget *target,
   for (mlir::Operation *op : semanticSources)
     op->erase();
 
+  compilation.executionIdentity =
+      std::string("compiler=") + LLK_COMPILER_VERSION + "|backend=" +
+      (options.backend == MappedBackend::SelectedTarget ? "selected-target"
+                                                        : "reference");
+  if (options.backend == MappedBackend::SelectedTarget) {
+    compilation.codegenRequirements = target->codegenRequirements();
+    if (!compilation.codegenRequirements)
+      return compileError("selected-target execution has no ISA requirements "
+                          "from its mapping target");
+    const auto &requirements = *compilation.codegenRequirements;
+    compilation.executionIdentity +=
+        "|target=" + target->name().str() +
+        "|machine-content=" + std::to_string(target->machine().contentHash) +
+        "|architecture=" + requirements.architecture +
+        "|cpu=" + requirements.cpu + "|features=";
+    for (size_t i = 0; i < requirements.requiredFeatures.size(); ++i) {
+      if (i)
+        compilation.executionIdentity += ",";
+      compilation.executionIdentity += requirements.requiredFeatures[i];
+    }
+  } else {
+    compilation.executionIdentity +=
+        "|target=native-host|cpu=host|features=host";
+  }
+  compilation.executionIdentity += "|math-mode=";
+  bool hasMathMode = false;
+  compilation.module->walk([&](mlir::Operation *op) {
+    if (mlir::Attribute mode = op->getAttr("math_mode")) {
+      if (hasMathMode)
+        compilation.executionIdentity += ",";
+      std::string printed;
+      llvm::raw_string_ostream stream(printed);
+      mode.print(stream);
+      stream.flush();
+      compilation.executionIdentity += printed;
+      hasMathMode = true;
+    }
+  });
+  if (!hasMathMode)
+    compilation.executionIdentity += "default";
+
   if (llvm::Error error =
           lowerToBackendForm(*compilation.module, target, options.backend))
     return std::move(error);
@@ -457,6 +503,12 @@ finishCompilation(MappedCompilation compilation, const MappingTarget *target,
       compilation.backendGroupsRealized == 0)
     return compileError(
         "selected-target backend realized no selected compute groups");
+  if (options.backend == MappedBackend::SelectedTarget &&
+      (compilation.selectedGroupsVerified == 0 ||
+       compilation.referenceGroupsLowered != 0))
+    return compileError(
+        "selected-target execution requires verified selected groups and no "
+        "reference-lowered groups");
   compilation.stopped = MappedStop::Lowered;
   if (options.stop == MappedStop::Lowered)
     return compilation;
@@ -473,8 +525,16 @@ finishCompilation(MappedCompilation compilation, const MappingTarget *target,
     return compileError("compiling to an executable needs the entry symbol to "
                         "name; a module may hold more than one function");
 
+  MappedJitOptions jitOptions;
+  jitOptions.executionIdentity = compilation.executionIdentity;
+  jitOptions.selectedTarget = compilation.codegenRequirements;
+  llvm::Expected<PreparedMappedKernel> prepared =
+      prepareMappedKernelForInvocation(*compilation.module,
+                                       options.entrySymbol);
+  if (!prepared)
+    return prepared.takeError();
   llvm::Expected<std::unique_ptr<MappedExecutable>> executable =
-      createMappedExecutable(*compilation.module, options.entrySymbol);
+      createMappedExecutable(std::move(*prepared), jitOptions);
   if (!executable)
     return executable.takeError();
   compilation.executable = std::move(*executable);
@@ -488,6 +548,30 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
                     const mlir::llk::mapping::CoveringPlan &plan,
                     const MappedCompileOptions &options) {
   MappedCompilation compilation;
+  compilation.executionIdentity =
+      std::string("compiler=") + LLK_COMPILER_VERSION + "|backend=" +
+      (options.backend == MappedBackend::SelectedTarget ? "selected-target"
+                                                        : "reference");
+  if (options.backend == MappedBackend::SelectedTarget) {
+    compilation.codegenRequirements = target.codegenRequirements();
+    if (!compilation.codegenRequirements)
+      return compileError("selected-target compilation has no ISA requirements "
+                          "from its mapping target");
+    const auto &requirements = *compilation.codegenRequirements;
+    compilation.executionIdentity +=
+        "|target=" + target.name().str() +
+        "|machine-content=" + std::to_string(target.machine().contentHash) +
+        "|architecture=" + requirements.architecture +
+        "|cpu=" + requirements.cpu + "|features=";
+    for (size_t i = 0; i < requirements.requiredFeatures.size(); ++i) {
+      if (i)
+        compilation.executionIdentity += ",";
+      compilation.executionIdentity += requirements.requiredFeatures[i];
+    }
+  } else {
+    compilation.executionIdentity +=
+        "|target=native-host|cpu=host|features=host";
+  }
 
   // Binding clones the source and writes the selected state onto the clone, so
   // the caller's module is untouched whatever happens next.

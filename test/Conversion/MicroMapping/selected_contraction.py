@@ -29,6 +29,8 @@ def main():
     ], input_text=exported)
 
     assert "backend=selected-target" in selected_ir
+    assert "stop=lowered executable=not-built invocation=not-run" in selected_ir
+    assert "architecture=x86_64 cpu=generic features=avx2" in selected_ir
     assert "backend-groups-realized=0" not in selected_ir
     assert "reference-lowered-ops=0" in selected_ir, (
         "selected staged bf16 GEMM fell back to reference lowering\n" +

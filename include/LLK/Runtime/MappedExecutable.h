@@ -85,6 +85,7 @@ public:
   /// The ABI this executable was compiled for.
   const KernelAbi &abi() const { return abi_; }
   uint64_t abiHash() const { return computeKernelAbiHash(abi_); }
+  llvm::StringRef executionIdentity() const { return executionIdentity_; }
 
   llvm::Error invoke(llvm::ArrayRef<InvocationBuffer2D> inputs,
                      llvm::ArrayRef<InvocationBuffer2D> outputs);
@@ -119,13 +120,14 @@ private:
                            testing::TestAllocatorHooks *hooks);
 
   MappedExecutable(std::unique_ptr<llvm::orc::LLJIT> jit, void *entry,
-                   KernelAbi abi);
+                   KernelAbi abi, std::string executionIdentity);
 
   /// The JIT that owns the compiled code. It outlives every call, which is
   /// what lets an invocation be a plain indirect call.
   std::unique_ptr<llvm::orc::LLJIT> jit_;
   void *entry_ = nullptr;
   KernelAbi abi_;
+  std::string executionIdentity_;
 };
 
 } // namespace llk

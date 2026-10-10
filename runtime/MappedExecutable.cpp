@@ -23,6 +23,7 @@
 
 #include "LLK/Runtime/MappedExecutable.h"
 #include "LLK/Conversion/MappedKernelAbi.h"
+#include "LLK/Mapping/CodegenRequirements.h"
 #include "mapped_jit_test_factory.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -37,18 +38,41 @@
 
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
 
 #include <cstdint>
 #include <string>
 #include <utility>
+
+llvm::Error mlir::llk::mapping::checkHostRequirements(
+    const TargetCodegenRequirements &requirements,
+    llvm::StringRef hostArchitecture,
+    const llvm::StringMap<bool> &hostFeatures) {
+  if (!requirements.architecture.empty() &&
+      requirements.architecture != hostArchitecture)
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "selected target requires architecture '" + requirements.architecture +
+            "' but host architecture is '" + hostArchitecture.str() + "'");
+  for (const std::string &feature : requirements.requiredFeatures) {
+    auto available = hostFeatures.find(feature);
+    if (available == hostFeatures.end() || !available->second)
+      return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                     "selected target requires host feature '" +
+                                         feature + "'");
+  }
+  return llvm::Error::success();
+}
 
 namespace llk {
 
@@ -266,8 +290,10 @@ MappedExecutable::invokeUncheckedLegacy(llvm::ArrayRef<MemRef2D *> inputs,
 }
 
 MappedExecutable::MappedExecutable(std::unique_ptr<llvm::orc::LLJIT> jit,
-                                   void *entry, KernelAbi abi)
-    : jit_(std::move(jit)), entry_(entry), abi_(std::move(abi)) {}
+                                   void *entry, KernelAbi abi,
+                                   std::string executionIdentity)
+    : jit_(std::move(jit)), entry_(entry), abi_(std::move(abi)),
+      executionIdentity_(std::move(executionIdentity)) {}
 
 MappedExecutable::~MappedExecutable() = default;
 
@@ -291,7 +317,6 @@ llvm::Expected<std::unique_ptr<MappedExecutable>>
 MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
                                            const MappedJitOptions &options,
                                            testing::TestAllocatorHooks *hooks) {
-  (void)options;
   if (!prepared.module)
     return abiError("prepared mapped kernel has no module");
   if (llvm::Error error = validateKernelAbi(prepared.abi))
@@ -307,6 +332,20 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
                     prepared.entrySymbol + "'");
   if (!function.getFunctionType().getResults().empty())
     return abiError("prepared mapped kernel must return void");
+
+  std::string loweredIR;
+  llvm::raw_string_ostream loweredIROutput(loweredIR);
+  module.print(loweredIROutput);
+  loweredIROutput.flush();
+  llvm::SHA256 loweredIRHash;
+  loweredIRHash.update(loweredIR);
+  const auto loweredIRDigest = loweredIRHash.final();
+  std::string executionIdentity = options.executionIdentity;
+  executionIdentity +=
+      "|abi=" + std::to_string(computeKernelAbiHash(prepared.abi));
+  executionIdentity +=
+      "|lowered-ir-sha256=" +
+      llvm::toHex(llvm::ArrayRef<uint8_t>(loweredIRDigest), true);
 
   size_t argumentCount =
       prepared.abi.inputs.size() + prepared.abi.outputs.size();
@@ -334,6 +373,26 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
   if (llvm::Error error = validateArguments(
           prepared.abi.outputs, prepared.abi.inputs.size(), "output"))
     return std::move(error);
+
+  const auto detectedFeatures = llvm::sys::getHostCPUFeatures();
+  llvm::StringMap<bool> hostFeatures;
+  for (const auto &feature : detectedFeatures)
+    hostFeatures[feature.getKey()] = feature.getValue();
+  if (options.selectedTarget) {
+    std::string hostTriple = llvm::sys::getDefaultTargetTriple();
+    llvm::StringRef hostArchitecture(hostTriple);
+    hostArchitecture = hostArchitecture.take_front(hostArchitecture.find('-'));
+    if (hostArchitecture == "arm64")
+      hostArchitecture = "aarch64";
+    else if (hostArchitecture == "amd64")
+      hostArchitecture = "x86_64";
+    if (llvm::Error error = mlir::llk::mapping::checkHostRequirements(
+            *options.selectedTarget, hostArchitecture, hostFeatures))
+      return error;
+    if (hostFeatures.empty())
+      return abiError("cannot detect host CPU features for selected-target "
+                      "execution");
+  }
 
   // The C-interface wrapper is what turns descriptor pointers into the expanded
   // form the lowered body expects, so the entry point asks for it explicitly.
@@ -367,8 +426,26 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
 
-  llvm::Expected<std::unique_ptr<llvm::orc::LLJIT>> jit =
-      llvm::orc::LLJITBuilder().create();
+  llvm::orc::LLJITBuilder jitBuilder;
+  if (options.selectedTarget) {
+    llvm::Expected<llvm::orc::JITTargetMachineBuilder> targetMachine =
+        llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!targetMachine)
+      return targetMachine.takeError();
+    if (!options.selectedTarget->cpu.empty())
+      targetMachine->setCPU(options.selectedTarget->cpu);
+    std::string features;
+    for (const std::string &feature :
+         options.selectedTarget->requiredFeatures) {
+      if (!features.empty())
+        features += ',';
+      features += '+' + feature;
+    }
+    if (!features.empty())
+      targetMachine->setFeatures(features);
+    jitBuilder.setJITTargetMachineBuilder(std::move(*targetMachine));
+  }
+  llvm::Expected<std::unique_ptr<llvm::orc::LLJIT>> jit = jitBuilder.create();
   if (!jit)
     return jit.takeError();
 
@@ -412,7 +489,8 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
     return symbol.takeError();
 
   return std::unique_ptr<MappedExecutable>(new MappedExecutable(
-      std::move(*jit), symbol->toPtr<void *>(), std::move(prepared.abi)));
+      std::move(*jit), symbol->toPtr<void *>(), std::move(prepared.abi),
+      std::move(executionIdentity)));
 }
 
 llvm::Expected<std::unique_ptr<MappedExecutable>>

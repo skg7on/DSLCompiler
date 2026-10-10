@@ -28,6 +28,7 @@
 #include "llvm/Support/Error.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace llk {
@@ -86,6 +87,11 @@ struct MappedCompilation {
   unsigned backendGroupsRealized = 0;
   /// Selected groups left to the reference bridge.
   unsigned referenceGroupsLowered = 0;
+  /// Declared ISA for a selected backend, retained for every reached stop.
+  std::optional<mlir::llk::mapping::TargetCodegenRequirements>
+      codegenRequirements;
+  /// Compiler, target, math mode, and host/ISA contract identity.
+  std::string executionIdentity;
 };
 
 /// Runs the shared mapped-compilation sequence over `source`.

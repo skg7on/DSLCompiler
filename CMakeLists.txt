@@ -1028,6 +1028,11 @@ add_llvm_executable(SelectedGroupLoweringTest
 target_link_libraries(SelectedGroupLoweringTest PRIVATE
     LLKMappedCompilation LLKMapping GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME SelectedGroupLoweringTest COMMAND SelectedGroupLoweringTest)
+add_llvm_executable(MappedCodegenRequirementsTest
+    test/Execution/mapped_codegen_requirements.cpp)
+target_link_libraries(MappedCodegenRequirementsTest PRIVATE
+    LLKRuntime GTest::gtest_main)
+add_test(NAME MappedCodegenRequirementsTest COMMAND MappedCodegenRequirementsTest)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
 target_link_libraries(MappingPlanReportTest PRIVATE LLKResourceRegressionFixture)

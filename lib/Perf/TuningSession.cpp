@@ -269,6 +269,7 @@ llvm::Error measureTopCandidates(mlir::MLIRContext &context,
       ranked.measuredTarget = options.targetIdentity;
       ranked.measuredMachine = options.machineIdentity;
       ranked.measuredAbi = options.abiIdentity;
+      ranked.measuredCodegenIdentity = options.codegenIdentity;
     }
     // A miss leaves the candidate exactly as it was: still ranked, still
     // legal, with its static score standing.

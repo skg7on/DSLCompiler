@@ -92,6 +92,8 @@ struct MeasurementOptions {
   std::string targetIdentity;
   std::string machineIdentity;
   std::string abiIdentity;
+  /// Compiler/codegen identity (backend, ISA, math mode and target content).
+  std::string codegenIdentity;
 };
 
 struct TuningSessionOptions {
@@ -121,6 +123,7 @@ struct RankedCandidate {
   std::string measuredTarget;
   std::string measuredMachine;
   std::string measuredAbi;
+  std::string measuredCodegenIdentity;
 };
 
 struct TuningSessionReport {
