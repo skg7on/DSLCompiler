@@ -288,7 +288,7 @@
 <section id="run-the-current-micro-tuner">
 <span id="tutorials-04-tuning-2-run-the-current-micro-tuner"></span><h2>2. Run the current Micro tuner<a class="headerlink" href="#run-the-current-micro-tuner" title="Link to this heading">¶</a></h2>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mkdir<span class="w"> </span>-p<span class="w"> </span>build/tutorial
-build/llk-tune<span class="w"> </span>--input<span class="o">=</span>docs/manual/source/examples/swiglu.search.mlir<span class="w"> </span><span class="se">\</span>
+build/bin/llk-tune<span class="w"> </span>--input<span class="o">=</span>docs/manual/source/examples/swiglu.search.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>-M<span class="o">=</span><span class="m">8</span><span class="w"> </span>-N<span class="o">=</span><span class="m">64</span><span class="w"> </span>-K<span class="o">=</span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--search<span class="o">=</span>grid<span class="w"> </span>--max-candidates<span class="o">=</span><span class="m">1</span><span class="w"> </span>--top-k<span class="o">=</span><span class="m">1</span><span class="w"> </span>--perf-level<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--output<span class="o">=</span>build/tutorial/swiglu.schedule.yaml
@@ -299,9 +299,9 @@ build/llk-tune<span class="w"> </span>--input<span class="o">=</span>docs/manual
 </section>
 <section id="export-a-search-space-from-semantic-source">
 <span id="tutorials-04-tuning-3-export-a-search-space-from-semantic-source"></span><h2>3. Export a search space from semantic source<a class="headerlink" href="#export-a-search-space-from-semantic-source" title="Link to this heading">¶</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro-search<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro-search<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/swiglu.exported.search.mlir
-build/llk-opt<span class="w"> </span>build/tutorial/swiglu.exported.search.mlir<span class="w"> </span><span class="se">\</span>
+build/bin/llk-opt<span class="w"> </span>build/tutorial/swiglu.exported.search.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/swiglu.exported.search.roundtrip.mlir
 </pre></div>
 </div>
@@ -314,7 +314,7 @@ build/llk-opt<span class="w"> </span>build/tutorial/swiglu.exported.search.mlir<
 </pre></div>
 </div>
 <p>In the copy, change <code class="docutils literal notranslate"><span class="pre">num_threads</span></code> choices from <code class="docutils literal notranslate"><span class="pre">[8</span> <span class="pre">:</span> <span class="pre">i64]</span></code> to <code class="docutils literal notranslate"><span class="pre">[1</span> <span class="pre">:</span> <span class="pre">i64,</span> <span class="pre">8</span> <span class="pre">:</span> <span class="pre">i64]</span></code>. Keep workload dimensions and all other choices fixed. Run both candidates:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-tune<span class="w"> </span>--input<span class="o">=</span>build/tutorial/swiglu.experiment.search.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-tune<span class="w"> </span>--input<span class="o">=</span>build/tutorial/swiglu.experiment.search.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>-M<span class="o">=</span><span class="m">8</span><span class="w"> </span>-N<span class="o">=</span><span class="m">64</span><span class="w"> </span>-K<span class="o">=</span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--search<span class="o">=</span>grid<span class="w"> </span>--max-candidates<span class="o">=</span><span class="m">2</span><span class="w"> </span>--top-k<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--output<span class="o">=</span>build/tutorial/swiglu.experiment.schedule.yaml
@@ -322,7 +322,7 @@ build/llk-opt<span class="w"> </span>build/tutorial/swiglu.exported.search.mlir<
 </div>
 <p>Compare the hierarchy/owner choices, predicted cycles, and retained records. Thread choices may tie or fail legality depending on the model; a smaller time from this prediction is not proof of faster measured execution. Next, change one tile dimension and observe capacity/legality effects before trying a large Cartesian product.</p>
 <p>For bounded random sampling with a reproducible seed:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-tune<span class="w"> </span>--input<span class="o">=</span>build/tutorial/swiglu.experiment.search.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-tune<span class="w"> </span>--input<span class="o">=</span>build/tutorial/swiglu.experiment.search.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--machine<span class="o">=</span>machines/x86-avx2-v2.yaml<span class="w"> </span>-M<span class="o">=</span><span class="m">8</span><span class="w"> </span>-N<span class="o">=</span><span class="m">64</span><span class="w"> </span>-K<span class="o">=</span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--search<span class="o">=</span>random<span class="w"> </span>--seed<span class="o">=</span><span class="m">17</span><span class="w"> </span>--max-candidates<span class="o">=</span><span class="m">2</span><span class="w"> </span>--top-k<span class="o">=</span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--output<span class="o">=</span>build/tutorial/swiglu.random.schedule.yaml

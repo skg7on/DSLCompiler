@@ -351,11 +351,11 @@ cmake<span class="w"> </span>--build<span class="w"> </span>build<span class="w"
 </section>
 <section id="check-the-build">
 <span id="getting-started-check-the-build"></span><h2>Check the build<a class="headerlink" href="#check-the-build" title="Link to this heading">¶</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-opt<span class="w"> </span>--help
-build/llk-compile<span class="w"> </span>--help
-build/micro-perf<span class="w"> </span>--help
-build/llk-tune<span class="w"> </span>--help
-build/llk-bench<span class="w"> </span>--help
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-opt<span class="w"> </span>--help
+build/bin/llk-compile<span class="w"> </span>--help
+build/bin/micro-perf<span class="w"> </span>--help
+build/bin/llk-tune<span class="w"> </span>--help
+build/bin/llk-bench<span class="w"> </span>--help
 cmake<span class="w"> </span>--build<span class="w"> </span>build<span class="w"> </span>--target<span class="w"> </span>check-llk<span class="w"> </span>--parallel<span class="w"> </span><span class="m">4</span>
 </pre></div>
 </div>
@@ -364,8 +364,8 @@ cmake<span class="w"> </span>--build<span class="w"> </span>build<span class="w"
 <section id="first-useful-result">
 <span id="getting-started-first-useful-result"></span><h2>First useful result<a class="headerlink" href="#first-useful-result" title="Link to this heading">¶</a></h2>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mkdir<span class="w"> </span>-p<span class="w"> </span>build/tutorial
-build/llk-opt<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.parsed.mlir
-build/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span><span class="se">\</span>
+build/bin/llk-opt<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.parsed.mlir
+build/bin/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/matmul.micro.mlir
 </pre></div>
 </div>

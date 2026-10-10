@@ -323,6 +323,21 @@ ninja check-llk
 
 When `LLVM_PROJECT_BUILD_DIR` is set, `MLIR_DIR` and `LLVM_DIR` are inferred and system-installed LLVM/MLIR are ignored. If omitted, `find_package` searches the standard CMake prefixes.
 
+Libraries are written to `build/lib`; tools and test executables are written to `build/bin`.
+GTest sources are combined into `LLKExecutionTests`, `LLKNumericalTests`,
+`LLKTransformsTests`, `LLKPerfTests`, `LLKMachineTests`, `LLKMappingTests`,
+`LLKConversionTests`, and `LLKBenchmarkTests`. CTest discovers individual GTest
+cases and labels them by category, alongside the FileCheck and verifier tests.
+
+```bash
+ctest --test-dir build -L Mapping --output-on-failure
+build/bin/LLKMappingTests --gtest_filter='MappingPlan.*'
+```
+
+Test configuration lives under `test/`. Use `-DBUILD_TESTING=OFF` for a build
+without tests or GoogleTest, or `-DLLK_BUILD_E2E_TESTS=OFF` to exclude the JIT
+execution tests.
+
 Configure emits a compilation database at `build/compile_commands.json` for clangd and other editors; pass `-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF` to turn it off.
 
 The build uses the `clang` found on `PATH`. CMake's own search would pick the Apple toolchain at `/usr/bin/cc` on macOS, so `CMakeLists.txt` selects `clang`/`clang++` from `PATH` explicitly. An absolute `CC`/`CXX` naming a file that does not exist is ignored with a status message instead of aborting the configure — the usual cause is a shell profile exporting a toolchain from `brew --prefix llvm@NN` after that keg has been uninstalled. To switch compilers, delete `build/` and reconfigure: an existing build tree keeps the compiler it cached.

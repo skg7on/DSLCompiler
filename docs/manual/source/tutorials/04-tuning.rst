@@ -32,7 +32,7 @@ This example deliberately offers one candidate, so you can learn the file format
 .. code-block:: bash
 
    mkdir -p build/tutorial
-   build/llk-tune --input=docs/manual/source/examples/swiglu.search.mlir \
+   build/bin/llk-tune --input=docs/manual/source/examples/swiglu.search.mlir \
      --machine=machines/x86-avx2-v2.yaml -M=8 -N=64 -K=64 \
      --search=grid --max-candidates=1 --top-k=1 --perf-level=1 \
      --output=build/tutorial/swiglu.schedule.yaml
@@ -48,9 +48,9 @@ The current session builds a **synthetic concrete kernel** for a candidate and r
 
 .. code-block:: bash
 
-   build/llk-compile --emit=micro-search docs/manual/source/examples/swiglu.mlir \
+   build/bin/llk-compile --emit=micro-search docs/manual/source/examples/swiglu.mlir \
      > build/tutorial/swiglu.exported.search.mlir
-   build/llk-opt build/tutorial/swiglu.exported.search.mlir \
+   build/bin/llk-opt build/tutorial/swiglu.exported.search.mlir \
      > build/tutorial/swiglu.exported.search.roundtrip.mlir
 
 Inspect the parameters exported for the source and schedule database. The adjacent LLK source is retained, but the current CLI tuning flow uses the search-space description and explicit dimensions rather than compiling that adjacent source. A later mapping-driven implementation must preserve source semantics and provenance; this tutorial does not claim that integration already exists.
@@ -70,7 +70,7 @@ In the copy, change ``num_threads`` choices from ``[8 : i64]`` to ``[1 : i64, 8 
 
 .. code-block:: bash
 
-   build/llk-tune --input=build/tutorial/swiglu.experiment.search.mlir \
+   build/bin/llk-tune --input=build/tutorial/swiglu.experiment.search.mlir \
      --machine=machines/x86-avx2-v2.yaml -M=8 -N=64 -K=64 \
      --search=grid --max-candidates=2 --top-k=2 \
      --output=build/tutorial/swiglu.experiment.schedule.yaml
@@ -81,7 +81,7 @@ For bounded random sampling with a reproducible seed:
 
 .. code-block:: bash
 
-   build/llk-tune --input=build/tutorial/swiglu.experiment.search.mlir \
+   build/bin/llk-tune --input=build/tutorial/swiglu.experiment.search.mlir \
      --machine=machines/x86-avx2-v2.yaml -M=8 -N=64 -K=64 \
      --search=random --seed=17 --max-candidates=2 --top-k=2 \
      --output=build/tutorial/swiglu.random.schedule.yaml

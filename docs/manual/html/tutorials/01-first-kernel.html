@@ -286,14 +286,14 @@
 <section id="parse-and-verify">
 <span id="tutorials-01-first-kernel-2-parse-and-verify"></span><h2>2. Parse and verify<a class="headerlink" href="#parse-and-verify" title="Link to this heading">¶</a></h2>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mkdir<span class="w"> </span>-p<span class="w"> </span>build/tutorial
-build/llk-opt<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.parsed.mlir
+build/bin/llk-opt<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.parsed.mlir
 </pre></div>
 </div>
 <p>Expected: an equivalent <code class="docutils literal notranslate"><span class="pre">func.func</span> <span class="pre">&#64;matmul</span></code> containing <code class="docutils literal notranslate"><span class="pre">llk.matmul</span></code>. Change one dimension so the operands no longer agree and the verifier will explain the mismatch. Revert that experiment before continuing.</p>
 </section>
 <section id="inspect-structured-lowering">
 <span id="tutorials-01-first-kernel-3-inspect-structured-lowering"></span><h2>3. Inspect structured lowering<a class="headerlink" href="#inspect-structured-lowering" title="Link to this heading">¶</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-opt<span class="w"> </span>--llk-to-linalg<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-opt<span class="w"> </span>--llk-to-linalg<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/swiglu.linalg.mlir
 </pre></div>
 </div>
@@ -301,9 +301,9 @@ build/llk-opt<span class="w"> </span>docs/manual/source/examples/matmul.mlir<spa
 </section>
 <section id="export-microir">
 <span id="tutorials-01-first-kernel-4-export-microir"></span><h2>4. Export MicroIR<a class="headerlink" href="#export-microir" title="Link to this heading">¶</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro<span class="w"> </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/matmul.micro.mlir
-build/llk-opt<span class="w"> </span>build/tutorial/matmul.micro.mlir<span class="w"> </span><span class="se">\</span>
+build/bin/llk-opt<span class="w"> </span>build/tutorial/matmul.micro.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/matmul.micro.roundtrip.mlir
 </pre></div>
 </div>
@@ -347,7 +347,7 @@ build/llk-opt<span class="w"> </span>build/tutorial/matmul.micro.mlir<span class
 </table>
 </div>
 <p>The exporter uses a schedule database when a matching entry exists, with a conservative fallback otherwise. Exact tile shapes can differ with the database and compiler revision. To deliberately select the built-in fallback for the remaining tutorials, use a filename that does not exist:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-opt<span class="w"> </span>--llk-to-micro<span class="o">=</span><span class="s2">"schedule-db=build/tutorial/no-schedule.json"</span><span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-opt<span class="w"> </span>--llk-to-micro<span class="o">=</span><span class="s2">"schedule-db=build/tutorial/no-schedule.json"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.fallback.micro.mlir
 </pre></div>
 </div>
@@ -355,13 +355,13 @@ build/llk-opt<span class="w"> </span>build/tutorial/matmul.micro.mlir<span class
 </section>
 <section id="see-a-fused-workload">
 <span id="tutorials-01-first-kernel-5-see-a-fused-workload"></span><h2>5. See a fused workload<a class="headerlink" href="#see-a-fused-workload" title="Link to this heading">¶</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/swiglu.micro.mlir
 </pre></div>
 </div>
 <p><a class="reference download internal" download="" href="../_downloads/754a75f450c3685b875556b140ecf37c/swiglu.mlir"><code class="xref download docutils literal notranslate"><span class="pre">SwiGLU</span></code></a> computes <code class="docutils literal notranslate"><span class="pre">SiLU(X·Wg)</span> <span class="pre">⊙</span> <span class="pre">(X·Wu)</span></code>. Inspect the two accumulator/MMA arms and the vector epilogue. A fused semantic operation decomposes into execution primitives; the kernel body does not retain a high-level <code class="docutils literal notranslate"><span class="pre">llk.fused_swiglu</span></code> operation. The adjacent source function still does.</p>
 <p>For a search-space view of the same source:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro-search<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--emit<span class="o">=</span>micro-search<span class="w"> </span>docs/manual/source/examples/swiglu.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/swiglu.exported.search.mlir
 </pre></div>
 </div>

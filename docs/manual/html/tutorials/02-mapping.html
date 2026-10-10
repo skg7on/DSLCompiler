@@ -275,7 +275,7 @@
 <section id="freeze-the-input-and-configuration">
 <span id="tutorials-02-mapping-1-freeze-the-input-and-configuration"></span><h2>1. Freeze the input and configuration<a class="headerlink" href="#freeze-the-input-and-configuration" title="Link to this heading">¶</a></h2>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mkdir<span class="w"> </span>-p<span class="w"> </span>build/tutorial
-build/llk-opt<span class="w"> </span>--llk-to-micro<span class="o">=</span><span class="s2">"schedule-db=build/tutorial/no-schedule.json"</span><span class="w"> </span><span class="se">\</span>
+build/bin/llk-opt<span class="w"> </span>--llk-to-micro<span class="o">=</span><span class="s2">"schedule-db=build/tutorial/no-schedule.json"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.fallback.micro.mlir
 
 <span class="nv">EMITTERS</span><span class="o">=</span><span class="s2">"avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul"</span>
@@ -294,9 +294,9 @@ build/llk-opt<span class="w"> </span>--llk-to-micro<span class="o">=</span><span
 </section>
 <section id="search-bind-and-report">
 <span id="tutorials-02-mapping-2-search-bind-and-report"></span><h2>2. Search, bind, and report<a class="headerlink" href="#search-bind-and-report" title="Link to this heading">¶</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-opt<span class="w"> </span><span class="s2">"--micro-map=</span><span class="nv">$MAP_OPTIONS</span><span class="s2"> report=build/tutorial/matmul.plan.json"</span><span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-opt<span class="w"> </span><span class="s2">"--micro-map=</span><span class="nv">$MAP_OPTIONS</span><span class="s2"> report=build/tutorial/matmul.plan.json"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>build/tutorial/matmul.fallback.micro.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.mapped.mlir
-build/llk-opt<span class="w"> </span><span class="s2">"--micro-verify-mapping=</span><span class="nv">$TARGET_OPTIONS</span><span class="s2">"</span><span class="w"> </span>build/tutorial/matmul.mapped.mlir<span class="w"> </span><span class="se">\</span>
+build/bin/llk-opt<span class="w"> </span><span class="s2">"--micro-verify-mapping=</span><span class="nv">$TARGET_OPTIONS</span><span class="s2">"</span><span class="w"> </span>build/tutorial/matmul.mapped.mlir<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>&gt;<span class="w"> </span>build/tutorial/matmul.verified.mlir
 </pre></div>
 </div>
@@ -318,7 +318,7 @@ build/llk-opt<span class="w"> </span><span class="s2">"--micro-verify-mapping=</
 <span id="tutorials-02-mapping-3-replay-by-plan-id"></span><h2>3. Replay by plan ID<a class="headerlink" href="#replay-by-plan-id" title="Link to this heading">¶</a></h2>
 <p>Extract the reported ID and rerun the same search settings through the binding pass:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">PLAN_ID</span><span class="o">=</span><span class="k">$(</span>python3<span class="w"> </span>-c<span class="w"> </span><span class="s1">'import json; print(json.load(open("build/tutorial/matmul.plan.json"))["selectedPlanId"])'</span><span class="k">)</span>
-build/llk-opt<span class="w"> </span><span class="s2">"--micro-bind-plan=plan-id=</span><span class="nv">$PLAN_ID</span><span class="s2"> </span><span class="nv">$MAP_OPTIONS</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+build/bin/llk-opt<span class="w"> </span><span class="s2">"--micro-bind-plan=plan-id=</span><span class="nv">$PLAN_ID</span><span class="s2"> </span><span class="nv">$MAP_OPTIONS</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>build/tutorial/matmul.fallback.micro.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.replayed.mlir
 diff<span class="w"> </span>-u<span class="w"> </span>build/tutorial/matmul.mapped.mlir<span class="w"> </span>build/tutorial/matmul.replayed.mlir
 </pre></div>
@@ -328,14 +328,14 @@ diff<span class="w"> </span>-u<span class="w"> </span>build/tutorial/matmul.mapp
 </section>
 <section id="inspect-a-later-compilation-stage">
 <span id="tutorials-02-mapping-4-inspect-a-later-compilation-stage"></span><h2>4. Inspect a later compilation stage<a class="headerlink" href="#inspect-a-later-compilation-stage" title="Link to this heading">¶</a></h2>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--mapping-mode<span class="o">=</span>exact<span class="w"> </span>--mapping-stop<span class="o">=</span>lowered<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>docs/manual/source/examples/matmul.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/matmul.lowered.txt
 </pre></div>
 </div>
 <p>The output starts with mapping/realization status followed by lowered MLIR. This driver independently exports and maps the source using its normal schedule settings; it is not a replay of the fallback export above. Review the status as well as the IR. Selected emitters can delegate tensor realization to a portable reference bridge; successful lowering does not establish selected AVX2 width or instruction fidelity.</p>
 <p>To request JIT compilation through the mapped path:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-compile<span class="w"> </span>--mapping-target<span class="o">=</span>x86-avx2<span class="w"> </span>--mapping-root<span class="o">=</span>.<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--mapping-mode<span class="o">=</span>exact<span class="w"> </span>docs/manual/source/examples/matmul.mlir
 </pre></div>
 </div>
@@ -344,7 +344,7 @@ diff<span class="w"> </span>-u<span class="w"> </span>build/tutorial/matmul.mapp
 <section id="optional-second-target-experiment">
 <span id="tutorials-02-mapping-5-optional-second-target-experiment"></span><h2>5. Optional second-target experiment<a class="headerlink" href="#optional-second-target-experiment" title="Link to this heading">¶</a></h2>
 <p>The <a class="reference external" href="https://github.com/skg7on/DSLCompiler/tree/main/mapping/generic-ai-accel">generic accelerator package</a> is for mapping/model exploration, not an accelerator runtime. Use the hand-authored <a class="reference external" href="https://github.com/skg7on/DSLCompiler/blob/main/test/Conversion/MicroMapping/micro_map.mlir">copy/add fixture</a>:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/llk-opt<span class="w"> </span>--micro-map<span class="o">=</span><span class="s2">"target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_mxu,accel_copy mode=deterministic report=build/tutorial/accelerator.plan.json"</span><span class="w"> </span><span class="se">\</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>build/bin/llk-opt<span class="w"> </span>--micro-map<span class="o">=</span><span class="s2">"target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_mxu,accel_copy mode=deterministic report=build/tutorial/accelerator.plan.json"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>test/Conversion/MicroMapping/micro_map.mlir<span class="w"> </span>&gt;<span class="w"> </span>build/tutorial/accelerator.mapped.mlir
 </pre></div>
 </div>

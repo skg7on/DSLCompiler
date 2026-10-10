@@ -13,7 +13,7 @@ Tutorial 2: map a kernel and replay its plan
 .. code-block:: bash
 
    mkdir -p build/tutorial
-   build/llk-opt --llk-to-micro="schedule-db=build/tutorial/no-schedule.json" \
+   build/bin/llk-opt --llk-to-micro="schedule-db=build/tutorial/no-schedule.json" \
      docs/manual/source/examples/matmul.mlir > build/tutorial/matmul.fallback.micro.mlir
 
    EMITTERS="avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul"
@@ -39,9 +39,9 @@ These configuration files serve different purposes:
 
 .. code-block:: bash
 
-   build/llk-opt "--micro-map=$MAP_OPTIONS report=build/tutorial/matmul.plan.json" \
+   build/bin/llk-opt "--micro-map=$MAP_OPTIONS report=build/tutorial/matmul.plan.json" \
      build/tutorial/matmul.fallback.micro.mlir > build/tutorial/matmul.mapped.mlir
-   build/llk-opt "--micro-verify-mapping=$TARGET_OPTIONS" build/tutorial/matmul.mapped.mlir \
+   build/bin/llk-opt "--micro-verify-mapping=$TARGET_OPTIONS" build/tutorial/matmul.mapped.mlir \
      > build/tutorial/matmul.verified.mlir
 
 The mapped kernel gains ``micro.plan``, placement metadata on covered operations, and route/movement metadata where needed. The report includes hashes of the input and target configuration, search options, diagnostic counts, retained plans, and a selected plan ID. The verifier checks the implemented metadata contract; it does not close the complete physical-feasibility gaps tracked in #129.
@@ -74,7 +74,7 @@ Extract the reported ID and rerun the same search settings through the binding p
 .. code-block:: bash
 
    PLAN_ID=$(python3 -c 'import json; print(json.load(open("build/tutorial/matmul.plan.json"))["selectedPlanId"])')
-   build/llk-opt "--micro-bind-plan=plan-id=$PLAN_ID $MAP_OPTIONS" \
+   build/bin/llk-opt "--micro-bind-plan=plan-id=$PLAN_ID $MAP_OPTIONS" \
      build/tutorial/matmul.fallback.micro.mlir > build/tutorial/matmul.replayed.mlir
    diff -u build/tutorial/matmul.mapped.mlir build/tutorial/matmul.replayed.mlir
 
@@ -89,7 +89,7 @@ Record the original input file, machine/layout/rule files, emitter list, compile
 
 .. code-block:: bash
 
-   build/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
+   build/bin/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
      --mapping-mode=exact --mapping-stop=lowered \
      docs/manual/source/examples/matmul.mlir > build/tutorial/matmul.lowered.txt
 
@@ -99,7 +99,7 @@ To request JIT compilation through the mapped path:
 
 .. code-block:: bash
 
-   build/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
+   build/bin/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
      --mapping-mode=exact docs/manual/source/examples/matmul.mlir
 
 Expected: a compilation-success status if this host/build supports the path. The CLI does not accept tensor data or invoke the resulting function. Numerical invocation uses ``MappedExecutable`` in the C++ runtime and is demonstrated in the :source:`mapped acceptance tests <test/Execution/mapped_acceptance.cpp>`. Repeated invocation ownership, richer ABI validation, and selected-target realization remain work in #129.
@@ -113,7 +113,7 @@ The :source:`generic accelerator package <mapping/generic-ai-accel>` is for mapp
 
 .. code-block:: bash
 
-   build/llk-opt --micro-map="target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_mxu,accel_copy mode=deterministic report=build/tutorial/accelerator.plan.json" \
+   build/bin/llk-opt --micro-map="target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_mxu,accel_copy mode=deterministic report=build/tutorial/accelerator.plan.json" \
      test/Conversion/MicroMapping/micro_map.mlir > build/tutorial/accelerator.mapped.mlir
 
 If emitter names or supported rules change, consult the package and :doc:`optimizer manual </tools/optimizer>`. Compare selected placements and routes with AVX2 rather than assuming the same cost model has been calibrated for both machines.

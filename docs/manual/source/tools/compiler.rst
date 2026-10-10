@@ -14,8 +14,8 @@ Invocation and outputs
 
 .. code-block:: sh
 
-   build/llk-compile [options] input.mlir
-   build/llk-compile --help
+   build/bin/llk-compile [options] input.mlir
+   build/bin/llk-compile --help
    mkdir -p build/tutorial
 
 The input filename is required. Textual output goes to stdout and diagnostics go to stderr. Use shell redirection to save an artifact; this driver has no ``-o`` output option. Errors return a nonzero exit status.
@@ -105,13 +105,13 @@ The tutorial sources use static BF16 matrices and FP32 accumulation. The matmul 
 
 .. code-block:: sh
 
-   build/llk-compile --emit=micro docs/manual/source/examples/matmul.mlir \
+   build/bin/llk-compile --emit=micro docs/manual/source/examples/matmul.mlir \
      > build/tutorial/matmul.micro.mlir
 
-   build/llk-compile --emit=micro-search docs/manual/source/examples/swiglu.mlir \
+   build/bin/llk-compile --emit=micro-search docs/manual/source/examples/swiglu.mlir \
      > build/tutorial/swiglu.search.mlir
 
-   build/llk-opt build/tutorial/matmul.micro.mlir -o build/tutorial/matmul.roundtrip.mlir
+   build/bin/llk-opt build/tutorial/matmul.micro.mlir -o build/tutorial/matmul.roundtrip.mlir
 
 The first artifact contains ``micro.kernel @matmul_M16_N64_K64``. The second contains a search space around the schedule selected for the SwiGLU workload. Neither command runs a mapping search, lowers to machine code, or invokes a kernel. The original ``func.func`` remains beside the export, so seeing ``llk.*`` in the module is expected; the generated concrete kernel itself contains Micro execution operations.
 
@@ -144,10 +144,10 @@ Use the SwiGLU source for this path:
 
 .. code-block:: sh
 
-   build/llk-compile --emit=mlir docs/manual/source/examples/swiglu.mlir \
+   build/bin/llk-compile --emit=mlir docs/manual/source/examples/swiglu.mlir \
      > build/tutorial/swiglu.llvm.mlir
 
-   build/llk-compile docs/manual/source/examples/swiglu.mlir
+   build/bin/llk-compile docs/manual/source/examples/swiglu.mlir
 
 The first command saves MLIR LLVM-dialect IR. The second prints ``Compilation successful`` after the native JIT has compiled an exported function. The JIT and its cache live only for this process; the command does not leave a callable executable file behind.
 
@@ -180,12 +180,12 @@ Map through a registered package
 
 .. code-block:: sh
 
-   build/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
+   build/bin/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
      --mapping-mode=exact --mapping-stop=mapped-micro \
      docs/manual/source/examples/matmul.mlir > build/tutorial/matmul.mapped.log
 
    sed '1d' build/tutorial/matmul.mapped.log > build/tutorial/matmul.mapped.mlir
-   build/llk-opt build/tutorial/matmul.mapped.mlir -o build/tutorial/matmul.mapped.roundtrip.mlir
+   build/bin/llk-opt build/tutorial/matmul.mapped.mlir -o build/tutorial/matmul.mapped.roundtrip.mlir
 
 The compiler exports a concrete kernel if the input does not already contain one, extracts its workload graph, selects a covering plan, binds and verifies it, and stops at the requested stage. When it exports, it removes the LLK source function from the mapped compilation module. It uses the first selected plan returned by the search.
 
@@ -218,11 +218,11 @@ For example:
 
 .. code-block:: sh
 
-   build/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
+   build/bin/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
      --mapping-mode=exact --mapping-stop=lowered \
      docs/manual/source/examples/matmul.mlir > build/tutorial/matmul.lowered.log
 
-   build/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
+   build/bin/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
      --mapping-mode=exact docs/manual/source/examples/matmul.mlir
 
 The shipped matmul example currently reports one target-lowered operation and four reference-lowered operations at the later stages. SwiGLU reports three and six. These count emitter-hook dispatches; they do not certify selected vector width, actual AVX2 instructions, physical resource occupancy, or numerical correctness. Native JIT execution is host-portable, and selected AVX2 width is currently lost by the tensor reference bridge. Read the :source:`current gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>` before treating mapping success as complete target-execution acceptance.
@@ -257,7 +257,7 @@ The compiler reads a report; it does not write one. Produce a versioned JSON rep
 .. code-block:: sh
 
    # Files created by the optimizer manual's report-only example:
-   build/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
+   build/bin/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
      --plan-report=build/tutorial/matmul.plan.json \
      --mapping-stop=mapped-micro build/tutorial/matmul.micro.mlir \
      > build/tutorial/matmul.replayed.log

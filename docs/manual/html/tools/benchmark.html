@@ -283,8 +283,8 @@ mean this benchmark invokes them.</p>
 <section id="short-first-run">
 <span id="tools-benchmark-short-first-run"></span><h2>Short first run<a class="headerlink" href="#short-first-run" title="Link to this heading">¶</a></h2>
 <p>Run from the repository root after building:</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-bench<span class="w"> </span>--help
-build/llk-bench<span class="w"> </span>-M<span class="o">=</span><span class="m">2</span><span class="w"> </span>-N<span class="o">=</span><span class="m">16</span><span class="w"> </span>-K<span class="o">=</span><span class="m">16</span><span class="w"> </span>--threads<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-bench<span class="w"> </span>--help
+build/bin/llk-bench<span class="w"> </span>-M<span class="o">=</span><span class="m">2</span><span class="w"> </span>-N<span class="o">=</span><span class="m">16</span><span class="w"> </span>-K<span class="o">=</span><span class="m">16</span><span class="w"> </span>--threads<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--warmup-ms<span class="o">=</span><span class="m">10</span><span class="w"> </span>--measure-ms<span class="o">=</span><span class="m">20</span><span class="w"> </span>--reps<span class="o">=</span><span class="m">2</span>
 </pre></div>
 </div>
@@ -296,7 +296,7 @@ Best: &lt;value&gt; GFLOPS (&lt;value&gt; ms/iter, 2 reps)
 </div>
 <p>The angle-bracket values above are placeholders, not reproducible expected
 measurements. To keep a log:</p>
-<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/llk-bench<span class="w"> </span>-M<span class="o">=</span><span class="m">2</span><span class="w"> </span>-N<span class="o">=</span><span class="m">16</span><span class="w"> </span>-K<span class="o">=</span><span class="m">16</span><span class="w"> </span>--threads<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<div class="highlight-sh notranslate"><div class="highlight"><pre><span></span>build/bin/llk-bench<span class="w"> </span>-M<span class="o">=</span><span class="m">2</span><span class="w"> </span>-N<span class="o">=</span><span class="m">16</span><span class="w"> </span>-K<span class="o">=</span><span class="m">16</span><span class="w"> </span>--threads<span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--warmup-ms<span class="o">=</span><span class="m">10</span><span class="w"> </span>--measure-ms<span class="o">=</span><span class="m">20</span><span class="w"> </span>--reps<span class="o">=</span><span class="m">2</span><span class="w"> </span>&gt;<span class="w"> </span>build/bench-small.txt
 </pre></div>
 </div>

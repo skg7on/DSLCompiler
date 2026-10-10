@@ -1,0 +1,22 @@
+add_llk_test_category(Perf
+    SOURCES
+        l0_static_bound.cpp
+        l1_resource_dag.cpp
+        route_identity.cpp
+        search_space_loader.cpp
+        candidate_generator.cpp
+        legality.cpp
+        candidate_binding.cpp
+        tuning_session.cpp
+    LIBRARIES
+        LLKPerf
+        MicroDialect
+        LLKMapping
+        LLKMicroMapping
+        LLKMappedCompilation
+        ${LLK_MLIR_EXEC_LIBS}
+    DEFINITIONS
+        LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
+    INCLUDE_DIRECTORIES
+        ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+)
