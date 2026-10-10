@@ -93,6 +93,8 @@ llvm::Error resultsBecomeOutParams(mlir::func::FuncOp function,
                       "', but the mapped ABI describes results as buffers");
     abi.outputs.push_back(describe(memref));
   }
+  if (llvm::Error error = validateKernelAbi(abi))
+    return error;
   if (type.getNumResults() == 0)
     return llvm::Error::success();
 
@@ -180,8 +182,73 @@ void callAtArity(void *entry, llvm::ArrayRef<MemRef2D *> args,
 
 } // namespace
 
+llvm::Error
+MappedExecutable::invoke(llvm::ArrayRef<InvocationBuffer2D> inputs,
+                         llvm::ArrayRef<InvocationBuffer2D> outputs) {
+  if (llvm::Error error = validateMappedInvocation(abi_, inputs, outputs))
+    return error;
+
+  llvm::SmallVector<MemRef2D, kMaxDescriptors> descriptors;
+  for (const InvocationBuffer2D &input : inputs)
+    descriptors.push_back(input.descriptor);
+  for (const InvocationBuffer2D &output : outputs)
+    descriptors.push_back(output.descriptor);
+  llvm::SmallVector<MemRef2D *, kMaxDescriptors> args;
+  for (MemRef2D &descriptor : descriptors)
+    args.push_back(&descriptor);
+
+  switch (args.size()) {
+  case 0:
+    callAtArity(entry_, args, std::make_index_sequence<0>{});
+    break;
+  case 1:
+    callAtArity(entry_, args, std::make_index_sequence<1>{});
+    break;
+  case 2:
+    callAtArity(entry_, args, std::make_index_sequence<2>{});
+    break;
+  case 3:
+    callAtArity(entry_, args, std::make_index_sequence<3>{});
+    break;
+  case 4:
+    callAtArity(entry_, args, std::make_index_sequence<4>{});
+    break;
+  case 5:
+    callAtArity(entry_, args, std::make_index_sequence<5>{});
+    break;
+  case 6:
+    callAtArity(entry_, args, std::make_index_sequence<6>{});
+    break;
+  case 7:
+    callAtArity(entry_, args, std::make_index_sequence<7>{});
+    break;
+  case 8:
+    callAtArity(entry_, args, std::make_index_sequence<8>{});
+    break;
+  case 9:
+    callAtArity(entry_, args, std::make_index_sequence<9>{});
+    break;
+  case 10:
+    callAtArity(entry_, args, std::make_index_sequence<10>{});
+    break;
+  case 11:
+    callAtArity(entry_, args, std::make_index_sequence<11>{});
+    break;
+  default:
+    callAtArity(entry_, args, std::make_index_sequence<12>{});
+    break;
+  }
+  return llvm::Error::success();
+}
+
 llvm::Error MappedExecutable::invoke(llvm::ArrayRef<MemRef2D *> inputs,
                                      llvm::ArrayRef<MemRef2D *> outputs) {
+  return invokeUncheckedLegacy(inputs, outputs);
+}
+
+llvm::Error
+MappedExecutable::invokeUncheckedLegacy(llvm::ArrayRef<MemRef2D *> inputs,
+                                        llvm::ArrayRef<MemRef2D *> outputs) {
   if (inputs.size() != abi_.inputs.size())
     return abiError("kernel takes " + std::to_string(abi_.inputs.size()) +
                     " input(s) but " + std::to_string(inputs.size()) +

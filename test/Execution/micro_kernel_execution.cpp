@@ -217,10 +217,16 @@ std::vector<float> runAdd(llk::MappedExecutable &executable,
                           std::vector<float> &aStorage,
                           std::vector<float> &bStorage) {
   std::vector<float> out(64, -1.0f);
-  MemRef2D da{aStorage.data(), aStorage.data(), 0, 8, 8, 8, 1};
-  MemRef2D db{bStorage.data(), bStorage.data(), 0, 8, 8, 8, 1};
-  MemRef2D dout{out.data(), out.data(), 0, 8, 8, 8, 1};
-  llvm::Error error = executable.invoke({&da, &db}, {&dout});
+  llk::InvocationBuffer2D da{{aStorage.data(), aStorage.data(), 0, 8, 8, 8, 1},
+                             llk::InvocationElementType::F32,
+                             aStorage.size() * sizeof(float)};
+  llk::InvocationBuffer2D db{{bStorage.data(), bStorage.data(), 0, 8, 8, 8, 1},
+                             llk::InvocationElementType::F32,
+                             bStorage.size() * sizeof(float)};
+  llk::InvocationBuffer2D dout{{out.data(), out.data(), 0, 8, 8, 8, 1},
+                               llk::InvocationElementType::F32,
+                               out.size() * sizeof(float)};
+  llvm::Error error = executable.invoke({da, db}, {dout});
   if (error) {
     ADD_FAILURE() << llvm::toString(std::move(error));
     return {};
@@ -290,11 +296,19 @@ TEST(MicroKernelExecution, AcceptsABufferThatStartsInsideALargerAllocation) {
 
   const size_t outBase = 16;
   std::vector<float> outStorage(64 + 32, -2.0f);
-  MemRef2D da{a.data(), a.data(), 0, 8, 8, 8, 1};
-  MemRef2D db{bStorage.data(), bStorage.data() + 8, 0, 8, 8, 8, 1};
-  MemRef2D dout{outStorage.data(), outStorage.data() + outBase, 0, 8, 8, 8, 1};
+  llk::InvocationBuffer2D da{{a.data(), a.data(), 0, 8, 8, 8, 1},
+                             llk::InvocationElementType::F32,
+                             a.size() * sizeof(float)};
+  llk::InvocationBuffer2D db{
+      {bStorage.data(), bStorage.data() + 8, 0, 8, 8, 8, 1},
+      llk::InvocationElementType::F32,
+      bStorage.size() * sizeof(float)};
+  llk::InvocationBuffer2D dout{
+      {outStorage.data(), outStorage.data() + outBase, 0, 8, 8, 8, 1},
+      llk::InvocationElementType::F32,
+      outStorage.size() * sizeof(float)};
 
-  llvm::Error error = executable->invoke({&da, &db}, {&dout});
+  llvm::Error error = executable->invoke({da, db}, {dout});
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
   for (size_t i = 0; i < 64; ++i)
     EXPECT_EQ(outStorage[outBase + i], float(i + 1)) << "element " << i;
@@ -313,34 +327,46 @@ TEST(MicroKernelExecution, RefusesDescriptorsThatDisagreeWithTheAbi) {
 
   std::vector<float> a, b, out(64, -1.0f);
   fillInputs(a, b, /*bBase=*/0);
-  MemRef2D da{a.data(), a.data(), 0, 8, 8, 8, 1};
-  MemRef2D db{b.data(), b.data(), 0, 8, 8, 8, 1};
-  MemRef2D dout{out.data(), out.data(), 0, 8, 8, 8, 1};
+  llk::InvocationBuffer2D da{{a.data(), a.data(), 0, 8, 8, 8, 1},
+                             llk::InvocationElementType::F32,
+                             a.size() * sizeof(float)};
+  llk::InvocationBuffer2D db{{b.data(), b.data(), 0, 8, 8, 8, 1},
+                             llk::InvocationElementType::F32,
+                             b.size() * sizeof(float)};
+  llk::InvocationBuffer2D dout{{out.data(), out.data(), 0, 8, 8, 8, 1},
+                               llk::InvocationElementType::F32,
+                               out.size() * sizeof(float)};
 
   // Too few inputs: the kernel expects two, and calling it with one would pass
   // whatever happened to be in the next register.
-  llvm::Error arity = executable->invoke({&da}, {&dout});
+  llvm::Error arity = executable->invoke({da}, {dout});
   ASSERT_TRUE(static_cast<bool>(arity));
   EXPECT_NE(llvm::toString(std::move(arity)).find("input"), std::string::npos);
 
   // A descriptor of the wrong shape would make the kernel address memory the
   // caller never offered.
-  MemRef2D wrongShape{out.data(), out.data(), 0, 4, 4, 4, 1};
-  llvm::Error shape = executable->invoke({&da, &db}, {&wrongShape});
+  auto wrongShape = dout;
+  wrongShape.descriptor.size0 = 4;
+  wrongShape.descriptor.size1 = 4;
+  wrongShape.descriptor.stride0 = 4;
+  llvm::Error shape = executable->invoke({da, db}, {wrongShape});
   ASSERT_TRUE(static_cast<bool>(shape));
-  EXPECT_NE(llvm::toString(std::move(shape)).find("compiled for"),
-            std::string::npos);
+  EXPECT_NE(llvm::toString(std::move(shape)).find("extent"), std::string::npos);
 
   // A row-major kernel cannot honour a different stride, so it is refused
   // rather than silently reading the wrong elements.
-  MemRef2D wrongStride{out.data(), out.data(), 0, 8, 8, 16, 2};
-  llvm::Error stride = executable->invoke({&da, &db}, {&wrongStride});
+  auto wrongStride = dout;
+  wrongStride.descriptor.stride0 = 16;
+  wrongStride.descriptor.stride1 = 2;
+  llvm::Error stride = executable->invoke({da, db}, {wrongStride});
   ASSERT_TRUE(static_cast<bool>(stride));
   EXPECT_NE(llvm::toString(std::move(stride)).find("stride"),
             std::string::npos);
 
   // A null descriptor is a caller mistake, not undefined behaviour.
-  llvm::Error null = executable->invoke({&da, nullptr}, {&dout});
+  auto nullBuffer = db;
+  nullBuffer.descriptor.allocated = nullptr;
+  llvm::Error null = executable->invoke({da, nullBuffer}, {dout});
   ASSERT_TRUE(static_cast<bool>(null));
   EXPECT_NE(llvm::toString(std::move(null)).find("null"), std::string::npos);
 }

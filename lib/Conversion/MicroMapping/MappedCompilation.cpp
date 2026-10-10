@@ -237,6 +237,9 @@ llvm::Expected<MappedCompilation>
 compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
                     const mlir::llk::mapping::CoveringPlan &plan,
                     const MappedCompileOptions &options) {
+  if (options.backend != MappedBackend::Reference)
+    return compileError("selected-target backend is not available yet");
+
   MappedCompilation compilation;
 
   // Binding clones the source and writes the selected state onto the clone, so
@@ -273,6 +276,9 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
 llvm::Expected<MappedCompilation>
 compileConcreteMicroKernel(mlir::ModuleOp source,
                            const MappedCompileOptions &options) {
+  if (options.backend != MappedBackend::Reference)
+    return compileError("selected-target backend is not available yet");
+
   if (options.stop == MappedStop::MappedMicro ||
       options.stop == MappedStop::TargetLowered)
     return compileError("a concrete Micro kernel has no plan to bind and no "

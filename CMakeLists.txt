@@ -371,6 +371,7 @@ mlir_target_link_libraries(LLKMicroToLinalg PUBLIC
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
     runtime/MappedExecutable.cpp
+    runtime/MappedInvocation.cpp
     runtime/PackedWeights.cpp
     runtime/ThreadPool.cpp
 )
@@ -771,6 +772,11 @@ target_link_libraries(MicroKernelExecution PRIVATE
     LLKMicroToLinalg LLKTransforms LLKRuntime GTest::gtest_main
     ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME MicroKernelExecution COMMAND MicroKernelExecution)
+
+add_llvm_executable(MappedInvocationTest test/Execution/mapped_invocation.cpp)
+target_link_libraries(MappedInvocationTest PRIVATE
+    LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME MappedInvocationTest COMMAND MappedInvocationTest)
 
 add_llvm_executable(SwiGLUFusedMemory test/Execution/swiglu_fused_memory.cpp)
 target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})

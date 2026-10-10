@@ -298,15 +298,31 @@ TEST(E2EWorkflow, CompilesAMappedKernelToARunnableExecutable) {
 
   std::vector<float> input(64, 1.0f);
   std::vector<float> output(64, -1.0f);
-  MemRef2D in{input.data(), input.data(), 0, 8, 8, 8, 1};
-  MemRef2D out{output.data(), output.data(), 0, 8, 8, 8, 1};
-  llvm::Error error = compiled->executable->invoke({&in}, {&out});
+  ::llk::InvocationBuffer2D in{{input.data(), input.data(), 0, 8, 8, 8, 1},
+                               ::llk::InvocationElementType::F32,
+                               input.size() * sizeof(float)};
+  ::llk::InvocationBuffer2D out{{output.data(), output.data(), 0, 8, 8, 8, 1},
+                                ::llk::InvocationElementType::F32,
+                                output.size() * sizeof(float)};
+  llvm::Error error = compiled->executable->invoke({in}, {out});
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
 
   // v + v over an input of ones is two everywhere -- and it is only two if the
   // staged copy actually delivered the input to the add.
   for (size_t i = 0; i < output.size(); ++i)
     EXPECT_EQ(output[i], 2.0f) << "element " << i;
+}
+
+TEST(E2EWorkflow, RejectsSelectedTargetUntilItsBackendExists) {
+  Parsed parsed = parseKernel(kLowerableKernel);
+  ASSERT_TRUE(parsed.module);
+
+  ::llk::MappedCompileOptions options;
+  options.backend = ::llk::MappedBackend::SelectedTarget;
+  auto compiled = ::llk::compileConcreteMicroKernel(*parsed.module, options);
+  ASSERT_FALSE(static_cast<bool>(compiled));
+  EXPECT_NE(llvm::toString(compiled.takeError()).find("selected-target"),
+            std::string::npos);
 }
 
 TEST(E2EWorkflow, StopsBeforeExecutingWhenAsked) {

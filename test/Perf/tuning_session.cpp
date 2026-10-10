@@ -659,14 +659,18 @@ TEST(Measurement, InvokesATopCandidateAndRecordsWhatItComputed) {
     MemRef2D outputDescriptor{output.data(), output.data(), 0, outShape[0],
                               outShape[1],   outShape[1],   1};
 
-    llvm::SmallVector<MemRef2D *, 4> inputPointers;
-    for (MemRef2D &descriptor : inputDescriptors)
-      inputPointers.push_back(&descriptor);
-    llvm::SmallVector<MemRef2D *, 1> outputPointers{&outputDescriptor};
+    llvm::SmallVector<::llk::InvocationBuffer2D, 4> inputBuffers;
+    for (size_t i = 0; i < inputDescriptors.size(); ++i)
+      inputBuffers.push_back({inputDescriptors[i],
+                              ::llk::InvocationElementType::BF16,
+                              inputStorage[i].size() * sizeof(uint16_t)});
+    ::llk::InvocationBuffer2D outputBuffer{outputDescriptor,
+                                           ::llk::InvocationElementType::BF16,
+                                           output.size() * sizeof(uint16_t)};
 
     const auto start = std::chrono::steady_clock::now();
     llvm::Error error =
-        compiled->executable->invoke(inputPointers, outputPointers);
+        compiled->executable->invoke(inputBuffers, {outputBuffer});
     const auto stop = std::chrono::steady_clock::now();
     if (error)
       return std::move(error);

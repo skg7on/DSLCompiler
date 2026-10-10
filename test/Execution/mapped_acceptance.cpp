@@ -200,6 +200,11 @@ struct Buffer {
     descriptor =
         MemRef2D{storage.data(), storage.data(), 0, rows, columns, columns, 1};
   }
+
+  llk::InvocationBuffer2D checked() const {
+    return {descriptor, llk::InvocationElementType::BF16,
+            storage.size() * sizeof(uint16_t)};
+  }
 };
 
 } // namespace
@@ -227,7 +232,7 @@ TEST(MappedAcceptance, InvokesTheCompilerGeneratedMatmulAndChecksEveryElement) {
   Buffer out(16, 64, -1.0f);
 
   llvm::Error error =
-      (*executable)->invoke({&a.descriptor, &b.descriptor}, {&out.descriptor});
+      (*executable)->invoke({a.checked(), b.checked()}, {out.checked()});
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
 
   // Every output is a full K=64 reduction of ones, so every one of the 1024
@@ -260,8 +265,7 @@ TEST(MappedAcceptance, InvokesTheCompilerGeneratedSwiGLUAndChecksEveryElement) {
 
   llvm::Error error =
       (*executable)
-          ->invoke({&x.descriptor, &wg.descriptor, &wu.descriptor},
-                   {&out.descriptor});
+          ->invoke({x.checked(), wg.checked(), wu.checked()}, {out.checked()});
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
 
   // The gate and the up projection each reduce K=64 ones to 64, `silu(64)` is
@@ -295,8 +299,10 @@ TEST(MappedAcceptance, LeavesTheCallersBuffersOwnedByTheCaller) {
   Buffer a(rows, columns, 1.0f);
   Buffer b(64, 64, 1.0f);
 
+  llk::InvocationBuffer2D checkedOut{out, llk::InvocationElementType::BF16,
+                                     storage.size() * sizeof(uint16_t)};
   llvm::Error error =
-      (*executable)->invoke({&a.descriptor, &b.descriptor}, {&out});
+      (*executable)->invoke({a.checked(), b.checked()}, {checkedOut});
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
 
   for (int64_t i = 0; i < rows * columns; ++i)

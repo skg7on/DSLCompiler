@@ -49,6 +49,8 @@ enum class MappedStop {
   Executable,
 };
 
+enum class MappedBackend { Reference, SelectedTarget };
+
 struct MappedCompileOptions {
   /// The kernel symbol to compile. Empty means the module's single
   /// `micro.kernel`, which is what the binder already requires.
@@ -58,6 +60,7 @@ struct MappedCompileOptions {
   /// what it left out, and must not be mistaken for executable code.
   bool requireExecutable = true;
   MappedStop stop = MappedStop::Executable;
+  MappedBackend backend = MappedBackend::Reference;
 };
 
 /// What a mapped compilation produced.
