@@ -26,7 +26,7 @@ ctest -R MicroDialectTileOps     # Run a single FileCheck test
 ./bin/LLKMappingTests --gtest_filter=MappingPlan.*  # Run selected GTest cases
 ```
 
-Libraries are emitted into `build/lib`, and tools and category test executables into `build/bin`. Test configuration lives in `test/CMakeLists.txt` and each category subdirectory; `BUILD_TESTING=OFF` disables tests and GoogleTest. `LLK_BUILD_E2E_TESTS=OFF` excludes the JIT execution sources from `LLKExecutionTests`.
+Root `CMakeLists.txt` builds libraries/tools; `test/CMakeLists.txt` and category subdirectories build one `LLK<Category>Tests` binary per category, with individual CTest cases. FileCheck/verifier registrations live in `test/FileCheck.cmake`; libraries go to `build/lib`, all executables to `build/bin`. `BUILD_TESTING=OFF` disables tests and GoogleTest; `LLK_BUILD_E2E_TESTS=OFF` omits JIT execution tests.
 
 Configure writes a compilation database to `build/compile_commands.json` for clangd and other editors; pass `-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF` to suppress it.
 
