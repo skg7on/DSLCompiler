@@ -162,7 +162,7 @@ ScheduleRecord sampleRecord() {
                                      {"memory_path", "dram:sram:acc"},
                                      {"owner_mapping", "worker/vector_engine"},
                                      {"fragment_shape", "16x16x32"},
-                                     {"tail_policy", "mask"}};
+                                     {"tail_policy", "none"}};
   record.tile.mBucket = 2;
   record.tile.workerTile = {8, 64, 64};
   record.tile.declaredFragment = {16, 16, 32};
@@ -171,7 +171,7 @@ ScheduleRecord sampleRecord() {
   record.tile.memoryPath = {"dram", "sram", "acc"};
   record.tile.outerOwner = "worker";
   record.tile.fragmentOwner = "vector_engine";
-  record.tile.tailPolicy = "mask";
+  record.tile.tailPolicy = "none";
   record.tile.pipelineStages = 1;
   record.tile.vectorWidth = 8;
   record.metrics.predictedCycles = 123456;
@@ -212,7 +212,7 @@ TEST(ScheduleRecord, WritesTheIdentityShapeAndTileDecisions) {
             std::string::npos);
   EXPECT_NE(yaml.find("      outer: worker\n"), std::string::npos);
   EXPECT_NE(yaml.find("      fragment: vector_engine\n"), std::string::npos);
-  EXPECT_NE(yaml.find("    tail_policy: mask\n"), std::string::npos);
+  EXPECT_NE(yaml.find("    tail_policy: none\n"), std::string::npos);
   EXPECT_NE(yaml.find("    pipeline_stages: 1\n"), std::string::npos);
 }
 
@@ -312,7 +312,7 @@ SearchSpace threadChoiceSpace() {
                     {SearchChoice("worker/vector_engine")}),
       symbolicParam("fragment_shape", "fragment_shape",
                     {SearchChoice("16x16x32")}),
-      symbolicParam("tail_policy", "tail_policy", {SearchChoice("mask")}),
+      symbolicParam("tail_policy", "tail_policy", {SearchChoice("none")}),
   };
   space.constraints = {
       SearchConstraint{

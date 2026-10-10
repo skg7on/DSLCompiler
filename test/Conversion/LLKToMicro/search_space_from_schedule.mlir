@@ -68,7 +68,7 @@ func.func @fused_swiglu(%x: tensor<8x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: micro.param "memory_path" {choices = ["dram:l2:sram", "dram:sram:acc", "dram:l2:sram:acc"], kind = "memory_path"}
 // CHECK: micro.param "owner_mapping" {choices = ["worker/vector_engine", "worker/lane"], kind = "owner_mapping"}
 // CHECK: micro.param "fragment_shape" {choices = ["8x8x32", "16x16x32"], kind = "fragment_shape"}
-// CHECK: micro.param "tail_policy" {choices = ["mask"], kind = "tail_policy"}
+// CHECK: micro.param "tail_policy" {choices = ["none", "pad"], kind = "tail_policy"}
 
 // Legality records. Every referenced name is a declared parameter.
 // CHECK: micro.constraint "sram_capacity" {params = ["BM", "BN", "BK"]}

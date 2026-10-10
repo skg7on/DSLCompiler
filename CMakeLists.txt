@@ -1371,6 +1371,11 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
           ${CMAKE_CURRENT_BINARY_DIR}/SelectedContraction
   )
+  add_test(NAME TailPadExport
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/tail_pad_export.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/TailPadExport
+  )
   # A target nobody registered is a diagnostic naming the ones that are, not a
   # silent fallback to a different backend.
   add_test(NAME MicroMappingCompileRejectsUnknownTarget

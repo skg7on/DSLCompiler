@@ -17,6 +17,7 @@
 #define LLK_CONVERSION_LLKTOMICRO_LLKTOMICRO_H
 
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/StringRef.h"
 
 #include <memory>
 
@@ -25,6 +26,9 @@ namespace llk {
 
 /// Lowers each supported LLK root operation to a concrete `micro.kernel`.
 std::unique_ptr<mlir::Pass> createLLKToMicroPass();
+
+/// Lowers roots using an explicit schedule database path.
+std::unique_ptr<mlir::Pass> createLLKToMicroPass(llvm::StringRef scheduleDb);
 
 /// Exports a tile-aware `micro.search_space` for each supported LLK root
 /// operation, holding the legal choices around the schedule it selects.

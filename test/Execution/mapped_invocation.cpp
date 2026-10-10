@@ -170,3 +170,28 @@ TEST(MappedInvocation, CheckedInvokeUsesAlignedSubviewAndRejectsBeforeWrite) {
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
   EXPECT_EQ(output, (std::vector<float>{1, 2, 3, 4}));
 }
+
+TEST(MappedInvocation, CopiesMultipleBorrowedResultsToDistinctOutputs) {
+  mlir::MLIRContext context;
+  context.loadDialect<mlir::func::FuncDialect, mlir::memref::MemRefDialect>();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(
+      "module { func.func @kernel(%a: memref<2x2xf32>, "
+      "%b: memref<2x2xf32>) -> (memref<2x2xf32>, memref<2x2xf32>) { "
+      "return %a, %b : memref<2x2xf32>, memref<2x2xf32> } }",
+      &context);
+  ASSERT_TRUE(module);
+  auto executable = llk::createMappedExecutable(*module, "kernel");
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+  ASSERT_EQ((*executable)->abi().outputs.size(), 2u);
+
+  std::vector<float> first{1, 2, 3, 4};
+  std::vector<float> second{10, 20, 30, 40};
+  std::vector<float> outputA(4, -1), outputB(4, -2);
+  auto a = buffer(first), b = buffer(second);
+  auto outA = buffer(outputA), outB = buffer(outputB);
+  llvm::Error error = (*executable)->invoke({a, b}, {outA, outB});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+  EXPECT_EQ(outputA, first);
+  EXPECT_EQ(outputB, second);
+}

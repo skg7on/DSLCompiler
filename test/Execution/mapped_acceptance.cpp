@@ -45,6 +45,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -133,7 +135,8 @@ mlir::DialectRegistry buildRegistry() {
 llvm::Expected<std::unique_ptr<llk::MappedExecutable>>
 compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
              llvm::StringRef entrySymbol,
-             llk::MappedBackend backend = llk::MappedBackend::Reference) {
+             llk::MappedBackend backend = llk::MappedBackend::Reference,
+             llvm::StringRef scheduleDb = {}) {
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::parseSourceString<mlir::ModuleOp>(sourceText, &context);
   if (!module)
@@ -142,7 +145,10 @@ compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
 
   // The kernel is exported here, not written by hand.
   mlir::PassManager pm(&context);
-  pm.addPass(mlir::llk::createLLKToMicroPass());
+  if (scheduleDb.empty())
+    pm.addPass(mlir::llk::createLLKToMicroPass());
+  else
+    pm.addPass(mlir::llk::createLLKToMicroPass(scheduleDb));
   if (mlir::failed(pm.run(*module)))
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "the LLK-to-Micro export failed");
@@ -209,6 +215,115 @@ struct Buffer {
             storage.size() * sizeof(uint16_t)};
   }
 };
+
+std::string matmulSource(int64_t M, int64_t N, int64_t K) {
+  const std::string lhs =
+      "tensor<" + std::to_string(M) + "x" + std::to_string(K) + "xbf16>";
+  const std::string rhs =
+      "tensor<" + std::to_string(K) + "x" + std::to_string(N) + "xbf16>";
+  const std::string output =
+      "tensor<" + std::to_string(M) + "x" + std::to_string(N) + "xf32>";
+  return "module {\n  func.func @matmul(%a: " + lhs + ", %b: " + rhs +
+         ", %init: " + output + ") -> " + output +
+         " {\n"
+         "    %y = llk.matmul ins(%a, %b : " +
+         lhs + ", " + rhs + ") outs(%init : " + output +
+         ") {accumulator_type = f32, math_mode = #llk.math_mode<bounded_fast>} "
+         "-> " +
+         output +
+         "\n"
+         "    return %y : " +
+         output + "\n  }\n}\n";
+}
+
+void fillSignedBf16(Buffer &buffer, int64_t seed) {
+  for (size_t i = 0; i < buffer.storage.size(); ++i) {
+    int64_t numerator = (static_cast<int64_t>(i) * 17 + seed * 11) % 31 - 15;
+    buffer.storage[i] = toBf16(static_cast<float>(numerator) / 8.0f);
+  }
+}
+
+float storedBf16(const Buffer &buffer, size_t index) {
+  return fromBf16(buffer.storage[index]);
+}
+
+struct FloatBuffer {
+  std::vector<float> storage;
+  MemRef2D descriptor;
+
+  FloatBuffer(int64_t rows, int64_t columns, float fill)
+      : storage(static_cast<size_t>(rows * columns), fill) {
+    descriptor =
+        MemRef2D{storage.data(), storage.data(), 0, rows, columns, columns, 1};
+  }
+
+  llk::InvocationBuffer2D checked() const {
+    return {descriptor, llk::InvocationElementType::F32,
+            storage.size() * sizeof(float)};
+  }
+};
+
+void fillSigned(FloatBuffer &buffer, int64_t seed) {
+  for (size_t i = 0; i < buffer.storage.size(); ++i) {
+    int64_t numerator = (static_cast<int64_t>(i) * 13 + seed * 7) % 19 - 9;
+    buffer.storage[i] = static_cast<float>(numerator) / 8.0f;
+  }
+}
+
+void expectPaddedMatmul(mlir::MLIRContext &context, llk::MappedBackend backend,
+                        int64_t M, int64_t N, int64_t K) {
+  const std::string source = matmulSource(M, N, K);
+  const std::string schedule =
+      std::string(LLK_SOURCE_DIR) +
+      "/test/Conversion/MicroMapping/tail_acceptance_schedule.json";
+  const std::string entry = "matmul_M" + std::to_string(M) + "_N" +
+                            std::to_string(N) + "_K" + std::to_string(K);
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      compileChain(context, source, entry, backend, schedule);
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+  const llk::KernelAbi &abi = (*executable)->abi();
+  ASSERT_EQ(abi.inputs.size(), 3u);
+  ASSERT_EQ(abi.outputs.size(), 1u);
+  EXPECT_EQ(abi.inputs[0].shape, (std::vector<int64_t>{M, K}));
+  EXPECT_EQ(abi.inputs[1].shape, (std::vector<int64_t>{K, N}));
+  EXPECT_EQ(abi.inputs[2].shape, (std::vector<int64_t>{M, N}));
+  EXPECT_EQ(abi.outputs[0].shape, (std::vector<int64_t>{M, N}));
+
+  Buffer a(M, K, 0.0f);
+  Buffer b(K, N, 0.0f);
+  fillSignedBf16(a, 3);
+  fillSignedBf16(b, 11);
+  FloatBuffer init(M, N, 0.0f);
+  fillSigned(init, 5);
+
+  std::vector<float> guarded(static_cast<size_t>(M * N) + 2, -77.0f);
+  MemRef2D descriptor{guarded.data(), guarded.data() + 1, 0, M, N, N, 1};
+  llk::InvocationBuffer2D checkedOutput{descriptor,
+                                        llk::InvocationElementType::F32,
+                                        guarded.size() * sizeof(float)};
+  llvm::Error error =
+      (*executable)
+          ->invoke({a.checked(), b.checked(), init.checked()}, {checkedOutput});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+
+  for (int64_t m = 0; m < M; ++m) {
+    for (int64_t n = 0; n < N; ++n) {
+      size_t index = static_cast<size_t>(m * N + n);
+      float expected = init.storage[index];
+      for (int64_t k = 0; k < K; ++k) {
+        size_t aIndex = static_cast<size_t>(m * K + k);
+        size_t bIndex = static_cast<size_t>(k * N + n);
+        expected += storedBf16(a, aIndex) * storedBf16(b, bIndex);
+      }
+      EXPECT_NEAR(guarded[index + 1], expected,
+                  2e-4f + 2e-4f * std::abs(expected))
+          << "shape " << M << "x" << N << "x" << K << " at " << m << "," << n;
+    }
+  }
+  EXPECT_EQ(guarded.front(), -77.0f);
+  EXPECT_EQ(guarded.back(), -77.0f);
+}
 
 } // namespace
 
@@ -320,6 +435,36 @@ TEST(MappedAcceptance, LeavesTheCallersBuffersOwnedByTheCaller) {
   EXPECT_EQ(fromBf16(storage[lead - 1]), -7.0f);
   EXPECT_EQ(fromBf16(storage[lead + static_cast<size_t>(rows * columns)]),
             -7.0f);
+}
+
+TEST(MappedAcceptance, ExecutesPaddedTailsWithNonzeroAccumulators) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  for (const std::array<int64_t, 3> shape :
+       {std::array<int64_t, 3>{5, 9, 7}, {1, 17, 3}, {17, 65, 63}})
+    expectPaddedMatmul(context, llk::MappedBackend::Reference, shape[0],
+                       shape[1], shape[2]);
+}
+
+TEST(MappedAcceptance, SelectedAvx2ExecutesThePaddedTailFixtures) {
+  const std::string hostTriple = llvm::sys::getDefaultTargetTriple();
+  if (hostTriple.rfind("x86_64-", 0) != 0)
+    GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
+  const auto hostFeatures = llvm::sys::getHostCPUFeatures();
+  auto avx2 = hostFeatures.find("avx2");
+  if (avx2 == hostFeatures.end() || !avx2->second)
+    GTEST_SKIP() << "selected AVX2 invocation requires host AVX2";
+
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  for (const std::array<int64_t, 3> shape :
+       {std::array<int64_t, 3>{5, 9, 7}, {1, 17, 3}, {17, 65, 63}})
+    expectPaddedMatmul(context, llk::MappedBackend::SelectedTarget, shape[0],
+                       shape[1], shape[2]);
 }
 
 TEST(MappedAcceptance, SelectedAvx2BackendExecutesNumerically) {

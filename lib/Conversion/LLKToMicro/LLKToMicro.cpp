@@ -34,6 +34,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
+#include "LLK/Conversion/MicroMapping/TileExtent.h"
 
 #include "LLK/Dialect/LLKEnums.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
@@ -55,6 +56,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 
 // LLK attribute and op declarations.
 #define GET_ATTRDEF_CLASSES
@@ -230,6 +232,8 @@ Block *startRegionBody(OpBuilder &builder, Region &region, Location loc,
 struct TilePlan {
   // Problem shape and element types.
   int64_t M = 0, N = 0, K = 0;
+  int64_t paddedM = 0, paddedN = 0, paddedK = 0;
+  std::string tailPolicy{"none"};
   Type inputElemType, accumulatorElemType, outputElemType;
 
   // Tiling.
@@ -330,6 +334,11 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
     return failure();
   };
 
+  if (schedule.tail_policy != "none" && schedule.tail_policy != "pad")
+    return fail("tail_policy '" + schedule.tail_policy +
+                "' is unsupported; expected 'none' or 'pad'");
+  plan.tailPolicy = schedule.tail_policy;
+
   // --- memory path -------------------------------------------------------
   if (failed(parseMemoryPath(root, schedule, plan.srcSpace, plan.stagingSpace)))
     return failure();
@@ -377,27 +386,27 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
 
   // --- tiling ------------------------------------------------------------
   auto resolveTile = [&](const char *axis, int64_t extent, int64_t requested,
-                         int64_t &out) -> LogicalResult {
+                         int64_t &out, int64_t &padded) -> LogicalResult {
     if (requested <= 0)
       return fail(Twine("schedule has no ") + axis + " tile size");
-    out = std::min(requested, extent);
-    if (extent % out != 0)
-      return fail(
-          Twine(axis) + " tile " + Twine(out) + " does not divide " + axis +
-          " = " + Twine(extent) +
-          (schedule.enable_tile_masks
-               ? "; the export does not emit tile masks, so the schedule's "
-               : "; tile masks are disabled for this schedule, so its ") +
-          axis + " tile must divide the problem");
+    out = plan.tailPolicy == "pad" ? requested : std::min(requested, extent);
+    if (extent % out != 0 && plan.tailPolicy == "none")
+      return fail(Twine(axis) + " tile " + Twine(out) + " does not divide " +
+                  axis + " = " + Twine(extent) + "; tail_policy is 'none'");
+    std::optional<int64_t> rounded =
+        mlir::llk::micro_mapping::roundUpExtent(extent, out);
+    if (!rounded)
+      return fail(Twine(axis) + " padded extent overflows int64");
+    padded = *rounded;
     return success();
   };
 
   plan.M = M;
   plan.N = N;
   plan.K = K;
-  if (failed(resolveTile("BM", M, schedule.BM, plan.BM)) ||
-      failed(resolveTile("BN", N, schedule.BN, plan.BN)) ||
-      failed(resolveTile("BK", K, schedule.BK, plan.BK)))
+  if (failed(resolveTile("BM", M, schedule.BM, plan.BM, plan.paddedM)) ||
+      failed(resolveTile("BN", N, schedule.BN, plan.BN, plan.paddedN)) ||
+      failed(resolveTile("BK", K, schedule.BK, plan.BK, plan.paddedK)))
     return failure();
 
   plan.fM = largestDivisorAtMost(plan.BM, std::min((*declared)[0], plan.BM));
@@ -448,6 +457,9 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   for (size_t arm = 0; arm < (fused ? 2u : 1u); ++arm)
     inputTypes.push_back(
         RankedTensorType::get({plan.K, plan.N}, plan.inputElemType));
+  if (!fused && plan.tailPolicy == "pad")
+    inputTypes.push_back(
+        RankedTensorType::get({plan.M, plan.N}, plan.outputElemType));
   llvm::SmallVector<Type, 1> resultTypes{
       RankedTensorType::get({plan.M, plan.N}, plan.outputElemType)};
 
@@ -470,8 +482,12 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   kernel->setAttr("fragment_shape",
                   DenseI64ArrayAttr::get(
                       ctx, SmallVector<int64_t, 3>{plan.fM, plan.fN, plan.fK}));
-  // Non-dividing tiles are rejected instead of masked, so there is no tail.
-  kernel->setAttr("tail_policy", StringAttr::get(ctx, "none"));
+  kernel->setAttr("tail_policy", StringAttr::get(ctx, plan.tailPolicy));
+  kernel->setAttr("valid_extents",
+                  DenseI64ArrayAttr::get(ctx, {plan.M, plan.N, plan.K}));
+  kernel->setAttr(
+      "padded_extents",
+      DenseI64ArrayAttr::get(ctx, {plan.paddedM, plan.paddedN, plan.paddedK}));
 
   // Original workload dimensions before tiling, as generic provenance. A
   // legality rule that needs the whole M/N/K (tail divisibility) reads this
@@ -532,6 +548,20 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   SmallVector<Value, 2> rhsTensors;
   for (size_t arm = 0; arm < (fused ? 2u : 1u); ++arm)
     rhsTensors.push_back(kernelBody->getArgument(1 + arm));
+  Value initTensor = (!fused && plan.tailPolicy == "pad")
+                         ? kernelBody->getArgument(1 + rhsTensors.size())
+                         : Value();
+
+  if (plan.tailPolicy == "pad") {
+    lhsTensor = mlir::llk::micro_mapping::padTensorWithZeros(
+        builder, loc, lhsTensor, {plan.paddedM, plan.paddedK});
+    for (Value &rhs : rhsTensors)
+      rhs = mlir::llk::micro_mapping::padTensorWithZeros(
+          builder, loc, rhs, {plan.paddedK, plan.paddedN});
+    if (initTensor)
+      initTensor = mlir::llk::micro_mapping::padTensorWithZeros(
+          builder, loc, initTensor, {plan.paddedM, plan.paddedN});
+  }
 
   // --- the output the kernel writes back ----------------------------------
   // The kernel writes its output tile by tile from inside the spatial nest, so
@@ -545,7 +575,7 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   // lands belongs to the ABI.
   micro::MemorySpaceAttr outputSpace =
       micro::MemorySpaceAttr::get(ctx, micro::MemorySpace::sram);
-  Type outputTileType = tile({plan.M, plan.N}, plan.outputElemType,
+  Type outputTileType = tile({plan.paddedM, plan.paddedN}, plan.outputElemType,
                              /*tileLayout=*/micro::LayoutAttr(), outputSpace,
                              /*owner=*/micro::OwnerAttr());
   Value output =
@@ -567,13 +597,13 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
     return loop;
   };
 
-  micro::SpatialForOp bmLoop =
-      openSpatialLoop(plan.M, plan.BM, plan.outerOwner, ValueRange{output});
+  micro::SpatialForOp bmLoop = openSpatialLoop(
+      plan.paddedM, plan.BM, plan.outerOwner, ValueRange{output});
   BlockArgument bm = bmLoop.getBody().front().getArgument(0);
   Value bmCarried = bmLoop.getBody().front().getArgument(1);
 
-  micro::SpatialForOp bnLoop =
-      openSpatialLoop(plan.N, plan.BN, plan.innerOwner, ValueRange{bmCarried});
+  micro::SpatialForOp bnLoop = openSpatialLoop(
+      plan.paddedN, plan.BN, plan.innerOwner, ValueRange{bmCarried});
   BlockArgument bn = bnLoop.getBody().front().getArgument(0);
   Value bnCarried = bnLoop.getBody().front().getArgument(1);
 
@@ -583,14 +613,42 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
       tile(accExtent, plan.accumulatorElemType,
            /*tileLayout=*/micro::LayoutAttr(), accSpace, workerOwner);
   SmallVector<Value, 2> accumulators;
-  for (size_t arm = 0; arm < rhsTensors.size(); ++arm)
-    accumulators.push_back(
-        micro::TileAllocOp::create(builder, loc, accTileType).getResult());
+  if (initTensor) {
+    SmallVector<int64_t, 2> initExtent{plan.BM, plan.BN};
+    Type initViewType = tile(initExtent, plan.outputElemType, layout, srcSpace,
+                             /*owner=*/micro::OwnerAttr());
+    Value initView = micro::TileViewOp::create(
+        builder, loc, initViewType, initTensor, ValueRange{bm, bn},
+        DenseI64ArrayAttr::get(ctx, initExtent), layout);
+    Type initStagedType =
+        tile(initExtent, plan.outputElemType, layout, stageSpace, workerOwner);
+    auto initStageCopy = micro::TileAsyncCopyOp::create(
+        builder, loc, initStagedType, micro::AsyncTokenType::get(ctx), initView,
+        stageSpace, workerOwner);
+    micro::WaitOp::create(builder, loc, ValueRange{initStageCopy.getToken()});
+    Type initAccumulatorType =
+        tile(initExtent, plan.outputElemType,
+             /*tileLayout=*/micro::LayoutAttr(), accSpace, workerOwner);
+    auto initAccumulatorCopy = micro::TileAsyncCopyOp::create(
+        builder, loc, initAccumulatorType, micro::AsyncTokenType::get(ctx),
+        initStageCopy.getResult(), accSpace, workerOwner);
+    micro::WaitOp::create(builder, loc,
+                          ValueRange{initAccumulatorCopy.getToken()});
+    Value initial = initAccumulatorCopy.getResult();
+    if (plan.outputElemType != plan.accumulatorElemType)
+      initial = micro::VectorOp::create(builder, loc, accTileType, "convert",
+                                        ValueRange{initial}, StringAttr());
+    accumulators.push_back(initial);
+  } else {
+    for (size_t arm = 0; arm < rhsTensors.size(); ++arm)
+      accumulators.push_back(
+          micro::TileAllocOp::create(builder, loc, accTileType).getResult());
+  }
 
   // --- K loop ------------------------------------------------------------
   Value kLower = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
   Value kUpper =
-      arith::ConstantIndexOp::create(builder, loc, plan.K).getResult();
+      arith::ConstantIndexOp::create(builder, loc, plan.paddedK).getResult();
   Value kStep =
       arith::ConstantIndexOp::create(builder, loc, plan.BK).getResult();
   // The loop carries the accumulators. What an iteration computes is what the
@@ -766,7 +824,20 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   }
   if (auto terminator = dyn_cast<micro::YieldOp>(kernelBody->getTerminator())) {
     builder.setInsertionPoint(terminator);
-    micro::YieldOp::create(builder, loc, bmLoop.getResults());
+    Value result = bmLoop.getResult(0);
+    if (plan.paddedM != plan.M || plan.paddedN != plan.N) {
+      Type validOutputType =
+          tile({plan.M, plan.N}, plan.outputElemType,
+               /*tileLayout=*/micro::LayoutAttr(), outputSpace,
+               /*owner=*/micro::OwnerAttr());
+      result =
+          micro::TilePartitionOp::create(
+              builder, loc, validOutputType, result,
+              DenseI64ArrayAttr::get(ctx, {plan.M, plan.N}),
+              /*owner=*/micro::OwnerAttr(), /*tail=*/builder.getBoolAttr(true))
+              .getResult();
+    }
+    micro::YieldOp::create(builder, loc, ValueRange{result});
     terminator.erase();
   }
 
@@ -942,6 +1013,9 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
     return root->emitError()
            << "schedule fragment_shape '" << schedule.fragment_shape
            << "' must be a positive MxNxK triple";
+  if (schedule.tail_policy != "none" && schedule.tail_policy != "pad")
+    return root->emitError() << "tail_policy '" << schedule.tail_policy
+                             << "' is unsupported; expected 'none' or 'pad'";
 
   MLIRContext *context = module.getContext();
   Location loc = root->getLoc();
@@ -1016,7 +1090,8 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
   addParam("fragment_shape", "fragment_shape",
            makeStringChoices(context,
                              {schedule.fragment_shape, "16x16x32", "8x8x32"}));
-  addParam("tail_policy", "tail_policy", makeStringChoices(context, {"mask"}));
+  addParam("tail_policy", "tail_policy",
+           makeStringChoices(context, {schedule.tail_policy, "none", "pad"}));
 
   // --- legality records ---
   // Machine-independent legality only: capacity and compatibility are named
@@ -1052,6 +1127,9 @@ struct LLKToMicroPass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LLKToMicroPass)
 
   LLKToMicroPass() = default;
+  explicit LLKToMicroPass(StringRef scheduleDbPath) {
+    scheduleDb = scheduleDbPath.str();
+  }
   LLKToMicroPass(const LLKToMicroPass &other) : PassWrapper(other) {}
 
   Option<std::string> scheduleDb{
@@ -1175,6 +1253,10 @@ namespace llk {
 
 std::unique_ptr<Pass> createLLKToMicroPass() {
   return std::make_unique<LLKToMicroPass>();
+}
+
+std::unique_ptr<Pass> createLLKToMicroPass(StringRef scheduleDb) {
+  return std::make_unique<LLKToMicroPass>(scheduleDb);
 }
 
 std::unique_ptr<Pass> createLLKToMicroSearchSpacePass() {

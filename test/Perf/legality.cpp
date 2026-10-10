@@ -78,7 +78,7 @@ std::vector<SearchParam> fullParams(bool withTail = true) {
   };
   if (withTail)
     params.push_back(
-        symbolicParam("tail_policy", "tail_policy", {SearchChoice("mask")}));
+        symbolicParam("tail_policy", "tail_policy", {SearchChoice("pad")}));
   return params;
 }
 
@@ -117,7 +117,7 @@ Candidate preferred() {
                         {"memory_path", "dram:sram:acc"},
                         {"owner_mapping", "worker/vector_engine"},
                         {"fragment_shape", "16x16x32"},
-                        {"tail_policy", "mask"}});
+                        {"tail_policy", "pad"}});
 }
 
 WorkloadShape swigluShape() {
@@ -216,7 +216,7 @@ SearchSpace exportedShapedSpace(std::string workload) {
           {SearchChoice("worker/lane"), SearchChoice("worker/vector_engine")}),
       symbolicParam("fragment_shape", "fragment_shape",
                     {SearchChoice("16x16x32"), SearchChoice("8x8x32")}),
-      symbolicParam("tail_policy", "tail_policy", {SearchChoice("mask")}),
+      symbolicParam("tail_policy", "tail_policy", {SearchChoice("pad")}),
   };
   space.constraints = exporterConstraints();
   return space;
@@ -386,13 +386,16 @@ TEST(Legality, TailWithoutAMaskPolicyIsRejected) {
                  "tail_supported:", "17");
 }
 
-TEST(Legality, TailWithAMaskPolicyIsLegal) {
+TEST(Legality, TailWithMaskPolicyIsRejected) {
   SearchSpace space = spaceWith(ConstraintKind::TailSupported,
                                 {"BM", "BN", "BK"}, fullParams());
   WorkloadShape shape = swigluShape();
   shape.M = 17;
 
-  EXPECT_TRUE(checkLegality(space, preferred(), shape, avx2()).legal);
+  Candidate candidate = preferred();
+  candidate.symbolicValues["tail_policy"] = "mask";
+  expectRejected(checkLegality(space, candidate, shape, avx2()),
+                 "tail_supported:", "tail_policy 'mask' is unsupported");
 }
 
 //===----------------------------------------------------------------------===//

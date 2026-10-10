@@ -1231,10 +1231,11 @@ static LogicalResult verifySymbolicChoice(Operation *op, StringRef kind,
     return success();
   }
 
-  // tail_policy: masked tails are the only strategy in the MVP.
-  if (choice != "mask")
+  // Tail policies are schema-level choices. Whether the selected realization
+  // supports one is checked by binding/legality, where the target is known.
+  if (choice != "none" && choice != "pad" && choice != "mask")
     return op->emitOpError("tail_policy choice '")
-           << choice << "' is not supported (only 'mask')";
+           << choice << "' is not a recognized policy";
   return success();
 }
 
