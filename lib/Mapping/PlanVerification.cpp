@@ -1604,6 +1604,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         // this operation's own source node and resolve, and its concrete map is
         // the one the recorded parameters must rebuild.
         mlir::AffineMap recordedMap;
+        std::optional<PortRef> layoutEndpoint;
         if (schemaV2) {
           auto found = layoutEntries.find(entry.getName().getValue());
           if (found == layoutEntries.end()) {
@@ -1631,10 +1632,24 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
               return;
             }
             auto recordedNode = mapping.getAs<mlir::IntegerAttr>("node");
-            if (!recordedNode || ref->node != recordedNode.getInt()) {
+            mlir::Operation *endpointOp =
+                mappedOpForNode(enclosingKernel(op), ref->node);
+            auto endpointMapping =
+                endpointOp ? endpointOp->getAttrOfType<mlir::DictionaryAttr>(
+                                 kMappingAttr)
+                           : mlir::DictionaryAttr();
+            auto recordedInstance =
+                mapping.getAs<mlir::IntegerAttr>("instance");
+            auto endpointInstance =
+                endpointMapping.getAs<mlir::IntegerAttr>("instance");
+            auto endpointRule = endpointMapping.getAs<mlir::StringAttr>("rule");
+            if (!recordedNode || !endpointOp || !recordedInstance ||
+                !endpointInstance || !endpointRule ||
+                endpointInstance.getValue() != recordedInstance.getValue() ||
+                endpointRule.getValue() != *ruleId) {
               fail(DiagnosticCode::NoLegalLayout,
-                   where + ": layout endpoint does not name this operation's "
-                           "node");
+                   where + ": layout endpoint does not belong to this selected "
+                           "instance");
               return;
             }
             llvm::Expected<SourceGraphView> view =
@@ -1649,12 +1664,40 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                            "graph");
               return;
             }
+            layoutEndpoint = *ref;
           }
           if (auto mapAttr = detail.getAs<mlir::AffineMapAttr>("map"))
             recordedMap = mapAttr.getValue();
         }
         LayoutContext portContext = layoutContextForRule(
             *rule, *lookup.node, *requirement, LayoutContext{});
+        if (layoutEndpoint) {
+          mlir::Operation *endpointOp =
+              mappedOpForNode(enclosingKernel(op), layoutEndpoint->node);
+          NodeLookup endpointLookup = workloadNodeFor(endpointOp);
+          if (!endpointLookup.node) {
+            fail(DiagnosticCode::NoLegalLayout,
+                 where + ": layout endpoint does not resolve to a selected "
+                         "workload operation");
+            return;
+          }
+          llvm::ArrayRef<WorkloadPort> endpointPorts =
+              layoutEndpoint->direction == PortDirection::Input
+                  ? endpointLookup.node->inputs
+                  : endpointLookup.node->outputs;
+          if (layoutEndpoint->index >= endpointPorts.size()) {
+            fail(DiagnosticCode::NoLegalLayout,
+                 where + ": layout endpoint does not resolve on its workload "
+                         "operation");
+            return;
+          }
+          mlir::Type endpointType = endpointPorts[layoutEndpoint->index].type;
+          if (mlir::Type element = elementTypeOf(endpointType))
+            portContext.elementType = printedTypeOf(element);
+          if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
+                  staticShapeOf(endpointType))
+            portContext.rank = static_cast<int64_t>(shape->size());
+        }
         if (llvm::Error error = verifySolvedLayout(
                 *def, machine, *module.getContext(), portContext,
                 recordedValues, recordedMap, {}, where)) {

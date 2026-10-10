@@ -1763,8 +1763,9 @@ mlir::MLIRContext *nodeContext(const WorkloadNode &node) {
 /// with neither attributes nor typed ports) is a fatal error naming the rule
 /// and node -- not a silent empty result two parameterizations could collide
 /// on.
-mlir::DictionaryAttr buildBundleParameters(const RuleDef &rule,
-                                           const WorkloadNode &node) {
+mlir::DictionaryAttr
+buildBundleParameters(const RuleDef &rule, const WorkloadNode &node,
+                      const llvm::StringMap<LayoutValue> &resolvedParameters) {
   if (rule.bundleParameters.empty())
     return {};
   mlir::MLIRContext *context = nodeContext(node);
@@ -1778,12 +1779,19 @@ mlir::DictionaryAttr buildBundleParameters(const RuleDef &rule,
   attributes.reserve(rule.bundleParameters.size());
   for (const auto &entry : rule.bundleParameters) {
     mlir::Attribute value;
-    if (const auto *integer = std::get_if<int64_t>(&entry.second))
+    if (const auto *integer = std::get_if<int64_t>(&entry.second)) {
       value =
           mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64), *integer);
-    else
+    } else if (auto resolved =
+                   resolvedParameters.find(std::get<std::string>(entry.second));
+               resolved != resolvedParameters.end() &&
+               std::holds_alternative<int64_t>(resolved->second)) {
+      value = mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
+                                     std::get<int64_t>(resolved->second));
+    } else {
       value =
           mlir::StringAttr::get(context, std::get<std::string>(entry.second));
+    }
     attributes.emplace_back(mlir::StringAttr::get(context, entry.first), value);
   }
   return mlir::DictionaryAttr::get(context, attributes);
@@ -1994,7 +2002,8 @@ toMappingCandidate(const RuleDef &rule, const WorkloadNode &node,
   candidate.coveredNodes.push_back(node.id);
   candidate.bundle.name = rule.bundle;
   candidate.bundle.emitterKey = rule.emitter;
-  candidate.bundle.parameters = buildBundleParameters(rule, node);
+  candidate.bundle.parameters =
+      buildBundleParameters(rule, node, resolution.parameters);
   candidate.resolvedParameters = std::move(resolution.parameters);
   if (rule.costLowerBound)
     candidate.lowerBound.latencyCycles =
@@ -2453,9 +2462,65 @@ std::optional<MappingCandidate> toFusedMappingCandidate(
       if (ref.index >= node->outputs.size())
         return std::nullopt;
       spec.value = node->outputs[ref.index].value;
-      spec.name = nodeName + ".result" + std::to_string(ref.index);
+      spec.name = nodeName + ".result";
+      if (ref.index != 0)
+        spec.name += std::to_string(ref.index);
     }
     candidate->ports.push_back(std::move(spec));
+  }
+
+  // `toMappingCandidate` resolved graph-port layout requirements against the
+  // anchor node before the pattern boundary was available. Rebind them to the
+  // named boundary occurrence now, including that occurrence's own type and
+  // shape; otherwise gate/result requirements inherit the anchor's port index
+  // and strict verification tests the wrong endpoint.
+  if (candidate->layoutRequirements.size() != rule.layoutRequirements.size()) {
+    if (reason)
+      *reason = "fused layout requirement count changed while resolving ports";
+    return std::nullopt;
+  }
+  for (size_t index = 0; index < rule.layoutRequirements.size(); ++index) {
+    const RuleLayoutRequirement &declared = rule.layoutRequirements[index];
+    if (declared.port.empty())
+      continue;
+    auto port = llvm::find_if(candidate->ports, [&](const PortSpec &spec) {
+      return spec.name == declared.port;
+    });
+    if (port == candidate->ports.end() || !port->port) {
+      if (reason)
+        *reason = "fused layout requirement names non-boundary port '" +
+                  declared.port + "'";
+      return std::nullopt;
+    }
+    const PortRef &ref = *port->port;
+    const WorkloadNode *node = graph.findNode(ref.node);
+    if (!node) {
+      if (reason)
+        *reason = "fused layout requirement names missing node " +
+                  std::to_string(ref.node);
+      return std::nullopt;
+    }
+    const WorkloadPort *workloadPort = nullptr;
+    if (ref.direction == PortDirection::Input &&
+        ref.index < node->inputs.size())
+      workloadPort = &node->inputs[ref.index];
+    else if (ref.direction == PortDirection::Output &&
+             ref.index < node->outputs.size())
+      workloadPort = &node->outputs[ref.index];
+    if (!workloadPort) {
+      if (reason)
+        *reason = "fused layout requirement resolves to an invalid port '" +
+                  declared.port + "'";
+      return std::nullopt;
+    }
+    LayoutRequirement &resolved = candidate->layoutRequirements[index];
+    resolved.port = ref;
+    resolved.portValue = static_cast<int64_t>(workloadPort->value);
+    if (mlir::Type element = elementTypeOf(workloadPort->type))
+      resolved.elementType = printedType(element);
+    if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
+            staticShapeOf(workloadPort->type))
+      resolved.rank = static_cast<int64_t>(shape->size());
   }
   return candidate;
 }

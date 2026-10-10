@@ -1350,6 +1350,11 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME MicroMappingCompileStopsAtTargetLowered
       COMMAND sh -c "$<TARGET_FILE:llk-compile> --mapping-target=x86-avx2 --mapping-root=${CMAKE_SOURCE_DIR} --mapping-mode=exact --mapping-stop=target-lowered ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | grep -q 'micro.kernel'"
   )
+  add_test(NAME FusedSelectedLowering
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/fused_selected_lowering.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/FusedSelectedLowering
+  )
   # A target nobody registered is a diagnostic naming the ones that are, not a
   # silent fallback to a different backend.
   add_test(NAME MicroMappingCompileRejectsUnknownTarget

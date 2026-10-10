@@ -516,6 +516,39 @@ module {
     %c = micro.vector "convert" %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     %s = micro.vector "silu" %c : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     %m = micro.vector "mul" %s, %t : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.tile_store %m {dst_memory = #micro.memory<dram>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+constexpr llvm::StringLiteral kFusedBf16ToF32Kernel = R"mlir(
+module {
+  micro.kernel @fused_bf16_to_f32 {
+    %input = tensor.empty() : tensor<8x8xbf16>
+    %tile = micro.tile_view %input {shape = array<i64: 8, 8>} : tensor<8x8xbf16> -> !micro.tile<8x8xbf16, memory = #micro.memory<sram>>
+    %gate = tensor.empty() : tensor<8x8xf32>
+    %gate_tile = micro.tile_view %gate {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %converted = micro.vector "convert" %tile : !micro.tile<8x8xbf16, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %activated = micro.vector "silu" %converted : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %result = micro.vector "mul" %activated, %gate_tile : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.tile_store %result {dst_memory = #micro.memory<dram>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+constexpr llvm::StringLiteral kFusedF16ToF32Kernel = R"mlir(
+module {
+  micro.kernel @fused_f16_to_f32 {
+    %input = tensor.empty() : tensor<8x8xf16>
+    %tile = micro.tile_view %input {shape = array<i64: 8, 8>} : tensor<8x8xf16> -> !micro.tile<8x8xf16, memory = #micro.memory<sram>>
+    %gate = tensor.empty() : tensor<8x8xf32>
+    %gate_tile = micro.tile_view %gate {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %converted = micro.vector "convert" %tile : !micro.tile<8x8xf16, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %activated = micro.vector "silu" %converted : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %result = micro.vector "mul" %activated, %gate_tile : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.tile_store %result {dst_memory = #micro.memory<dram>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
     micro.yield
   }
 }
@@ -549,6 +582,59 @@ TEST(Avx2Target, LowersAWholeFusedGroupInOneBundle) {
   llvm::SmallVector<mlir::Operation *> covered = coveredVectorOps(*module);
   ASSERT_EQ(covered.size(), 3u) << "the group is all three epilogue ops";
 
+  mlir::Operation *kernel = nullptr;
+  module->walk([&](mlir::Operation *op) {
+    if (!kernel && op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+  });
+  ASSERT_NE(kernel, nullptr);
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+  LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "f32";
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 0;
+  CoveringSearch search(*graph, **target, context, layoutContext, options);
+  llvm::Expected<MappingSearchResult> selected = search.search();
+  ASSERT_TRUE(static_cast<bool>(selected))
+      << llvm::toString(selected.takeError());
+  ASSERT_FALSE(selected->plans.empty());
+  auto selectedFusedPlan =
+      llvm::find_if(selected->plans, [](const CoveringPlan &plan) {
+        return llvm::any_of(
+            plan.placements, [](const PlanPlacement &placement) {
+              return placement.rule == "avx2.fused_convert_silu_mul";
+            });
+      });
+  std::string searchDiagnostics;
+  for (const Diagnostic &diagnostic : selected->frontier.diagnostics)
+    searchDiagnostics += diagnostic.message + "\n";
+  ASSERT_NE(selectedFusedPlan, selected->plans.end())
+      << "exact search did not select the shipped fused rule; plan count="
+      << selected->plans.size() << "\n"
+      << searchDiagnostics;
+  const CoveringPlan &selectedPlan = *selectedFusedPlan;
+  llvm::SmallVector<const PlanPlacement *> fusedPlacements;
+  for (const PlanPlacement &placement : selectedPlan.placements)
+    if (placement.rule == "avx2.fused_convert_silu_mul")
+      fusedPlacements.push_back(&placement);
+  ASSERT_EQ(fusedPlacements.size(), 3u);
+  const InstanceId fusedInstance = fusedPlacements.front()->instance;
+  for (const PlanPlacement *placement : fusedPlacements) {
+    EXPECT_EQ(placement->instance, fusedInstance);
+    ASSERT_TRUE(placement->bundle.parameters);
+    auto bundleWidth =
+        placement->bundle.parameters.getAs<mlir::IntegerAttr>("VW");
+    ASSERT_TRUE(bundleWidth);
+    EXPECT_EQ(bundleWidth.getInt(), 8);
+    auto resolvedWidth = placement->resolvedParameters.find("VW");
+    ASSERT_NE(resolvedWidth, placement->resolvedParameters.end());
+    ASSERT_TRUE(std::holds_alternative<int64_t>(resolvedWidth->second));
+    EXPECT_EQ(std::get<int64_t>(resolvedWidth->second), 8);
+  }
+
   TargetLoweringContext lowering{(*target)->machine(), {}, {}};
   mlir::IRRewriter rewriter(&context);
   llvm::Error error = emitter->lower(covered, fused, lowering, rewriter);
@@ -570,6 +656,129 @@ TEST(Avx2Target, LowersAWholeFusedGroupInOneBundle) {
     ++rewritten;
   EXPECT_EQ(rewritten, 3u) << text;
   EXPECT_NE(text.find("vector = 8"), std::string::npos) << text;
+
+  auto checkConversion = [&](llvm::StringRef source, bool shouldSucceed) {
+    mlir::OwningOpRef<mlir::ModuleOp> typedModule =
+        mlir::parseSourceString<mlir::ModuleOp>(source, &context);
+    ASSERT_TRUE(typedModule);
+    llvm::SmallVector<mlir::Operation *> typedOps =
+        coveredVectorOps(*typedModule);
+    ASSERT_EQ(typedOps.size(), 3u);
+    mlir::IRRewriter typedRewriter(&context);
+    llvm::Error typedError =
+        emitter->lower(typedOps, fused, lowering, typedRewriter);
+    EXPECT_EQ(!static_cast<bool>(typedError), shouldSucceed)
+        << (typedError ? llvm::toString(std::move(typedError)) : "");
+  };
+  checkConversion(kFusedBf16ToF32Kernel, /*shouldSucceed=*/true);
+  checkConversion(kFusedF16ToF32Kernel, /*shouldSucceed=*/false);
+
+  std::string repeatedOperandSource = kFusedVectorKernel.str();
+  size_t repeatedOperand = repeatedOperandSource.find("%s, %t");
+  ASSERT_NE(repeatedOperand, std::string::npos);
+  repeatedOperandSource.replace(repeatedOperand, 6, "%s, %s");
+  mlir::OwningOpRef<mlir::ModuleOp> repeatedOperandModule =
+      mlir::parseSourceString<mlir::ModuleOp>(repeatedOperandSource, &context);
+  ASSERT_TRUE(repeatedOperandModule);
+  llvm::SmallVector<mlir::Operation *> repeatedOperandOps =
+      coveredVectorOps(*repeatedOperandModule);
+  ASSERT_EQ(repeatedOperandOps.size(), 3u);
+  mlir::IRRewriter repeatedOperandRewriter(&context);
+  llvm::Error repeatedOperandError = emitter->lower(
+      repeatedOperandOps, fused, lowering, repeatedOperandRewriter);
+  EXPECT_FALSE(static_cast<bool>(repeatedOperandError))
+      << llvm::toString(std::move(repeatedOperandError));
+
+  std::string externalUseSource = kFusedVectorKernel.str();
+  size_t terminalStore = externalUseSource.find("    micro.tile_store %m");
+  ASSERT_NE(terminalStore, std::string::npos);
+  externalUseSource.insert(terminalStore,
+                           "    micro.tile_store %c {dst_memory = "
+                           "#micro.memory<dram>} : !micro.tile<8x8xf32, "
+                           "memory = #micro.memory<sram>>\n");
+  mlir::OwningOpRef<mlir::ModuleOp> externalUseModule =
+      mlir::parseSourceString<mlir::ModuleOp>(externalUseSource, &context);
+  ASSERT_TRUE(externalUseModule);
+  llvm::SmallVector<mlir::Operation *> externalUseOps =
+      coveredVectorOps(*externalUseModule);
+  ASSERT_EQ(externalUseOps.size(), 3u);
+  std::string beforeExternalUse = print(*externalUseModule);
+  mlir::IRRewriter externalUseRewriter(&context);
+  llvm::Error externalUseError =
+      emitter->lower(externalUseOps, fused, lowering, externalUseRewriter);
+  ASSERT_TRUE(static_cast<bool>(externalUseError));
+  EXPECT_NE(llvm::toString(std::move(externalUseError))
+                .find("fused intermediate has a live external use"),
+            std::string::npos);
+  EXPECT_EQ(print(*externalUseModule), beforeExternalUse);
+
+  TargetBundle fusedWidth4 = fused;
+  fusedWidth4.parameters = mlir::DictionaryAttr::get(
+      &context,
+      {mlir::NamedAttribute(
+          mlir::StringAttr::get(&context, "VW"),
+          mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), 4))});
+  mlir::OwningOpRef<mlir::ModuleOp> width4Module =
+      mlir::parseSourceString<mlir::ModuleOp>(kFusedVectorKernel, &context);
+  ASSERT_TRUE(width4Module);
+  llvm::SmallVector<mlir::Operation *> width4Ops =
+      coveredVectorOps(*width4Module);
+  ASSERT_EQ(width4Ops.size(), 3u);
+  mlir::IRRewriter width4Rewriter(&context);
+  llvm::Error width4Error =
+      emitter->lower(width4Ops, fusedWidth4, lowering, width4Rewriter);
+  ASSERT_FALSE(static_cast<bool>(width4Error))
+      << llvm::toString(std::move(width4Error));
+  EXPECT_NE(print(*width4Module).find("vector = 4"), std::string::npos);
+
+  auto rejectWidth = [&](TargetBundle invalidBundle,
+                         bool recordLayout) -> std::string {
+    mlir::OwningOpRef<mlir::ModuleOp> invalidModule =
+        mlir::parseSourceString<mlir::ModuleOp>(kFusedVectorKernel, &context);
+    EXPECT_TRUE(invalidModule);
+    if (!invalidModule)
+      return {};
+    llvm::SmallVector<mlir::Operation *> invalidOps =
+        coveredVectorOps(*invalidModule);
+    EXPECT_EQ(invalidOps.size(), 3u);
+    if (invalidOps.size() != 3)
+      return {};
+    if (recordLayout) {
+      auto i64 = mlir::IntegerType::get(&context, 64);
+      auto width = mlir::IntegerAttr::get(i64, 8);
+      auto layout = mlir::DictionaryAttr::get(
+          &context,
+          {mlir::NamedAttribute(mlir::StringAttr::get(&context, "VW"), width)});
+      auto layouts = mlir::DictionaryAttr::get(
+          &context, {mlir::NamedAttribute(
+                        mlir::StringAttr::get(&context, "selected"), layout)});
+      auto mapping = mlir::DictionaryAttr::get(
+          &context,
+          {mlir::NamedAttribute(
+              mlir::StringAttr::get(&context, "layout_parameters"), layouts)});
+      invalidOps.front()->setAttr("micro.mapping", mapping);
+    }
+    mlir::IRRewriter invalidRewriter(&context);
+    llvm::Error invalidError =
+        emitter->lower(invalidOps, invalidBundle, lowering, invalidRewriter);
+    EXPECT_TRUE(static_cast<bool>(invalidError));
+    return llvm::toString(std::move(invalidError));
+  };
+
+  TargetBundle missingWidth = fused;
+  missingWidth.parameters = {};
+  EXPECT_NE(rejectWidth(missingWidth, /*recordLayout=*/false)
+                .find("no vector width was selected"),
+            std::string::npos);
+  TargetBundle conflictingWidth = fused;
+  conflictingWidth.parameters = mlir::DictionaryAttr::get(
+      &context,
+      {mlir::NamedAttribute(
+          mlir::StringAttr::get(&context, "VW"),
+          mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), 4))});
+  EXPECT_NE(rejectWidth(conflictingWidth, /*recordLayout=*/true)
+                .find("conflicts with selected layout width"),
+            std::string::npos);
 }
 
 TEST(Avx2Target, ReportsEmitterKeysItHasNoLoweringFor) {

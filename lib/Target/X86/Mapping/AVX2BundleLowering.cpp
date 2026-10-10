@@ -114,25 +114,45 @@ llvm::Expected<int64_t> checkVectorWidth(mlir::Attribute raw,
 /// real pipeline always takes.
 llvm::Expected<int64_t> resolveVectorWidth(const mapping::TargetBundle &bundle,
                                            mlir::Operation *op) {
+  std::optional<int64_t> bundleWidth;
   if (bundle.parameters)
-    if (mlir::Attribute raw = bundle.parameters.get("VW"))
-      return checkVectorWidth(raw, "bundle '" + bundle.name + "'");
+    if (mlir::Attribute raw = bundle.parameters.get("VW")) {
+      llvm::Expected<int64_t> width =
+          checkVectorWidth(raw, "bundle '" + bundle.name + "'");
+      if (!width)
+        return width.takeError();
+      bundleWidth = *width;
+    }
 
   auto mapping = op->getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
   auto solutions =
       mapping ? mapping.getAs<mlir::DictionaryAttr>("layout_parameters")
               : mlir::DictionaryAttr();
+  std::optional<int64_t> layoutWidth;
   if (solutions) {
-    // Layout ids are sorted on write, so the first solution that carries a
-    // width is a deterministic choice rather than an arbitrary one.
     for (mlir::NamedAttribute entry : solutions) {
       auto solution = mlir::dyn_cast<mlir::DictionaryAttr>(entry.getValue());
       if (!solution)
         continue;
-      if (mlir::Attribute raw = solution.get("VW"))
-        return checkVectorWidth(raw, "layout '" + entry.getName().str() + "'");
+      if (mlir::Attribute raw = solution.get("VW")) {
+        llvm::Expected<int64_t> width =
+            checkVectorWidth(raw, "layout '" + entry.getName().str() + "'");
+        if (!width)
+          return width.takeError();
+        if (layoutWidth && *layoutWidth != *width)
+          return avx2Error("selected layouts disagree on vector width");
+        layoutWidth = *width;
+      }
     }
   }
+
+  if (bundleWidth && layoutWidth && *bundleWidth != *layoutWidth)
+    return avx2Error(
+        "bundle vector width conflicts with selected layout width");
+  if (bundleWidth)
+    return *bundleWidth;
+  if (layoutWidth)
+    return *layoutWidth;
 
   return avx2Error(
       "no vector width was selected: bundle '" + bundle.name +
@@ -212,6 +232,50 @@ llvm::Error AVX2Emitter::lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
       return avx2Error("element type '" +
                        typeToString(resultType.getElementType()) +
                        "' has no AVX2 arithmetic implementation");
+  }
+
+  if (isFusedKey(key())) {
+    if (coveredOps.size() != 3)
+      return avx2Error("fused convert-silu-mul lowering requires exactly three "
+                       "covered operations");
+    auto convert = mlir::dyn_cast<micro::VectorOp>(coveredOps[0]);
+    auto silu = mlir::dyn_cast<micro::VectorOp>(coveredOps[1]);
+    auto multiply = mlir::dyn_cast<micro::VectorOp>(coveredOps[2]);
+    if (!convert || !silu || !multiply || convert.getOp() != "convert" ||
+        silu.getOp() != "silu" || multiply.getOp() != "mul")
+      return avx2Error("fused lowering requires the ordered convert -> silu -> "
+                       "mul operation group");
+    if (convert.getInputs().size() != 1 || silu.getInputs().size() != 1 ||
+        multiply.getInputs().size() != 2 ||
+        silu.getInputs().front() != convert.getResult() ||
+        multiply.getInputs().front() != silu.getResult())
+      return avx2Error("fused lowering requires connected convert -> silu -> "
+                       "mul dataflow");
+
+    auto sourceTile =
+        mlir::dyn_cast<micro::TileType>(convert.getInputs().front().getType());
+    auto convertedTile =
+        mlir::dyn_cast<micro::TileType>(convert.getResult().getType());
+    if (!sourceTile || !convertedTile ||
+        !convertedTile.getElementType().isF32() ||
+        !(sourceTile.getElementType().isF32() ||
+          sourceTile.getElementType().isBF16()))
+      return avx2Error("fused convert supports only f32 -> f32 and bf16 -> "
+                       "f32 conversions");
+
+    llvm::SmallPtrSet<mlir::Operation *, 4> members;
+    for (mlir::Operation *op : coveredOps)
+      members.insert(op);
+    for (mlir::Value intermediate : {convert.getResult(), silu.getResult()}) {
+      bool internalUse = false;
+      bool externalUse = false;
+      for (mlir::OpOperand &use : intermediate.getUses()) {
+        internalUse |= members.contains(use.getOwner());
+        externalUse |= !members.contains(use.getOwner());
+      }
+      if (internalUse && externalUse)
+        return avx2Error("fused intermediate has a live external use");
+    }
   }
 
   // The contract holds. Apply it: the bundle's vector width becomes the

@@ -14,7 +14,6 @@
 rule avx2.vector_add v1 {
   match micro.vector(op = "add");
   param VW in [4..8];
-  require VW == machine.compute("vector_engine").lanes(element_type);
   require executor kind worker;
   require compute kind vector_engine;
   require layout operand0 satisfies avx2.blocked_2d;
@@ -155,12 +154,16 @@ rule avx2.fused_convert_silu_mul v1 {
     edge act.result -> gate.operand0;
   }
   param VW in [4..8];
+  require VW == machine.compute("vector_engine").lanes(element_type);
   require executor kind worker;
   require compute kind vector_engine;
+  require layout cv.operand0 satisfies avx2.blocked_2d;
+  require layout gate.operand1 satisfies avx2.blocked_2d;
+  require layout gate.result satisfies avx2.blocked_2d;
   input "cv.operand0";
   input "gate.operand1";
   output "gate.result";
-  bundle "avx2.fused.convert_silu_mul";
+  bundle "avx2.fused.convert_silu_mul" { VW = VW };
   emit "avx2_fused_convert_silu_mul";
   cost 3;
 }
