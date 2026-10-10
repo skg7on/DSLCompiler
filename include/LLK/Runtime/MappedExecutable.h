@@ -22,6 +22,8 @@
 
 #include "LLK/Runtime/JitCache.h"
 #include "LLK/Runtime/MappedInvocation.h"
+#include "LLK/Runtime/MappedJitOptions.h"
+#include "LLK/Runtime/PreparedMappedKernel.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -64,6 +66,9 @@ class MappedExecutable;
 llvm::Expected<std::unique_ptr<MappedExecutable>>
 createMappedExecutable(mlir::ModuleOp bufferedModule,
                        llvm::StringRef entrySymbol);
+llvm::Expected<std::unique_ptr<MappedExecutable>>
+createMappedExecutable(PreparedMappedKernel prepared,
+                       const MappedJitOptions &options = {});
 
 /// A compiled kernel, callable through descriptor pointers.
 class MappedExecutable {
@@ -99,6 +104,9 @@ private:
   friend llvm::Expected<std::unique_ptr<MappedExecutable>>
   createMappedExecutable(mlir::ModuleOp bufferedModule,
                          llvm::StringRef entrySymbol);
+  friend llvm::Expected<std::unique_ptr<MappedExecutable>>
+  createMappedExecutable(PreparedMappedKernel prepared,
+                         const MappedJitOptions &options);
 
   MappedExecutable(std::unique_ptr<llvm::orc::LLJIT> jit, void *entry,
                    KernelAbi abi);

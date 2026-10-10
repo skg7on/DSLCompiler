@@ -22,6 +22,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Runtime/MappedExecutable.h"
+#include "LLK/Conversion/MappedKernelAbi.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -66,57 +67,6 @@ std::string typeToString(mlir::Type type) {
   llvm::raw_string_ostream stream(buffer);
   type.print(stream);
   return buffer;
-}
-
-KernelAbi::Port describe(mlir::MemRefType type) {
-  KernelAbi::Port port;
-  port.shape.assign(type.getShape().begin(), type.getShape().end());
-  port.elementType = typeToString(type.getElementType());
-  return port;
-}
-
-/// Turns every result into a trailing caller-owned parameter.
-///
-/// The caller has to own the output buffer, and a returned memref aggregate is
-/// a convention no C declaration expresses, so the parameter list is where it
-/// belongs. After this the function returns nothing and its convention is the
-/// uniform one the C-interface wrapper then exposes.
-llvm::Error resultsBecomeOutParams(mlir::func::FuncOp function,
-                                   KernelAbi &abi) {
-  mlir::FunctionType type = function.getFunctionType();
-  mlir::Location loc = function.getLoc();
-
-  for (mlir::Type result : type.getResults()) {
-    auto memref = mlir::dyn_cast<mlir::MemRefType>(result);
-    if (!memref)
-      return abiError("kernel result is '" + typeToString(result) +
-                      "', but the mapped ABI describes results as buffers");
-    abi.outputs.push_back(describe(memref));
-  }
-  if (llvm::Error error = validateKernelAbi(abi))
-    return error;
-  if (type.getNumResults() == 0)
-    return llvm::Error::success();
-
-  mlir::Block &entry = function.getBody().front();
-  llvm::SmallVector<mlir::Value> outs;
-  for (mlir::Type result : type.getResults())
-    outs.push_back(entry.addArgument(result, loc));
-
-  llvm::SmallVector<mlir::Type> inputs(type.getInputs().begin(),
-                                       type.getInputs().end());
-  inputs.append(type.getResults().begin(), type.getResults().end());
-  function.setType(mlir::FunctionType::get(function.getContext(), inputs, {}));
-
-  // The value that used to be returned is written into the caller's buffer,
-  // which is the whole point of making it a parameter.
-  auto ret = mlir::cast<mlir::func::ReturnOp>(entry.getTerminator());
-  mlir::OpBuilder builder(ret);
-  for (auto [value, out] : llvm::zip(ret.getOperands(), outs))
-    mlir::memref::CopyOp::create(builder, loc, value, out);
-  mlir::func::ReturnOp::create(builder, loc);
-  ret.erase();
-  return llvm::Error::success();
 }
 
 /// Checks one side's descriptors against the recorded ABI.
@@ -322,20 +272,58 @@ MappedExecutable::~MappedExecutable() = default;
 
 llvm::Expected<std::unique_ptr<MappedExecutable>>
 createMappedExecutable(mlir::ModuleOp module, llvm::StringRef entrySymbol) {
-  mlir::func::FuncOp function =
-      module.lookupSymbol<mlir::func::FuncOp>(entrySymbol);
-  if (!function)
-    return abiError("module has no function named '" + entrySymbol.str() + "'");
+  llvm::Expected<PreparedMappedKernel> prepared =
+      prepareMappedKernelForInvocation(module, entrySymbol);
+  if (!prepared)
+    return prepared.takeError();
+  return createMappedExecutable(std::move(*prepared));
+}
 
-  KernelAbi abi;
-  for (mlir::Type input : function.getFunctionType().getInputs()) {
-    auto memref = mlir::dyn_cast<mlir::MemRefType>(input);
-    if (!memref)
-      return abiError("kernel input is '" + typeToString(input) +
-                      "', but the mapped ABI describes inputs as buffers");
-    abi.inputs.push_back(describe(memref));
-  }
-  if (llvm::Error error = resultsBecomeOutParams(function, abi))
+llvm::Expected<std::unique_ptr<MappedExecutable>>
+createMappedExecutable(PreparedMappedKernel prepared,
+                       const MappedJitOptions &options) {
+  (void)options;
+  if (!prepared.module)
+    return abiError("prepared mapped kernel has no module");
+  if (llvm::Error error = validateKernelAbi(prepared.abi))
+    return std::move(error);
+  if (prepared.entrySymbol.empty())
+    return abiError("prepared mapped kernel has no entry symbol");
+
+  mlir::ModuleOp module = *prepared.module;
+  mlir::func::FuncOp function =
+      module.lookupSymbol<mlir::func::FuncOp>(prepared.entrySymbol);
+  if (!function)
+    return abiError("prepared module has no function named '" +
+                    prepared.entrySymbol + "'");
+  if (!function.getFunctionType().getResults().empty())
+    return abiError("prepared mapped kernel must return void");
+
+  size_t argumentCount =
+      prepared.abi.inputs.size() + prepared.abi.outputs.size();
+  if (function.getFunctionType().getNumInputs() != argumentCount)
+    return abiError(
+        "prepared mapped kernel argument count does not match its ABI");
+  auto validateArguments = [&](llvm::ArrayRef<KernelAbi::Port> ports,
+                               size_t offset,
+                               llvm::StringRef side) -> llvm::Error {
+    for (size_t i = 0; i < ports.size(); ++i) {
+      mlir::Type argType = function.getFunctionType().getInput(offset + i);
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(argType);
+      if (!memref)
+        return abiError("prepared " + side.str() + " argument " +
+                        std::to_string(i) + " is not a memref");
+      if (memref.getShape() != llvm::ArrayRef<int64_t>(ports[i].shape) ||
+          typeToString(memref.getElementType()) != ports[i].elementType)
+        return abiError("prepared " + side.str() + " argument " +
+                        std::to_string(i) + " does not match its ABI port");
+    }
+    return llvm::Error::success();
+  };
+  if (llvm::Error error = validateArguments(prepared.abi.inputs, 0, "input"))
+    return std::move(error);
+  if (llvm::Error error = validateArguments(
+          prepared.abi.outputs, prepared.abi.inputs.size(), "output"))
     return std::move(error);
 
   // The C-interface wrapper is what turns descriptor pointers into the expanded
@@ -349,22 +337,23 @@ createMappedExecutable(mlir::ModuleOp module, llvm::StringRef entrySymbol) {
   mlir::PassManager pm(module.getContext());
   addKernelToLLVMPasses(pm);
   if (mlir::failed(pm.run(module)))
-    return abiError("lowering kernel '" + entrySymbol.str() +
+    return abiError("lowering kernel '" + prepared.entrySymbol +
                     "' to the LLVM dialect failed");
 
   auto llvmContext = std::make_unique<llvm::LLVMContext>();
   std::unique_ptr<llvm::Module> llvmModule =
       mlir::translateModuleToLLVMIR(module, *llvmContext);
   if (!llvmModule)
-    return abiError("translating kernel '" + entrySymbol.str() +
+    return abiError("translating kernel '" + prepared.entrySymbol +
                     "' to LLVM IR failed");
 
   // Checked before the module is handed to the JIT, so a kernel whose wrapper
   // was never generated fails with that fact rather than a lookup error.
-  std::string wrapperName = ("_mlir_ciface_" + entrySymbol).str();
+  std::string wrapperName = "_mlir_ciface_" + prepared.entrySymbol;
   if (!llvmModule->getFunction(wrapperName))
     return abiError("no C-interface wrapper '" + wrapperName +
-                    "' was generated for kernel '" + entrySymbol.str() + "'");
+                    "' was generated for kernel '" + prepared.entrySymbol +
+                    "'");
 
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
@@ -397,7 +386,7 @@ createMappedExecutable(mlir::ModuleOp module, llvm::StringRef entrySymbol) {
     return symbol.takeError();
 
   return std::unique_ptr<MappedExecutable>(new MappedExecutable(
-      std::move(*jit), symbol->toPtr<void *>(), std::move(abi)));
+      std::move(*jit), symbol->toPtr<void *>(), std::move(prepared.abi)));
 }
 
 } // namespace llk

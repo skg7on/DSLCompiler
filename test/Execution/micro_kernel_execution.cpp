@@ -36,6 +36,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "LLK/Conversion/MappedKernelAbi.h"
 #include "LLK/Conversion/MicroToLinalg.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Runtime/JitCache.h"
@@ -60,6 +61,7 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Error.h"
@@ -386,6 +388,94 @@ TEST(MicroKernelExecution, RefusesAModuleWithoutTheEntrySymbol) {
   ASSERT_FALSE(static_cast<bool>(executable));
   EXPECT_NE(llvm::toString(executable.takeError()).find("not_a_kernel"),
             std::string::npos);
+}
+
+TEST(MappedKernelAbi, BorrowsAnInputReturnedAsAnOutput) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = llvm::MemoryBuffer::getFile(
+      std::string(LLK_SOURCE_DIR) +
+      "/test/Execution/Inputs/issue129/borrowed_return.mlir");
+  ASSERT_TRUE(static_cast<bool>(source));
+  auto module =
+      mlir::parseSourceString<mlir::ModuleOp>((*source)->getBuffer(), &context);
+  ASSERT_TRUE(module);
+
+  auto prepared = llk::prepareMappedKernelForInvocation(*module, "borrow");
+  ASSERT_TRUE(static_cast<bool>(prepared))
+      << llvm::toString(prepared.takeError());
+  auto function = prepared->module->lookupSymbol<mlir::func::FuncOp>("borrow");
+  ASSERT_TRUE(function);
+  EXPECT_EQ(function.getFunctionType().getNumResults(), 0u);
+  EXPECT_EQ(function.getNumArguments(), 2u);
+  ASSERT_EQ(prepared->abi.inputs.size(), 1u);
+  ASSERT_EQ(prepared->abi.outputs.size(), 1u);
+  unsigned allocations = 0;
+  unsigned deallocations = 0;
+  unsigned copies = 0;
+  function.walk([&](mlir::memref::AllocOp) { ++allocations; });
+  function.walk([&](mlir::memref::DeallocOp) { ++deallocations; });
+  function.walk([&](mlir::memref::CopyOp) { ++copies; });
+  EXPECT_EQ(allocations, 0u);
+  EXPECT_EQ(deallocations, 0u);
+  EXPECT_EQ(copies, 1u);
+}
+
+TEST(MappedKernelAbi, CopiesSharedResultsBeforeReleasingTheirAllocation) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = llvm::MemoryBuffer::getFile(
+      std::string(LLK_SOURCE_DIR) +
+      "/test/Execution/Inputs/issue129/shared_results.mlir");
+  ASSERT_TRUE(static_cast<bool>(source));
+  auto module =
+      mlir::parseSourceString<mlir::ModuleOp>((*source)->getBuffer(), &context);
+  ASSERT_TRUE(module);
+
+  auto prepared = llk::prepareMappedKernelForInvocation(*module, "shared");
+  ASSERT_TRUE(static_cast<bool>(prepared))
+      << llvm::toString(prepared.takeError());
+  auto function = prepared->module->lookupSymbol<mlir::func::FuncOp>("shared");
+  ASSERT_TRUE(function);
+  EXPECT_EQ(function.getFunctionType().getNumResults(), 0u);
+  EXPECT_EQ(function.getNumArguments(), 2u);
+  ASSERT_EQ(prepared->abi.outputs.size(), 2u);
+  unsigned copies = 0;
+  unsigned deallocations = 0;
+  function.walk([&](mlir::memref::CopyOp) { ++copies; });
+  function.walk([&](mlir::memref::DeallocOp) { ++deallocations; });
+  EXPECT_EQ(copies, 2u);
+  EXPECT_GE(deallocations, 1u);
+}
+
+TEST(MappedKernelAbi, ReleasesScratchAllocatedInsideStructuredLoops) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = llvm::MemoryBuffer::getFile(
+      std::string(LLK_SOURCE_DIR) +
+      "/test/Execution/Inputs/issue129/nested_alloc.mlir");
+  ASSERT_TRUE(static_cast<bool>(source));
+  auto module =
+      mlir::parseSourceString<mlir::ModuleOp>((*source)->getBuffer(), &context);
+  ASSERT_TRUE(module);
+
+  auto prepared = llk::prepareMappedKernelForInvocation(*module, "nested");
+  ASSERT_TRUE(static_cast<bool>(prepared))
+      << llvm::toString(prepared.takeError());
+  auto function = prepared->module->lookupSymbol<mlir::func::FuncOp>("nested");
+  ASSERT_TRUE(function);
+  unsigned loops = 0;
+  unsigned allocations = 0;
+  unsigned deallocations = 0;
+  function.walk([&](mlir::scf::ForOp) { ++loops; });
+  function.walk([&](mlir::memref::AllocOp) { ++allocations; });
+  function.walk([&](mlir::memref::DeallocOp) { ++deallocations; });
+  EXPECT_GE(loops, 1u);
+  EXPECT_GE(allocations, 1u);
+  EXPECT_GE(deallocations, allocations);
 }
 
 TEST(MicroKernelExecution, KeepsTheExecutableAliveAfterTheModuleIsGone) {

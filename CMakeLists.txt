@@ -367,6 +367,19 @@ mlir_target_link_libraries(LLKMicroToLinalg PUBLIC
     MLIRSCFDialect MLIRTensorDialect MLIRPass MLIRTransforms
 )
 
+add_library(LLKMappedKernelAbi STATIC
+    lib/Conversion/MicroMapping/MappedKernelAbi.cpp
+)
+target_include_directories(LLKMappedKernelAbi PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+target_compile_options(LLKMappedKernelAbi PRIVATE -fno-rtti -fno-exceptions)
+mlir_target_link_libraries(LLKMappedKernelAbi PUBLIC
+    MLIRBufferizationPipelines MLIRBufferizationTransforms MLIRSCFTransforms
+    MLIRFuncDialect MLIRMemRefDialect MLIRSCFDialect MLIRPass MLIRIR
+)
+
 # Library: JIT cache runtime + weight packing
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
@@ -385,6 +398,7 @@ target_include_directories(LLKRuntime PUBLIC
 # On AArch64 → LLVMAArch64{CodeGen,Info,Desc,AsmParser,AsmPrinter,Disassembler}
 llvm_map_components_to_libnames(LLVM_NATIVE_TARGET_LIBS native)
 target_link_libraries(LLKRuntime PUBLIC
+    LLKMappedKernelAbi
     LLVMOrcJIT
     ${LLVM_NATIVE_TARGET_LIBS}
 )
@@ -525,7 +539,8 @@ target_include_directories(LLKMappedCompilation PRIVATE
     ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
 )
 target_link_libraries(LLKMappedCompilation PUBLIC
-    LLKMicroMapping LLKMicroToLinalg LLKRuntime LLKMapping LLKTargetMapping
+    LLKMicroMapping LLKMicroToLinalg LLKMappedKernelAbi LLKRuntime LLKMapping
+    LLKTargetMapping
 )
 # LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
 # not inherit those. Match the toolchain, exactly as LLKMapping does.
@@ -771,6 +786,8 @@ add_llvm_executable(MicroKernelExecution test/Execution/micro_kernel_execution.c
 target_link_libraries(MicroKernelExecution PRIVATE
     LLKMicroToLinalg LLKTransforms LLKRuntime GTest::gtest_main
     ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(MicroKernelExecution PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME MicroKernelExecution COMMAND MicroKernelExecution)
 
 add_llvm_executable(MappedInvocationTest test/Execution/mapped_invocation.cpp)
