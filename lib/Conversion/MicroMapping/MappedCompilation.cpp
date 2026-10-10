@@ -33,16 +33,24 @@
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Error.h"
 
+#include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 // The canonical plan materializer lives beside this file, in the one library
 // that owns the Micro dialect on the mapping path.
 #include "MicroMappingCommon.h"
+#include "selected_group_lowering_test_hooks.h"
 
 #if LLVM_VERSION_MAJOR >= 21
 using BufOpts = mlir::bufferization::OneShotBufferizePassOptions;
@@ -101,41 +109,255 @@ llvm::Expected<TargetBundle> readSelectedBundle(mlir::Operation *op) {
 /// bridge lowers its operation later. That is a real difference and it is
 /// counted rather than glossed: a compilation whose operations were all carried
 /// by the bridge has said nothing about this target's code generation.
-llvm::Error lowerSelectedOperations(mlir::ModuleOp module,
-                                    const MappingTarget &target,
-                                    MappedCompilation &compilation) {
-  // The lowering context carries the selected facts. Only the machine is
-  // populated here: the placements and connections a target might need are the
-  // bound plan's, and the emitter interface takes them as arrays so a lowerer
-  // that reads them can be handed them without changing this signature.
-  TargetLoweringContext context{target.machine(), {}, {}};
+llvm::Error
+lowerSelectedOperations(mlir::ModuleOp module, const MappingTarget &target,
+                        const mlir::llk::mapping::CoveringPlan &plan,
+                        MappedCompilation &compilation) {
+  using namespace mlir::llk::mapping;
+  struct SelectedGroup {
+    InstanceId instance = 0;
+    TargetBundle bundle;
+    std::string rule;
+    llvm::SmallVector<mlir::Operation *> operations;
+    llvm::SmallVector<PlanPlacement, 1> placements;
+    llvm::SmallVector<PlanConnection, 1> connections;
+    std::unique_ptr<TargetEmitter> emitter;
+  };
 
-  llvm::SmallVector<mlir::Operation *> covered;
+  std::map<WorkloadNodeId, const PlanPlacement *> placementForNode;
+  std::map<InstanceId, std::vector<const PlanPlacement *>>
+      placementsForInstance;
+  for (const PlanPlacement &placement : plan.placements) {
+    if (!placementForNode.emplace(placement.node, &placement).second)
+      return compileError("selected plan repeats placement for node " +
+                          std::to_string(placement.node));
+    placementsForInstance[placement.instance].push_back(&placement);
+  }
+
+  std::map<InstanceId, SelectedGroup> groups;
+  std::map<WorkloadNodeId, mlir::Operation *> operationForNode;
+  std::string metadataError;
   module.walk([&](mlir::Operation *op) {
-    if (op->hasAttr("micro.mapping"))
-      covered.push_back(op);
-  });
-
-  mlir::IRRewriter rewriter(module.getContext());
-  for (mlir::Operation *op : covered) {
+    if (!metadataError.empty() || !op->hasAttr("micro.mapping"))
+      return;
+    auto mapping = op->getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
+    if (!mapping) {
+      metadataError = "operation '" + op->getName().getStringRef().str() +
+                      "' has malformed micro.mapping metadata";
+      return;
+    }
+    auto nodeAttr = mapping.getAs<mlir::IntegerAttr>("node");
+    auto instanceAttr = mapping.getAs<mlir::IntegerAttr>("instance");
+    if (!nodeAttr || !instanceAttr ||
+        nodeAttr.getValue().getActiveBits() > 64 ||
+        instanceAttr.getValue().getActiveBits() > 64) {
+      metadataError = "operation '" + op->getName().getStringRef().str() +
+                      "' has no valid selected node and instance identity";
+      return;
+    }
+    WorkloadNodeId node = nodeAttr.getValue().getZExtValue();
+    InstanceId instance = instanceAttr.getValue().getZExtValue();
+    auto placement = placementForNode.find(node);
+    if (placement == placementForNode.end() ||
+        placement->second->instance != instance) {
+      metadataError = "selected instance " + std::to_string(instance) +
+                      " has no matching plan placement for node " +
+                      std::to_string(node);
+      return;
+    }
+    if (!operationForNode.emplace(node, op).second) {
+      metadataError = "selected instance " + std::to_string(instance) +
+                      " repeats mapped node " + std::to_string(node);
+      return;
+    }
     llvm::Expected<TargetBundle> bundle = readSelectedBundle(op);
-    if (!bundle)
-      return bundle.takeError();
+    if (!bundle) {
+      metadataError = llvm::toString(bundle.takeError());
+      return;
+    }
+    const TargetBundle &selected = placement->second->bundle;
+    if (bundle->name != selected.name ||
+        bundle->emitterKey != selected.emitterKey ||
+        bundle->parameters != selected.parameters) {
+      metadataError = "selected instance " + std::to_string(instance) +
+                      " rule '" + placement->second->rule +
+                      "' has bundle metadata that disagrees with its plan";
+      return;
+    }
 
-    std::unique_ptr<mlir::llk::mapping::TargetEmitter> emitter =
-        target.createEmitter(bundle->emitterKey);
-    if (!emitter)
-      return compileError("selected emitter '" + bundle->emitterKey +
+    auto [groupIt, inserted] = groups.try_emplace(instance);
+    SelectedGroup &group = groupIt->second;
+    if (inserted) {
+      group.instance = instance;
+      group.bundle = *bundle;
+      group.rule = placement->second->rule;
+    } else if (group.bundle.name != bundle->name ||
+               group.bundle.emitterKey != bundle->emitterKey ||
+               group.bundle.parameters != bundle->parameters ||
+               group.rule != placement->second->rule) {
+      metadataError = "selected instance " + std::to_string(instance) +
+                      " has inconsistent bundle or rule metadata";
+      return;
+    }
+    group.operations.push_back(op);
+  });
+  if (!metadataError.empty())
+    return compileError(metadataError);
+
+  if (operationForNode.size() != placementForNode.size())
+    for (const auto &[node, placement] : placementForNode)
+      if (!operationForNode.count(node))
+        return compileError("selected instance " +
+                            std::to_string(placement->instance) + " rule '" +
+                            placement->rule + "' is missing mapped node " +
+                            std::to_string(node));
+
+  // Validate group membership, SSA order, control/effect boundaries and
+  // external intermediate uses before resolving or invoking any emitter.
+  for (auto &[instance, group] : groups) {
+    auto expected = placementsForInstance.find(instance);
+    if (expected == placementsForInstance.end() ||
+        expected->second.size() != group.operations.size())
+      return compileError("selected instance " + std::to_string(instance) +
+                          " rule '" + group.rule +
+                          "' has a different number of mapped operations and "
+                          "plan placements");
+    for (const PlanPlacement *placement : expected->second)
+      group.placements.push_back(*placement);
+
+    llvm::SmallPtrSet<mlir::Operation *, 8> members;
+    for (mlir::Operation *op : group.operations)
+      members.insert(op);
+    llvm::SmallVector<mlir::Operation *> sourceOrder(group.operations.begin(),
+                                                     group.operations.end());
+    llvm::SmallPtrSet<mlir::Operation *, 8> emitted;
+    group.operations.clear();
+    while (group.operations.size() < sourceOrder.size()) {
+      bool added = false;
+      for (mlir::Operation *op : sourceOrder) {
+        if (emitted.contains(op))
+          continue;
+        bool ready = true;
+        for (mlir::Value operand : op->getOperands())
+          if (mlir::Operation *def = operand.getDefiningOp())
+            if (members.contains(def) && !emitted.contains(def)) {
+              ready = false;
+              break;
+            }
+        if (ready) {
+          group.operations.push_back(op);
+          emitted.insert(op);
+          added = true;
+        }
+      }
+      if (!added)
+        return compileError("selected instance " + std::to_string(instance) +
+                            " rule '" + group.rule +
+                            "' has cyclic or unresolved SSA order");
+    }
+
+    mlir::Block *block = group.operations.front()->getBlock();
+    for (mlir::Operation *op : group.operations)
+      if (op->getBlock() != block)
+        return compileError("selected instance " + std::to_string(instance) +
+                            " rule '" + group.rule +
+                            "' crosses a region or block boundary");
+    for (mlir::Operation *op : group.operations)
+      for (mlir::Value result : op->getResults()) {
+        bool internalUse = false;
+        bool externalUse = false;
+        for (mlir::OpOperand &use : result.getUses()) {
+          internalUse |= members.contains(use.getOwner());
+          externalUse |= !members.contains(use.getOwner());
+        }
+        if (internalUse && externalUse)
+          return compileError("selected instance " + std::to_string(instance) +
+                              " rule '" + group.rule +
+                              "' has a live external use of an internal value");
+      }
+
+    llvm::DenseSet<mlir::Operation *> memberSet;
+    for (mlir::Operation *op : group.operations)
+      memberSet.insert(op);
+    bool betweenMembers = false;
+    for (mlir::Operation &operation : *block) {
+      if (memberSet.contains(&operation)) {
+        betweenMembers = true;
+        continue;
+      }
+      if (!betweenMembers)
+        continue;
+      bool laterMember = false;
+      for (auto it = std::next(operation.getIterator()); it != block->end();
+           ++it)
+        if (memberSet.contains(&*it)) {
+          laterMember = true;
+          break;
+        }
+      if (!laterMember)
+        break;
+      if (!mlir::isMemoryEffectFree(&operation))
+        return compileError("selected instance " + std::to_string(instance) +
+                            " rule '" + group.rule +
+                            "' crosses an intervening side effect");
+    }
+  }
+
+  auto connectionTouches = [&](const PlanConnection &connection,
+                               const SelectedGroup &group) {
+    if (llvm::is_contained(connection.consumers, group.instance))
+      return true;
+    auto touchesPort = [&](const PortRef &port) {
+      auto found = placementForNode.find(port.node);
+      return found != placementForNode.end() &&
+             found->second->instance == group.instance;
+    };
+    if (connection.producerPort && touchesPort(*connection.producerPort))
+      return true;
+    for (PortRef port : connection.producerPorts)
+      if (touchesPort(port))
+        return true;
+    for (PortRef port : connection.consumerPorts)
+      if (touchesPort(port))
+        return true;
+    return false;
+  };
+  for (const PlanConnection &connection : plan.connectionPlans)
+    for (auto &[instance, group] : groups)
+      if (connectionTouches(connection, group))
+        group.connections.push_back(connection);
+
+  // Verify every bundle and resolve every emitter before the first rewrite.
+  for (auto &[instance, group] : groups) {
+    group.emitter = target.createEmitter(group.bundle.emitterKey);
+    if (!group.emitter)
+      return compileError("selected emitter '" + group.bundle.emitterKey +
                           "' is not declared by target '" +
                           target.name().str() + "'");
+    if (llvm::Error error = group.emitter->verify(group.bundle))
+      return compileError(
+          "selected instance " + std::to_string(instance) + " rule '" +
+          group.rule +
+          "' bundle validation failed: " + llvm::toString(std::move(error)));
+  }
+  compilation.selectedGroupsVerified += groups.size();
 
-    if (!emitter->hasLowering()) {
-      ++compilation.referenceLowered;
+  mlir::IRRewriter rewriter(module.getContext());
+  for (auto &[instance, group] : groups) {
+    TargetLoweringContext context{target.machine(), group.placements,
+                                  group.connections, instance};
+    if (!group.emitter->hasLowering()) {
+      compilation.referenceLowered += group.operations.size();
+      ++compilation.referenceGroupsLowered;
       continue;
     }
-    if (llvm::Error error = emitter->lower({op}, *bundle, context, rewriter))
-      return error;
-    ++compilation.targetLowered;
+    if (llvm::Error error = group.emitter->lower(group.operations, group.bundle,
+                                                 context, rewriter))
+      return compileError("selected instance " + std::to_string(instance) +
+                          " rule '" + group.rule + "' lowering failed: " +
+                          llvm::toString(std::move(error)));
+    compilation.targetLowered += group.operations.size();
+    ++compilation.backendGroupsRealized;
   }
   return llvm::Error::success();
 }
@@ -178,6 +400,16 @@ mlir::LogicalResult lowerToBackendForm(mlir::ModuleOp module) {
 }
 
 } // namespace
+
+namespace testing {
+llvm::Error
+lowerSelectedOperationsForTest(mlir::ModuleOp module,
+                               const MappingTarget &target,
+                               const mlir::llk::mapping::CoveringPlan &plan,
+                               MappedCompilation &compilation) {
+  return lowerSelectedOperations(module, target, plan, compilation);
+}
+} // namespace testing
 
 /// The tail every compilation shares: Linalg and loops, then the calling
 /// convention, then the code.
@@ -263,8 +495,8 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
           mlir::llk::mapping::verifyMappedMicroIR(*compilation.module, target))
     return std::move(error);
 
-  if (llvm::Error error =
-          lowerSelectedOperations(*compilation.module, target, compilation))
+  if (llvm::Error error = lowerSelectedOperations(*compilation.module, target,
+                                                  plan, compilation))
     return std::move(error);
   compilation.stopped = MappedStop::TargetLowered;
   if (options.stop == MappedStop::TargetLowered)

@@ -80,6 +80,12 @@ struct MappedCompilation {
   /// a run that is entirely reference execution has said nothing about the
   /// target's code generation.
   unsigned referenceLowered = 0;
+  /// Selected instance groups that passed bundle and plan-context validation.
+  unsigned selectedGroupsVerified = 0;
+  /// Selected groups lowered by a target-owned backend emitter.
+  unsigned backendGroupsRealized = 0;
+  /// Selected groups left to the reference bridge.
+  unsigned referenceGroupsLowered = 0;
 };
 
 /// Runs the shared mapped-compilation sequence over `source`.

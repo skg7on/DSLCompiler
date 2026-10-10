@@ -538,6 +538,7 @@ target_include_directories(LLKMappedCompilation PUBLIC
 # private because it is an implementation detail of the Micro mapping library.
 target_include_directories(LLKMappedCompilation PRIVATE
     ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+    ${CMAKE_SOURCE_DIR}/test/Execution
 )
 target_link_libraries(LLKMappedCompilation PUBLIC
     LLKMicroMapping LLKMicroToLinalg LLKMappedKernelAbi LLKRuntime LLKMapping
@@ -1021,6 +1022,11 @@ target_compile_definitions(MappingE2EWorkflowTest PRIVATE
     LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
     LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME MappingE2EWorkflowTest COMMAND MappingE2EWorkflowTest)
+add_llvm_executable(SelectedGroupLoweringTest
+    test/Execution/selected_group_lowering.cpp)
+target_link_libraries(SelectedGroupLoweringTest PRIVATE
+    LLKMappedCompilation LLKMapping GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+add_test(NAME SelectedGroupLoweringTest COMMAND SelectedGroupLoweringTest)
 add_llk_mapping_test(MappingRoutingTest test/Mapping/routing.cpp)
 add_llk_mapping_test(MappingPlanReportTest test/Mapping/plan_report.cpp)
 target_link_libraries(MappingPlanReportTest PRIVATE LLKResourceRegressionFixture)
