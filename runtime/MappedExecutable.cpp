@@ -23,6 +23,7 @@
 
 #include "LLK/Runtime/MappedExecutable.h"
 #include "LLK/Conversion/MappedKernelAbi.h"
+#include "mapped_jit_test_factory.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -282,6 +283,14 @@ createMappedExecutable(mlir::ModuleOp module, llvm::StringRef entrySymbol) {
 llvm::Expected<std::unique_ptr<MappedExecutable>>
 createMappedExecutable(PreparedMappedKernel prepared,
                        const MappedJitOptions &options) {
+  return MappedExecutable::createWithAllocatorHooks(std::move(prepared),
+                                                    options, nullptr);
+}
+
+llvm::Expected<std::unique_ptr<MappedExecutable>>
+MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
+                                           const MappedJitOptions &options,
+                                           testing::TestAllocatorHooks *hooks) {
   (void)options;
   if (!prepared.module)
     return abiError("prepared mapped kernel has no module");
@@ -373,6 +382,23 @@ createMappedExecutable(PreparedMappedKernel prepared,
       llvm::orc::ExecutorSymbolDef(
           llvm::orc::ExecutorAddr::fromPtr(&memrefCopy),
           llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+  if (hooks) {
+    if (hooks->allocate)
+      runtimeSymbols[(*jit)->mangleAndIntern("malloc")] =
+          llvm::orc::ExecutorSymbolDef(
+              llvm::orc::ExecutorAddr::fromPtr(hooks->allocate),
+              llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+    if (hooks->alignedAllocate)
+      runtimeSymbols[(*jit)->mangleAndIntern("aligned_alloc")] =
+          llvm::orc::ExecutorSymbolDef(
+              llvm::orc::ExecutorAddr::fromPtr(hooks->alignedAllocate),
+              llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+    if (hooks->release)
+      runtimeSymbols[(*jit)->mangleAndIntern("free")] =
+          llvm::orc::ExecutorSymbolDef(
+              llvm::orc::ExecutorAddr::fromPtr(hooks->release),
+              llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+  }
   if (llvm::Error error = (*jit)->getMainJITDylib().define(
           llvm::orc::absoluteSymbols(std::move(runtimeSymbols))))
     return std::move(error);
@@ -387,6 +413,14 @@ createMappedExecutable(PreparedMappedKernel prepared,
 
   return std::unique_ptr<MappedExecutable>(new MappedExecutable(
       std::move(*jit), symbol->toPtr<void *>(), std::move(prepared.abi)));
+}
+
+llvm::Expected<std::unique_ptr<MappedExecutable>>
+testing::MappedExecutableTestFactory::create(PreparedMappedKernel prepared,
+                                             const MappedJitOptions &options,
+                                             TestAllocatorHooks hooks) {
+  return MappedExecutable::createWithAllocatorHooks(std::move(prepared),
+                                                    options, &hooks);
 }
 
 } // namespace llk

@@ -391,6 +391,7 @@ add_library(LLKRuntime STATIC
 target_include_directories(LLKRuntime PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
+    PRIVATE ${CMAKE_SOURCE_DIR}/test/Execution
 )
 # Resolve native target libraries dynamically for the build host.
 # Equivalent to: llvm-config --libs native
@@ -794,6 +795,14 @@ add_llvm_executable(MappedInvocationTest test/Execution/mapped_invocation.cpp)
 target_link_libraries(MappedInvocationTest PRIVATE
     LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
 add_test(NAME MappedInvocationTest COMMAND MappedInvocationTest)
+
+add_llvm_executable(MappedAllocationLifetimeTest
+    test/Execution/mapped_allocation_lifetime.cpp)
+target_link_libraries(MappedAllocationLifetimeTest PRIVATE
+    LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(MappedAllocationLifetimeTest PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME MappedAllocationLifetimeTest COMMAND MappedAllocationLifetimeTest)
 
 add_llvm_executable(SwiGLUFusedMemory test/Execution/swiglu_fused_memory.cpp)
 target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})

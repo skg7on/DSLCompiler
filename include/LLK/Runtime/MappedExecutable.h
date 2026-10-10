@@ -52,6 +52,10 @@ namespace llk {
 /// the caller never offered.
 
 class MappedExecutable;
+namespace testing {
+struct TestAllocatorHooks;
+class MappedExecutableTestFactory;
+} // namespace testing
 
 /// Compiles `bufferedModule`'s `entrySymbol` into an executable.
 ///
@@ -107,6 +111,12 @@ private:
   friend llvm::Expected<std::unique_ptr<MappedExecutable>>
   createMappedExecutable(PreparedMappedKernel prepared,
                          const MappedJitOptions &options);
+  friend class testing::MappedExecutableTestFactory;
+
+  static llvm::Expected<std::unique_ptr<MappedExecutable>>
+  createWithAllocatorHooks(PreparedMappedKernel prepared,
+                           const MappedJitOptions &options,
+                           testing::TestAllocatorHooks *hooks);
 
   MappedExecutable(std::unique_ptr<llvm::orc::LLJIT> jit, void *entry,
                    KernelAbi abi);
