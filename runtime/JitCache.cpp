@@ -157,6 +157,11 @@ void registerKernelToLLVMInterfaces(mlir::MLIRContext &context) {
 }
 
 void addKernelToLLVMPasses(mlir::PassManager &pm) {
+  // Lower vector transfers before ConvertToLLVM converts their memrefs. The
+  // unified conversion interface handles vector compute ops, but vector
+  // transfers need this dedicated lowering while their source memrefs remain
+  // in the original type domain.
+  pm.addPass(mlir::createConvertVectorToLLVMPass());
   // Expand memref ops that carry layout metadata into explicit
   // `extract_strided_metadata` arithmetic, before anything else looks at them.
   // A windowed tile view lowers to a `memref.subview` whose offsets are affine
