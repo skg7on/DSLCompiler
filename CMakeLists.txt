@@ -822,7 +822,7 @@ target_link_libraries(MappedAVX2Acceptance PRIVATE
 target_compile_definitions(MappedAVX2Acceptance PRIVATE
     LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
 add_test(NAME MappedAVX2Acceptance COMMAND MappedAVX2Acceptance
-    --gtest_filter=MappedAcceptance.SelectedAvx2*)
+    --gtest_filter=MappedAcceptance.*)
 set_tests_properties(MappedAVX2Acceptance PROPERTIES LABELS "selected-avx2")
 
 add_llvm_executable(MicroKernelExecution test/Execution/micro_kernel_execution.cpp)

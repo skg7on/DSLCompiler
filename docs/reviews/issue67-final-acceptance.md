@@ -11,15 +11,26 @@ replay, parse/print determinism, and planner versus `micro-perf` cycle/DRAM
 parity. The T6 targeted CTest selection passed 4/4.
 
 The current local configuration is LLVM/MLIR 24.0.0git on Darwin arm64. The
-portable mapped numeric binary ran four tests successfully and skipped its two
-selected-AVX2 tests. The separate required-target binary was also run as a
-negative control and failed on this unsupported host, as designed. T7 currently
-adds fixed-seed xorshift32 signed inputs rounded to stored BF16 and aligned plus
-padded-tail matmul checks; fused random, transform numerical, width-specific
-vector, and multi-output invocation cases remain open. T8 adds a required
-selected-AVX2 CTest and a JUnit outcome parser to the pinned LLVM 22 CI workflow,
-but no CI run on this branch head is recorded. T9's current workflow smoke and
-DocReferences both pass locally; the full closure matrix remains incomplete.
+portable mapped numeric binary now runs eight tests successfully and skips its
+two selected-AVX2 tests. In addition to fixed-seed xorshift32 BF16 inputs and
+aligned plus padded-tail matmul checks, it exercises randomized fused SwiGLU,
+two independent numeric vector outputs over repeated invocations, and the
+required layout transform against a scalar numeric oracle, and width-4/8
+numeric vector invocation. The transform fixture now uses a non-identity
+permutation under the target's supported `blocked` layout name; its oracle
+checks the transposed element relation, and a valid plan with that transform
+omitted produces a numeric mismatch. The separate required-target binary was
+run as a negative host-capability check and failed on this arm64 host as
+designed. T8 adds a required selected-AVX2 CTest and a JUnit outcome parser to
+the pinned LLVM 22 CI workflow, but no CI run on this branch head is recorded.
+T9's current workflow smoke and DocReferences both pass locally; the full
+closure matrix remains incomplete.
+
+On the pre-T7-commit working tree based on `4b7a19a`, the full CTest run
+registered 159 tests: 155 passed, one required selected-AVX2 test failed on
+arm64, and three platform tests were skipped. The evidence parser rejected that
+JUnit report with `MappedAVX2Acceptance=failed`, as required; this confirms the
+host gate and is not selected-x86 evidence.
 
 Therefore issue #67 and the mandatory #129 release gate remain open. In
 particular, selected AVX2 invocation has not passed on the candidate release

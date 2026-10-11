@@ -19,7 +19,10 @@
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/LayoutConstraints.h"
+#include "LLK/Mapping/MappingRules.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Runtime/MappedExecutable.h"
@@ -40,11 +43,13 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Error.h"
 #include "llvm/TargetParser/Host.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -151,7 +156,11 @@ mlir::DialectRegistry buildRegistry() {
 llvm::Expected<std::unique_ptr<llk::MappedExecutable>>
 compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
              llvm::StringRef entrySymbol,
+#ifdef LLK_REQUIRE_SELECTED_TARGET
+             llk::MappedBackend backend = llk::MappedBackend::SelectedTarget,
+#else
              llk::MappedBackend backend = llk::MappedBackend::Reference,
+#endif
              llvm::StringRef scheduleDb = {}) {
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::parseSourceString<mlir::ModuleOp>(sourceText, &context);
@@ -223,6 +232,175 @@ compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
                                    "the compilation produced no executable");
   return std::move(compiled->executable);
 }
+
+llvm::Expected<std::unique_ptr<llk::MappedExecutable>>
+compileMicroKernel(mlir::MLIRContext &context, llvm::StringRef sourceText,
+                   llvm::StringRef entrySymbol, bool requireTransform = false,
+                   bool *transformMaterialized = nullptr,
+                   int64_t vectorWidth = 8, bool noTransformControl = false) {
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(sourceText, &context);
+  if (!module)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the Micro source did not parse");
+  mlir::Operation *kernel = nullptr;
+  module->walk([&](mlir::Operation *op) {
+    if (!kernel && op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+  });
+  if (!kernel)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the module contains no micro.kernel");
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = [&]() {
+    if (requireTransform) {
+      const std::string root = LLK_SOURCE_DIR;
+      return mlir::llk::mapping::loadMappingTarget(
+          "x86-avx2", root + "/machines/x86-avx2-v2.yaml",
+          root + "/test/Conversion/MicroMapping/Inputs/issue129/"
+                 "numeric_transform_layouts.llkmap",
+          root + "/test/Conversion/MicroMapping/Inputs/issue129/"
+                 "required_transform.llkmap",
+          {"avx2_vector_add", "avx2_vector_mul", "avx2_copy"});
+    }
+    if (vectorWidth == 4) {
+      const std::string root = LLK_SOURCE_DIR;
+      llvm::Expected<mlir::llk::machine::MachineModel> machine =
+          mlir::llk::machine::loadMachineModel(root +
+                                               "/machines/x86-avx2-v2.yaml");
+      if (!machine)
+        return llvm::Expected<std::unique_ptr<MappingTarget>>(
+            machine.takeError());
+      bool changedWidth = false;
+      for (auto &compute : machine->computes) {
+        if (compute.kind == "vector_engine") {
+          compute.lanes["f32"] = vectorWidth;
+          changedWidth = true;
+        }
+      }
+      if (!changedWidth)
+        return llvm::Expected<std::unique_ptr<MappingTarget>>(
+            llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                    "AVX2 machine has no vector engine"));
+      llvm::Expected<mlir::llk::mapping::LayoutRegistry> layouts =
+          mlir::llk::mapping::loadLayoutFile(
+              root + "/mapping/x86-avx2/layouts.llkmap");
+      if (!layouts)
+        return llvm::Expected<std::unique_ptr<MappingTarget>>(
+            layouts.takeError());
+      llvm::Expected<mlir::llk::mapping::RuleRegistry> rules =
+          mlir::llk::mapping::loadRuleFile(root +
+                                           "/mapping/x86-avx2/rules.llkmap");
+      if (!rules)
+        return llvm::Expected<std::unique_ptr<MappingTarget>>(
+            rules.takeError());
+      auto custom = std::make_unique<mlir::llk::mapping::FileMappingTarget>(
+          "x86-avx2-vw4", std::move(*machine), std::move(*layouts),
+          std::move(*rules),
+          std::vector<std::string>{
+              "avx2_vector_add", "avx2_vector_convert", "avx2_vector_silu",
+              "avx2_vector_mul", "avx2_fused_convert_silu_mul", "avx2_mma",
+              "avx2_reduce", "avx2_copy", "avx2_tile_copy", "avx2_tile_store"});
+      if (llvm::Error error = mlir::llk::mapping::verifyMappingTarget(*custom))
+        return llvm::Expected<std::unique_ptr<MappingTarget>>(std::move(error));
+      return llvm::Expected<std::unique_ptr<MappingTarget>>(
+          std::unique_ptr<MappingTarget>(std::move(custom)));
+    }
+    return mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  }();
+  if (!target)
+    return target.takeError();
+  llvm::Expected<mlir::llk::mapping::WorkloadGraph> graph =
+      mlir::llk::mapping::extractWorkloadGraph(kernel);
+  if (!graph)
+    return graph.takeError();
+  mlir::llk::mapping::LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "f32";
+  MappingSearchOptions searchOptions;
+  searchOptions.mode = SearchMode::Exact;
+  mlir::llk::mapping::CoveringSearch search(*graph, **target, context,
+                                            layoutContext, searchOptions);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  if (!result)
+    return result.takeError();
+  if (result->plans.empty()) {
+    std::string detail = "the Micro graph has no complete mapping";
+    for (const auto &diagnostic : result->frontier.diagnostics)
+      detail += "; " + diagnostic.message;
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), detail);
+  }
+  if (noTransformControl) {
+    bool foundTransform = false;
+    for (auto &connection : result->plans.front().connectionPlans) {
+      if (!connection.transform)
+        continue;
+      connection.transform.reset();
+      connection.kind = mlir::llk::mapping::ConnectionKind::Direct;
+      foundTransform = true;
+    }
+    if (!foundTransform)
+      return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                     "the selected plan has no transform");
+    result->plans.front().id =
+        mlir::llk::mapping::computePlanId(result->plans.front());
+  }
+  llk::MappedCompileOptions options;
+  options.entrySymbol = entrySymbol.str();
+#ifdef LLK_REQUIRE_SELECTED_TARGET
+  options.backend = (requireTransform || vectorWidth == 4)
+                        ? llk::MappedBackend::Reference
+                        : llk::MappedBackend::SelectedTarget;
+#else
+  options.backend = llk::MappedBackend::Reference;
+#endif
+  if (requireTransform) {
+    llk::MappedCompileOptions boundOptions = options;
+    boundOptions.stop = llk::MappedStop::MappedMicro;
+    llvm::Expected<llk::MappedCompilation> bound = llk::compileMappedKernel(
+        *module, **target, result->plans.front(), boundOptions);
+    if (!bound)
+      return bound.takeError();
+    bool foundTransform = false;
+    bound->module->walk([&](mlir::Operation *op) {
+      foundTransform |= op->getName().getStringRef() == "micro.transform";
+    });
+    if (transformMaterialized)
+      *transformMaterialized = foundTransform;
+  }
+  llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
+      *module, **target, result->plans.front(), options);
+  if (!compiled)
+    return compiled.takeError();
+  if (!compiled->executable)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the mapped Micro kernel did not compile");
+  return std::move(compiled->executable);
+}
+
+constexpr llvm::StringLiteral kTwoOutputVectorKernel = R"mlir(
+module {
+  micro.kernel @two_outputs(%a: tensor<8x8xf32>, %b: tensor<8x8xf32>)
+      -> (tensor<8x8xf32>, tensor<8x8xf32>) {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %tb = micro.tile_view %b {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %sum = micro.vector "add" %ta, %tb : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<acc>>
+    %product = micro.vector "mul" %ta, %tb : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<acc>>
+    micro.yield %sum, %product : !micro.tile<8x8xf32, memory = #micro.memory<acc>>, !micro.tile<8x8xf32, memory = #micro.memory<acc>>
+  }
+}
+)mlir";
+
+constexpr llvm::StringLiteral kRequiredTransformNumericKernel = R"mlir(
+module {
+  micro.kernel @required_transform(%x: tensor<8x8xf32>) -> tensor<8x8xf32> {
+    %t, %tok = micro.async_copy %x {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    %a = micro.tile_view %t {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %a, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %product = micro.vector "mul" %r, %a : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<dram>>
+    micro.yield %product : !micro.tile<8x8xf32, memory = #micro.memory<dram>>
+  }
+}
+)mlir";
 
 /// One bf16 buffer of `rows` x `columns`.
 struct Buffer {
@@ -431,6 +609,220 @@ TEST(MappedAcceptance, InvokesTheCompilerGeneratedSwiGLUAndChecksEveryElement) {
   // activation can produce.
   for (size_t i = 0; i < out.storage.size(); ++i)
     EXPECT_EQ(fromBf16(out.storage[i]), 4096.0f) << "element " << i;
+
+  uint32_t state = 0x12967u;
+  fillSignedBf16(x, state);
+  fillSignedBf16(wg, state);
+  fillSignedBf16(wu, state);
+  const auto originalX = x.storage;
+  const auto originalWg = wg.storage;
+  const auto originalWu = wu.storage;
+  std::fill(out.storage.begin(), out.storage.end(), toBf16(-7.0f));
+  error =
+      (*executable)
+          ->invoke({x.checked(), wg.checked(), wu.checked()}, {out.checked()});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+
+  // bounded_fast replaces exp with a cubic on its reduced interval. Inputs are
+  // in [-0.5, 0.5], so each K=64 projection is bounded by 16 in magnitude;
+  // this absolute-plus-relative tolerance includes BF16 output rounding and
+  // the approximation error over that declared range.
+  for (int64_t m = 0; m < 16; ++m) {
+    for (int64_t n = 0; n < 64; ++n) {
+      float gate = 0.0f;
+      float up = 0.0f;
+      for (int64_t k = 0; k < 64; ++k) {
+        const float value = storedBf16(x, static_cast<size_t>(m * 64 + k));
+        gate += value * storedBf16(wg, static_cast<size_t>(k * 64 + n));
+        up += value * storedBf16(wu, static_cast<size_t>(k * 64 + n));
+      }
+      const float expected = gate / (1.0f + std::exp(-gate)) * up;
+      const float actual =
+          fromBf16(out.storage[static_cast<size_t>(m * 64 + n)]);
+      EXPECT_NEAR(actual, expected, 0.04f + 0.02f * std::abs(expected))
+          << "element " << m << "," << n << " gate=" << gate << " up=" << up;
+    }
+  }
+  EXPECT_EQ(x.storage, originalX);
+  EXPECT_EQ(wg.storage, originalWg);
+  EXPECT_EQ(wu.storage, originalWu);
+}
+
+TEST(MappedAcceptance, MapsAndInvokesTwoIndependentVectorOutputs) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      compileMicroKernel(context, kTwoOutputVectorKernel, "two_outputs");
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+  ASSERT_EQ((*executable)->abi().inputs.size(), 2u);
+  ASSERT_EQ((*executable)->abi().outputs.size(), 2u);
+
+  FloatBuffer a(8, 8, 0.0f);
+  FloatBuffer b(8, 8, 0.0f);
+  uint32_t state = 0x12967u;
+  fillSigned(a, state);
+  fillSigned(b, state);
+  const auto originalA = a.storage;
+  const auto originalB = b.storage;
+  std::vector<float> first(66, -77.0f);
+  std::vector<float> second(66, -79.0f);
+  llk::InvocationBuffer2D out0{{first.data(), first.data() + 1, 0, 8, 8, 8, 1},
+                               llk::InvocationElementType::F32,
+                               first.size() * sizeof(float)};
+  llk::InvocationBuffer2D out1{
+      {second.data(), second.data() + 1, 0, 8, 8, 8, 1},
+      llk::InvocationElementType::F32,
+      second.size() * sizeof(float)};
+  llvm::Error error =
+      (*executable)->invoke({a.checked(), b.checked()}, {out0, out1});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+  for (size_t i = 0; i < a.storage.size(); ++i) {
+    EXPECT_FLOAT_EQ(first[i + 1], a.storage[i] + b.storage[i]);
+    EXPECT_FLOAT_EQ(second[i + 1], a.storage[i] * b.storage[i]);
+  }
+  EXPECT_EQ(first.front(), -77.0f);
+  EXPECT_EQ(first.back(), -77.0f);
+  EXPECT_EQ(second.front(), -79.0f);
+  EXPECT_EQ(second.back(), -79.0f);
+  EXPECT_EQ(a.storage, originalA);
+  EXPECT_EQ(b.storage, originalB);
+
+  state = 0x12968u;
+  fillSigned(a, state);
+  fillSigned(b, state);
+  error = (*executable)->invoke({a.checked(), b.checked()}, {out0, out1});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+  for (size_t i = 0; i < a.storage.size(); ++i) {
+    EXPECT_FLOAT_EQ(first[i + 1], a.storage[i] + b.storage[i]);
+    EXPECT_FLOAT_EQ(second[i + 1], a.storage[i] * b.storage[i]);
+  }
+}
+
+TEST(MappedAcceptance, ExecutesWidthFourVectorAdditionNumerically) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      compileMicroKernel(context, kTwoOutputVectorKernel, "two_outputs",
+                         /*requireTransform=*/false,
+                         /*transformMaterialized=*/nullptr, /*vectorWidth=*/4);
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+
+  FloatBuffer a(8, 8, 0.0f);
+  FloatBuffer b(8, 8, 0.0f);
+  uint32_t state = 0x12967u;
+  fillSigned(a, state);
+  fillSigned(b, state);
+  const auto originalA = a.storage;
+  const auto originalB = b.storage;
+  std::vector<float> output(66, -91.0f);
+  std::vector<float> product(66, -93.0f);
+  llk::InvocationBuffer2D out{{output.data(), output.data() + 1, 0, 8, 8, 8, 1},
+                              llk::InvocationElementType::F32,
+                              output.size() * sizeof(float)};
+  llk::InvocationBuffer2D productOut{
+      {product.data(), product.data() + 1, 0, 8, 8, 8, 1},
+      llk::InvocationElementType::F32,
+      product.size() * sizeof(float)};
+  llvm::Error error =
+      (*executable)->invoke({a.checked(), b.checked()}, {out, productOut});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+  for (size_t i = 0; i < a.storage.size(); ++i)
+    EXPECT_FLOAT_EQ(output[i + 1], a.storage[i] + b.storage[i])
+        << "element " << i;
+  for (size_t i = 0; i < a.storage.size(); ++i)
+    EXPECT_FLOAT_EQ(product[i + 1], a.storage[i] * b.storage[i])
+        << "product element " << i;
+  EXPECT_EQ(output.front(), -91.0f);
+  EXPECT_EQ(output.back(), -91.0f);
+  EXPECT_EQ(product.front(), -93.0f);
+  EXPECT_EQ(product.back(), -93.0f);
+  EXPECT_EQ(a.storage, originalA);
+  EXPECT_EQ(b.storage, originalB);
+}
+
+TEST(MappedAcceptance, ExecutesTheRequiredLayoutTransformNumerically) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  bool transformMaterialized = false;
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      compileMicroKernel(context, kRequiredTransformNumericKernel,
+                         "required_transform", /*requireTransform=*/true,
+                         &transformMaterialized);
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+  ASSERT_TRUE(transformMaterialized)
+      << "incompatible selected maps did not materialize micro.transform";
+  ASSERT_EQ((*executable)->abi().inputs.size(), 1u);
+  ASSERT_EQ((*executable)->abi().outputs.size(), 1u);
+
+  FloatBuffer input(8, 8, 0.0f);
+  uint32_t state = 0x12967u;
+  fillSigned(input, state);
+  const auto original = input.storage;
+  FloatBuffer output(8, 8, -7.0f);
+  llvm::Error error =
+      (*executable)->invoke({input.checked()}, {output.checked()});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+  for (int64_t row = 0; row < 8; ++row) {
+    for (int64_t column = 0; column < 8; ++column) {
+      const size_t index = static_cast<size_t>(row * 8 + column);
+      const size_t transposed = static_cast<size_t>(column * 8 + row);
+      const float expected =
+          2.0f * input.storage[transposed] * input.storage[index];
+      EXPECT_NEAR(output.storage[index], expected, 1e-6f)
+          << "element " << row << "," << column;
+    }
+  }
+  EXPECT_EQ(input.storage, original);
+}
+
+TEST(MappedAcceptance, NoTransformControlChangesTheNumericResult) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  bool transformMaterialized = true;
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      compileMicroKernel(context, kRequiredTransformNumericKernel,
+                         "required_transform", /*requireTransform=*/true,
+                         &transformMaterialized, /*vectorWidth=*/8,
+                         /*noTransformControl=*/true);
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+  ASSERT_FALSE(transformMaterialized)
+      << "the no-transform plan unexpectedly materialized micro.transform";
+
+  FloatBuffer input(8, 8, 0.0f);
+  uint32_t state = 0x12967u;
+  fillSigned(input, state);
+  const auto original = input.storage;
+  FloatBuffer output(8, 8, -7.0f);
+  llvm::Error error =
+      (*executable)->invoke({input.checked()}, {output.checked()});
+  ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
+
+  size_t mismatches = 0;
+  for (int64_t row = 0; row < 8; ++row) {
+    for (int64_t column = 0; column < 8; ++column) {
+      const size_t index = static_cast<size_t>(row * 8 + column);
+      const size_t transposed = static_cast<size_t>(column * 8 + row);
+      const float transformedExpected =
+          2.0f * input.storage[transposed] * input.storage[index];
+      const float noTransformExpected =
+          2.0f * input.storage[index] * input.storage[index];
+      EXPECT_NEAR(output.storage[index], noTransformExpected, 1e-6f)
+          << "element " << row << "," << column;
+      mismatches +=
+          std::abs(output.storage[index] - transformedExpected) > 1e-6f;
+    }
+  }
+  EXPECT_GT(mismatches, 0u)
+      << "omitting the selected layout transform preserved its result";
+  EXPECT_EQ(input.storage, original);
 }
 
 TEST(MappedAcceptance, LeavesTheCallersBuffersOwnedByTheCaller) {
