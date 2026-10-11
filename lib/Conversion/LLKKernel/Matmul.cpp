@@ -49,6 +49,18 @@ public:
         root, root->getOperand(0), root->getOperand(1), root->getResult(0),
         root->getAttr("accumulator_type"), c);
   }
+  bool hasLinalgLowering() const override { return true; }
+  LogicalResult lowerToLinalg(Operation *root,
+                              OpBuilder &builder) const override {
+    auto op = cast<llk::MatmulOp>(root);
+    Value result = linalg::MatmulOp::create(builder, op.getLoc(),
+                                            ValueRange{op.getA(), op.getB()},
+                                            ValueRange{op.getInit()})
+                       .getResult(0);
+    op.replaceAllUsesWith(result);
+    op.erase();
+    return success();
+  }
   bool hasMicroLowering() const override { return true; }
   LogicalResult
   describeMicroKernel(Operation *root, const llk::KernelContract &c,

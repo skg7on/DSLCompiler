@@ -612,3 +612,7 @@ if(LLK_BUILD_TOOLS)
       COMMAND llk-opt --shape-specialize --verify-diagnostics
       ${CMAKE_SOURCE_DIR}/test/Transforms/kernel_shape_specialization.mlir)
 endif()
+
+if(LLK_BUILD_TOOLS)
+  add_llk_filecheck_test(LLKMatmulToLinalg test/Conversion/matmul_to_linalg.mlir --llk-to-linalg)
+endif()
