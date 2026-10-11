@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToLinalg.h"
+#include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/LLKEnums.h"
 #include "LLK/Transforms/Common/MathApproximation.h"
@@ -57,7 +58,6 @@ struct LLKToLinalgPass
   }
 
   void runOnOperation() override;
-  void lowerSwiGLU(OpBuilder &builder, mlir::llk::FusedSwiGLUOp op);
   void lowerRoPE(OpBuilder &builder, mlir::llk::RoPEOp op);
   void lowerAttention(OpBuilder &builder, mlir::llk::AttentionOp op);
 };
@@ -65,95 +65,6 @@ struct LLKToLinalgPass
 //===----------------------------------------------------------------------===//
 // SwiGLU lowering: gate = X@Wg, up = X@Wu, SiLU(gate) * up
 //===----------------------------------------------------------------------===//
-
-void LLKToLinalgPass::lowerSwiGLU(OpBuilder &builder,
-                                  mlir::llk::FusedSwiGLUOp op) {
-  Location loc = op.getLoc();
-
-  Value x = op.getX();
-  Value wg = op.getWg();
-  Value wu = op.getWu();
-  Value init = op.getInit();
-
-  auto xType = mlir::cast<ShapedType>(x.getType());
-  auto wgType = mlir::cast<ShapedType>(wg.getType());
-  int64_t M = xType.getDimSize(0);
-  int64_t N = wgType.getDimSize(1);
-
-  if (ShapedType::isDynamic(M) || ShapedType::isDynamic(N)) {
-    op.emitError("SwiGLU requires static shapes");
-    signalPassFailure();
-    return;
-  }
-
-  llk::MathMode mode = op.getMathMode();
-
-  auto bf16Type = builder.getBF16Type();
-  auto f32Type = builder.getF32Type();
-  auto gateUpType = RankedTensorType::get({M, N}, bf16Type);
-
-  Value bf16Zero = arith::ConstantOp::create(
-      builder, loc, bf16Type, builder.getFloatAttr(bf16Type, 0.0));
-
-  // Gate projection: X @ Wg
-  Value gateInit =
-      tensor::EmptyOp::create(builder, loc, gateUpType, ValueRange{});
-  Value gateFilled = linalg::FillOp::create(builder, loc, ValueRange{bf16Zero},
-                                            ValueRange{gateInit})
-                         .getResult(0);
-  Value gateResult = linalg::MatmulOp::create(builder, loc, ValueRange{x, wg},
-                                              ValueRange{gateFilled})
-                         .getResult(0);
-
-  // Up projection: X @ Wu
-  Value upInit =
-      tensor::EmptyOp::create(builder, loc, gateUpType, ValueRange{});
-  Value upFilled = linalg::FillOp::create(builder, loc, ValueRange{bf16Zero},
-                                          ValueRange{upInit})
-                       .getResult(0);
-  Value upResult = linalg::MatmulOp::create(builder, loc, ValueRange{x, wu},
-                                            ValueRange{upFilled})
-                       .getResult(0);
-
-  // Elementwise: SiLU(gate) * up, f32 internals, truncate to bf16
-  AffineMap idMap = AffineMap::getMultiDimIdentityMap(2, &getContext());
-
-  Value siluResult =
-      linalg::GenericOp::create(
-          builder, loc,
-          /*resultTensorTypes=*/TypeRange{gateUpType},
-          /*inputs=*/ValueRange{gateResult, upResult},
-          /*outputs=*/ValueRange{init},
-          /*indexingMaps=*/ArrayRef<AffineMap>{idMap, idMap, idMap},
-          /*iteratorTypes=*/
-          ArrayRef<utils::IteratorType>{utils::IteratorType::parallel,
-                                        utils::IteratorType::parallel},
-          /*bodyBuilder=*/
-          [&](OpBuilder &b, Location l, ValueRange args) {
-            Value g = args[0]; // bf16
-            Value u = args[1]; // bf16
-
-            Value gF32 = arith::ExtFOp::create(b, l, f32Type, g);
-            Value uF32 = arith::ExtFOp::create(b, l, f32Type, u);
-
-            // SiLU(g) = g * sigmoid(g) = g / (1 + exp(-g))
-            Value neg = arith::NegFOp::create(b, l, gF32);
-            Value exp = llk::createApproxExp(b, l, neg, mode);
-            Value f32One = arith::ConstantOp::create(b, l, f32Type,
-                                                     b.getF32FloatAttr(1.0));
-            Value den = arith::AddFOp::create(b, l, f32One, exp);
-            Value invDen = arith::DivFOp::create(b, l, f32One, den);
-            Value silu = arith::MulFOp::create(b, l, gF32, invDen);
-            Value r = arith::MulFOp::create(b, l, silu, uF32);
-
-            Value trunc = arith::TruncFOp::create(b, l, bf16Type, r);
-            linalg::YieldOp::create(b, l, trunc);
-          })
-          .getResult(0);
-
-  op.replaceAllUsesWith(siluResult);
-  op.erase();
-}
 
 //===----------------------------------------------------------------------===//
 // RoPE lowering: cos/sin tables → even/odd split → rotate → interleave
@@ -633,7 +544,11 @@ void LLKToLinalgPass::runOnOperation() {
   // Lower each op kind.
   for (auto op : swigluOps) {
     builder.setInsertionPoint(op);
-    lowerSwiGLU(builder, op);
+    llk::LLKKernelRegistry registry;
+    llk::populateLLKKernelLowerings(registry);
+    if (failed(registry.lookup(op->getName().getStringRef())
+                   ->lowerToLinalg(op, builder)))
+      signalPassFailure();
   }
   for (auto op : ropeOps) {
     builder.setInsertionPoint(op);

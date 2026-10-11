@@ -353,6 +353,7 @@ mlir_target_link_libraries(LLKMapping PRIVATE MLIRIR MLIRAsmParser)
 add_mlir_library(LLKKernel
     lib/Conversion/LLKKernel/Registry.cpp
     lib/Conversion/LLKKernel/Contract.cpp
+    lib/Conversion/LLKKernel/SwiGLU.cpp
     DEPENDS LLKDialect MicroDialect LLKCommon
     LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon
 )
@@ -363,7 +364,7 @@ mlir_target_link_libraries(LLKKernel PUBLIC
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
     DEPENDS LLKDialect LLKCommon
-    LINK_LIBS PUBLIC LLKDialect LLKCommon
+    LINK_LIBS PUBLIC LLKDialect LLKCommon LLKKernel
 )
 mlir_target_link_libraries(LLKToLinalg PUBLIC
     MLIRLinalgDialect MLIRArithDialect MLIRMathDialect MLIRFuncDialect

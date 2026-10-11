@@ -32,3 +32,11 @@ TEST(LLKKernelRegistryTest, LookupOrderCapabilitiesAndStableOwnership) {
   EXPECT_EQ(registry.lookup("first"), first);
 }
 } // namespace
+
+TEST(LLKKernelRegistryTest, PopulatedSwiGLU) {
+  llk::LLKKernelRegistry registry;
+  llk::populateLLKKernelLowerings(registry);
+  auto *entry = registry.lookup("llk.fused_swiglu");
+  ASSERT_NE(entry, nullptr);
+  EXPECT_TRUE(entry->hasLinalgLowering());
+}
