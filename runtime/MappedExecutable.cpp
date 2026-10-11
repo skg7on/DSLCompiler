@@ -418,9 +418,23 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
   auto llvmContext = std::make_unique<llvm::LLVMContext>();
   std::unique_ptr<llvm::Module> llvmModule =
       mlir::translateModuleToLLVMIR(module, *llvmContext);
-  if (!llvmModule)
-    return abiError("translating kernel '" + prepared.entrySymbol +
-                    "' to LLVM IR failed");
+  if (!llvmModule) {
+    std::string unresolvedCasts;
+    llvm::raw_string_ostream castOutput(unresolvedCasts);
+    unsigned reportedCasts = 0;
+    module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+      if (reportedCasts++ >= 5)
+        return;
+      cast.print(castOutput);
+      castOutput << "\n";
+    });
+    castOutput.flush();
+    std::string message =
+        "translating kernel '" + prepared.entrySymbol + "' to LLVM IR failed";
+    if (!unresolvedCasts.empty())
+      message += "; remaining conversion casts: " + unresolvedCasts;
+    return abiError(message);
+  }
 
   if (options.evidenceSink) {
     std::string llvmIR;
