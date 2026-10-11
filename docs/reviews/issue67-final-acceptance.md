@@ -55,7 +55,7 @@ open.
 | **7. Search modes** | `MappingPropertiesTest`, `ExactResourceOracleTest`, `MappingSearchBindingTest` | Verified locally |
 | **8. Materialization** | Five public chains verify named placements/routes/transforms and frozen replay; portable numerical transform/tail tests pass | Partial: selected-target invocation still needs the x86 gate in §10 |
 | **9. Static performance parity** | Five public chains compare planner and `micro-perf` cycles and DRAM bytes and require no capacity violations | Verified locally |
-| **10. AVX2 and legacy execution** | Direct `MappedAcceptance` run: 8 passed, 2 AVX2 cases skipped; `SelectedTargetFlagContract` injects disabled AVX2 and proves required execution fails; `MappedAVX2Acceptance` failed on arm64; legacy `SwigluScalar` and `SwiGLUVector` skip on this host | **Open:** non-skipped selected-x86 and legacy CI evidence required |
+| **10. AVX2 and legacy execution** | Direct `MappedAcceptance` run: 8 passed, 2 AVX2 cases skipped; `SelectedTargetFlagContract` injects disabled AVX2 and proves required execution fails; `MappedAVX2Acceptance` failed on arm64. Verbose legacy results: `SwigluScalar` 4 passed / 2 skipped because ORC LLJIT is not configured; `SwiGLUVector` 1 passed / 1 skipped because JIT compilation is unavailable | **Open:** non-skipped selected-x86 evidence required; report LLVM22 CI legacy outcomes separately |
 | **11. Second target** | `MappingGenericAcceleratorTargetTest` and the public `second-target-two-hop` chain | Verified as a static mapping/performance model; no hardware execution is claimed |
 | **12. Determinism** | `MappingStableHashTest`, `MicroMappingBindPlanRoundtrip`, and fresh-process repeat comparisons in `MicroMappingAcceptancePipeline` | Verified locally |
 
