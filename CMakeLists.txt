@@ -347,11 +347,12 @@ mlir_target_link_libraries(LLKToLinalg PUBLIC
 # Library: LLK -> concrete micro.kernel export (M11)
 add_mlir_library(LLKToMicro
     lib/Conversion/LLKToMicro/LLKToMicro.cpp
-    DEPENDS LLKDialect MicroDialect LLKCommon
+    DEPENDS LLKDialect MicroDialect LLKCommon MLIRLinalgDialect
     LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon
 )
 mlir_target_link_libraries(LLKToMicro PUBLIC
-    MLIRArithDialect MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
+    MLIRArithDialect MLIRFuncDialect MLIRLinalgDialect MLIRTensorDialect
+    MLIRPass MLIRTransforms
 )
 
 # Library: micro -> Linalg bridge. `micro` was a sink: nothing lowered it to
@@ -493,6 +494,7 @@ add_library(LLKMicroMapping STATIC
     lib/Conversion/MicroMapping/MicroBindPlanPass.cpp
     lib/Conversion/MicroMapping/MicroVerifyMappingPass.cpp
     lib/Conversion/MicroMapping/SearchBindingLoader.cpp
+    lib/Conversion/MicroMapping/CandidateInstantiation.cpp
     lib/Conversion/MicroMapping/PlanMaterialization.cpp
     lib/Conversion/MicroMapping/CompletePlanEvaluation.cpp
 )
@@ -505,7 +507,7 @@ target_include_directories(LLKMicroMapping PUBLIC
 # needs LLKPerf. That direction is legal: LLKPerf already depends on LLKMapping,
 # and LLKMapping must never depend on LLKPerf, so the pass library -- above both
 # -- is the only layer that may link them together.
-target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine LLKPerf)
+target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine LLKPerf LLKToMicro)
 # LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
 # not inherit those. Match the toolchain, exactly as LLKMapping does.
 target_compile_options(LLKMicroMapping PRIVATE -fno-rtti -fno-exceptions)
@@ -904,6 +906,16 @@ add_llk_perf_test(LegalityTest test/Perf/legality.cpp)
 # becomes a concrete micro.kernel. The test builds the kernel and asserts both
 # the emitted IR and the decisions the schedule record persists.
 add_llk_perf_test(CandidateBindingTest test/Perf/candidate_binding.cpp)
+
+# Source-preserving candidate instantiation starts at a named LLK root and
+# requires the concrete exporter to select that exact root before emission.
+add_llvm_executable(CandidateInstantiationTest
+    test/Tuning/candidate_instantiation.cpp)
+target_link_libraries(CandidateInstantiationTest PRIVATE
+    LLKToMicro LLKMicroMapping LLKDialect MicroDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(CandidateInstantiationTest PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME CandidateInstantiationTest COMMAND CandidateInstantiationTest)
 
 # Tuning session and schedule YAML (issue #50): ranking order, the session loop,
 # and the persisted record. Uses the shipped machine model, so the model the

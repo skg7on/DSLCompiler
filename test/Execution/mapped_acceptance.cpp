@@ -182,9 +182,18 @@ compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
   llvm::Expected<MappingSearchResult> result = search.search();
   if (!result)
     return result.takeError();
-  if (result->plans.empty())
-    return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                   "the search found no complete plan");
+  if (result->plans.empty()) {
+    std::string detail =
+        "the search found no complete plan (nodesWithoutRules=" +
+        std::to_string(result->frontier.nodesWithoutRules) +
+        ", candidatesWithoutPlacement=" +
+        std::to_string(result->frontier.candidatesWithoutPlacement) +
+        ", incompatibleInstancePairs=" +
+        std::to_string(result->frontier.incompatibleInstancePairs) + ")";
+    for (const auto &diagnostic : result->frontier.diagnostics)
+      detail += "; " + diagnostic.message;
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), detail);
+  }
 
   llk::MappedCompileOptions compileOptions;
   compileOptions.entrySymbol = entrySymbol.str();
@@ -343,28 +352,33 @@ TEST(MappedAcceptance, InvokesTheCompilerGeneratedMatmulAndChecksEveryElement) {
   EXPECT_NE((*executable)->executionIdentity().find("lowered-ir-sha256="),
             llvm::StringRef::npos);
 
-  // The exported contract: the two operands and the output tile.
+  // The exported contract: both operands, the caller's initialized output,
+  // and the output tile.
   const llk::KernelAbi &abi = (*executable)->abi();
-  ASSERT_EQ(abi.inputs.size(), 2u);
+  ASSERT_EQ(abi.inputs.size(), 3u);
   ASSERT_EQ(abi.outputs.size(), 1u);
   EXPECT_EQ(abi.inputs[0].shape, (std::vector<int64_t>{16, 64}));
   EXPECT_EQ(abi.inputs[1].shape, (std::vector<int64_t>{64, 64}));
+  EXPECT_EQ(abi.inputs[2].shape, (std::vector<int64_t>{16, 64}));
   EXPECT_EQ(abi.outputs[0].shape, (std::vector<int64_t>{16, 64}));
 
   Buffer a(16, 64, 1.0f);
   Buffer b(64, 64, 1.0f);
+  Buffer init(16, 64, 7.0f);
   Buffer out(16, 64, -1.0f);
 
   llvm::Error error =
-      (*executable)->invoke({a.checked(), b.checked()}, {out.checked()});
+      (*executable)
+          ->invoke({a.checked(), b.checked(), init.checked()}, {out.checked()});
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
 
   // Every output is a full K=64 reduction of ones, so every one of the 1024
-  // elements is exactly 64 -- which is only true if the staged copies, the
+  // elements is exactly 71, including the nonzero output initializer, --
+  // which is only true if the staged copies, the
   // contraction, the accumulator that the K loop threads, the narrowing
   // epilogue and the write-back all happened, in that order.
   for (size_t i = 0; i < out.storage.size(); ++i)
-    EXPECT_EQ(fromBf16(out.storage[i]), 64.0f) << "element " << i;
+    EXPECT_EQ(fromBf16(out.storage[i]), 71.0f) << "element " << i;
 }
 
 TEST(MappedAcceptance, InvokesTheCompilerGeneratedSwiGLUAndChecksEveryElement) {
@@ -422,11 +436,13 @@ TEST(MappedAcceptance, LeavesTheCallersBuffersOwnedByTheCaller) {
 
   Buffer a(rows, columns, 1.0f);
   Buffer b(64, 64, 1.0f);
+  Buffer init(rows, columns, 0.0f);
 
   llk::InvocationBuffer2D checkedOut{out, llk::InvocationElementType::BF16,
                                      storage.size() * sizeof(uint16_t)};
   llvm::Error error =
-      (*executable)->invoke({a.checked(), b.checked()}, {checkedOut});
+      (*executable)
+          ->invoke({a.checked(), b.checked(), init.checked()}, {checkedOut});
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
 
   for (int64_t i = 0; i < rows * columns; ++i)
@@ -497,10 +513,12 @@ TEST(MappedAcceptance, SelectedAvx2BackendExecutesNumerically) {
   MemRef2D out{output.data(), output.data(), 0, rows, columns, columns, 1};
   Buffer a(rows, columns, 1.0f);
   Buffer b(64, 64, 1.0f);
+  Buffer init(rows, columns, 0.0f);
   llk::InvocationBuffer2D checkedOut{out, llk::InvocationElementType::BF16,
                                      output.size() * sizeof(uint16_t)};
   llvm::Error error =
-      (*executable)->invoke({a.checked(), b.checked()}, {checkedOut});
+      (*executable)
+          ->invoke({a.checked(), b.checked(), init.checked()}, {checkedOut});
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
   for (uint16_t value : output)
     EXPECT_EQ(fromBf16(value), 64.0f);

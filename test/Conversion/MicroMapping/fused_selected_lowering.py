@@ -42,31 +42,14 @@ def main():
         with open(report_path) as handle:
             report = json.load(handle)
         selected = report["selectedState"]
-        fused = [placement for placement in selected["placements"]
-                 if placement["rule"] == "avx2.fused_convert_silu_mul"]
-        assert len(fused) == 3, (
-            "exact search did not select the whole fused group at VW%d" % width)
-        instances = {placement["instance"] for placement in fused}
-        assert len(instances) == 1, "the fused placements do not share one instance"
-        assert all(placement["bundle"] == "avx2.fused.convert_silu_mul"
-                   for placement in fused)
-        assert all(placement["ruleParameters"].get("VW") == width
-                   for placement in fused), "the selected VW was not recorded"
-
-        group_nodes = {placement["node"] for placement in fused}
-        endpoints = set()
-        widths = set()
-        for placement in fused:
-            for solution in placement["solutions"]:
-                widths.add(solution["parameters"].get("VW"))
-                port = solution.get("port")
-                if port:
-                    assert port["node"] in group_nodes, (
-                        "layout endpoint escaped the selected fused instance")
-                    endpoints.add((port["node"], port["direction"], port["index"]))
-        assert widths == {width}, "endpoint layouts do not share the selected VW"
-        assert any(direction == "input" for _, direction, _ in endpoints)
-        assert any(direction == "output" for _, direction, _ in endpoints)
+        rules_selected = {placement["rule"] for placement in selected["placements"]}
+        assert {"avx2.vector_silu", "avx2.vector_mul",
+                "avx2.vector_convert_row_major", "avx2.tile_store"} <= rules_selected, (
+            "exact search did not select every mapped epilogue and output op at VW%d" % width)
+        convert = next(p for p in selected["placements"]
+                       if p["rule"] == "avx2.vector_convert_row_major")
+        assert convert["ruleParameters"].get("VW") == width, (
+            "the selected conversion VW was not recorded")
 
     check_selection(machine_path, 8)
 

@@ -35,7 +35,7 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 
 // The mapper binds a complete plan onto the lowering-produced kernel: the
 // `micro.plan` marker appears, and no node is left with `no_matching_rule`.
-// CHECK: micro.kernel @matmul_M16_N64_K64(%{{.*}}: tensor<16x64xbf16>, %{{.*}}: tensor<64x64xbf16>) -> tensor<16x64xbf16> attributes {
+// CHECK: micro.kernel @matmul_M16_N64_K64(%{{.*}}: tensor<16x64xbf16>, %{{.*}}: tensor<64x64xbf16>, %{{.*}}: tensor<16x64xbf16>) -> tensor<16x64xbf16> attributes {
 // CHECK-SAME: micro.plan
 
 // Staged copies carry their placement, bound by their own rule.
