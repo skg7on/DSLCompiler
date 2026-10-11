@@ -325,6 +325,21 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attribute("rule", placement.rule);
             json.attribute("bundle", placement.bundle.name);
             json.attribute("emitter", placement.bundle.emitterKey);
+            if (placement.bundle.parameters)
+              json.attributeObject("bundleParameters", [&] {
+                std::vector<std::string> names;
+                for (mlir::NamedAttribute parameter :
+                     placement.bundle.parameters)
+                  names.push_back(parameter.getName().str());
+                llvm::sort(names);
+                for (const std::string &name : names) {
+                  mlir::Attribute value = placement.bundle.parameters.get(name);
+                  if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(value))
+                    json.attribute(name, integer.getInt());
+                  else if (auto text = mlir::dyn_cast<mlir::StringAttr>(value))
+                    json.attribute(name, text.getValue());
+                }
+              });
             json.attribute("executor", placement.executor);
             // The concrete compute node each requirement selected (issue #129,
             // task R1), sorted by requirement kind so the report stays
@@ -822,6 +837,30 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         placement.bundle.name = bundle->str();
       if (std::optional<llvm::StringRef> emitter = object->getString("emitter"))
         placement.bundle.emitterKey = emitter->str();
+      if (const llvm::json::Object *parameters =
+              object->getObject("bundleParameters")) {
+        mlir::MLIRContext *context = workloadNode->attributes.getContext();
+        if (!context)
+          return reportError("plan report bundle parameters need a "
+                             "context-bound source graph");
+        llvm::SmallVector<mlir::NamedAttribute> attributes;
+        for (const auto &parameter : *parameters) {
+          mlir::Attribute value;
+          if (std::optional<int64_t> integer = parameter.second.getAsInteger())
+            value = mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
+                                           *integer);
+          else if (std::optional<llvm::StringRef> text =
+                       parameter.second.getAsString())
+            value = mlir::StringAttr::get(context, *text);
+          else
+            return reportError("plan report bundle parameter is neither an "
+                               "integer nor a string");
+          attributes.emplace_back(
+              mlir::StringAttr::get(context, parameter.first.str()), value);
+        }
+        placement.bundle.parameters =
+            mlir::DictionaryAttr::get(context, attributes);
+      }
       if (std::optional<llvm::StringRef> executor =
               object->getString("executor"))
         placement.executor = executor->str();
@@ -932,6 +971,42 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
             return reportError("plan report rule parameter is neither an "
                                "integer nor a string");
         }
+      // Reports written before bundleParameters was made explicit still carry
+      // the rule's resolved assignments. Reconstruct the opaque bundle values
+      // from that same rule contract so old v3 reports replay their exact
+      // emitter arguments instead of silently dropping them.
+      if (!placement.bundle.parameters) {
+        const RuleDef *rule = target.rules().find(placement.rule);
+        if (rule && !rule->bundleParameters.empty()) {
+          mlir::MLIRContext *context = workloadNode->attributes.getContext();
+          if (!context)
+            return reportError("plan report bundle parameters need a "
+                               "context-bound source graph");
+          llvm::SmallVector<mlir::NamedAttribute> attributes;
+          for (const auto &parameter : rule->bundleParameters) {
+            mlir::Attribute value;
+            if (const int64_t *integer =
+                    std::get_if<int64_t>(&parameter.second)) {
+              value = mlir::IntegerAttr::get(
+                  mlir::IntegerType::get(context, 64), *integer);
+            } else {
+              const std::string &name = std::get<std::string>(parameter.second);
+              auto resolved = placement.resolvedParameters.find(name);
+              if (resolved != placement.resolvedParameters.end() &&
+                  std::holds_alternative<int64_t>(resolved->second))
+                value =
+                    mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
+                                           std::get<int64_t>(resolved->second));
+              else
+                value = mlir::StringAttr::get(context, name);
+            }
+            attributes.emplace_back(
+                mlir::StringAttr::get(context, parameter.first), value);
+          }
+          placement.bundle.parameters =
+              mlir::DictionaryAttr::get(context, attributes);
+        }
+      }
       plan.placements.push_back(std::move(placement));
     }
   }

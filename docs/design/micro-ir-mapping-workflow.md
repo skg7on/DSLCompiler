@@ -78,6 +78,44 @@ is *rejected with a reason*, not a crash: the search space may legitimately offe
 alternatives this pipeline does not implement, and the tuner reports them and
 moves on.
 
+For target-aware tuning, give `llk-tune` the exported module that contains both
+the original semantic function and its `micro.search_space`. Select the source
+symbol explicitly, then request plan and candidate artifacts:
+
+```bash
+llk-tune --input matmul.search.mlir --machine machines/x86-avx2-v2.yaml \
+  --M 8 --N 16 --K 32 --mapping-target x86-avx2 --mapping-root . \
+  --mapping-mode exact --mapping-backend reference \
+  --candidate-source semantic --source-symbol matmul \
+  --mapping-report tune.json --candidate-artifacts tune-candidates \
+  --output tune.yaml
+```
+
+The JSON report carries the complete candidate bindings, selected plan report,
+static metrics and truncation status. Each candidate directory contains the
+instantiated source and frozen plan. Replay that plan against its exact source
+artifact and the same machine profile:
+
+```bash
+llk-compile --mapping-target x86-avx2 --mapping-root . \
+  --machine machines/x86-avx2-v2.yaml --mapping-backend reference \
+  --mapping-stop lowered \
+  --plan-report tune-candidates/candidate_.../plan.json \
+  tune-candidates/candidate_.../source.mlir --emit mlir
+```
+
+Optional runtime measurement uses a version-1 JSON fixture with ordered input
+and output ports. Each port declares `dtype`, rank-two `shape`, and `data`; data
+can be a scalar to fill the tensor or an element array. Output ports can also
+declare absolute and relative tolerances. Set `--measure-top N` together with
+`--measurement-inputs fixture.json`. The tuner validates these ports against
+the compiled `KernelAbi`, performs the declared warmups and timed repeats,
+checks output values, and records the median runtime separately from the static
+report. The sidecar is written beside `--mapping-report` as
+`<report>.measurements.json` (or beside the schedule output when there is no
+mapping report). A measured run therefore leaves the static JSON report
+byte-identical to a static-only run with the same inputs.
+
 ## Describing your machine
 
 Machine models are YAML (`machines/*.yaml`) and are loaded into a typed topology:

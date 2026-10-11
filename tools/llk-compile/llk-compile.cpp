@@ -120,6 +120,12 @@ static cl::opt<std::string> mappingRoot(
              "and its layout and rule files from"),
     cl::init("."));
 
+static cl::opt<std::string> mappingMachine(
+    "machine",
+    cl::desc(
+        "Machine profile override shared by mapping search and compilation"),
+    cl::init(""));
+
 static cl::opt<std::string>
     mappingMode("mapping-mode",
                 cl::desc("Search mode: deterministic, beam, or exact"),
@@ -369,8 +375,8 @@ static int runMappedCompilation(mlir::ModuleOp module,
   }
 
   llvm::Expected<std::unique_ptr<mlir::llk::mapping::MappingTarget>> target =
-      mlir::llk::mapping::createRegisteredMappingTarget(mappingTargetName,
-                                                        mappingRoot);
+      mlir::llk::mapping::createRegisteredMappingTarget(
+          mappingTargetName, mappingRoot, mappingMachine);
   if (!target) {
     llvm::errs() << llvm::toString(target.takeError()) << "\n";
     return 1;

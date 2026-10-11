@@ -219,6 +219,17 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
 
   CandidateInstance instance;
   instance.module = OwningOpRef<ModuleOp>(cast<ModuleOp>(source->clone()));
+  // The search-space op is input metadata for this instantiation, not part of
+  // the executable candidate. Keep it in the caller's source module but drop
+  // it from the private clone so the compiler never sees an unlowered tuning
+  // directive when materializing or replaying the selected kernel.
+  SmallVector<Operation *> searchSpaces;
+  instance.module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.search_space")
+      searchSpaces.push_back(op);
+  });
+  for (Operation *op : searchSpaces)
+    op->erase();
   instance.sourceMode = options.sourceMode;
   mapping::SearchBinding binding =
       mapping::makeSearchBinding(candidate.id, [&] {

@@ -49,7 +49,8 @@ void buildAVX2SelectedBackendPipeline(mlir::OpPassManager &pm,
 /// returned, and its emitters are the AVX2 plugin's own rather than the
 /// configuration-only default.
 llvm::Expected<std::unique_ptr<mapping::MappingTarget>>
-createMappingTarget(llvm::StringRef configurationRoot);
+createMappingTarget(llvm::StringRef configurationRoot,
+                    llvm::StringRef machinePath = {});
 
 } // namespace mlir::llk::target::avx2
 

@@ -753,7 +753,9 @@ target_link_libraries(llk-bench PRIVATE LLKRuntime)
 # Tool: llk-tune (autotuning: Micro search space, or the legacy grid)
 add_llvm_executable(llk-tune tools/llk-tune/llk-tune.cpp)
 target_link_libraries(llk-tune PRIVATE
-    LLKPerf MicroDialect LLKDialect LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+    LLKPerf LLKMappedTuning LLKTargetMapping LLKMappedCompilation LLKMapping
+    LLKMicroMapping LLKToMicro MicroDialect LLKDialect LLKRuntime
+    ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: micro-perf (Micro-IR performance simulator, M10)
 add_llvm_executable(micro-perf tools/micro-perf/micro-perf.cpp)
@@ -1680,6 +1682,10 @@ if(LLK_BUILD_TOOLS)
   # schedule YAML comes out. The fixture's YAML checks describe that output.
   add_test(NAME LLKTuneSearchSpace
       COMMAND sh -c "$<TARGET_FILE:llk-tune> --input=${CMAKE_SOURCE_DIR}/test/Perf/llk_tune_search_space.mlir --machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml --M=8 --N=64 --K=64 --top-k=2 --output=${CMAKE_CURRENT_BINARY_DIR}/llk_tune_out.yaml && ${FILECHECK_BIN} --check-prefix=YAML ${CMAKE_SOURCE_DIR}/test/Perf/llk_tune_search_space.mlir < ${CMAKE_CURRENT_BINARY_DIR}/llk_tune_out.yaml"
+  )
+  add_test(NAME MappedTuneCLI
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Tuning/mapped_tune_cli.py
+        $<TARGET_FILE:llk-tune> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
   )
   # Compatibility: with no --input the driver keeps the pre-Micro grid search
   # and writes the JSON schedule_db entry the existing pipeline consumes.

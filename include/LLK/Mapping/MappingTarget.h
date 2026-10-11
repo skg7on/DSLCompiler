@@ -224,7 +224,7 @@ llvm::Error verifyMappingTarget(const MappingTarget &target);
 /// generic loader gets emitters that can verify a bundle and not lower it, so a
 /// pipeline that wants selected-bundle execution has to ask the package.
 using MappingTargetFactory = llvm::Expected<std::unique_ptr<MappingTarget>> (*)(
-    llvm::StringRef configurationRoot);
+    llvm::StringRef configurationRoot, llvm::StringRef machinePath);
 
 /// Registers `factory` under `name`, so generic code can reach a target without
 /// naming it.
@@ -249,7 +249,8 @@ bool isRegisteredMappingTarget(llvm::StringRef name);
 /// backend, which is what a silent default would amount to.
 llvm::Expected<std::unique_ptr<MappingTarget>>
 createRegisteredMappingTarget(llvm::StringRef name,
-                              llvm::StringRef configurationRoot);
+                              llvm::StringRef configurationRoot,
+                              llvm::StringRef machinePath = {});
 
 } // namespace mlir::llk::mapping
 

@@ -90,15 +90,18 @@ llvm::ArrayRef<llvm::StringLiteral> emitterKeys() {
 }
 
 llvm::Expected<std::unique_ptr<mapping::MappingTarget>>
-createMappingTarget(llvm::StringRef configurationRoot) {
+createMappingTarget(llvm::StringRef configurationRoot,
+                    llvm::StringRef machinePath) {
   std::string root = configurationRoot.str();
+  std::string machine = machinePath.empty()
+                            ? root + "/machines/x86-avx2-v2.yaml"
+                            : machinePath.str();
   std::vector<std::string> keys;
   for (llvm::StringLiteral key : emitterKeys())
     keys.push_back(key.str());
   llvm::Expected<std::unique_ptr<mapping::MappingTarget>> configuration =
       mapping::loadMappingTarget(
-          "x86-avx2", root + "/machines/x86-avx2-v2.yaml",
-          root + "/mapping/x86-avx2/layouts.llkmap",
+          "x86-avx2", machine, root + "/mapping/x86-avx2/layouts.llkmap",
           root + "/mapping/x86-avx2/rules.llkmap", std::move(keys));
   if (!configuration)
     return configuration.takeError();
