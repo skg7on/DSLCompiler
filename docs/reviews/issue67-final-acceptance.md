@@ -28,18 +28,49 @@ checks. No CI run on this branch head is recorded. T9's current workflow smoke
 and DocReferences both pass locally; the full closure matrix remains
 incomplete.
 
+### Candidate branch matrix (local evidence; not final acceptance)
+
+This snapshot is for source commit `d48a46d` on the isolated
+`feat/issue129-gap-closure` worktree. The local host is Darwin arm64, with
+Homebrew clang 20.1.8 and LLVM/MLIR 24.0.0git. Its JUnit report is
+`build/ctest-results-current.xml`; generated selected-width IR is under
+`build/SelectedVectorWidth/`. The full local run registered 161 tests: 157
+passed, three skipped, and the required `MappedAVX2Acceptance` failed because
+the target requires x86_64. The evidence parser rejected that report. This
+table records the local candidate evidence and leaves the x86 release gate
+open.
+
+| §29 | Candidate evidence | Local result |
+|---|---|---|
+| **1. Search round trip** | `CandidateInstantiationTest`, `SearchBindingLoaderTest`, and all five `MicroMappingAcceptancePipeline` chains (parse/print, full bindings, frozen replay) | Verified locally |
+| **2. Machine topology** | `MachineModelV2LoaderTest`, `L0StaticBoundTest`, `L1ResourceDAGTest`, `ExactResourceOracleTest` | Verified locally |
+| **3. Routing** | `MappingRoutingTest`, `RouteIdentityTest`, `MappingConnectionsTest`; second-target chain checks SRAM→L2→DRAM and its 256-byte L2 allocation | Verified locally |
+| **4. Declarative layout** | `MappingLayoutTest`, `SelectedVectorWidth` (width-4, width-8 and fused IR artifacts), portable numeric width-4 and transform/no-transform controls in `MappedAcceptance` | Verified locally; selected numeric execution is tracked under §10 |
+| **5. Rules and fused groups** | `MappingRulesTest`, `SelectedGroupLoweringTest`, `FusedSelectedLowering`, fused-SwiGLU public chain | Verified locally |
+| **6. Complete coverings** | `MappingCoveringSearchTest`, `CompletePlanEvaluationTest`, `ExactResourceOracleTest`, over-capacity rejection in `L0StaticBoundTest` | Verified locally |
+| **7. Search modes** | `MappingPropertiesTest`, `ExactResourceOracleTest`, `MappingSearchBindingTest` | Verified locally |
+| **8. Materialization** | Five public chains verify named placements/routes/transforms and frozen replay; portable numerical transform/tail tests pass | Partial: selected-target invocation still needs the x86 gate in §10 |
+| **9. Static performance parity** | Five public chains compare planner and `micro-perf` cycles and DRAM bytes and require no capacity violations | Verified locally |
+| **10. AVX2 and legacy execution** | Direct `MappedAcceptance` run: 8 passed, 2 AVX2 cases skipped; `MappedAVX2Acceptance` is required and failed on arm64; legacy `SwigluScalar` and `SwiGLUVector` skip on this host | **Open:** non-skipped selected-x86 and legacy CI evidence required |
+| **11. Second target** | `MappingGenericAcceleratorTargetTest` and the public `second-target-two-hop` chain | Verified as a static mapping/performance model; no hardware execution is claimed |
+| **12. Determinism** | `MappingStableHashTest`, `MicroMappingBindPlanRoundtrip`, and fresh-process repeat comparisons in `MicroMappingAcceptancePipeline` | Verified locally |
+
+The matrix's local passes do not replace the pinned LLVM 22 x86 run. The
+selected-AVX2 job must pass on the exact release head before §10, T8, or the
+overall acceptance gate can close.
+
 On the pre-T7-commit working tree based on `4b7a19a`, the full CTest run
 registered 159 tests: 155 passed, one required selected-AVX2 test failed on
 arm64, and three platform tests were skipped. The evidence parser rejected
 that JUnit report with `MappedAVX2Acceptance=failed`, as required; this
 confirms the host gate and is not selected-x86 evidence.
 
-On the current working tree based on `abfcb3b`, the full build succeeds and
-CTest registers 160 tests: 156 pass, one required selected-AVX2 test fails on
-arm64, and three tests are skipped (`SwigluScalar`, `SwiGLUVector`, and
-portable `MappedAcceptance`). The evidence parser rejects the current JUnit
-report with `MappedAVX2Acceptance=failed`, as required; this confirms the host
-gate and is not selected-x86 evidence.
+On the current working tree at `d48a46d`, the full build succeeds and CTest
+registers 161 tests: 157 pass, one required selected-AVX2 test fails on arm64,
+and three tests are skipped (`SwigluScalar`, `SwiGLUVector`, and portable
+`MappedAcceptance`). The evidence parser rejects the current JUnit report with
+`MappedAVX2Acceptance=failed`, as required; this confirms the host gate and is
+not selected-x86 evidence.
 
 Therefore issue #67 and the mandatory #129 release gate remain open. In
 particular, selected AVX2 invocation has not passed on the candidate release

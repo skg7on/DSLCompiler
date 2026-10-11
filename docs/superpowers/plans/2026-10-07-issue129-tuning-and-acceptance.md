@@ -390,7 +390,7 @@ for command in manifest["commands"]:
 `manifest_outputs` is a local manifest lookup function implemented here; commands are JSON argv arrays, never eval/shell text. The docs reference the same fixtures/options, and a drift check compares those exact examples to the manifest.
 
 - [x] **Step 2: Run DocReferences and WorkflowSmoke.** Correct the claimed scope of each check and replace stale examples/options. Preserve runnable relative CLI commands in docs; the evidence table identifies the actual isolated checkout and revision separately. At the current candidate tree, `DocReferences`, `WorkflowSmoke`, and `WorkflowSmokeNegativeControls` pass.
-- [ ] **Step 3: Write the criterion matrix using exact artifacts:**
+- [x] **Step 3: Write the criterion matrix using exact artifacts:** Candidate evidence and local status for all twelve criteria are recorded in `docs/reviews/issue67-final-acceptance.md` at `d48a46d`. The matrix explicitly leaves selected-x86 invocation open; final release artifacts still depend on T8.
 
 | Design §29 | Required repaired evidence |
 |---|---|
