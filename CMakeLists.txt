@@ -356,6 +356,8 @@ add_mlir_library(LLKKernel
     lib/Conversion/LLKKernel/SwiGLU.cpp
     lib/Conversion/LLKKernel/RoPE.cpp
     lib/Conversion/LLKKernel/Attention.cpp
+    lib/Conversion/LLKKernel/Matmul.cpp
+    lib/Conversion/LLKKernel/LinalgMatmul.cpp
     DEPENDS LLKDialect MicroDialect LLKCommon
     LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon
 )
@@ -376,8 +378,9 @@ mlir_target_link_libraries(LLKToLinalg PUBLIC
 # Library: LLK -> concrete micro.kernel export (M11)
 add_mlir_library(LLKToMicro
     lib/Conversion/LLKToMicro/LLKToMicro.cpp
+    lib/Conversion/LLKToMicro/MicroKernelDriver.cpp
     DEPENDS LLKDialect MicroDialect LLKCommon MLIRLinalgDialect
-    LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon
+    LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon LLKKernel
 )
 mlir_target_link_libraries(LLKToMicro PUBLIC
     MLIRArithDialect MLIRFuncDialect MLIRLinalgDialect MLIRTensorDialect

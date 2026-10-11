@@ -28,6 +28,16 @@
 using namespace mlir;
 
 #include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"
+#include "LLK/Dialect/Micro/MicroDialect.h"
+#include "LLK/Dialect/Micro/MicroEnums.h"
+#include "mlir/IR/BuiltinTypes.h"
+#define GET_ATTRDEF_CLASSES
+#include "LLK/Dialect/Micro/MicroAttributes.h.inc"
+#define GET_TYPEDEF_CLASSES
+#include "LLK/Dialect/Micro/MicroTypes.h.inc"
+#define GET_OP_CLASSES
+#include "LLK/Dialect/Micro/MicroOps.h.inc"
+
 namespace {
 LogicalResult lowerSwiGLU(OpBuilder &builder, mlir::llk::FusedSwiGLUOp op) {
   Location loc = op.getLoc();
@@ -127,6 +137,43 @@ public:
     return llk::inferContractionContract(root, op.getX(), op.getWg(),
                                          op.getResult(),
                                          op.getAccumulatorType(), c);
+  }
+  bool hasMicroLowering() const override { return true; }
+  LogicalResult
+  describeMicroKernel(Operation *root, const llk::KernelContract &contract,
+                      llk::MicroKernelFragment &f) const override {
+    auto op = cast<llk::FusedSwiGLUOp>(root);
+    auto validated = contract;
+    if (failed(llk::validateMicroContraction(
+            root, op.getX(), op.getWg(), op.getResult(),
+            op.getAccumulatorType(), validated)))
+      return failure();
+    if (failed(llk::checkMicroTensor(root, op.getWu(), "up-projection weight")))
+      return failure();
+    auto wu = cast<ShapedType>(op.getWu().getType());
+    if (wu.getDimSize(0) != contract.K || wu.getDimSize(1) != contract.N)
+      return root->emitError()
+             << "the up-projection weight must be shaped [K, N] = ["
+             << contract.K << ", " << contract.N << "]";
+    if (wu.getElementType() != contract.inputElemType)
+      return root->emitError("the concrete Micro-IR exporter requires matching "
+                             "input and up-projection weight element types");
+    if (op.getActivation() != llk::Activation::silu)
+      return root->emitError(
+          "unsupported SwiGLU activation; the Micro-IR export emits silu only");
+    f.armCount = 2;
+    f.hasOutputInit = false;
+    f.rhsOperandTypes = {op.getWg().getType(), op.getWu().getType()};
+    auto mode = op.getMathMode();
+    f.buildEpilogue = [mode](OpBuilder &b, Location loc,
+                             ArrayRef<Value> acc) -> Value {
+      Value gate = micro::VectorOp::create(
+          b, loc, acc[0].getType(), "silu", ValueRange{acc[0]},
+          b.getStringAttr(llk::stringifyMathMode(mode)));
+      return micro::VectorOp::create(b, loc, acc[0].getType(), "mul",
+                                     ValueRange{gate, acc[1]}, StringAttr());
+    };
+    return success();
   }
   bool hasLinalgLowering() const override { return true; }
   LogicalResult lowerToLinalg(Operation *root, OpBuilder &b) const override {

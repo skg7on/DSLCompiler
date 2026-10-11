@@ -51,3 +51,13 @@ TEST(LLKKernelRegistryTest, PopulatedLinalgOnlyKernels) {
     EXPECT_FALSE(entry->hasMicroLowering());
   }
 }
+TEST(LLKKernelRegistryTest, MicroCapabilitiesAndCompatibility) {
+  llk::LLKKernelRegistry r;
+  llk::populateLLKKernelLowerings(r);
+  for (auto name : {"llk.fused_swiglu", "llk.matmul", "linalg.matmul"}) {
+    auto *entry = r.lookup(name);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_TRUE(entry->hasMicroLowering());
+  }
+  EXPECT_FALSE(r.lookup("linalg.matmul")->hasLinalgLowering());
+}

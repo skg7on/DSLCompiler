@@ -1,0 +1,50 @@
+#ifndef LLK_MICROKERNELDRIVER_H
+#define LLK_MICROKERNELDRIVER_H
+#include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"
+#include "LLK/Dialect/Micro/MicroEnums.h"
+#include "LLK/Transforms/Common/ScheduleLoader.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
+namespace mlir::llk::kernel_driver {
+struct TilePlan {
+  // Problem shape and element types.
+  int64_t M = 0, N = 0, K = 0;
+  int64_t paddedM = 0, paddedN = 0, paddedK = 0;
+  std::string tailPolicy{"none"};
+  Type inputElemType, accumulatorElemType, outputElemType;
+
+  // Tiling.
+  int64_t BM = 0, BN = 0, BK = 0;
+  /// Instruction fragment, clamped to a divisor of the tile on each axis.
+  int64_t fM = 0, fN = 0, fK = 0;
+  /// The fragment triple as the schedule stated it, before clamping.
+  SmallVector<int64_t, 3> declaredFragment;
+
+  int64_t stages = 1;
+  int64_t vectorWidth = 0;
+  micro::LayoutKind layoutKind = micro::LayoutKind::row_major;
+  // Owner and spatial-axis spellings are target vocabulary, carried verbatim
+  // from the schedule and recorded in the IR as *symbols*. The export does not
+  // resolve them to a concrete class -- it has no target loaded -- so it
+  // neither normalizes nor rejects a spelling here; the owning target's machine
+  // model resolves it before execution. The defaults are the legacy schedule
+  // spellings the built-in conservative entry uses, preserved so an export
+  // without an explicit owner_mapping has the same owner path it always had.
+  std::string outerOwner = "worker";
+  std::string innerOwner = "lane";
+  std::string fragmentOwner = "vector_engine";
+  micro::MemorySpace srcSpace = micro::MemorySpace::dram;
+  micro::MemorySpace stagingSpace = micro::MemorySpace::sram;
+  micro::MemorySpace accumulatorSpace = micro::MemorySpace::acc;
+};
+LogicalResult resolvePlan(Operation *, const ScheduleEntry &, int64_t, int64_t,
+                          int64_t, TilePlan &);
+ScheduleEntry selectSchedule(Operation *, const KernelContract &, StringRef);
+LogicalResult buildKernel(ModuleOp, Operation *, const TilePlan &,
+                          const ScheduleEntry &, StringRef, int64_t,
+                          SymbolTable &, const KernelContract &,
+                          const MicroKernelFragment &);
+LogicalResult buildSearchSpace(ModuleOp, Operation *, const KernelContract &,
+                               const ScheduleEntry &);
+} // namespace mlir::llk::kernel_driver
+#endif
