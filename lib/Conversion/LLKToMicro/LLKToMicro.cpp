@@ -467,6 +467,10 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
       StringAttr::get(ctx, workload), StringAttr::get(ctx, target),
       /*candidate=*/StringAttr(),
       IntegerAttr::get(IntegerType::get(ctx, 64), mBucket));
+  SmallVector<Attribute> inputMemories(inputTypes.size(),
+                                       StringAttr::get(ctx, "dram"));
+  kernel->setAttr("source_argument_memories",
+                  ArrayAttr::get(ctx, inputMemories));
 
   // Schedule intent that the concrete ops cannot carry themselves. The tile
   // types and op attributes already hold shape, dtype, layout, memory space,

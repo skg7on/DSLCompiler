@@ -554,6 +554,28 @@ mlir_target_link_libraries(LLKMappedCompilation PUBLIC
     MLIRBufferizationTransforms MLIRLinalgTransforms MLIRPass MLIRIR
 )
 
+# Target-aware tuning sits above both mapping and mapped compilation: each
+# candidate is searched, physically evaluated, and passed through the shared
+# lowering path before it can be ranked as executable.
+add_library(LLKMappedTuning STATIC
+    lib/Conversion/MicroMapping/MappedTuningSession.cpp
+)
+target_include_directories(LLKMappedTuning PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+    PRIVATE ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+)
+target_link_libraries(LLKMappedTuning PUBLIC LLKMicroMapping LLKMappedCompilation)
+target_compile_options(LLKMappedTuning PRIVATE -fno-rtti -fno-exceptions)
+
+add_llvm_executable(MappedTuningSessionTest
+    test/Tuning/mapped_tuning_session.cpp)
+target_link_libraries(MappedTuningSessionTest PRIVATE
+    LLKMappedTuning GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(MappedTuningSessionTest PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME MappedTuningSessionTest COMMAND MappedTuningSessionTest)
+
 add_mlir_library(LLKCommon
     lib/Transforms/Common/TilingUtils.cpp
     lib/Transforms/Common/VectorizationUtils.cpp

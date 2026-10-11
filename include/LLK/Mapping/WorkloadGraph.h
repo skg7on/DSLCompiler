@@ -68,6 +68,11 @@ struct WorkloadValue {
   /// occurrence reads) and for every non-carried value. Derived, so likewise
   /// outside the identity.
   std::optional<WorkloadValueId> carriedFrom = std::nullopt;
+  /// The target-independent memory kind an external kernel argument resides
+  /// in. The LLK-to-Micro ABI currently guarantees tensor inputs are DRAM
+  /// backed; retaining that fact lets strict physical planning account for
+  /// staged copies without guessing from a tile produced by `tile_view`.
+  std::optional<std::string> memoryKind = std::nullopt;
 };
 
 /// A value as seen from one node. `accessMap` is the affine relationship

@@ -476,6 +476,8 @@ std::string WorkloadGraph::canonicalString() const {
     out += std::to_string(value.id);
     out += value.external ? " external " : " internal ";
     out += typeString(value.type);
+    if (value.memoryKind)
+      out += " memory=" + *value.memoryKind;
     out += " name=";
     out += value.name;
     out += '\n';
@@ -522,6 +524,22 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
   llvm::SmallVector<std::pair<WorkloadValueId, Value>, 8> carriedResults;
   unsigned ordinal = 0;
 
+  auto boundaryMemory = [&](Value value) -> std::optional<std::string> {
+    auto argument = dyn_cast<BlockArgument>(value);
+    if (!argument || kernel->getNumRegions() == 0 ||
+        kernel->getRegion(0).empty() ||
+        argument.getOwner() != &kernel->getRegion(0).front())
+      return std::nullopt;
+    auto memories =
+        kernel->getAttrOfType<ArrayAttr>("source_argument_memories");
+    if (!memories || argument.getArgNumber() >= memories.size())
+      return std::nullopt;
+    auto memory = dyn_cast<StringAttr>(memories[argument.getArgNumber()]);
+    if (!memory)
+      return std::nullopt;
+    return memory.getValue().str();
+  };
+
   std::function<WorkloadValueId(Value)> resolve =
       [&](Value value) -> WorkloadValueId {
     auto it = valueIds.find(value);
@@ -544,6 +562,7 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
       WorkloadValueId carriedFrom = resolve(*source);
       WorkloadValue record{0, value.getType(), nameFor(value),
                            /*external=*/true};
+      record.memoryKind = boundaryMemory(value);
       record.loopCarried = true;
       record.carriedFrom = carriedFrom;
       WorkloadValueId id = graph.addValue(std::move(record));
@@ -552,8 +571,10 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
       return id;
     }
 
-    WorkloadValueId id = graph.addValue(
-        WorkloadValue{0, value.getType(), nameFor(value), /*external=*/true});
+    WorkloadValue record{0, value.getType(), nameFor(value),
+                         /*external=*/true};
+    record.memoryKind = boundaryMemory(value);
+    WorkloadValueId id = graph.addValue(std::move(record));
     valueIds[value] = id;
     pendingValues[id] = value;
     return id;
@@ -586,7 +607,10 @@ extractWorkloadGraph(Operation *kernel, WorkloadGraphBinding *binding) {
       ordinalOps[ordinal] = op;
       ++ordinal;
       for (Value operand : op->getOperands()) {
-        if (isAsyncToken(operand.getType()))
+        // Induction coordinates select a tile/window; they are control values,
+        // not data operands to route or reserve in a physical memory.
+        if (isAsyncToken(operand.getType()) ||
+            isa<IndexType>(operand.getType()))
           continue;
         // A logical view chains this operand to the value it really reads;
         // record the index relationship when the chain states one, so §10.2

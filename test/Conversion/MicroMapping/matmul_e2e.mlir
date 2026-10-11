@@ -49,7 +49,7 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // The narrowing epilogue -- `micro.vector "convert"` -- is the op that had no
 // rule before this task.
 // CHECK: micro.vector "convert"
-// CHECK-SAME: rule = "avx2.vector_convert"
+// CHECK-SAME: rule = "avx2.vector_convert_row_major"
 
 // The write back carries a placement too.
 // CHECK: micro.tile_store

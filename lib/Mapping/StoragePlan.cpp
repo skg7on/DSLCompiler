@@ -348,8 +348,18 @@ std::optional<std::string> occurrenceMemoryKind(const WorkloadGraph &graph,
     return std::nullopt;
   if (std::optional<std::string> kind = explicitMemoryKind(port->type))
     return kind;
-  if (const WorkloadValue *value = graph.findValue(port->value))
-    return explicitMemoryKind(value->type);
+  std::optional<WorkloadValueId> current = port->value;
+  llvm::SmallSet<WorkloadValueId, 4> visited;
+  while (current && visited.insert(*current).second) {
+    const WorkloadValue *value = graph.findValue(*current);
+    if (!value)
+      break;
+    if (std::optional<std::string> kind = explicitMemoryKind(value->type))
+      return kind;
+    if (value->memoryKind)
+      return value->memoryKind;
+    current = value->carriedFrom;
+  }
   return std::nullopt;
 }
 
