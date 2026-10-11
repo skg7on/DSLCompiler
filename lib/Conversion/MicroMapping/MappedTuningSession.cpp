@@ -122,6 +122,14 @@ bool ranksBefore(const MappedTuningCandidate &lhs,
   return lhs.plan.id < rhs.plan.id;
 }
 
+bool objectiveUsesMeasuredMetric(const perf::SearchObjective &objective) {
+  auto measured = [](llvm::StringRef name) {
+    return name == "measured_ns" || name == "measured_gflops";
+  };
+  return measured(objective.primaryMetric) ||
+         llvm::any_of(objective.secondaryMetrics, measured);
+}
+
 void appendField(std::string &out, llvm::StringRef value) {
   out += std::to_string(value.size());
   out += ':';
@@ -315,7 +323,20 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
                 "providers");
 
   std::vector<size_t> rejected;
-  for (size_t index = 0; index < report.ranked.size(); ++index) {
+  const bool measuredObjective = objectiveUsesMeasuredMetric(space.objective);
+  const size_t attemptLimit =
+      options.maxMeasurementAttempts
+          ? std::min<size_t>(options.maxMeasurementAttempts,
+                             report.ranked.size())
+          : report.ranked.size();
+  size_t measuredCount = 0;
+  size_t completedCount = 0;
+  size_t index = 0;
+  for (; index < attemptLimit &&
+         (measuredObjective ? measuredCount < options.measureTop
+                            : completedCount < options.measureTop);
+       ++index) {
+    report.measurementAttempts++;
     MappedTuningCandidate &candidate = report.ranked[index];
     CandidateInstantiationOptions sourceOptions = options.source;
     sourceOptions.machine = &target.machine();
@@ -446,8 +467,11 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
       rejected.push_back(index);
       continue;
     }
-    if (!*observed)
+    if (!*observed) {
+      if (!measuredObjective)
+        completedCount++;
       continue; // A miss leaves the legal static candidate untouched.
+    }
     if (llvm::Error error =
             measurement.verify(candidate, buffers->inputs, buffers->outputs)) {
       candidate.ranking.rejectionReason =
@@ -471,6 +495,16 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
     candidate.ranking.metrics.measuredNs = metrics.measuredNs;
     candidate.ranking.metrics.measuredGflops = metrics.measuredGflops;
     candidate.measurementIdentity = std::move(identity);
+    bool hasObjectiveMetrics =
+        bool(perf::resolveMetric(candidate.ranking.metrics,
+                                 space.objective.primaryMetric)
+                 .value);
+    for (const std::string &secondary : space.objective.secondaryMetrics)
+      hasObjectiveMetrics &=
+          bool(perf::resolveMetric(candidate.ranking.metrics, secondary).value);
+    if (hasObjectiveMetrics)
+      measuredCount++;
+    completedCount++;
   }
   for (auto it = rejected.rbegin(); it != rejected.rend(); ++it)
     report.ranked.erase(report.ranked.begin() + *it);
@@ -488,6 +522,9 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
     return fail("mapped tuning requires a source module");
   if (llvm::Error error = perf::validateObjective(space.objective))
     return std::move(error);
+  const bool measuredObjective = objectiveUsesMeasuredMetric(space.objective);
+  if (measuredObjective && !options.measurement.measure)
+    return fail("a measured objective requires a mapped measurement provider");
   MappedTuningReport report;
   std::vector<perf::Candidate> candidates =
       perf::generateCandidates(space, options.generator);
@@ -665,11 +702,38 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
       [&](const MappedTuningCandidate &a, const MappedTuningCandidate &b) {
         return ranksBefore(a, b, space.objective);
       });
-  if (options.topK && report.ranked.size() > options.topK)
-    report.ranked.resize(options.topK);
   if (llvm::Error error = measureSelectedCandidates(source, space, shape,
                                                     target, options, report))
     return std::move(error);
+  if (measuredObjective) {
+    report.measuredCohortOnly = true;
+    for (auto it = report.ranked.begin(); it != report.ranked.end();) {
+      bool available = bool(perf::resolveMetric(it->ranking.metrics,
+                                                space.objective.primaryMetric)
+                                .value);
+      for (const std::string &secondary : space.objective.secondaryMetrics)
+        available &=
+            bool(perf::resolveMetric(it->ranking.metrics, secondary).value);
+      if (!available) {
+        it->ranking.rejectionReason =
+            "measurement_unavailable: candidate has no value for every "
+            "objective metric";
+        report.unrankable.push_back(std::move(*it));
+        it = report.ranked.erase(it);
+      } else {
+        report.measuredCohortSize++;
+        ++it;
+      }
+    }
+    report.hasMeasuredResult = !report.ranked.empty();
+  }
+  std::stable_sort(
+      report.ranked.begin(), report.ranked.end(),
+      [&](const MappedTuningCandidate &a, const MappedTuningCandidate &b) {
+        return ranksBefore(a, b, space.objective);
+      });
+  if (options.topK && report.ranked.size() > options.topK)
+    report.ranked.resize(options.topK);
   return report;
 }
 

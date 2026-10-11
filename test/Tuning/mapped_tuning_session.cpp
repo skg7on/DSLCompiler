@@ -218,6 +218,15 @@ TEST(MappedTuningSessionTest, AnalysisOnlyTargetsDoNotClaimExecutableSupport) {
               : analysis->rejected.front().rejectionReason);
   EXPECT_FALSE(analysis->ranked.front().executable);
   EXPECT_TRUE(analysis->ranked.front().materializationReady);
+
+  auto measuredSpace = oneCandidateSpace();
+  measuredSpace.objective.primaryMetric = "measured_ns";
+  auto missingMeasurement = mlir::llk::tuning::runMappedTuningSession(
+      *source, measuredSpace, testShape(), target, options);
+  ASSERT_FALSE(bool(missingMeasurement));
+  EXPECT_NE(llvm::toString(missingMeasurement.takeError())
+                .find("requires a mapped measurement provider"),
+            std::string::npos);
 }
 
 TEST(MappedTuningSessionTest, MeasuresExactExecutableAndKeepsIdentity) {
@@ -347,6 +356,22 @@ TEST(MappedTuningSessionTest, MeasuresExactExecutableAndKeepsIdentity) {
         return rejected.rejectionReason.find("measurement metric:") !=
                std::string::npos;
       }));
+
+  auto measuredSpace = oneCandidateSpace();
+  measuredSpace.objective.primaryMetric = "measured_ns";
+  options.measurement.measure = [](const MappedMeasurementRequest &)
+      -> llvm::Expected<std::optional<mlir::llk::perf::CandidateMetrics>> {
+    return std::optional<mlir::llk::perf::CandidateMetrics>();
+  };
+  auto noMeasuredResult = runMappedTuningSession(
+      *source, measuredSpace, testShape(), **target, options);
+  ASSERT_TRUE(bool(noMeasuredResult))
+      << llvm::toString(noMeasuredResult.takeError());
+  EXPECT_TRUE(noMeasuredResult->ranked.empty());
+  ASSERT_EQ(noMeasuredResult->unrankable.size(), 1u);
+  EXPECT_TRUE(noMeasuredResult->unrankable.front().ranking.legal);
+  EXPECT_FALSE(noMeasuredResult->hasMeasuredResult);
+  EXPECT_TRUE(noMeasuredResult->measuredCohortOnly);
 }
 
 } // namespace

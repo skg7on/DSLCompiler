@@ -70,6 +70,55 @@ SearchObjective latencyObjective() {
   return objective;
 }
 
+TEST(Ranking, MetricResolverDistinguishesStaticMeasuredUnavailable) {
+  CandidateMetrics metrics;
+  metrics.predictedNs = 22.0;
+  auto predicted = resolveMetric(metrics, "latency_cycles");
+  ASSERT_TRUE(predicted.value);
+  EXPECT_EQ(predicted.origin, MetricOrigin::Static);
+  auto missing = resolveMetric(metrics, "measured_ns");
+  EXPECT_FALSE(missing.value);
+  EXPECT_EQ(missing.origin, MetricOrigin::Unavailable);
+  auto missingGflops = resolveMetric(metrics, "measured_gflops");
+  EXPECT_FALSE(missingGflops.value);
+  EXPECT_EQ(missingGflops.origin, MetricOrigin::Unavailable);
+  metrics.measuredNs = 12.0;
+  auto observed = resolveMetric(metrics, "measured_ns");
+  ASSERT_TRUE(observed.value);
+  EXPECT_EQ(*observed.value, 12.0);
+  EXPECT_EQ(observed.origin, MetricOrigin::Measured);
+}
+
+TEST(Ranking, MeasuredMetricReordersAndUnavailableNeverBecomesZero) {
+  TuningResult staticallyFirst = resultWith("a", 1, 0.0, 0);
+  staticallyFirst.metrics.measuredGflops = 4.0;
+  TuningResult measuredWinner = resultWith("b", 2, 0.0, 0);
+  measuredWinner.metrics.measuredGflops = 20.0;
+  TuningResult unavailable = resultWith("c", 3, 0.0, 0);
+
+  SearchObjective objective;
+  objective.primaryMetric = "measured_gflops";
+  objective.direction = ObjectiveDirection::Maximize;
+  auto ranked = rankTuningResults(
+      {staticallyFirst, unavailable, measuredWinner}, objective);
+  ASSERT_EQ(ranked.size(), 3u);
+  EXPECT_EQ(ranked[0].candidate.id, "b");
+  EXPECT_EQ(ranked[1].candidate.id, "a");
+  EXPECT_EQ(ranked[2].candidate.id, "c");
+}
+
+TEST(Ranking, MeasuredTiesUseStableCandidateId) {
+  TuningResult later = resultWith("zeta", 1, 0.0, 0);
+  later.metrics.measuredNs = 8.0;
+  TuningResult earlier = resultWith("alpha", 2, 0.0, 0);
+  earlier.metrics.measuredNs = 8.0;
+  SearchObjective objective;
+  objective.primaryMetric = "measured_ns";
+  auto ranked = rankTuningResults({later, earlier}, objective);
+  ASSERT_EQ(ranked.size(), 2u);
+  EXPECT_EQ(ranked.front().candidate.id, "alpha");
+}
+
 //===----------------------------------------------------------------------===//
 // Ranking
 //===----------------------------------------------------------------------===//
@@ -477,6 +526,16 @@ TEST(TuningSession, RefusesAnObjectiveItCannotRankBy) {
             std::string::npos);
 }
 
+TEST(TuningSession, RefusesMeasuredObjectiveWithoutProvider) {
+  auto context = perfContext();
+  SearchSpace space = threadChoiceSpace();
+  space.objective.primaryMetric = "measured_ns";
+  auto report = runTuningSession(*context, space, swigluShape(), avx2(), {});
+  ASSERT_FALSE(static_cast<bool>(report));
+  EXPECT_NE(llvm::toString(report.takeError()).find("requires a measurement"),
+            std::string::npos);
+}
+
 TEST(Ranking, OrdersByANonLatencyPrimaryMetricThenASecondary) {
   // A has the smaller DRAM footprint, B the better utilization. Ranking by
   // dram_bytes must put A first even though B wins on utilization alone --
@@ -520,6 +579,28 @@ TEST(Measurement, AMissKeepsTheStaticScoreAndTheRanking) {
   EXPECT_FALSE(report->ranked.front().measured.has_value());
   EXPECT_GT(report->ranked.front().result.metrics.predictedCycles, 0u);
   EXPECT_TRUE(report->ranked.front().result.legal);
+}
+
+TEST(Measurement, MeasuredObjectiveMissIsLegalButUnrankable) {
+  auto context = perfContext();
+  SearchSpace space = threadChoiceSpace();
+  space.objective.primaryMetric = "measured_gflops";
+  space.objective.direction = ObjectiveDirection::Maximize;
+  TuningSessionOptions options;
+  options.measurement.measureTop = 1;
+  options.measurement.provider = [](mlir::ModuleOp, const TuningResult &)
+      -> llvm::Expected<std::optional<CandidateMetrics>> {
+    return std::optional<CandidateMetrics>();
+  };
+  auto report =
+      runTuningSession(*context, space, swigluShape(), avx2(), options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  EXPECT_TRUE(report->ranked.empty());
+  ASSERT_EQ(report->unrankable.size(), 1u);
+  EXPECT_TRUE(report->unrankable.front().result.legal);
+  EXPECT_GT(report->unrankable.front().result.metrics.predictedCycles, 0u);
+  EXPECT_FALSE(report->hasMeasuredResult);
+  EXPECT_TRUE(report->measuredCohortOnly);
 }
 
 TEST(Measurement, AProviderThatObservedSomethingRecordsItWithItsIdentity) {
@@ -589,7 +670,7 @@ TEST(Measurement, IsOffUnlessAProviderIsSupplied) {
   ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
   ASSERT_EQ(report->ranked.size(), 1u);
   EXPECT_FALSE(report->ranked.front().measured.has_value());
-  EXPECT_EQ(report->schemaVersion, 1u);
+  EXPECT_EQ(report->schemaVersion, 2u);
 }
 
 TEST(Measurement, InvokesATopCandidateAndRecordsWhatItComputed) {
@@ -692,11 +773,16 @@ TEST(Measurement, InvokesATopCandidateAndRecordsWhatItComputed) {
     return std::optional<CandidateMetrics>(measured);
   };
 
-  auto report =
-      runTuningSession(*context, threadChoiceSpace(), shape, avx2(), options);
+  SearchSpace space = threadChoiceSpace();
+  space.objective.primaryMetric = "measured_ns";
+  auto report = runTuningSession(*context, space, shape, avx2(), options);
   ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
   ASSERT_EQ(report->ranked.size(), 1u);
   EXPECT_EQ(invocations, 1u);
+  EXPECT_TRUE(report->measuredCohortOnly);
+  EXPECT_TRUE(report->hasMeasuredResult);
+  EXPECT_EQ(report->measuredCohortSize, 1u);
+  EXPECT_TRUE(report->unrankable.empty());
 
   const RankedCandidate &best = report->ranked.front();
   ASSERT_TRUE(best.measured.has_value());

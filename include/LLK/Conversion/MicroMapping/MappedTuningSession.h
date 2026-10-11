@@ -76,6 +76,8 @@ struct MappedTuningOptions {
   ::llk::MappedBackend backend = ::llk::MappedBackend::SelectedTarget;
   bool executable = true;
   uint64_t topK = 10;
+  uint64_t measureTop = 1;
+  uint64_t maxMeasurementAttempts = 0;
   MappedMeasurementOptions measurement;
 };
 
@@ -104,7 +106,12 @@ struct MappedTuningReport {
   uint64_t mappingPlanCount = 0;
   bool generatorTruncated = false;
   bool mappingTruncated = false;
+  bool measuredCohortOnly = false;
+  bool hasMeasuredResult = false;
+  uint64_t measuredCohortSize = 0;
+  uint64_t measurementAttempts = 0;
   std::vector<MappedTuningCandidate> ranked;
+  std::vector<MappedTuningCandidate> unrankable;
   std::vector<perf::TuningResult> rejected;
 };
 

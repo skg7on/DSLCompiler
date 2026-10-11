@@ -21,6 +21,7 @@
 #include "llvm/Support/Error.h"
 
 #include <algorithm>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -30,38 +31,20 @@ using llvm::StringRef;
 
 namespace {
 
-/// The CandidateMetrics field a metric name selects. `validateObjective` is
-/// what rejects a name with no field, so this is only reached for names the
-/// model produces.
-double metricValue(const CandidateMetrics &metrics, StringRef name) {
-  if (name == "latency_cycles")
-    return static_cast<double>(metrics.predictedCycles);
-  if (name == "dram_bytes")
-    return static_cast<double>(metrics.dramBytes);
-  if (name == "sram_bytes")
-    return static_cast<double>(metrics.sramBytes);
-  if (name == "matrix_utilization")
-    return metrics.matrixUtilization;
-  if (name == "dma_utilization")
-    return metrics.dmaUtilization;
-  // A measured metric falls back to its static counterpart when no measurement
-  // was taken: a provider *miss* leaves the static score standing, which is a
-  // different statement from scoring the candidate zero.
-  if (name == "measured_ns")
-    return metrics.measuredNs.value_or(metrics.predictedNs);
-  if (name == "measured_gflops")
-    return metrics.measuredGflops.value_or(0.0);
-  // Every other name is refused by validateObjective before a ranking runs, so
-  // reaching here would mean the check was skipped.
-  return 0.0;
-}
-
 /// Utilization metrics are the ones where more is better; everything else the
 /// objective can name is a cost. Secondary metrics declare no direction, so
 /// their sense comes from what they measure.
 bool lowerIsBetter(StringRef name) {
   return name != "matrix_utilization" && name != "dma_utilization" &&
          name != "measured_gflops";
+}
+
+bool objectiveUsesMeasuredMetric(const SearchObjective &objective) {
+  auto measured = [](StringRef name) {
+    return name == "measured_ns" || name == "measured_gflops";
+  };
+  return measured(objective.primaryMetric) ||
+         llvm::any_of(objective.secondaryMetrics, measured);
 }
 
 CandidateMetrics metricsFrom(const MicroPerfReport &report,
@@ -88,6 +71,28 @@ CandidateMetrics metricsFrom(const MicroPerfReport &report,
 
 } // namespace
 
+MetricValue resolveMetric(const CandidateMetrics &metrics, StringRef name) {
+  MetricValue result;
+  if (name == "latency_cycles")
+    result = {static_cast<double>(metrics.predictedCycles),
+              MetricOrigin::Static};
+  else if (name == "dram_bytes")
+    result = {static_cast<double>(metrics.dramBytes), MetricOrigin::Static};
+  else if (name == "sram_bytes")
+    result = {static_cast<double>(metrics.sramBytes), MetricOrigin::Static};
+  else if (name == "matrix_utilization")
+    result = {metrics.matrixUtilization, MetricOrigin::Static};
+  else if (name == "dma_utilization")
+    result = {metrics.dmaUtilization, MetricOrigin::Static};
+  else if (name == "measured_ns" && metrics.measuredNs)
+    result = {*metrics.measuredNs, MetricOrigin::Measured};
+  else if (name == "measured_gflops" && metrics.measuredGflops)
+    result = {*metrics.measuredGflops, MetricOrigin::Measured};
+  if (!result.value || !std::isfinite(*result.value))
+    return {{}, MetricOrigin::Unavailable};
+  return result;
+}
+
 bool isKnownMetric(StringRef name) {
   return name == "latency_cycles" || name == "dram_bytes" ||
          name == "sram_bytes" || name == "matrix_utilization" ||
@@ -96,6 +101,11 @@ bool isKnownMetric(StringRef name) {
 }
 
 llvm::Error validateObjective(const SearchObjective &objective) {
+  if (objective.direction != ObjectiveDirection::Minimize &&
+      objective.direction != ObjectiveDirection::Maximize)
+    return llvm::make_error<llvm::StringError>(
+        "objective has an unsupported ranking direction",
+        llvm::inconvertibleErrorCode());
   auto check = [](StringRef name) -> llvm::Error {
     if (isKnownMetric(name))
       return llvm::Error::success();
@@ -123,15 +133,27 @@ bool ranksBefore(const TuningResult &a, const TuningResult &b,
     return (left < right) == lower ? -1 : 1;
   };
 
-  int primary = compare(metricValue(a.metrics, objective.primaryMetric),
-                        metricValue(b.metrics, objective.primaryMetric),
-                        objective.direction == ObjectiveDirection::Minimize);
+  MetricValue left = resolveMetric(a.metrics, objective.primaryMetric);
+  MetricValue right = resolveMetric(b.metrics, objective.primaryMetric);
+  if (left.value.has_value() != right.value.has_value())
+    return left.value.has_value();
+  int primary =
+      left.value && right.value
+          ? compare(*left.value, *right.value,
+                    objective.direction == ObjectiveDirection::Minimize)
+          : 0;
   if (primary != 0)
     return primary < 0;
 
   for (const std::string &name : objective.secondaryMetrics) {
-    int secondary = compare(metricValue(a.metrics, name),
-                            metricValue(b.metrics, name), lowerIsBetter(name));
+    left = resolveMetric(a.metrics, name);
+    right = resolveMetric(b.metrics, name);
+    if (left.value.has_value() != right.value.has_value())
+      return left.value.has_value();
+    int secondary =
+        left.value && right.value
+            ? compare(*left.value, *right.value, lowerIsBetter(name))
+            : 0;
     if (secondary != 0)
       return secondary < 0;
   }
@@ -162,6 +184,11 @@ runTuningSession(mlir::MLIRContext &context, const SearchSpace &space,
   // checked before anything is generated.
   if (llvm::Error error = validateObjective(space.objective))
     return std::move(error);
+  const bool measuredObjective = objectiveUsesMeasuredMetric(space.objective);
+  if (measuredObjective && !options.measurement.provider)
+    return llvm::make_error<llvm::StringError>(
+        "a measured objective requires a measurement provider",
+        llvm::inconvertibleErrorCode());
 
   TuningSessionReport report;
   report.objective = space.objective;
@@ -211,15 +238,37 @@ runTuningSession(mlir::MLIRContext &context, const SearchSpace &space,
             [&](const RankedCandidate &a, const RankedCandidate &b) {
               return ranksBefore(a.result, b.result, space.objective);
             });
-  if (options.topK != 0 && report.ranked.size() > options.topK)
-    report.ranked.resize(options.topK);
-
-  // Measurement is optional and comes last: it measures the best candidates the
-  // ranking just chose, so it can only ever confirm or reject them, never
-  // change which ones they are.
   if (llvm::Error error = measureTopCandidates(context, space, shape, report,
                                                options.measurement))
     return std::move(error);
+
+  if (measuredObjective) {
+    report.measuredCohortOnly = true;
+    for (auto it = report.ranked.begin(); it != report.ranked.end();) {
+      bool available =
+          bool(resolveMetric(it->result.metrics, space.objective.primaryMetric)
+                   .value);
+      for (const std::string &secondary : space.objective.secondaryMetrics)
+        available &= bool(resolveMetric(it->result.metrics, secondary).value);
+      if (!available) {
+        it->result.rejectionReason =
+            "measurement_unavailable: candidate has no value for every "
+            "objective metric";
+        report.unrankable.push_back(std::move(*it));
+        it = report.ranked.erase(it);
+      } else {
+        report.measuredCohortSize++;
+        ++it;
+      }
+    }
+    report.hasMeasuredResult = !report.ranked.empty();
+    std::stable_sort(report.ranked.begin(), report.ranked.end(),
+                     [&](const RankedCandidate &a, const RankedCandidate &b) {
+                       return ranksBefore(a.result, b.result, space.objective);
+                     });
+  }
+  if (options.topK != 0 && report.ranked.size() > options.topK)
+    report.ranked.resize(options.topK);
 
   return report;
 }
@@ -232,11 +281,21 @@ llvm::Error measureTopCandidates(mlir::MLIRContext &context,
   if (!options.provider || options.measureTop == 0)
     return llvm::Error::success();
 
-  const size_t count = std::min<size_t>(static_cast<size_t>(options.measureTop),
-                                        report.ranked.size());
+  const bool measuredObjective = objectiveUsesMeasuredMetric(report.objective);
+  const size_t limit =
+      options.maxAttempts
+          ? std::min<size_t>(options.maxAttempts, report.ranked.size())
+          : report.ranked.size();
 
   std::vector<size_t> rejectedIndices;
-  for (size_t index = 0; index < count; ++index) {
+  size_t successfulMeasurements = 0;
+  size_t completedCandidates = 0;
+  size_t index = 0;
+  for (; index < limit &&
+         (measuredObjective ? successfulMeasurements < options.measureTop
+                            : completedCandidates < options.measureTop);
+       ++index) {
+    report.measurementAttempts++;
     RankedCandidate &ranked = report.ranked[index];
 
     // Binding is deterministic, so binding again gives the module the ranking
@@ -266,10 +325,37 @@ llvm::Error measureTopCandidates(mlir::MLIRContext &context,
     }
     if (*observed) {
       ranked.measured = **observed;
+      if ((ranked.measured->measuredNs &&
+           (!std::isfinite(*ranked.measured->measuredNs) ||
+            *ranked.measured->measuredNs <= 0.0)) ||
+          (ranked.measured->measuredGflops &&
+           (!std::isfinite(*ranked.measured->measuredGflops) ||
+            *ranked.measured->measuredGflops < 0.0))) {
+        report.rejected.push_back(TuningResult{
+            ranked.result.candidate, ranked.result.metrics, false,
+            "measurement: invalid non-finite or out-of-range metric"});
+        rejectedIndices.push_back(index);
+        continue;
+      }
+      if (ranked.measured->measuredNs)
+        ranked.result.metrics.measuredNs = ranked.measured->measuredNs;
+      if (ranked.measured->measuredGflops)
+        ranked.result.metrics.measuredGflops = ranked.measured->measuredGflops;
       ranked.measuredTarget = options.targetIdentity;
       ranked.measuredMachine = options.machineIdentity;
       ranked.measuredAbi = options.abiIdentity;
       ranked.measuredCodegenIdentity = options.codegenIdentity;
+      bool hasObjectiveMetrics = bool(
+          resolveMetric(ranked.result.metrics, report.objective.primaryMetric)
+              .value);
+      for (const std::string &secondary : report.objective.secondaryMetrics)
+        hasObjectiveMetrics &=
+            bool(resolveMetric(ranked.result.metrics, secondary).value);
+      if (hasObjectiveMetrics)
+        successfulMeasurements++;
+      completedCandidates++;
+    } else if (!measuredObjective) {
+      completedCandidates++;
     }
     // A miss leaves the candidate exactly as it was: still ranked, still
     // legal, with its static score standing.
