@@ -354,6 +354,8 @@ add_mlir_library(LLKKernel
     lib/Conversion/LLKKernel/Registry.cpp
     lib/Conversion/LLKKernel/Contract.cpp
     lib/Conversion/LLKKernel/SwiGLU.cpp
+    lib/Conversion/LLKKernel/RoPE.cpp
+    lib/Conversion/LLKKernel/Attention.cpp
     DEPENDS LLKDialect MicroDialect LLKCommon
     LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon
 )

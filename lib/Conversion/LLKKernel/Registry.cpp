@@ -5,7 +5,11 @@ const LLKKernelLowering *LLKKernelRegistry::lookup(StringRef name) const {
   return it == byName.end() ? nullptr : it->second;
 }
 void registerSwiGLULowering(LLKKernelRegistry &);
+void registerRoPELowering(LLKKernelRegistry &);
+void registerAttentionLowering(LLKKernelRegistry &);
 void populateLLKKernelLowerings(LLKKernelRegistry &r) {
   registerSwiGLULowering(r);
+  registerRoPELowering(r);
+  registerAttentionLowering(r);
 }
 } // namespace mlir::llk

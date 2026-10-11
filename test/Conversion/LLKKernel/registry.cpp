@@ -40,3 +40,14 @@ TEST(LLKKernelRegistryTest, PopulatedSwiGLU) {
   ASSERT_NE(entry, nullptr);
   EXPECT_TRUE(entry->hasLinalgLowering());
 }
+
+TEST(LLKKernelRegistryTest, PopulatedLinalgOnlyKernels) {
+  llk::LLKKernelRegistry registry;
+  llk::populateLLKKernelLowerings(registry);
+  for (auto name : {"llk.rope", "llk.attention"}) {
+    auto *entry = registry.lookup(name);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_TRUE(entry->hasLinalgLowering());
+    EXPECT_FALSE(entry->hasMicroLowering());
+  }
+}
