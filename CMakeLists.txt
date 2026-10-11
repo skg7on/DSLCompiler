@@ -435,7 +435,10 @@ mlir_target_link_libraries(LLKRuntime PUBLIC
     MLIRExecutionEngine
     MLIRArithToLLVM
     MLIRControlFlowToLLVM
+    MLIRConvertToLLVMInterface
+    MLIRConvertToLLVMPass
     MLIRFuncToLLVM
+    MLIRIndexToLLVM
     MLIRMathToLLVM
     MLIRMemRefToLLVM
     MLIRMemRefTransforms

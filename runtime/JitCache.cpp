@@ -11,10 +11,19 @@
 
 #include "LLK/Runtime/JitCache.h"
 
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/Passes.h"
-#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/DialectRegistry.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
@@ -130,15 +139,24 @@ std::string JitCache::weightKeyToString(const WeightKey &key) {
 // ---------------------------------------------------------------------------
 // Lowering pipeline: progressively lower MLIR dialects to LLVM dialect.
 // ---------------------------------------------------------------------------
+void registerKernelToLLVMInterfaces(mlir::MLIRContext &context) {
+  static const mlir::DialectRegistry registry = [] {
+    mlir::DialectRegistry registry;
+    mlir::registerConvertToLLVMDependentDialectLoading(registry);
+    mlir::arith::registerConvertArithToLLVMInterface(registry);
+    mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
+    mlir::registerConvertFuncToLLVMInterface(registry);
+    mlir::index::registerConvertIndexToLLVMInterface(registry);
+    mlir::registerConvertMathToLLVMInterface(registry);
+    mlir::registerConvertMemRefToLLVMInterface(registry);
+    mlir::ub::registerConvertUBToLLVMInterface(registry);
+    mlir::vector::registerConvertVectorToLLVMInterface(registry);
+    return registry;
+  }();
+  context.appendDialectRegistry(registry);
+}
+
 void addKernelToLLVMPasses(mlir::PassManager &pm) {
-  // Lower UB operations before type-converting passes. UBToLLVM uses its own
-  // LLVMTypeConverter for poison results; running it later would leave casts
-  // from LLVM structs/arrays back to memref/vector types after those dialects
-  // have already been lowered.
-  pm.addPass(mlir::createUBToLLVMConversionPass());
-  // Lower vector dialect ops to LLVM dialect (must run before SCF→CF
-  // lowering because vector.mask may contain scf ops).
-  pm.addPass(mlir::createConvertVectorToLLVMPass());
   // Expand memref ops that carry layout metadata into explicit
   // `extract_strided_metadata` arithmetic, before anything else looks at them.
   // A windowed tile view lowers to a `memref.subview` whose offsets are affine
@@ -156,21 +174,13 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
 #else
   pm.addPass(mlir::createConvertSCFToCFPass());
 #endif
-  // Lower control flow to LLVM dialect.
-  pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-  // Lower arithmetic ops to LLVM dialect.
-  pm.addPass(mlir::createArithToLLVMConversionPass());
-  // Lower math ops (exp, erf, etc.) to LLVM dialect.
-  pm.addPass(mlir::createConvertMathToLLVMPass());
-  // Lower memref ops to LLVM dialect (finalizes the MemRef→LLVM conversion).
-  pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-  // Lower func ops after memref operations so function wrappers do not retain
-  // casts between LLVM descriptors and memref types.
-  pm.addPass(mlir::createConvertFuncToLLVMPass());
-  // Drop the materializations the conversions inserted and then left unused --
-  // an `i64 -> index` cast with no users, typically, from lowering a loop's
-  // induction variable. Reconciliation only removes casts whose types agree, so
-  // without this one they survive to LLVM translation, which refuses them.
+  // Convert all dialects with LLVM conversion interfaces in a single partial
+  // conversion. Sharing one LLVMTypeConverter lets vector, memref, function,
+  // arithmetic, and UB patterns agree on converted types instead of leaving
+  // incompatible unrealized casts between separately run conversions.
+  registerKernelToLLVMInterfaces(*pm.getContext());
+  pm.addPass(mlir::createConvertToLLVMPass());
+  // Remove no-op materializations left by the joint partial conversion.
   pm.addPass(mlir::createCanonicalizerPass());
   // Reconcile unrealized casts between conversion passes.
   pm.addPass(mlir::createReconcileUnrealizedCastsPass());
