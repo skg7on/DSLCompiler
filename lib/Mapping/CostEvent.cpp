@@ -860,9 +860,46 @@ buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
         std::vector<uint32_t> deps;
         if (chainFrom)
           deps.push_back(*chainFrom);
-        produced.push_back(add(makePlanCostEvent(
+        PlanCostEvent transformEvent = makePlanCostEvent(
             CostEventKind::Transform, engine->id, cost->latencyCycles,
-            workItems, cost->localBytes, deps)));
+            workItems, cost->localBytes, deps);
+        transformEvent.connectionId = connection.id;
+        transformEvent.planStep = step->id;
+        // A layout conversion reads the connection's pre-transform slot and
+        // writes its post-transform slot. Keep those uses on the event stream
+        // so storage liveness can establish both ranges; otherwise the
+        // materialized micro.transform has a planned output allocation that
+        // no scheduled event appears to touch.
+        if (connection.storageIds.size() >= 2) {
+          uint64_t sourceStorage = connection.storageIds.front();
+          if (!connection.hops.empty())
+            sourceStorage = connection.hops.back().destinationStorageId;
+          uint64_t destinationStorage = connection.storageIds.back();
+          uint64_t occurrences = 1;
+          for (const StorageAllocation &allocation : plan.allocations)
+            if (allocation.id == destinationStorage) {
+              occurrences = allocation.simultaneousOccurrences;
+              break;
+            }
+          if (occurrences > kMaxEnumeratedOccurrences)
+            return planEventError(
+                "plan events: transform destination allocation " +
+                llvm::Twine(destinationStorage) + " is resident " +
+                llvm::Twine(occurrences) + " times, more than the " +
+                llvm::Twine(kMaxEnumeratedOccurrences) +
+                " occurrences the event stream enumerates");
+          const uint64_t occurrenceBase =
+              (static_cast<uint64_t>(connection.id) << 32) |
+              uint64_t{0x80000000};
+          for (uint64_t index = 0; index < occurrences; ++index) {
+            transformEvent.storageUses.push_back(StorageUse{
+                sourceStorage, occurrenceBase + index, StorageAccess::Read});
+            transformEvent.storageUses.push_back(
+                StorageUse{destinationStorage, occurrenceBase + index,
+                           StorageAccess::Write});
+          }
+        }
+        produced.push_back(add(std::move(transformEvent)));
       }
       break;
     }

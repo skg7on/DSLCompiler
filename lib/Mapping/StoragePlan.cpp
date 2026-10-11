@@ -1648,9 +1648,12 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
   probe.stepEdges = stepEdges;
   probe.allocations = allocations;
   probe.connectionPlans = plan.connectionPlans;
-  for (size_t index = 0; index < probe.connectionPlans.size(); ++index)
+  for (size_t index = 0; index < probe.connectionPlans.size(); ++index) {
+    probe.connectionPlans[index].storageIds.assign(
+        connectionStorage[index].begin(), connectionStorage[index].end());
     probe.connectionPlans[index].hops.assign(connectionHops[index].begin(),
                                              connectionHops[index].end());
+  }
 
   llvm::Expected<PlanEventDAG> planEvents =
       buildPlanEvents(probe, machine, &graph);
