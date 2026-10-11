@@ -34,3 +34,33 @@ Compilation uses `-fno-rtti -fno-exceptions -Werror=deprecated-declarations`.
 - Initial nine full-suite failures included missing standalone executables; explicit build and T9 check-llk dependencies resolve those. The remaining failure is solely the forced hardware gate.
 
 Independent review and pinned Linux CI results will be recorded below.
+
+## Independent review
+
+A separate reviewer inspected the complete implementation and found one Important
+issue: the new Matmul Linalg hook accumulated in the output dtype rather than the
+declared accumulator dtype. No other Critical/Important issues or deferred minors
+were reported.
+
+Final: fixed accumulator precision —
+`KernelContractTest.MatmulF32AccumulationPreservesNonzeroBF16Init` RED→GREEN.
+The test executes the emitted scalar regions through actual MLIR constant folding:
+bf16 init 256 plus two unit products now yields 258 with f32 accumulation, versus
+256 before the fix. FileCheck also covers dynamic init dimensions and equal-width
+f16/bf16 conversions through f32. This is portable scalar-IR numerical validation,
+not native JIT execution.
+
+Final: Ruling: honor accumulator precision rather than the plan's direct original-init
+Linalg construction — source numerical semantics require it. Cost if wrong: extra
+conversion operations; the nonzero-init regression pins their numerical purpose.
+
+Reviewer declined to judge Linux static-link CI and forced AVX2 execution on ARM64;
+those remain assigned to pinned Linux CI, with local failure reported above.
+
+## Post-review local verification
+
+All build targets compile after the precision fix. Full check-llk now registers
+1,245 tests: 1,237 passed, six skipped, one disabled, one failed solely in forced
+AVX2 execution on ARM64. The eight complete Micro baseline outputs still match
+byte-for-byte. Scoped deprecated API and operator-type dispatch audits are clean.
+Eight framework GTests and the expanded Matmul FileCheck pass.

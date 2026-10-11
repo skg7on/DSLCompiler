@@ -52,10 +52,72 @@ public:
   LogicalResult lowerToLinalg(Operation *root,
                               OpBuilder &builder) const override {
     auto op = cast<llk::MatmulOp>(root);
-    Value result = linalg::MatmulOp::create(builder, op.getLoc(),
-                                            ValueRange{op.getA(), op.getB()},
-                                            ValueRange{op.getInit()})
-                       .getResult(0);
+    auto accAttr = dyn_cast<TypeAttr>(op.getAccumulatorType());
+    auto accType =
+        accAttr ? dyn_cast<FloatType>(accAttr.getValue()) : FloatType();
+    if (!accType)
+      return op.emitError("accumulator_type must name a floating-point type "
+                          "for Linalg lowering");
+    auto initType = dyn_cast<RankedTensorType>(op.getInit().getType());
+    auto outType = dyn_cast<RankedTensorType>(op.getResult().getType());
+    if (!initType || !outType || initType.getRank() != 2 ||
+        outType.getRank() != 2 || initType.getShape() != outType.getShape())
+      return op.emitError(
+          "initialized destination shape must match the rank-2 result");
+    auto convertTensor = [&](Value source, FloatType target) -> Value {
+      auto sourceType = cast<RankedTensorType>(source.getType());
+      auto sourceElem = cast<FloatType>(sourceType.getElementType());
+      if (sourceElem == target)
+        return source;
+      auto type = RankedTensorType::get(sourceType.getShape(), target,
+                                        sourceType.getEncoding());
+      SmallVector<Value> dynamicSizes;
+      for (int64_t dim = 0; dim < sourceType.getRank(); ++dim)
+        if (sourceType.isDynamicDim(dim))
+          dynamicSizes.push_back(
+              tensor::DimOp::create(builder, op.getLoc(), source, dim));
+      Value empty =
+          tensor::EmptyOp::create(builder, op.getLoc(), type, dynamicSizes);
+      auto id = AffineMap::getMultiDimIdentityMap(2, builder.getContext());
+      return linalg::GenericOp::create(
+                 builder, op.getLoc(), TypeRange{type}, ValueRange{source},
+                 ValueRange{empty}, ArrayRef<AffineMap>{id, id},
+                 ArrayRef<utils::IteratorType>{utils::IteratorType::parallel,
+                                               utils::IteratorType::parallel},
+                 [target, sourceWidth = sourceElem.getWidth(),
+                  targetWidth = target.getWidth()](OpBuilder &b, Location loc,
+                                                   ValueRange args) {
+                   Value value = args[0];
+                   // f16 and bf16 have equal widths but different formats.
+                   // Convert through f32 so neither extf nor truncf receives
+                   // equal widths.
+                   if (sourceWidth == targetWidth) {
+                     value =
+                         arith::ExtFOp::create(b, loc, b.getF32Type(), value);
+                     value = arith::TruncFOp::create(b, loc, target, value);
+                   } else if (sourceWidth < targetWidth)
+                     value = arith::ExtFOp::create(b, loc, target, value);
+                   else
+                     value = arith::TruncFOp::create(b, loc, target, value);
+                   linalg::YieldOp::create(b, loc, value);
+                 })
+          .getResult(0);
+    };
+    Value init = convertTensor(op.getInit(), accType);
+    Value lhs = op.getA(), rhs = op.getB();
+    // Named matmul handles ordinary extension/truncation. Equal-width
+    // format changes need the explicit conversion used for the init tensor.
+    for (Value *input : {&lhs, &rhs}) {
+      auto elem =
+          cast<FloatType>(cast<ShapedType>(input->getType()).getElementType());
+      if (elem != accType && elem.getWidth() == accType.getWidth())
+        *input = convertTensor(*input, accType);
+    }
+    Value result =
+        linalg::MatmulOp::create(builder, op.getLoc(), ValueRange{lhs, rhs},
+                                 ValueRange{init})
+            .getResult(0);
+    result = convertTensor(result, cast<FloatType>(outType.getElementType()));
     op.replaceAllUsesWith(result);
     op.erase();
     return success();

@@ -573,3 +573,10 @@ implementation plan records the approved amendments:
 The explicit populate anchor documents each registration's sink capabilities.
 Adding an operator requires its source file, build-source registration and one
 line in that anchor; conversion and transform drivers require no operator edits.
+
+The new Matmul Linalg hook honors `accumulator_type`: it promotes or converts
+the initialized destination, performs the reduction in that element type, and
+converts the completed result once to the declared output type. Directly using
+a bf16 destination for f32 accumulation changes the numerical contract. This
+refines the simplified §5.3 estimate; existing SwiGLU/RoPE/Attention lowerings
+remain unchanged.
