@@ -366,10 +366,10 @@ for name in required:
 ```
 
 - [x] **Step 2: Run parser tests and invoke the executable on an injected unsupported-feature case with --require-selected-target.** It must fail; ordinary local diagnostics may report unsupported. `SelectedTargetFlagContract` sets `LLK_TEST_DISABLE_AVX2=1` and confirms that required selected execution fails with the injected-feature diagnostic.
-- [ ] **Step 3: Add an explicit selected-x86 step to pinned LLVM22 static CI.** Record host architecture/features and exact toolchain; run the selected acceptance binary with --require-selected-target and then the full CTest suite. Save CTest result artifacts and selected Vector/LLVM/manifest/numeric/lifetime evidence. If the runner lacks AVX2, use a known compatible runner or report CI blocked; do not silently skip the gate. The workflow now captures the post-lowering LLVM dialect, translated LLVM IR, and a selected-plan manifest through an opt-in JIT evidence sink, validates those artifacts, and uploads them with the JUnit/log and host record. Local sink/file-writer/error-propagation tests and five validator controls pass; the full local run still fails the required selected binary on arm64, so this step remains open until pinned LLVM22 x86 CI passes.
-- [ ] **Step 4: Validate new static library dependencies on that job.** Ownership pipelines, target vectorization and runtime math/copy/alloc symbols must resolve without a monolithic MLIR dylib masking missing links. Local LLVM24/arm64 runs the reference and policy tests and cannot replace this x86 gate.
+- [x] **Step 3: Add an explicit selected-x86 step to pinned LLVM22 static CI.** Record host architecture/features and exact toolchain; run the selected acceptance binary with --require-selected-target and then the full CTest suite. Save CTest result artifacts and selected Vector/LLVM/manifest/numeric/lifetime evidence. If the runner lacks AVX2, use a known compatible runner or report CI blocked; do not silently skip the gate. The workflow now captures the post-lowering LLVM dialect, translated LLVM IR, and a selected-plan manifest through an opt-in JIT evidence sink, validates those artifacts, and uploads them with the JUnit/log and host record. Local sink/file-writer/error-propagation tests and five validator controls pass; the full local run still fails the required selected binary on arm64, the pinned LLVM22 x86 CI now passes at `6c42be9` (run `38124760443`), with seven validated manifests and 13/13 required selected tests.
+- [x] **Step 4: Validate new static library dependencies on that job.** Ownership pipelines, target vectorization and runtime math/copy/alloc symbols must resolve without a monolithic MLIR dylib masking missing links. Local LLVM24/arm64 runs the reference and policy tests and cannot replace this x86 gate.
 - [x] **Step 5: Retain legacy tests with truthful status.** On the local Darwin arm64 LLVM24 build, `SwigluScalar` passes four tests and skips `JitCompilationSmoke` and `E2EWithAbiWrapper` because ORC LLJIT is not configured; `SwiGLUVector` passes `PipelineSmoke` and skips `Correctness` because JIT compilation is unavailable. These are local runtime-capability skips, not selected mapped-target evidence. The pinned Linux LLVM22 job must still report their actual outcomes and is covered by Step 6.
-- [ ] **Step 6: Run final candidate CI and inspect artifacts/skips.** Commit with `ci: require selected mapped AVX2 execution evidence`. Review gate: actual selected-target numerical and ownership tests pass on the exact repaired head, with no required skips.
+- [x] **Step 6: Run final candidate CI and inspect artifacts/skips.** Commit with `ci: require selected mapped AVX2 execution evidence`. Review gate: actual selected-target numerical and ownership tests pass on the exact repaired head, with no required skips.
 
 ### Task T9: Publish a reproducible twelve-criterion closure matrix
 
@@ -407,6 +407,29 @@ for command in manifest["commands"]:
 | 11 Second target | Canonical tile two-hop materialization/perf and generic ODS neutrality, T6 |
 | 12 Determinism | Fresh-process byte comparisons of static reports/IR and replay, R8/T5/T6 |
 
-- [ ] **Step 4: Record proof with honest capability boundaries.** Pin the implementation head/CI run rather than quoting the #127/#128 baseline. List registered/passed/failed/skipped test counts from that head, every required skip reason, compiler/LLVM revisions and execution mode. Portable reference correctness, actual selected AVX2 execution, static model parity and future calibrated prediction are separate rows.
-- [ ] **Step 5: Reconcile historical issue checklists.** Credit #106's resolved defects; link still-relevant #109 items to exact new tests; connect #67 mandatory criteria to the matrix; check #129 G1–G10 only with corresponding evidence. Keep production persistence/calibration in #51/#52 and accelerator hardware execution outside this closure. Do not close any mandatory row on the basis that a stage PR merged. The local G1–G10 crosswalk is in `docs/reviews/issue67-final-acceptance.md`; tracker checklist reconciliation remains for the final authorized publication after the x86 gate.
-- [ ] **Step 6: Run documentation checks, final full CTest and final x86 selected gate on the release head.** Complete whole-branch review and resolve findings. Commit with `docs: record verified issue129 and issue67 acceptance evidence`. Gate close requires every mandatory matrix row passed; unresolved gaps remain open with concrete diagnostics and artifacts.
+- [x] **Step 4: Record proof with honest capability boundaries.** Pin the implementation head/CI run rather than quoting the #127/#128 baseline. List registered/passed/failed/skipped test counts from that head, every required skip reason, compiler/LLVM revisions and execution mode. Portable reference correctness, actual selected AVX2 execution, static model parity and future calibrated prediction are separate rows.
+- [x] **Step 5: Reconcile historical issue checklists.** Credit #106's resolved defects; link still-relevant #109 items to exact new tests; connect #67 mandatory criteria to the matrix; check #129 G1–G10 only with corresponding evidence. Keep production persistence/calibration in #51/#52 and accelerator hardware execution outside this closure. Do not close any mandatory row on the basis that a stage PR merged. The local G1–G10 crosswalk is in `docs/reviews/issue67-final-acceptance.md`; tracker checklist reconciliation remains for the final authorized publication after the x86 gate.
+- [x] **Step 6: Run documentation checks, final full CTest and final x86 selected gate on the release head.** Complete whole-branch review and resolve findings. Commit with `docs: record verified issue129 and issue67 acceptance evidence`. Gate close requires every mandatory matrix row passed; unresolved gaps remain open with concrete diagnostics and artifacts.
+
+## Verified final candidate record (2026-10-11)
+
+T8 Steps 3/4/6 and T9 Step 4 are verified at `6c42be9`, CI run
+`38124760443`: static LLVM22.1.8 build, selected 13/13 without skips, full CTest
+1,215 registered / 1,211 passed / zero failed / three legacy skips / one disabled.
+Downloaded artifacts pass both validators (seven selected manifests).
+The current matrix supersedes the historical local candidate record.
+
+Ruling: retain historical tracker closure boxes until PR #133 merges — #129's
+completion contract explicitly requires merged implementation — checking them
+on branch evidence would imply delivered main behavior. Publish branch evidence
+and mappings instead. This does not leave an implementation requirement open.
+
+Unified conversion and the unit-row broadcast transfer-write normalization were
+verified by failing then passing pinned LLVM22 remote runs; the selected backend
+identity assertion now follows the binary's required-target policy.
+
+T9 Steps 5/6: publish the verified branch crosswalk on #67/#106/#109/#129 while
+retaining merge-dependent closure boxes. Final implementation-head CI passes;
+current documentation checks pass 4/4. Fresh-context final contract review found
+no critical/important actionable defect; targeted CTest passes 9/9. The review
+sampled the branch, and Linux numeric execution uses the pinned CI proof.

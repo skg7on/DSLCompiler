@@ -76,8 +76,8 @@ acceptance documentation through `149f260` are recorded below.
 | **T5** | `d696879` CLI report and frozen replay | Implemented; replay and CLI tests pass |
 | **T6** | `5d9a574` five public acceptance chains | Verified; all five chains pass locally |
 | **T7** | `0929b53`, `abfcb3b` randomized tails, transforms and multiple outputs | Verified on portable backend: 8 pass, 2 AVX2 cases skip |
-| **T8** | `cce2c6e`, `1c678de` strict selected-target CLI, evidence parser, injected unsupported-feature control and CI artifact capture; local legacy skip investigation recorded in tuning plan | Harness and local legacy skip reasons verified. CI currently archives Vector IR, logs/JUnit and host/toolchain facts but not explicit LLVM IR or a selected-plan manifest; add those artifacts. Selected-x86 run, static LLVM22 link gate and CI legacy outcomes remain open |
-| **T9** | `d48a46d` smoke negative controls; `106a1dc`, `841e193`, `118b267`, `149f260` matrix, branch status and G1–G10 crosswalk | Steps 1–3 verified; final CI proof, GitHub checklist reconciliation and release-head review remain open |
+| **T8** | `cce2c6e`, `1c678de` strict selected-target CLI, evidence parser, injected unsupported-feature control and CI artifact capture; local legacy skip investigation recorded in tuning plan | Verified at `6c42be9`, CI `38124760443`: static LLVM22 build, selected 13/13, seven validated LLVM/manifest artifact sets; three legacy JIT skips retained with diagnostics |
+| **T9** | `d48a46d` smoke negative controls; `106a1dc`, `841e193`, `118b267`, `149f260` matrix, branch status and G1–G10 crosswalk | Steps 1–4 verified; revision-pinned CI matrix added. Historical closure checkboxes require merge; branch evidence reconciliation and final review recorded below |
 
 At `1c678de`, the full local build succeeded and CTest registered 161 tests:
 157 passed, three skipped, and `MappedAVX2Acceptance` failed because the host
@@ -202,3 +202,25 @@ The path above is the observed local installation; Linux uses CI's pinned `$LLVM
 - Static-model agreement, target execution and calibrated prediction are separate claims. The plan does not expand into #51/#52 or accelerator hardware execution.
 - The plan retains exact-search completeness only within disclosed candidate/route/event/memory bounds. It makes no beam optimality promise.
 - Remaining implementation-sensitive choices have explicit defaults: strict rank-2 typed ABI, explicit reference/selected backend, canonical preview for final score, conservative ordered storage reuse, and missing measured metrics as missing data rather than zero.
+
+## Final CI evidence audit (2026-10-11)
+
+Source head `6c42be938d8f72ef3d66dc2731b3cfdfeb387b85` passes CI
+`38124760443` on Linux x86_64/AVX2, static LLVM22.1.8. Selected acceptance
+passes 13/13 without skips. CTest registers 1,215 entries: 1,211 pass, three
+legacy JIT entries skip, one pre-existing Triton entry is disabled, zero fail.
+Both downloaded-artifact validators pass; seven LLVM/selected-plan manifests
+record zero reference groups. Coverage, CodeQL and developer manual pass.
+See the leading matrix in `docs/reviews/issue67-final-acceptance.md` for all
+twelve criteria and capability boundaries.
+
+Ruling: tracker closure remains pending merge, as #129 requires merged evidence;
+branch implementation proof is published separately from historical delivery.
+
+Fresh-context final contract review found no critical/important actionable defect
+in unified conversion, guarded row-transfer normalization, backend identity,
+invocation/group enforcement, evidence capture and the acceptance matrix.
+Reviewer targeted CTest passed 9/9; documentation checks passed 4/4. The review
+sampled the large branch rather than auditing every added line; selected Linux
+execution proof comes from the pinned CI artifacts. A historical-section label
+was clarified to avoid confusing the old candidate status with current proof.

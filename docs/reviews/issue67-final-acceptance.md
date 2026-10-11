@@ -1,6 +1,79 @@
 # Issue #67 interim acceptance evidence
 
-## Issue #129 worktree update (not a release acceptance)
+## Verified PR #133 implementation evidence — 2026-10-11
+
+This section supersedes the candidate status below. Implementation head
+`6c42be938d8f72ef3d66dc2731b3cfdfeb387b85` passed the pinned Linux LLVM/MLIR
+22.1.8 static build and selected execution gate in
+[CI run 38124760443](https://github.com/skg7on/DSLCompiler/actions/runs/38124760443).
+The host was Ubuntu 24.04 x86_64, AMD EPYC 7763, with AVX2 and FMA available;
+C/C++ compilers were GNU 13.3.0 (`/usr/bin/cc` and `/usr/bin/c++`). The workflow uses the
+`llvmorg-22.1.8` release source archive and individual MLIR component libraries.
+The successful project link verifies the unified conversion, IndexToLLVM,
+VectorToSCF and VectorToLLVM dependencies on this static configuration.
+
+The downloaded `selected-avx2-execution-evidence` artifact contains the exact
+JIT LLVM dialect/LLVM IR and seven selected-plan manifests, selected width-4,
+width-8 and fused Vector IR, host/toolchain record, selected numeric XML/log,
+and full CTest JUnit/log. Both checked-in evidence validators were rerun against
+the downloaded artifact and passed. Each manifest records `selected-target`,
+`x86-avx2`, architecture `x86_64`, required feature `avx2`, and zero reference
+groups; the ABI, machine, selected plan and lowered IR identities are retained.
+The embedded compiler version identifies the configured build; the source
+revision is established by the Actions run's `headSha` above.
+
+- Required selected executable: **13 passed, zero failed, zero skipped**.
+- Full CTest: **1,215 registered; 1,211 passed, zero failed, three skipped,
+  one disabled**. Linux discovers individual GoogleTests, so this count is not
+  directly comparable to the older local aggregate-test counts.
+- Required mapped AVX2 and allocation lifetime entries passed; randomized
+  BF16 matmul/SwiGLU, padded M/N/K tails, multiple outputs, width-4 and required
+  transform/no-transform controls passed.
+- Legacy `SwiGLUScalar.JitCompilationSmoke` and `E2EWithAbiWrapper` skipped;
+  their logs report unavailable JIT and the preceding scalar lowering diagnostic
+  `expected add/mul op in the body`. `SwiGLUVectorAVX2.Correctness` skipped with
+  unavailable JIT. These are legacy-path limitations, not missing host AVX2.
+  The remaining scalar/vector legacy pipeline cases passed. The pre-existing
+  `TritonStagedExecution.SwiGLUCorrectness` entry is disabled. None of these
+  outcomes is counted as numeric legacy execution proof.
+- Coverage [38124760379](https://github.com/skg7on/DSLCompiler/actions/runs/38124760379),
+  CodeQL [38124760438](https://github.com/skg7on/DSLCompiler/actions/runs/38124760438),
+  and developer manual [38124760399](https://github.com/skg7on/DSLCompiler/actions/runs/38124760399)
+  passed on this head; the manual deployment step was skipped by workflow policy.
+
+### Twelve-criterion implementation matrix
+
+All entries below refer to the same source head and full CI artifact. A passed
+implementation row does not imply that PR #133 has merged. Tracker closure
+still requires merged implementation. Production measurement persistence and
+calibration (#51/#52), accelerator hardware execution and unsupported generic
+programs remain outside this bounded acceptance contract.
+
+| §29 | Verified regression/integration evidence | Result and boundary |
+|---|---|---|
+| 1 Search round trip | CandidateInstantiationTest, SearchBindingLoaderTest, five MicroMappingAcceptancePipeline chains | Passed complete binding, parse/print and frozen replay |
+| 2 Machine topology | MachineModelV2LoaderTest, L0StaticBoundTest, L1ResourceDAGTest, ExactResourceOracleTest | Passed concrete resource and occupancy controls |
+| 3 Routing | MappingRoutingTest, RouteIdentityTest, MappingConnectionsTest, two-hop public chain | Passed SRAM→L2→DRAM with 256-byte L2 allocation |
+| 4 Declarative layout | MappingLayoutTest, SelectedVectorWidth, numeric width-4 and transform controls | Passed selected width-4/8 IR and numeric controls |
+| 5 Rules and fused groups | MappingRulesTest, SelectedGroupLoweringTest, FusedSelectedLowering, selected numeric SwiGLU | Passed searched fused group and invocation |
+| 6 Complete coverings | MappingCoveringSearchTest, CompletePlanEvaluationTest, ExactResourceOracleTest, L0StaticBoundTest | Passed capacity-feasible top-K and bounded independent oracle |
+| 7 Search modes | MappingPropertiesTest, ExactResourceOracleTest, MappingSearchBindingTest | Passed shared modes and honest bounded/capped search |
+| 8 Materialization | Five public chains, selected matmul/tail/transform/multi-output execution | Passed replay, named routes/storage and supported backend realization |
+| 9 Static performance parity | Five public chains, CompletePlanEvaluationTest | Passed static cycles/traffic/capacity parity; no calibrated prediction claim |
+| 10 AVX2 and legacy | MappedAVX2Acceptance 13/13; legacy pipeline tests and logs | Selected numeric/ownership gate passed; three legacy JIT skips explicitly retained |
+| 11 Second target | MappingGenericAcceleratorTargetTest, second-target-two-hop public chain | Passed static model/materialization/perf; no accelerator hardware claim |
+| 12 Determinism | MappingStableHashTest, MicroMappingBindPlanRoundtrip, five-chain fresh-process comparisons | Passed normalized report/IR and replay checks |
+
+### Issue reconciliation
+
+G1–G10's candidate regression crosswalk below is now backed by this passing x86
+run, including previously open G4/G10. #106's four original defects retain their
+merged #108 credit. The remaining #106/#109 integration items and #67 §29 rows
+map to this matrix and the R/E/T ledger. Because #129 requires **merged**
+implementation, historical unchecked closure boxes remain pending PR #133's
+merge; branch proof must not be presented as merged delivery.
+
+## Historical worktree update (local snapshot before `6c42be9`)
 
 The 2026-10-07 audited-head results below are historical and remain revision-
 pinned to that head. The current `feat/issue129-gap-closure` worktree has since
