@@ -249,6 +249,7 @@ mlir_target_link_libraries(MicroDialect PUBLIC
 # goes through mlir_target_link_libraries() inside MicroDialect itself, so the
 # dylib/archive split described below stays correct for every consumer.
 add_library(LLKPerf STATIC
+    lib/Perf/OpDAGBuilder.cpp
     lib/Perf/TileInfo.cpp
     lib/Perf/MicroDAG.cpp
     lib/Perf/MicroCostModel.cpp
