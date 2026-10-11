@@ -352,6 +352,7 @@ mlir_target_link_libraries(LLKMapping PRIVATE MLIRIR MLIRAsmParser)
 
 add_mlir_library(LLKKernel
     lib/Conversion/LLKKernel/Registry.cpp
+    lib/Conversion/LLKKernel/Contract.cpp
     DEPENDS LLKDialect MicroDialect LLKCommon
     LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon
 )
