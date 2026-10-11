@@ -427,6 +427,11 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
         return;
       cast.print(castOutput);
       castOutput << "\n";
+      for (mlir::Operation *user : cast.getResult(0).getUsers()) {
+        castOutput << "  used by: ";
+        user->print(castOutput);
+        castOutput << "\n";
+      }
     });
     castOutput.flush();
     std::string message =
