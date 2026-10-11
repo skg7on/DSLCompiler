@@ -653,8 +653,13 @@ TEST(MappedAcceptance, InvokesTheCompilerGeneratedMatmulAndChecksEveryElement) {
       compileChain(context, kMatmulSource, "matmul_M16_N64_K64");
   ASSERT_TRUE(static_cast<bool>(executable))
       << llvm::toString(executable.takeError());
+#ifdef LLK_REQUIRE_SELECTED_TARGET
+  EXPECT_NE((*executable)->executionIdentity().find("backend=selected-target"),
+            llvm::StringRef::npos);
+#else
   EXPECT_NE((*executable)->executionIdentity().find("backend=reference"),
             llvm::StringRef::npos);
+#endif
   EXPECT_NE((*executable)->executionIdentity().find("abi="),
             llvm::StringRef::npos);
   EXPECT_NE((*executable)->executionIdentity().find("lowered-ir-sha256="),
