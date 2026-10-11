@@ -45,18 +45,26 @@
 
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/TargetParser/Host.h"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -159,6 +167,90 @@ mlir::DialectRegistry buildRegistry() {
   return registry;
 }
 
+llk::MappedJitEvidenceSink
+acceptanceEvidenceSinkForDirectory(std::filesystem::path outputDirectory) {
+  return [outputDirectory](
+             const llk::MappedJitEvidence &evidence) -> llvm::Error {
+    std::string stem;
+    for (unsigned char character : evidence.entrySymbol)
+      stem.push_back(std::isalnum(character) || character == '_' ? character
+                                                                 : '_');
+    stem += "-" + std::to_string(evidence.planId);
+    const std::string dialectName = stem + ".llvm-dialect.mlir";
+    const std::string irName = stem + ".ll";
+    const std::string manifestName = stem + ".manifest.json";
+
+    std::error_code error;
+    std::filesystem::create_directories(outputDirectory, error);
+    if (error)
+      return llvm::createStringError(error, "cannot create evidence directory");
+
+    auto writeFile = [&](const std::string &name,
+                         llvm::StringRef contents) -> llvm::Error {
+      std::ofstream output(outputDirectory / name,
+                           std::ios::out | std::ios::binary | std::ios::trunc);
+      if (!output)
+        return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                       "cannot write selected evidence file '" +
+                                           name + "'");
+      output.write(contents.data(),
+                   static_cast<std::streamsize>(contents.size()));
+      output.flush();
+      if (!output)
+        return llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
+            "failed writing selected evidence file '" + name + "'");
+      return llvm::Error::success();
+    };
+
+    if (llvm::Error writeError = writeFile(dialectName, evidence.llvmDialect))
+      return writeError;
+    if (llvm::Error writeError = writeFile(irName, evidence.llvmIR))
+      return writeError;
+
+    llvm::json::Array features;
+    if (evidence.selectedTarget)
+      for (const std::string &feature :
+           evidence.selectedTarget->requiredFeatures)
+        features.emplace_back(feature);
+    llvm::json::Object manifest;
+    manifest["schema_version"] = 1;
+    manifest["entry_symbol"] = evidence.entrySymbol;
+    manifest["backend"] =
+        evidence.selectedTarget ? "selected-target" : "reference";
+    manifest["target"] = evidence.targetName;
+    manifest["plan_id"] = std::to_string(evidence.planId);
+    manifest["machine_hash"] = std::to_string(evidence.machineHash);
+    manifest["execution_identity"] = evidence.executionIdentity;
+    manifest["architecture"] = evidence.selectedTarget
+                                   ? evidence.selectedTarget->architecture
+                                   : std::string();
+    manifest["cpu"] =
+        evidence.selectedTarget ? evidence.selectedTarget->cpu : std::string();
+    manifest["required_features"] = std::move(features);
+    manifest["selected_groups_verified"] =
+        static_cast<int64_t>(evidence.selectedGroupsVerified);
+    manifest["backend_groups_realized"] =
+        static_cast<int64_t>(evidence.backendGroupsRealized);
+    manifest["reference_groups_lowered"] =
+        static_cast<int64_t>(evidence.referenceGroupsLowered);
+    manifest["abi_hash"] = std::to_string(evidence.abiHash);
+    manifest["llvm_dialect_file"] = dialectName;
+    manifest["llvm_ir_file"] = irName;
+    std::string manifestText =
+        llvm::formatv("{0:2}", llvm::json::Value(std::move(manifest))).str();
+    manifestText.push_back('\n');
+    return writeFile(manifestName, manifestText);
+  };
+}
+
+llk::MappedJitEvidenceSink acceptanceEvidenceSink() {
+  const char *directory = std::getenv("LLK_ACCEPTANCE_ARTIFACT_DIR");
+  if (!directory || directory[0] == '\0')
+    return {};
+  return acceptanceEvidenceSinkForDirectory(directory);
+}
+
 /// Runs the whole chain on `source` and returns the executable it produced:
 /// export to concrete Micro, search the shipped AVX2 target, and compile the
 /// plan the search selected.
@@ -170,7 +262,8 @@ compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
 #else
              llk::MappedBackend backend = llk::MappedBackend::Reference,
 #endif
-             llvm::StringRef scheduleDb = {}) {
+             llvm::StringRef scheduleDb = {},
+             llk::MappedJitEvidenceSink evidenceSink = {}) {
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::parseSourceString<mlir::ModuleOp>(sourceText, &context);
   if (!module)
@@ -232,6 +325,13 @@ compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
   llk::MappedCompileOptions compileOptions;
   compileOptions.entrySymbol = entrySymbol.str();
   compileOptions.backend = backend;
+  compileOptions.evidenceSink = std::move(evidenceSink);
+  if (!compileOptions.evidenceSink &&
+      backend == llk::MappedBackend::SelectedTarget)
+    compileOptions.evidenceSink = acceptanceEvidenceSink();
+  if (!compileOptions.evidenceSink &&
+      backend == llk::MappedBackend::SelectedTarget)
+    compileOptions.evidenceSink = acceptanceEvidenceSink();
   llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
       *module, **target, result->plans.front(), compileOptions);
   if (!compiled)
@@ -362,6 +462,8 @@ compileMicroKernel(mlir::MLIRContext &context, llvm::StringRef sourceText,
 #else
   options.backend = llk::MappedBackend::Reference;
 #endif
+  if (options.backend == llk::MappedBackend::SelectedTarget)
+    options.evidenceSink = acceptanceEvidenceSink();
   if (requireTransform) {
     llk::MappedCompileOptions boundOptions = options;
     boundOptions.stop = llk::MappedStop::MappedMicro;
@@ -585,6 +687,110 @@ TEST(MappedAcceptance, InvokesTheCompilerGeneratedMatmulAndChecksEveryElement) {
   // epilogue and the write-back all happened, in that order.
   for (size_t i = 0; i < out.storage.size(); ++i)
     EXPECT_EQ(fromBf16(out.storage[i]), 71.0f) << "element " << i;
+}
+
+TEST(MappedAcceptance, JitEvidenceSinkReceivesLlvmAndSelectedPlanMetadata) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  bool received = false;
+  llk::MappedJitEvidence captured;
+  auto sink = [&](const llk::MappedJitEvidence &evidence) -> llvm::Error {
+    captured = evidence;
+    received = true;
+    return llvm::Error::success();
+  };
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      compileChain(context, kMatmulSource, "matmul_M16_N64_K64",
+                   llk::MappedBackend::Reference, {}, sink);
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+  ASSERT_TRUE(received);
+  EXPECT_EQ(captured.entrySymbol, "matmul_M16_N64_K64");
+  EXPECT_NE(captured.executionIdentity.find("backend=reference"),
+            std::string::npos);
+  EXPECT_NE(captured.executionIdentity.find("|abi="), std::string::npos);
+  EXPECT_NE(captured.executionIdentity.find("|lowered-ir-sha256="),
+            std::string::npos);
+  EXPECT_NE(captured.llvmDialect.find("llvm.func"), std::string::npos);
+  EXPECT_NE(captured.llvmIR.find("define "), std::string::npos);
+  EXPECT_NE(captured.planId, 0u);
+  EXPECT_NE(captured.machineHash, 0u);
+  EXPECT_NE(captured.abiHash, 0u);
+  EXPECT_GT(captured.selectedGroupsVerified, 0u);
+}
+
+TEST(MappedAcceptance, EvidenceSinkWritesLlvmAndManifestFiles) {
+  struct TemporaryDirectory {
+    std::filesystem::path path =
+        std::filesystem::temp_directory_path() /
+        ("llk-mapped-evidence-" +
+         std::to_string(
+             std::chrono::steady_clock::now().time_since_epoch().count()));
+    ~TemporaryDirectory() {
+      std::error_code ignored;
+      std::filesystem::remove_all(path, ignored);
+    }
+  } temporary;
+
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      compileChain(context, kMatmulSource, "matmul_M16_N64_K64",
+                   llk::MappedBackend::Reference, {},
+                   acceptanceEvidenceSinkForDirectory(temporary.path));
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+
+  std::filesystem::path manifestPath;
+  std::filesystem::path dialectPath;
+  std::filesystem::path llvmIRPath;
+  for (const auto &entry :
+       std::filesystem::directory_iterator(temporary.path)) {
+    const std::string name = entry.path().filename().string();
+    if (name.ends_with(".manifest.json"))
+      manifestPath = entry.path();
+    else if (name.ends_with(".llvm-dialect.mlir"))
+      dialectPath = entry.path();
+    else if (name.ends_with(".ll"))
+      llvmIRPath = entry.path();
+  }
+  ASSERT_FALSE(manifestPath.empty());
+  ASSERT_FALSE(dialectPath.empty());
+  ASSERT_FALSE(llvmIRPath.empty());
+  std::ifstream manifestFile(manifestPath);
+  std::stringstream manifestText;
+  manifestText << manifestFile.rdbuf();
+  EXPECT_NE(manifestText.str().find("\"execution_identity\""),
+            std::string::npos);
+  EXPECT_NE(manifestText.str().find("\"abi_hash\""), std::string::npos);
+  EXPECT_NE(manifestText.str().find("\"plan_id\""), std::string::npos);
+  std::ifstream dialectFile(dialectPath);
+  std::stringstream dialectText;
+  dialectText << dialectFile.rdbuf();
+  EXPECT_NE(dialectText.str().find("llvm.func"), std::string::npos);
+  std::ifstream llvmIRFile(llvmIRPath);
+  std::stringstream llvmIRText;
+  llvmIRText << llvmIRFile.rdbuf();
+  EXPECT_NE(llvmIRText.str().find("define "), std::string::npos);
+}
+
+TEST(MappedAcceptance, EvidenceSinkFailureStopsJitCompilation) {
+  mlir::DialectRegistry registry = buildRegistry();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto sink = [](const llk::MappedJitEvidence &) -> llvm::Error {
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "evidence sink failed");
+  };
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      compileChain(context, kMatmulSource, "matmul_M16_N64_K64",
+                   llk::MappedBackend::Reference, {}, sink);
+  ASSERT_FALSE(static_cast<bool>(executable));
+  EXPECT_NE(llvm::toString(executable.takeError()).find("evidence sink failed"),
+            std::string::npos);
 }
 
 TEST(MappedAcceptance, InvokesTheCompilerGeneratedSwiGLUAndChecksEveryElement) {

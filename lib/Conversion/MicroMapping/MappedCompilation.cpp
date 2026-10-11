@@ -528,6 +528,13 @@ finishCompilation(MappedCompilation compilation, const MappingTarget *target,
   MappedJitOptions jitOptions;
   jitOptions.executionIdentity = compilation.executionIdentity;
   jitOptions.selectedTarget = compilation.codegenRequirements;
+  jitOptions.targetName = compilation.targetName;
+  jitOptions.planId = compilation.planId;
+  jitOptions.machineHash = compilation.machineHash;
+  jitOptions.selectedGroupsVerified = compilation.selectedGroupsVerified;
+  jitOptions.backendGroupsRealized = compilation.backendGroupsRealized;
+  jitOptions.referenceGroupsLowered = compilation.referenceGroupsLowered;
+  jitOptions.evidenceSink = options.evidenceSink;
   llvm::Expected<PreparedMappedKernel> prepared =
       prepareMappedKernelForInvocation(*compilation.module,
                                        options.entrySymbol);
@@ -548,6 +555,9 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
                     const mlir::llk::mapping::CoveringPlan &plan,
                     const MappedCompileOptions &options) {
   MappedCompilation compilation;
+  compilation.planId = plan.id;
+  compilation.machineHash = target.machine().contentHash;
+  compilation.targetName = target.name().str();
   compilation.executionIdentity =
       std::string("compiler=") + LLK_COMPILER_VERSION + "|backend=" +
       (options.backend == MappedBackend::SelectedTarget ? "selected-target"

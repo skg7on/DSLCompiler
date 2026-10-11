@@ -408,12 +408,42 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
     return abiError("lowering kernel '" + prepared.entrySymbol +
                     "' to the LLVM dialect failed");
 
+  std::string llvmDialect;
+  if (options.evidenceSink) {
+    llvm::raw_string_ostream llvmDialectOutput(llvmDialect);
+    module.print(llvmDialectOutput);
+    llvmDialectOutput.flush();
+  }
+
   auto llvmContext = std::make_unique<llvm::LLVMContext>();
   std::unique_ptr<llvm::Module> llvmModule =
       mlir::translateModuleToLLVMIR(module, *llvmContext);
   if (!llvmModule)
     return abiError("translating kernel '" + prepared.entrySymbol +
                     "' to LLVM IR failed");
+
+  if (options.evidenceSink) {
+    std::string llvmIR;
+    llvm::raw_string_ostream llvmIROutput(llvmIR);
+    llvmModule->print(llvmIROutput, nullptr);
+    llvmIROutput.flush();
+
+    MappedJitEvidence evidence;
+    evidence.entrySymbol = prepared.entrySymbol;
+    evidence.executionIdentity = executionIdentity;
+    evidence.targetName = options.targetName;
+    evidence.planId = options.planId;
+    evidence.machineHash = options.machineHash;
+    evidence.selectedGroupsVerified = options.selectedGroupsVerified;
+    evidence.backendGroupsRealized = options.backendGroupsRealized;
+    evidence.referenceGroupsLowered = options.referenceGroupsLowered;
+    evidence.abiHash = computeKernelAbiHash(prepared.abi);
+    evidence.selectedTarget = options.selectedTarget;
+    evidence.llvmDialect = std::move(llvmDialect);
+    evidence.llvmIR = std::move(llvmIR);
+    if (llvm::Error error = options.evidenceSink(evidence))
+      return std::move(error);
+  }
 
   // Checked before the module is handed to the JIT, so a kernel whose wrapper
   // was never generated fails with that fact rather than a lookup error.

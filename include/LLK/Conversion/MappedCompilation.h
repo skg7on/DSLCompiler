@@ -23,10 +23,12 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Runtime/MappedExecutable.h"
+#include "LLK/Runtime/MappedJitOptions.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/Support/Error.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -62,6 +64,8 @@ struct MappedCompileOptions {
   bool requireExecutable = true;
   MappedStop stop = MappedStop::Executable;
   MappedBackend backend = MappedBackend::Reference;
+  /// Optional observer for the exact LLVM input handed to the mapped JIT.
+  MappedJitEvidenceSink evidenceSink;
 };
 
 /// What a mapped compilation produced.
@@ -90,6 +94,9 @@ struct MappedCompilation {
   /// Declared ISA for a selected backend, retained for every reached stop.
   std::optional<mlir::llk::mapping::TargetCodegenRequirements>
       codegenRequirements;
+  uint64_t planId = 0;
+  uint64_t machineHash = 0;
+  std::string targetName;
   /// Compiler, target, math mode, and host/ISA contract identity.
   std::string executionIdentity;
 };

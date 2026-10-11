@@ -25,11 +25,17 @@ designed. T8 now requires the explicit `--require-selected-target` flag, and
 `SelectedTargetFlagContract` injects an unavailable AVX2 feature and confirms
 the required executable fails. CI runs selected AVX2 before full CTest and
 archives the JUnit/log, host/compiler/LLVM record, and selected
-width-4/width-8/fused Vector IR emitted by the codegen checks. No CI run on
-this branch head is recorded. T8's requested explicit LLVM IR and selected-plan
-manifest files are not yet in the workflow artifact list. T9's current workflow smoke
-and DocReferences both pass locally; the full closure matrix remains
-incomplete.
+width-4/width-8/fused Vector IR emitted by the codegen checks. The workflow now
+also captures the post-lowering LLVM dialect, translated LLVM IR, and selected
+plan manifest from the exact JIT input, validates their execution identity,
+target, ABI, feature, and group-count fields, and uploads all three artifacts.
+Local evidence-sink capture, file writing, error propagation, and validator
+controls pass. The full arm64 CTest run has one expected required-target failure
+(`MappedAVX2Acceptance`, host architecture `aarch64`) and three capability skips;
+the required-evidence parser rejects it. No CI run on this branch head is
+recorded, so selected-x86 execution and the LLVM22 static-link gate remain open.
+T9's current workflow smoke and DocReferences pass locally; the full closure
+matrix remains incomplete.
 
 ### Candidate branch matrix (local evidence; not final acceptance)
 

@@ -853,6 +853,9 @@ set_tests_properties(MappedAllocationLifetimeTest PROPERTIES LABELS "mapped-refe
 add_test(NAME RequiredExecutionEvidenceParser
     COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Execution/check_required_execution_test.py)
 set_tests_properties(RequiredExecutionEvidenceParser PROPERTIES LABELS "mapped-reference")
+add_test(NAME SelectedExecutionEvidenceValidator
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Execution/check_selected_execution_evidence.py --self-test)
+set_tests_properties(SelectedExecutionEvidenceValidator PROPERTIES LABELS "selected-avx2")
 
 add_llvm_executable(SwiGLUFusedMemory test/Execution/swiglu_fused_memory.cpp)
 target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})

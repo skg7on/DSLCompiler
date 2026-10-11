@@ -86,6 +86,7 @@ jobs:
 
       - name: Run selected AVX2 acceptance
         run: |
+          export LLK_ACCEPTANCE_ARTIFACT_DIR="$GITHUB_WORKSPACE/build/selected-execution-evidence"
           uname -a | tee build/selected-avx2-host.txt
           lscpu | grep -E 'Architecture|Model name|Flags' | head -n 3 | tee -a build/selected-avx2-host.txt
           cmake -LA -N build | grep -E '^CMAKE_(C|CXX)_COMPILER:FILEPATH=' | tee -a build/selected-avx2-host.txt
@@ -95,6 +96,7 @@ jobs:
           ./MappedAVX2Acceptance --require-selected-target \
             --gtest_filter=MappedAcceptance.* \
             --gtest_output=xml:selected-avx2-results.xml 2>&1 | tee selected-avx2.log
+          python3 ../test/Execution/check_selected_execution_evidence.py selected-execution-evidence
 
       - name: Run tests
         run: |
@@ -116,3 +118,4 @@ jobs:
             build/selected-avx2-host.txt
             build/SelectedVectorWidth/selected-width-*.mlir
             build/SelectedVectorWidth/selected-fused.mlir
+            build/selected-execution-evidence/*
