@@ -1402,6 +1402,13 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
           $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
   )
+  add_test(NAME WorkflowSmokeNegativeControls
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke_test.py
+          ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke_manifest.json
+          ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
+          $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
+  )
   # Stage C5: the shared mapped-compilation path, taken by the compiler. A
   # plan is searched, bound, verified, handed to the target's own emitters where
   # they implement it, lowered, bufferized and JIT-compiled -- and the compiler

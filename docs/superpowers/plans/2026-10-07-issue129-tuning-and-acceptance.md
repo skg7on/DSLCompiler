@@ -377,7 +377,7 @@ for name in required:
 
 **Interfaces:** Consumes every release gate. Produces exact revision/toolchain/host/capability/test-artifact evidence for each normative criterion and each issue finding. DocReferences remains link/help lint; WorkflowSmoke executes a small allowlisted set of actual documented commands with controlled output directories.
 
-- [ ] **Step 1: Add a workflow smoke test with real arguments.** Cover parse/export, mapped search/report, frozen replay/verify, compiler lowered stop, micro-perf static output and mapped-tune static output. Use checked-in fixtures and actual option values. It must fail for a nonexistent fixture or invalid pass option; do not execute arbitrary shell fences from Markdown.
+- [x] **Step 1: Add a workflow smoke test with real arguments.** Cover parse/export, mapped search/report, frozen replay/verify, compiler lowered stop, micro-perf static output and mapped-tune static output. Use checked-in fixtures and actual option values. It must fail for a nonexistent fixture or invalid pass option; do not execute arbitrary shell fences from Markdown. `WorkflowSmokeNegativeControls` proves that a missing fixture root and invalid `llk-opt` option fail through the manifest runner.
 
 ```python
 for command in manifest["commands"]:
@@ -389,7 +389,7 @@ for command in manifest["commands"]:
 
 `manifest_outputs` is a local manifest lookup function implemented here; commands are JSON argv arrays, never eval/shell text. The docs reference the same fixtures/options, and a drift check compares those exact examples to the manifest.
 
-- [ ] **Step 2: Run DocReferences and WorkflowSmoke.** Correct the claimed scope of each check and replace stale examples/options. Preserve runnable relative CLI commands in docs; the evidence table identifies the actual isolated checkout and revision separately.
+- [x] **Step 2: Run DocReferences and WorkflowSmoke.** Correct the claimed scope of each check and replace stale examples/options. Preserve runnable relative CLI commands in docs; the evidence table identifies the actual isolated checkout and revision separately. At the current candidate tree, `DocReferences`, `WorkflowSmoke`, and `WorkflowSmokeNegativeControls` pass.
 - [ ] **Step 3: Write the criterion matrix using exact artifacts:**
 
 | Design §29 | Required repaired evidence |
