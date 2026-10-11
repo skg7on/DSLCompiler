@@ -50,6 +50,9 @@ public:
   pickMatrixEngine(llvm::StringRef requested, std::string &reason) const = 0;
   virtual const machine::ComputeNode *
   pickVectorEngine(std::string &reason) const = 0;
+  /// Select the conversion capability from the current transform executor.
+  virtual const machine::ComputeNode *
+  pickTransformEngine(std::string &reason) const = 0;
   virtual uint64_t vectorCycles(const machine::ComputeNode *engine,
                                 llvm::StringRef dtype,
                                 uint64_t elements) const = 0;

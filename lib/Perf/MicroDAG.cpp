@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/MicroDAG.h"
+#include "LLK/Perf/OpDAGBuilder.h"
 
 #include "MicroTileInfo.h"
 
@@ -42,18 +43,6 @@ namespace {
 llvm::Error invalid(const llvm::Twine &message) {
   return llvm::make_error<llvm::StringError>(message.str(),
                                              llvm::inconvertibleErrorCode());
-}
-
-/// The plain shaped type the shared transform-cost model reads. A `!micro.tile`
-/// carries its shape and element type the same way a ranked tensor does, but
-/// the cost model sits below the dialect, so the tile is presented to it as the
-/// shaped type it describes.
-mlir::Type shapedCostType(mlir::Type type) {
-  if (llvm::isa<mlir::ShapedType>(type))
-    return type;
-  if (auto tile = llvm::dyn_cast<micro::TileType>(type))
-    return mlir::RankedTensorType::get(tile.getShape(), tile.getElementType());
-  return type;
 }
 
 /// Trip count of a `micro.for`/`micro.spatial_for` when both bounds and the
@@ -149,8 +138,10 @@ llvm::StringRef transformExecutor(mlir::Operation &op) {
 class DAGBuilder {
 public:
   DAGBuilder(const machine::MachineModel &machine, llvm::StringRef kernelName,
+             const OpDAGBuilderRegistry &builders,
              const MeasuredOverrides *measured = nullptr)
-      : machine(machine), kernelName(kernelName.str()), measured(measured) {}
+      : machine(machine), builders(builders), kernelName(kernelName.str()),
+        measured(measured) {}
 
   llvm::Expected<MicroDAG> run(mlir::Operation *kernel);
 
@@ -171,6 +162,97 @@ private:
     /// Buffers a body must hold at once: pipeline stages, times the owners a
     /// spatial loop spreads its iterations over.
     uint64_t storageFactor = 1;
+  };
+
+  class Context final : public OpDAGBuildContext {
+  public:
+    Context(DAGBuilder &builder, mlir::Operation &op, State &state)
+        : builder(builder), op(op), state(state) {}
+    mlir::Operation &operation() const override { return op; }
+    const machine::MachineModel &machineModel() const override {
+      return builder.machine;
+    }
+    llvm::StringRef kernelName() const override { return builder.kernelName; }
+    uint32_t emitEvent(MicroEvent event, mlir::ValueRange inputs,
+                       mlir::ValueRange outputs,
+                       llvm::ArrayRef<uint32_t> extraDeps = {}) override {
+      auto deps = builder.producerDeps(inputs);
+      llvm::append_range(deps, extraDeps);
+      if (event.kind != EventKind::Wait && event.kind != EventKind::Barrier)
+        builder.applyMeasuredDuration(op, event);
+      uint32_t id = builder.addEvent(std::move(event), state, deps);
+      for (mlir::Value output : outputs)
+        builder.producers[output] = id;
+      return id;
+    }
+    void aliasValue(mlir::Value result, mlir::Value source) override {
+      builder.inheritProducer(result, source);
+    }
+    std::string memoryOf(mlir::Value value) const override {
+      return builder.memoryOf(value);
+    }
+    void accountStorage(llvm::StringRef memory, uint64_t bytes) override {
+      builder.noteStorage(op, memory, bytes, state.storageFactor);
+    }
+    void noteUnsizable(const TileInfo &info) override {
+      builder.noteUnsizable(info, op);
+    }
+    void noteWarning(std::string message) override {
+      builder.noteWarning(std::move(message));
+    }
+    void noteLayoutUsage(llvm::StringRef engine,
+                         const std::vector<std::string> &supported,
+                         llvm::StringRef layout) override {
+      builder.noteLayoutUsage(engine, supported, layout);
+    }
+    llvm::Error buildLogicalTile(mlir::Value source, mlir::Value result,
+                                 const std::optional<std::string> &owner,
+                                 EventKind kind) override {
+      return builder.buildLogicalTileOp(op, source, result, owner, kind, state);
+    }
+    llvm::Error buildMovement(llvm::StringRef src, llvm::StringRef dst,
+                              const TileInfo &source, const TileInfo &result,
+                              EventKind kind,
+                              llvm::ArrayRef<mlir::Value> outputs) override {
+      return builder.buildCopyOp(op, src, dst, source, result, kind, state,
+                                 outputs);
+    }
+    llvm::Error noteAllocation(const TileInfo &info,
+                               llvm::StringRef memory) override {
+      return builder.noteAllocation(op, info, memory, state);
+    }
+    const machine::ComputeNode *
+    pickMatrixEngine(llvm::StringRef requested,
+                     std::string &reason) const override {
+      return builder.pickMatrixEngine(
+          requested.empty() ? mappedComputeEngine(op, "matrix_engine")
+                            : requested,
+          reason, mappedExecutor(op));
+    }
+    const machine::ComputeNode *
+    pickVectorEngine(std::string &reason) const override {
+      return builder.pickVectorEngine(mappedComputeEngine(op, "vector_engine"),
+                                      reason, mappedExecutor(op));
+    }
+    const machine::ComputeNode *
+    pickTransformEngine(std::string &reason) const override {
+      return builder.pickVectorEngine("", reason, transformExecutor(op));
+    }
+    uint64_t vectorCycles(const machine::ComputeNode *engine,
+                          llvm::StringRef dtype,
+                          uint64_t elements) const override {
+      return builder.vectorCycles(engine, dtype, elements);
+    }
+    uint64_t mmaCycles(const machine::ComputeNode &engine,
+                       llvm::ArrayRef<int64_t> shape,
+                       uint64_t flops) const override {
+      return builder.mmaCycles(engine, shape, flops);
+    }
+
+  private:
+    DAGBuilder &builder;
+    mlir::Operation &op;
+    State &state;
   };
 
   llvm::Error walkBlock(mlir::Block &block, State state,
@@ -260,6 +342,7 @@ private:
   const machine::MemoryNode *soleMemoryOfKind(llvm::StringRef kind) const;
 
   const machine::MachineModel &machine;
+  const OpDAGBuilderRegistry &builders;
   std::string kernelName;
   std::vector<PlannedRoute> routes;
   /// Each declared route, by the connection id it was declared under. A stamped
@@ -955,361 +1038,11 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
 
 llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
   ++opOccurrences[&op];
-  if (auto view = llvm::dyn_cast<micro::TileViewOp>(op))
-    return buildLogicalTileOp(op, view.getSource(), view.getResult(),
-                              std::nullopt, EventKind::TileView, state);
-
-  if (auto partition = llvm::dyn_cast<micro::TilePartitionOp>(op)) {
-    std::optional<std::string> owner;
-    if (std::optional<micro::OwnerAttr> attr = partition.getOwner())
-      owner = attr->getSymbol().str();
-    return buildLogicalTileOp(op, partition.getSource(), partition.getResult(),
-                              owner, EventKind::TilePartition, state);
-  }
-
-  if (auto alloc = llvm::dyn_cast<micro::TileAllocOp>(op)) {
-    TileInfo info = describeType(alloc.getResult().getType());
-    return noteAllocation(op, info, info.memory, state);
-  }
-
-  if (auto alloc = llvm::dyn_cast<micro::AllocOp>(op)) {
-    TileInfo info = describeType(alloc.getResult().getType());
-    return noteAllocation(
-        op, info, micro::stringifyMemorySpace(alloc.getMemory()), state);
-  }
-
-  if (auto copy = llvm::dyn_cast<micro::TileAsyncCopyOp>(op)) {
-    TileInfo resultInfo = describeType(copy.getResult().getType());
-    TileInfo sourceInfo = describeType(copy.getSource().getType());
-    std::string src = memoryOf(copy.getSource());
-    if (src.empty())
-      src = "dram"; // an untagged operand is an external buffer
-    return buildCopyOp(op, src,
-                       micro::stringifyMemorySpace(copy.getDstMemory()),
-                       sourceInfo, resultInfo, EventKind::AsyncCopy, state,
-                       {copy.getResult(), copy.getToken()});
-  }
-
-  if (auto copy = llvm::dyn_cast<micro::AsyncCopyOp>(op)) {
-    TileInfo resultInfo = describeType(copy.getResult().getType());
-    TileInfo sourceInfo = describeType(copy.getSource().getType());
-    return buildCopyOp(op, micro::stringifyMemorySpace(copy.getSrcMemory()),
-                       micro::stringifyMemorySpace(copy.getDstMemory()),
-                       sourceInfo, resultInfo, EventKind::AsyncCopy, state,
-                       {copy.getResult(), copy.getToken()});
-  }
-
-  if (auto store = llvm::dyn_cast<micro::TileStoreOp>(op)) {
-    TileInfo sourceInfo = describeType(store.getSource().getType());
-    std::string src = memoryOf(store.getSource());
-    if (src.empty())
-      src = "sram"; // a tile without a tag came from on-chip storage
-    return buildCopyOp(op, src,
-                       micro::stringifyMemorySpace(store.getDstMemory()),
-                       sourceInfo, TileInfo(), EventKind::Store, state, {});
-  }
-
-  if (auto store = llvm::dyn_cast<micro::StoreOp>(op)) {
-    TileInfo sourceInfo = describeType(store.getSource().getType());
-    return buildCopyOp(op, micro::stringifyMemorySpace(store.getSrcMemory()),
-                       micro::stringifyMemorySpace(store.getDstMemory()),
-                       sourceInfo, TileInfo(), EventKind::Store, state, {});
-  }
-
-  if (auto mma = llvm::dyn_cast<micro::MmaOp>(op)) {
-    llvm::StringRef requested;
-    if (auto engineAttr = mma.getEngine())
-      requested = *engineAttr;
-    std::string reason;
-    const machine::ComputeNode *engine = pickMatrixEngine(
-        requested.empty() ? mappedComputeEngine(op, "matrix_engine")
-                          : requested,
-        reason, mappedExecutor(op));
-    if (!engine)
-      return invalid("kernel '" + kernelName + "' uses micro.mma: " + reason);
-
-    llvm::ArrayRef<int64_t> shape = mma.getShape();
-    if (shape.size() != 3)
-      return invalid("micro.mma shape must have three dimensions");
-
-    uint64_t macs = static_cast<uint64_t>(shape[0]) *
-                    static_cast<uint64_t>(shape[1]) *
-                    static_cast<uint64_t>(shape[2]);
-    std::string inputDtype = micro::stringifyDType(mma.getInput()).str();
-    std::string accumulatorDtype =
-        micro::stringifyDType(mma.getAccumulator()).str();
-    if (!llvm::is_contained(engine->elementTypes, inputDtype))
-      noteWarning("micro.mma input dtype '" + inputDtype +
-                  "' is not supported by engine '" + engine->id +
-                  "' (supported: " + llvm::join(engine->elementTypes, ", ") +
-                  ")");
-    if (!llvm::is_contained(engine->accumulatorDTypes, accumulatorDtype))
-      noteWarning(
-          "micro.mma accumulator dtype '" + accumulatorDtype +
-          "' is not supported by engine '" + engine->id +
-          "' (supported: " + llvm::join(engine->accumulatorDTypes, ", ") + ")");
-
-    TileInfo lhsInfo = describeType(mma.getLhs().getType());
-    TileInfo accInfo = describeType(mma.getAcc().getType());
-
-    MicroEvent event;
-    event.kind = EventKind::Mma;
-    event.resource = ResourceKind::MatrixEngine;
-    // An op that names no engine runs on the first engine of its class; one
-    // that names an engine runs there. Either way the event names a single
-    // pool, so two events naming the same engine share its slots instead of
-    // each being handed the whole machine.
-    event.resourceName = engine->id;
-    event.ownerPool = mappedExecutor(op).str();
-    event.workItems = macs;
-    event.minCycles = mmaCycles(*engine, shape, 2 * macs);
-    applyMeasuredDuration(op, event);
-    event.sourceOpName = op.getName().getStringRef().str();
-    event.tileShape = shapeString(shape);
-    event.tileLayout = lhsInfo.layout.empty() ? accInfo.layout : lhsInfo.layout;
-    event.tileMemory = accInfo.memory;
-    event.tileOwner = accInfo.owner;
-    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
-
-    uint32_t id =
-        addEvent(std::move(event), state,
-                 producerDeps({mma.getLhs(), mma.getRhs(), mma.getAcc()}));
-    producers[mma.getResult()] = id;
+  const auto *handler = builders.lookup(op.getName().getStringRef());
+  if (!handler)
     return llvm::Error::success();
-  }
-
-  if (auto vector = llvm::dyn_cast<micro::VectorOp>(op)) {
-    std::string reason;
-    const machine::ComputeNode *engine = pickVectorEngine(
-        mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
-    if (!engine)
-      return invalid("kernel '" + kernelName +
-                     "' uses micro.vector: " + reason);
-
-    TileInfo resultInfo = describeType(vector.getResult().getType());
-    MicroEvent event;
-    event.kind = EventKind::Vector;
-    event.resource = ResourceKind::VectorEngine;
-    event.resourceName = engine->id;
-    event.ownerPool = mappedExecutor(op).str();
-    event.workItems = resultInfo.elements();
-    event.minCycles =
-        vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
-    applyMeasuredDuration(op, event);
-    event.sourceOpName = op.getName().getStringRef().str();
-    event.tileShape = shapeString(resultInfo.shape);
-    event.tileLayout = resultInfo.layout;
-    event.tileMemory = resultInfo.memory;
-    event.tileOwner = resultInfo.owner;
-    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
-
-    uint32_t id =
-        addEvent(std::move(event), state, producerDeps(vector.getInputs()));
-    producers[vector.getResult()] = id;
-    return llvm::Error::success();
-  }
-
-  if (auto reduce = llvm::dyn_cast<micro::ReduceOp>(op)) {
-    std::string reason;
-    const machine::ComputeNode *engine = pickVectorEngine(
-        mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
-    if (!engine)
-      return invalid("kernel '" + kernelName +
-                     "' uses micro.reduce: " + reason);
-
-    TileInfo inputInfo = describeType(reduce.getInput().getType());
-    MicroEvent event;
-    event.kind = EventKind::Reduce;
-    event.resource = ResourceKind::VectorEngine;
-    event.resourceName = engine->id;
-    event.ownerPool = mappedExecutor(op).str();
-    event.workItems = inputInfo.elements();
-    event.minCycles =
-        vectorCycles(engine, inputInfo.dtype, inputInfo.elements());
-    applyMeasuredDuration(op, event);
-    event.sourceOpName = op.getName().getStringRef().str();
-    event.tileShape = shapeString(inputInfo.shape);
-    event.tileLayout = inputInfo.layout;
-    event.tileMemory = inputInfo.memory;
-    event.tileOwner = inputInfo.owner;
-    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
-
-    uint32_t id =
-        addEvent(std::move(event), state, producerDeps({reduce.getInput()}));
-    producers[reduce.getResult()] = id;
-    return llvm::Error::success();
-  }
-
-  if (auto gather = llvm::dyn_cast<micro::GatherOp>(op)) {
-    // A gather combines several producer values, so it is real compute work on
-    // the engine the plan selected -- charged like the reduction it performs,
-    // never folded into the zero-cost path. Its semantics must be one the model
-    // understands; an undeclared or unknown kind is rejected rather than
-    // charged some invented cost.
-    if (!micro::symbolizeGatherKind(gather.getKind()))
-      return invalid("kernel '" + kernelName +
-                     "' uses micro.gather: unknown "
-                     "gather kind '" +
-                     gather.getKind().str() + "'");
-    std::string reason;
-    const machine::ComputeNode *engine = pickVectorEngine(
-        mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
-    if (!engine)
-      return invalid("kernel '" + kernelName +
-                     "' uses micro.gather: " + reason);
-
-    TileInfo resultInfo = describeType(gather.getResult().getType());
-    MicroEvent event;
-    event.kind = EventKind::Reduce;
-    event.resource = ResourceKind::VectorEngine;
-    event.resourceName = engine->id;
-    event.ownerPool = mappedExecutor(op).str();
-    event.workItems = resultInfo.elements();
-    event.minCycles =
-        vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
-    applyMeasuredDuration(op, event);
-    event.sourceOpName = op.getName().getStringRef().str();
-    event.tileShape = shapeString(resultInfo.shape);
-    event.tileLayout = resultInfo.layout;
-    event.tileMemory = resultInfo.memory;
-    event.tileOwner = resultInfo.owner;
-    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
-
-    uint32_t id =
-        addEvent(std::move(event), state, producerDeps(gather.getInputs()));
-    producers[gather.getResult()] = id;
-    return llvm::Error::success();
-  }
-
-  if (auto transform = llvm::dyn_cast<micro::TransformOp>(op)) {
-    // A conversion is real work: it runs on a compute capability like the other
-    // mapped elementwise work, and its selected resource is the executor the
-    // plan stamped on it (`micro.engine`, task B8) -- the same one the planner
-    // charged -- falling back to `micro.mapping` and then the machine default.
-    // A hand-written or pre-B8 kernel may instead name the resource directly
-    // with `micro.compute_resource`; when present it wins over the stamped
-    // executor, so a stale or misspelled resource is rejected rather than
-    // silently charged against some other engine.
-    std::string reason;
-    const machine::ComputeNode *engine = nullptr;
-    if (mlir::Attribute raw = op.getAttr("micro.compute_resource")) {
-      auto resource = mlir::dyn_cast<mlir::StringAttr>(raw);
-      engine = resource ? machine.findCompute(resource.getValue()) : nullptr;
-      if (!engine || engine->kind != "vector_engine")
-        return invalid("micro.transform selects an invalid vector resource");
-    } else {
-      engine = pickVectorEngine("", reason, transformExecutor(op));
-    }
-    if (!engine)
-      return invalid("kernel '" + kernelName +
-                     "' uses micro.transform: " + reason);
-
-    TileInfo sourceInfo = describeType(transform.getSource().getType());
-    TileInfo resultInfo = describeType(transform.getResult().getType());
-    // The conversion reads the memory its source landed in and writes its
-    // output there: a logical view carries no memory of its own, so the
-    // producing event is asked (as `memoryOf` does for a copy source).
-    std::string sourceMemory = memoryOf(transform.getSource());
-    std::string destination =
-        resultInfo.memory.empty() ? sourceMemory : resultInfo.memory;
-
-    // A hand-written or pre-B8 kernel may name the landing memory explicitly;
-    // the stamp wins over the memory the result type implies, so the cost model
-    // charges the placement the kernel actually declared.
-    if (mlir::Attribute raw = op.getAttr("micro.memory_node")) {
-      auto memory = mlir::dyn_cast<mlir::StringAttr>(raw);
-      if (!memory)
-        return invalid("micro.transform memory node is not a string");
-      destination = memory.getValue().str();
-    }
-
-    // The one shared estimate the planner and the simulator both charge. An
-    // unknown resource or footprint comes back as an error, never a silent
-    // zero, so a mis-modeled conversion cannot vanish from the report.
-    mapping::TransformCostInput costInput;
-    costInput.inputType = shapedCostType(transform.getSource().getType());
-    costInput.outputType = shapedCostType(transform.getResult().getType());
-    if (std::optional<mlir::AffineMap> srcMap = transform.getSrcMap())
-      costInput.srcMap = *srcMap;
-    if (std::optional<mlir::AffineMap> dstMap = transform.getDstMap())
-      costInput.dstMap = *dstMap;
-    costInput.memoryNode = destination;
-    costInput.computeResource = engine->id;
-
-    llvm::Expected<mapping::Cost> cost =
-        mapping::estimateTransformCost(costInput, machine);
-    if (!cost)
-      return invalid("kernel '" + kernelName + "' uses micro.transform: " +
-                     llvm::toString(cost.takeError()));
-
-    MicroEvent event;
-    event.kind = EventKind::Transform;
-    event.resource = ResourceKind::VectorEngine;
-    event.resourceName = engine->id;
-    event.ownerPool = transformExecutor(op).str();
-    event.workItems =
-        resultInfo.elements() ? resultInfo.elements() : sourceInfo.elements();
-    event.bytes = cost->localBytes;
-    event.minCycles = static_cast<uint64_t>(std::ceil(cost->latencyCycles));
-    applyMeasuredDuration(op, event);
-    event.sourceOpName = op.getName().getStringRef().str();
-    event.tileShape = shapeString(resultInfo.shape.empty() ? sourceInfo.shape
-                                                           : resultInfo.shape);
-    event.tileLayout =
-        resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
-    event.tileMemory = destination;
-    event.srcMemory = sourceMemory;
-    event.tileOwner =
-        resultInfo.owner.empty() ? sourceInfo.owner : resultInfo.owner;
-    noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
-
-    const uint64_t bytes = event.bytes;
-    uint32_t id = addEvent(std::move(event), state,
-                           producerDeps({transform.getSource()}));
-    // The result is produced by this event, so every consumer depends on the
-    // conversion rather than on whatever produced its input.
-    producers[transform.getResult()] = id;
-    // The conversion materializes a fresh output buffer, which the capacity
-    // check must see.
-    noteStorage(op, destination, bytes, state.storageFactor);
-    return llvm::Error::success();
-  }
-
-  if (auto wait = llvm::dyn_cast<micro::WaitOp>(op)) {
-    MicroEvent event;
-    event.kind = EventKind::Wait;
-    event.resource = ResourceKind::Sync;
-    event.resourceName = "sync";
-    event.minCycles = machine.sync.waitCycles;
-    event.sourceOpName = op.getName().getStringRef().str();
-    addEvent(std::move(event), state, producerDeps(wait.getTokens()));
-    return llvm::Error::success();
-  }
-
-  if (auto barrier = llvm::dyn_cast<micro::BarrierOp>(op)) {
-    // A barrier is charged as synchronization, not as free program order. Its
-    // scope must be one the dialect and the machine can express; an unknown
-    // scope is rejected rather than silently treated as a full-machine fence.
-    if (!micro::symbolizeBarrierScope(barrier.getScope()))
-      return invalid("kernel '" + kernelName +
-                     "' uses micro.barrier: unknown "
-                     "barrier scope '" +
-                     barrier.getScope().str() + "'");
-    MicroEvent event;
-    event.kind = EventKind::Barrier;
-    event.resource = ResourceKind::Sync;
-    event.resourceName = "sync";
-    event.minCycles = machine.sync.barrierCycles;
-    event.sourceOpName = op.getName().getStringRef().str();
-    // A barrier depends on every token it covers, so the work it orders cannot
-    // be scheduled as if the barrier were absent.
-    addEvent(std::move(event), state, producerDeps(barrier.getTokens()));
-    return llvm::Error::success();
-  }
-
-  // Everything else -- arithmetic feeding loop bounds, micro.yield -- has no
-  // execution cost in the MVP model.
-  return llvm::Error::success();
+  Context context(*this, op, state);
+  return (*handler)(op, context);
 }
 
 llvm::Error DAGBuilder::buildLogicalTileOp(
@@ -1582,12 +1315,20 @@ llvm::Expected<MicroDAG> DAGBuilder::run(mlir::Operation *kernel) {
 llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
                                        const machine::MachineModel &machine,
                                        const MeasuredOverrides *measured) {
+  auto builders = makeDefaultOpDAGBuilders();
+  return buildMicroDAG(kernel, machine, builders, measured);
+}
+
+llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
+                                       const machine::MachineModel &machine,
+                                       const OpDAGBuilderRegistry &builders,
+                                       const MeasuredOverrides *measured) {
   auto kernelOp = llvm::dyn_cast<micro::KernelOp>(kernel);
   if (!kernelOp)
     return invalid("expected a micro.kernel, got '" +
                    kernel->getName().getStringRef() + "'");
 
-  DAGBuilder builder(machine, kernelOp.getSymName(), measured);
+  DAGBuilder builder(machine, kernelOp.getSymName(), builders, measured);
   return builder.run(kernel);
 }
 
