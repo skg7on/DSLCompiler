@@ -4,6 +4,7 @@
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta name="color-scheme" content="light dark"><meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="index" title="Index" href="genindex.html"><link rel="search" title="Search" href="search.html"><link rel="prev" title="Contributing" href="contributing.html">
+        <link rel="canonical" href="https://skg7on.github.io/DSLCompiler/building-docs.html">
 
     <!-- Generated with Sphinx 9.1.0 and Furo 2025.12.19 -->
         <title>Build and maintain this manual - MicroIR Developer Manual</title>
@@ -379,8 +380,25 @@ builds the manual with
 warnings treated as errors. Each successful run uploads a <code class="docutils literal notranslate"><span class="pre">developer-manual</span></code>
 artifact containing the HTML directory. The compiler CI separately runs
 <code class="docutils literal notranslate"><span class="pre">DocReferences</span></code> and <code class="docutils literal notranslate"><span class="pre">CommunityTutorials</span></code> against freshly built binaries.</p>
-<p>An HTML artifact can be served by any static host. The workflow builds and
-packages it; site publication is a separate repository-maintainer decision.</p>
+</section>
+<section id="published-site">
+<h2>Published site<a class="headerlink" href="#published-site" title="Link to this heading">¶</a></h2>
+<p>The manual is served from GitHub Pages at
+<code class="docutils literal notranslate"><span class="pre">https://skg7on.github.io/DSLCompiler/</span></code>. On every push to <code class="docutils literal notranslate"><span class="pre">main</span></code> the
+workflow deploys the directory it just built to the <code class="docutils literal notranslate"><span class="pre">github-pages</span></code>
+environment; pull requests build and verify the same way but never publish.</p>
+<p>The deployed tree is the one the <em>Check committed HTML is current</em> step proved
+identical to <code class="docutils literal notranslate"><span class="pre">docs/manual/html/</span></code>, so merging is what changes the live site —
+regenerating and committing the HTML is the editor’s release step, not an
+extra one. Run <code class="docutils literal notranslate"><span class="pre">git</span> <span class="pre">pull</span></code> on <code class="docutils literal notranslate"><span class="pre">main</span></code> before trusting a local preview that
+should match the public page.</p>
+<p>Publication needs the repository’s Pages source set to <strong>GitHub Actions</strong>
+(Settings → Pages). Without it the <code class="docutils literal notranslate"><span class="pre">deploy</span></code> job fails while <code class="docutils literal notranslate"><span class="pre">html</span></code> still
+passes, so a missing setting never blocks the build or the diff check. Once
+the source is set, the deployed URL is reported as the <code class="docutils literal notranslate"><span class="pre">github-pages</span></code>
+environment URL on the workflow run.</p>
+<p>Any HTML artifact remains servable by any other static host; Pages is the
+project’s chosen one.</p>
 </section>
 </section>
 
@@ -436,6 +454,7 @@ packages it; site publication is a separate repository-maintainer decision.</p>
 <li><a class="reference internal" href="#edit-a-page">Edit a page</a></li>
 <li><a class="reference internal" href="#verify-commands-and-artifacts">Verify commands and artifacts</a></li>
 <li><a class="reference internal" href="#continuous-integration">Continuous integration</a></li>
+<li><a class="reference internal" href="#published-site">Published site</a></li>
 </ul>
 </li>
 </ul>

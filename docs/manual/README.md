@@ -1,5 +1,8 @@
 # MicroIR developer manual
 
+Published at **<https://skg7on.github.io/DSLCompiler/>**, updated automatically
+from `main`.
+
 Open [`html/index.html`](html/index.html) in a browser. The HTML directory includes search, navigation, styles, the architecture diagram, and downloadable examples. It can be copied or served independently.
 
 | Location | Purpose |

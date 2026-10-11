@@ -133,5 +133,25 @@ warnings treated as errors. Each successful run uploads a ``developer-manual``
 artifact containing the HTML directory. The compiler CI separately runs
 ``DocReferences`` and ``CommunityTutorials`` against freshly built binaries.
 
-An HTML artifact can be served by any static host. The workflow builds and
-packages it; site publication is a separate repository-maintainer decision.
+Published site
+--------------
+
+The manual is served from GitHub Pages at
+``https://skg7on.github.io/DSLCompiler/``. On every push to ``main`` the
+workflow deploys the directory it just built to the ``github-pages``
+environment; pull requests build and verify the same way but never publish.
+
+The deployed tree is the one the *Check committed HTML is current* step proved
+identical to ``docs/manual/html/``, so merging is what changes the live site —
+regenerating and committing the HTML is the editor's release step, not an
+extra one. Run ``git pull`` on ``main`` before trusting a local preview that
+should match the public page.
+
+Publication needs the repository's Pages source set to **GitHub Actions**
+(Settings → Pages). Without it the ``deploy`` job fails while ``html`` still
+passes, so a missing setting never blocks the build or the diff check. Once
+the source is set, the deployed URL is reported as the ``github-pages``
+environment URL on the workflow run.
+
+Any HTML artifact remains servable by any other static host; Pages is the
+project's chosen one.

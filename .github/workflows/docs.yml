@@ -36,3 +36,31 @@ jobs:
           name: developer-manual
           path: build/docs/html/
           if-no-files-found: error
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/docs/html/
+
+  # Publishes the manual to https://skg7on.github.io/DSLCompiler/ on main only.
+  # Requires the repository's Pages source to be "GitHub Actions". The deployed
+  # tree is the same build/docs/html that the html job just proved matches the
+  # committed docs/manual/html, so the live site cannot drift from the checkout.
+  deploy:
+    needs: html
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    # Own group, and deliberately not cancel-in-progress: the workflow-level
+    # group above cancels the previous run on every push, which would abort a
+    # deploy halfway and leave the site serving a partial tree.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
