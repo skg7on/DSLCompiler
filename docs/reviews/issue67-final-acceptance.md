@@ -27,6 +27,14 @@ head, and the full T7 numeric matrix and final whole-suite CI artifact still
 need completion. The `WorkflowSmoke` manifest is an allowlisted argv list; its
 commands use checked-in fixtures and controlled output paths.
 
+At commit `8c16fe2`, the local full suite registered 159 tests: 155 passed, one
+failed, and three were skipped. The one failure was `MappedAVX2Acceptance`,
+which correctly rejected this arm64 host; the required-evidence parser read the
+JUnit report and rejected that result. The three skips were `SwigluScalar`,
+`SwiGLUVector` and the portable `MappedAcceptance` GTest binary (which itself
+reported four passes and two AVX2 skips). This full run validates the fail-closed
+gate on arm64; it does not substitute for a passing x86 CI run.
+
 Interim, revision-pinned evidence for the twelve normative §29 acceptance
 criteria of the
 [MicroIR-inspired enhancement design](../superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md).
