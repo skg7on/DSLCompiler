@@ -155,15 +155,16 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   pm.addPass(mlir::createConvertControlFlowToLLVMPass());
   // Lower arithmetic ops to LLVM dialect.
   pm.addPass(mlir::createArithToLLVMConversionPass());
-  // Arithmetic lowering may materialize `ub.poison` for undefined results.
-  // Convert UB operations before translating the LLVM dialect to LLVM IR.
-  pm.addPass(mlir::createUBToLLVMConversionPass());
   // Lower math ops (exp, erf, etc.) to LLVM dialect.
   pm.addPass(mlir::createConvertMathToLLVMPass());
   // Lower func ops (function boundaries) to LLVM dialect.
   pm.addPass(mlir::createConvertFuncToLLVMPass());
   // Lower memref ops to LLVM dialect (finalizes the MemRef→LLVM conversion).
   pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+  // Arithmetic lowering may materialize `ub.poison` for undefined results.
+  // Lower UB after all other types have reached LLVM form so this conversion
+  // does not leave casts between pre- and post-conversion types.
+  pm.addPass(mlir::createUBToLLVMConversionPass());
   // Drop the materializations the conversions inserted and then left unused --
   // an `i64 -> index` cast with no users, typically, from lowering a loop's
   // induction variable. Reconciliation only removes casts whose types agree, so
