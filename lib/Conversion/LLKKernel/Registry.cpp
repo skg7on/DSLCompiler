@@ -10,10 +10,10 @@ void registerAttentionLowering(LLKKernelRegistry &);
 void registerMatmulLowering(LLKKernelRegistry &);
 void registerLinalgMatmulLowering(LLKKernelRegistry &);
 void populateLLKKernelLowerings(LLKKernelRegistry &r) {
-  registerSwiGLULowering(r);
-  registerRoPELowering(r);
-  registerAttentionLowering(r);
-  registerMatmulLowering(r);
-  registerLinalgMatmulLowering(r);
+  registerSwiGLULowering(r);       // Linalg + Micro
+  registerRoPELowering(r);         // Linalg
+  registerAttentionLowering(r);    // Linalg
+  registerMatmulLowering(r);       // Linalg + Micro
+  registerLinalgMatmulLowering(r); // Micro compatibility adapter
 }
 } // namespace mlir::llk

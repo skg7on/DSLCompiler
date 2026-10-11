@@ -145,4 +145,4 @@ cmake --build build --target check-llk
 
 ## Execution ledger
 
-Plan written after reviewing the merged spec and current root export/transform implementations. No production edits or test runs have occurred yet. Implementation awaits review of the interface amendments above.
+User approved the interface amendments. Implementation and local verification are recorded in `docs/reviews/issue138-implementation-verification.md`; pinned Linux CI and independent review are the final acceptance gates.

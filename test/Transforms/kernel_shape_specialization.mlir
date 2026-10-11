@@ -30,3 +30,11 @@ func.func @dynamic_shape(%x: tensor<?x64xbf16>, %wg: tensor<64x64xbf16>,
   return %y : tensor<?x64xbf16>
 }
 
+func.func @rope_test(%x: tensor<1x1x128x64xf32>, %pos: tensor<128xi64>, %init: tensor<1x1x128x64xf32>) -> tensor<1x1x128x64xf32> {
+  // expected-remark @below {{M=1 -> bucket 0}}
+  %y = llk.rope ins(%x, %pos : tensor<1x1x128x64xf32>, tensor<128xi64>)
+      outs(%init : tensor<1x1x128x64xf32>)
+      {theta = 10000.0 : f64, math_mode = #llk.math_mode<bounded_fast>}
+      -> tensor<1x1x128x64xf32>
+  return %y : tensor<1x1x128x64xf32>
+}

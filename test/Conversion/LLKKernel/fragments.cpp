@@ -58,3 +58,33 @@ TEST(KernelContractTest, FragmentsRetainCallbackAndInitSemantics) {
   EXPECT_EQ(gate->getAttrOfType<StringAttr>("math_mode").getValue(),
             "bounded_fast");
 }
+
+TEST(KernelContractTest, LinalgMatmulExplicitAccumulatorAndInit) {
+  MLIRContext ctx;
+  ctx.getOrLoadDialect<linalg::LinalgDialect>();
+  OpBuilder b(&ctx);
+  Block block;
+  b.setInsertionPointToEnd(&block);
+  auto loc = b.getUnknownLoc();
+  auto a =
+      block.addArgument(RankedTensorType::get({2, 4}, b.getBF16Type()), loc);
+  auto rhs =
+      block.addArgument(RankedTensorType::get({4, 8}, b.getBF16Type()), loc);
+  auto init =
+      block.addArgument(RankedTensorType::get({2, 8}, b.getBF16Type()), loc);
+  auto op =
+      linalg::MatmulOp::create(b, loc, ValueRange{a, rhs}, ValueRange{init});
+  op->setAttr("accumulator_type", TypeAttr::get(b.getF32Type()));
+  llk::LLKKernelRegistry r;
+  llk::populateLLKKernelLowerings(r);
+  auto *entry = r.lookup("linalg.matmul");
+  ASSERT_NE(entry, nullptr);
+  llk::KernelContract c;
+  ASSERT_TRUE(succeeded(entry->inferContract(op, c)));
+  EXPECT_EQ(c.accumulatorElemType, b.getF32Type());
+  llk::MicroKernelFragment f;
+  ASSERT_TRUE(succeeded(entry->describeMicroKernel(op, c, f)));
+  EXPECT_TRUE(f.hasOutputInit);
+  EXPECT_EQ(f.armCount, 1u);
+  EXPECT_EQ(f.rhsOperandTypes.front(), rhs.getType());
+}

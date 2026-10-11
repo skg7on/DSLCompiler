@@ -1,4 +1,3 @@
-#include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/LLKEnums.h"
 #include "LLK/Transforms/Common/MathApproximation.h"
@@ -39,6 +38,12 @@ using namespace mlir;
 #include "LLK/Dialect/Micro/MicroOps.h.inc"
 
 namespace {
+TypeAttr accumulatorType(Operation *root) {
+  if (auto attr = root->getAttrOfType<TypeAttr>("accumulator_type"))
+    return attr;
+  return TypeAttr::get(
+      cast<ShapedType>(root->getResult(0).getType()).getElementType());
+}
 class LinalgMatmulLowering final : public llk::LLKKernelLowering {
 public:
   StringRef getOpName() const override { return "linalg.matmul"; }
@@ -47,9 +52,7 @@ public:
     c.workload = "matmul";
     return llk::inferContractionContract(
         root, root->getOperand(0), root->getOperand(1), root->getResult(0),
-        TypeAttr::get(
-            cast<ShapedType>(root->getResult(0).getType()).getElementType()),
-        c);
+        accumulatorType(root), c);
   }
   bool hasMicroLowering() const override { return true; }
   LogicalResult
@@ -58,9 +61,7 @@ public:
     auto validated = c;
     if (failed(llk::validateMicroContraction(
             root, root->getOperand(0), root->getOperand(1), root->getResult(0),
-            TypeAttr::get(cast<ShapedType>(root->getResult(0).getType())
-                              .getElementType()),
-            validated)))
+            accumulatorType(root), validated)))
       return failure();
     f.armCount = 1;
     f.hasOutputInit = true;

@@ -616,3 +616,8 @@ endif()
 if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(LLKMatmulToLinalg test/Conversion/matmul_to_linalg.mlir --llk-to-linalg)
 endif()
+
+if(LLK_BUILD_TOOLS)
+  add_llk_filecheck_test(LLKKernelSearchCapabilityGate
+      test/Conversion/LLKToMicro/kernel_capability_gate.mlir --llk-to-micro-search-space)
+endif()

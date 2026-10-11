@@ -1,7 +1,7 @@
 //===- ScheduleSelection.cpp - Deterministic schedule lookup from DB ------===//
 //
 // Loads schedule_db.json and selects the best-matching schedule entry for
-// each llk.fused_swiglu operation based on (M_bucket, N, K).
+// each registered LLK kernel based on its shared contract.
 //
 // Fallback order: exact match → relax K → relax N → bucket default → built-in.
 //
@@ -24,10 +24,9 @@
 using namespace mlir;
 
 // ---------------------------------------------------------------------------
-// M bucket classifier (duplicated from ShapeSpecialization for pass isolation)
+// Shared schedule loader
 // ---------------------------------------------------------------------------
 
-using llk::classifyM;
 using llk::loadScheduleDB;
 using llk::ScheduleEntry;
 using llk::selectBestSchedule;

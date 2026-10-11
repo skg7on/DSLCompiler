@@ -1,6 +1,6 @@
 //===- ShapeSpecialization.cpp - M dimension bucketing pass ---------------===//
 //
-// Classifies the M dimension of llk.fused_swiglu operations into one of
+// Classifies the M dimension of registered LLK kernels into one of
 // 5 buckets used by the schedule selection system.
 //
 // M buckets:

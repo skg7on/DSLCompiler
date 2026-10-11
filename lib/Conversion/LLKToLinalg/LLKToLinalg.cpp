@@ -1,7 +1,6 @@
 //===- LLKToLinalg.cpp - Lower LLK ops to Linalg + Arith + Math -----------===//
 //
-// Lowers llk.fused_swiglu, llk.rope, and llk.attention into linalg named ops
-// + generic ops + arith + math.
+// Dispatches registered kernel lowerings into Linalg + Arith + Math.
 //
 //===----------------------------------------------------------------------===//
 

@@ -73,9 +73,8 @@ using llk::ScheduleEntry;
 
 using namespace mlir::llk::kernel_driver;
 namespace {
-LogicalResult inferRootInfo(Operation *root, llk::KernelContract &info) {
-  llk::LLKKernelRegistry registry;
-  llk::populateLLKKernelLowerings(registry);
+LogicalResult inferMicroContract(const llk::LLKKernelRegistry &registry,
+                                 Operation *root, llk::KernelContract &info) {
   auto *entry = registry.lookup(root->getName().getStringRef());
   if (!entry || !entry->hasMicroLowering())
     return failure();
@@ -157,7 +156,7 @@ struct LLKToMicroPass
         return;
       }
       llk::KernelContract info;
-      if (failed(inferRootInfo(root, info))) {
+      if (failed(inferMicroContract(registry, root, info))) {
         signalPassFailure();
         return;
       }
@@ -235,7 +234,7 @@ struct LLKToMicroSearchSpacePass
 
     for (Operation *root : roots) {
       llk::KernelContract info;
-      if (failed(inferRootInfo(root, info))) {
+      if (failed(inferMicroContract(registry, root, info))) {
         signalPassFailure();
         return;
       }
@@ -283,7 +282,7 @@ exportMicroKernelFromSchedule(ModuleOp module, StringRef sourceSymbol,
 
   Operation *root = roots[sourceRootOrdinal];
   llk::KernelContract info;
-  if (failed(inferRootInfo(root, info)))
+  if (failed(inferMicroContract(registry, root, info)))
     return fail("selected source root is not supported");
   TilePlan plan;
   plan.inputElemType = info.inputElemType;
