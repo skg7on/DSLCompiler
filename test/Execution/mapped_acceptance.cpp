@@ -65,11 +65,11 @@ using mlir::llk::mapping::MappingSearchResult;
 using mlir::llk::mapping::MappingTarget;
 using mlir::llk::mapping::SearchMode;
 
-/// `bfloat16` is the top half of an `f32`, which is all these chains need: the
-/// operands are ones and every expected result is a power of two.
+/// Store the high 16 bits as the BF16 representation used by the ABI fixtures.
 uint16_t toBf16(float value) {
   uint32_t bits;
   std::memcpy(&bits, &value, sizeof(bits));
+  bits += 0x7fffu + ((bits >> 16) & 1u); // round to nearest, ties to even
   return static_cast<uint16_t>(bits >> 16);
 }
 
@@ -78,6 +78,22 @@ float fromBf16(uint16_t value) {
   float result;
   std::memcpy(&result, &bits, sizeof(result));
   return result;
+}
+
+float nextSignedValue(uint32_t &state) {
+  state ^= state << 13;
+  state ^= state >> 17;
+  state ^= state << 5;
+  return static_cast<float>(state & 0xffffu) / 65535.0f - 0.5f;
+}
+
+bool selectedAvx2Available() {
+  const std::string triple = llvm::sys::getDefaultTargetTriple();
+  if (triple.rfind("x86_64-", 0) != 0)
+    return false;
+  const auto features = llvm::sys::getHostCPUFeatures();
+  auto avx2 = features.find("avx2");
+  return avx2 != features.end() && avx2->second;
 }
 
 /// The LLK source of `test/Conversion/MicroMapping/matmul_e2e.mlir`. The
@@ -208,7 +224,7 @@ compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
   return std::move(compiled->executable);
 }
 
-/// One all-ones bf16 buffer of `rows` x `columns`.
+/// One bf16 buffer of `rows` x `columns`.
 struct Buffer {
   std::vector<uint16_t> storage;
   MemRef2D descriptor;
@@ -245,11 +261,9 @@ std::string matmulSource(int64_t M, int64_t N, int64_t K) {
          output + "\n  }\n}\n";
 }
 
-void fillSignedBf16(Buffer &buffer, int64_t seed) {
-  for (size_t i = 0; i < buffer.storage.size(); ++i) {
-    int64_t numerator = (static_cast<int64_t>(i) * 17 + seed * 11) % 31 - 15;
-    buffer.storage[i] = toBf16(static_cast<float>(numerator) / 8.0f);
-  }
+void fillSignedBf16(Buffer &buffer, uint32_t &state) {
+  for (uint16_t &value : buffer.storage)
+    value = toBf16(nextSignedValue(state));
 }
 
 float storedBf16(const Buffer &buffer, size_t index) {
@@ -272,11 +286,9 @@ struct FloatBuffer {
   }
 };
 
-void fillSigned(FloatBuffer &buffer, int64_t seed) {
-  for (size_t i = 0; i < buffer.storage.size(); ++i) {
-    int64_t numerator = (static_cast<int64_t>(i) * 13 + seed * 7) % 19 - 9;
-    buffer.storage[i] = static_cast<float>(numerator) / 8.0f;
-  }
+void fillSigned(FloatBuffer &buffer, uint32_t &state) {
+  for (float &value : buffer.storage)
+    value = nextSignedValue(state);
 }
 
 void expectPaddedMatmul(mlir::MLIRContext &context, llk::MappedBackend backend,
@@ -301,10 +313,14 @@ void expectPaddedMatmul(mlir::MLIRContext &context, llk::MappedBackend backend,
 
   Buffer a(M, K, 0.0f);
   Buffer b(K, N, 0.0f);
-  fillSignedBf16(a, 3);
-  fillSignedBf16(b, 11);
+  uint32_t state = 0x12967u;
+  fillSignedBf16(a, state);
+  fillSignedBf16(b, state);
   FloatBuffer init(M, N, 0.0f);
-  fillSigned(init, 5);
+  fillSigned(init, state);
+  const auto originalA = a.storage;
+  const auto originalB = b.storage;
+  const auto originalInit = init.storage;
 
   std::vector<float> guarded(static_cast<size_t>(M * N) + 2, -77.0f);
   MemRef2D descriptor{guarded.data(), guarded.data() + 1, 0, M, N, N, 1};
@@ -332,6 +348,9 @@ void expectPaddedMatmul(mlir::MLIRContext &context, llk::MappedBackend backend,
   }
   EXPECT_EQ(guarded.front(), -77.0f);
   EXPECT_EQ(guarded.back(), -77.0f);
+  EXPECT_EQ(a.storage, originalA);
+  EXPECT_EQ(b.storage, originalB);
+  EXPECT_EQ(init.storage, originalInit);
 }
 
 } // namespace
@@ -458,40 +477,42 @@ TEST(MappedAcceptance, ExecutesPaddedTailsWithNonzeroAccumulators) {
   mlir::MLIRContext context(registry);
   context.loadAllAvailableDialects();
 
-  for (const std::array<int64_t, 3> shape :
-       {std::array<int64_t, 3>{5, 9, 7}, {1, 17, 3}, {17, 65, 63}})
+  for (const std::array<int64_t, 3> shape : {std::array<int64_t, 3>{16, 64, 64},
+                                             {5, 9, 7},
+                                             {1, 17, 3},
+                                             {17, 65, 63}})
     expectPaddedMatmul(context, llk::MappedBackend::Reference, shape[0],
                        shape[1], shape[2]);
 }
 
 TEST(MappedAcceptance, SelectedAvx2ExecutesThePaddedTailFixtures) {
-  const std::string hostTriple = llvm::sys::getDefaultTargetTriple();
-  if (hostTriple.rfind("x86_64-", 0) != 0)
+  if (!selectedAvx2Available()) {
+#ifdef LLK_REQUIRE_SELECTED_TARGET
+    FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+#else
     GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
-  const auto hostFeatures = llvm::sys::getHostCPUFeatures();
-  auto avx2 = hostFeatures.find("avx2");
-  if (avx2 == hostFeatures.end() || !avx2->second)
-    GTEST_SKIP() << "selected AVX2 invocation requires host AVX2";
+#endif
+  }
 
   mlir::DialectRegistry registry = buildRegistry();
   mlir::MLIRContext context(registry);
   context.loadAllAvailableDialects();
 
-  for (const std::array<int64_t, 3> shape :
-       {std::array<int64_t, 3>{5, 9, 7}, {1, 17, 3}, {17, 65, 63}})
+  for (const std::array<int64_t, 3> shape : {std::array<int64_t, 3>{16, 64, 64},
+                                             {5, 9, 7},
+                                             {1, 17, 3},
+                                             {17, 65, 63}})
     expectPaddedMatmul(context, llk::MappedBackend::SelectedTarget, shape[0],
                        shape[1], shape[2]);
 }
 
 TEST(MappedAcceptance, SelectedAvx2BackendExecutesNumerically) {
-  const std::string hostTriple = llvm::sys::getDefaultTargetTriple();
-  if (hostTriple.rfind("x86_64-", 0) != 0) {
+  if (!selectedAvx2Available()) {
+#ifdef LLK_REQUIRE_SELECTED_TARGET
+    FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+#else
     GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
-  }
-  const auto hostFeatures = llvm::sys::getHostCPUFeatures();
-  auto avx2 = hostFeatures.find("avx2");
-  if (avx2 == hostFeatures.end() || !avx2->second) {
-    GTEST_SKIP() << "selected AVX2 invocation requires host AVX2";
+#endif
   }
 
   mlir::DialectRegistry registry = buildRegistry();
