@@ -100,7 +100,7 @@ After :doc:`Tutorial 2 </tutorials/02-mapping>`:
    build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
      build/tutorial/matmul.mapped.mlir > build/tutorial/matmul.mapped.perf.yaml
 
-Keep this report beside ``matmul.plan.json``. They currently use shared infrastructure but do **not** guarantee equal planner/perf cycles, DRAM traffic, or complete physical resource accounting. The :source:`gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>` explains the disagreement and `#129 <https://github.com/skg7on/DSLCompiler/issues/129>`__ plans common bound-kernel analysis.
+Keep this report beside ``matmul.plan.json``. PR #133 uses shared normalized materialized analysis and verifies planner/perf cycles, DRAM traffic and capacity in all five public chains. Compare equivalent source/plan/machine configurations and preserve the reports. Static parity is not calibrated hardware prediction; see the :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`.
 
 .. _tutorials-03-performance-5-compare-a-machine-change-responsibly:
 

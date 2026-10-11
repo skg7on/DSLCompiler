@@ -44,7 +44,7 @@ These configuration files serve different purposes:
    build/bin/llk-opt "--micro-verify-mapping=$TARGET_OPTIONS" build/tutorial/matmul.mapped.mlir \
      > build/tutorial/matmul.verified.mlir
 
-The mapped kernel gains ``micro.plan``, placement metadata on covered operations, and route/movement metadata where needed. The report includes hashes of the input and target configuration, search options, diagnostic counts, retained plans, and a selected plan ID. The verifier checks the implemented metadata contract; it does not close the complete physical-feasibility gaps tracked in #129.
+The mapped kernel gains ``micro.plan``, placement metadata on covered operations, and route/movement metadata where needed. The report includes hashes of the input and target configuration, search options, diagnostic counts, retained plans, and a selected plan ID. Verification checks persisted selected facts, and complete-plan analysis checks physical storage/lifetimes before retention. Unsupported execution decisions are rejected; exact search remains bounded.
 
 Inspect the report using Python, without an extra JSON utility:
 
@@ -102,7 +102,7 @@ To request JIT compilation through the mapped path:
    build/bin/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
      --mapping-mode=exact docs/manual/source/examples/matmul.mlir
 
-Expected: a compilation-success status if this host/build supports the path. The CLI does not accept tensor data or invoke the resulting function. Numerical invocation uses ``MappedExecutable`` in the C++ runtime and is demonstrated in the :source:`mapped acceptance tests <test/Execution/mapped_acceptance.cpp>`. Repeated invocation ownership, richer ABI validation, and selected-target realization remain work in #129.
+Expected: a compilation-success status if this host/build supports the path. The CLI does not accept tensor data or invoke the resulting function. Numerical invocation uses ``MappedExecutable`` in the C++ runtime and is demonstrated in the :source:`mapped acceptance tests <test/Execution/mapped_acceptance.cpp>`. Typed invocation checks dtype, rank-two shapes, strides and backing bounds; compiler scratch is released per call. Selected AVX2 execution is verified separately from portable reference execution in the acceptance matrix.
 
 .. _tutorials-02-mapping-5-optional-second-target-experiment:
 

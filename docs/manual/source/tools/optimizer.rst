@@ -268,7 +268,7 @@ All three passes require exactly one ``micro.kernel``. They do not export semant
      - ``0``
      - With ``1``, reject decisions the binder cannot materialize instead of binding a partial plan with warnings.
 
-The module's supported ``micro.objective`` controls comparison order; absent one, latency minimization is used. Inspect report provenance, cap/truncation fields, and diagnostics rather than assuming the selected plan is globally optimal. Exact mode still works within internal enumeration/resource caps. Current storage validation can reject plans **after** top-K retention, so increasing top-K may expose a legal plan but does not establish a complete feasibility guarantee. The :source:`current gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>` explains this and other resource-model limits.
+The module's supported ``micro.objective`` controls comparison order; absent one, latency minimization is used. Inspect report provenance, cap/truncation fields, and diagnostics rather than assuming the selected plan is globally optimal. Exact mode still works within internal enumeration/resource caps. Complete-plan evaluation finalizes materialization/storage and shared static analysis **before** top-K retention. The :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>` records feasible-top-K controls and bounded-search limits.
 
 .. _tools-optimizer-save-an-analysis-report-without-binding:
 
@@ -327,7 +327,7 @@ Verification has three boundaries:
 
 #. A target emitter validates/interprets its selected bundle during mapped compilation.
 
-``micro-verify-mapping`` has only the five configuration keys. It accepts no ``mode``, ``top-k``, ``beam-width``, ``report``, ``candidate``, or ``plan-id``, and it does not search. Verifying a saved module without loading its target cannot establish layer two. Passing layer two does not prove target code generation, measured performance, or complete physical-resource checking: shipped plans can report skipped storage finalization, and selected width/resource/fused execution gaps remain open.
+``micro-verify-mapping`` has only the five configuration keys. It accepts no ``mode``, ``top-k``, ``beam-width``, ``report``, ``candidate``, or ``plan-id``, and it does not search. Verifying a saved module without loading its target cannot establish layer two. Mapping verification resolves persisted decisions; execution and numerical correctness still require the backend/invocation gate. PR #133 separately verifies complete storage, selected width/fused realization and selected AVX2 execution. Partial analysis does not establish executable support.
 
 .. _tools-optimizer-reproduce-a-plan-id-with-micro-bind-plan:
 
@@ -405,7 +405,7 @@ Troubleshooting and next steps
    * - No complete plan / ``no_matching_rule``
      - Read the frontier diagnostics; check operation variant, dtype, layout and candidate requirements. Inspect truncation before concluding the workload is unmappable.
    * - No retained satisfiable storage plan
-     - Inspect physical footprint/capacity and the report/search limits. Top-K filtering and storage finalization currently have known ordering limitations.
+     - Inspect physical footprint/capacity and the report/search limits. Complete-plan feasibility is checked before retention; inspect concrete capacity facts and honest search caps.
    * - ``no plan ... has id``
      - Reproduce the original source, configuration, mode, top-K, beam width, and candidate. Do not search already-bound IR.
    * - Structural verification passes but mapping verification fails
@@ -417,4 +417,4 @@ Troubleshooting and next steps
    * - ``schedule-file``/``target-isa`` changes no output
      - These ``tile-and-vectorize`` options are currently unused. Use the active Micro schedule-database path for schedule experiments.
 
-Evaluate a concrete or mapped kernel with :doc:`micro-perf </tools/performance>`, explore schedules with :doc:`llk-tune </tools/tuning>`, and compile an explicit kernel ABI with :doc:`llk-compile </tools/compiler>`. :doc:`llk-bench </tools/benchmark>` measures a synthetic host harness; timing a compiled kernel requires a C++ invocation/measurement caller. Consult the :source:`current gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>` when interpreting mapping, resource, and execution claims.
+Evaluate a concrete or mapped kernel with :doc:`micro-perf </tools/performance>`, explore schedules with :doc:`llk-tune </tools/tuning>`, and compile an explicit kernel ABI with :doc:`llk-compile </tools/compiler>`. :doc:`llk-bench </tools/benchmark>` measures a synthetic host harness; verified timing uses target-aware tuning with a typed measurement fixture or a C++ invocation caller. Consult the :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>` for supported resource/execution claims.

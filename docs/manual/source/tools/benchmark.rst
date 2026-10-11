@@ -9,7 +9,7 @@ It does not load MLIR, use a schedule database, invoke the LLK JIT, or execute a
 selected mapped kernel. Its GFLOPS numbers are synthetic-workload throughput,
 not SwiGLU/GEMM compiler performance.
 
-This manual describes main revision ``bb82038`` (2026-10-07), checked against
+This harness remains separate from the mapped execution delivered in PR #133; see
 :source:`tools/llk-bench/llk-bench.cpp <tools/llk-bench/llk-bench.cpp>`. A mapped
 executable and its numerical tests are separate paths; their presence does not
 mean this benchmark invokes them.

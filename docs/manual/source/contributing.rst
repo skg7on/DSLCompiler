@@ -16,8 +16,8 @@ Read, build, then trace one workflow
 
 #. Read :doc:`concepts </concepts>`, :doc:`architecture </architecture>`, and
    :source:`CLAUDE.md <CLAUDE.md>`. For current status, consult the
-   :source:`gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>` alongside
-   historical completion claims.
+   :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`. The October 7
+   gap assessment records the historical pre-#133 baseline.
 
 #. Follow :doc:`getting started </getting-started>` to obtain a working toolchain.
 
@@ -210,9 +210,10 @@ include the verification actually run, and state any relevant limits. Record
 skips separately from passes. Distinguish static predictions, portable numerical
 correctness, selected-target execution and calibrated measurements.
 
-Before proposing a #129 repair, read its
+Before extending the PR #133 contracts, read the completed #129
 :source:`resource <docs/superpowers/plans/2026-10-07-issue129-resources-and-costs.md>`,
 :source:`runtime <docs/superpowers/plans/2026-10-07-issue129-execution-and-runtime.md>`, or
 :source:`tuner/acceptance <docs/superpowers/plans/2026-10-07-issue129-tuning-and-acceptance.md>`
 companion plan. Those documents coordinate shared interfaces and dependencies;
-their proposed APIs should not be treated as existing code.
+consult current headers and tests for implemented APIs; historical task prose
+is not a broader support promise.

@@ -26,8 +26,8 @@ This example deliberately offers one candidate, so you can learn the file format
 
 .. _tutorials-04-tuning-2-run-the-current-micro-tuner:
 
-2. Run the current Micro tuner
-------------------------------
+2. Run compatibility tuning
+---------------------------
 
 .. code-block:: bash
 
@@ -39,7 +39,7 @@ This example deliberately offers one candidate, so you can learn the file format
 
 The current spelling is ``--input``, not ``--search-space``. It writes schedule YAML; legacy ``-o`` selects a different output path in the legacy tuner. Expected output includes the workload and machine identity, hierarchy/layout/memory/owner choices, predicted metrics, and ``measurement.measured: false``.
 
-The current session builds a **synthetic concrete kernel** for a candidate and ranks its modeled costs. It does not map the original source through the selected LLKMap target, compile that selected plan, invoke it, or save actual latency measurements. Some emitted objective metrics are incomplete; read the :doc:`tuner manual </tools/tuning>` before optimizing a metric beyond predicted cycles. #129 supplies the plan for the missing mapping-driven path.
+Without ``--mapping-target``, this session builds a **synthetic concrete kernel** for a candidate and ranks its modeled costs. It does not map the original source through the selected LLKMap target, compile that selected plan, invoke it, or save actual latency measurements. Use the target-aware workflow below when preserving original-source semantics; see :doc:`the tuner manual </tools/tuning>` for backend and measurement controls.
 
 .. _tutorials-04-tuning-3-export-a-search-space-from-semantic-source:
 
@@ -53,7 +53,7 @@ The current session builds a **synthetic concrete kernel** for a candidate and r
    build/bin/llk-opt build/tutorial/swiglu.exported.search.mlir \
      > build/tutorial/swiglu.exported.search.roundtrip.mlir
 
-Inspect the parameters exported for the source and schedule database. The adjacent LLK source is retained, but the current CLI tuning flow uses the search-space description and explicit dimensions rather than compiling that adjacent source. A later mapping-driven implementation must preserve source semantics and provenance; this tutorial does not claim that integration already exists.
+Inspect the parameters exported for the source and schedule database. The adjacent LLK source is retained. Compatibility mode uses a synthetic workload; target-aware semantic mode selects the original function with ``--source-symbol`` and instantiates it for each binding.
 
 .. _tutorials-04-tuning-4-expand-the-choices:
 
@@ -93,9 +93,35 @@ Use a nonzero ``--max-candidates`` to bound a random experiment; omitting it or 
 5. Keep tuning and scheduling formats separate
 ----------------------------------------------
 
-Micro mode produces schedule YAML records. The legacy shape-grid path writes the JSON schedule database consumed by existing schedule selection. A Micro YAML output is not a drop-in ``schedule_db.json``. Binding selected search decisions into mapping, compiling verified executables, and persisting complete measured provenance are separate integration concerns.
+Micro mode produces schedule YAML records. The legacy shape-grid path writes the JSON schedule database consumed by existing schedule selection. A Micro YAML output is not a drop-in ``schedule_db.json``. Target-aware mode adds selected mapping reports, candidate source/plan artifacts and optional verified measurement sidecars; use those artifacts for complete mapped provenance.
 
 The :doc:`tuner manual </tools/tuning>` covers the legacy grid, supported options/defaults, workload/dtype controls, objectives, and persistence limits. For a meaningful contribution, add a regression that demonstrates one missing contract rather than a new heuristic that obscures it; see the :doc:`contributor guide </contributing>`.
+
+6. Tune and replay the original source
+--------------------------------------
+
+Use the small source-plus-space fixture validated by PR #133:
+
+.. code-block:: bash
+
+   build/bin/llk-tune --input=test/Tuning/Inputs/issue129/mapped_tune.mlir \
+     --machine=machines/x86-avx2-v2.yaml -M=8 -N=16 -K=32 \
+     --mapping-target=x86-avx2 --mapping-root=. --mapping-mode=exact \
+     --mapping-backend=reference --candidate-source=semantic --source-symbol=matmul \
+     --top-k=1 --mapping-report=build/tutorial/tune.json \
+     --candidate-artifacts=build/tutorial/candidates \
+     --output=build/tutorial/matmul.schedule.yaml
+
+Inspect ``tune.json``: retained candidates include full bindings and a selected
+plan report. Each candidate directory has the exact ``source.mlir`` and frozen
+``plan.json``; replay those together using the :doc:`tuner guide </tools/tuning>`.
+This reference-backend example is portable. Selected-target AVX2 requires a
+compatible x86_64 host and explicitly rejects fallback.
+
+For verified timing, append ``--measure-top=1`` and
+``--measurement-inputs=test/Tuning/Inputs/issue129/measurement_inputs.json``.
+This checks typed ports and output values and saves ``tune.json.measurements.json``.
+Static predictions and measurements remain separate; calibration is future work.
 
 .. _tutorials-04-tuning-verify-the-tutorial-set:
 
@@ -106,4 +132,5 @@ Verify the tutorial set
 
    python3 docs/manual/source/tutorials/run_tutorials.py --build-dir build
 
-The runner uses the same checked-in examples, writes its artifacts to ``build/tutorial-check/``, and verifies parsing/export, mapped plan replay, work/traffic fields, and predicted schedule records. It does not invoke tensor computations or establish selected ISA fidelity.
+The runner uses the same checked-in examples, writes its artifacts to ``build/tutorial-check/``, and verifies parsing/export, mapped plan replay, work/traffic fields, and predicted schedule records. It also checks original-source frozen replay and verified reference measurement.
+Selected ISA fidelity is established separately by the required AVX2 gate.

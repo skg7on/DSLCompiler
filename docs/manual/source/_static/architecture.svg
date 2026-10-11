@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 940" role="img" aria-labelledby="title desc">
 <title id="title">MicroIR compiler architecture</title>
-<desc id="desc">LLK semantic source feeds either the established CPU pipeline or the MicroIR exporter. Concrete MicroIR is mapped using machine facts and target policy, then analyzed or lowered through a portable reference bridge. Search IR currently feeds synthetic candidate analysis.</desc>
+<desc id="desc">LLK semantic source feeds either the established CPU pipeline or the MicroIR exporter. Concrete MicroIR is mapped using machine facts and target policy, then analyzed or lowered through selected-target or reference backends. Search IR and source feed target-aware candidate mapping and analysis.</desc>
 <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#54738a"/></marker></defs>
 <style>text{font-family:system-ui,-apple-system,Segoe UI,sans-serif;fill:#19384d;font-size:20px} .title{font-weight:650;font-size:22px}.small{font-size:17px;fill:#4b6475}.edge{fill:none;stroke:#54738a;stroke-width:2.5;marker-end:url(#arrow)}.node{fill:#fff;stroke:#769ab4;stroke-width:1.5;rx:10}</style>
 <rect width="1120" height="940" rx="16" fill="#f3f7fa"/>
@@ -66,7 +66,7 @@
 <text x="949.0" y="251.0" text-anchor="middle">micro.search_space</text>
 <rect class="node" x="826" y="316" width="246" height="68"/>
 <text x="949.0" y="345.0" text-anchor="middle">Candidate generation</text>
-<text x="949.0" y="369.0" text-anchor="middle">synthetic kernel binding</text>
+<text x="949.0" y="369.0" text-anchor="middle">source candidate mapping</text>
 <rect class="node" x="826" y="446" width="246" height="90"/>
 <text x="949.0" y="486.0" text-anchor="middle">MachineModel YAML</text>
 <text x="949.0" y="510.0" text-anchor="middle">LLKMap / target package</text>

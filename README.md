@@ -45,11 +45,11 @@ Mapping follows **extract → match → place → connect → cover → bind →
 - **Execution IR:** tile types and verifiers, temporal/spatial loops, pipelines, MMA/vector/reduction operations, layout transforms, explicit movement and synchronization.
 - **Declarative mapping:** topology-aware placement and routing, single-operation and fused rules, deterministic/beam/bounded exact covering search, plan binding, reports, and replay.
 - **Performance exploration:** static work/bandwidth bounds and dependency/resource scheduling; predicted cycles, traffic, utilization, bottlenecks, and capacity diagnostics.
-- **Schedule exploration:** finite parameter spaces, grid/random candidate generation, legality checks, ranking, and schedule persistence.
-- **CPU validation:** scheduling, fusion, packing, specialization, parallel runtime, and JIT infrastructure for supported kernels, including SwiGLU, RoPE, and attention. Portable mapped GEMM/SwiGLU numerical fixtures are also available.
+- **Schedule exploration:** finite parameter spaces, original-source candidate instantiation, target-aware mapping, static ranking, frozen plan replay, and optional typed verified measurement.
+- **CPU validation:** scheduling, fusion, packing, specialization, parallel runtime, and JIT infrastructure for supported kernels, including SwiGLU, RoPE, and attention. Selected AVX2 mapped GEMM/SwiGLU, padded-tail, transform and multi-output numerical fixtures are verified.
 - **Target examples:** AVX2 and generic accelerator machine profiles and mapping packages.
 
-The mapped path is under active development: physical feasibility, selected-target code generation, runtime ownership, and original-source tuning still have gaps. Performance predictions are uncalibrated, and the generic accelerator package has no hardware execution backend. The [feature matrix](docs/manual/source/features.rst) records current support and limits.
+[PR #133](https://github.com/skg7on/DSLCompiler/pull/133) delivers selected resource identity, capacity-feasible search, per-hop storage/lifetimes, shared static scoring, typed invocation with scratch release, selected vector/fused lowering, and original-source mapped tuning. Its pinned LLVM 22.1.8 Linux CI passes selected AVX2 execution without required skips. Three legacy JIT cases remain skipped; the [acceptance matrix](docs/reviews/issue67-final-acceptance.md) records exact evidence and limits. Performance predictions are uncalibrated, and the generic accelerator package has no hardware execution backend. The [feature matrix](docs/manual/source/features.rst) records current support and limits.
 
 ## Start understanding the project
 
@@ -106,14 +106,16 @@ build/bin/llk-compile --emit=micro-search docs/manual/source/examples/swiglu.mli
 build/bin/micro-perf --machine machines/x86-avx2-v2.yaml --level 1 \
   docs/manual/source/examples/gemm-tile.micro.mlir
 
-# Explore a small parameter space and save ranked schedules.
-build/bin/llk-tune --input=test/Perf/llk_tune_search_space.mlir \
-  --machine=machines/x86-avx2-v2.yaml -M=8 -N=64 -K=64 \
-  --search=grid --max-candidates=4 --top-k=2 \
-  --output=build/examples/schedules.yaml
+# Tune the original semantic source, retaining replayable candidate plans.
+build/bin/llk-tune --input=test/Tuning/Inputs/issue129/mapped_tune.mlir \
+  --machine=machines/x86-avx2-v2.yaml -M=8 -N=16 -K=32 \
+  --mapping-target=x86-avx2 --mapping-root=. --mapping-mode=exact \
+  --mapping-backend=reference --candidate-source=semantic --source-symbol=matmul \
+  --top-k=1 --mapping-report=build/examples/tune.json \
+  --candidate-artifacts=build/examples/candidates --output=build/examples/schedules.yaml
 ```
 
-Exporting IR does not execute a kernel. The current tuning CLI constructs compatibility workloads rather than compiling every candidate from the original source. Follow the [mapping tutorial](docs/manual/source/tutorials/02-mapping.rst) to select, bind, inspect, and replay a plan.
+Exporting IR does not execute a kernel. Target-aware tuning instantiates the selected original source and evaluates its mapped plan. The example uses the portable reference backend; use `--mapping-backend=selected-target` for compatible x86_64 AVX2 execution. Static ranking is uncalibrated; `--measure-top` with a typed `--measurement-inputs` fixture enables verified timing. Follow the [mapping tutorial](docs/manual/source/tutorials/02-mapping.rst) to select, bind, inspect, and replay a plan.
 
 | Tool | Purpose and reference |
 | --- | --- |
@@ -133,7 +135,7 @@ Read [CLAUDE.md](CLAUDE.md) and the [contributor guide](docs/manual/source/contr
 
 ## Future plan
 
-- **Close mapped execution gaps:** concrete resource identity and storage feasibility, consistent static scoring, typed invocation and allocation ownership, selected ISA/vector realization, fused lowering, and source-preserving tuning. See [issue #129](https://github.com/skg7on/DSLCompiler/issues/129) and its [gap-closure plan](docs/superpowers/plans/2026-10-07-issue129-gap-closure.md).
+- **Extend verified mapped coverage:** broaden supported kernels, dtypes, layouts, tails and target emitters while preserving the [PR #133 acceptance contract](docs/reviews/issue67-final-acceptance.md).
 - **Add measured feedback and calibration:** persist measurements, fit cost models, and validate prediction error ([#51](https://github.com/skg7on/DSLCompiler/issues/51), [#52](https://github.com/skg7on/DSLCompiler/issues/52)).
 - **Broaden frontend and target coverage:** expand semantic import and GPU/NPU/systolic/custom accelerator backends. A general Python frontend and direct Micro-IR emulator remain deferred.
 
