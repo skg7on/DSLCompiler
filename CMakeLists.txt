@@ -691,7 +691,8 @@ mlir_target_link_libraries(LLKForallToOpenMP PUBLIC
 # Library: ShapeSpecialization pass
 add_mlir_library(LLKShapeSpecialization
     lib/Transforms/ShapeSpecialization.cpp
-    DEPENDS LLKDialect
+    DEPENDS LLKDialect LLKKernel
+    LINK_LIBS PUBLIC LLKKernel
 )
 mlir_target_link_libraries(LLKShapeSpecialization PUBLIC
     MLIRFuncDialect MLIRPass
@@ -700,7 +701,8 @@ mlir_target_link_libraries(LLKShapeSpecialization PUBLIC
 # Library: ScheduleSelection pass
 add_mlir_library(LLKScheduleSelection
     lib/Transforms/ScheduleSelection.cpp
-    DEPENDS LLKDialect
+    DEPENDS LLKDialect LLKKernel
+    LINK_LIBS PUBLIC LLKKernel
 )
 mlir_target_link_libraries(LLKScheduleSelection PUBLIC
     MLIRFuncDialect MLIRPass

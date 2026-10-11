@@ -606,3 +606,9 @@ add_test(NAME ScratchAnalysis
             ${CMAKE_SOURCE_DIR}/test/Transforms/scratch_analysis.mlir
 )
 endif()
+
+if(LLK_BUILD_TOOLS)
+  add_test(NAME KernelShapeSpecialization
+      COMMAND llk-opt --shape-specialize --verify-diagnostics
+      ${CMAKE_SOURCE_DIR}/test/Transforms/kernel_shape_specialization.mlir)
+endif()
