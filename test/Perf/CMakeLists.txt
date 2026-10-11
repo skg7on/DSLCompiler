@@ -1,6 +1,7 @@
 add_llk_test_category(Perf
     SOURCES
         ../Mapping/resource_regression_fixture.cpp
+        op_dag_builders.cpp
         l0_static_bound.cpp
         l1_resource_dag.cpp
         route_identity.cpp

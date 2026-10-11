@@ -56,6 +56,8 @@ class Operation;
 
 namespace mlir::llk::perf {
 
+class OpDAGBuilderRegistry;
+
 /// Upper bound on unrolled events. Reached only by kernels far outside the MVP
 /// scope; exceeding it is reported as an error so a cycle estimate is never
 /// quietly produced from a truncated graph.
@@ -209,6 +211,14 @@ struct MeasuredOverrides {
 /// duration for charges that duration instead of the machine formula.
 llvm::Expected<MicroDAG>
 buildMicroDAG(mlir::Operation *kernel, const machine::MachineModel &machine,
+              const MeasuredOverrides *measured = nullptr);
+
+/// Uses precisely the supplied leaf builders; unregistered leaves cost zero.
+/// Configure the registry before construction and do not mutate it during a
+/// build.
+llvm::Expected<MicroDAG>
+buildMicroDAG(mlir::Operation *kernel, const machine::MachineModel &machine,
+              const OpDAGBuilderRegistry &builders,
               const MeasuredOverrides *measured = nullptr);
 
 /// The normalized view of one DAG event (task B8): the same

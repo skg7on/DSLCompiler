@@ -41,6 +41,7 @@
 #include "gtest/gtest.h"
 
 #include <memory>
+#include <set>
 #include <string>
 
 namespace mlir::llk::perf {
@@ -1311,7 +1312,26 @@ TEST(L1ResourceDag, SelectedPlanEventsMatchItsMaterializedKernel) {
     EXPECT_DOUBLE_EQ(planDag->events[i].event.cost.latencyCycles,
                      normalized.event.cost.latencyCycles)
         << i;
-    EXPECT_EQ(planDag->events[i].deps, normalized.deps) << i;
+    // The IR records an explicit source data edge even when the hop's wait
+    // already reaches that producer. The hand-built plan stores only the wait
+    // edge. Compare the partial order, retaining the direct-edge regression
+    // tests below for movement correctness.
+    auto ancestors = [](const auto &events, size_t id) {
+      std::set<uint32_t> reached;
+      std::vector<uint32_t> pending(events[id].deps.begin(),
+                                    events[id].deps.end());
+      while (!pending.empty()) {
+        uint32_t dep = pending.back();
+        pending.pop_back();
+        if (!reached.insert(dep).second)
+          continue;
+        pending.insert(pending.end(), events[dep].deps.begin(),
+                       events[dep].deps.end());
+      }
+      return reached;
+    };
+    EXPECT_EQ(ancestors(planDag->events, i), ancestors(kernelDag->events, i))
+        << i;
   }
 }
 
@@ -1873,4 +1893,44 @@ TEST(L1ResourceDag, StrictAnalysisCarriesTheFinalizedPlansStorageLiveness) {
             mapping::requiredReuseEdgesFor(plan.allocations));
 }
 
+} // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+TEST(L1ResourceDag, DependentCopiesKeepSourceDataEdge) {
+  auto parsed = parseKernel(R"mlir(
+module { micro.kernel @dependent_copies {
+  %ext = tensor.empty() : tensor<8x8xf32>
+  %a, %ta = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  %b, %tb = micro.async_copy %a {src_memory = #micro.memory<sram>, dst_memory = #micro.memory<acc>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+  micro.wait %tb
+  micro.yield
+} }
+)mlir");
+  ASSERT_TRUE(parsed);
+  auto model = parseMachine(testMachine(2, 2, 4));
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 3u);
+  EXPECT_TRUE(llvm::is_contained(dag->events[1].deps, 0u));
+  auto report = scheduleL1(*dag, model);
+  EXPECT_LE(report.schedule[0].finish, report.schedule[1].start);
+  EXPECT_EQ(dag->events[2].deps, (std::vector<uint32_t>{1}));
+}
+TEST(L1ResourceDag, PhysicalPartitionKeepsSameKindProducerEdge) {
+  auto parsed = parseKernel(R"mlir(
+module { micro.kernel @dependent_partition {
+  %buf = micro.tile_alloc : !micro.tile<32x32xbf16, memory = #micro.memory<sram>, layout = #micro.layout<row_major>>
+  %t = micro.vector "silu" %buf : !micro.tile<32x32xbf16, memory = #micro.memory<sram>, layout = #micro.layout<row_major>> -> !micro.tile<32x32xbf16, memory = #micro.memory<sram>, layout = #micro.layout<row_major>>
+  %frag = micro.tile_partition %t {shape = array<i64: 16, 16>} : !micro.tile<32x32xbf16, memory = #micro.memory<sram>, layout = #micro.layout<row_major>> -> !micro.tile<16x16xbf16, memory = #micro.memory<sram>, layout = #micro.layout<vectorized, vector = 8>>
+  micro.yield
+} }
+)mlir");
+  ASSERT_TRUE(parsed);
+  auto model = parseMachine(testMachine(2, 2, 4));
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 2u);
+  EXPECT_EQ(dag->events[1].kind, EventKind::TilePartition);
+  EXPECT_EQ(dag->events[1].deps, (std::vector<uint32_t>{0}));
+}
 } // namespace mlir::llk::perf
