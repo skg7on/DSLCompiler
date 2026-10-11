@@ -441,6 +441,7 @@ mlir_target_link_libraries(LLKRuntime PUBLIC
     MLIRMemRefTransforms
     MLIRReconcileUnrealizedCasts
     MLIRSCFToControlFlow
+    MLIRUBToLLVM
     MLIRVectorToLLVMPass
 )
 

@@ -155,6 +155,9 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   pm.addPass(mlir::createConvertControlFlowToLLVMPass());
   // Lower arithmetic ops to LLVM dialect.
   pm.addPass(mlir::createArithToLLVMConversionPass());
+  // Arithmetic lowering may materialize `ub.poison` for undefined results.
+  // Convert UB operations before translating the LLVM dialect to LLVM IR.
+  pm.addPass(mlir::createUBToLLVMConversionPass());
   // Lower math ops (exp, erf, etc.) to LLVM dialect.
   pm.addPass(mlir::createConvertMathToLLVMPass());
   // Lower func ops (function boundaries) to LLVM dialect.
