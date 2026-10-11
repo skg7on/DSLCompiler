@@ -84,17 +84,35 @@ jobs:
       - name: Build
         run: cd build && ninja
 
+      - name: Run selected AVX2 acceptance
+        run: |
+          uname -a | tee build/selected-avx2-host.txt
+          lscpu | grep -E 'Architecture|Model name|Flags' | head -n 3 | tee -a build/selected-avx2-host.txt
+          cmake -LA -N build | grep -E '^CMAKE_(C|CXX)_COMPILER:FILEPATH=' | tee -a build/selected-avx2-host.txt
+          "$LLVM_BUILD/bin/llvm-config" --version | tee -a build/selected-avx2-host.txt
+          cd build
+          set -o pipefail
+          ./MappedAVX2Acceptance --require-selected-target \
+            --gtest_filter=MappedAcceptance.* \
+            --gtest_output=xml:selected-avx2-results.xml 2>&1 | tee selected-avx2.log
+
       - name: Run tests
         run: |
-          uname -a
-          lscpu | grep -E 'Architecture|Model name|Flags' | head -n 3
           cd build
-          ctest --output-on-failure --output-junit ctest-results.xml
+          set -o pipefail
+          ctest --verbose --output-on-failure --output-junit ctest-results.xml 2>&1 | tee ctest-output.log
           python3 ../test/Execution/check_required_execution.py ctest-results.xml
 
       - name: Save selected execution evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: selected-avx2-ctest-results
-          path: build/ctest-results.xml
+          name: selected-avx2-execution-evidence
+          path: |
+            build/ctest-results.xml
+            build/ctest-output.log
+            build/selected-avx2-results.xml
+            build/selected-avx2.log
+            build/selected-avx2-host.txt
+            build/SelectedVectorWidth/selected-width-*.mlir
+            build/SelectedVectorWidth/selected-fused.mlir

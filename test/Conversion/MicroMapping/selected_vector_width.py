@@ -61,6 +61,9 @@ def main():
         assert "vector.transfer_read" in output
         assert "vector.transfer_write" in output
         results[width] = output
+        with open(os.path.join(work_dir, "selected-width-%d.mlir" % width),
+                  "w") as handle:
+            handle.write(output)
 
     assert results[4] != results[8], "different selected widths emitted identical IR"
 
@@ -79,6 +82,8 @@ def main():
     assert "vector<1x8xf32>" in fused
     assert re.search(r"math\.exp .* : vector<8xf32>", fused)
     assert re.search(r"arith\.mulf .* : vector<8xf32>", fused)
+    with open(os.path.join(work_dir, "selected-fused.mlir"), "w") as handle:
+        handle.write(fused)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -935,4 +936,35 @@ TEST(MappedAcceptance, SelectedAvx2BackendExecutesNumerically) {
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
   for (uint16_t value : output)
     EXPECT_EQ(fromBf16(value), 64.0f);
+}
+
+int main(int argc, char **argv) {
+  bool requireSelectedTarget = false;
+  for (int index = 1; index < argc;) {
+    if (std::strcmp(argv[index], "--require-selected-target") == 0) {
+      requireSelectedTarget = true;
+      for (int move = index; move + 1 < argc; ++move)
+        argv[move] = argv[move + 1];
+      --argc;
+      continue;
+    }
+    ++index;
+  }
+
+#ifdef LLK_REQUIRE_SELECTED_TARGET
+  if (!requireSelectedTarget) {
+    std::fprintf(stderr,
+                 "MappedAVX2Acceptance requires --require-selected-target\n");
+    return 2;
+  }
+#else
+  if (requireSelectedTarget) {
+    std::fprintf(stderr, "--require-selected-target is only valid for the "
+                         "selected-target executable\n");
+    return 2;
+  }
+#endif
+
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
 }

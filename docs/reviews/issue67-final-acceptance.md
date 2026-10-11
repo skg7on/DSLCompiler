@@ -21,21 +21,30 @@ permutation under the target's supported `blocked` layout name; its oracle
 checks the transposed element relation, and a valid plan with that transform
 omitted produces a numeric mismatch. The separate required-target binary was
 run as a negative host-capability check and failed on this arm64 host as
-designed. T8 adds a required selected-AVX2 CTest and a JUnit outcome parser to
-the pinned LLVM 22 CI workflow, but no CI run on this branch head is recorded.
-T9's current workflow smoke and DocReferences both pass locally; the full
-closure matrix remains incomplete.
+designed. T8 now requires the explicit `--require-selected-target` flag, runs
+selected AVX2 before full CTest, and archives the JUnit/log, host/compiler/LLVM
+record, and selected width-4/width-8/fused Vector IR emitted by the codegen
+checks. No CI run on this branch head is recorded. T9's current workflow smoke
+and DocReferences both pass locally; the full closure matrix remains
+incomplete.
 
 On the pre-T7-commit working tree based on `4b7a19a`, the full CTest run
 registered 159 tests: 155 passed, one required selected-AVX2 test failed on
-arm64, and three platform tests were skipped. The evidence parser rejected that
-JUnit report with `MappedAVX2Acceptance=failed`, as required; this confirms the
-host gate and is not selected-x86 evidence.
+arm64, and three platform tests were skipped. The evidence parser rejected
+that JUnit report with `MappedAVX2Acceptance=failed`, as required; this
+confirms the host gate and is not selected-x86 evidence.
+
+On the current working tree based on `abfcb3b`, the full build succeeds and
+CTest registers 160 tests: 156 pass, one required selected-AVX2 test fails on
+arm64, and three tests are skipped (`SwigluScalar`, `SwiGLUVector`, and
+portable `MappedAcceptance`). The evidence parser rejects the current JUnit
+report with `MappedAVX2Acceptance=failed`, as required; this confirms the host
+gate and is not selected-x86 evidence.
 
 Therefore issue #67 and the mandatory #129 release gate remain open. In
 particular, selected AVX2 invocation has not passed on the candidate release
-head, and the full T7 numeric matrix and final whole-suite CI artifact still
-need completion. The `WorkflowSmoke` manifest is an allowlisted argv list; its
+head, and the final whole-suite CI artifact and T9 closure matrix still need
+completion. The `WorkflowSmoke` manifest is an allowlisted argv list; its
 commands use checked-in fixtures and controlled output paths.
 
 At commit `8c16fe2`, the local full suite registered 159 tests: 155 passed, one
