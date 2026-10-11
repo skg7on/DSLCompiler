@@ -54,18 +54,21 @@ struct DumpScalableTransferWritesPass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpScalableTransferWritesPass)
   llvm::StringRef getArgument() const final { return "dump-scalable-writes"; }
   void runOnOperation() override {
+    unsigned printed = 0;
     getOperation().walk([&](mlir::Operation *op) {
-      if (op->getName().getStringRef() != "vector.transfer_write")
+      if (op->getName().getStringRef() != "vector.transfer_write" ||
+          printed == 3)
         return;
       auto type = mlir::dyn_cast<mlir::VectorType>(op->getOperand(0).getType());
-      if (!type || !llvm::is_contained(type.getScalableDims(), true))
-        return;
-      llvm::errs() << "SCALABLE WRITE AFTER V2SCF: ";
+      llvm::errs() << "TRANSFER WRITE AFTER V2SCF (scalable="
+                   << (type && llvm::is_contained(type.getScalableDims(), true))
+                   << "): ";
       op->dump();
       if (auto *def = op->getOperand(0).getDefiningOp()) {
-        llvm::errs() << "SCALABLE WRITE VECTOR DEF: ";
+        llvm::errs() << "TRANSFER WRITE VECTOR DEF: ";
         def->dump();
       }
+      ++printed;
     });
   }
 };
