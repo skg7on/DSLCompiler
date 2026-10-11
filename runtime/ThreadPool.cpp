@@ -24,8 +24,14 @@ ThreadPool::ThreadPool(int num_threads) {
 }
 
 ThreadPool::~ThreadPool() {
-  for (int i = 0; i < num_workers_; i++)
-    running_[i] = false;
+  // Update the wait predicate under the same mutex as cv_work_.wait().
+  // Atomics alone do not prevent shutdown notification from being lost between
+  // a worker's predicate check and its transition into the wait.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (int i = 0; i < num_workers_; i++)
+      running_[i] = false;
+  }
   cv_work_.notify_all();
   for (auto &w : workers_) {
     if (w.thread.joinable())

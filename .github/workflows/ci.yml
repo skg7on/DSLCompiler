@@ -116,6 +116,6 @@ jobs:
             build/selected-avx2-results.xml
             build/selected-avx2.log
             build/selected-avx2-host.txt
-            build/SelectedVectorWidth/selected-width-*.mlir
-            build/SelectedVectorWidth/selected-fused.mlir
+            build/test/SelectedVectorWidth/selected-width-*.mlir
+            build/test/SelectedVectorWidth/selected-fused.mlir
             build/selected-execution-evidence/*

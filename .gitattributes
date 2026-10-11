@@ -1,0 +1,2 @@
+# Preserve Sphinx/theme output byte-for-byte; review and lint the RST sources.
+docs/manual/html/** linguist-generated=true -whitespace

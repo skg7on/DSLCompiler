@@ -63,3 +63,16 @@ TEST(ThreadPool, ZeroTiles) {
     // Should never be called
   });
 }
+
+// llk-bench constructs a pool for every invocation. Shutdown must wake workers
+// even when it races with their transition back into the idle wait.
+TEST(ThreadPool, RepeatedConstructionAndShutdown) {
+  for (int workers : {1, 4}) {
+    for (int iteration = 0; iteration < 10000; ++iteration) {
+      llk::ThreadPool pool(workers);
+      std::atomic<int> completed{0};
+      pool.parallelFor(2, 1, [&](int64_t, int) { ++completed; });
+      ASSERT_EQ(completed.load(), 2);
+    }
+  }
+}
