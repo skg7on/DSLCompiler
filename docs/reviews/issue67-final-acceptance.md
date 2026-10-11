@@ -63,6 +63,26 @@ The matrix's local passes do not replace the pinned LLVM 22 x86 run. The
 selected-AVX2 job must pass on the exact release head before §10, T8, or the
 overall acceptance gate can close.
 
+### Issue #129 gap crosswalk
+
+This candidate evidence maps the ten tracker findings to the repaired tests;
+it does not close the GitHub checklists. G4 and G10 still require the passing
+x86 job, and G9's static mapped tuning remains separate from production
+measurement/calibration in #51/#52.
+
+| Gap | Candidate regression evidence | Status |
+|---|---|---|
+| **G1. Compute identity** | `MappingCostModelTest`, `MappingPlanReportTest`, `ExactResourceOracleTest`; the `vpu.a`/`vpu.b` choice is identity-bearing and replay/verification reject tampering | Local regressions pass |
+| **G2. Feasibility before top-K** | `CompletePlanEvaluationTest`, `ExactResourceOracleTest`, `L0StaticBoundTest` | Local regressions pass |
+| **G3. Scratch and ABI** | `MappedAllocationLifetimeTest`, `MicroKernelExecution`, `MappedAcceptance.LeavesTheCallersBuffersOwnedByTheCaller`, mapped ABI rejection controls | Local regressions pass |
+| **G4. Width and ISA realization** | `SelectedVectorWidth`, `MappedCodegenRequirementsTest`, required selected binary `MappedAVX2Acceptance` | **Open:** width codegen passes; selected-x86 invocation remains unverified |
+| **G5. Fused execution** | `SelectedGroupLoweringTest`, `FusedSelectedLowering`, numeric fused-SwiGLU `MappedAcceptance` | Local regressions pass |
+| **G6. Physical storage** | `L1ResourceDAGTest`, `MappingStoragePlanTest`, `MappingStorageLivenessTest`, `MicroMappingAcceptancePipeline` two-hop L2 allocation | Local regressions pass |
+| **G7. DMA concurrency** | `MappingCostModelTest` named-engine pool, node-count, distinct-engine overlap, and dependency-order regressions | Local regressions pass |
+| **G8. Static parity** | `CompletePlanEvaluationTest`, all five `MicroMappingAcceptancePipeline` planner/`micro-perf` comparisons | Local regressions pass |
+| **G9. Mapping-driven tuner** | `CandidateInstantiationTest`, `MappedTuningSessionTest`, `MappedTuneCLI`; original-source candidate, mapping, binding and report path | Local regressions pass; production calibration remains #51/#52 |
+| **G10. Acceptance and claims** | Five public chains, numeric random/tail/multi-output/transform controls, `SelectedTargetFlagContract`, `MappedAVX2Acceptance` | **Open:** all portable controls pass; selected-x86 gate remains required |
+
 On the pre-T7-commit working tree based on `4b7a19a`, the full CTest run
 registered 159 tests: 155 passed, one required selected-AVX2 test failed on
 arm64, and three platform tests were skipped. The evidence parser rejected
