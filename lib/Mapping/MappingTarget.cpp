@@ -159,7 +159,8 @@ bool isRegisteredMappingTarget(llvm::StringRef name) {
 
 llvm::Expected<std::unique_ptr<MappingTarget>>
 createRegisteredMappingTarget(llvm::StringRef name,
-                              llvm::StringRef configurationRoot) {
+                              llvm::StringRef configurationRoot,
+                              llvm::StringRef machinePath) {
   auto it = targetFactories().find(name);
   if (it == targetFactories().end()) {
     std::string known;
@@ -172,7 +173,7 @@ createRegisteredMappingTarget(llvm::StringRef name,
         "no mapping target is registered under '" + name.str() + "'" +
         (known.empty() ? "; none is registered" : "; registered: " + known));
   }
-  return it->second(configurationRoot);
+  return it->second(configurationRoot, machinePath);
 }
 
 llvm::Error verifyMappingTarget(const MappingTarget &target) {

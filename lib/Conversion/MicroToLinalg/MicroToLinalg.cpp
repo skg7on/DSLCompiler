@@ -220,6 +220,62 @@ Value buildElementwiseCast(ConversionPatternRewriter &rewriter, Location loc,
   return cast.getResult(0);
 }
 
+/// Record selected identity conversions that do not need a Linalg operation.
+/// Keep the mapping fact opaque here; target backends can account for the
+/// structural member when validating a fused instance.
+void recordStructuralMapping(Operation *source, StringRef microOp,
+                             Attribute mathMode) {
+  if (!source)
+    return;
+  auto mapping = source->getAttrOfType<DictionaryAttr>("micro.mapping");
+  if (!mapping)
+    return;
+  ModuleOp module = source->getParentOfType<ModuleOp>();
+  if (!module)
+    return;
+
+  NamedAttrList record;
+  record.set("mapping", mapping);
+  record.set("op", StringAttr::get(source->getContext(), microOp));
+  if (mathMode)
+    record.set("math_mode", mathMode);
+  for (StringRef name :
+       {"micro.routes", "micro.engine", "micro.connection",
+        "micro.selected_connections", "llk.avx2.selected_handoff"})
+    if (Attribute value = source->getAttr(name))
+      record.set(name, value);
+  SmallVector<Attribute> records;
+  if (auto existing =
+          module->getAttrOfType<ArrayAttr>("micro.structural_mappings"))
+    records.append(existing.begin(), existing.end());
+  DictionaryAttr next = DictionaryAttr::get(source->getContext(), record);
+  if (llvm::is_contained(records, Attribute(next)))
+    return;
+  records.push_back(next);
+  module->setAttr("micro.structural_mappings",
+                  ArrayAttr::get(source->getContext(), records));
+}
+
+/// Preserve opaque mapping provenance on the Linalg operation that replaces a
+/// selected Micro compute op. The generic bridge copies facts; only a target
+/// backend interprets their target-specific meaning.
+void copyMappingMetadata(Operation *source, Operation *replacement,
+                         StringRef microOp, Attribute mathMode) {
+  if (!source || !replacement ||
+      (!isa<linalg::GenericOp>(replacement) &&
+       !isa<linalg::MatmulOp>(replacement) &&
+       !isa<linalg::ReduceOp>(replacement)))
+    return;
+  for (StringRef name : {"micro.mapping", "micro.routes", "micro.op",
+                         "micro.math_mode", "llk.avx2.selected_handoff"})
+    if (Attribute value = source->getAttr(name))
+      replacement->setAttr(name, value);
+  replacement->setAttr("micro.op",
+                       StringAttr::get(source->getContext(), microOp));
+  if (mathMode)
+    replacement->setAttr("micro.math_mode", mathMode);
+}
+
 Value buildElementwise(OpBuilder &builder, Location loc, ElementwiseKind kind,
                        ValueRange args, Type elementType) {
   const bool floating = llvm::isa<FloatType>(elementType);
@@ -437,6 +493,10 @@ struct VectorOpLowering : OpConversionPattern<micro::VectorOp> {
       if (!converted)
         return rewriter.notifyMatchFailure(op,
                                            "convert needs a shaped operand");
+      if (converted == adaptor.getInputs()[0])
+        recordStructuralMapping(op, name, op.getMathModeAttr());
+      copyMappingMetadata(op, converted.getDefiningOp(), name,
+                          op.getMathModeAttr());
       rewriter.replaceOp(op, converted);
       return success();
     }
@@ -477,6 +537,7 @@ struct VectorOpLowering : OpConversionPattern<micro::VectorOp> {
                                   : sigmoid;
             linalg::YieldOp::create(nested, nestedLoc, result);
           });
+      copyMappingMetadata(op, generic, name, op.getMathModeAttr());
       rewriter.replaceOp(op, generic.getResult(0));
       return success();
     }
@@ -502,17 +563,15 @@ struct VectorOpLowering : OpConversionPattern<micro::VectorOp> {
               builder, loc,
               buildElementwise(builder, loc, *kind, args, elementType));
         });
+    copyMappingMetadata(op, generic, name, op.getMathModeAttr());
     rewriter.replaceOp(op, generic.getResult(0));
     return success();
   }
 };
 
-/// A layout conversion materializes as a copy. The two affine maps describe
-/// *physical* layouts, which this pass drops along with the tile's memory
-/// space, layout and owner, so the repack is a same-shape copy here. Encoding
-/// the layouts as tensor/memref layout maps -- and so making the copy do the
-/// actual repack -- is the next slice, and belongs with the target's
-/// memory-space mapping.
+/// Preserve a layout conversion as an indexed copy. Rank-preserving
+/// permutations express real data movement directly; AVX2's unpadded blocked
+/// row map flattens to the same linear element order as row-major.
 struct TransformOpLowering : OpConversionPattern<micro::TransformOp> {
   using OpConversionPattern::OpConversionPattern;
   LogicalResult
@@ -520,10 +579,61 @@ struct TransformOpLowering : OpConversionPattern<micro::TransformOp> {
                   ConversionPatternRewriter &rewriter) const override {
     auto resultType = dyn_cast<RankedTensorType>(
         getTypeConverter()->convertType(op.getType()));
-    if (!resultType)
-      return rewriter.notifyMatchFailure(op, "not convertible to a tensor");
-    rewriter.replaceOp(op, buildTensorCopy(rewriter, op.getLoc(),
-                                           adaptor.getSource(), resultType));
+    auto sourceType = dyn_cast<RankedTensorType>(adaptor.getSource().getType());
+    if (!resultType || !sourceType || !sourceType.hasStaticShape() ||
+        !resultType.hasStaticShape())
+      return rewriter.notifyMatchFailure(
+          op, "transform requires static ranked tensor source and result");
+    unsigned rank = sourceType.getRank();
+    AffineMap identity = rewriter.getMultiDimIdentityMap(rank);
+    auto normalizeMap = [&](AffineMap map) -> std::optional<AffineMap> {
+      if (map.getNumDims() != rank)
+        return std::nullopt;
+      if (map.getNumResults() == rank && map.isPermutation())
+        return map;
+      if (rank == 2 && map.getNumResults() == 3) {
+        MLIRContext *context = op.getContext();
+        AffineExpr d0 = getAffineDimExpr(0, context);
+        AffineExpr d1 = getAffineDimExpr(1, context);
+        for (int64_t width = 4; width <= 8; ++width) {
+          AffineExpr divisor = getAffineConstantExpr(width, context);
+          AffineMap blocked = AffineMap::get(
+              2, 0, {d0, d1.floorDiv(divisor), d1 % divisor}, context);
+          if (map == blocked && sourceType.getShape()[1] % width == 0)
+            return identity;
+        }
+      }
+      return std::nullopt;
+    };
+    std::optional<AffineMap> sourceMap =
+        normalizeMap(op.getSrcMap().value_or(identity));
+    std::optional<AffineMap> destinationMap =
+        normalizeMap(op.getDstMap().value_or(identity));
+    if (!sourceMap || !destinationMap ||
+        sourceMap->getNumResults() != sourceType.getRank() ||
+        destinationMap->getNumResults() != resultType.getRank())
+      return rewriter.notifyMatchFailure(
+          op, "transform lowering currently requires rank-preserving "
+              "permutation maps or unpadded AVX2 blocked rows");
+
+    auto empty =
+        tensor::EmptyOp::create(rewriter, op.getLoc(), resultType.getShape(),
+                                resultType.getElementType());
+    SmallVector<AffineMap> maps{*sourceMap, *destinationMap};
+    SmallVector<utils::IteratorType> iterators(rank,
+                                               utils::IteratorType::parallel);
+    auto transformed = linalg::GenericOp::create(
+        rewriter, op.getLoc(), TypeRange{resultType},
+        ValueRange{adaptor.getSource()}, ValueRange{empty}, maps, iterators,
+        [&](OpBuilder &nested, Location nestedLoc, ValueRange args) {
+          linalg::YieldOp::create(nested, nestedLoc, args[0]);
+        });
+    copyMappingMetadata(op, transformed, "transform",
+                        op->getAttr("micro.math_mode"));
+    for (StringRef name : {"micro.engine", "micro.value", "micro.connection"})
+      if (Attribute value = op->getAttr(name))
+        transformed->setAttr(name, value);
+    rewriter.replaceOp(op, transformed.getResults());
     return success();
   }
 };
@@ -545,6 +655,8 @@ struct AsyncCopyOpLowering : OpConversionPattern<CopyOp> {
       return rewriter.notifyMatchFailure(op, "not convertible to a tensor");
     Value copied =
         buildTensorCopy(rewriter, op.getLoc(), adaptor.getSource(), resultType);
+    recordStructuralMapping(op, op->getName().getStringRef(),
+                            op->getAttr("micro.math_mode"));
     auto token = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
     rewriter.replaceOp(op, ValueRange{copied, token});
     return success();
@@ -686,6 +798,7 @@ struct TileStoreOpLowering : OpConversionPattern<micro::TileStoreOp> {
     auto insert = tensor::InsertSliceOp::create(
         rewriter, op.getLoc(), adaptor.getSource(), adaptor.getDestination(),
         offsets, sizes, strides);
+    recordStructuralMapping(op, "tile_store", op->getAttr("micro.math_mode"));
     rewriter.replaceOp(op, insert.getResult());
     return success();
   }
@@ -778,6 +891,9 @@ struct ReduceOpLowering : OpConversionPattern<micro::ReduceOp> {
                                                  args[0], args[1],
                                                  elementType));
         });
+    copyMappingMetadata(op, reduce, "reduce", op->getAttr("micro.math_mode"));
+    reduce->setAttr("micro.reduce_kind",
+                    StringAttr::get(op.getContext(), name));
     rewriter.replaceOp(op, reduce.getResults());
     return success();
   }
@@ -836,6 +952,7 @@ struct MmaOpLowering : OpConversionPattern<micro::MmaOp> {
     auto matmul = linalg::MatmulOp::create(
         rewriter, op.getLoc(), TypeRange{accType}, ValueRange{lhs, rhs},
         ValueRange{adaptor.getAcc()});
+    copyMappingMetadata(op, matmul, "mma", op->getAttr("micro.math_mode"));
     rewriter.replaceOp(op, matmul.getResults());
     return success();
   }

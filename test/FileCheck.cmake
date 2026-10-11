@@ -228,6 +228,20 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
           $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
   )
+  add_test(NAME WorkflowSmoke
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke.py
+          ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke_manifest.json
+          ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
+          $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
+  )
+  add_test(NAME WorkflowSmokeNegativeControls
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke_test.py
+          ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke_manifest.json
+          ${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
+          $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
+  )
   add_test(NAME DocReferencesUnit
       COMMAND python3 -m unittest discover
           -s ${CMAKE_SOURCE_DIR}/test/Docs -p test_*.py
@@ -257,6 +271,26 @@ if(LLK_BUILD_TOOLS)
   )
   add_test(NAME MicroMappingCompileStopsAtTargetLowered
       COMMAND sh -c "$<TARGET_FILE:llk-compile> --mapping-target=x86-avx2 --mapping-root=${CMAKE_SOURCE_DIR} --mapping-mode=exact --mapping-stop=target-lowered ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | grep -q 'micro.kernel'"
+  )
+  add_test(NAME FusedSelectedLowering
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/fused_selected_lowering.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/FusedSelectedLowering
+  )
+  add_test(NAME SelectedVectorWidth
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/selected_vector_width.py
+          $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/SelectedVectorWidth
+  )
+  add_test(NAME SelectedContraction
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/selected_contraction.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/SelectedContraction
+  )
+  add_test(NAME TailPadExport
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/tail_pad_export.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/TailPadExport
   )
   # A target nobody registered is a diagnostic naming the ones that are, not a
   # silent fallback to a different backend.

@@ -22,6 +22,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
+#include <cstdint>
 #include <memory>
 
 namespace mlir::llk::target::avx2 {
@@ -35,13 +36,21 @@ llvm::ArrayRef<llvm::StringLiteral> emitterKeys();
 /// lowered as AVX2 rather than rejected as unsupported.
 std::unique_ptr<mapping::TargetEmitter> createAVX2Emitter(llvm::StringRef key);
 
+/// Adds the AVX2 selected-code lowering after generic Micro to Linalg
+/// conversion. The pass interprets only opaque mapping metadata carried by the
+/// generated Linalg operations.
+void buildAVX2SelectedBackendPipeline(mlir::OpPassManager &pm,
+                                      int64_t f32VectorWidth,
+                                      int64_t bf16VectorWidth);
+
 /// Loads the AVX2 mapping target from a configuration root, which must contain
 /// `machines/x86-avx2-v2.yaml`, `mapping/x86-avx2/layouts.llkmap`, and
 /// `mapping/x86-avx2/rules.llkmap`. The target is verified before it is
 /// returned, and its emitters are the AVX2 plugin's own rather than the
 /// configuration-only default.
 llvm::Expected<std::unique_ptr<mapping::MappingTarget>>
-createMappingTarget(llvm::StringRef configurationRoot);
+createMappingTarget(llvm::StringRef configurationRoot,
+                    llvm::StringRef machinePath = {});
 
 } // namespace mlir::llk::target::avx2
 

@@ -78,6 +78,44 @@ is *rejected with a reason*, not a crash: the search space may legitimately offe
 alternatives this pipeline does not implement, and the tuner reports them and
 moves on.
 
+For target-aware tuning, give `llk-tune` the exported module that contains both
+the original semantic function and its `micro.search_space`. Select the source
+symbol explicitly, then request plan and candidate artifacts:
+
+```bash
+llk-tune --input matmul.search.mlir --machine machines/x86-avx2-v2.yaml \
+  --M 8 --N 16 --K 32 --mapping-target x86-avx2 --mapping-root . \
+  --mapping-mode exact --mapping-backend reference \
+  --candidate-source semantic --source-symbol matmul \
+  --mapping-report tune.json --candidate-artifacts tune-candidates \
+  --output tune.yaml
+```
+
+The JSON report carries the complete candidate bindings, selected plan report,
+static metrics and truncation status. Each candidate directory contains the
+instantiated source and frozen plan. Replay that plan against its exact source
+artifact and the same machine profile:
+
+```bash
+llk-compile --mapping-target x86-avx2 --mapping-root . \
+  --machine machines/x86-avx2-v2.yaml --mapping-backend reference \
+  --mapping-stop lowered \
+  --plan-report tune-candidates/candidate_.../plan.json \
+  tune-candidates/candidate_.../source.mlir --emit mlir
+```
+
+Optional runtime measurement uses a version-1 JSON fixture with ordered input
+and output ports. Each port declares `dtype`, rank-two `shape`, and `data`; data
+can be a scalar to fill the tensor or an element array. Output ports can also
+declare absolute and relative tolerances. Set `--measure-top N` together with
+`--measurement-inputs fixture.json`. The tuner validates these ports against
+the compiled `KernelAbi`, performs the declared warmups and timed repeats,
+checks output values, and records the median runtime separately from the static
+report. The sidecar is written beside `--mapping-report` as
+`<report>.measurements.json` (or beside the schedule output when there is no
+mapping report). A measured run therefore leaves the static JSON report
+byte-identical to a static-only run with the same inputs.
+
 ## Describing your machine
 
 Machine models are YAML (`machines/*.yaml`) and are loaded into a typed topology:
@@ -226,16 +264,47 @@ from inside one process:
 - `--micro-verify-mapping` accepts what the mapper wrote;
 - the performance model produces events for it.
 
-Its chains are `vector-add`, `staged-gemm`, `fused-swiglu` and `second-target`
-(the same concrete kernel mapped on the generic accelerator). The
-compiler-generated chains are AVX2-only, because the exported program uses the
-tile-level ops that only the AVX2 rule set covers; the accelerator's rules
-describe the tensor-level movement and vector family.
+Its five chains are `vector-add`, `staged-gemm`, `fused-swiglu`,
+`required-transform` and `second-target-two-hop`. They compare planner and
+`micro-perf` cycle/DRAM totals, replay the selected plan id, and assert stable
+source parse/print, report and mapped IR. The second target checks the concrete
+SRAM→L2→DRAM route and its intermediate reservation. This is static and portable
+pipeline evidence; it does not establish selected AVX2 execution.
+
+The documented commands and the smoke manifest live together here:
+
+```bash
+# Search and save a versioned mapped-plan report.
+llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store report=build/WorkflowSmoke/plan.json" test/Conversion/MicroMapping/micro_map.mlir -o build/WorkflowSmoke/mapped.mlir
+
+# Replay the selected id from that report with the same source and target.
+llk-opt --micro-bind-plan="plan-id=<selectedPlanId> target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store" test/Conversion/MicroMapping/micro_map.mlir -o build/WorkflowSmoke/replayed.mlir
+
+# Verify and lower the frozen plan, then run static capacity/performance checks.
+llk-opt --micro-verify-mapping="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store" build/WorkflowSmoke/mapped.mlir
+llk-compile --mapping-target=x86-avx2 --mapping-root=. --machine=machines/x86-avx2-v2.yaml --mapping-backend=reference --mapping-stop=lowered --plan-report=build/WorkflowSmoke/plan.json build/WorkflowSmoke/mapped.mlir --emit=mlir
+micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 --fail-on-capacity-violation build/WorkflowSmoke/mapped.mlir
+
+# Run the checked semantic-source tuner example.
+llk-tune --input=test/Tuning/Inputs/issue129/mapped_tune.mlir --M=8 --N=16 --K=32 --top-k=1 --output=build/WorkflowSmoke/schedule.yaml --mapping-target=x86-avx2 --mapping-root=. --machine=machines/x86-avx2-v2.yaml --mapping-mode=exact --mapping-backend=reference --candidate-source=semantic --source-symbol=matmul --mapping-report=build/WorkflowSmoke/tune-report.json
+```
+
+`test/Docs/workflow_smoke_manifest.json` holds the executable argv arrays and
+expected artifacts. `WorkflowSmoke` runs those arrays without a shell and
+checks the documented option spellings against this section. `DocReferences`
+still performs link/path and help-flag lint. Mandatory issue #67 acceptance is
+**not** closed by static pipeline evidence; see the
+[verified gap assessment](../reviews/2026-10-07-issue67-current-gap-assessment.md)
+and issue [#129](https://github.com/skg7on/DSLCompiler/issues/129).
 
 ## Where to go deeper
 
-- the design's acceptance criteria, with revision-pinned evidence for each:
+- the design's acceptance criteria — interim, revision-pinned evidence for each,
+  with mandatory rows still open under issue #129:
   `docs/reviews/issue67-final-acceptance.md`
+- the verified assessment of the remaining gaps, and what each release gate must
+  repair: `docs/reviews/2026-10-07-issue67-current-gap-assessment.md`,
+  `docs/superpowers/plans/2026-10-07-issue129-gap-closure.md`
 - tile model, ops, and verifier rules: `docs/design/m9-micro-ir-core-concepts.md`
 - layering and the redesign: `docs/design/m9-canonical-micro-ir-architecture.md`
 - the mapping design: `docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md`

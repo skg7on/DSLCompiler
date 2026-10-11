@@ -18,6 +18,7 @@
 #define LLK_MAPPING_MAPPINGTARGET_H
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/CodegenRequirements.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
 #include "LLK/Mapping/MappingLowering.h"
@@ -28,11 +29,13 @@
 #include "llvm/Support/Error.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace mlir {
 class Operation;
+class OpPassManager;
 class RewriterBase;
 } // namespace mlir
 
@@ -126,6 +129,12 @@ public:
   virtual const RuleRegistry &rules() const = 0;
   virtual bool isKnownEmitter(llvm::StringRef key) const = 0;
 
+  /// ISA and architecture required when invoking this target's selected code.
+  /// Targets without a native code-generation contract leave it unset.
+  virtual std::optional<TargetCodegenRequirements> codegenRequirements() const {
+    return std::nullopt;
+  }
+
   /// The emitter for `key`, or null when the target does not declare that key.
   /// A target that declares several emitter keys exposes each one here; the
   /// caller passes the key a bundle's `emitterKey` names. This is the one
@@ -151,6 +160,16 @@ public:
   /// (design §17.3). Defaulting to null keeps a target that predates
   /// measurement working unchanged.
   virtual const LatencyProvider *latencyProvider() const { return nullptr; }
+
+  /// Add this target's post-MicroToLinalg selected-code passes. A target with
+  /// no selected backend rejects the request instead of inheriting reference
+  /// lowering and being reported as target execution.
+  virtual llvm::Error
+  buildSelectedBackendPipeline(mlir::OpPassManager &) const {
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "selected backend is unsupported by target '" + name().str() + "'");
+  }
 };
 
 /// A target built from already-loaded registries. `loadMappingTarget` is the
@@ -205,7 +224,7 @@ llvm::Error verifyMappingTarget(const MappingTarget &target);
 /// generic loader gets emitters that can verify a bundle and not lower it, so a
 /// pipeline that wants selected-bundle execution has to ask the package.
 using MappingTargetFactory = llvm::Expected<std::unique_ptr<MappingTarget>> (*)(
-    llvm::StringRef configurationRoot);
+    llvm::StringRef configurationRoot, llvm::StringRef machinePath);
 
 /// Registers `factory` under `name`, so generic code can reach a target without
 /// naming it.
@@ -230,7 +249,8 @@ bool isRegisteredMappingTarget(llvm::StringRef name);
 /// backend, which is what a silent default would amount to.
 llvm::Expected<std::unique_ptr<MappingTarget>>
 createRegisteredMappingTarget(llvm::StringRef name,
-                              llvm::StringRef configurationRoot);
+                              llvm::StringRef configurationRoot,
+                              llvm::StringRef machinePath = {});
 
 } // namespace mlir::llk::mapping
 

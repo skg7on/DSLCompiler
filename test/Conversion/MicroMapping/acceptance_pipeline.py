@@ -28,7 +28,9 @@ mapping *disabled*.
 """
 
 import argparse
+import json
 import os
+import re
 import subprocess
 import sys
 
@@ -44,17 +46,17 @@ def run(command, expect_success=True):
     available in this build, and reporting a missing tool as "unavailable"
     would turn a broken chain into a passing run.
     """
-    result = subprocess.run(
-        command, shell=True, capture_output=True, text=True)
+    result = subprocess.run(command, capture_output=True, text=True)
     if expect_success and result.returncode != 0:
         raise ChainFailure(
-            "command failed (%d): %s\n%s" % (
-                result.returncode, command, result.stderr.strip()))
-    return result.stdout
+                "command failed (%d): %s\n%s" % (
+                result.returncode, " ".join(command), result.stderr.strip()))
+    return result
 
 
 class Chain:
-    def __init__(self, name, micro_source, export, target, emitters, entry):
+    def __init__(self, name, micro_source, export, target, emitters, entry,
+                 expected_rules, required_ops, transform=False):
         self.name = name
         # The .mlir file the chain starts from.
         self.micro_source = micro_source
@@ -65,6 +67,9 @@ class Chain:
         self.emitters = emitters
         # The kernel symbol the chain expects to find.
         self.entry = entry
+        self.expected_rules = expected_rules
+        self.required_ops = required_ops
+        self.transform = transform
 
 
 AVX2 = {
@@ -81,6 +86,13 @@ ACCEL = {
     "rules": "mapping/generic-ai-accel/rules.llkmap",
 }
 
+TWO_HOP = {
+    "name": "issue129-two-hop",
+    "machine": "test/Mapping/Inputs/issue129/two_hop_machine.yaml",
+    "layouts": "mapping/x86-avx2/layouts.llkmap",
+    "rules": "test/Mapping/Inputs/issue129/two_hop_rules.llkmap",
+}
+
 AVX2_EMITTERS = ("avx2_vector_add,avx2_vector_convert,avx2_vector_silu,"
                  "avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,"
                  "avx2_tile_copy,avx2_tile_store,"
@@ -91,17 +103,29 @@ ACCEL_EMITTERS = "accel_vector_add,accel_mxu,accel_copy"
 def chains():
     return [
         Chain("vector-add", "micro_map.mlir", False, AVX2, AVX2_EMITTERS,
-              "mapped"),
+              "mapped", {"avx2.vector_add", "avx2.async_copy"},
+              {"micro.async_copy", "micro.vector"}),
         Chain("staged-gemm", "matmul_e2e.mlir", True, AVX2, AVX2_EMITTERS,
-              "matmul_M16_N64_K64"),
+              "matmul_M16_N64_K64", {"avx2.mma_bf16", "avx2.tile_async_copy",
+                                      "avx2.tile_store"},
+              {"micro.mma", "micro.tile_async_copy", "micro.wait"}),
         Chain("fused-swiglu", "swiglu_e2e.mlir", True, AVX2, AVX2_EMITTERS,
-              "fused_swiglu_M16_N64_K64"),
-        # The accelerator's rules cover the tensor-level movement and the
-        # vector family, not the tile-level ops the LLK export emits, so the
-        # neutrality chain uses the concrete kernel both targets' rules cover:
-        # the same program, mapped twice, with nothing generic changed.
-        Chain("second-target", "micro_map.mlir", False, ACCEL, ACCEL_EMITTERS,
-              "mapped"),
+              "fused_swiglu_M16_N64_K64", {"avx2.mma_bf16", "avx2.vector_mul",
+                                            "avx2.vector_silu"},
+              {"micro.mma", "micro.vector", "micro.tile_async_copy"}),
+        Chain("required-transform", "Inputs/issue129/required_transform.mlir",
+              False, {**AVX2,
+                      "layouts": "test/Conversion/MicroMapping/Inputs/issue129/required_transform_layouts.llkmap",
+                      "rules": "test/Conversion/MicroMapping/Inputs/issue129/required_transform.llkmap"},
+              "avx2_vector_add,avx2_vector_mul,avx2_copy", "required_transform",
+              {"issue129.add_row_major", "issue129.mul_blocked"},
+              {"micro.vector"}, transform=True),
+        # The second-target closure is the named two-hop profile. Its selected
+        # route and intermediate reservation are reviewed below.
+        Chain("second-target-two-hop", "physical_two_hop.mlir", False, TWO_HOP,
+              "e1", "physical_two_hop", {"issue129.vector_add_sram",
+                                           "issue129.store_dram"},
+              {"micro.vector", "micro.tile_async_copy", "micro.wait"}),
     ]
 
 
@@ -113,6 +137,7 @@ def map_options(chain, source_dir, target, mode, report=None, report_only=None):
         "rules=%s" % os.path.join(source_dir, target["rules"]),
         "emitters=%s" % chain.emitters,
         "mode=%s" % mode,
+        "top-k=0",
     ]
     if report:
         options.append("report=%s" % report)
@@ -146,8 +171,8 @@ def run_chain(chain, args, work, report_lines):
     #    pass the IR fixtures exercise.
     micro_path = os.path.join(work, "micro.mlir")
     if chain.export:
-        exported = run('%s "--llk-to-micro=schedule-db=missing.json" %s'
-                       % (llk_opt, source))
+        exported = run([llk_opt, "--llk-to-micro=schedule-db=missing.json",
+                        source]).stdout
         check("micro.kernel @%s" % chain.entry in exported,
               "%s: the export produced no kernel @%s" % (chain.name, chain.entry))
         # Mapping disabled: the legacy export still emits the concrete kernel,
@@ -159,6 +184,17 @@ def run_chain(chain, args, work, report_lines):
     else:
         micro_path = source
 
+    # Parse/print twice before mapping.  The second print must be stable; this
+    # catches syntax accepted only by the original text path and printer drift.
+    parsed_once = run([llk_opt, "--mlir-print-op-generic", micro_path]).stdout
+    parsed_path = os.path.join(work, "parsed_once.mlir")
+    with open(parsed_path, "w") as handle:
+        handle.write(parsed_once)
+    parsed_twice = run([llk_opt, "--mlir-print-op-generic", parsed_path]).stdout
+    check(parsed_once == parsed_twice,
+          "%s: parse/print is not byte-stable" % chain.name)
+    micro_path = parsed_path
+
     # 2. The mapping search. Run twice, into different report paths, so the
     #    repeat check is about the *search* rather than about a cached file.
     report_a = os.path.join(work, "report_a.json")
@@ -168,7 +204,7 @@ def run_chain(chain, args, work, report_lines):
     for report, mapped in ((report_a, mapped_a), (report_b, mapped_b)):
         options = map_options(chain, args.source_dir, chain.target, "exact",
                               report=report)
-        output = run('%s "--micro-map=%s" %s' % (llk_opt, options, micro_path))
+        output = run([llk_opt, "--micro-map=" + options, micro_path]).stdout
         with open(mapped, "w") as handle:
             handle.write(output)
 
@@ -198,6 +234,49 @@ def run_chain(chain, args, work, report_lines):
                 "layoutLibraryHash", "targetHash"):
         check(key in report_text,
               "%s: the plan report has no %s" % (chain.name, key))
+    report_data = json.loads(report_text)
+    selected = report_data["selectedState"]
+    check(selected["physicalComplete"] and not selected["physicalReasons"],
+          "%s: selected plan is physically incomplete" % chain.name)
+    placements = selected["placements"]
+    selected_rules = {placement["rule"] for placement in placements}
+    check(chain.expected_rules.issubset(selected_rules),
+          "%s: selected rules %s omit %s" %
+          (chain.name, sorted(selected_rules), sorted(chain.expected_rules)))
+    check(report_data["plans"][0]["rank"] == 0,
+          "%s: selected plan is not the top ranked plan" % chain.name)
+    check(not report_data["searchTruncated"],
+          "%s: exact acceptance search was truncated" % chain.name)
+    check(not report_data["plans"][0]["diagnostics"]["warnings"],
+          "%s: selected plan has physical warnings" % chain.name)
+
+    # Replay the selected frozen plan by its public ID into the same exact
+    # configuration, proving that a real report selection is reproducible.
+    plan_id = report_data["selectedPlanId"]
+    bind_options = map_options(chain, args.source_dir, chain.target, "exact")
+    rebound = run([llk_opt, "--micro-bind-plan=plan-id=%s %s" %
+                   (plan_id, bind_options), micro_path]).stdout
+    check(rebound == mapped_text,
+          "%s: frozen selected-plan ID did not reproduce mapped IR" % chain.name)
+    for operation in chain.required_ops:
+        check(operation in mapped_text,
+              "%s: selected IR is missing required operation %s" %
+              (chain.name, operation))
+    if chain.transform:
+        check("micro.transform" in mapped_text,
+              "%s: incompatible maps did not materialize a transform" % chain.name)
+    if chain.name == "second-target-two-hop":
+        route = next((connection for connection in selected["connections"]
+                      if connection["route"] == ["sram.0", "l2.0", "dram.0"]), None)
+        check(route is not None, "two-hop connection did not select SRAM -> L2 -> DRAM")
+        check(len(route.get("hops", [])) == 2,
+              "two-hop connection did not record both physical hops")
+        intermediate = [allocation for allocation in selected["allocations"]
+                        if allocation["memory"] == "l2.0" and
+                        allocation["bytes"] == 256]
+        check(intermediate, "two-hop route has no 256-byte L2 reservation")
+        check("micro.hop = 1" in mapped_text and "micro.hop = 2" in mapped_text,
+              "two-hop IR does not identify both emitted hops")
 
     # 6. Layered verification accepts what the mapper wrote.
     verify_options = " ".join([
@@ -207,14 +286,41 @@ def run_chain(chain, args, work, report_lines):
         "rules=%s" % os.path.join(args.source_dir, chain.target["rules"]),
         "emitters=%s" % chain.emitters,
     ])
-    run('%s "--micro-verify-mapping=%s" %s'
-        % (llk_opt, verify_options, mapped_a))
+    verify = run([llk_opt, "--micro-verify-mapping=" + verify_options,
+                  mapped_a])
 
     # 7. The performance model accepts the selected plan and charges it.
     machine = os.path.join(args.source_dir, chain.target["machine"])
-    perf = run("%s --machine=%s --level=1 %s" % (micro_perf, machine, mapped_a))
-    check(len(perf.strip()) > 0,
-          "%s: the performance model produced no events" % chain.name)
+    perf = run([micro_perf, "--machine=" + machine, "--level=1",
+                "--fail-on-capacity-violation", "--format=yaml", mapped_a]).stdout
+    selected_cost = report_data["plans"][0]["costComponents"]
+    predicted = float(re.search(r"(?m)^predicted_cycles: ([0-9.]+)$", perf).group(1))
+    dram = int(re.search(r"(?m)^    dram: ([0-9]+)$", perf).group(1))
+    check(predicted == float(selected_cost["latencyCycles"]),
+          "%s: planner cycles %s differ from perf cycles %s" %
+          (chain.name, selected_cost["latencyCycles"], predicted))
+    check(dram == int(selected_cost["dramBytes"]),
+          "%s: planner DRAM traffic %s differs from perf bytes %s" %
+          (chain.name, selected_cost["dramBytes"], dram))
+    check("capacity_violations: []" in perf,
+          "%s: static perf reports a capacity violation" % chain.name)
+
+    if chain.export:
+        frozen = os.path.join(work, "frozen_plan.json")
+        with open(frozen, "w") as handle:
+            handle.write(report_text)
+        compiled = run([llk_compile,
+                        "--mapping-target=" + chain.target["name"],
+                        "--mapping-root=" + args.source_dir,
+                        "--machine=" + machine,
+                        "--mapping-backend=reference",
+                        "--mapping-stop=lowered",
+                        "--plan-report=" + frozen,
+                        "--emit=mlir", mapped_a])
+        check("selected-groups-verified=" in compiled.stdout and
+              "arith.extf" in compiled.stdout,
+              "%s: frozen report did not rebind and lower in llk-compile" %
+              chain.name)
 
     # 8. With mapping disabled the legacy export still produces the same
     #    concrete kernel, twice, byte for byte. Compiling that kernel through
@@ -222,8 +328,8 @@ def run_chain(chain, args, work, report_lines):
     #    (MicroToLinalgJit, LLKToLinalgConversion, the AVX2 SwiGLU chains) --
     #    repeating it here would test the backend, not the mapping path.
     if chain.export:
-        again = run('%s "--llk-to-micro=schedule-db=missing.json" %s'
-                    % (llk_opt, source))
+        again = run([llk_opt, "--llk-to-micro=schedule-db=missing.json",
+                     source]).stdout
         check(again == exported,
               "%s: the mapping-disabled export is not deterministic"
               % chain.name)

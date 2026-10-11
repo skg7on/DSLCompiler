@@ -11,6 +11,7 @@
 #include "LLK/Mapping/Diagnostics.h"
 
 #include "llvm/ADT/StringSwitch.h"
+#include "llvm/Support/ErrorHandling.h"
 
 namespace mlir::llk::mapping {
 
@@ -46,6 +47,8 @@ llvm::StringRef stringifyDiagnosticCode(DiagnosticCode code) {
     return "connection_choice_unexplored";
   case DiagnosticCode::InvalidGatherDeclaration:
     return "invalid_gather_declaration";
+  case DiagnosticCode::UnsupportedMaterialization:
+    return "unsupported_materialization";
   }
   return "";
 }
@@ -70,6 +73,8 @@ std::optional<DiagnosticCode> symbolizeDiagnosticCode(llvm::StringRef name) {
             DiagnosticCode::ConnectionChoiceUnexplored)
       .Case("invalid_gather_declaration",
             DiagnosticCode::InvalidGatherDeclaration)
+      .Case("unsupported_materialization",
+            DiagnosticCode::UnsupportedMaterialization)
       .Default(std::nullopt);
 }
 
@@ -77,6 +82,51 @@ bool diagnosticLess(const Diagnostic &lhs, const Diagnostic &rhs) {
   if (lhs.code != rhs.code)
     return static_cast<int>(lhs.code) < static_cast<int>(rhs.code);
   return lhs.message < rhs.message;
+}
+
+bool isRejection(DiagnosticCode code) {
+  switch (code) {
+  // Notices: a cap, a provider gap, or an advisory assumption. None is a
+  // refusal the search made.
+  case DiagnosticCode::SearchTruncated:
+  case DiagnosticCode::LatencyCacheMiss:
+  case DiagnosticCode::AssumedValueSize:
+  case DiagnosticCode::ConnectionChoiceUnexplored:
+    return false;
+  // Rejections: the search refused a rule, a placement, a pair, a layout, a
+  // global constraint, a bundle, or a plan.
+  case DiagnosticCode::NoMatchingRule:
+  case DiagnosticCode::NoLegalLayout:
+  case DiagnosticCode::NoLegalExecutor:
+  case DiagnosticCode::MemoryCapacityExceeded:
+  case DiagnosticCode::UnsupportedComputeFragment:
+  case DiagnosticCode::NoMemoryRoute:
+  case DiagnosticCode::NoLayoutTransform:
+  case DiagnosticCode::GlobalConstraintFailed:
+  case DiagnosticCode::TargetBundleInvalid:
+  case DiagnosticCode::InvalidMappingMetadata:
+  case DiagnosticCode::InvalidGatherDeclaration:
+  case DiagnosticCode::UnsupportedMaterialization:
+    return true;
+  }
+  llvm_unreachable("unclassified DiagnosticCode");
+}
+
+const Diagnostic *primaryRefusal(llvm::ArrayRef<Diagnostic> diagnostics) {
+  const Diagnostic *first = nullptr;
+  for (const Diagnostic &detail : diagnostics) {
+    if (!isRejection(detail.code))
+      continue;
+    if (!first)
+      first = &detail;
+    // A plan-level refusal outranks a rule-level one whichever order the codes
+    // sort in: it is the one that names the decision the search got as far as
+    // choosing and then could not materialize.
+    if (detail.code == DiagnosticCode::UnsupportedMaterialization ||
+        detail.code == DiagnosticCode::MemoryCapacityExceeded)
+      return &detail;
+  }
+  return first;
 }
 
 } // namespace mlir::llk::mapping

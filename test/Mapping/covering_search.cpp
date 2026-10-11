@@ -3,9 +3,12 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/Diagnostics.h"
 #include "LLK/Mapping/LatencyProvider.h"
+#include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/TileFacts.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
+
+#include "resource_regression_fixture.h"
 
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/MLIRContext.h"
@@ -20,6 +23,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <variant>
 #include <vector>
@@ -1171,7 +1175,12 @@ values(std::initializer_list<std::pair<llvm::StringRef, SearchValue>> entries) {
 // connection's producer/consumer ports now join their content keys, so two uses
 // of one value are distinct. The plan id changed once when those were resolved
 // (task A2); from then on it is content-stable.
-constexpr PlanId kNoBindingPlanId = 16999786886447551871ULL;
+//
+// Re-baselined for issue #129 task R1 (schema v3): the canonical instance and
+// plan forms each gained a leading `v3|` schema tag and the selected compute
+// bindings, and lost the derived `localCost`/score and diagnostic fields. The
+// v3 form is what a plan id is computed from now, so this pin moves with it.
+constexpr PlanId kNoBindingPlanId = 11768839360329919068ULL;
 
 //===----------------------------------------------------------------------===//
 // Search bound fixtures
@@ -4612,6 +4621,39 @@ TEST(MappingDiagnostics, DistinctFailuresCarryDistinctCodes) {
   }
 }
 
+// Issue #129, task R7 review: the "no plan" primary message must be the
+// plan-level refusal -- the one the completion evaluator produced, which names
+// the decision that could not be materialized -- not whichever rejection
+// happens to carry the lowest enum code. `UnsupportedMaterialization` is the
+// last enumerator, so an enum-ordered scan would always report an earlier
+// rule-level rejection instead.
+TEST(MappingDiagnostics, PrimaryRefusalPrefersThePlanLevelRefusal) {
+  std::vector<Diagnostic> diagnostics = {
+      {DiagnosticCode::NoMatchingRule, "no rule names this node"},
+      {DiagnosticCode::UnsupportedMaterialization,
+       "placement for node 3 records compute node 'vpu.x'"},
+      {DiagnosticCode::SearchTruncated, "a cap is a notice, not a refusal"},
+  };
+  const Diagnostic *primary = primaryRefusal(diagnostics);
+  ASSERT_NE(primary, nullptr);
+  EXPECT_EQ(primary->code, DiagnosticCode::UnsupportedMaterialization);
+}
+
+TEST(MappingDiagnostics, PrimaryRefusalFallsBackToTheFirstRejection) {
+  std::vector<Diagnostic> diagnostics = {
+      {DiagnosticCode::SearchTruncated, "a cap is a notice"},
+      {DiagnosticCode::NoMemoryRoute, "no route"},
+      {DiagnosticCode::NoLegalLayout, "no layout"},
+  };
+  const Diagnostic *primary = primaryRefusal(diagnostics);
+  ASSERT_NE(primary, nullptr);
+  EXPECT_EQ(primary->code, DiagnosticCode::NoMemoryRoute);
+  EXPECT_EQ(primaryRefusal(std::vector<Diagnostic>{}), nullptr);
+  std::vector<Diagnostic> noticesOnly = {
+      {DiagnosticCode::SearchTruncated, "only a notice"}};
+  EXPECT_EQ(primaryRefusal(noticesOnly), nullptr);
+}
+
 //===----------------------------------------------------------------------===//
 // Physical (layout-image) capacity charging (task B3)
 //===----------------------------------------------------------------------===//
@@ -5192,4 +5234,424 @@ TEST(CoveringSearch, RejectsConflictingRequirementsOnOneEndpoint) {
   EXPECT_TRUE(result->plans.empty())
       << "conflicting endpoint requirements produced " << result->plans.size()
       << " plans";
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R1: the selected compute node survives the search
+//===----------------------------------------------------------------------===//
+
+/// Two attached vector engines of one kind are two legal placements of one
+/// rule. The selected engine must travel into every complete plan instead of
+/// collapsing to the executor's first attached capability: the two plans name
+/// `vpu.a` and `vpu.b`, and their ids differ because the decision differs.
+TEST(CoveringSearch, Issue129TwoComputePlansKeepTheirSelectedEngine) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 2u);
+  std::set<std::string> selected;
+  for (const auto &plan : result->plans)
+    selected.insert(
+        plan.placements.front().computeBindings.lookup("vector_engine"));
+  EXPECT_EQ(selected, (std::set<std::string>{"vpu.a", "vpu.b"}));
+  EXPECT_NE(result->plans[0].id, result->plans[1].id);
+}
+
+/// Reversing the machine's engine declaration order must not change which
+/// engines are selected, nor which plan ranks first: placement order is decided
+/// by the selected binding (`vpu.a` before `vpu.b`), never by the order the
+/// machine happened to list the capabilities in.
+TEST(CoveringSearch, Issue129ReversingEngineOrderKeepsTheSelections) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto forward = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(forward)) << llvm::toString(forward.takeError());
+  ASSERT_EQ(forward->plans.size(), 2u);
+  // Written while `c->target` is still the forward target, so the two reports
+  // below really compare the two machine declaration orders.
+  ASSERT_FALSE(forward->plans.empty());
+  const std::string forwardReport =
+      writePlanReport(*forward, c->target->machine(), *c->target, options,
+                      forward->workloadHash);
+
+  // The same machine with its two attached engines declared in the other order.
+  MachineModel reversed = c->target->machine();
+  std::reverse(reversed.computes.begin(), reversed.computes.end());
+  c->target = std::make_unique<FileMappingTarget>(
+      "issue129", reversed, LayoutRegistry(c->target->layouts()),
+      RuleRegistry(c->target->rules()),
+      std::vector<std::string>{"issue129_vector_add"});
+  auto backward = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(backward)) << llvm::toString(backward.takeError());
+  ASSERT_EQ(backward->plans.size(), 2u);
+
+  auto selections = [](const MappingSearchResult &result) {
+    std::set<std::string> engines;
+    for (const auto &plan : result.plans)
+      engines.insert(
+          plan.placements.front().computeBindings.lookup("vector_engine"));
+    return engines;
+  };
+  EXPECT_EQ(selections(*forward), selections(*backward));
+  EXPECT_EQ(selections(*backward), (std::set<std::string>{"vpu.a", "vpu.b"}));
+  EXPECT_EQ(forward->plans.front().placements.front().computeBindings.lookup(
+                "vector_engine"),
+            backward->plans.front().placements.front().computeBindings.lookup(
+                "vector_engine"));
+
+  // The reports are byte-identical too: node declaration order is normalized
+  // out of the machine content hash and out of every canonical plan id, so a
+  // reordering of equivalent capabilities changes neither a selection nor the
+  // bytes a reader compares. `forwardReport` was written from the forward
+  // target and `backwardReport` from the reversed one.
+  const std::string backwardReport =
+      writePlanReport(*backward, c->target->machine(), *c->target, options,
+                      backward->workloadHash);
+  EXPECT_EQ(forwardReport, backwardReport);
+}
+
+/// The canonical identity depends on what a plan *decided*. Changing only the
+/// selected engine changes it; changing only a derived score, a diagnostic, or
+/// the truncation flag does not -- so a preview can acquire a valid id before
+/// it is scored, and a score can never be what distinguishes two plans.
+TEST(CoveringSearch, Issue129IdentityDependsOnDecisionsNotScores) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan plan = result->plans.front();
+  ASSERT_FALSE(plan.placements.empty());
+
+  // Change *only* the selected engine: the id must change.
+  CoveringPlan otherEngine = plan;
+  llvm::StringMap<std::string> &bindings =
+      otherEngine.placements.front().computeBindings;
+  const std::string selected = bindings.lookup("vector_engine");
+  bindings["vector_engine"] = selected == "vpu.a" ? "vpu.b" : "vpu.a";
+  EXPECT_NE(computePlanId(plan), computePlanId(otherEngine));
+
+  // Change only derived scores, diagnostics and the truncation flag: the id
+  // must not.
+  CoveringPlan scored = plan;
+  scored.totalCost.latencyCycles = 12345.0;
+  scored.accumulatedCost.latencyCycles = 999.0;
+  scored.scoreSource = PlanScoreSource::Schedule;
+  scored.diagnostics.errors.push_back("a diagnostic that is not a decision");
+  scored.diagnostics.warnings.push_back("a warning that is not a decision");
+  scored.diagnostics.searchTruncated = true;
+  EXPECT_EQ(computePlanId(plan), computePlanId(scored));
+
+  // The same rule holds for an instance's own identity.
+  CandidateInstance instance;
+  instance.candidate = 7;
+  instance.computeBindings["vector_engine"] = "vpu.a";
+  instance.localCost.latencyCycles = 4.0;
+  CandidateInstance rescored = instance;
+  rescored.localCost.latencyCycles = 4096.0;
+  EXPECT_EQ(computeInstanceId(instance), computeInstanceId(rescored));
+  rescored.computeBindings["vector_engine"] = "vpu.b";
+  EXPECT_NE(computeInstanceId(instance), computeInstanceId(rescored));
+}
+
+//===----------------------------------------------------------------------===//
+// R7: evaluate complete proposals before exact/beam retention
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// A completion evaluator that accepts every proposal, counting the calls, so a
+/// test can learn how many complete proposals a search found.
+struct CountingEvaluator {
+  unsigned calls = 0;
+  unsigned rejectFirst = 0;
+  llvm::Expected<CompletePlanEvaluation> operator()(const CoveringPlan &plan) {
+    ++calls;
+    CompletePlanEvaluation evaluation;
+    if (calls <= rejectFirst) {
+      evaluation.rejection = Diagnostic{
+          DiagnosticCode::MemoryCapacityExceeded,
+          "test evaluator: candidate " + std::to_string(calls) + " rejected"};
+      return evaluation;
+    }
+    evaluation.plan = plan;
+    return evaluation;
+  }
+};
+
+} // namespace
+
+// Issue #129 finding 2 / task R7: exact search could trim to top-K *before*
+// physical storage was validated, so a cheap proposal that fails its capacity
+// was retained and a more expensive legal covering was discarded. The fixture
+// states an `8x8xf32` result with four live versions (pipeline stages four), so
+// its 1024-byte footprint does not fit the 512-byte SRAM the cheap `r.small`
+// rule binds, while it fits the 4096-byte DRAM `r.large` binds.
+TEST(CoveringSearch, EvaluatesFeasibilityBeforeRetainingTopK) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  options.requireCompleteEvaluation = true;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 1u);
+  EXPECT_EQ(result->plans.front().placements.front().rule, "r.large");
+  EXPECT_GT(result->frontier.plansRejectedByCapacity, 0u);
+  EXPECT_FALSE(result->searchTruncated);
+}
+
+// The same fixture proves the two levers are *not* interchangeable: raising K
+// does not recover the legal plan unless feasibility is evaluated before the
+// trim, because the trim's key is the additive rule cost (r.small = 1) and the
+// legal plan is never kept in the first place. With the evaluator, K=1 and K=64
+// select the same best feasible plan.
+TEST(CoveringSearch, ChangingTopKDoesNotChangeTheBestFeasibleExactPlan) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+
+  MappingSearchOptions one;
+  one.mode = SearchMode::Exact;
+  one.topK = 1;
+  auto narrow = issue129::searchCase(*c, one);
+  ASSERT_TRUE(static_cast<bool>(narrow)) << llvm::toString(narrow.takeError());
+  ASSERT_EQ(narrow->plans.size(), 1u);
+
+  MappingSearchOptions many;
+  many.mode = SearchMode::Exact;
+  many.topK = 64;
+  auto wide = issue129::searchCase(*c, many);
+  ASSERT_TRUE(static_cast<bool>(wide)) << llvm::toString(wide.takeError());
+  ASSERT_FALSE(wide->plans.empty());
+  EXPECT_EQ(wide->plans.front().id, narrow->plans.front().id);
+  EXPECT_EQ(wide->plans.front().placements.front().rule, "r.large");
+}
+
+// Issue #129, task R7 review: the top-K trim runs *after* the walk, so a plan
+// retained under a cap must report that cap in its own diagnostics. The plan's
+// `diagnostics.searchTruncated` was snapshotted while the proposal was built --
+// before `result.searchTruncated` was set by the trim -- so a trimmed plan
+// reported `false`. The `two-compute` fixture has two feasible plans (one per
+// attached engine), so `topK = 1` genuinely trims.
+TEST(CoveringSearch, ATrimmedPlanReportsTheTopKCapThatTrimmedIt) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 1u);
+  ASSERT_TRUE(result->searchTruncated)
+      << "the fixture must produce more than one feasible plan";
+  EXPECT_TRUE(result->plans.front().diagnostics.searchTruncated);
+}
+
+// Issue #129, task R7 review: with an evaluator installed the search's own
+// partial-state budget check is disabled (its sum is an over-estimate), so the
+// whole-plan budget must still be enforced -- on the finalized plan's live peak
+// -- or the option is silently ignored on every evaluator-backed run.
+TEST(CoveringSearch, TheWholePlanBudgetIsEnforcedThroughTheEvaluator) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 0; // no cap: any accepted plan would be returned
+  // The legal DRAM binding's live peak is 1024 bytes; a 512-byte budget refuses
+  // it, so no covering is feasible and the refusal carries the capacity code.
+  options.memoryBudgetBytes = 512;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(hasDiagnostic(*result, DiagnosticCode::MemoryCapacityExceeded));
+}
+
+// A rejected cheap proposal must not end a deterministic search: the walk
+// continues and retains the first proposal the evaluator accepts.
+TEST(CoveringSearch, ARejectionContinuesADeterministicSearch) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  CountingEvaluator counting;
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  options.topK = 0; // no cap: keep every accepted plan
+  options.evaluateCompletePlan = [&counting](const CoveringPlan &plan) {
+    return counting(plan);
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  // The deterministic walk stops at the first accepted plan, so it evaluated
+  // exactly one proposal and retained it.
+  EXPECT_EQ(counting.calls, 1u);
+  EXPECT_EQ(result->frontier.plansRejectedByCapacity, 0u);
+}
+
+// A candidate rejection is a property of one proposal, never a cap: it is
+// tallied under its category and does not set `searchTruncated`.
+TEST(CoveringSearch, ACandidateRejectionDoesNotReportTruncation) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  CountingEvaluator counting;
+  counting.rejectFirst = 1;
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 0;
+  options.evaluateCompletePlan = [&counting](const CoveringPlan &plan) {
+    return counting(plan);
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  EXPECT_FALSE(result->searchTruncated);
+  EXPECT_EQ(result->frontier.plansRejectedByCapacity, 1u);
+  // The four complete coverings minus the one rejected.
+  EXPECT_EQ(result->plans.size(), 3u);
+}
+
+// An `llvm::Error` from the evaluator is an infrastructure failure, not a
+// candidate property: it stops the search and is surfaced to the caller.
+TEST(CoveringSearch, ACompletionErrorStopsTheSearch) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.evaluateCompletePlan =
+      [](const CoveringPlan &) -> llvm::Expected<CompletePlanEvaluation> {
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "test evaluator: infrastructure failure");
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_FALSE(static_cast<bool>(result));
+  EXPECT_NE(llvm::toString(result.takeError()).find("infrastructure failure"),
+            std::string::npos);
+}
+
+// The callback contract: exactly one of plan/rejection. Both, or neither, is an
+// invalid callback and stops the search rather than being silently interpreted.
+TEST(CoveringSearch, ACompletionReturningBothPlanAndRejectionIsAnError) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.evaluateCompletePlan =
+      [](const CoveringPlan &plan) -> llvm::Expected<CompletePlanEvaluation> {
+    CompletePlanEvaluation evaluation;
+    evaluation.plan = plan;
+    evaluation.rejection =
+        Diagnostic{DiagnosticCode::MemoryCapacityExceeded, "both"};
+    return evaluation;
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_FALSE(static_cast<bool>(result));
+  EXPECT_NE(llvm::toString(result.takeError()).find("both a plan and"),
+            std::string::npos);
+}
+
+TEST(CoveringSearch, ACompletionReturningNeitherIsAnError) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.evaluateCompletePlan =
+      [](const CoveringPlan &) -> llvm::Expected<CompletePlanEvaluation> {
+    return CompletePlanEvaluation{};
+  };
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_FALSE(static_cast<bool>(result));
+  EXPECT_NE(llvm::toString(result.takeError()).find("neither a plan nor"),
+            std::string::npos);
+}
+
+// Requiring validated complete plans without supplying an evaluator is a
+// configuration error, reported before any work is done -- never a silent
+// fallback to the unvalidated path.
+TEST(CoveringSearch, RequiringEvaluationWithoutACallbackIsAConfigurationError) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.requireCompleteEvaluation = true;
+
+  CoveringSearch search(graph, *target, context, LayoutContext{}, options);
+  llvm::Expected<MappingSearchResult> result = search.search();
+  ASSERT_FALSE(static_cast<bool>(result));
+  EXPECT_NE(
+      llvm::toString(result.takeError()).find("requireCompleteEvaluation"),
+      std::string::npos);
+}
+
+// `topK == 0` is no cap: every feasible complete plan is returned, and the
+// result is not reported as truncated. A finite K still truncates and reports.
+TEST(CoveringSearch, ZeroTopKReturnsEveryFeasibleCompletePlan) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph = twoNodeGraph(context);
+  std::unique_ptr<MappingTarget> target = targetWith(searchMachine(), kRules);
+  ASSERT_NE(target, nullptr);
+
+  CountingEvaluator counting;
+  MappingSearchOptions unlimited;
+  unlimited.mode = SearchMode::Exact;
+  unlimited.topK = 0;
+  unlimited.evaluateCompletePlan = [&counting](const CoveringPlan &plan) {
+    return counting(plan);
+  };
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, unlimited);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_FALSE(result->plans.empty());
+    EXPECT_FALSE(result->searchTruncated);
+    EXPECT_EQ(result->plans.size(), static_cast<size_t>(counting.calls));
+  }
+
+  MappingSearchOptions capped = unlimited;
+  capped.topK = 1;
+  {
+    CoveringSearch search(graph, *target, context, LayoutContext{}, capped);
+    llvm::Expected<MappingSearchResult> result = search.search();
+    ASSERT_TRUE(static_cast<bool>(result))
+        << llvm::toString(result.takeError());
+    EXPECT_EQ(result->plans.size(), 1u);
+    EXPECT_TRUE(result->searchTruncated);
+  }
 }

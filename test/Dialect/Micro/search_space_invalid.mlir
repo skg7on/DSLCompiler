@@ -173,8 +173,8 @@ func.func @fragment_shape_not_positive() {
 
 func.func @unsupported_tail_policy() {
   micro.search_space @bad attributes {workload = "fused_swiglu"} {
-    // expected-error @+1 {{tail_policy choice 'none' is not supported (only 'mask')}}
-    micro.param "tail" {kind = "tail_policy", choices = ["mask", "none"]}
+    // expected-error @+1 {{tail_policy choice 'wrap' is not a recognized policy}}
+    micro.param "tail" {kind = "tail_policy", choices = ["none", "wrap"]}
   }
   return
 }

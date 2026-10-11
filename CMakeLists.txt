@@ -251,6 +251,7 @@ mlir_target_link_libraries(MicroDialect PUBLIC
 add_library(LLKPerf STATIC
     lib/Perf/MicroDAG.cpp
     lib/Perf/MicroCostModel.cpp
+    lib/Perf/SelectedKernelAnalysis.cpp
     lib/Perf/MicroPerfReport.cpp
     lib/Perf/SearchSpace.cpp
     lib/Perf/Candidate.cpp
@@ -307,6 +308,7 @@ add_library(LLKMapping STATIC
     lib/Mapping/Diagnostics.cpp
     lib/Mapping/TileFacts.cpp
     lib/Mapping/StoragePlan.cpp
+    lib/Mapping/StorageLiveness.cpp
     lib/Mapping/CostModel.cpp
     lib/Mapping/CostEvent.cpp
     lib/Mapping/EventSchedule.cpp
@@ -359,11 +361,12 @@ mlir_target_link_libraries(LLKToLinalg PUBLIC
 # Library: LLK -> concrete micro.kernel export (M11)
 add_mlir_library(LLKToMicro
     lib/Conversion/LLKToMicro/LLKToMicro.cpp
-    DEPENDS LLKDialect MicroDialect LLKCommon
+    DEPENDS LLKDialect MicroDialect LLKCommon MLIRLinalgDialect
     LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon
 )
 mlir_target_link_libraries(LLKToMicro PUBLIC
-    MLIRArithDialect MLIRFuncDialect MLIRTensorDialect MLIRPass MLIRTransforms
+    MLIRArithDialect MLIRFuncDialect MLIRLinalgDialect MLIRTensorDialect
+    MLIRPass MLIRTransforms
 )
 
 # Library: micro -> Linalg bridge. `micro` was a sink: nothing lowered it to
@@ -374,6 +377,19 @@ add_mlir_library(LLKMicroToLinalg
     DEPENDS MicroDialect
     LINK_LIBS PUBLIC MicroDialect
 )
+
+add_library(LLKMappedKernelAbi STATIC
+    lib/Conversion/MicroMapping/MappedKernelAbi.cpp
+)
+target_include_directories(LLKMappedKernelAbi PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+)
+target_compile_options(LLKMappedKernelAbi PRIVATE -fno-rtti -fno-exceptions)
+mlir_target_link_libraries(LLKMappedKernelAbi PUBLIC
+    MLIRBufferizationPipelines MLIRBufferizationTransforms MLIRSCFTransforms
+    MLIRFuncDialect MLIRMemRefDialect MLIRSCFDialect MLIRPass MLIRIR
+)
 mlir_target_link_libraries(LLKMicroToLinalg PUBLIC
     MLIRArithDialect MLIRFuncDialect MLIRLinalgDialect MLIRMemRefDialect
     MLIRSCFDialect MLIRTensorDialect MLIRPass MLIRTransforms
@@ -383,12 +399,14 @@ mlir_target_link_libraries(LLKMicroToLinalg PUBLIC
 add_library(LLKRuntime STATIC
     runtime/JitCache.cpp
     runtime/MappedExecutable.cpp
+    runtime/MappedInvocation.cpp
     runtime/PackedWeights.cpp
     runtime/ThreadPool.cpp
 )
 target_include_directories(LLKRuntime PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${LLVM_INCLUDE_DIRS}
+    PRIVATE ${CMAKE_SOURCE_DIR}/test/Execution
 )
 # Resolve native target libraries dynamically for the build host.
 # Equivalent to: llvm-config --libs native
@@ -396,6 +414,7 @@ target_include_directories(LLKRuntime PUBLIC
 # On AArch64 → LLVMAArch64{CodeGen,Info,Desc,AsmParser,AsmPrinter,Disassembler}
 llvm_map_components_to_libnames(LLVM_NATIVE_TARGET_LIBS native)
 target_link_libraries(LLKRuntime PUBLIC
+    LLKMappedKernelAbi
     LLVMOrcJIT
     ${LLVM_NATIVE_TARGET_LIBS}
 )
@@ -422,6 +441,7 @@ mlir_target_link_libraries(LLKRuntime PUBLIC
     MLIRMemRefTransforms
     MLIRReconcileUnrealizedCasts
     MLIRSCFToControlFlow
+    MLIRUBToLLVM
     MLIRVectorToLLVMPass
 )
 
@@ -470,6 +490,7 @@ add_library(LLKTargetMapping STATIC
     lib/Target/MappingTargets.cpp
     lib/Target/X86/Mapping/AVX2MappingTarget.cpp
     lib/Target/X86/Mapping/AVX2BundleLowering.cpp
+    lib/Target/X86/Mapping/AVX2BackendLowering.cpp
     lib/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.cpp
 )
 target_include_directories(LLKTargetMapping PUBLIC
@@ -488,7 +509,9 @@ add_library(LLKMicroMapping STATIC
     lib/Conversion/MicroMapping/MicroBindPlanPass.cpp
     lib/Conversion/MicroMapping/MicroVerifyMappingPass.cpp
     lib/Conversion/MicroMapping/SearchBindingLoader.cpp
+    lib/Conversion/MicroMapping/CandidateInstantiation.cpp
     lib/Conversion/MicroMapping/PlanMaterialization.cpp
+    lib/Conversion/MicroMapping/CompletePlanEvaluation.cpp
 )
 target_include_directories(LLKMicroMapping PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -499,7 +522,7 @@ target_include_directories(LLKMicroMapping PUBLIC
 # needs LLKPerf. That direction is legal: LLKPerf already depends on LLKMapping,
 # and LLKMapping must never depend on LLKPerf, so the pass library -- above both
 # -- is the only layer that may link them together.
-target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine LLKPerf)
+target_link_libraries(LLKMicroMapping PUBLIC LLKMapping LLKTargetMapping LLKMachine LLKPerf LLKToMicro)
 # LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
 # not inherit those. Match the toolchain, exactly as LLKMapping does.
 target_compile_options(LLKMicroMapping PRIVATE -fno-rtti -fno-exceptions)
@@ -533,9 +556,11 @@ target_include_directories(LLKMappedCompilation PUBLIC
 # private because it is an implementation detail of the Micro mapping library.
 target_include_directories(LLKMappedCompilation PRIVATE
     ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+    ${CMAKE_SOURCE_DIR}/test/Execution
 )
 target_link_libraries(LLKMappedCompilation PUBLIC
-    LLKMicroMapping LLKMicroToLinalg LLKRuntime LLKMapping LLKTargetMapping
+    LLKMicroMapping LLKMicroToLinalg LLKMappedKernelAbi LLKRuntime LLKMapping
+    LLKTargetMapping
 )
 # LLVM and MLIR are built without RTTI or exceptions; a plain add_library does
 # not inherit those. Match the toolchain, exactly as LLKMapping does.
@@ -543,6 +568,18 @@ target_compile_options(LLKMappedCompilation PRIVATE -fno-rtti -fno-exceptions)
 mlir_target_link_libraries(LLKMappedCompilation PUBLIC
     MLIRBufferizationTransforms MLIRLinalgTransforms MLIRPass MLIRIR
 )
+
+# Target-aware tuning sits above both mapping and mapped compilation.
+add_library(LLKMappedTuning STATIC
+    lib/Conversion/MicroMapping/MappedTuningSession.cpp
+)
+target_include_directories(LLKMappedTuning PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${LLVM_INCLUDE_DIRS}
+    PRIVATE ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+)
+target_link_libraries(LLKMappedTuning PUBLIC LLKMicroMapping LLKMappedCompilation)
+target_compile_options(LLKMappedTuning PRIVATE -fno-rtti -fno-exceptions)
 
 add_mlir_library(LLKCommon
     lib/Transforms/Common/TilingUtils.cpp
@@ -721,7 +758,9 @@ target_link_libraries(llk-bench PRIVATE LLKRuntime)
 # Tool: llk-tune (autotuning: Micro search space, or the legacy grid)
 add_llvm_executable(llk-tune tools/llk-tune/llk-tune.cpp)
 target_link_libraries(llk-tune PRIVATE
-    LLKPerf MicroDialect LLKDialect LLKRuntime ${LLK_MLIR_EXEC_LIBS})
+    LLKPerf LLKMappedTuning LLKTargetMapping LLKMappedCompilation LLKMapping
+    LLKMicroMapping LLKToMicro MicroDialect LLKDialect LLKRuntime
+    ${LLK_MLIR_EXEC_LIBS})
 
 # Tool: micro-perf (Micro-IR performance simulator, M10)
 add_llvm_executable(micro-perf tools/micro-perf/micro-perf.cpp)

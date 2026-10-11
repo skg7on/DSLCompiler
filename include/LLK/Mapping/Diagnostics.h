@@ -18,6 +18,7 @@
 #ifndef LLK_MAPPING_DIAGNOSTICS_H
 #define LLK_MAPPING_DIAGNOSTICS_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
@@ -90,6 +91,14 @@ enum class DiagnosticCode {
   /// consumer declared none. Nothing is inferred -- a guessed axis would
   /// materialize a different tile -- so the connection is refused.
   InvalidGatherDeclaration,
+  /// A selected plan cannot be materialized as executable code: a decision it
+  /// makes has no material form (a connection the binder reports as
+  /// unmaterializable under an executable contract). This is a candidate
+  /// *rejection* raised by the completion evaluator (issue #129, task R7) --
+  /// the plan is physically legal but cannot be turned into code, so a search
+  /// that requires executable plans must not retain it. Distinct from
+  /// `NoLayoutTransform`, which names one specific unmaterializable decision.
+  UnsupportedMaterialization,
 };
 
 /// The stable string for `code` (for example `no_matching_rule`). Never empty.
@@ -109,6 +118,32 @@ struct Diagnostic {
 /// this gives a deterministic order independent of how the search reached a
 /// failure (design §22.1).
 bool diagnosticLess(const Diagnostic &lhs, const Diagnostic &rhs);
+
+/// True when `code` classifies a *rejection* -- a refusal the search made --
+/// rather than a notice. A cap hit, a provider gap or an advisory assumption
+/// (an assumed value size) is a notice: it must not inflate a rejection tally,
+/// and a caller reporting "no plan" wants the first *refusal* as its primary
+/// reason rather than a cache miss.
+///
+/// Every code is classified explicitly and there is deliberately no `default`:
+/// a code added to the enum without a case here is a compile error
+/// (`-Wswitch`), rather than silently defaulting into the rejection bucket.
+bool isRejection(DiagnosticCode code);
+
+/// The rejection whose words should lead a "no plan" report. A *plan-level*
+/// refusal -- one the completion evaluator produced because a chosen decision
+/// could not be materialized -- is the most useful primary message, because it
+/// names the exact decision that failed; a rule-level rejection (no matching
+/// rule, no legal executor, no route) only says a node never had a candidate,
+/// which the rest of the frontier already lists.
+///
+/// This prefers the plan-level codes over the rule-level ones *regardless of
+/// their numeric order* -- `UnsupportedMaterialization` is the last enumerator,
+/// so an enum-ordered scan would always report an earlier rule-level rejection
+/// instead -- and otherwise returns the first rejection in `diagnostics`, which
+/// is stable because the frontier is sorted by `diagnosticLess`. Returns null
+/// when `diagnostics` holds no rejection at all (only notices, or nothing).
+const Diagnostic *primaryRefusal(llvm::ArrayRef<Diagnostic> diagnostics);
 
 } // namespace mlir::llk::mapping
 

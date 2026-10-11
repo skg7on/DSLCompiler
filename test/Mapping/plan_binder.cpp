@@ -5,11 +5,15 @@
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Mapping/PlanReport.h"
+#include "LLK/Mapping/StoragePlan.h"
+#include "LLK/Perf/SelectedKernelAnalysis.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
 #include "MicroMappingCommon.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
+
+#include "resource_regression_fixture.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -17,13 +21,16 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace mlir;
 using namespace mlir::llk::mapping;
@@ -725,6 +732,47 @@ TEST(PlanBinder, MaterializesALayoutTransformAsATransformOp) {
   EXPECT_EQ(countOps(*bound->module, "micro.transform"), transformsBefore + 1);
   EXPECT_FALSE(
       static_cast<bool>(verifyMappedMicroIR(*bound->module, **target)));
+}
+
+// The concrete resource the plan recorded for a layout conversion survives the
+// metadata round trip (issue #129, task R1), so a replay normalizes the same
+// transform event instead of re-deriving one from executor order.
+TEST(PlanBinder, Issue129TransformResourceSurvivesMetadataRoundTrip) {
+  Fixture fixture = makeFixture();
+  ASSERT_TRUE(fixture.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target = movementTarget();
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  llvm::Expected<CoveringPlan> plan =
+      selectPlan(*fixture.context, *fixture.module, **target);
+  ASSERT_TRUE(static_cast<bool>(plan)) << llvm::toString(plan.takeError());
+  ASSERT_FALSE(plan->connectionPlans.empty());
+
+  mlir::MLIRContext *context = fixture.context.get();
+  PlanConnection &connection = plan->connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route.resize(1); // same memory: nothing to move
+  LayoutTransform transform;
+  transform.srcLayout = "t.plain";
+  transform.dstLayout = "t.blocked";
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  transform.dstMap = mlir::AffineMap::getMultiDimIdentityMap(2, context);
+  // The machine's own vector engine, recorded as the conversion's resource.
+  transform.computeResource = "vpu";
+  connection.transform = transform;
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*fixture.module, *plan, **target);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  auto decoded = decodeSelectedPlan(*bound->module, **target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  const PlanConnection *replayed = nullptr;
+  for (const PlanConnection &candidate : decoded->connectionPlans)
+    if (candidate.transform)
+      replayed = &candidate;
+  ASSERT_NE(replayed, nullptr) << "the replayed plan records no transform";
+  EXPECT_EQ(replayed->transform->computeResource, "vpu");
 }
 
 // Task B8 (closes A9's parked finding): the emitted `micro.transform` carries
@@ -1662,7 +1710,7 @@ TEST(PlanBinder, RoundTripsConnectionEndpointsAndResourceBindings) {
 
   auto decoded = decodeSelectedPlan(*b->module, **target);
   ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
-  EXPECT_EQ(decoded->schemaVersion, 2u);
+  EXPECT_EQ(decoded->schemaVersion, 3u);
   EXPECT_EQ(decoded->id, p->id);
 
   ASSERT_EQ(decoded->connectionPlans.size(), p->connectionPlans.size());
@@ -1800,7 +1848,7 @@ TEST(PlanBinder, DecodeRejectsAnUnsupportedSchemaVersion) {
   ASSERT_TRUE(plan);
   NamedAttrList updated(plan);
   updated.set("schema_version",
-              IntegerAttr::get(IntegerType::get(f.context.get(), 64), 3));
+              IntegerAttr::get(IntegerType::get(f.context.get(), 64), 4));
   b->kernel->setAttr("micro.plan", updated.getDictionary(f.context.get()));
 
   auto decoded = decodeSelectedPlan(*b->module, *f.target);
@@ -2028,7 +2076,11 @@ module {
 
 } // namespace
 
-TEST(PlanBinder, DecodesUnambiguousV1Metadata) {
+// Sub-v3 metadata records no concrete compute selection, so a replay cannot
+// know which attached capability was selected. It is rejected with an explicit
+// migration diagnostic -- regenerate the binding -- rather than recovered by
+// guessing an engine from executor order (issue #129, task R1).
+TEST(PlanBinder, RejectsSubV3MetadataWithAMigrationDiagnostic) {
   Fixture f = makeFixture();
   ASSERT_TRUE(f.target);
   MLIRContext context;
@@ -2039,21 +2091,17 @@ TEST(PlanBinder, DecodesUnambiguousV1Metadata) {
   ASSERT_TRUE(module);
 
   auto decoded = decodeSelectedPlan(*module, *f.target);
-  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
-  EXPECT_EQ(decoded->schemaVersion, 1u);
-  EXPECT_EQ(decoded->id, 7u);
-  ASSERT_EQ(decoded->placements.size(), 1u);
-  EXPECT_EQ(decoded->placements[0].rule, "avx2.vector_add");
-  ASSERT_EQ(decoded->placements[0].layoutSolutions.size(), 1u);
-  const SolvedLayout &solved =
-      decoded->placements[0].layoutSolutions.lookup("avx2.blocked_2d");
-  EXPECT_EQ(solved.parameters.size(), 3u);
-  ASSERT_TRUE(solved.port.has_value());
-  EXPECT_EQ(solved.port->direction, PortDirection::Input);
-  EXPECT_EQ(solved.port->index, 0u);
+  ASSERT_FALSE(bool(decoded));
+  const std::string text = llvm::toString(decoded.takeError());
+  EXPECT_NE(text.find("schema version 1"), std::string::npos) << text;
+  EXPECT_NE(text.find("Re-run"), std::string::npos) << text;
 }
 
-TEST(PlanBinder, RejectsAmbiguousV1ExecutableReplay) {
+// The same rule applies to a sub-v3 binding whose missing associations used to
+// be "ambiguous": it is now uniformly rejected as the older schema it is,
+// because guessing the compute selection is not more recoverable than guessing
+// an endpoint.
+TEST(PlanBinder, RejectsAmbiguousV1MetadataAsSubV3) {
   Fixture f = makeFixture();
   ASSERT_TRUE(f.target);
   MLIRContext context;
@@ -2065,8 +2113,8 @@ TEST(PlanBinder, RejectsAmbiguousV1ExecutableReplay) {
 
   auto decoded = decodeSelectedPlan(*module, *f.target);
   ASSERT_FALSE(bool(decoded));
-  EXPECT_NE(llvm::toString(decoded.takeError()).find("ambiguous"),
-            std::string::npos);
+  const std::string text = llvm::toString(decoded.takeError());
+  EXPECT_NE(text.find("schema version 1"), std::string::npos) << text;
 }
 
 //===----------------------------------------------------------------------===//
@@ -4006,4 +4054,994 @@ TEST(PlanBinder, RejectsMovementDisconnectedFromSelectedConsumer) {
   auto e = verifyMappedMicroIR(*b->module, **target);
   EXPECT_TRUE(bool(e));
   llvm::consumeError(std::move(e));
+}
+
+//=============================================================================//
+// Issue #129, task R1: the selected compute node survives metadata
+//=============================================================================//
+
+namespace {
+
+/// Binds `plan` against a fresh clone of the case's source module, so two plans
+/// of one search never share a stamped kernel.
+llvm::Expected<BoundPlan> bindCloned(issue129::ResourceCase &c,
+                                     const CoveringPlan &plan) {
+  OwningOpRef<ModuleOp> module = cast<ModuleOp>((*c.source)->clone());
+  std::unique_ptr<PlanMaterializer> materializer =
+      mlir::llk::micro_mapping_detail::createCanonicalPlanMaterializer();
+  return bindPlan(*module, plan, *c.target, BindContract::Partial,
+                  materializer.get());
+}
+
+/// Records `id` as the selected `vector_engine` on every mapped operation that
+/// records a compute selection.
+void rewriteRecordedCompute(ModuleOp module, MLIRContext &context,
+                            llvm::StringRef id) {
+  module->walk([&](Operation *op) {
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping || !mapping.get("compute_bindings"))
+      return;
+    NamedAttrList fields(mapping);
+    fields.set("compute_bindings",
+               DictionaryAttr::get(
+                   &context,
+                   {NamedAttribute(StringAttr::get(&context, "vector_engine"),
+                                   StringAttr::get(&context, id))}));
+    op->setAttr("micro.mapping", fields.getDictionary(&context));
+  });
+}
+
+/// Empties the recorded compute container on every mapped operation that has
+/// one -- present but recording nothing, which is what a dropped or tampered
+/// selection looks like.
+void emptyRecordedCompute(ModuleOp module, MLIRContext &context) {
+  module->walk([&](Operation *op) {
+    auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+    if (!mapping || !mapping.get("compute_bindings"))
+      return;
+    NamedAttrList fields(mapping);
+    fields.set("compute_bindings", DictionaryAttr::get(&context, {}));
+    op->setAttr("micro.mapping", fields.getDictionary(&context));
+  });
+}
+
+/// Binds the first plan of a two-compute search against a clone of the case's
+/// module, ready for a recorded-selection tamper.
+llvm::Expected<BoundPlan> bindFirstTwoComputePlan(issue129::ResourceCase &c) {
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(c, options);
+  if (!result)
+    return result.takeError();
+  if (result->plans.empty())
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the two-compute search produced no plan");
+  return bindCloned(c, result->plans.front());
+}
+
+} // namespace
+
+/// Every engine the search selected survives the metadata round trip: the
+/// binding records it on the mapped operation, `decodeSelectedPlan` restores it
+/// per placement, and the decoded plan keeps the id the search computed --
+/// which it can only do if the selection is part of canonical identity.
+TEST(PlanBinder, Issue129SelectedComputeSurvivesMetadataRoundTrip) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 2u);
+
+  std::set<std::string> decodedSelections;
+  for (const CoveringPlan &plan : result->plans) {
+    auto bound = bindCloned(*c, plan);
+    ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+    auto decoded = decodeSelectedPlan(*bound->module, *c->target);
+    ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+    EXPECT_EQ(decoded->schemaVersion, kMappingMetadataVersion);
+    EXPECT_EQ(decoded->id, plan.id);
+    ASSERT_EQ(decoded->placements.size(), plan.placements.size());
+    EXPECT_EQ(
+        decoded->placements.front().computeBindings.lookup("vector_engine"),
+        plan.placements.front().computeBindings.lookup("vector_engine"));
+    decodedSelections.insert(
+        decoded->placements.front().computeBindings.lookup("vector_engine"));
+
+    // A freshly bound v3 kernel verifies.
+    llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+    EXPECT_FALSE(bool(verified)) << llvm::toString(std::move(verified));
+    llvm::consumeError(std::move(verified));
+  }
+  EXPECT_EQ(decodedSelections, (std::set<std::string>{"vpu.a", "vpu.b"}));
+}
+
+/// Deleting the recorded compute container must not let verification fall back
+/// to the executor's first attached engine.
+TEST(PlanBinder, Issue129DeletingComputeBindingsIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  auto bound = bindCloned(*c, result->plans.front());
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+
+  eraseFromVectorMapping(*bound->module, *c->context, "compute_bindings");
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("compute_bindings"), std::string::npos) << text;
+}
+
+/// A recorded engine the machine does not declare is rejected by verification,
+/// never silently replaced.
+TEST(PlanBinder, Issue129UnknownRecordedComputeNodeIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  rewriteRecordedCompute(*bound->module, *c->context, "vpu.unknown");
+
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("vpu.unknown"), std::string::npos) << text;
+}
+
+/// A recorded engine whose *kind* is not the one the rule requires is rejected:
+/// the requirement is a capability class, not merely a node id.
+TEST(PlanBinder, Issue129WrongKindRecordedComputeNodeIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  // `mxu.a` is a real capability of the machine, but a `matrix_engine` -- not
+  // the `vector_engine` the rule requires.
+  rewriteRecordedCompute(*bound->module, *c->context, "mxu.a");
+
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("mxu.a"), std::string::npos) << text;
+  EXPECT_NE(text.find("matrix_engine"), std::string::npos) << text;
+}
+
+/// A recorded engine that exists and has the right kind but is not attached to
+/// the placement's executor is rejected too.
+TEST(PlanBinder, Issue129UnattachedRecordedComputeNodeIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  // `vpu.c` is a `vector_engine`, but attached to `dsp.0`, not the selected
+  // `e0`.
+  rewriteRecordedCompute(*bound->module, *c->context, "vpu.c");
+
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("vpu.c"), std::string::npos) << text;
+  EXPECT_NE(text.find("attached"), std::string::npos) << text;
+}
+
+/// A container that is *present but empty* is not "nothing was recorded": the
+/// rule requires a `vector_engine`, so the missing entry is a dropped selection
+/// and verification must reject it rather than fall through to the existential
+/// check (which would let the executor's first engine stand in).
+TEST(PlanBinder, Issue129EmptyComputeContainerIsRejectedNotFallenBack) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  emptyRecordedCompute(*bound->module, *c->context);
+
+  llvm::Error verified = verifyMappedMicroIR(*bound->module, *c->target);
+  ASSERT_TRUE(bool(verified));
+  const std::string text = llvm::toString(std::move(verified));
+  EXPECT_NE(text.find("vector_engine"), std::string::npos) << text;
+  EXPECT_NE(text.find("records no concrete node"), std::string::npos) << text;
+}
+
+/// The same tamper is not recoverable by the metadata reader either: a replay
+/// refuses to invent a selection rather than re-deriving one.
+TEST(PlanBinder, Issue129EmptyComputeContainerIsNotDecodable) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto bound = bindFirstTwoComputePlan(*c);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  emptyRecordedCompute(*bound->module, *c->context);
+
+  auto decoded = decodeSelectedPlan(*bound->module, *c->target);
+  ASSERT_FALSE(bool(decoded));
+  const std::string text = llvm::toString(decoded.takeError());
+  EXPECT_NE(text.find("vector_engine"), std::string::npos) << text;
+}
+
+/// Two placements of one instance must agree on the selected engine: a fused
+/// instance cannot claim two different capabilities. Two mapped operations are
+/// forced to share an instance id while their recorded compute selections
+/// differ, which is exactly the inconsistency verification must reject.
+TEST(PlanBinder, Issue129DifferingComputeInsideOneInstanceIsRejected) {
+  Fixture f = makeFixture();
+  ASSERT_TRUE(f.module);
+  ASSERT_NE(f.target, nullptr);
+  auto p = selectPlan(*f.context, *f.module, *f.target);
+  ASSERT_TRUE(bool(p)) << llvm::toString(p.takeError());
+  auto b = bindCanonical(*f.module, *p, *f.target);
+  ASSERT_TRUE(bool(b)) << llvm::toString(b.takeError());
+
+  llvm::SmallVector<Operation *> mapped;
+  b->module->walk([&](Operation *op) {
+    if (op->getAttrOfType<DictionaryAttr>("micro.mapping"))
+      mapped.push_back(op);
+  });
+  ASSERT_GE(mapped.size(), 2u);
+  auto first = mapped.front()->getAttrOfType<DictionaryAttr>("micro.mapping");
+  ASSERT_TRUE(first);
+  auto instance = first.getAs<IntegerAttr>("instance");
+  ASSERT_TRUE(instance);
+  Operation *second = mapped[1];
+  NamedAttrList fields(second->getAttrOfType<DictionaryAttr>("micro.mapping"));
+  fields.set("instance", instance);
+  second->setAttr("micro.mapping", fields.getDictionary(f.context.get()));
+
+  llvm::Error verified = verifyMappedMicroIR(*b->module, *f.target);
+  ASSERT_TRUE(bool(verified));
+  EXPECT_NE(
+      llvm::toString(std::move(verified)).find("differing compute bindings"),
+      std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R3: complete per-endpoint physical memory facts
+//===----------------------------------------------------------------------===//
+
+// A rule that binds no memory at all, over a tile whose kind the machine offers
+// twice: the endpoint is ambiguous, so no strict binding may pick one. The
+// analysis contract keeps the plan and states why it is incomplete; the
+// executable contract refuses it.
+TEST(PlanBinder, Issue129PhysicalMemoryAmbiguityRefusesStrictBinding) {
+  auto c = issue129::resourceCase("missing-memory");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  // Partial analysis: the plan is retained, and it records that it is not
+  // physically complete, naming the ambiguous memory rather than guessing.
+  CoveringPlan analysis = result->plans.front();
+  analysis.materialized = false;
+  llvm::Error finalized =
+      finalizeStoragePlan(c->graph, analysis, c->target->machine());
+  ASSERT_FALSE(bool(finalized)) << llvm::toString(std::move(finalized));
+  EXPECT_FALSE(analysis.diagnostics.physicalComplete);
+  bool namedSram = false;
+  for (const std::string &reason : analysis.diagnostics.physicalReasons)
+    namedSram |= reason.find("sram") != std::string::npos;
+  EXPECT_TRUE(namedSram);
+
+  // Strict executable binding: refused, with a memory diagnostic.
+  std::unique_ptr<PlanMaterializer> materializer =
+      mlir::llk::micro_mapping_detail::createCanonicalPlanMaterializer();
+  auto strict = bindPlan(*c->source, result->plans.front(), *c->target,
+                         BindContract::Executable, materializer.get());
+  EXPECT_FALSE(bool(strict));
+  if (!strict)
+    EXPECT_NE(llvm::toString(strict.takeError()).find("memory"),
+              std::string::npos);
+}
+
+// The control: with every occurrence named, the same ambiguous kind is a
+// decision the search makes per occurrence, so the strict binding succeeds and
+// the explicit selections survive the metadata round trip.
+TEST(PlanBinder, Issue129PhysicalMemoryNamedPortSelectionsSurvive) {
+  auto c = issue129::resourceCase("named-ports");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  const CoveringPlan &plan = result->plans.front();
+  ASSERT_EQ(plan.placements.size(), 1u);
+  const PlanPlacement &placement = plan.placements.front();
+  ASSERT_EQ(placement.portMemoryBindings.size(), 3u);
+  for (const PortMemoryBinding &binding : placement.portMemoryBindings)
+    EXPECT_FALSE(binding.memory.empty());
+
+  auto strict =
+      bindCanonical(*c->source, plan, *c->target, BindContract::Executable);
+  ASSERT_TRUE(bool(strict)) << llvm::toString(strict.takeError());
+
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*strict->module, *c->target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  ASSERT_EQ(decoded->placements.size(), 1u);
+  EXPECT_EQ(decoded->placements.front().portMemoryBindings,
+            placement.portMemoryBindings);
+}
+
+// The report is where a `report-only` run states an incomplete verdict: a plan
+// whose physical facts do not resolve is reported with `physicalComplete:
+// false` and its reasons, never presented as a fully executable plan.
+TEST(PlanBinder, Issue129PhysicalMemoryReportRecordsIncompleteStatus) {
+  auto c = issue129::resourceCase("missing-memory");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  result->plans.front().materialized = false;
+  ASSERT_FALSE(bool(finalizeStoragePlan(c->graph, result->plans.front(),
+                                        c->target->machine())));
+
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, /*moduleHash=*/0);
+  EXPECT_NE(report.find("\"physicalComplete\": false"), std::string::npos)
+      << report;
+  EXPECT_NE(report.find("\"physicalReasons\": ["), std::string::npos) << report;
+  EXPECT_NE(report.find("ambiguous"), std::string::npos) << report;
+
+  // ... and the verdict must survive the round trip (issue #129, task R7
+  // review). A plan found physically incomplete replayed as complete, because
+  // the field was written to the report but never read back and the in-memory
+  // default is optimistic.
+  llvm::Expected<CoveringPlan> replayed =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_TRUE(bool(replayed)) << llvm::toString(replayed.takeError());
+  EXPECT_FALSE(replayed->diagnostics.physicalComplete);
+  EXPECT_FALSE(replayed->diagnostics.physicalReasons.empty());
+}
+
+// The same verdict must survive the `micro.plan` metadata round trip (issue
+// #129, task R7 review), so a kernel decoded from the IR does not present an
+// incomplete analysis artifact as a complete plan.
+TEST(PlanBinder, Issue129PhysicalVerdictSurvivesMetadataRoundTrip) {
+  auto c = issue129::resourceCase("missing-memory");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  CoveringPlan plan = result->plans.front();
+  plan.materialized = false;
+  ASSERT_FALSE(bool(finalizeStoragePlan(c->graph, plan, c->target->machine())));
+  ASSERT_FALSE(plan.diagnostics.physicalComplete);
+  ASSERT_FALSE(plan.diagnostics.physicalReasons.empty());
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c->source, plan, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*bound->module, *c->target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  EXPECT_FALSE(decoded->diagnostics.physicalComplete);
+  EXPECT_FALSE(decoded->diagnostics.physicalReasons.empty());
+}
+
+// A boundary descriptor -- a value no node in the graph produces, here the
+// `micro.tile_alloc` the add reads -- is recorded as a *borrowed* allocation:
+// the node its named requirement resolved it to, and its own 8x8xf32 span. It
+// is never counted as reusable scratch, and it is never bound to a
+// class-default memory.
+TEST(PlanBinder, Issue129PhysicalMemoryBorrowedBoundaryDescriptorsAreRecorded) {
+  auto c = issue129::resourceCase("named-ports");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  // Analysis mode, so the fixture's small machine is not asked to hold the
+  // plan's whole live set: this pins the boundary facts, not capacity.
+  CoveringPlan plan = result->plans.front();
+  plan.materialized = false;
+  ASSERT_FALSE(bool(finalizeStoragePlan(c->graph, plan, c->target->machine())));
+  EXPECT_TRUE(plan.diagnostics.physicalComplete);
+
+  // The add reads the one descriptor through two operand occurrences, and the
+  // named requirements bind them to the nodes the search selected. One borrow
+  // is recorded per distinct node, never one class-default for both.
+  std::set<std::string> inputMemories;
+  for (const PortMemoryBinding &binding :
+       plan.placements.front().portMemoryBindings)
+    if (binding.port.direction == PortDirection::Input)
+      inputMemories.insert(binding.memory);
+
+  std::set<std::string> borrowedMemories;
+  for (const StorageAllocation &allocation : plan.allocations) {
+    if (!allocation.borrowed)
+      continue;
+    // 8x8xf32 = 256 bytes: the descriptor's own known span, not an assumed one.
+    EXPECT_EQ(allocation.bytes, 256u);
+    borrowedMemories.insert(allocation.memory);
+  }
+  EXPECT_FALSE(borrowedMemories.empty());
+  EXPECT_EQ(borrowedMemories, inputMemories);
+  for (const std::string &memory : borrowedMemories)
+    EXPECT_NE(memory.find("sram."), std::string::npos) << memory;
+
+  // The borrow is durable: a replayed report keeps the flag, so a reader can
+  // still tell scratch from a caller's buffer.
+  result->plans.front() = plan;
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, /*moduleHash=*/0);
+  llvm::Expected<CoveringPlan> replayed =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_TRUE(bool(replayed)) << llvm::toString(replayed.takeError());
+  size_t replayedBorrowed = 0;
+  for (const StorageAllocation &allocation : replayed->allocations)
+    if (allocation.borrowed)
+      ++replayedBorrowed;
+  EXPECT_EQ(replayedBorrowed, borrowedMemories.size());
+}
+
+//===----------------------------------------------------------------------===//
+// Materializing every movement hop (issue #129, task R4)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The `two-hop` fixture, searched exactly and storage-finalized: one 256-byte
+/// value moving sram.0 -> l2.0 -> dram.0 on two distinct DMA engines, with a
+/// reserved allocation for each hop destination.
+llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> twoHopBound() {
+  llvm::Expected<issue129::ResourceCase> c = issue129::resourceCase("two-hop");
+  if (!c)
+    return c.takeError();
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  llvm::Expected<MappingSearchResult> result =
+      issue129::searchCase(*c, options);
+  if (!result)
+    return result.takeError();
+  if (result->plans.empty())
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the two-hop fixture searched no plan");
+  CoveringPlan plan = result->plans.front();
+  if (llvm::Error error =
+          finalizeStoragePlan(c->graph, plan, c->target->machine()))
+    return std::move(error);
+  return std::make_pair(std::move(*c), std::move(plan));
+}
+
+/// The `micro.tile_async_copy` operations in `module`, in walk order.
+llvm::SmallVector<Operation *> materializedCopies(ModuleOp module) {
+  llvm::SmallVector<Operation *> copies;
+  module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.tile_async_copy")
+      copies.push_back(op);
+  });
+  return copies;
+}
+
+/// Rewrites the kernel's `micro.routes` with `mutate` applied to each route
+/// dictionary, so a test can tamper with one recorded decision.
+void mutateRoutes(Operation *kernel, MLIRContext &context,
+                  llvm::function_ref<DictionaryAttr(DictionaryAttr)> mutate) {
+  auto routes = kernel->getAttrOfType<ArrayAttr>("micro.routes");
+  llvm::SmallVector<Attribute> rewritten;
+  for (Attribute element : routes)
+    rewritten.push_back(mutate(cast<DictionaryAttr>(element)));
+  kernel->setAttr("micro.routes", ArrayAttr::get(&context, rewritten));
+}
+
+/// Replaces `micro.routes`' `hops` array with `hops` on every route.
+DictionaryAttr withHops(DictionaryAttr route, MLIRContext &context,
+                        ArrayRef<Attribute> hops) {
+  llvm::SmallVector<NamedAttribute> fields;
+  for (NamedAttribute attribute : route)
+    if (attribute.getName() != "hops")
+      fields.push_back(attribute);
+  fields.emplace_back(StringAttr::get(&context, "hops"),
+                      ArrayAttr::get(&context, hops));
+  return DictionaryAttr::get(&context, fields);
+}
+
+/// Rewrites `micro.routes` so the hop at `hopIndex` of every route records
+/// `engine` as the transfer engine it runs on.
+void setRouteHopEngine(mlir::Operation *kernel, MLIRContext &context,
+                       size_t hopIndex, llvm::StringRef engine) {
+  mutateRoutes(kernel, context, [&](DictionaryAttr route) {
+    auto hops = route.getAs<ArrayAttr>("hops");
+    llvm::SmallVector<Attribute> rewritten;
+    for (size_t index = 0; index < hops.size(); ++index) {
+      if (index != hopIndex) {
+        rewritten.push_back(hops[index]);
+        continue;
+      }
+      llvm::SmallVector<NamedAttribute> fields;
+      for (NamedAttribute attribute : cast<DictionaryAttr>(hops[index]))
+        if (attribute.getName() != "engine")
+          fields.push_back(attribute);
+      fields.emplace_back(StringAttr::get(&context, "engine"),
+                          StringAttr::get(&context, engine));
+      rewritten.push_back(DictionaryAttr::get(&context, fields));
+    }
+    return withHops(route, context, rewritten);
+  });
+}
+
+} // namespace
+
+// Every movement hop becomes one awaited copy that reads the storage its hop
+// resourced and writes its destination's, so the emitted IR states the storage
+// decision each copy materializes rather than leaving a reader to re-derive one
+// from the memory kind.
+TEST(PlanBinder, Issue129MaterializesEveryHopIntoItsReservedStorage) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+
+  ASSERT_FALSE(plan.connectionPlans.empty());
+  const PlanConnection &movement = plan.connectionPlans.front();
+  ASSERT_EQ(movement.hops.size(), 2u);
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  for (const std::string &note : bound->unmaterialized)
+    ADD_FAILURE() << note;
+  EXPECT_TRUE(bound->unmaterialized.empty());
+
+  llvm::SmallVector<Operation *> copies = materializedCopies(*bound->module);
+  ASSERT_EQ(copies.size(), 2u) << "one copy per hop";
+  for (size_t hop = 0; hop < copies.size(); ++hop) {
+    Operation *copy = copies[hop];
+    EXPECT_EQ(copy->getAttrOfType<IntegerAttr>("micro.hop").getInt(),
+              static_cast<int64_t>(hop + 1));
+    EXPECT_EQ(copy->getAttrOfType<StringAttr>("micro.dst_node").getValue(),
+              movement.hops[hop].dstMemory);
+    EXPECT_EQ(copy->getAttrOfType<IntegerAttr>("micro.src_storage").getInt(),
+              static_cast<int64_t>(movement.hops[hop].sourceStorageId));
+    EXPECT_EQ(copy->getAttrOfType<IntegerAttr>("micro.dst_storage").getInt(),
+              static_cast<int64_t>(movement.hops[hop].destinationStorageId));
+  }
+  // Every stamped storage id is a buffer this plan actually reserved.
+  for (Operation *copy : copies) {
+    const int64_t source =
+        copy->getAttrOfType<IntegerAttr>("micro.src_storage").getInt();
+    const int64_t destination =
+        copy->getAttrOfType<IntegerAttr>("micro.dst_storage").getInt();
+    EXPECT_TRUE(llvm::any_of(plan.allocations, [&](const StorageAllocation &a) {
+      return static_cast<int64_t>(a.id) == source;
+    }));
+    EXPECT_TRUE(llvm::any_of(plan.allocations, [&](const StorageAllocation &a) {
+      return static_cast<int64_t>(a.id) == destination;
+    }));
+  }
+
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  EXPECT_FALSE(static_cast<bool>(verification))
+      << llvm::toString(std::move(verification));
+}
+
+// A movement that reads or writes a storage other than the one its hop
+// reserved is rejected: the copy no longer materializes the decision the plan
+// made, and re-deriving one is exactly what the hop record exists to prevent.
+TEST(PlanBinder, Issue129AMutatedHopStorageIdIsRejected) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  llvm::SmallVector<Operation *> copies = materializedCopies(*bound->module);
+  ASSERT_EQ(copies.size(), 2u);
+
+  // The copy keeps claiming its hop, but writes a storage the hop never
+  // reserved.
+  const int64_t reserved =
+      copies[0]->getAttrOfType<IntegerAttr>("micro.dst_storage").getInt();
+  copies[0]->setAttr(
+      "micro.dst_storage",
+      IntegerAttr::get(IntegerType::get(c.context.get(), 64), reserved + 1000));
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(verification));
+  const std::string message = llvm::toString(std::move(verification));
+  EXPECT_NE(message.find("does not write the storage"), std::string::npos)
+      << message;
+}
+
+// A hop set that does not describe the route is rejected rather than replayed:
+// the plan's storage decisions and its route must be the same movement.
+TEST(PlanBinder, Issue129AHopSetThatDoesNotMatchItsRouteIsRejected) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  // Drop the last hop: one hop cannot describe a three-memory route.
+  mlir::Operation *kernel = findKernel(*bound->module);
+  ASSERT_NE(kernel, nullptr);
+  mutateRoutes(kernel, *c.context, [&](DictionaryAttr route) {
+    auto hops = route.getAs<ArrayAttr>("hops");
+    llvm::SmallVector<Attribute> kept(hops.begin(), hops.end() - 1);
+    return withHops(route, *c.context, kept);
+  });
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(verification));
+  const std::string message = llvm::toString(std::move(verification));
+  EXPECT_NE(message.find("movement hops for a route"), std::string::npos)
+      << message;
+}
+
+// The hop records survive `micro.mapping`/`micro.routes` exactly: a decoded
+// plan states the same per-hop engine, storage allocations and ordering steps
+// the selected plan made.
+TEST(PlanBinder, Issue129MovementHopsRoundTripThroughMetadata) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+  const PlanConnection &stated = plan.connectionPlans.front();
+  ASSERT_EQ(stated.hops.size(), 2u);
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(decoded))
+      << llvm::toString(decoded.takeError());
+
+  ASSERT_EQ(decoded->connectionPlans.size(), 1u);
+  const PlanConnection &replayed = decoded->connectionPlans.front();
+  ASSERT_EQ(replayed.hops.size(), stated.hops.size());
+  for (size_t hop = 0; hop < stated.hops.size(); ++hop) {
+    EXPECT_EQ(replayed.hops[hop].index, stated.hops[hop].index);
+    EXPECT_EQ(replayed.hops[hop].srcMemory, stated.hops[hop].srcMemory);
+    EXPECT_EQ(replayed.hops[hop].dstMemory, stated.hops[hop].dstMemory);
+    EXPECT_EQ(replayed.hops[hop].engine, stated.hops[hop].engine);
+    EXPECT_EQ(replayed.hops[hop].sourceStorageId,
+              stated.hops[hop].sourceStorageId);
+    EXPECT_EQ(replayed.hops[hop].destinationStorageId,
+              stated.hops[hop].destinationStorageId);
+    EXPECT_EQ(replayed.hops[hop].movementStep, stated.hops[hop].movementStep);
+    EXPECT_EQ(replayed.hops[hop].waitStep, stated.hops[hop].waitStep);
+  }
+  ASSERT_EQ(decoded->steps.size(), plan.steps.size());
+  for (size_t index = 0; index < decoded->steps.size(); ++index)
+    EXPECT_EQ(decoded->steps[index].hop, plan.steps[index].hop);
+}
+
+// A hop's physical choices are identity-bearing. Re-pointing a hop at another
+// engine or another storage slot is a *different plan*, not the same plan with
+// a different annotation, so a tampered hop cannot pass as the plan it was
+// bound from. The derived timing around the hop is not identity.
+TEST(PlanBinder, Issue129HopPhysicalChoicesAreIdentityBearing) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  CoveringPlan &plan = built->second;
+  ASSERT_FALSE(plan.connectionPlans.empty());
+  ASSERT_FALSE(plan.connectionPlans.front().hops.empty());
+
+  // `finalizeStoragePlan` assigns the id from the decisions it built, so the
+  // plan it produced is the plan its id names.
+  const PlanId base = plan.id;
+  EXPECT_EQ(computePlanId(plan), base);
+
+  CoveringPlan otherEngine = plan;
+  otherEngine.connectionPlans.front().hops[0].engine = "dma.ghost";
+  EXPECT_NE(computePlanId(otherEngine), base)
+      << "a hop on a different engine is a different plan";
+
+  CoveringPlan otherStorage = plan;
+  otherStorage.connectionPlans.front().hops[0].destinationStorageId += 1000;
+  EXPECT_NE(computePlanId(otherStorage), base)
+      << "a hop into a different storage slot is a different plan";
+
+  CoveringPlan otherIntermediate = plan;
+  otherIntermediate.connectionPlans.front().hops[1].sourceStorageId += 1000;
+  EXPECT_NE(computePlanId(otherIntermediate), base)
+      << "the intermediate a hop reads is part of the decision";
+
+  // The steps that order the hops are derived timing: they are recorded for a
+  // reader but must not enter the identity.
+  CoveringPlan laterSteps = plan;
+  laterSteps.connectionPlans.front().hops[0].movementStep += 1000;
+  laterSteps.connectionPlans.front().hops[0].waitStep += 1000;
+  EXPECT_EQ(computePlanId(laterSteps), base);
+}
+
+// Mutating a hop's engine is rejected: the recorded hop must run on an engine
+// the machine declares, exactly as the route's engines do.
+TEST(PlanBinder, Issue129AMutatedHopEngineIsRejected) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  mlir::Operation *kernel = findKernel(*bound->module);
+  ASSERT_NE(kernel, nullptr);
+  setRouteHopEngine(kernel, *c.context, /*hopIndex=*/0, "dma.ghost");
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(verification));
+  const std::string message = llvm::toString(std::move(verification));
+  EXPECT_NE(message.find("dma.ghost"), std::string::npos) << message;
+  EXPECT_NE(message.find("unsupported transfer engine"), std::string::npos)
+      << message;
+}
+
+// A hop re-pointed at an engine the machine *does* declare, but its link does
+// not offer, is rejected too. `dma.a` and `dma.b` are both real engines of the
+// fixture's machine; only `dma.a` serves the sram.0 -> l2.0 link, so recording
+// `dma.b` for that hop is a tampered decision even though the engine exists.
+// (Verification must not fall back to "some engine of this machine can carry
+// it": two engine pools are not interchangeable.)
+TEST(PlanBinder, Issue129AHopEngineItsLinkDoesNotOfferIsRejected) {
+  llvm::Expected<std::pair<issue129::ResourceCase, CoveringPlan>> built =
+      twoHopBound();
+  ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
+  issue129::ResourceCase &c = built->first;
+  const CoveringPlan &plan = built->second;
+  ASSERT_EQ(plan.connectionPlans.front().hops.size(), 2u);
+  ASSERT_EQ(plan.connectionPlans.front().hops[0].engine, "dma.a");
+  ASSERT_EQ(plan.connectionPlans.front().hops[1].engine, "dma.b");
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, plan, *c.target, BindContract::Executable);
+  ASSERT_TRUE(static_cast<bool>(bound)) << llvm::toString(bound.takeError());
+
+  mlir::Operation *kernel = findKernel(*bound->module);
+  ASSERT_NE(kernel, nullptr);
+  // The first hop's link offers `dma.a` only; `dma.b` exists but serves the
+  // second link.
+  setRouteHopEngine(kernel, *c.context, /*hopIndex=*/0, "dma.b");
+  llvm::Error verification = verifyMappedMicroIR(*bound->module, *c.target);
+  ASSERT_TRUE(static_cast<bool>(verification));
+  const std::string message = llvm::toString(std::move(verification));
+  EXPECT_NE(message.find("dma.b"), std::string::npos) << message;
+  EXPECT_NE(message.find("its link does not offer"), std::string::npos)
+      << message;
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R8: durable replay reproduces the same IR and decisions
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+std::string printed(mlir::ModuleOp module) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  module->print(stream);
+  return stream.str();
+}
+
+/// The selected decisions two plans share, as a comparable rendering: the
+/// content id (which names them), plus the per-placement rule/executor/compute
+/// selection and the per-connection route and hops. A decode that dropped or
+/// re-derived any of these would differ here.
+std::string decisionRendering(const CoveringPlan &plan) {
+  std::string text = "id=" + std::to_string(plan.id);
+  for (const PlanPlacement &placement : plan.placements) {
+    text += "|p=" + placement.rule + ":" + placement.executor + ":";
+    std::vector<std::string> computes;
+    for (const auto &entry : placement.computeBindings)
+      computes.push_back(entry.first().str() + "=" + entry.second);
+    llvm::sort(computes);
+    for (const std::string &compute : computes)
+      text += "[" + compute + "]";
+  }
+  for (const PlanConnection &connection : plan.connectionPlans) {
+    text += "|c=" + std::to_string(connection.id) + ":";
+    for (const MemoryNodeId &memory : connection.route)
+      text += memory + ">";
+    for (const PlanMovementHop &hop : connection.hops)
+      text += "{" + std::to_string(hop.index) + ":" + hop.srcMemory + ">" +
+              hop.dstMemory + "@" + hop.engine + "}";
+  }
+  return text;
+}
+
+} // namespace
+
+// A bound plan decoded from its own `micro.plan` and re-bound must reproduce
+// the same durable decisions and the same normalized IR (§29.12). Without this,
+// a replay could quietly re-derive a decision -- an engine from executor order,
+// a route from the machine default -- and still look like a success.
+TEST(PlanBinder, Issue129ReplayReproducesTheSameIrAndDecisions) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan original = result->plans.front();
+  ASSERT_FALSE(original.connectionPlans.front().hops.empty())
+      << "the fixture must materialize a multi-hop movement";
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c->source, original, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  const std::string firstIr = printed(*bound->module);
+
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*bound->module, *c->target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  EXPECT_EQ(decisionRendering(*decoded), decisionRendering(original));
+
+  // Re-binding the replayed plan reproduces byte-identical normalized IR.
+  llvm::Expected<BoundPlan> rebound =
+      bindCanonical(*c->source, *decoded, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(rebound)) << llvm::toString(rebound.takeError());
+  EXPECT_EQ(printed(*rebound->module), firstIr);
+}
+
+// The same replay, decoded in a *second, independent* MLIRContext: a decoded
+// plan that kept a borrowed affine map or attribute from the first context
+// would crash or render differently here.
+TEST(PlanBinder, Issue129ReplayInAFreshContextReproducesTheDecisions) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan original = result->plans.front();
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c->source, original, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  const std::string ir = printed(*bound->module);
+
+  // A fresh context and module, parsed from the bound IR's own text.
+  MLIRContext freshContext;
+  freshContext.getOrLoadDialect<micro::MicroDialect>();
+  freshContext.getOrLoadDialect<tensor::TensorDialect>();
+  OwningOpRef<ModuleOp> freshModule =
+      parseSourceString<ModuleOp>(ir, &freshContext);
+  ASSERT_TRUE(static_cast<bool>(freshModule));
+
+  llvm::Expected<CoveringPlan> decoded =
+      decodeSelectedPlan(*freshModule, *c->target);
+  ASSERT_TRUE(bool(decoded)) << llvm::toString(decoded.takeError());
+  EXPECT_EQ(decisionRendering(*decoded), decisionRendering(original));
+}
+
+namespace {
+
+/// Reads `report` and binds the replayed plan; the error text when the replay
+/// is refused, or empty when it succeeded.
+std::string replayRefusal(const issue129::ResourceCase &c,
+                          const std::string &report) {
+  llvm::Expected<CoveringPlan> replayed =
+      readPlanReport(report, *c.target, c.graph);
+  if (!replayed)
+    return llvm::toString(replayed.takeError());
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c.source, *replayed, *c.target, BindContract::Executable);
+  if (!bound)
+    return llvm::toString(bound.takeError());
+  // The replayed module is what a compile would verify next: a tampered
+  // decision must be refused here even when the binder itself accepts it.
+  if (llvm::Error error = verifyMappedMicroIR(*bound->module, *c.target))
+    return llvm::toString(std::move(error));
+  return {};
+}
+
+} // namespace
+
+// Review focus / task R8 step 4: altering exactly one selected decision in a
+// report must make it unreplayable. The control is the untampered report, which
+// must replay, so a fixture that simply stopped replaying could not pass.
+TEST(PlanBinder, Issue129ReplayRejectsEveryAlteredDecision) {
+  struct Tamper {
+    llvm::StringRef fixture;
+    llvm::StringRef from;
+    llvm::StringRef to;
+    llvm::StringRef what;
+  };
+  for (const Tamper &tamper : {Tamper{"two-compute", "\"vpu.a\"",
+                                      "\"vpu.unknown\"", "compute binding"},
+                               Tamper{"two-compute", "\"issue129.vector_add\"",
+                                      "\"issue129.absent\"", "rule"},
+                               Tamper{"capacity-topk", "\"dram\": \"dram.0\"",
+                                      "\"dram\": \"dram.9\"", "memory node"}}) {
+    auto c = issue129::resourceCase(tamper.fixture);
+    ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+    MappingSearchOptions options;
+    options.mode = SearchMode::Exact;
+    options.topK = 1;
+    auto result = issue129::searchCase(*c, options);
+    ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError()) << " for "
+                              << tamper.fixture.str();
+    ASSERT_FALSE(result->plans.empty());
+    const std::string report = writePlanReport(
+        *result, c->target->machine(), *c->target, options, /*moduleHash=*/0);
+    // The control: the untampered report replays and verifies, so a fixture
+    // that simply stopped replaying could not pass.
+    ASSERT_EQ(replayRefusal(*c, report), "")
+        << "the untampered " << tamper.fixture.str() << " report must replay";
+
+    const size_t at = report.find(tamper.from);
+    ASSERT_NE(at, std::string::npos)
+        << "the " << tamper.fixture.str() << " fixture must record "
+        << tamper.what.str();
+    std::string tampered = report;
+    tampered.replace(at, tamper.from.size(), tamper.to);
+    EXPECT_FALSE(replayRefusal(*c, tampered).empty())
+        << "an altered " << tamper.what.str() << " must not replay";
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R8 step 3: planner and performance model share one analysis
+//===----------------------------------------------------------------------===//
+
+// The planner's final cost is the performance model's own number for the
+// *bound* kernel -- one normalized analysis, not two estimates that happen to
+// be close. The concrete values pin the fields the acceptance parity table
+// reports (cycles, owner, per-memory peak), so a drift in any of them fails
+// here rather than being tolerated.
+TEST(PlanBinder, Issue129PlannerCostIsTheBoundKernelsAnalysis) {
+  auto c = issue129::resourceCase("capacity-topk");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan plan = result->plans.front();
+  ASSERT_EQ(plan.placements.front().rule, "r.large")
+      << "the legal DRAM covering is the retained one";
+
+  llvm::Expected<BoundPlan> bound =
+      bindCanonical(*c->source, plan, *c->target, BindContract::Partial);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  llvm::Expected<mlir::llk::perf::SelectedKernelAnalysis> analysis =
+      mlir::llk::perf::analyzeSelectedKernel(
+          bound->kernel, c->target->machine(),
+          /*requireComplete=*/false, plan, c->graph);
+  ASSERT_TRUE(bool(analysis)) << llvm::toString(analysis.takeError());
+
+  // The planner's reported cost *is* the analysis's own scheduled cost.
+  EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, analysis->cost.latencyCycles);
+  EXPECT_GT(plan.totalCost.latencyCycles, 0.0);
+  // ... and the analysis names the plan's recorded compute selection and
+  // executor as the owner pool, so the two describe the same execution.
+  ASSERT_FALSE(analysis->events.events.empty());
+  const mlir::llk::mapping::PlanCostEvent &compute =
+      analysis->events.events.front();
+  EXPECT_EQ(compute.event.resource, "vpu.0");
+  EXPECT_EQ(compute.owner, "worker.0");
+  // DRAM holds the four simultaneously-live 256-byte result versions (1024)
+  // plus the 256-byte borrowed input descriptor the rule bound there: 1280
+  // bytes, the same number the plan's own capacity verdict used.
+  EXPECT_EQ(analysis->peakBytes.at("dram.0"), 1280u);
 }

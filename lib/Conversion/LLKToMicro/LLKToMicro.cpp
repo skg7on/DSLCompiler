@@ -34,6 +34,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
+#include "LLK/Conversion/MicroMapping/TileExtent.h"
 
 #include "LLK/Dialect/LLKEnums.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
@@ -42,6 +43,7 @@
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -55,6 +57,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 
 // LLK attribute and op declarations.
 #define GET_ATTRDEF_CLASSES
@@ -119,13 +122,10 @@ FailureOr<SmallVector<int64_t, 3>> parseShapeTriple(StringRef text) {
 constexpr int64_t kSearchBM[] = {1, 4, 8, 16, 32, 64};
 constexpr int64_t kSearchBN[] = {16, 32, 64, 128, 256};
 constexpr int64_t kSearchBK[] = {32, 64, 128, 256};
-constexpr int64_t kSearchVM[] = {1, 2, 4};
-constexpr int64_t kSearchVN[] = {4, 8};
 constexpr int64_t kSearchVectorWidth[] = {8};
-constexpr int64_t kSearchThreads[] = {1, 2, 4, 8};
-constexpr int64_t kSearchGrain[] = {1, 2, 4};
+constexpr int64_t kSearchThreads[] = {1};
+constexpr int64_t kSearchGrain[] = {1};
 constexpr int64_t kSearchStages[] = {1, 2};
-constexpr int64_t kSearchPrefetch[] = {1, 2};
 
 /// Builds an integer choice list. The dialect requires integer choices to be
 /// positive and strictly increasing, so the values are filtered, sorted, and
@@ -230,6 +230,8 @@ Block *startRegionBody(OpBuilder &builder, Region &region, Location loc,
 struct TilePlan {
   // Problem shape and element types.
   int64_t M = 0, N = 0, K = 0;
+  int64_t paddedM = 0, paddedN = 0, paddedK = 0;
+  std::string tailPolicy{"none"};
   Type inputElemType, accumulatorElemType, outputElemType;
 
   // Tiling.
@@ -330,6 +332,11 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
     return failure();
   };
 
+  if (schedule.tail_policy != "none" && schedule.tail_policy != "pad")
+    return fail("tail_policy '" + schedule.tail_policy +
+                "' is unsupported; expected 'none' or 'pad'");
+  plan.tailPolicy = schedule.tail_policy;
+
   // --- memory path -------------------------------------------------------
   if (failed(parseMemoryPath(root, schedule, plan.srcSpace, plan.stagingSpace)))
     return failure();
@@ -377,27 +384,27 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
 
   // --- tiling ------------------------------------------------------------
   auto resolveTile = [&](const char *axis, int64_t extent, int64_t requested,
-                         int64_t &out) -> LogicalResult {
+                         int64_t &out, int64_t &padded) -> LogicalResult {
     if (requested <= 0)
       return fail(Twine("schedule has no ") + axis + " tile size");
-    out = std::min(requested, extent);
-    if (extent % out != 0)
-      return fail(
-          Twine(axis) + " tile " + Twine(out) + " does not divide " + axis +
-          " = " + Twine(extent) +
-          (schedule.enable_tile_masks
-               ? "; the export does not emit tile masks, so the schedule's "
-               : "; tile masks are disabled for this schedule, so its ") +
-          axis + " tile must divide the problem");
+    out = plan.tailPolicy == "pad" ? requested : std::min(requested, extent);
+    if (extent % out != 0 && plan.tailPolicy == "none")
+      return fail(Twine(axis) + " tile " + Twine(out) + " does not divide " +
+                  axis + " = " + Twine(extent) + "; tail_policy is 'none'");
+    std::optional<int64_t> rounded =
+        mlir::llk::micro_mapping::roundUpExtent(extent, out);
+    if (!rounded)
+      return fail(Twine(axis) + " padded extent overflows int64");
+    padded = *rounded;
     return success();
   };
 
   plan.M = M;
   plan.N = N;
   plan.K = K;
-  if (failed(resolveTile("BM", M, schedule.BM, plan.BM)) ||
-      failed(resolveTile("BN", N, schedule.BN, plan.BN)) ||
-      failed(resolveTile("BK", K, schedule.BK, plan.BK)))
+  if (failed(resolveTile("BM", M, schedule.BM, plan.BM, plan.paddedM)) ||
+      failed(resolveTile("BN", N, schedule.BN, plan.BN, plan.paddedN)) ||
+      failed(resolveTile("BK", K, schedule.BK, plan.BK, plan.paddedK)))
     return failure();
 
   plan.fM = largestDivisorAtMost(plan.BM, std::min((*declared)[0], plan.BM));
@@ -448,6 +455,9 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   for (size_t arm = 0; arm < (fused ? 2u : 1u); ++arm)
     inputTypes.push_back(
         RankedTensorType::get({plan.K, plan.N}, plan.inputElemType));
+  if (!fused)
+    inputTypes.push_back(
+        RankedTensorType::get({plan.M, plan.N}, plan.outputElemType));
   llvm::SmallVector<Type, 1> resultTypes{
       RankedTensorType::get({plan.M, plan.N}, plan.outputElemType)};
 
@@ -457,6 +467,10 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
       StringAttr::get(ctx, workload), StringAttr::get(ctx, target),
       /*candidate=*/StringAttr(),
       IntegerAttr::get(IntegerType::get(ctx, 64), mBucket));
+  SmallVector<Attribute> inputMemories(inputTypes.size(),
+                                       StringAttr::get(ctx, "dram"));
+  kernel->setAttr("source_argument_memories",
+                  ArrayAttr::get(ctx, inputMemories));
 
   // Schedule intent that the concrete ops cannot carry themselves. The tile
   // types and op attributes already hold shape, dtype, layout, memory space,
@@ -470,8 +484,14 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   kernel->setAttr("fragment_shape",
                   DenseI64ArrayAttr::get(
                       ctx, SmallVector<int64_t, 3>{plan.fM, plan.fN, plan.fK}));
-  // Non-dividing tiles are rejected instead of masked, so there is no tail.
-  kernel->setAttr("tail_policy", StringAttr::get(ctx, "none"));
+  kernel->setAttr("tail_policy", StringAttr::get(ctx, plan.tailPolicy));
+  if (Attribute mathMode = root->getAttr("math_mode"))
+    kernel->setAttr("source_math_mode", mathMode);
+  kernel->setAttr("valid_extents",
+                  DenseI64ArrayAttr::get(ctx, {plan.M, plan.N, plan.K}));
+  kernel->setAttr(
+      "padded_extents",
+      DenseI64ArrayAttr::get(ctx, {plan.paddedM, plan.paddedN, plan.paddedK}));
 
   // Original workload dimensions before tiling, as generic provenance. A
   // legality rule that needs the whole M/N/K (tail divisibility) reads this
@@ -532,6 +552,19 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   SmallVector<Value, 2> rhsTensors;
   for (size_t arm = 0; arm < (fused ? 2u : 1u); ++arm)
     rhsTensors.push_back(kernelBody->getArgument(1 + arm));
+  Value initTensor =
+      !fused ? kernelBody->getArgument(1 + rhsTensors.size()) : Value();
+
+  if (plan.tailPolicy == "pad") {
+    lhsTensor = mlir::llk::micro_mapping::padTensorWithZeros(
+        builder, loc, lhsTensor, {plan.paddedM, plan.paddedK});
+    for (Value &rhs : rhsTensors)
+      rhs = mlir::llk::micro_mapping::padTensorWithZeros(
+          builder, loc, rhs, {plan.paddedK, plan.paddedN});
+    if (initTensor)
+      initTensor = mlir::llk::micro_mapping::padTensorWithZeros(
+          builder, loc, initTensor, {plan.paddedM, plan.paddedN});
+  }
 
   // --- the output the kernel writes back ----------------------------------
   // The kernel writes its output tile by tile from inside the spatial nest, so
@@ -545,7 +578,7 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   // lands belongs to the ABI.
   micro::MemorySpaceAttr outputSpace =
       micro::MemorySpaceAttr::get(ctx, micro::MemorySpace::sram);
-  Type outputTileType = tile({plan.M, plan.N}, plan.outputElemType,
+  Type outputTileType = tile({plan.paddedM, plan.paddedN}, plan.outputElemType,
                              /*tileLayout=*/micro::LayoutAttr(), outputSpace,
                              /*owner=*/micro::OwnerAttr());
   Value output =
@@ -567,13 +600,13 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
     return loop;
   };
 
-  micro::SpatialForOp bmLoop =
-      openSpatialLoop(plan.M, plan.BM, plan.outerOwner, ValueRange{output});
+  micro::SpatialForOp bmLoop = openSpatialLoop(
+      plan.paddedM, plan.BM, plan.outerOwner, ValueRange{output});
   BlockArgument bm = bmLoop.getBody().front().getArgument(0);
   Value bmCarried = bmLoop.getBody().front().getArgument(1);
 
-  micro::SpatialForOp bnLoop =
-      openSpatialLoop(plan.N, plan.BN, plan.innerOwner, ValueRange{bmCarried});
+  micro::SpatialForOp bnLoop = openSpatialLoop(
+      plan.paddedN, plan.BN, plan.innerOwner, ValueRange{bmCarried});
   BlockArgument bn = bnLoop.getBody().front().getArgument(0);
   Value bnCarried = bnLoop.getBody().front().getArgument(1);
 
@@ -583,14 +616,43 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
       tile(accExtent, plan.accumulatorElemType,
            /*tileLayout=*/micro::LayoutAttr(), accSpace, workerOwner);
   SmallVector<Value, 2> accumulators;
-  for (size_t arm = 0; arm < rhsTensors.size(); ++arm)
-    accumulators.push_back(
-        micro::TileAllocOp::create(builder, loc, accTileType).getResult());
+  if (initTensor) {
+    SmallVector<int64_t, 2> initExtent{plan.BM, plan.BN};
+    Type initViewType = tile(initExtent, plan.outputElemType, layout, srcSpace,
+                             /*owner=*/micro::OwnerAttr());
+    Value initView = micro::TileViewOp::create(
+        builder, loc, initViewType, initTensor, ValueRange{bm, bn},
+        DenseI64ArrayAttr::get(ctx, initExtent), layout);
+    Type initStagedType =
+        tile(initExtent, plan.outputElemType,
+             /*tileLayout=*/micro::LayoutAttr(), stageSpace, workerOwner);
+    auto initStageCopy = micro::TileAsyncCopyOp::create(
+        builder, loc, initStagedType, micro::AsyncTokenType::get(ctx), initView,
+        stageSpace, workerOwner);
+    micro::WaitOp::create(builder, loc, ValueRange{initStageCopy.getToken()});
+    Type initAccumulatorType =
+        tile(initExtent, plan.outputElemType,
+             /*tileLayout=*/micro::LayoutAttr(), accSpace, workerOwner);
+    auto initAccumulatorCopy = micro::TileAsyncCopyOp::create(
+        builder, loc, initAccumulatorType, micro::AsyncTokenType::get(ctx),
+        initStageCopy.getResult(), accSpace, workerOwner);
+    micro::WaitOp::create(builder, loc,
+                          ValueRange{initAccumulatorCopy.getToken()});
+    Value initial = initAccumulatorCopy.getResult();
+    if (plan.outputElemType != plan.accumulatorElemType)
+      initial = micro::VectorOp::create(builder, loc, accTileType, "convert",
+                                        ValueRange{initial}, StringAttr());
+    accumulators.push_back(initial);
+  } else {
+    for (size_t arm = 0; arm < rhsTensors.size(); ++arm)
+      accumulators.push_back(
+          micro::TileAllocOp::create(builder, loc, accTileType).getResult());
+  }
 
   // --- K loop ------------------------------------------------------------
   Value kLower = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
   Value kUpper =
-      arith::ConstantIndexOp::create(builder, loc, plan.K).getResult();
+      arith::ConstantIndexOp::create(builder, loc, plan.paddedK).getResult();
   Value kStep =
       arith::ConstantIndexOp::create(builder, loc, plan.BK).getResult();
   // The loop carries the accumulators. What an iteration computes is what the
@@ -766,7 +828,20 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   }
   if (auto terminator = dyn_cast<micro::YieldOp>(kernelBody->getTerminator())) {
     builder.setInsertionPoint(terminator);
-    micro::YieldOp::create(builder, loc, bmLoop.getResults());
+    Value result = bmLoop.getResult(0);
+    if (plan.paddedM != plan.M || plan.paddedN != plan.N) {
+      Type validOutputType =
+          tile({plan.M, plan.N}, plan.outputElemType,
+               /*tileLayout=*/micro::LayoutAttr(), outputSpace,
+               /*owner=*/micro::OwnerAttr());
+      result =
+          micro::TilePartitionOp::create(
+              builder, loc, validOutputType, result,
+              DenseI64ArrayAttr::get(ctx, {plan.M, plan.N}),
+              /*owner=*/micro::OwnerAttr(), /*tail=*/builder.getBoolAttr(true))
+              .getResult();
+    }
+    micro::YieldOp::create(builder, loc, ValueRange{result});
     terminator.erase();
   }
 
@@ -805,12 +880,14 @@ LogicalResult checkTensor(Operation *root, Value value, const char *what) {
 /// Validates `root`'s shapes, dtypes, and accumulator type and fills `info`.
 LogicalResult inferRootInfo(Operation *root, RootInfo &info) {
   auto fused = dyn_cast<llk::FusedSwiGLUOp>(root);
-  auto matmul = dyn_cast<llk::MatmulOp>(root);
+  bool matmul = isa<llk::MatmulOp, linalg::MatmulOp>(root);
+  if (!fused && !matmul)
+    return root->emitError("unsupported LLK-to-Micro source root");
   info.workload = fused ? "fused_swiglu" : "matmul";
 
-  Value lhs = fused ? fused.getX() : matmul.getA();
-  Value rhs = fused ? fused.getWg() : matmul.getB();
-  Value out = fused ? fused.getResult() : matmul.getResult();
+  Value lhs = fused ? fused.getX() : root->getOperand(0);
+  Value rhs = fused ? fused.getWg() : root->getOperand(1);
+  Value out = fused ? Value(fused.getResult()) : Value(root->getResult(0));
   if (failed(checkTensor(root, lhs, "left-hand side")) ||
       failed(checkTensor(root, rhs, "right-hand side")) ||
       failed(checkTensor(root, out, "result")))
@@ -830,6 +907,11 @@ LogicalResult inferRootInfo(Operation *root, RootInfo &info) {
            << info.K << " but the right-hand side has "
            << rhsShaped.getDimSize(0) << " rows";
 
+  if (rhsShaped.getElementType() != lhsShaped.getElementType())
+    return root->emitError()
+           << "the concrete Micro-IR exporter requires matching input and "
+              "weight element types";
+
   if (outShaped.getDimSize(0) != info.M || outShaped.getDimSize(1) != info.N)
     return root->emitError()
            << "result shape does not match the contraction: expected M = "
@@ -843,14 +925,23 @@ LogicalResult inferRootInfo(Operation *root, RootInfo &info) {
       return root->emitError()
              << "the up-projection weight must be shaped [K, N] = [" << info.K
              << ", " << info.N << "]";
+    if (wuShaped.getElementType() != lhsShaped.getElementType())
+      return root->emitError()
+             << "the concrete Micro-IR exporter requires matching input and "
+                "up-projection weight element types";
     if (fused.getActivation() != llk::Activation::silu)
       return root->emitError()
              << "unsupported SwiGLU activation; the Micro-IR export emits "
                 "silu only";
   }
 
-  auto accumulatorTypeAttr = dyn_cast<TypeAttr>(
-      fused ? fused.getAccumulatorType() : matmul.getAccumulatorType());
+  Attribute accumulatorAttribute =
+      fused ? fused.getAccumulatorType() : root->getAttr("accumulator_type");
+  TypeAttr accumulatorTypeAttr;
+  if (accumulatorAttribute)
+    accumulatorTypeAttr = dyn_cast<TypeAttr>(accumulatorAttribute);
+  if (!accumulatorTypeAttr && isa<linalg::MatmulOp>(root))
+    accumulatorTypeAttr = TypeAttr::get(outShaped.getElementType());
   if (!accumulatorTypeAttr ||
       !micro::dtypeOfElementType(accumulatorTypeAttr.getValue()))
     return root->emitError()
@@ -876,26 +967,6 @@ ScheduleEntry selectSchedule(Operation *root, const RootInfo &info,
                         << " M_bucket=" << info.mBucket << " in " << dbPath
                         << "; using the built-in conservative schedule";
   return llk::selectBestSchedule(matches, info.N, info.K);
-}
-
-/// Validates the root operation's shapes and dtypes, resolves its schedule, and
-/// emits its kernel.
-LogicalResult lowerRootOp(ModuleOp module, Operation *root, StringRef dbPath,
-                          StringRef target, SymbolTable &symbols) {
-  RootInfo info;
-  if (failed(inferRootInfo(root, info)))
-    return failure();
-  ScheduleEntry schedule = selectSchedule(root, info, dbPath);
-
-  TilePlan plan;
-  plan.inputElemType = info.inputElemType;
-  plan.accumulatorElemType = info.accumulatorElemType;
-  plan.outputElemType = info.outputElemType;
-  if (failed(resolvePlan(root, schedule, info.M, info.N, info.K, plan)))
-    return failure();
-
-  return buildKernel(module, root, plan, schedule, target, info.mBucket,
-                     symbols);
 }
 
 //===----------------------------------------------------------------------===//
@@ -942,6 +1013,9 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
     return root->emitError()
            << "schedule fragment_shape '" << schedule.fragment_shape
            << "' must be a positive MxNxK triple";
+  if (schedule.tail_policy != "none" && schedule.tail_policy != "pad")
+    return root->emitError() << "tail_policy '" << schedule.tail_policy
+                             << "' is unsupported; expected 'none' or 'pad'";
 
   MLIRContext *context = module.getContext();
   Location loc = root->getLoc();
@@ -981,26 +1055,15 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
            makeNumericChoices(context, kSearchBN, schedule.BN));
   addParam("BK", "integer",
            makeNumericChoices(context, kSearchBK, schedule.BK));
-  addParam("VM", "integer",
-           makeNumericChoices(context, kSearchVM, schedule.VM));
-  addParam("VN", "integer",
-           makeNumericChoices(context, kSearchVN, schedule.VN));
   addParam(
       "vector_width", "integer",
       makeNumericChoices(context, kSearchVectorWidth, schedule.vector_width));
   addParam("num_threads", "integer",
-           makeNumericChoices(context, kSearchThreads, schedule.num_threads));
-  addParam("grain_size", "integer",
-           makeNumericChoices(context, kSearchGrain, schedule.grain_size));
+           makeIntegerChoices(context, kSearchThreads));
+  addParam("grain_size", "integer", makeIntegerChoices(context, kSearchGrain));
   addParam(
       "pipeline_stages", "integer",
       makeNumericChoices(context, kSearchStages, schedule.pipeline_stages));
-  // Prefetch distance 0 means "no prefetch" -- a schedule decision rather than
-  // a search choice -- so it is not part of the domain.
-  addParam(
-      "prefetch_distance", "integer",
-      makeNumericChoices(context, kSearchPrefetch, schedule.prefetch_distance));
-
   // --- symbolic parameters ---
   // The layout choices are the schedule's own value and the plain row-major
   // fallback. A bare `blocked`/`swizzled` is *not* offered: each is well-formed
@@ -1016,7 +1079,8 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
   addParam("fragment_shape", "fragment_shape",
            makeStringChoices(context,
                              {schedule.fragment_shape, "16x16x32", "8x8x32"}));
-  addParam("tail_policy", "tail_policy", makeStringChoices(context, {"mask"}));
+  addParam("tail_policy", "tail_policy",
+           makeStringChoices(context, {schedule.tail_policy, "none", "pad"}));
 
   // --- legality records ---
   // Machine-independent legality only: capacity and compatibility are named
@@ -1030,8 +1094,7 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
   addConstraint("fragment_compatible", {"fragment_shape", "BM", "BN", "BK"});
   addConstraint("vector_width_supported", {"vector_width"});
   addConstraint("mapping_extent", {"num_threads", "BM", "BN"});
-  addConstraint("pipeline_live_tiles",
-                {"pipeline_stages", "prefetch_distance", "BM", "BN", "BK"});
+  addConstraint("pipeline_live_tiles", {"pipeline_stages", "BM", "BN", "BK"});
   addConstraint("tail_supported", {"BM", "BN", "BK"});
 
   // --- objective ---
@@ -1052,6 +1115,9 @@ struct LLKToMicroPass
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LLKToMicroPass)
 
   LLKToMicroPass() = default;
+  explicit LLKToMicroPass(StringRef scheduleDbPath) {
+    scheduleDb = scheduleDbPath.str();
+  }
   LLKToMicroPass(const LLKToMicroPass &other) : PassWrapper(other) {}
 
   Option<std::string> scheduleDb{
@@ -1090,19 +1156,54 @@ struct LLKToMicroPass
 
     SmallVector<Operation *> roots;
     module.walk([&](Operation *op) {
-      if (isa<llk::FusedSwiGLUOp, llk::MatmulOp>(op))
+      if (isa<llk::FusedSwiGLUOp, llk::MatmulOp, linalg::MatmulOp>(op))
         roots.push_back(op);
     });
     if (roots.empty())
       return;
 
     SymbolTable symbols(module);
+    llvm::DenseMap<Operation *, uint64_t> ordinals;
     for (Operation *root : roots) {
-      if (failed(lowerRootOp(module, root, scheduleDb.getValue(),
-                             target.getValue(), symbols))) {
+      Operation *function = root->getParentOp();
+      while (function && function->getName().getStringRef() != "func.func")
+        function = function->getParentOp();
+      if (!function) {
+        root->emitError("supported root is not nested in a symbol table");
         signalPassFailure();
         return;
       }
+      auto symbol = SymbolTable::getSymbolName(function);
+      if (!symbol) {
+        root->emitError("containing function has no symbol name");
+        signalPassFailure();
+        return;
+      }
+      RootInfo info;
+      if (failed(inferRootInfo(root, info))) {
+        signalPassFailure();
+        return;
+      }
+      ScheduleEntry schedule =
+          selectSchedule(root, info, scheduleDb.getValue());
+      TilePlan validatedPlan;
+      validatedPlan.inputElemType = info.inputElemType;
+      validatedPlan.accumulatorElemType = info.accumulatorElemType;
+      validatedPlan.outputElemType = info.outputElemType;
+      if (failed(resolvePlan(root, schedule, info.M, info.N, info.K,
+                             validatedPlan))) {
+        signalPassFailure();
+        return;
+      }
+      auto exported = exportMicroKernelFromSchedule(
+          module, symbol.getValue(), ordinals[function]++, schedule);
+      if (!exported) {
+        root->emitError() << llvm::toString(exported.takeError());
+        signalPassFailure();
+        return;
+      }
+      (*exported)->setAttr("target",
+                           StringAttr::get(context, target.getValue()));
     }
   }
 };
@@ -1146,7 +1247,7 @@ struct LLKToMicroSearchSpacePass
 
     SmallVector<Operation *> roots;
     module.walk([&](Operation *op) {
-      if (isa<llk::FusedSwiGLUOp, llk::MatmulOp>(op))
+      if (isa<llk::FusedSwiGLUOp, llk::MatmulOp, linalg::MatmulOp>(op))
         roots.push_back(op);
     });
     if (roots.empty())
@@ -1173,8 +1274,65 @@ struct LLKToMicroSearchSpacePass
 namespace mlir {
 namespace llk {
 
+llvm::Expected<Operation *>
+exportMicroKernelFromSchedule(ModuleOp module, StringRef sourceSymbol,
+                              uint64_t sourceRootOrdinal,
+                              const ScheduleEntry &schedule) {
+  auto fail = [](const llvm::Twine &message) -> llvm::Expected<Operation *> {
+    return llvm::make_error<llvm::StringError>(message.str(),
+                                               llvm::inconvertibleErrorCode());
+  };
+  if (!module || sourceSymbol.empty())
+    return fail("a module and non-empty source function symbol are required");
+  Operation *function = SymbolTable::lookupSymbolIn(module, sourceSymbol);
+  if (!function || function->getName().getStringRef() != "func.func")
+    return fail("unknown source function '" + sourceSymbol + "'");
+
+  SmallVector<Operation *> roots;
+  function->walk([&](Operation *op) {
+    if (isa<llk::MatmulOp, llk::FusedSwiGLUOp, linalg::MatmulOp>(op))
+      roots.push_back(op);
+  });
+  if (sourceRootOrdinal >= roots.size())
+    return fail("source function @" + sourceSymbol + " has " +
+                Twine(roots.size()) + " supported roots; ordinal " +
+                Twine(sourceRootOrdinal) + " is out of range");
+
+  Operation *root = roots[sourceRootOrdinal];
+  RootInfo info;
+  if (failed(inferRootInfo(root, info)))
+    return fail("selected source root is not supported");
+  TilePlan plan;
+  plan.inputElemType = info.inputElemType;
+  plan.accumulatorElemType = info.accumulatorElemType;
+  plan.outputElemType = info.outputElemType;
+  if (failed(resolvePlan(root, schedule, info.M, info.N, info.K, plan)))
+    return fail("selected schedule is not valid for the source root");
+
+  // The checks above are read-only. Build only after exact selection and full
+  // plan validation have succeeded, so an invalid ordinal/schedule leaves the
+  // supplied clone byte-identical.
+  if (!module.getContext()->getOrLoadDialect<micro::MicroDialect>() ||
+      !module.getContext()->getOrLoadDialect<tensor::TensorDialect>() ||
+      !module.getContext()->getOrLoadDialect<arith::ArithDialect>())
+    return fail("the micro, tensor, and arith dialects must be registered");
+  SymbolTable symbols(module);
+  if (failed(buildKernel(module, root, plan, schedule, "x86-avx2-cpu",
+                         info.mBucket, symbols)))
+    return fail("failed to emit concrete Micro-IR kernel");
+  Operation *result = nullptr;
+  module.walk([&](micro::KernelOp kernel) { result = kernel.getOperation(); });
+  if (!result)
+    return fail("concrete Micro-IR export emitted no kernel");
+  return result;
+}
+
 std::unique_ptr<Pass> createLLKToMicroPass() {
   return std::make_unique<LLKToMicroPass>();
+}
+
+std::unique_ptr<Pass> createLLKToMicroPass(StringRef scheduleDb) {
+  return std::make_unique<LLKToMicroPass>(scheduleDb);
 }
 
 std::unique_ptr<Pass> createLLKToMicroSearchSpacePass() {

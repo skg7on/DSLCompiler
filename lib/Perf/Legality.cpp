@@ -126,7 +126,10 @@ std::optional<StringRef> symbolOfKind(const SearchSpace &space,
 bool isMasked(const SearchSpace &space, const Candidate &candidate) {
   std::optional<StringRef> policy =
       symbolOfKind(space, candidate, "tail_policy");
-  return policy && *policy == "mask";
+  // The tile/fragment realization supports exact full tiles and padded tails.
+  // `mask` is rejected by checkTailSupported, but still shares these shape
+  // checks so its diagnostic is reported by that policy-specific constraint.
+  return policy && *policy != "none";
 }
 
 /// The shapes a dtype/shape-dependent rule must evaluate: every contraction the
@@ -461,12 +464,20 @@ LegalityResult checkTailSupported(const SearchSpace &space,
                                   const BindingFacts &facts,
                                   const machine::MachineModel &) {
   ConstraintKind kind = ConstraintKind::TailSupported;
-  if (isMasked(space, candidate))
+  std::optional<StringRef> policy =
+      symbolOfKind(space, candidate, "tail_policy");
+  if (!policy || *policy == "none") {
+    // Divisibility is a whole-workload question, so it reads the original
+    // dimensions the export recorded before tiling -- never a contraction's
+    // instruction-fragment shape.
+  } else if (*policy == "pad") {
     return legal();
+  } else if (*policy == "mask") {
+    return illegal(kind, "tail_policy 'mask' is unsupported");
+  } else {
+    return illegal(kind, "tail_policy '" + policy->str() + "' is unsupported");
+  }
 
-  // Divisibility is a whole-workload question, so it reads the original
-  // dimensions the export recorded before tiling -- never a contraction's
-  // instruction-fragment shape.
   if (!facts.originalWorkload)
     return illegal(kind, "cannot be evaluated: the kernel supplies no original "
                          "workload dimensions (no original-workload "

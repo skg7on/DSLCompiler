@@ -20,9 +20,9 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // CHECK-LABEL: func.func @matmul
 // CHECK: llk.matmul
 
-// The kernel names its two operands in its signature -- the block arguments
-// the body reads -- so no entry tensor is guessed to be external.
-// CHECK: micro.kernel @matmul_M16_N64_K64(%[[A:.*]]: tensor<16x64xbf16>, %[[B:.*]]: tensor<64x64xbf16>) -> tensor<16x64xbf16> attributes {
+// The kernel names both operands and the caller's initialized output in its
+// signature, preserving the destination-style GEMM semantics.
+// CHECK: micro.kernel @matmul_M16_N64_K64(%[[A:.*]]: tensor<16x64xbf16>, %[[B:.*]]: tensor<64x64xbf16>, %[[INIT:.*]]: tensor<16x64xbf16>) -> tensor<16x64xbf16> attributes {
 // CHECK-SAME: fragment_shape = array<i64: 8, 16, 32>
 // CHECK-SAME: memory_path = "dram:sram:acc"
 // CHECK-SAME: mma_shape = array<i64: 16, 16, 32>
@@ -33,7 +33,7 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // CHECK-SAME: tile_layout = "row_major"
 // CHECK-SAME: workload = "matmul"
 
-// Two operands, not three: A and B, both declared rather than materialized.
+// The caller-provided init tensor seeds the accumulator for each output tile.
 // CHECK-NOT: tensor.empty
 
 // The output is threaded through both spatial loops: each pass hands the
@@ -43,8 +43,13 @@ func.func @matmul(%a: tensor<16x64xbf16>, %b: tensor<64x64xbf16>,
 // CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<worker> iter_args(%{{.*}} = %[[OUT_ALLOC]]) -> (!micro.tile<16x64xbf16, memory = #micro.memory<sram>>) {
 // CHECK: micro.spatial_for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} map = #micro.map<lane> iter_args(%{{.*}} = %{{.*}}) -> (!micro.tile<16x64xbf16, memory = #micro.memory<sram>>) {
 
-// One accumulator, in acc memory.
-// CHECK: %[[ACC:.*]] = micro.tile_alloc : !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
+// The init tile is staged and promoted into the accumulator dtype.
+// CHECK: %[[INIT_VIEW:.*]] = micro.tile_view %[[INIT]][
+// CHECK: %[[INIT_STAGE:.*]], %[[INIT_TOKEN:.*]] = micro.tile_async_copy %[[INIT_VIEW]]
+// CHECK: micro.wait %[[INIT_TOKEN]]
+// CHECK: %[[ACC_COPY:.*]], %[[ACC_TOKEN:.*]] = micro.tile_async_copy %[[INIT_STAGE]]
+// CHECK: micro.wait %[[ACC_TOKEN]]
+// CHECK: %[[ACC:.*]] = micro.vector "convert" %[[ACC_COPY]] : {{.*}} -> !micro.tile<8x32xf32, memory = #micro.memory<acc>, owner = #micro.owner<worker>>
 
 // The K loop carries the accumulator: what an iteration computes is what the
 // next one accumulates into. The pipeline carries it too, because the MMA runs

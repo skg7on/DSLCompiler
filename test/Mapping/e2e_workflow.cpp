@@ -287,26 +287,41 @@ TEST(E2EWorkflow, CompilesAMappedKernelToARunnableExecutable) {
   EXPECT_EQ(compiled->executable->abi().inputs[0].shape,
             (std::vector<int64_t>{8, 8}));
 
-  // The vector add is the one operation the AVX2 package lowers itself; the
-  // staged copy is carried by the reference bridge. Reporting the two apart is
-  // what keeps "the target ran this" from being claimed for both.
-  EXPECT_GE(compiled->targetLowered, 1u);
-  EXPECT_GE(compiled->referenceLowered, 1u);
+  // Both selected groups are handed to their concrete consumers: vector
+  // arithmetic to the AVX2 Vector pass and the copy to the host movement ABI.
+  EXPECT_EQ(compiled->targetLowered, 2u);
+  EXPECT_EQ(compiled->referenceLowered, 0u);
 
   // The source module is untouched: binding clones.
   EXPECT_FALSE(parsed.kernel->hasAttr("micro.plan"));
 
   std::vector<float> input(64, 1.0f);
   std::vector<float> output(64, -1.0f);
-  MemRef2D in{input.data(), input.data(), 0, 8, 8, 8, 1};
-  MemRef2D out{output.data(), output.data(), 0, 8, 8, 8, 1};
-  llvm::Error error = compiled->executable->invoke({&in}, {&out});
+  ::llk::InvocationBuffer2D in{{input.data(), input.data(), 0, 8, 8, 8, 1},
+                               ::llk::InvocationElementType::F32,
+                               input.size() * sizeof(float)};
+  ::llk::InvocationBuffer2D out{{output.data(), output.data(), 0, 8, 8, 8, 1},
+                                ::llk::InvocationElementType::F32,
+                                output.size() * sizeof(float)};
+  llvm::Error error = compiled->executable->invoke({in}, {out});
   ASSERT_FALSE(static_cast<bool>(error)) << llvm::toString(std::move(error));
 
   // v + v over an input of ones is two everywhere -- and it is only two if the
   // staged copy actually delivered the input to the add.
   for (size_t i = 0; i < output.size(); ++i)
     EXPECT_EQ(output[i], 2.0f) << "element " << i;
+}
+
+TEST(E2EWorkflow, RejectsSelectedTargetUntilItsBackendExists) {
+  Parsed parsed = parseKernel(kLowerableKernel);
+  ASSERT_TRUE(parsed.module);
+
+  ::llk::MappedCompileOptions options;
+  options.backend = ::llk::MappedBackend::SelectedTarget;
+  auto compiled = ::llk::compileConcreteMicroKernel(*parsed.module, options);
+  ASSERT_FALSE(static_cast<bool>(compiled));
+  EXPECT_NE(llvm::toString(compiled.takeError()).find("selected-target"),
+            std::string::npos);
 }
 
 TEST(E2EWorkflow, StopsBeforeExecutingWhenAsked) {
@@ -352,7 +367,8 @@ TEST(E2EWorkflow, StopsBeforeExecutingWhenAsked) {
     ASSERT_TRUE(static_cast<bool>(compiled))
         << llvm::toString(compiled.takeError());
     EXPECT_EQ(compiled->stopped, ::llk::MappedStop::TargetLowered);
-    EXPECT_EQ(compiled->targetLowered, 1u);
+    EXPECT_EQ(compiled->targetLowered, 2u);
+    EXPECT_EQ(compiled->referenceLowered, 0u);
 
     std::string text;
     llvm::raw_string_ostream stream(text);

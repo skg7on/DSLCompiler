@@ -29,6 +29,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace mlir::llk::perf {
@@ -65,6 +66,14 @@ struct ScheduleRecord {
   unsigned repeat = 0;
   double medianNs = 0.0;
   double measuredGflops = 0.0;
+
+  /// Reference to the frozen mapped choice, present only for target-aware
+  /// tuning. Paths are caller-selected and are not part of plan identity.
+  uint32_t mappingProvenanceVersion = 0;
+  std::string mappingPlanId;
+  std::string mappingBindingHash;
+  std::string mappingSourceArtifact;
+  std::string mappingPlanReport;
 };
 
 /// Writes one record as a YAML document.

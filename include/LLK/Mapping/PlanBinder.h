@@ -135,6 +135,25 @@ bindPlan(mlir::ModuleOp source, const CoveringPlan &plan,
          BindContract contract = BindContract::Partial,
          PlanMaterializer *materializer = nullptr);
 
+/// Verifies the *physical memory facts* of `plan` against `graph` and
+/// `machine` (issue #129, task R3): every placement must cover a node of the
+/// graph, and the value each output occurrence produces must resolve to exactly
+/// one memory by endpoint -- a named rule requirement, the occurrence's own
+/// explicit tile memory kind, or the rule's single bare requirement. An
+/// occurrence whose kind resolves to no node the executor can address, or to
+/// several, is a failure; the message names the missing or ambiguous memory and
+/// asks for a named port.
+///
+/// `BindContract::Executable` calls this, so a backend-facing binding cannot
+/// succeed while any materialized value's memory is unstated or ambiguous --
+/// the guarantee the storage-skip escape used to defeat. It is deliberately
+/// independent of whether a `PlanMaterializer` exists: the verdict is about
+/// physical facts, not about a target emitter.
+llvm::Error
+verifyPlanPhysicalCompleteness(const WorkloadGraph &graph,
+                               const CoveringPlan &plan,
+                               const machine::MachineModel &machine);
+
 /// Layered verification of mapped Micro-IR (design §18.3), in order:
 ///
 ///   1. structural -- the module passes the dialect verifier, and every generic

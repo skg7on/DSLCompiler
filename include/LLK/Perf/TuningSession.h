@@ -49,11 +49,19 @@ class MLIRContext;
 
 namespace mlir::llk::perf {
 
+enum class MetricOrigin { Static, Measured, Unavailable };
+
+struct MetricValue {
+  std::optional<double> value;
+  MetricOrigin origin = MetricOrigin::Unavailable;
+};
+
+/// Resolves an objective metric without substituting a different metric when
+/// a measurement is unavailable. Unknown or non-finite values are unavailable.
+MetricValue resolveMetric(const CandidateMetrics &metrics,
+                          llvm::StringRef name);
+
 /// The metrics a tuning objective may name.
-///
-/// The tuner ranks by these and produces every one of them, except the two
-/// measured ones, which a measurement provider supplies and which fall back to
-/// their static counterparts when it has none.
 bool isKnownMetric(llvm::StringRef name);
 
 /// Checks that every metric an objective names is one the tuner can rank by.
@@ -76,8 +84,8 @@ llvm::Error validateObjective(const SearchObjective &objective);
 /// The two failures are different and are reported differently:
 ///   * `llvm::Error` -- the candidate could not be compiled or verified, which
 ///     is a rejection carrying that reason;
-///   * `std::nullopt` -- a *miss*: the static score stands and legality is
-///     untouched, because an unavailable measurement is not a rejection.
+///   * `std::nullopt` -- a *miss*: static objectives retain the static score;
+///     measured objectives report the legal candidate as unrankable.
 using MeasurementProvider =
     std::function<llvm::Expected<std::optional<CandidateMetrics>>(
         mlir::ModuleOp boundModule, const TuningResult &candidate)>;
@@ -86,12 +94,17 @@ struct MeasurementOptions {
   MeasurementProvider provider;
   /// How many of the best-ranked candidates to measure. Zero measures none.
   uint64_t measureTop = 1;
+  /// Maximum candidates visited while filling `measureTop`. Zero means no
+  /// additional cap beyond the static candidate list.
+  uint64_t maxAttempts = 0;
   /// Recorded on every measurement so a stored number can be traced to the
   /// target, machine and model that produced it. Production persistence (and
   /// the calibration that reads it back) stays with #51/#52.
   std::string targetIdentity;
   std::string machineIdentity;
   std::string abiIdentity;
+  /// Compiler/codegen identity (backend, ISA, math mode and target content).
+  std::string codegenIdentity;
 };
 
 struct TuningSessionOptions {
@@ -121,6 +134,7 @@ struct RankedCandidate {
   std::string measuredTarget;
   std::string measuredMachine;
   std::string measuredAbi;
+  std::string measuredCodegenIdentity;
 };
 
 struct TuningSessionReport {
@@ -130,8 +144,14 @@ struct TuningSessionReport {
 
   /// Every candidate the generator produced.
   uint64_t generated = 0;
-  /// Legal candidates, best first, at most `topK` of them.
+  /// Comparable candidates, best first, at most `topK` of them.
   std::vector<RankedCandidate> ranked;
+  /// Legal candidates for which the requested measured objective is missing.
+  std::vector<RankedCandidate> unrankable;
+  bool measuredCohortOnly = false;
+  uint64_t measuredCohortSize = 0;
+  uint64_t measurementAttempts = 0;
+  bool hasMeasuredResult = false;
   /// Illegal, unbindable, or uncompilable candidates, in generation order,
   /// each with a stable rejection reason.
   std::vector<TuningResult> rejected;
@@ -141,7 +161,7 @@ struct TuningSessionReport {
   SearchObjective objective;
   /// The report schema, bumped when a field's meaning changes, so a stored
   /// report is never read as a different one.
-  uint32_t schemaVersion = 1;
+  uint32_t schemaVersion = 2;
 };
 
 /// Compiles and measures the best-ranked candidates.
@@ -150,9 +170,9 @@ struct TuningSessionReport {
 /// the module measured is the one the ranking described -- and handed to the
 /// provider. A candidate whose compilation fails moves to `rejected` with the
 /// compiler's reason, because a plan that cannot be turned into code is not a
-/// candidate whatever its predicted cost; a candidate the provider cannot
-/// measure keeps its static score and stays ranked, because a miss is not a
-/// rejection.
+/// candidate whatever its predicted cost. A provider miss preserves legality;
+/// static objectives keep its static ranking, while measured objectives place
+/// it in `TuningSessionReport::unrankable`.
 llvm::Error measureTopCandidates(mlir::MLIRContext &context,
                                  const SearchSpace &space,
                                  const WorkloadShape &shape,

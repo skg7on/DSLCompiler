@@ -17,9 +17,12 @@
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
+
+#include "resource_regression_fixture.h"
 
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -34,6 +37,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -147,7 +151,8 @@ TEST(MappingPlanReportTest, EmitsRequiredFieldsAndIsByteIdentical) {
   ASSERT_TRUE(root);
 
   EXPECT_TRUE(root->getInteger("version").has_value());
-  EXPECT_EQ(*root->getInteger("version"), 2);
+  EXPECT_EQ(*root->getInteger("version"),
+            static_cast<int64_t>(kPlanReportVersion));
   EXPECT_TRUE(root->getString("compilerVersion").has_value());
   EXPECT_NE(*root->getString("compilerVersion"), "llk-compiler");
   EXPECT_TRUE(root->getInteger("costModelVersion").has_value());
@@ -413,12 +418,54 @@ TEST(MappingPlanReportTest, RegistryHashChangesWithContent) {
   EXPECT_EQ(ruleBase.computeContentHash(), ruleBase.computeContentHash());
 }
 
+// Review focus #2 / task R8: a target *file* renamed or copied without a
+// content change must keep its content identity, so a report bound to the old
+// path still replays against the new one. The content hash is over the declared
+// content, not the file name it was read from -- only a content change (the
+// same name with a different body) may invalidate it.
+TEST(MappingPlanReportTest, ARenamedTargetFileKeepsItsContentIdentity) {
+  constexpr llvm::StringLiteral rules = R"llkmap(
+rule r.one {
+  match micro.vector();
+  require executor kind worker;
+  bundle "b";
+  emit "e1";
+  cost 1;
+}
+)llkmap";
+  constexpr llvm::StringLiteral changedRules = R"llkmap(
+rule r.one {
+  match micro.vector();
+  require executor kind worker;
+  bundle "b";
+  emit "e1";
+  cost 2;
+}
+)llkmap";
+
+  llvm::Expected<RuleRegistry> first =
+      parseRuleText(rules, "mapping/a/rules.llkmap");
+  ASSERT_TRUE(bool(first)) << llvm::toString(first.takeError());
+  llvm::Expected<RuleRegistry> renamed =
+      parseRuleText(rules, "mapping/b/rules.llkmap");
+  ASSERT_TRUE(bool(renamed)) << llvm::toString(renamed.takeError());
+  EXPECT_EQ(first->computeContentHash(), renamed->computeContentHash())
+      << "renaming the file must not change content identity";
+
+  llvm::Expected<RuleRegistry> edited =
+      parseRuleText(changedRules, "mapping/a/rules.llkmap");
+  ASSERT_TRUE(bool(edited)) << llvm::toString(edited.takeError());
+  EXPECT_NE(first->computeContentHash(), edited->computeContentHash())
+      << "a content change under the same file name must still fail";
+}
+
 //===----------------------------------------------------------------------===//
 // Versioned replay (task B1)
 //===----------------------------------------------------------------------===//
 
-// A v2 report round-trips the selected state: reading it back reconstructs the
-// same plan identity, endpoints, routes and solved-layout assignments.
+// A v3 report round-trips the selected state: reading it back reconstructs the
+// same plan identity, endpoints, routes, solved-layout assignments and selected
+// compute nodes.
 TEST(MappingPlanReportTest, ReplayReportRoundTripsSelectedState) {
   Parsed parsed = parseKernel(kKernel);
   ASSERT_TRUE(parsed.module);
@@ -442,7 +489,7 @@ TEST(MappingPlanReportTest, ReplayReportRoundTripsSelectedState) {
       readPlanReport(report, **target, *graph);
   ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
   EXPECT_EQ(replay->id, selected.id);
-  EXPECT_EQ(replay->schemaVersion, 2u);
+  EXPECT_EQ(replay->schemaVersion, 3u);
   EXPECT_EQ(replay->sourceBindingHash, selected.sourceBindingHash);
 
   ASSERT_EQ(replay->placements.size(), selected.placements.size());
@@ -451,6 +498,14 @@ TEST(MappingPlanReportTest, ReplayReportRoundTripsSelectedState) {
     EXPECT_EQ(replay->placements[i].instance, selected.placements[i].instance);
     EXPECT_EQ(replay->placements[i].rule, selected.placements[i].rule);
     EXPECT_EQ(replay->placements[i].executor, selected.placements[i].executor);
+    // The concrete compute node the placement selected survives the report
+    // (issue #129, task R1): a replay must read the recorded engine, not
+    // re-derive one from the executor.
+    EXPECT_EQ(replay->placements[i].computeBindings.size(),
+              selected.placements[i].computeBindings.size());
+    for (const auto &entry : selected.placements[i].computeBindings)
+      EXPECT_EQ(replay->placements[i].computeBindings.lookup(entry.first()),
+                entry.second);
     EXPECT_EQ(replay->placements[i].layoutSolutions.size(),
               selected.placements[i].layoutSolutions.size());
     // An `AffineMap` is context-bound and a replay re-derives it from the
@@ -664,4 +719,259 @@ TEST(MappingPlanReportTest, ReplayRejectsAChangedInputGraph) {
   ASSERT_FALSE(static_cast<bool>(replay));
   EXPECT_NE(llvm::toString(replay.takeError()).find("graph"),
             std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R1: the selected compute node survives the report
+//===----------------------------------------------------------------------===//
+
+/// Each attached engine the search selected survives the report read, so a
+/// caller holding only the report can tell which capability ran.
+TEST(MappingPlanReportTest, Issue129SelectedComputeSurvivesReportReplay) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  const CoveringPlan &selected = result->plans.front();
+  ASSERT_FALSE(selected.placements.empty());
+
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, stableHash("case"));
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_TRUE(bool(replay)) << llvm::toString(replay.takeError());
+  ASSERT_FALSE(replay->placements.empty());
+  EXPECT_EQ(replay->id, selected.id);
+  EXPECT_EQ(
+      replay->placements.front().computeBindings.lookup("vector_engine"),
+      selected.placements.front().computeBindings.lookup("vector_engine"));
+  EXPECT_TRUE(replay->placements.front().computeBindings.lookup(
+                  "vector_engine") == "vpu.a" ||
+              replay->placements.front().computeBindings.lookup(
+                  "vector_engine") == "vpu.b");
+}
+
+/// A report written under an older schema records no compute selection, so it
+/// must be rejected with an unsupported-schema diagnostic and regeneration
+/// guidance rather than replayed with a guessed engine.
+TEST(MappingPlanReportTest, Issue129RejectsAnOlderReportSchema) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, stableHash("case"));
+
+  const std::string current =
+      "\"version\": " + std::to_string(kPlanReportVersion);
+  size_t position = report.find(current);
+  ASSERT_NE(position, std::string::npos);
+  report.replace(position, current.size(), "\"version\": 2");
+
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_FALSE(bool(replay));
+  const std::string text = llvm::toString(replay.takeError());
+  EXPECT_NE(text.find("unsupported"), std::string::npos) << text;
+  EXPECT_NE(text.find("re-run"), std::string::npos) << text;
+}
+
+/// A change to the *machine* content invalidates the report: a plan bound for a
+/// machine whose capabilities differ is not the same plan, so a fresh target
+/// rejects the replay.
+TEST(MappingPlanReportTest, Issue129ReplayRejectsChangedMachineContent) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  std::string report = writePlanReport(*result, c->target->machine(),
+                                       *c->target, options, stableHash("case"));
+
+  // The same machine with one attached engine's concurrency changed: a real
+  // content difference, not a rename.
+  mlir::llk::machine::MachineModel changed = c->target->machine();
+  ASSERT_FALSE(changed.computes.empty());
+  changed.computes.front().concurrency += 1;
+  FileMappingTarget changedTarget(
+      "issue129", changed, LayoutRegistry(c->target->layouts()),
+      RuleRegistry(c->target->rules()), {"issue129_vector_add"});
+
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, changedTarget, c->graph);
+  ASSERT_FALSE(bool(replay));
+  EXPECT_NE(llvm::toString(replay.takeError()).find("target"),
+            std::string::npos);
+}
+
+/// The concrete compute resource a layout conversion runs on survives the
+/// report round trip (issue #129, task R1): the search picked it by memory
+/// visibility, which can disagree with the executor's declaration order, so a
+/// replay must read it rather than re-derive one.
+TEST(MappingPlanReportTest, Issue129TransformResourceSurvivesReportReplay) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult result =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  ASSERT_FALSE(result.plans.empty());
+  CoveringPlan &plan = result.plans.front();
+  if (plan.connectionPlans.empty()) {
+    // The plan content id is written verbatim by the report, so adding the
+    // connection this test needs does not disturb the replayed identity.
+    PlanConnection connection;
+    connection.id = 4242;
+    connection.kind = ConnectionKind::LayoutTransform;
+    plan.connectionPlans.push_back(connection);
+  }
+  PlanConnection &connection = plan.connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  LayoutTransform transform;
+  transform.srcLayout = "avx2.row_major";
+  transform.dstLayout = "avx2.blocked_2d";
+  transform.computeResource = "vpu";
+  connection.transform = transform;
+
+  llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+  std::string report = writePlanReport(result, (**target).machine(), **target,
+                                       options, result.workloadHash);
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, **target, *graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+  const PlanConnection *replayed = nullptr;
+  for (const PlanConnection &candidate : replay->connectionPlans)
+    if (candidate.transform)
+      replayed = &candidate;
+  ASSERT_NE(replayed, nullptr) << "the replayed plan records no transform";
+  EXPECT_EQ(replayed->transform->computeResource, "vpu");
+}
+
+namespace {
+
+/// A fresh identical write of the report already produced for `result`. The two
+/// strings must be byte-identical (§29.12): the hop records are part of the
+/// serialized plan and must not depend on iteration order.
+std::string secondReport(const MappingSearchResult &result,
+                         const mlir::llk::machine::MachineModel &model,
+                         const MappingTarget &target,
+                         const MappingSearchOptions &options) {
+  return writePlanReport(result, model, target, options, result.workloadHash);
+}
+
+} // namespace
+
+// The physical movement hops travel with the plan: a replayed report states the
+// same per-hop memories, engine, storage allocations and ordering steps the
+// selected plan made, and two identical runs write byte-identical bytes.
+TEST(PlanReport, Issue129MovementHopsRoundTripWithTheirStorageDecisions) {
+  llvm::Expected<issue129::ResourceCase> c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  llvm::Expected<MappingSearchResult> result =
+      issue129::searchCase(*c, options);
+  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  ASSERT_FALSE(bool(finalizeStoragePlan(c->graph, result->plans.front(),
+                                        c->target->machine())));
+  const CoveringPlan &selected = result->plans.front();
+  ASSERT_FALSE(selected.connectionPlans.empty());
+  ASSERT_FALSE(selected.connectionPlans.front().hops.empty());
+
+  std::string report = writePlanReport(
+      *result, c->target->machine(), *c->target, options, result->workloadHash);
+  EXPECT_NE(report.find("\"hops\""), std::string::npos)
+      << "the report must record the movement hops";
+  EXPECT_EQ(secondReport(*result, c->target->machine(), *c->target, options),
+            report)
+      << "two identical runs must write identical bytes";
+
+  llvm::Expected<CoveringPlan> replay =
+      readPlanReport(report, *c->target, c->graph);
+  ASSERT_TRUE(static_cast<bool>(replay)) << llvm::toString(replay.takeError());
+
+  ASSERT_EQ(replay->connectionPlans.size(), selected.connectionPlans.size());
+  for (size_t index = 0; index < replay->connectionPlans.size(); ++index) {
+    const PlanConnection &stated = selected.connectionPlans[index];
+    const PlanConnection &replayed = replay->connectionPlans[index];
+    ASSERT_EQ(replayed.hops.size(), stated.hops.size());
+    for (size_t hop = 0; hop < stated.hops.size(); ++hop) {
+      EXPECT_EQ(replayed.hops[hop].index, stated.hops[hop].index);
+      EXPECT_EQ(replayed.hops[hop].srcMemory, stated.hops[hop].srcMemory);
+      EXPECT_EQ(replayed.hops[hop].dstMemory, stated.hops[hop].dstMemory);
+      EXPECT_EQ(replayed.hops[hop].engine, stated.hops[hop].engine);
+      EXPECT_EQ(replayed.hops[hop].sourceStorageId,
+                stated.hops[hop].sourceStorageId);
+      EXPECT_EQ(replayed.hops[hop].destinationStorageId,
+                stated.hops[hop].destinationStorageId);
+      EXPECT_EQ(replayed.hops[hop].movementStep, stated.hops[hop].movementStep);
+      EXPECT_EQ(replayed.hops[hop].waitStep, stated.hops[hop].waitStep);
+    }
+  }
+  ASSERT_EQ(replay->steps.size(), selected.steps.size());
+  for (size_t index = 0; index < replay->steps.size(); ++index)
+    EXPECT_EQ(replay->steps[index].hop, selected.steps[index].hop);
+  // The replayed allocations are the same buffers the hops name.
+  EXPECT_EQ(replay->allocations.size(), selected.allocations.size());
+}
+
+// Issue #129, task R7: a plan's diagnostics carry their *text*, not only a
+// count. The completion evaluator records a reason when a derived fact could
+// not be established -- an event snapshot the machine cannot model, for
+// instance -- and a reader of the report must be able to see *why*, not merely
+// that something was refused.
+TEST(MappingPlanReportTest, PlanDiagnosticsEmitTheirText) {
+  Parsed parsed = parseKernel(kKernel);
+  ASSERT_TRUE(parsed.module);
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      avx2_mapping::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
+
+  MappingSearchOptions options;
+  options.mode = SearchMode::Deterministic;
+  MappingSearchResult result =
+      searchKernel(*parsed.context, parsed.kernel, **target, options);
+  ASSERT_FALSE(result.plans.empty());
+
+  const std::string reason =
+      "plan evaluation: the derived event snapshot could not be attached: "
+      "event 0 names transfer engine 'dma', which machine 'test' does not "
+      "model";
+  result.plans.front().diagnostics.warnings.push_back(reason);
+
+  const std::string report = writePlanReport(
+      result, (**target).machine(), **target, options, stableHash(kKernel));
+  EXPECT_NE(report.find("could not be attached"), std::string::npos);
+
+  llvm::Expected<llvm::json::Value> json = llvm::json::parse(report);
+  ASSERT_TRUE(static_cast<bool>(json)) << llvm::toString(json.takeError());
+  const llvm::json::Object *root = json->getAsObject();
+  ASSERT_TRUE(root);
+  const llvm::json::Array *plans = root->getArray("plans");
+  ASSERT_TRUE(plans);
+  ASSERT_FALSE(plans->empty());
+  const llvm::json::Object *diagnostics =
+      (*plans)[0].getAsObject()->getObject("diagnostics");
+  ASSERT_TRUE(diagnostics);
+  // The count and the text cohere, so a reader sees both how many and why.
+  ASSERT_TRUE(diagnostics->getInteger("warningCount").has_value());
+  EXPECT_EQ(*diagnostics->getInteger("warningCount"), 1);
+  const llvm::json::Array *warnings = diagnostics->getArray("warnings");
+  ASSERT_TRUE(warnings);
+  ASSERT_EQ(warnings->size(), 1u);
+  EXPECT_EQ(*warnings->front().getAsString(), reason);
 }

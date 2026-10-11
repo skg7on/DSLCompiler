@@ -13,6 +13,7 @@
 #ifndef LLK_CONVERSION_MICROMAPPING_MICROMAPPINGCOMMON_H
 #define LLK_CONVERSION_MICROMAPPING_MICROMAPPINGCOMMON_H
 
+#include "CompletePlanEvaluation.h"
 #include "LLK/Conversion/MicroMapping/MicroMappingPasses.h"
 #include "LLK/Conversion/MicroMapping/SearchBindingLoader.h"
 #include "LLK/Mapping/CoveringSearch.h"
@@ -502,6 +503,27 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     boundAxes = std::move(*loadedAxes);
   }
 
+  // R7: the completion evaluator. The search keeps knowing nothing about
+  // dialect conversion, materialization or the performance model -- this pass
+  // library is the layer above both, so it is where a proposal becomes a
+  // physical, schedulable plan. The caller's module is only *read* (the binder
+  // clones it), and the evaluator never writes files. A plan whose physical
+  // facts do not resolve is a candidate rejection under the executable contract
+  // and an analysis artifact under the partial one.
+  const mapping::BindContract contract = options.requireExecutable
+                                             ? mapping::BindContract::Executable
+                                             : mapping::BindContract::Partial;
+  // Captured by value: `searchOptions` is moved into the search below, and the
+  // budget must not be read from a moved-from object.
+  const uint64_t memoryBudgetBytes = searchOptions.memoryBudgetBytes;
+  searchOptions.evaluateCompletePlan =
+      [&, memoryBudgetBytes](const mapping::CoveringPlan &proposal)
+      -> llvm::Expected<mapping::CompletePlanEvaluation> {
+    return mapping::evaluateCompletePlan(module, *graph, *run.target, proposal,
+                                         contract, memoryBudgetBytes);
+  };
+  searchOptions.requireCompleteEvaluation = true;
+
   mapping::CoveringSearch search(*graph, *run.target, *module.getContext(),
                                  deriveLayoutContext(*graph), searchOptions,
                                  std::move(binding), std::move(boundLayouts),
@@ -515,10 +537,27 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
     // rules, and their reasons -- so the failure is diagnosable rather than a
     // bare "no plan". A truncated search is called out separately: no plan
     // under a cap does not mean the graph is unmappable (design §16.2).
-    std::string message =
-        (passName + ": the search produced no complete plan").str();
+    //
+    // Under the executable contract every candidate was *refused* rather than
+    // simply never completed, and the first refusal's own words are the most
+    // useful primary message: a binding refusal names the decision that could
+    // not be materialized, exactly as a direct `bindPlan` under that contract
+    // would (issue #129, task R7). The notices -- a cache miss, a cap -- stay
+    // in the diagnostic list below it rather than leading.
+    const mapping::Diagnostic *refusal = nullptr;
+    if (contract == mapping::BindContract::Executable)
+      refusal = mapping::primaryRefusal(run.result.frontier.diagnostics);
+
+    std::string message;
+    if (refusal)
+      message = refusal->message;
+    else
+      message = (passName + ": the search produced no complete plan").str();
     if (run.result.searchTruncated)
-      message += " (a search cap was hit)";
+      message += "\n  (a search cap was hit)";
+    if (refusal)
+      message +=
+          "\n  " + (passName + ": the search produced no complete plan").str();
     for (const mapping::Diagnostic &detail : run.result.frontier.diagnostics)
       message += "\n  " + mapping::stringifyDiagnosticCode(detail.code).str() +
                  ": " + detail.message;
@@ -526,81 +565,34 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
                                    std::move(message));
   }
 
-  // B3: build and validate the storage plan of every retained plan now, while
-  // both the source workload graph and the target machine are in hand. This is
-  // where a *real* plan is produced -- after the search has scored and named
-  // its plans, before either entry point (`micro-map`, `micro-bind-plan`)
-  // reports or binds one -- so the allocations, plan-step DAG, synchronization
-  // decisions and per-connection storage ids travel with whichever plan the
-  // caller selects. It is the single call site: neither pass finalizes again.
-  //
-  // Finalization never changes a plan id: `allocations`, `steps`, `stepEdges`,
-  // `synchronization` and a connection's `storageIds` are all excluded from
-  // `canonicalPlanString`, and the plan's score was already computed from the
-  // search's synthesized step DAG. A plan whose physical footprint or
-  // live-range occupancy exceeds a memory's capacity -- or whose strict facts
-  // cannot be derived -- is a *legitimate rejection*: it is dropped with a
-  // stable diagnostic rather than bound with an unmet reservation.
-  //
-  // Storage planning needs the target to say *where* each value lives, and a
-  // rule that binds no memory leaves every placement unbound -- the shipped
-  // AVX2 rules do exactly that. Finalizing such a plan would reject it for a
-  // missing fact rather than a real overflow, so it is skipped with an explicit
-  // note: the plan stays bindable, its storage fields stay empty, and a target
-  // that does model memory (the probe/barrier fixtures, and any future rules
-  // that declare `require memory`) gets the full capacity check.
-  auto storagePlannable = [](const mapping::CoveringPlan &plan) {
-    if (plan.placements.empty())
-      return false;
-    for (const mapping::PlanPlacement &placement : plan.placements)
-      if (placement.memories.empty() && placement.portMemoryBindings.empty())
-        return false;
-    return true;
-  };
-  std::vector<mapping::CoveringPlan> finalized;
-  finalized.reserve(run.result.plans.size());
-  for (mapping::CoveringPlan &plan : run.result.plans) {
-    // `finalizeStoragePlan` replaces `storageNotes` with its occupancy report;
-    // prepend any note an earlier stage (the plan-score fallback) recorded so
-    // it is not lost.
-    std::vector<std::string> priorNotes =
-        std::move(plan.diagnostics.storageNotes);
-    if (!storagePlannable(plan)) {
-      priorNotes.push_back(
-          "storage plan: skipped -- the target binds no memory to every "
-          "placement, so no reservation can be checked");
-      plan.diagnostics.storageNotes = std::move(priorNotes);
-      finalized.push_back(std::move(plan));
-      continue;
+  // R7: the post-top-K storage filter is gone as the acceptance authority. It
+  // ran *after* the search had already trimmed to top-K and could only ever
+  // drop a retained plan whose finalized storage did not fit -- it never
+  // recovered a more expensive but legal covering the trim had discarded. Every
+  // plan returned now carries its finalized storage, its physical-readiness
+  // verdict and its analysis-derived cost from the completion evaluator, which
+  // ran *before* retention. What remains here is the idempotence check that
+  // invariant rests on: re-finalizing a returned plan must reproduce its
+  // decision-only id, so the physical choices the evaluator retained are the
+  // ones a replay would rebuild.
+  for (const mapping::CoveringPlan &plan : run.result.plans) {
+    mapping::CoveringPlan probe = plan;
+    if (llvm::Error error = mapping::finalizeStoragePlan(
+            *graph, probe, run.target->machine())) {
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          (passName + ": a returned plan does not re-finalize: " +
+           llvm::toString(std::move(error)))
+              .str());
     }
-    if (llvm::Error error =
-            mapping::finalizeStoragePlan(*graph, plan, run.target->machine())) {
-      std::string reason = llvm::toString(std::move(error));
-      run.result.frontier
-          .codeCounts[mapping::DiagnosticCode::MemoryCapacityExceeded] += 1;
-      run.result.frontier.diagnostics.push_back(
-          {mapping::DiagnosticCode::MemoryCapacityExceeded,
-           "storage plan rejected: " + reason});
-      continue;
+    if (probe.id != plan.id) {
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          (passName + ": a returned plan's id is not reproducible; its "
+                      "decisions depend on a derived ordering rather than on "
+                      "the choices it retained")
+              .str());
     }
-    if (!priorNotes.empty()) {
-      std::vector<std::string> merged = std::move(priorNotes);
-      llvm::append_range(merged, plan.diagnostics.storageNotes);
-      plan.diagnostics.storageNotes = std::move(merged);
-    }
-    finalized.push_back(std::move(plan));
-  }
-  run.result.plans = std::move(finalized);
-  if (run.result.plans.empty()) {
-    // Every retained plan was rejected by storage planning, so there is nothing
-    // the caller may bind. Report the reasons rather than a bare "no plan".
-    std::string message =
-        (passName + ": no retained plan has a satisfiable storage plan").str();
-    for (const mapping::Diagnostic &detail : run.result.frontier.diagnostics)
-      message += "\n  " + mapping::stringifyDiagnosticCode(detail.code).str() +
-                 ": " + detail.message;
-    return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                   std::move(message));
   }
   return std::move(run);
 }

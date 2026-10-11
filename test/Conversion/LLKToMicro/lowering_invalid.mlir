@@ -36,7 +36,7 @@ func.func @m_not_divisible(%x: tensor<12x64xbf16>, %wg: tensor<64x64xbf16>,
                            %wu: tensor<64x64xbf16>, %init: tensor<12x64xbf16>)
     -> tensor<12x64xbf16> {
   // expected-warning @below {{no schedule entry for fused_swiglu}}
-  // expected-error @below {{BM tile 8 does not divide BM = 12; the export does not emit tile masks, so the schedule's BM tile must divide the problem}}
+  // expected-error @below {{BM tile 8 does not divide BM = 12; tail_policy is 'none'}}
   %y = llk.fused_swiglu ins(%x, %wg, %wu : tensor<12x64xbf16>,
                             tensor<64x64xbf16>, tensor<64x64xbf16>)
       outs(%init : tensor<12x64xbf16>)
@@ -53,7 +53,7 @@ func.func @k_not_divisible(%x: tensor<16x48xbf16>, %wg: tensor<48x64xbf16>,
                            %wu: tensor<48x64xbf16>, %init: tensor<16x64xbf16>)
     -> tensor<16x64xbf16> {
   // expected-warning @below {{no schedule entry for fused_swiglu}}
-  // expected-error @below {{BK tile 32 does not divide BK = 48; the export does not emit tile masks, so the schedule's BK tile must divide the problem}}
+  // expected-error @below {{BK tile 32 does not divide BK = 48; tail_policy is 'none'}}
   %y = llk.fused_swiglu ins(%x, %wg, %wu : tensor<16x48xbf16>,
                             tensor<48x64xbf16>, tensor<48x64xbf16>)
       outs(%init : tensor<16x64xbf16>)

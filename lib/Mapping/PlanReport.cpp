@@ -53,42 +53,6 @@ llvm::StringRef stringifySearchMode(SearchMode mode) {
   return "unknown";
 }
 
-/// True when `code` names a *rejection* -- something the search refused -- as
-/// opposed to a notice. §22.2 asks for "rejected counts", so a notice never
-/// inflates the rejection tally.
-///
-/// Every code is classified explicitly and there is deliberately no `default`:
-/// a code added to the enum without a case here makes this switch incomplete
-/// (`-Wswitch`), rather than silently defaulting into the rejection bucket.
-/// `AssumedValueSize` is the case that motivated it -- its own documentation
-/// says it is not an error, so it must land under notices.
-bool isRejection(DiagnosticCode code) {
-  switch (code) {
-  // Notices: a cap, a provider gap, or an advisory assumption. None is a
-  // refusal the search made.
-  case DiagnosticCode::SearchTruncated:
-  case DiagnosticCode::LatencyCacheMiss:
-  case DiagnosticCode::AssumedValueSize:
-  case DiagnosticCode::ConnectionChoiceUnexplored:
-    return false;
-  // Rejections: the search refused a rule, a placement, a pair, a layout, a
-  // global constraint, a bundle, or a plan.
-  case DiagnosticCode::NoMatchingRule:
-  case DiagnosticCode::NoLegalLayout:
-  case DiagnosticCode::NoLegalExecutor:
-  case DiagnosticCode::MemoryCapacityExceeded:
-  case DiagnosticCode::UnsupportedComputeFragment:
-  case DiagnosticCode::NoMemoryRoute:
-  case DiagnosticCode::NoLayoutTransform:
-  case DiagnosticCode::GlobalConstraintFailed:
-  case DiagnosticCode::TargetBundleInvalid:
-  case DiagnosticCode::InvalidMappingMetadata:
-  case DiagnosticCode::InvalidGatherDeclaration:
-    return true;
-  }
-  llvm_unreachable("unclassified DiagnosticCode");
-}
-
 /// Fixed six-decimal rendering of a double, matching `canonicalCostString`, so
 /// a cost component is byte-stable and never printed in exponent form.
 /// `snprintf`'s `%f` honours the C locale's decimal separator; the report
@@ -267,14 +231,27 @@ std::string writePlanReport(const MappingSearchResult &result,
           });
           json.attributeObject("diagnostics", [&] {
             json.attribute("searchTruncated", plan.diagnostics.searchTruncated);
-            // `errors`/`warnings` are never written by the search, so these
-            // counts are always 0 today; they are emitted so the report shape
-            // is stable for a future producer rather than silently omitted.
+            // The plan's error and warning lists. The search itself produces
+            // neither today, but the completion evaluator (issue #129, task R7)
+            // records a *reason* here when a derived fact could not be
+            // established -- an event snapshot the machine cannot model, for
+            // instance -- so both the counts and the ordered text are emitted.
+            // A count alone would leave a reader unable to see what was
+            // refused. These lists are provenance, not content: they never fold
+            // into a plan id.
             json.attribute("errorCount", static_cast<uint64_t>(
                                              plan.diagnostics.errors.size()));
+            json.attributeArray("errors", [&] {
+              for (const std::string &error : plan.diagnostics.errors)
+                json.value(error);
+            });
             json.attribute(
                 "warningCount",
                 static_cast<uint64_t>(plan.diagnostics.warnings.size()));
+            json.attributeArray("warnings", [&] {
+              for (const std::string &warning : plan.diagnostics.warnings)
+                json.value(warning);
+            });
             // Storage finalization's informational notes: occupancy and
             // analysis-mode reports. They are deliberately separate from the
             // identity-bearing warnings, so a staged note never changes a plan
@@ -282,6 +259,27 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attributeArray("storageNotes", [&] {
               for (const std::string &note : plan.diagnostics.storageNotes)
                 json.value(note);
+            });
+            // The physical-memory verdict (issue #129, task R3). A plan that
+            // was analyzed and found incomplete records `physicalComplete:
+            // false` with its ordered reasons, so a `report-only` run states
+            // what could not be completed instead of presenting the plan as
+            // fully executable. A strict binding re-derives the facts and
+            // refuses such a plan whatever this says.
+            json.attribute("physicalComplete",
+                           plan.diagnostics.physicalComplete);
+            json.attributeArray("physicalReasons", [&] {
+              for (const std::string &reason : plan.diagnostics.physicalReasons)
+                json.value(reason);
+            });
+            // The resolution decisions the occurrence's own stated kind did not
+            // force (a bare requirement standing in for an unreachable kind, a
+            // borrowed boundary bound by that class requirement). Recorded, so
+            // an override is visible in the report rather than silent.
+            json.attributeArray("physicalDecisions", [&] {
+              for (const std::string &decision :
+                   plan.diagnostics.physicalDecisions)
+                json.value(decision);
             });
           });
         });
@@ -298,6 +296,25 @@ std::string writePlanReport(const MappingSearchResult &result,
       json.attribute("sourceBindingHash",
                      hexId(selected ? selected->sourceBindingHash : 0));
       json.attribute("materialized", selected ? selected->materialized : false);
+      // The physical-memory verdict is part of the replayed state, not merely a
+      // note in the plan's diagnostics (issue #129, task R7 review): a plan
+      // found physically incomplete must not replay as complete. It is
+      // provenance, so it stays out of the plan id.
+      json.attribute("physicalComplete",
+                     selected ? selected->diagnostics.physicalComplete : true);
+      json.attributeArray("physicalReasons", [&] {
+        if (!selected)
+          return;
+        for (const std::string &reason : selected->diagnostics.physicalReasons)
+          json.value(reason);
+      });
+      json.attributeArray("physicalDecisions", [&] {
+        if (!selected)
+          return;
+        for (const std::string &decision :
+             selected->diagnostics.physicalDecisions)
+          json.value(decision);
+      });
       json.attributeArray("placements", [&] {
         if (!selected)
           return;
@@ -308,7 +325,35 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attribute("rule", placement.rule);
             json.attribute("bundle", placement.bundle.name);
             json.attribute("emitter", placement.bundle.emitterKey);
+            if (placement.bundle.parameters)
+              json.attributeObject("bundleParameters", [&] {
+                std::vector<std::string> names;
+                for (mlir::NamedAttribute parameter :
+                     placement.bundle.parameters)
+                  names.push_back(parameter.getName().str());
+                llvm::sort(names);
+                for (const std::string &name : names) {
+                  mlir::Attribute value = placement.bundle.parameters.get(name);
+                  if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(value))
+                    json.attribute(name, integer.getInt());
+                  else if (auto text = mlir::dyn_cast<mlir::StringAttr>(value))
+                    json.attribute(name, text.getValue());
+                }
+              });
             json.attribute("executor", placement.executor);
+            // The concrete compute node each requirement selected (issue #129,
+            // task R1), sorted by requirement kind so the report stays
+            // byte-identical across runs (§29.12). Recorded even when empty, so
+            // a v3 reader can require the container and a replay cannot have
+            // its selection dropped and re-derived from executor order.
+            json.attributeObject("compute", [&] {
+              std::vector<std::string> keys;
+              for (const auto &entry : placement.computeBindings)
+                keys.push_back(entry.first().str());
+              llvm::sort(keys);
+              for (const std::string &key : keys)
+                json.attribute(key, placement.computeBindings.lookup(key));
+            });
             // `StringMap` iteration order is not a contract; sort the keys so
             // the report stays byte-identical across runs (§29.12).
             json.attributeObject("memories", [&] {
@@ -443,6 +488,27 @@ std::string writePlanReport(const MappingSearchResult &result,
               for (uint64_t id : connection.storageIds)
                 json.value(hexId(id));
             });
+            // The physical movement hops (issue #129, task R4), in route
+            // order: each hop's memories, engine and the storage it reads and
+            // writes, plus the copy/wait steps that order it. Written only
+            // when the plan has them, so a plan that was never storage-planned
+            // keeps the report bytes it always had.
+            if (!connection.hops.empty())
+              json.attributeArray("hops", [&] {
+                for (const PlanMovementHop &hop : connection.hops)
+                  json.object([&] {
+                    json.attribute("index", hop.index);
+                    json.attribute("srcMemory", hop.srcMemory);
+                    json.attribute("dstMemory", hop.dstMemory);
+                    json.attribute("engine", hop.engine);
+                    json.attribute("sourceStorageId",
+                                   hexId(hop.sourceStorageId));
+                    json.attribute("destinationStorageId",
+                                   hexId(hop.destinationStorageId));
+                    json.attribute("movementStep", hop.movementStep);
+                    json.attribute("waitStep", hop.waitStep);
+                  });
+              });
             if (connection.producerPort)
               json.attributeObject("producerPort", [&] {
                 json.attribute("node", static_cast<uint64_t>(
@@ -498,6 +564,15 @@ std::string writePlanReport(const MappingSearchResult &result,
                 if (connection.transform->dstMap)
                   json.attribute(
                       "dstMap", printedMapString(connection.transform->dstMap));
+                // The concrete compute resource the transformation runs on
+                // (issue #129, task R1): the decision `selectTransformResource`
+                // made by memory visibility, persisted so a replay normalizes
+                // the same event instead of re-deriving it from executor order.
+                // Recorded only when the plan has one, so a transform without a
+                // resolved resource keeps the report bytes it always had.
+                if (!connection.transform->computeResource.empty())
+                  json.attribute("compute",
+                                 connection.transform->computeResource);
               });
             }
           });
@@ -514,10 +589,18 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attribute("value", static_cast<uint64_t>(allocation.value));
             json.attribute("memory", allocation.memory);
             json.attribute("bytes", allocation.bytes);
+            // Written only when greater than one, so an allocation whose work
+            // runs once keeps the report it had before this field existed
+            // (issue #129, task R5).
+            if (allocation.simultaneousOccurrences != 1)
+              json.attribute("simultaneousOccurrences",
+                             allocation.simultaneousOccurrences);
             if (allocation.aliasOf)
               json.attribute("aliasOf", hexId(*allocation.aliasOf));
             json.attribute("beginStep", allocation.beginStep);
             json.attribute("endStep", allocation.endStep);
+            if (allocation.borrowed)
+              json.attribute("borrowed", true);
           });
         }
       });
@@ -557,6 +640,11 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attribute("kind", stringifyPlanStepKind(step.kind));
             json.attribute("node", static_cast<uint64_t>(step.node));
             json.attribute("connection", hexId(step.connection));
+            // Which hop of a multi-hop movement a copy or wait step orders
+            // (issue #129, task R4). Absent where the step is not hop-scoped,
+            // so a single-hop plan's report is unchanged.
+            if (step.hop)
+              json.attribute("hop", static_cast<uint64_t>(*step.hop));
           });
         }
       });
@@ -650,7 +738,13 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
     return reportError("plan report is not a JSON object");
   std::optional<int64_t> version = root->getInteger("version");
   if (!version || *version != static_cast<int64_t>(kPlanReportVersion))
-    return reportError("plan report has an unsupported version");
+    return reportError(
+        "plan report has an unsupported version: this reader requires " +
+        std::to_string(kPlanReportVersion) +
+        " (issue #129, task R1). An older report records no concrete compute "
+        "selection, so which attached capability ran cannot be recovered from "
+        "it; re-run the mapping search to regenerate the report under the "
+        "current schema");
   std::optional<llvm::StringRef> targetHash = root->getString("targetHash");
   if (!targetHash || *targetHash != hexId(computeTargetContentHash(target)))
     return reportError(
@@ -668,7 +762,7 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
     return reportError("plan report has no selectedState");
 
   CoveringPlan plan;
-  plan.schemaVersion = 2;
+  plan.schemaVersion = kPlanReportVersion;
   if (std::optional<llvm::StringRef> id = state->getString("id"))
     plan.id = parseHexId(*id);
   if (std::optional<llvm::StringRef> binding =
@@ -676,6 +770,26 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
     plan.sourceBindingHash = parseHexId(*binding);
   if (std::optional<bool> materialized = state->getBoolean("materialized"))
     plan.materialized = *materialized;
+  // The physical-memory verdict replays with the plan (issue #129, task R7
+  // review), so a plan found incomplete does not come back claiming complete.
+  if (std::optional<bool> complete = state->getBoolean("physicalComplete"))
+    plan.diagnostics.physicalComplete = *complete;
+  for (llvm::StringRef key : {llvm::StringRef("physicalReasons"),
+                              llvm::StringRef("physicalDecisions")}) {
+    const llvm::json::Array *array = state->getArray(key);
+    if (!array)
+      continue;
+    std::vector<std::string> *out = key == "physicalReasons"
+                                        ? &plan.diagnostics.physicalReasons
+                                        : &plan.diagnostics.physicalDecisions;
+    for (const llvm::json::Value &element : *array) {
+      std::optional<llvm::StringRef> text = element.getAsString();
+      if (!text)
+        return reportError("plan report selectedState '" + key.str() +
+                           "' holds a non-string entry");
+      out->push_back(text->str());
+    }
+  }
   plan.targetHash = computeTargetContentHash(target);
   plan.machineHash = machine::computeContentHash(target.machine());
   plan.layoutHash = target.layouts().computeContentHash();
@@ -702,18 +816,76 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         placement.instance = static_cast<InstanceId>(parseHexId(*instance));
       if (std::optional<llvm::StringRef> rule = object->getString("rule")) {
         placement.rule = rule->str();
-        if (const RuleDef *def = target.rules().find(placement.rule))
+        if (const RuleDef *def = target.rules().find(placement.rule)) {
           if (def->matchOp != workloadNode->opName)
             return reportError("plan report placement rule does not implement "
                                "the source graph's operation");
+          // Re-derived from the recorded rule id, so a replayed plan still
+          // knows which capability kinds must have a recorded selection (issue
+          // #129, task R1).
+          for (const KindRequirement &requirement : def->kindRequirements)
+            if (requirement.role == "compute")
+              placement.computeRequirements.push_back(requirement.kind);
+          llvm::sort(placement.computeRequirements);
+          placement.computeRequirements.erase(
+              std::unique(placement.computeRequirements.begin(),
+                          placement.computeRequirements.end()),
+              placement.computeRequirements.end());
+        }
       }
       if (std::optional<llvm::StringRef> bundle = object->getString("bundle"))
         placement.bundle.name = bundle->str();
       if (std::optional<llvm::StringRef> emitter = object->getString("emitter"))
         placement.bundle.emitterKey = emitter->str();
+      if (const llvm::json::Object *parameters =
+              object->getObject("bundleParameters")) {
+        mlir::MLIRContext *context = workloadNode->attributes.getContext();
+        if (!context)
+          return reportError("plan report bundle parameters need a "
+                             "context-bound source graph");
+        llvm::SmallVector<mlir::NamedAttribute> attributes;
+        for (const auto &parameter : *parameters) {
+          mlir::Attribute value;
+          if (std::optional<int64_t> integer = parameter.second.getAsInteger())
+            value = mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
+                                           *integer);
+          else if (std::optional<llvm::StringRef> text =
+                       parameter.second.getAsString())
+            value = mlir::StringAttr::get(context, *text);
+          else
+            return reportError("plan report bundle parameter is neither an "
+                               "integer nor a string");
+          attributes.emplace_back(
+              mlir::StringAttr::get(context, parameter.first.str()), value);
+        }
+        placement.bundle.parameters =
+            mlir::DictionaryAttr::get(context, attributes);
+      }
       if (std::optional<llvm::StringRef> executor =
               object->getString("executor"))
         placement.executor = executor->str();
+      // The concrete compute node each requirement selected (issue #129, task
+      // R1). A v3 report always records the container (it may be empty only for
+      // a rule that requires no compute capability), so deleting it cannot skip
+      // the selection and let a reader re-derive an engine from executor order.
+      const llvm::json::Object *compute = object->getObject("compute");
+      if (!compute)
+        return reportError(
+            "plan report placement records no compute selection");
+      for (const auto &entry : *compute) {
+        std::optional<llvm::StringRef> value = entry.second.getAsString();
+        if (!value)
+          return reportError("plan report compute selection is not a string");
+        placement.computeBindings[entry.first] = value->str();
+      }
+      // A container that omits a kind the rule requires is an incomplete
+      // selection, not a licence to re-derive an engine from executor order
+      // (issue #129, task R1).
+      if (std::optional<std::string> missing = missingComputeBinding(placement))
+        return reportError("plan report placement records no concrete '" +
+                           *missing +
+                           "' compute selection, which its rule "
+                           "requires");
       if (const llvm::json::Object *memories = object->getObject("memories"))
         for (const auto &entry : *memories)
           if (std::optional<llvm::StringRef> value = entry.second.getAsString())
@@ -799,6 +971,42 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
             return reportError("plan report rule parameter is neither an "
                                "integer nor a string");
         }
+      // Reports written before bundleParameters was made explicit still carry
+      // the rule's resolved assignments. Reconstruct the opaque bundle values
+      // from that same rule contract so old v3 reports replay their exact
+      // emitter arguments instead of silently dropping them.
+      if (!placement.bundle.parameters) {
+        const RuleDef *rule = target.rules().find(placement.rule);
+        if (rule && !rule->bundleParameters.empty()) {
+          mlir::MLIRContext *context = workloadNode->attributes.getContext();
+          if (!context)
+            return reportError("plan report bundle parameters need a "
+                               "context-bound source graph");
+          llvm::SmallVector<mlir::NamedAttribute> attributes;
+          for (const auto &parameter : rule->bundleParameters) {
+            mlir::Attribute value;
+            if (const int64_t *integer =
+                    std::get_if<int64_t>(&parameter.second)) {
+              value = mlir::IntegerAttr::get(
+                  mlir::IntegerType::get(context, 64), *integer);
+            } else {
+              const std::string &name = std::get<std::string>(parameter.second);
+              auto resolved = placement.resolvedParameters.find(name);
+              if (resolved != placement.resolvedParameters.end() &&
+                  std::holds_alternative<int64_t>(resolved->second))
+                value =
+                    mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64),
+                                           std::get<int64_t>(resolved->second));
+              else
+                value = mlir::StringAttr::get(context, name);
+            }
+            attributes.emplace_back(
+                mlir::StringAttr::get(context, parameter.first), value);
+          }
+          placement.bundle.parameters =
+              mlir::DictionaryAttr::get(context, attributes);
+        }
+      }
       plan.placements.push_back(std::move(placement));
     }
   }
@@ -837,6 +1045,40 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         for (const llvm::json::Value &id : *storageIds)
           if (std::optional<llvm::StringRef> value = id.getAsString())
             connection.storageIds.push_back(parseHexId(*value));
+      // The physical movement hops (issue #129, task R4), read back checked:
+      // a hop the report cannot describe completely is rejected rather than
+      // decoded with a guessed memory or storage.
+      if (const llvm::json::Array *hops = object->getArray("hops")) {
+        for (const llvm::json::Value &element : *hops) {
+          const llvm::json::Object *hopObject = element.getAsObject();
+          if (!hopObject)
+            return reportError("plan report movement hop is not an object");
+          PlanMovementHop hop;
+          if (std::optional<int64_t> index = hopObject->getInteger("index"))
+            hop.index = static_cast<uint64_t>(*index);
+          if (std::optional<llvm::StringRef> memory =
+                  hopObject->getString("srcMemory"))
+            hop.srcMemory = memory->str();
+          if (std::optional<llvm::StringRef> memory =
+                  hopObject->getString("dstMemory"))
+            hop.dstMemory = memory->str();
+          if (std::optional<llvm::StringRef> engine =
+                  hopObject->getString("engine"))
+            hop.engine = engine->str();
+          if (std::optional<llvm::StringRef> id =
+                  hopObject->getString("sourceStorageId"))
+            hop.sourceStorageId = parseHexId(*id);
+          if (std::optional<llvm::StringRef> id =
+                  hopObject->getString("destinationStorageId"))
+            hop.destinationStorageId = parseHexId(*id);
+          if (std::optional<int64_t> step =
+                  hopObject->getInteger("movementStep"))
+            hop.movementStep = static_cast<uint64_t>(*step);
+          if (std::optional<int64_t> step = hopObject->getInteger("waitStep"))
+            hop.waitStep = static_cast<uint64_t>(*step);
+          connection.hops.push_back(std::move(hop));
+        }
+      }
       if (const llvm::json::Object *producer =
               object->getObject("producerPort")) {
         llvm::Expected<PortRef> ref = jsonPortRef(producer, "producerPort");
@@ -896,6 +1138,13 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
           layoutTransform.srcLayout = src->str();
         if (std::optional<llvm::StringRef> dst = transform->getString("dst"))
           layoutTransform.dstLayout = dst->str();
+        // The concrete compute resource the transformation runs on (issue #129,
+        // task R1). Restored verbatim, so re-normalizing the replayed plan
+        // names the recorded engine rather than re-deriving one from executor
+        // order.
+        if (std::optional<llvm::StringRef> compute =
+                transform->getString("compute"))
+          layoutTransform.computeResource = compute->str();
         // The transform's maps are context-bound and re-derived by a
         // materializer from the declaration and parameters; the report records
         // them for inspection only.
@@ -921,10 +1170,18 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
         allocation.bytes = static_cast<uint64_t>(*bytes);
       if (std::optional<llvm::StringRef> alias = object->getString("aliasOf"))
         allocation.aliasOf = parseHexId(*alias);
+      if (std::optional<int64_t> occurrences =
+              object->getInteger("simultaneousOccurrences"))
+        allocation.simultaneousOccurrences =
+            static_cast<uint64_t>(*occurrences);
       if (std::optional<int64_t> begin = object->getInteger("beginStep"))
         allocation.beginStep = static_cast<uint64_t>(*begin);
       if (std::optional<int64_t> end = object->getInteger("endStep"))
         allocation.endStep = static_cast<uint64_t>(*end);
+      // Absent for every allocation written before the field existed, which
+      // decodes to the owned (non-borrowed) default (issue #129, task R3).
+      if (std::optional<bool> borrowed = object->getBoolean("borrowed"))
+        allocation.borrowed = *borrowed;
       plan.allocations.push_back(std::move(allocation));
     }
   }
@@ -975,6 +1232,8 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
       if (std::optional<llvm::StringRef> connection =
               object->getString("connection"))
         step.connection = static_cast<ConnectionId>(parseHexId(*connection));
+      if (std::optional<int64_t> hop = object->getInteger("hop"))
+        step.hop = static_cast<uint64_t>(*hop);
       plan.steps.push_back(step);
     }
   }

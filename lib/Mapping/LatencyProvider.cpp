@@ -38,6 +38,7 @@ std::string OperationSignature::canonicalString() const {
   appendField(out, "layout", layout);
   appendField(out, "placement_class", placementClass);
   appendField(out, "placement", placement);
+  appendField(out, "compute", compute);
   appendField(out, "route", routeClass);
   appendField(out, "cost_model", std::to_string(costModelVersion));
   return out;

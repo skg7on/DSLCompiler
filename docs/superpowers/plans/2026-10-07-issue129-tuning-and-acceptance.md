@@ -356,7 +356,7 @@ auto nextValue = [&]() {
 
 **Interfaces:** Register `MappedAVX2Acceptance` with label `selected-avx2`, portable tests with label `mapped-reference`. Add an executable option `--require-selected-target` that treats missing features/JIT or any skipped required case as failure; local portable runs may still diagnose unsupported hosts honestly.
 
-- [ ] **Step 1: Add a parser/control test using saved CTest outcomes.** All required selected cases pass -> success; one skipped/failed/not-run/missing case -> failure. Empty output cannot pass. Include the audited legacy-skip records as a negative documentation control, not a mandatory dependency for new mapped execution.
+- [x] **Step 1: Add a parser/control test using saved CTest outcomes.** All required selected cases pass -> success; one skipped/failed/not-run/missing case -> failure. Empty output cannot pass. Include the audited legacy-skip records as a negative documentation control, not a mandatory dependency for new mapped execution. `RequiredExecutionEvidenceParser` covers pass, skip, failure, missing, and empty reports.
 
 ```python
 required = {"MappedAVX2Acceptance", "MappedAllocationLifetimeTest"}
@@ -365,10 +365,10 @@ for name in required:
     assert outcomes[name] == "passed", f"required execution did not pass: {name}"
 ```
 
-- [ ] **Step 2: Run parser tests and invoke the executable on an injected unsupported-feature case with --require-selected-target.** It must fail; ordinary local diagnostics may report unsupported.
-- [ ] **Step 3: Add an explicit selected-x86 step to pinned LLVM22 static CI.** Record host architecture/features and exact toolchain; run the selected acceptance binary with --require-selected-target and then the full CTest suite. Save CTest result artifacts and selected Vector/LLVM/manifest/numeric/lifetime evidence. If the runner lacks AVX2, use a known compatible runner or report CI blocked; do not silently skip the gate.
+- [x] **Step 2: Run parser tests and invoke the executable on an injected unsupported-feature case with --require-selected-target.** It must fail; ordinary local diagnostics may report unsupported. `SelectedTargetFlagContract` sets `LLK_TEST_DISABLE_AVX2=1` and confirms that required selected execution fails with the injected-feature diagnostic.
+- [ ] **Step 3: Add an explicit selected-x86 step to pinned LLVM22 static CI.** Record host architecture/features and exact toolchain; run the selected acceptance binary with --require-selected-target and then the full CTest suite. Save CTest result artifacts and selected Vector/LLVM/manifest/numeric/lifetime evidence. If the runner lacks AVX2, use a known compatible runner or report CI blocked; do not silently skip the gate. The workflow now captures the post-lowering LLVM dialect, translated LLVM IR, and a selected-plan manifest through an opt-in JIT evidence sink, validates those artifacts, and uploads them with the JUnit/log and host record. Local sink/file-writer/error-propagation tests and five validator controls pass; the full local run still fails the required selected binary on arm64, so this step remains open until pinned LLVM22 x86 CI passes.
 - [ ] **Step 4: Validate new static library dependencies on that job.** Ownership pipelines, target vectorization and runtime math/copy/alloc symbols must resolve without a monolithic MLIR dylib masking missing links. Local LLVM24/arm64 runs the reference and policy tests and cannot replace this x86 gate.
-- [ ] **Step 5: Retain legacy tests with truthful status.** Investigate legacy SwiGLU skips if required by their own regression contract; record actual reason and result. Do not count a legacy SIMD pass as mapped selected-target proof. A legacy path regression caused by these changes must be fixed before integration.
+- [x] **Step 5: Retain legacy tests with truthful status.** On the local Darwin arm64 LLVM24 build, `SwigluScalar` passes four tests and skips `JitCompilationSmoke` and `E2EWithAbiWrapper` because ORC LLJIT is not configured; `SwiGLUVector` passes `PipelineSmoke` and skips `Correctness` because JIT compilation is unavailable. These are local runtime-capability skips, not selected mapped-target evidence. The pinned Linux LLVM22 job must still report their actual outcomes and is covered by Step 6.
 - [ ] **Step 6: Run final candidate CI and inspect artifacts/skips.** Commit with `ci: require selected mapped AVX2 execution evidence`. Review gate: actual selected-target numerical and ownership tests pass on the exact repaired head, with no required skips.
 
 ### Task T9: Publish a reproducible twelve-criterion closure matrix
@@ -377,7 +377,7 @@ for name in required:
 
 **Interfaces:** Consumes every release gate. Produces exact revision/toolchain/host/capability/test-artifact evidence for each normative criterion and each issue finding. DocReferences remains link/help lint; WorkflowSmoke executes a small allowlisted set of actual documented commands with controlled output directories.
 
-- [ ] **Step 1: Add a workflow smoke test with real arguments.** Cover parse/export, mapped search/report, frozen replay/verify, compiler lowered stop, micro-perf static output and mapped-tune static output. Use checked-in fixtures and actual option values. It must fail for a nonexistent fixture or invalid pass option; do not execute arbitrary shell fences from Markdown.
+- [x] **Step 1: Add a workflow smoke test with real arguments.** Cover parse/export, mapped search/report, frozen replay/verify, compiler lowered stop, micro-perf static output and mapped-tune static output. Use checked-in fixtures and actual option values. It must fail for a nonexistent fixture or invalid pass option; do not execute arbitrary shell fences from Markdown. `WorkflowSmokeNegativeControls` proves that a missing fixture root and invalid `llk-opt` option fail through the manifest runner.
 
 ```python
 for command in manifest["commands"]:
@@ -389,8 +389,8 @@ for command in manifest["commands"]:
 
 `manifest_outputs` is a local manifest lookup function implemented here; commands are JSON argv arrays, never eval/shell text. The docs reference the same fixtures/options, and a drift check compares those exact examples to the manifest.
 
-- [ ] **Step 2: Run DocReferences and WorkflowSmoke.** Correct the claimed scope of each check and replace stale examples/options. Preserve runnable relative CLI commands in docs; the evidence table identifies the actual isolated checkout and revision separately.
-- [ ] **Step 3: Write the criterion matrix using exact artifacts:**
+- [x] **Step 2: Run DocReferences and WorkflowSmoke.** Correct the claimed scope of each check and replace stale examples/options. Preserve runnable relative CLI commands in docs; the evidence table identifies the actual isolated checkout and revision separately. At the current candidate tree, `DocReferences`, `WorkflowSmoke`, and `WorkflowSmokeNegativeControls` pass.
+- [x] **Step 3: Write the criterion matrix using exact artifacts:** Candidate evidence and local status for all twelve criteria are recorded in `docs/reviews/issue67-final-acceptance.md` at `1c678de`. The matrix explicitly leaves selected-x86 invocation open; final release artifacts still depend on T8.
 
 | Design §29 | Required repaired evidence |
 |---|---|
@@ -408,5 +408,5 @@ for command in manifest["commands"]:
 | 12 Determinism | Fresh-process byte comparisons of static reports/IR and replay, R8/T5/T6 |
 
 - [ ] **Step 4: Record proof with honest capability boundaries.** Pin the implementation head/CI run rather than quoting the #127/#128 baseline. List registered/passed/failed/skipped test counts from that head, every required skip reason, compiler/LLVM revisions and execution mode. Portable reference correctness, actual selected AVX2 execution, static model parity and future calibrated prediction are separate rows.
-- [ ] **Step 5: Reconcile historical issue checklists.** Credit #106's resolved defects; link still-relevant #109 items to exact new tests; connect #67 mandatory criteria to the matrix; check #129 G1–G10 only with corresponding evidence. Keep production persistence/calibration in #51/#52 and accelerator hardware execution outside this closure. Do not close any mandatory row on the basis that a stage PR merged.
+- [ ] **Step 5: Reconcile historical issue checklists.** Credit #106's resolved defects; link still-relevant #109 items to exact new tests; connect #67 mandatory criteria to the matrix; check #129 G1–G10 only with corresponding evidence. Keep production persistence/calibration in #51/#52 and accelerator hardware execution outside this closure. Do not close any mandatory row on the basis that a stage PR merged. The local G1–G10 crosswalk is in `docs/reviews/issue67-final-acceptance.md`; tracker checklist reconciliation remains for the final authorized publication after the x86 gate.
 - [ ] **Step 6: Run documentation checks, final full CTest and final x86 selected gate on the release head.** Complete whole-branch review and resolve findings. Commit with `docs: record verified issue129 and issue67 acceptance evidence`. Gate close requires every mandatory matrix row passed; unresolved gaps remain open with concrete diagnostics and artifacts.

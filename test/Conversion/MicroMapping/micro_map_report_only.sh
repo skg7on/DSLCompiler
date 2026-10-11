@@ -47,7 +47,7 @@ NO_PLAN="$SRC/test/Conversion/MicroMapping/report_only_no_plan.mlir"
 "$LLK_OPT" "--micro-map=$OPTIONS report-only=1 report=$WORK/report_only.json" \
     "$KERNEL" > "$WORK/report_only.mlir"
 
-grep -Eq '"version" *: *2[,}]' "$WORK/report_only.json"
+grep -Eq '"version" *: *3[,}]' "$WORK/report_only.json"
 grep -q '"compilerVersion"' "$WORK/report_only.json"
 grep -q '"inputModuleHash"' "$WORK/report_only.json"
 grep -q '"selectedPlanId"' "$WORK/report_only.json"

@@ -19,6 +19,9 @@ add_llk_test_category(Mapping
         routing.cpp
         plan_report.cpp
         properties.cpp
+        exact_resource_oracle.cpp
+        resource_regression_fixture.cpp
+        storage_liveness.cpp
     LIBRARIES
         LLKMapping
         LLKTargetMapping

@@ -1,6 +1,8 @@
 add_llk_test_category(Conversion
     SOURCES
         MicroMapping/search_binding_loader.cpp
+        MicroMapping/complete_plan_evaluation.cpp
+        ../Mapping/resource_regression_fixture.cpp
     LIBRARIES
         LLKMicroMapping
         MicroDialect
@@ -9,4 +11,5 @@ add_llk_test_category(Conversion
         LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
     INCLUDE_DIRECTORIES
         ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+        ${CMAKE_SOURCE_DIR}/test/Mapping
 )

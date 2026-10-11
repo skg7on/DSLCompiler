@@ -3,8 +3,10 @@
 #include "LLK/Mapping/CostEvent.h"
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingPlan.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Mapping/TileFacts.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
@@ -84,6 +86,119 @@ const machine::LinkEdge *linkBetween(const machine::MachineModel &machine,
   return nullptr;
 }
 
+/// The compute node a placement *recorded* as selected, validated against the
+/// machine before its id is used (issue #129, task R1). Returns:
+///
+///   - null when the placement recorded no compute binding -- a hand-built or
+///     pre-#129 plan -- so the caller keeps the executor-based fallback;
+///   - the selected node otherwise, preferring a vector engine, then a matrix
+///     engine, then the first selection in sorted key order. That mirrors the
+///     priority `engineForExecutor` applies to an executor's attachments, so a
+///     single-capability placement normalizes exactly as it did before;
+///   - an error when a recorded node is unknown to the machine, or when it is
+///     not attached to the placement's executor. A recorded selection that no
+///     longer resolves is never silently replaced by executor order: that is
+///     the very re-derivation this task removes.
+llvm::Expected<const machine::ComputeNode *>
+recordedComputeNode(const machine::MachineModel &machine,
+                    const PlanPlacement &placement) {
+  if (placement.computeBindings.empty())
+    return static_cast<const machine::ComputeNode *>(nullptr);
+  // Sorted keys, so the choice is a function of the recorded content and never
+  // of `StringMap` iteration order.
+  std::vector<std::string> keys;
+  keys.reserve(placement.computeBindings.size());
+  for (const auto &entry : placement.computeBindings)
+    keys.push_back(entry.first().str());
+  llvm::sort(keys);
+  const machine::ComputeNode *vector = nullptr;
+  const machine::ComputeNode *matrix = nullptr;
+  const machine::ComputeNode *other = nullptr;
+  for (const std::string &key : keys) {
+    const std::string &id = placement.computeBindings.lookup(key);
+    const machine::ComputeNode *node = machine.findCompute(id);
+    if (!node)
+      return planEventError(
+          "plan events: placement for node " + llvm::Twine(placement.node) +
+          " records compute node '" + id + "', which machine '" +
+          machine.target + "' does not declare");
+    if (!placement.executor.empty() && node->attachedTo != placement.executor)
+      return planEventError("plan events: placement for node " +
+                            llvm::Twine(placement.node) +
+                            " records compute node '" + id +
+                            "', which is not attached to its executor '" +
+                            placement.executor + "'");
+    if (node->kind == "vector_engine" && !vector)
+      vector = node;
+    else if (node->kind == "matrix_engine" && !matrix)
+      matrix = node;
+    else if (!other)
+      other = node;
+  }
+  if (vector)
+    return vector;
+  if (matrix)
+    return matrix;
+  return other;
+}
+
+/// The engine a compute event for `placement` runs on, with the "a required
+/// kind must be recorded" diagnosis applied before any fallback is even
+/// considered (issue #129, task R1).
+///
+/// A placement whose rule requires a compute kind but which records no concrete
+/// node for it has had its selection dropped or tampered with. Returning null
+/// there would let the caller re-derive an engine from the executor's first
+/// attachment -- the exact silent substitution this task removes -- so it is an
+/// error instead. Null is returned only for a placement that genuinely records
+/// nothing to select: a rule that requires no capability (a copy or store
+/// placement) or a hand-built plan.
+llvm::Expected<const machine::ComputeNode *>
+recordedEngineForPlacement(const machine::MachineModel &machine,
+                           const PlanPlacement &placement) {
+  if (std::optional<std::string> missing = missingComputeBinding(placement))
+    return planEventError(
+        "plan events: placement for node " + llvm::Twine(placement.node) +
+        " requires a '" + *missing +
+        "' compute capability but the plan records no concrete node for it; "
+        "refusing to re-derive one from executor order");
+  return recordedComputeNode(machine, placement);
+}
+
+/// The engine a connection's transform runs on: the concrete resource the
+/// plan *recorded* for it (the same one `selectTransformResource` chose), never
+/// a re-derivation from executor order. Falls back to the executor's first
+/// attached engine only for a connection that recorded no resource at all
+/// (issue #129, task R1).
+llvm::Expected<const machine::ComputeNode *>
+transformEngineFor(const PlanConnection &connection,
+                   const machine::MachineModel &machine,
+                   const CoveringPlan &plan) {
+  if (connection.transform && !connection.transform->computeResource.empty()) {
+    const std::string &recorded = connection.transform->computeResource;
+    const machine::ComputeNode *node = machine.findCompute(recorded);
+    if (!node)
+      return planEventError(
+          "plan events: transform connection " + llvm::Twine(connection.id) +
+          " records compute resource '" + recorded + "', which machine '" +
+          machine.target + "' does not declare");
+    return node;
+  }
+  return engineForExecutor(machine, transformExecutorFor(plan, connection));
+}
+
+/// The first placement serving one of `connection`'s consumer instances, in
+/// placement order -- the same placement `transformExecutorFor` takes the
+/// executor from. Null when no recorded consumer instance resolves to a
+/// placement.
+const PlanPlacement *consumerPlacementOf(const CoveringPlan &plan,
+                                         const PlanConnection &connection) {
+  for (const PlanPlacement &placement : plan.placements)
+    if (llvm::is_contained(connection.consumers, placement.instance))
+      return &placement;
+  return nullptr;
+}
+
 /// The node a connection serves, for the data dependency from a movement to the
 /// consumer that reads it: the first consumer instance's covered node.
 std::optional<WorkloadNodeId> consumerNodeOf(const CoveringPlan &plan,
@@ -95,7 +210,80 @@ std::optional<WorkloadNodeId> consumerNodeOf(const CoveringPlan &plan,
   return std::nullopt;
 }
 
+/// Checks a derived analysis stream before it is trusted (issue #129, task R6).
+///
+/// A snapshot is a claim about the plan's own work: the event stream the kernel
+/// this plan bound actually does. It is accepted only when that claim is
+/// internally consistent with the plan -- a non-empty stream, every resource
+/// modelled by the machine, a real acyclic dependency order, and every
+/// step/connection it names present in the plan. Anything else is an error
+/// rather than a silently scored stream, because a stale or foreign snapshot
+/// would make the plan's score describe work it does not do.
+llvm::Error verifyPlanAnalysisStream(const CoveringPlan &plan,
+                                     const PlanEventDAG &events,
+                                     const machine::MachineModel &machine) {
+  if (events.events.empty())
+    return planEventError(
+        "plan events: the plan's analysis snapshot carries no events");
+  if (llvm::Error error = validateEventResources(events, machine))
+    return planEventError("plan events: the plan's analysis snapshot is not a "
+                          "valid stream: " +
+                          llvm::toString(std::move(error)));
+
+  // The recorded compute selection each placement claims (issue #129, task
+  // R1) is part of what the snapshot is a snapshot *of*: a plan whose required
+  // capability has no concrete recorded node, or whose recorded node the
+  // machine does not declare, must be refused here exactly as the accumulation
+  // path refuses it -- otherwise a tampered plan would quietly present the
+  // materialized kernel's stream as if it were its own. Reusing
+  // `recordedEngineForPlacement` keeps one wording for one defect.
+  for (const PlanPlacement &placement : plan.placements)
+    if (llvm::Expected<const machine::ComputeNode *> engine =
+            recordedEngineForPlacement(machine, placement);
+        !engine)
+      return engine.takeError();
+
+  std::vector<uint64_t> stepIds;
+  stepIds.reserve(plan.steps.size());
+  for (const PlanStep &step : plan.steps)
+    stepIds.push_back(step.id);
+  llvm::sort(stepIds);
+  std::vector<uint64_t> connectionIds;
+  connectionIds.reserve(plan.connectionPlans.size());
+  for (const PlanConnection &connection : plan.connectionPlans)
+    connectionIds.push_back(connection.id);
+  llvm::sort(connectionIds);
+
+  for (size_t index = 0; index < events.events.size(); ++index) {
+    const PlanCostEvent &event = events.events[index];
+    if (event.planStep &&
+        !std::binary_search(stepIds.begin(), stepIds.end(), *event.planStep))
+      return planEventError("plan events: the plan's analysis snapshot event " +
+                            llvm::Twine(index) + " names plan step " +
+                            llvm::Twine(*event.planStep) +
+                            ", which the plan does not record");
+    if (event.connectionId &&
+        !std::binary_search(connectionIds.begin(), connectionIds.end(),
+                            *event.connectionId))
+      return planEventError("plan events: the plan's analysis snapshot event " +
+                            llvm::Twine(index) + " names connection " +
+                            llvm::Twine(*event.connectionId) +
+                            ", which the plan does not record");
+  }
+  return llvm::Error::success();
+}
+
 } // namespace
+
+llvm::StringRef stringifyPlanEventSource(PlanEventSource source) {
+  switch (source) {
+  case PlanEventSource::Accumulation:
+    return "accumulation";
+  case PlanEventSource::Snapshot:
+    return "snapshot";
+  }
+  return "";
+}
 
 llvm::StringRef stringifyCostEventKind(CostEventKind kind) {
   for (const KindInfo &info : kKinds)
@@ -127,9 +315,41 @@ PlanCostEvent makePlanCostEvent(CostEventKind kind, std::string resource,
   return normalized;
 }
 
+llvm::StringRef stringifyStorageAccess(StorageAccess access) {
+  switch (access) {
+  case StorageAccess::Read:
+    return "read";
+  case StorageAccess::Write:
+    return "write";
+  }
+  return "";
+}
+
 llvm::Expected<PlanEventDAG>
-buildPlanEvents(const CoveringPlan &plan,
-                const machine::MachineModel &machine) {
+buildPlanEvents(const CoveringPlan &plan, const machine::MachineModel &machine,
+                const WorkloadGraph *graph) {
+  // A plan whose kernel has been bound and analyzed carries the derived
+  // normalized snapshot the shared selected-kernel analysis produced from that
+  // kernel (issue #129, task R6). It is the materialized work's own event
+  // stream -- machine formulas, owner pools, movement memories, dependency
+  // edges -- so the planner's score and `micro-perf`'s prediction are one
+  // analysis of one kernel rather than two estimates of the same work.
+  //
+  // The snapshot is used only for the *schedule-level* call. The graph-carrying
+  // call is the storage-liveness path: it needs each allocation's identity and
+  // access, which the kernel-side extraction does not record (a plan's
+  // allocation ids are the planner's own), so it always derives the stream from
+  // the plan's storage facts. A snapshot is never silently substituted where it
+  // would be the wrong shape; it is verified or it is an error.
+  if (plan.analysisEvents && graph == nullptr) {
+    if (llvm::Error error =
+            verifyPlanAnalysisStream(plan, *plan.analysisEvents, machine))
+      return std::move(error);
+    PlanEventDAG snapshot = *plan.analysisEvents;
+    snapshot.source = PlanEventSource::Snapshot;
+    return snapshot;
+  }
+
   // The placement covering each node, and the placement for each instance, so a
   // compute step and a connection's consumers resolve without the workload
   // graph.
@@ -234,6 +454,114 @@ buildPlanEvents(const CoveringPlan &plan,
     return id;
   };
 
+  // --- storage facts (issue #129, task R5) ----------------------------------
+  //
+  // The allocations holding each value, in id order: a value can live in more
+  // than one memory at once (a producer's own buffer, a movement stage's copy,
+  // and one borrow per memory a boundary descriptor resolved to), and the
+  // occurrence's own resolved memory is what picks between them. The lowest-id
+  // match is the fallback when the memory cannot be resolved.
+
+  // The value whose storage `value` occupies: a carried loop value is the value
+  // the loop carries it from, followed transitively. Without a graph the value
+  // resolves to itself.
+  auto storageValueOf = [&](WorkloadValueId value) -> WorkloadValueId {
+    if (!graph)
+      return value;
+    for (unsigned guard = 0; guard < 64; ++guard) {
+      const WorkloadValue *entry = graph->findValue(value);
+      if (!entry || !entry->carriedFrom)
+        return value;
+      WorkloadValueId next = *entry->carriedFrom;
+      if (next == value)
+        return value;
+      value = next;
+    }
+    return value;
+  };
+
+  // One event's storage uses: every operand it reads and every result it
+  // writes, expanded once per simultaneously-live occurrence of that slot, so
+  // a consumer of a spatial loop's product sees the residency a serial loop
+  // would not have. Each occurrence is attributed to the allocation that holds
+  // its value *in the memory the occurrence resolved to*, so two same-kind
+  // nodes (or a producer's buffer and a staged copy) are never confused.
+  // `occurrenceBase` keeps the ids of two events distinct.
+  auto storageUsesFor =
+      [&](const PlanPlacement &placed, WorkloadNodeId node,
+          uint64_t occurrenceBase) -> llvm::Expected<std::vector<StorageUse>> {
+    std::vector<StorageUse> uses;
+    if (!graph)
+      return uses;
+    const WorkloadNode *workloadNode = graph->findNode(node);
+    if (!workloadNode)
+      return uses;
+    llvm::Error expansionError = llvm::Error::success();
+    auto emit = [&](const WorkloadPort &port, PortDirection direction,
+                    unsigned index, StorageAccess access) {
+      if (expansionError)
+        return;
+      const WorkloadValueId value = storageValueOf(port.value);
+      std::optional<std::string> memory;
+      if (llvm::Expected<EndpointMemory> resolved = resolveEndpointMemory(
+              *graph, placed, PortRef{node, direction, index}, machine))
+        memory = resolved->memory;
+      else {
+        // The memory this occurrence resolves to is what picks between a
+        // producer's own buffer and a staged copy of the same value. When it
+        // cannot be resolved, attributing the use to the lowest-id allocation
+        // would silently guess -- possibly the wrong memory, feeding the wrong
+        // peak into the capacity verdict (issue #129, task R7 review). It is an
+        // incomplete fact, reported like the residency bound below.
+        expansionError = planEventError(
+            "plan events: the memory of value " + llvm::Twine(value) +
+            " read or written by node " + llvm::Twine(node) +
+            " could not be resolved, so its storage use cannot be "
+            "attributed: " +
+            llvm::toString(resolved.takeError()));
+        return;
+      }
+      const StorageAllocation *chosen = nullptr;
+      for (const StorageAllocation &allocation : plan.allocations) {
+        if (allocation.value != value)
+          continue;
+        if (allocation.memory == *memory) {
+          chosen = &allocation;
+          break;
+        }
+      }
+      if (!chosen)
+        return;
+      // One use per simultaneously resident occurrence, so liveness can count
+      // them: an occurrence is what the event stream spells out. A residency
+      // beyond the enumeration bound is an explicit incomplete fact rather
+      // than a truncated stream (issue #129, task R5).
+      if (chosen->simultaneousOccurrences > kMaxEnumeratedOccurrences) {
+        if (expansionError)
+          return;
+        expansionError = planEventError(
+            "plan events: allocation " + llvm::Twine(chosen->id) +
+            " is resident " + llvm::Twine(chosen->simultaneousOccurrences) +
+            " times, more than the " + llvm::Twine(kMaxEnumeratedOccurrences) +
+            " occurrences the event stream enumerates");
+        return;
+      }
+      for (uint64_t step = 0; step < chosen->simultaneousOccurrences; ++step)
+        uses.push_back(StorageUse{chosen->id, occurrenceBase + step, access});
+    };
+    // Reads first, writes second, each in port order: deterministic and
+    // independent of the allocation layout.
+    for (unsigned index = 0; index < workloadNode->inputs.size(); ++index)
+      emit(workloadNode->inputs[index], PortDirection::Input, index,
+           StorageAccess::Read);
+    for (unsigned index = 0; index < workloadNode->outputs.size(); ++index)
+      emit(workloadNode->outputs[index], PortDirection::Output, index,
+           StorageAccess::Write);
+    if (expansionError)
+      return std::move(expansionError);
+    return uses;
+  };
+
   for (const PlanStep *step : steps) {
     std::vector<uint32_t> produced;
     switch (step->kind) {
@@ -245,8 +573,19 @@ buildPlanEvents(const CoveringPlan &plan,
                               llvm::Twine(step->node) +
                               ", which no placement covers");
       const PlanPlacement &placed = *placement->second;
-      const machine::ComputeNode *engine =
-          engineForExecutor(machine, placed.executor);
+      // The selected engine comes from the placement's *recorded* compute
+      // binding when it has one; only a placement that recorded nothing to
+      // select -- a rule requiring no compute capability, or a hand-built plan
+      // -- falls back to the executor's first attached engine (issue #129, task
+      // R1). A required kind with no recorded node, or a recorded node that no
+      // longer resolves, is an error, never a silent re-derivation.
+      llvm::Expected<const machine::ComputeNode *> recorded =
+          recordedEngineForPlacement(machine, placed);
+      if (!recorded)
+        return recorded.takeError();
+      const machine::ComputeNode *engine = *recorded;
+      if (!engine)
+        engine = engineForExecutor(machine, placed.executor);
       if (!engine)
         return planEventError("plan events: machine '" + machine.target +
                               "' declares no compute resource for node " +
@@ -255,18 +594,31 @@ buildPlanEvents(const CoveringPlan &plan,
       // vector/mma events carry no bytes, so this one carries none either and
       // the two streams stay comparable.
       //
-      // `kPlanComputeUsesRuleEstimate` (named reason): the cycle input here is
-      // the selected instance's rule-local estimate, *not* the machine's
-      // elementwise formula the performance DAG charges. A mapping plan records
-      // a rule's declared cost and its output element count, never the
-      // operation kind (mma vs vector) the machine would need to pick a
-      // formula, so only the transform, transfer and synchronization events --
-      // for which both paths call one shared estimate -- agree cycle for cycle.
-      // The divergence is intentional and pinned by
-      // `L1ResourceDag.PlanComputeCyclesUseTheRuleEstimate`.
-      produced.push_back(add(makePlanCostEvent(
+      // The cycle input here is the selected instance's rule-local estimate.
+      // That is the *accumulation fallback*'s value: a plan scored before its
+      // kernel was bound has no operation kind (mma vs vector) to pick the
+      // machine's formula from, so it can only charge the rule's declared cost.
+      // The `AnalysisSnapshotEvents` path is what replaces it (issue #129, task
+      // R6): once the shared selected-kernel analysis has extracted the bound
+      // kernel, `buildPlanEvents` returns that stream and this estimate is
+      // never what a final plan is scored on. The two consumers therefore agree
+      // on every field of a finalized plan, and this estimate only ever
+      // describes a stream explicitly labelled `PlanEventSource::Accumulation`.
+      PlanCostEvent compute = makePlanCostEvent(
           CostEventKind::Compute, engine->id, placed.cost.latencyCycles,
-          placed.workItems, /*bytes=*/0)));
+          placed.workItems, /*bytes=*/0);
+      compute.owner = placed.executor;
+      compute.sourceNode = std::to_string(step->node);
+      compute.planStep = step->id;
+      // One occurrence namespace per node, so two steps' uses never collide.
+      compute.occurrence =
+          (static_cast<uint64_t>(step->node) << 32) | uint64_t{1};
+      llvm::Expected<std::vector<StorageUse>> uses =
+          storageUsesFor(placed, step->node, compute.occurrence);
+      if (!uses)
+        return uses.takeError();
+      compute.storageUses = std::move(*uses);
+      produced.push_back(add(std::move(compute)));
       break;
     }
     case PlanStepKind::Movement: {
@@ -298,7 +650,26 @@ buildPlanEvents(const CoveringPlan &plan,
           -> llvm::Expected<std::vector<uint32_t>> {
         std::vector<uint32_t> hops;
         std::optional<uint32_t> previousWait = chainFrom;
-        for (size_t hop = 1; hop < connection.route.size(); ++hop) {
+        // A per-hop `Movement` step (R4) names exactly one hop of the route and
+        // must emit only that hop; a single-step movement carries no `hop` and
+        // emits the whole route chained. Emitting the whole route for every
+        // per-hop step duplicated a multi-hop movement -- four transfer events
+        // for a two-hop route, and each storage use attributed twice -- so
+        // storage finalization and plan liveness analyzed the same movement
+        // twice (issue #129 review finding 3).
+        const size_t routeHops =
+            connection.route.size() > 1 ? connection.route.size() - 1 : 0;
+        const size_t firstHop = step->hop ? *step->hop + 1 : 1;
+        const size_t hopCount = step->hop ? 1 : routeHops;
+        if (hopCount > 0 && firstHop + hopCount > connection.route.size()) {
+          const std::string hopName =
+              step->hop ? std::to_string(*step->hop) : std::string("(none)");
+          return planEventError(
+              "plan events: movement step " + llvm::Twine(step->id) +
+              " names hop " + hopName + ", which connection " +
+              llvm::Twine(connection.id) + "'s route does not have");
+        }
+        for (size_t hop = firstHop; hop < firstHop + hopCount; ++hop) {
           const machine::MemoryNode *from =
               machine.findMemory(connection.route[hop - 1]);
           const machine::MemoryNode *to =
@@ -326,13 +697,62 @@ buildPlanEvents(const CoveringPlan &plan,
           std::vector<uint32_t> deps;
           if (previousWait)
             deps.push_back(*previousWait);
-          uint32_t transfer = add(makePlanCostEvent(
+          PlanCostEvent transferEvent = makePlanCostEvent(
               CostEventKind::TransferHop, resource, static_cast<double>(cycles),
-              workItems, bytes, deps));
+              workItems, bytes, deps);
+          transferEvent.srcMemory = from->id;
+          transferEvent.dstMemory = to->id;
+          transferEvent.connectionId = connection.id;
+          transferEvent.hopIndex = hop - 1;
+          transferEvent.planStep = step->id;
+          // The storage the hop reads and writes, when the plan recorded the
+          // hop: a reader of the source slot and a writer of the destination
+          // one. Each side is spelled out once per simultaneously resident
+          // occurrence of the slot it names, exactly as a compute event's uses
+          // are, so liveness counts one residency from the stream instead of
+          // trusting a field (issue #129, task R5).
+          const uint64_t occurrenceBase =
+              (static_cast<uint64_t>(connection.id) << 32) | uint64_t{1};
+          if (hop - 1 < connection.hops.size()) {
+            const PlanMovementHop &recorded = connection.hops[hop - 1];
+            auto hopUses = [&](uint64_t storageId,
+                               StorageAccess access) -> llvm::Error {
+              if (storageId == 0)
+                return llvm::Error::success();
+              uint64_t occurrences = 1;
+              for (const StorageAllocation &allocation : plan.allocations)
+                if (allocation.id == storageId) {
+                  occurrences = allocation.simultaneousOccurrences;
+                  break;
+                }
+              if (occurrences > kMaxEnumeratedOccurrences)
+                return planEventError(
+                    "plan events: allocation " + llvm::Twine(storageId) +
+                    " is resident " + llvm::Twine(occurrences) +
+                    " times, more than the " +
+                    llvm::Twine(kMaxEnumeratedOccurrences) +
+                    " occurrences the event stream enumerates");
+              for (uint64_t index = 0; index < occurrences; ++index)
+                transferEvent.storageUses.push_back(
+                    StorageUse{storageId, occurrenceBase + index, access});
+              return llvm::Error::success();
+            };
+            if (llvm::Error error =
+                    hopUses(recorded.sourceStorageId, StorageAccess::Read))
+              return std::move(error);
+            if (llvm::Error error = hopUses(recorded.destinationStorageId,
+                                            StorageAccess::Write))
+              return std::move(error);
+          }
+          uint32_t transfer = add(std::move(transferEvent));
           hops.push_back(transfer);
-          uint32_t wait = add(makePlanCostEvent(
+          PlanCostEvent waitEvent = makePlanCostEvent(
               CostEventKind::Synchronization, "sync",
-              static_cast<double>(machine.sync.waitCycles), 0, 0, {transfer}));
+              static_cast<double>(machine.sync.waitCycles), 0, 0, {transfer});
+          waitEvent.connectionId = connection.id;
+          waitEvent.hopIndex = hop - 1;
+          waitEvent.planStep = step->id;
+          uint32_t wait = add(std::move(waitEvent));
           hops.push_back(wait);
           previousWait = wait;
         }
@@ -363,8 +783,22 @@ buildPlanEvents(const CoveringPlan &plan,
           if (!hops->empty())
             feedTails.push_back(hops->back());
         }
-        const machine::ComputeNode *engine =
-            engineForExecutor(machine, transformExecutorFor(plan, connection));
+        // A gather's combination is compute on the engine the *serving
+        // placement* recorded, not on whatever the executor happens to list
+        // first: the same selection rule the compute and transform events use
+        // (issue #129, task R1).
+        const machine::ComputeNode *engine = nullptr;
+        if (const PlanPlacement *consumer =
+                consumerPlacementOf(plan, connection)) {
+          llvm::Expected<const machine::ComputeNode *> recorded =
+              recordedEngineForPlacement(machine, *consumer);
+          if (!recorded)
+            return recorded.takeError();
+          engine = *recorded;
+        }
+        if (!engine)
+          engine = engineForExecutor(machine,
+                                     transformExecutorFor(plan, connection));
         if (!engine)
           return planEventError(
               "plan events: machine '" + machine.target +
@@ -387,12 +821,21 @@ buildPlanEvents(const CoveringPlan &plan,
       if (!hops->empty())
         chainFrom = hops->back();
 
-      // A layout conversion is real work; its cost is the *shared* estimate the
-      // materialized kernel's event also uses, so the two paths cannot
-      // disagree.
-      if (connection.transform) {
-        const machine::ComputeNode *engine =
-            engineForExecutor(machine, transformExecutorFor(plan, connection));
+      // Canonical materialization converts once after the entire copy chain,
+      // in the final destination memory. A per-hop movement converts only at
+      // its final hop; earlier hops carry the unchanged source layout.
+      const bool finalMovement =
+          !step->hop || *step->hop + 2 == connection.route.size();
+      if (connection.transform && finalMovement) {
+        // The conversion runs on the resource the plan *recorded* for it --
+        // `selectTransformResource` picked it by memory visibility, which can
+        // disagree with the executor's declaration order. Only a connection
+        // that recorded none falls back (issue #129, task R1).
+        llvm::Expected<const machine::ComputeNode *> recorded =
+            transformEngineFor(connection, machine, plan);
+        if (!recorded)
+          return recorded.takeError();
+        const machine::ComputeNode *engine = *recorded;
         if (!engine)
           return planEventError(
               "plan events: machine '" + machine.target +
@@ -417,9 +860,46 @@ buildPlanEvents(const CoveringPlan &plan,
         std::vector<uint32_t> deps;
         if (chainFrom)
           deps.push_back(*chainFrom);
-        produced.push_back(add(makePlanCostEvent(
+        PlanCostEvent transformEvent = makePlanCostEvent(
             CostEventKind::Transform, engine->id, cost->latencyCycles,
-            workItems, cost->localBytes, deps)));
+            workItems, cost->localBytes, deps);
+        transformEvent.connectionId = connection.id;
+        transformEvent.planStep = step->id;
+        // A layout conversion reads the connection's pre-transform slot and
+        // writes its post-transform slot. Keep those uses on the event stream
+        // so storage liveness can establish both ranges; otherwise the
+        // materialized micro.transform has a planned output allocation that
+        // no scheduled event appears to touch.
+        if (connection.storageIds.size() >= 2) {
+          uint64_t sourceStorage = connection.storageIds.front();
+          if (!connection.hops.empty())
+            sourceStorage = connection.hops.back().destinationStorageId;
+          uint64_t destinationStorage = connection.storageIds.back();
+          uint64_t occurrences = 1;
+          for (const StorageAllocation &allocation : plan.allocations)
+            if (allocation.id == destinationStorage) {
+              occurrences = allocation.simultaneousOccurrences;
+              break;
+            }
+          if (occurrences > kMaxEnumeratedOccurrences)
+            return planEventError(
+                "plan events: transform destination allocation " +
+                llvm::Twine(destinationStorage) + " is resident " +
+                llvm::Twine(occurrences) + " times, more than the " +
+                llvm::Twine(kMaxEnumeratedOccurrences) +
+                " occurrences the event stream enumerates");
+          const uint64_t occurrenceBase =
+              (static_cast<uint64_t>(connection.id) << 32) |
+              uint64_t{0x80000000};
+          for (uint64_t index = 0; index < occurrences; ++index) {
+            transformEvent.storageUses.push_back(StorageUse{
+                sourceStorage, occurrenceBase + index, StorageAccess::Read});
+            transformEvent.storageUses.push_back(
+                StorageUse{destinationStorage, occurrenceBase + index,
+                           StorageAccess::Write});
+          }
+        }
+        produced.push_back(add(std::move(transformEvent)));
       }
       break;
     }
@@ -433,11 +913,23 @@ buildPlanEvents(const CoveringPlan &plan,
           barrier = true;
           break;
         }
-      if (!barrier)
+      if (!barrier) {
+        // The movement already emitted its wait. This step still carries that
+        // event frontier so an edge through the wait orders the next hop even
+        // when the DMA pool has spare channels and no barrier is necessary.
+        auto movement = movementStep.find(step->connection);
+        if (movement != movementStep.end()) {
+          auto events = stepEvents.find(movement->second);
+          if (events != stepEvents.end() && !events->second.empty())
+            produced.push_back(events->second.back());
+        }
         break;
-      produced.push_back(add(makePlanCostEvent(
+      }
+      PlanCostEvent barrierEvent = makePlanCostEvent(
           CostEventKind::Synchronization, "sync",
-          static_cast<double>(machine.sync.barrierCycles), 0, 0)));
+          static_cast<double>(machine.sync.barrierCycles), 0, 0);
+      barrierEvent.connectionId = step->connection;
+      produced.push_back(add(std::move(barrierEvent)));
       break;
     }
     }
@@ -445,14 +937,25 @@ buildPlanEvents(const CoveringPlan &plan,
   }
 
   // Inter-step dependencies: every event of a dependent step follows the last
-  // event of each step it depends on.
+  // event of each step it depends on. A step cannot follow itself: a self-step
+  // edge -- the reuse edge an in-place update contributes -- states which
+  // single buffer two allocations share, and the step's own events are already
+  // ordered by their emission sequence, so imposing it would only make an event
+  // depend on itself (issue #129, task R5).
   for (const PlanStepEdge &edge : sourceEdges) {
+    if (edge.from == edge.to)
+      continue;
     auto from = stepEvents.find(edge.from);
     auto to = stepEvents.find(edge.to);
     if (from == stepEvents.end() || to == stepEvents.end() ||
         from->second.empty() || to->second.empty())
       continue;
     uint32_t predecessor = from->second.back();
+    // A wait step can forward its movement's already emitted tail. The edge
+    // between these two steps then connects one event to itself and is already
+    // satisfied; retaining it would introduce a cycle into the event DAG.
+    if (predecessor == to->second.front())
+      continue;
     uint32_t &head = dag.events[to->second.front()].deps.emplace_back();
     head = predecessor;
   }
@@ -488,6 +991,24 @@ buildPlanEvents(const CoveringPlan &plan,
                      event.deps.end());
   }
   return dag;
+}
+
+llvm::Error attachPlanAnalysisEvents(CoveringPlan &plan, PlanEventDAG events,
+                                     const machine::MachineModel &machine) {
+  // A plan decoded from persisted metadata is a replay: its derived execution
+  // facts were deliberately not persisted, so a snapshot handed to it would be
+  // describing a kernel it has not re-derived. Reject rather than attach one
+  // that a caller assumed was trustworthy.
+  if (plan.schemaVersion != 0)
+    return planEventError(
+        "plan events: refusing to attach an analysis snapshot to a plan "
+        "decoded from metadata; a replay must re-derive its events");
+
+  events.source = PlanEventSource::Snapshot;
+  if (llvm::Error error = verifyPlanAnalysisStream(plan, events, machine))
+    return error;
+  plan.analysisEvents = std::move(events);
+  return llvm::Error::success();
 }
 
 ConnectionSignature
@@ -561,21 +1082,36 @@ connectionSignatureFor(const ConnectionPlan &connection,
   }
   signature.maps = maps;
 
-  // The concrete parameters: the transform's layout families and, for a gather,
-  // its declared semantics and axis (execution-affecting content the canonical
-  // connection string already folds).
+  // The concrete parameters: the transform's layout families *and the concrete
+  // compute resource it runs on* (issue #129, task R1 -- a transform on two
+  // different engines is different work), plus, for a gather, its declared
+  // semantics and axis (execution-affecting content the canonical connection
+  // string already folds).
+  //
+  // Every component is length-delimited (`<name>=<len>:<bytes>`), so a layout
+  // id or resource id that itself contains the `;` or `=` separator cannot be
+  // mistaken for a component boundary and collide two different connections on
+  // one key.
   std::string parameters;
+  auto component = [&](llvm::StringRef name, llvm::StringRef value) {
+    if (!parameters.empty())
+      parameters += ';';
+    parameters += name.str();
+    parameters += '=';
+    parameters += std::to_string(value.size());
+    parameters += ':';
+    parameters.append(value.begin(), value.end());
+  };
   if (connection.transform) {
-    parameters = connection.transform->srcLayout + "->" +
-                 connection.transform->dstLayout;
+    component("src", connection.transform->srcLayout);
+    component("dst", connection.transform->dstLayout);
+    if (!connection.transform->computeResource.empty())
+      component("compute", connection.transform->computeResource);
   }
   if (connection.gatherSemantics) {
-    if (!parameters.empty())
-      parameters += ";";
-    parameters += "gather=";
-    parameters += stringifyGatherSemantics(*connection.gatherSemantics);
+    component("gather", stringifyGatherSemantics(*connection.gatherSemantics));
     if (connection.concatAxis)
-      parameters += ":axis=" + std::to_string(*connection.concatAxis);
+      component("axis", std::to_string(*connection.concatAxis));
   }
   signature.parameters = parameters;
 

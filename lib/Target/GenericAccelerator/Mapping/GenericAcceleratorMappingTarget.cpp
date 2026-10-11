@@ -14,13 +14,17 @@ llvm::ArrayRef<llvm::StringRef> emitterKeys() {
 }
 
 llvm::Expected<std::unique_ptr<mapping::MappingTarget>>
-createMappingTarget(llvm::StringRef configurationRoot) {
+createMappingTarget(llvm::StringRef configurationRoot,
+                    llvm::StringRef machinePath) {
   std::string root = configurationRoot.str();
+  std::string machine = machinePath.empty()
+                            ? root + "/machines/generic-ai-accel-v2.yaml"
+                            : machinePath.str();
   std::vector<std::string> keys;
   for (llvm::StringRef key : emitterKeys())
     keys.push_back(key.str());
   return mapping::loadMappingTarget(
-      "generic-ai-accel", root + "/machines/generic-ai-accel-v2.yaml",
+      "generic-ai-accel", machine,
       root + "/mapping/generic-ai-accel/layouts.llkmap",
       root + "/mapping/generic-ai-accel/rules.llkmap", std::move(keys));
 }

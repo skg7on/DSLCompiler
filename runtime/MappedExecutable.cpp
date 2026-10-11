@@ -22,6 +22,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Runtime/MappedExecutable.h"
+#include "LLK/Conversion/MappedKernelAbi.h"
+#include "LLK/Mapping/CodegenRequirements.h"
+#include "mapped_jit_test_factory.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -35,18 +38,41 @@
 
 #include "mlir/ExecutionEngine/CRunnerUtils.h"
 
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/AbsoluteSymbols.h"
 #include "llvm/ExecutionEngine/Orc/LLJIT.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
 
 #include <cstdint>
 #include <string>
 #include <utility>
+
+llvm::Error mlir::llk::mapping::checkHostRequirements(
+    const TargetCodegenRequirements &requirements,
+    llvm::StringRef hostArchitecture,
+    const llvm::StringMap<bool> &hostFeatures) {
+  if (!requirements.architecture.empty() &&
+      requirements.architecture != hostArchitecture)
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "selected target requires architecture '" + requirements.architecture +
+            "' but host architecture is '" + hostArchitecture.str() + "'");
+  for (const std::string &feature : requirements.requiredFeatures) {
+    auto available = hostFeatures.find(feature);
+    if (available == hostFeatures.end() || !available->second)
+      return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                     "selected target requires host feature '" +
+                                         feature + "'");
+  }
+  return llvm::Error::success();
+}
 
 namespace llk {
 
@@ -66,55 +92,6 @@ std::string typeToString(mlir::Type type) {
   llvm::raw_string_ostream stream(buffer);
   type.print(stream);
   return buffer;
-}
-
-KernelAbi::Port describe(mlir::MemRefType type) {
-  KernelAbi::Port port;
-  port.shape.assign(type.getShape().begin(), type.getShape().end());
-  port.elementType = typeToString(type.getElementType());
-  return port;
-}
-
-/// Turns every result into a trailing caller-owned parameter.
-///
-/// The caller has to own the output buffer, and a returned memref aggregate is
-/// a convention no C declaration expresses, so the parameter list is where it
-/// belongs. After this the function returns nothing and its convention is the
-/// uniform one the C-interface wrapper then exposes.
-llvm::Error resultsBecomeOutParams(mlir::func::FuncOp function,
-                                   KernelAbi &abi) {
-  mlir::FunctionType type = function.getFunctionType();
-  mlir::Location loc = function.getLoc();
-
-  for (mlir::Type result : type.getResults()) {
-    auto memref = mlir::dyn_cast<mlir::MemRefType>(result);
-    if (!memref)
-      return abiError("kernel result is '" + typeToString(result) +
-                      "', but the mapped ABI describes results as buffers");
-    abi.outputs.push_back(describe(memref));
-  }
-  if (type.getNumResults() == 0)
-    return llvm::Error::success();
-
-  mlir::Block &entry = function.getBody().front();
-  llvm::SmallVector<mlir::Value> outs;
-  for (mlir::Type result : type.getResults())
-    outs.push_back(entry.addArgument(result, loc));
-
-  llvm::SmallVector<mlir::Type> inputs(type.getInputs().begin(),
-                                       type.getInputs().end());
-  inputs.append(type.getResults().begin(), type.getResults().end());
-  function.setType(mlir::FunctionType::get(function.getContext(), inputs, {}));
-
-  // The value that used to be returned is written into the caller's buffer,
-  // which is the whole point of making it a parameter.
-  auto ret = mlir::cast<mlir::func::ReturnOp>(entry.getTerminator());
-  mlir::OpBuilder builder(ret);
-  for (auto [value, out] : llvm::zip(ret.getOperands(), outs))
-    mlir::memref::CopyOp::create(builder, loc, value, out);
-  mlir::func::ReturnOp::create(builder, loc);
-  ret.erase();
-  return llvm::Error::success();
 }
 
 /// Checks one side's descriptors against the recorded ABI.
@@ -180,8 +157,73 @@ void callAtArity(void *entry, llvm::ArrayRef<MemRef2D *> args,
 
 } // namespace
 
+llvm::Error
+MappedExecutable::invoke(llvm::ArrayRef<InvocationBuffer2D> inputs,
+                         llvm::ArrayRef<InvocationBuffer2D> outputs) {
+  if (llvm::Error error = validateMappedInvocation(abi_, inputs, outputs))
+    return error;
+
+  llvm::SmallVector<MemRef2D, kMaxDescriptors> descriptors;
+  for (const InvocationBuffer2D &input : inputs)
+    descriptors.push_back(input.descriptor);
+  for (const InvocationBuffer2D &output : outputs)
+    descriptors.push_back(output.descriptor);
+  llvm::SmallVector<MemRef2D *, kMaxDescriptors> args;
+  for (MemRef2D &descriptor : descriptors)
+    args.push_back(&descriptor);
+
+  switch (args.size()) {
+  case 0:
+    callAtArity(entry_, args, std::make_index_sequence<0>{});
+    break;
+  case 1:
+    callAtArity(entry_, args, std::make_index_sequence<1>{});
+    break;
+  case 2:
+    callAtArity(entry_, args, std::make_index_sequence<2>{});
+    break;
+  case 3:
+    callAtArity(entry_, args, std::make_index_sequence<3>{});
+    break;
+  case 4:
+    callAtArity(entry_, args, std::make_index_sequence<4>{});
+    break;
+  case 5:
+    callAtArity(entry_, args, std::make_index_sequence<5>{});
+    break;
+  case 6:
+    callAtArity(entry_, args, std::make_index_sequence<6>{});
+    break;
+  case 7:
+    callAtArity(entry_, args, std::make_index_sequence<7>{});
+    break;
+  case 8:
+    callAtArity(entry_, args, std::make_index_sequence<8>{});
+    break;
+  case 9:
+    callAtArity(entry_, args, std::make_index_sequence<9>{});
+    break;
+  case 10:
+    callAtArity(entry_, args, std::make_index_sequence<10>{});
+    break;
+  case 11:
+    callAtArity(entry_, args, std::make_index_sequence<11>{});
+    break;
+  default:
+    callAtArity(entry_, args, std::make_index_sequence<12>{});
+    break;
+  }
+  return llvm::Error::success();
+}
+
 llvm::Error MappedExecutable::invoke(llvm::ArrayRef<MemRef2D *> inputs,
                                      llvm::ArrayRef<MemRef2D *> outputs) {
+  return invokeUncheckedLegacy(inputs, outputs);
+}
+
+llvm::Error
+MappedExecutable::invokeUncheckedLegacy(llvm::ArrayRef<MemRef2D *> inputs,
+                                        llvm::ArrayRef<MemRef2D *> outputs) {
   if (inputs.size() != abi_.inputs.size())
     return abiError("kernel takes " + std::to_string(abi_.inputs.size()) +
                     " input(s) but " + std::to_string(inputs.size()) +
@@ -248,28 +290,109 @@ llvm::Error MappedExecutable::invoke(llvm::ArrayRef<MemRef2D *> inputs,
 }
 
 MappedExecutable::MappedExecutable(std::unique_ptr<llvm::orc::LLJIT> jit,
-                                   void *entry, KernelAbi abi)
-    : jit_(std::move(jit)), entry_(entry), abi_(std::move(abi)) {}
+                                   void *entry, KernelAbi abi,
+                                   std::string executionIdentity)
+    : jit_(std::move(jit)), entry_(entry), abi_(std::move(abi)),
+      executionIdentity_(std::move(executionIdentity)) {}
 
 MappedExecutable::~MappedExecutable() = default;
 
 llvm::Expected<std::unique_ptr<MappedExecutable>>
 createMappedExecutable(mlir::ModuleOp module, llvm::StringRef entrySymbol) {
-  mlir::func::FuncOp function =
-      module.lookupSymbol<mlir::func::FuncOp>(entrySymbol);
-  if (!function)
-    return abiError("module has no function named '" + entrySymbol.str() + "'");
+  llvm::Expected<PreparedMappedKernel> prepared =
+      prepareMappedKernelForInvocation(module, entrySymbol);
+  if (!prepared)
+    return prepared.takeError();
+  return createMappedExecutable(std::move(*prepared));
+}
 
-  KernelAbi abi;
-  for (mlir::Type input : function.getFunctionType().getInputs()) {
-    auto memref = mlir::dyn_cast<mlir::MemRefType>(input);
-    if (!memref)
-      return abiError("kernel input is '" + typeToString(input) +
-                      "', but the mapped ABI describes inputs as buffers");
-    abi.inputs.push_back(describe(memref));
-  }
-  if (llvm::Error error = resultsBecomeOutParams(function, abi))
+llvm::Expected<std::unique_ptr<MappedExecutable>>
+createMappedExecutable(PreparedMappedKernel prepared,
+                       const MappedJitOptions &options) {
+  return MappedExecutable::createWithAllocatorHooks(std::move(prepared),
+                                                    options, nullptr);
+}
+
+llvm::Expected<std::unique_ptr<MappedExecutable>>
+MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
+                                           const MappedJitOptions &options,
+                                           testing::TestAllocatorHooks *hooks) {
+  if (!prepared.module)
+    return abiError("prepared mapped kernel has no module");
+  if (llvm::Error error = validateKernelAbi(prepared.abi))
     return std::move(error);
+  if (prepared.entrySymbol.empty())
+    return abiError("prepared mapped kernel has no entry symbol");
+
+  mlir::ModuleOp module = *prepared.module;
+  mlir::func::FuncOp function =
+      module.lookupSymbol<mlir::func::FuncOp>(prepared.entrySymbol);
+  if (!function)
+    return abiError("prepared module has no function named '" +
+                    prepared.entrySymbol + "'");
+  if (!function.getFunctionType().getResults().empty())
+    return abiError("prepared mapped kernel must return void");
+
+  std::string loweredIR;
+  llvm::raw_string_ostream loweredIROutput(loweredIR);
+  module.print(loweredIROutput);
+  loweredIROutput.flush();
+  llvm::SHA256 loweredIRHash;
+  loweredIRHash.update(loweredIR);
+  const auto loweredIRDigest = loweredIRHash.final();
+  std::string executionIdentity = options.executionIdentity;
+  executionIdentity +=
+      "|abi=" + std::to_string(computeKernelAbiHash(prepared.abi));
+  executionIdentity +=
+      "|lowered-ir-sha256=" +
+      llvm::toHex(llvm::ArrayRef<uint8_t>(loweredIRDigest), true);
+
+  size_t argumentCount =
+      prepared.abi.inputs.size() + prepared.abi.outputs.size();
+  if (function.getFunctionType().getNumInputs() != argumentCount)
+    return abiError(
+        "prepared mapped kernel argument count does not match its ABI");
+  auto validateArguments = [&](llvm::ArrayRef<KernelAbi::Port> ports,
+                               size_t offset,
+                               llvm::StringRef side) -> llvm::Error {
+    for (size_t i = 0; i < ports.size(); ++i) {
+      mlir::Type argType = function.getFunctionType().getInput(offset + i);
+      auto memref = mlir::dyn_cast<mlir::MemRefType>(argType);
+      if (!memref)
+        return abiError("prepared " + side.str() + " argument " +
+                        std::to_string(i) + " is not a memref");
+      if (memref.getShape() != llvm::ArrayRef<int64_t>(ports[i].shape) ||
+          typeToString(memref.getElementType()) != ports[i].elementType)
+        return abiError("prepared " + side.str() + " argument " +
+                        std::to_string(i) + " does not match its ABI port");
+    }
+    return llvm::Error::success();
+  };
+  if (llvm::Error error = validateArguments(prepared.abi.inputs, 0, "input"))
+    return std::move(error);
+  if (llvm::Error error = validateArguments(
+          prepared.abi.outputs, prepared.abi.inputs.size(), "output"))
+    return std::move(error);
+
+  const auto detectedFeatures = llvm::sys::getHostCPUFeatures();
+  llvm::StringMap<bool> hostFeatures;
+  for (const auto &feature : detectedFeatures)
+    hostFeatures[feature.getKey()] = feature.getValue();
+  if (options.selectedTarget) {
+    std::string hostTriple = llvm::sys::getDefaultTargetTriple();
+    llvm::StringRef hostArchitecture(hostTriple);
+    hostArchitecture = hostArchitecture.take_front(hostArchitecture.find('-'));
+    if (hostArchitecture == "arm64")
+      hostArchitecture = "aarch64";
+    else if (hostArchitecture == "amd64")
+      hostArchitecture = "x86_64";
+    if (llvm::Error error = mlir::llk::mapping::checkHostRequirements(
+            *options.selectedTarget, hostArchitecture, hostFeatures))
+      return error;
+    if (hostFeatures.empty())
+      return abiError("cannot detect host CPU features for selected-target "
+                      "execution");
+  }
 
   // The C-interface wrapper is what turns descriptor pointers into the expanded
   // form the lowered body expects, so the entry point asks for it explicitly.
@@ -282,28 +405,91 @@ createMappedExecutable(mlir::ModuleOp module, llvm::StringRef entrySymbol) {
   mlir::PassManager pm(module.getContext());
   addKernelToLLVMPasses(pm);
   if (mlir::failed(pm.run(module)))
-    return abiError("lowering kernel '" + entrySymbol.str() +
+    return abiError("lowering kernel '" + prepared.entrySymbol +
                     "' to the LLVM dialect failed");
+
+  std::string llvmDialect;
+  if (options.evidenceSink) {
+    llvm::raw_string_ostream llvmDialectOutput(llvmDialect);
+    module.print(llvmDialectOutput);
+    llvmDialectOutput.flush();
+  }
 
   auto llvmContext = std::make_unique<llvm::LLVMContext>();
   std::unique_ptr<llvm::Module> llvmModule =
       mlir::translateModuleToLLVMIR(module, *llvmContext);
-  if (!llvmModule)
-    return abiError("translating kernel '" + entrySymbol.str() +
-                    "' to LLVM IR failed");
+  if (!llvmModule) {
+    std::string unresolvedCasts;
+    llvm::raw_string_ostream castOutput(unresolvedCasts);
+    unsigned reportedCasts = 0;
+    module.walk([&](mlir::UnrealizedConversionCastOp cast) {
+      if (reportedCasts++ >= 5)
+        return;
+      cast.print(castOutput);
+      castOutput << "\n";
+    });
+    castOutput.flush();
+    std::string message =
+        "translating kernel '" + prepared.entrySymbol + "' to LLVM IR failed";
+    if (!unresolvedCasts.empty())
+      message += "; remaining conversion casts: " + unresolvedCasts;
+    return abiError(message);
+  }
+
+  if (options.evidenceSink) {
+    std::string llvmIR;
+    llvm::raw_string_ostream llvmIROutput(llvmIR);
+    llvmModule->print(llvmIROutput, nullptr);
+    llvmIROutput.flush();
+
+    MappedJitEvidence evidence;
+    evidence.entrySymbol = prepared.entrySymbol;
+    evidence.executionIdentity = executionIdentity;
+    evidence.targetName = options.targetName;
+    evidence.planId = options.planId;
+    evidence.machineHash = options.machineHash;
+    evidence.selectedGroupsVerified = options.selectedGroupsVerified;
+    evidence.backendGroupsRealized = options.backendGroupsRealized;
+    evidence.referenceGroupsLowered = options.referenceGroupsLowered;
+    evidence.abiHash = computeKernelAbiHash(prepared.abi);
+    evidence.selectedTarget = options.selectedTarget;
+    evidence.llvmDialect = std::move(llvmDialect);
+    evidence.llvmIR = std::move(llvmIR);
+    if (llvm::Error error = options.evidenceSink(evidence))
+      return std::move(error);
+  }
 
   // Checked before the module is handed to the JIT, so a kernel whose wrapper
   // was never generated fails with that fact rather than a lookup error.
-  std::string wrapperName = ("_mlir_ciface_" + entrySymbol).str();
+  std::string wrapperName = "_mlir_ciface_" + prepared.entrySymbol;
   if (!llvmModule->getFunction(wrapperName))
     return abiError("no C-interface wrapper '" + wrapperName +
-                    "' was generated for kernel '" + entrySymbol.str() + "'");
+                    "' was generated for kernel '" + prepared.entrySymbol +
+                    "'");
 
   llvm::InitializeNativeTarget();
   llvm::InitializeNativeTargetAsmPrinter();
 
-  llvm::Expected<std::unique_ptr<llvm::orc::LLJIT>> jit =
-      llvm::orc::LLJITBuilder().create();
+  llvm::orc::LLJITBuilder jitBuilder;
+  if (options.selectedTarget) {
+    llvm::Expected<llvm::orc::JITTargetMachineBuilder> targetMachine =
+        llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!targetMachine)
+      return targetMachine.takeError();
+    if (!options.selectedTarget->cpu.empty())
+      targetMachine->setCPU(options.selectedTarget->cpu);
+    std::string features;
+    for (const std::string &feature :
+         options.selectedTarget->requiredFeatures) {
+      if (!features.empty())
+        features += ',';
+      features += '+' + feature;
+    }
+    if (!features.empty())
+      targetMachine->setFeatures(features);
+    jitBuilder.setJITTargetMachineBuilder(std::move(*targetMachine));
+  }
+  llvm::Expected<std::unique_ptr<llvm::orc::LLJIT>> jit = jitBuilder.create();
   if (!jit)
     return jit.takeError();
 
@@ -317,6 +503,23 @@ createMappedExecutable(mlir::ModuleOp module, llvm::StringRef entrySymbol) {
       llvm::orc::ExecutorSymbolDef(
           llvm::orc::ExecutorAddr::fromPtr(&memrefCopy),
           llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+  if (hooks) {
+    if (hooks->allocate)
+      runtimeSymbols[(*jit)->mangleAndIntern("malloc")] =
+          llvm::orc::ExecutorSymbolDef(
+              llvm::orc::ExecutorAddr::fromPtr(hooks->allocate),
+              llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+    if (hooks->alignedAllocate)
+      runtimeSymbols[(*jit)->mangleAndIntern("aligned_alloc")] =
+          llvm::orc::ExecutorSymbolDef(
+              llvm::orc::ExecutorAddr::fromPtr(hooks->alignedAllocate),
+              llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+    if (hooks->release)
+      runtimeSymbols[(*jit)->mangleAndIntern("free")] =
+          llvm::orc::ExecutorSymbolDef(
+              llvm::orc::ExecutorAddr::fromPtr(hooks->release),
+              llvm::JITSymbolFlags::Exported | llvm::JITSymbolFlags::Callable);
+  }
   if (llvm::Error error = (*jit)->getMainJITDylib().define(
           llvm::orc::absoluteSymbols(std::move(runtimeSymbols))))
     return std::move(error);
@@ -330,7 +533,16 @@ createMappedExecutable(mlir::ModuleOp module, llvm::StringRef entrySymbol) {
     return symbol.takeError();
 
   return std::unique_ptr<MappedExecutable>(new MappedExecutable(
-      std::move(*jit), symbol->toPtr<void *>(), std::move(abi)));
+      std::move(*jit), symbol->toPtr<void *>(), std::move(prepared.abi),
+      std::move(executionIdentity)));
+}
+
+llvm::Expected<std::unique_ptr<MappedExecutable>>
+testing::MappedExecutableTestFactory::create(PreparedMappedKernel prepared,
+                                             const MappedJitOptions &options,
+                                             TestAllocatorHooks hooks) {
+  return MappedExecutable::createWithAllocatorHooks(std::move(prepared),
+                                                    options, &hooks);
 }
 
 } // namespace llk

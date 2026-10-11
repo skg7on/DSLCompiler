@@ -49,6 +49,43 @@ Previous assessment verification on the exact #128 head registered 139 CTests: 1
 
 There are **27 reviewable tasks**. A task is a small independently reviewable deliverable, not an estimate that a backend or ownership change takes five minutes. Each checkbox is one action; larger implementation steps name the concrete sub-actions needed. Build/test setup belongs to its owning task. Do not introduce unrelated refactors.
 
+## Worktree execution ledger (2026-10-11)
+
+This ledger records the requested `feat/issue129-gap-closure` worktree without
+mistaking local ARM64 evidence for the selected-x86 release gate. The worktree
+started from `origin/feat/issue129-gap-closure` at `1a015c7`; the starting state
+had T0 and R1–R8 complete. Implementation commits through `1c678de` and the
+acceptance documentation through `149f260` are recorded below.
+
+| Task | Verified implementation record | Current disposition |
+|---|---|---|
+| **T0, R1–R8** | Present at the `1a015c7` worktree base; starting status records R8 complete | Complete at base |
+| **E1** | `813979e` typed invocation validation | Implemented; local ABI tests pass |
+| **E2** | `6c4045b` output preparation before deallocation | Implemented; local preparation tests pass |
+| **E3** | `aef1219` deterministic scratch lifetime | Implemented; lifetime tests pass locally |
+| **E4** | `f493fa7` selected-instance grouping and context | Implemented; `SelectedGroupLoweringTest` passes |
+| **E5** | `63809bf` fused bundle layout and group outputs | Implemented; fused lowering tests pass |
+| **E6** | `267b44f` selected widths in Vector IR | Implemented; width-4/8 codegen checks pass |
+| **E7** | `6dda506` selected contractions and physical layouts | Implemented; mapped codegen checks pass |
+| **E8** | `b365fbd` target ISA requirements and execution identity | Implemented; requirement/policy tests pass |
+| **E9** | `d100062` bounded tails and multiple outputs | Implemented; portable numeric controls pass |
+| **T1** | `d850c2e` original-source candidate instantiation | Implemented; `CandidateInstantiationTest` passes |
+| **T2** | `4f3a0db` selected mapped compilation | Implemented; `MappedTuningSessionTest` passes |
+| **T3** | `0377ab4` selected executable measurement identity | Implemented; tuning-session tests pass |
+| **T4** | `8d31c12` missing metrics stay out of ranking | Implemented; tuning-session tests pass |
+| **T5** | `d696879` CLI report and frozen replay | Implemented; replay and CLI tests pass |
+| **T6** | `5d9a574` five public acceptance chains | Verified; all five chains pass locally |
+| **T7** | `0929b53`, `abfcb3b` randomized tails, transforms and multiple outputs | Verified on portable backend: 8 pass, 2 AVX2 cases skip |
+| **T8** | `cce2c6e`, `1c678de` strict selected-target CLI, evidence parser, injected unsupported-feature control and CI artifact capture; local legacy skip investigation recorded in tuning plan | Harness and local legacy skip reasons verified. CI currently archives Vector IR, logs/JUnit and host/toolchain facts but not explicit LLVM IR or a selected-plan manifest; add those artifacts. Selected-x86 run, static LLVM22 link gate and CI legacy outcomes remain open |
+| **T9** | `d48a46d` smoke negative controls; `106a1dc`, `841e193`, `118b267`, `149f260` matrix, branch status and G1–G10 crosswalk | Steps 1–3 verified; final CI proof, GitHub checklist reconciliation and release-head review remain open |
+
+At `1c678de`, the full local build succeeded and CTest registered 161 tests:
+157 passed, three skipped, and `MappedAVX2Acceptance` failed because the host
+is Darwin arm64. The required-execution parser rejected that report as intended.
+The current suite therefore verifies the fail-closed gate, not selected-x86
+acceptance. The candidate matrix and local toolchain record are in
+[`docs/reviews/issue67-final-acceptance.md`](../../reviews/issue67-final-acceptance.md).
+
 ## File and dependency boundaries
 
 | Area | Existing files to modify | New focused files | Responsibility |

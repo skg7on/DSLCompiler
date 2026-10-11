@@ -45,6 +45,7 @@
 
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/SearchBinding.h"
+#include "LLK/Perf/Legality.h"
 
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
@@ -71,6 +72,10 @@ namespace mlir::llk::mapping {
 /// outside its parameter's declared choices.
 llvm::Expected<SearchBinding>
 loadSearchBinding(mlir::ModuleOp module, llvm::StringRef candidateSymbol = "");
+
+/// Extracts the original pre-tiling workload and every concrete MMA's facts
+/// from a `micro.kernel`, using the same provenance reader as binding legality.
+perf::BindingFacts extractBindingFacts(mlir::Operation *kernel);
 
 /// The layouts the binding selects, one entry per `layout`-kind parameter,
 /// keyed by the role that parameter governs -- a rule's port name such as

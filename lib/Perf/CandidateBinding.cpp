@@ -31,6 +31,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/CandidateBinding.h"
+#include "LLK/Conversion/MicroMapping/TileExtent.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Dialect/Micro/MicroEnums.h"
@@ -180,14 +181,14 @@ llvm::Expected<int64_t> requiredInteger(const Candidate &candidate,
 /// non-positive request is rejected rather than clamped to 1, because it is a
 /// malformed binding, not a small tile.
 llvm::Expected<int64_t> resolveTile(StringRef axis, int64_t extent,
-                                    int64_t requested) {
+                                    int64_t requested, bool padTails) {
   if (requested <= 0)
     return invalid("candidate has no " + axis + " tile size");
-  int64_t tile = std::min(requested, extent);
-  if (extent % tile != 0)
+  int64_t tile = padTails ? requested : std::min(requested, extent);
+  if (!padTails && extent % tile != 0)
     return invalid(axis + " tile " + llvm::Twine(tile) + " does not divide " +
                    axis + " = " + llvm::Twine(extent) +
-                   "; the binder emits no tile masks");
+                   "; tail_policy is 'none'");
   return tile;
 }
 
@@ -283,6 +284,12 @@ resolveDecisions(MLIRContext *context, const SearchSpace &space,
 
   BoundTileDecisions decisions;
   decisions.mBucket = classifyMBucket(shape.M);
+  decisions.tailPolicy =
+      symbolOfKind(space, candidate, "tail_policy").value_or("none").str();
+  if (decisions.tailPolicy != "none" && decisions.tailPolicy != "pad")
+    return invalid("tail_policy '" + decisions.tailPolicy +
+                   "' is unsupported; expected 'none' or 'pad'");
+  const bool padTails = decisions.tailPolicy == "pad";
 
   llvm::Expected<int64_t> bm = requiredInteger(candidate, "BM");
   if (!bm)
@@ -294,16 +301,20 @@ resolveDecisions(MLIRContext *context, const SearchSpace &space,
   if (!bk)
     return bk.takeError();
 
-  llvm::Expected<int64_t> m = resolveTile("BM", shape.M, *bm);
+  llvm::Expected<int64_t> m = resolveTile("BM", shape.M, *bm, padTails);
   if (!m)
     return m.takeError();
-  llvm::Expected<int64_t> n = resolveTile("BN", shape.N, *bn);
+  llvm::Expected<int64_t> n = resolveTile("BN", shape.N, *bn, padTails);
   if (!n)
     return n.takeError();
-  llvm::Expected<int64_t> k = resolveTile("BK", shape.K, *bk);
+  llvm::Expected<int64_t> k = resolveTile("BK", shape.K, *bk, padTails);
   if (!k)
     return k.takeError();
   decisions.workerTile = {*m, *n, *k};
+  if (padTails && (!micro_mapping::roundUpExtent(shape.M, *m) ||
+                   !micro_mapping::roundUpExtent(shape.N, *n) ||
+                   !micro_mapping::roundUpExtent(shape.K, *k)))
+    return invalid("padded workload extent overflows int64");
 
   // --- layout ------------------------------------------------------------
   StringRef layoutName =
@@ -363,8 +374,6 @@ resolveDecisions(MLIRContext *context, const SearchSpace &space,
                            std::min(declared[2], decisions.workerTile[2])),
   };
 
-  decisions.tailPolicy =
-      symbolOfKind(space, candidate, "tail_policy").value_or("none").str();
   decisions.pipelineStages =
       std::max<int64_t>(1, candidate.integer("pipeline_stages").value_or(1));
   decisions.vectorWidth =
@@ -398,6 +407,9 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   for (size_t arm = 0; arm < (context.fused ? 2u : 1u); ++arm)
     inputTypes.push_back(
         RankedTensorType::get({shape.K, shape.N}, context.inputElemType));
+  if (!context.fused)
+    inputTypes.push_back(
+        RankedTensorType::get({shape.M, shape.N}, context.outputElemType));
   llvm::SmallVector<Type, 1> resultTypes{
       RankedTensorType::get({shape.M, shape.N}, context.outputElemType)};
 
@@ -454,6 +466,13 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   int64_t BM = decisions.workerTile[0];
   int64_t BN = decisions.workerTile[1];
   int64_t BK = decisions.workerTile[2];
+  const bool padTails = decisions.tailPolicy == "pad";
+  auto paddedMResult = micro_mapping::roundUpExtent(shape.M, BM);
+  auto paddedNResult = micro_mapping::roundUpExtent(shape.N, BN);
+  auto paddedKResult = micro_mapping::roundUpExtent(shape.K, BK);
+  int64_t paddedM = padTails ? *paddedMResult : shape.M;
+  int64_t paddedN = padTails ? *paddedNResult : shape.N;
+  int64_t paddedK = padTails ? *paddedKResult : shape.K;
 
   SmallVector<int64_t, 2> lhsExtent{shape.M, shape.K};
   SmallVector<int64_t, 2> rhsExtent{shape.K, shape.N};
@@ -461,6 +480,18 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   SmallVector<Value, 2> rhsTensors;
   for (size_t arm = 0; arm < (fused ? 2u : 1u); ++arm)
     rhsTensors.push_back(kernelBody->getArgument(1 + arm));
+  Value initTensor =
+      fused ? Value() : kernelBody->getArgument(1 + rhsTensors.size());
+  if (padTails) {
+    lhsTensor = micro_mapping::padTensorWithZeros(builder, loc, lhsTensor,
+                                                  {paddedM, paddedK});
+    for (Value &rhs : rhsTensors)
+      rhs = micro_mapping::padTensorWithZeros(builder, loc, rhs,
+                                              {paddedK, paddedN});
+    if (initTensor)
+      initTensor = micro_mapping::padTensorWithZeros(builder, loc, initTensor,
+                                                     {paddedM, paddedN});
+  }
 
   // --- spatial tiling ----------------------------------------------------
   auto openSpatialLoop = [&](int64_t extent, int64_t step, StringRef ownerName,
@@ -486,19 +517,19 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   // makes it the kernel's *external* output is the declared result.
   micro::MemorySpaceAttr outputSpace =
       micro::MemorySpaceAttr::get(ctx, micro::MemorySpace::sram);
-  Type outputTileType = tile({shape.M, shape.N}, context.outputElemType,
+  Type outputTileType = tile({paddedM, paddedN}, context.outputElemType,
                              /*tileLayout=*/layoutAttr, outputSpace,
                              /*owner=*/micro::OwnerAttr());
   Value output =
       micro::TileAllocOp::create(builder, loc, outputTileType).getResult();
 
   micro::SpatialForOp bmLoop =
-      openSpatialLoop(shape.M, BM, decisions.outerOwner, ValueRange{output});
+      openSpatialLoop(paddedM, BM, decisions.outerOwner, ValueRange{output});
   BlockArgument bm = bmLoop.getBody().front().getArgument(0);
   Value bmCarried = bmLoop.getBody().front().getArgument(1);
 
   micro::SpatialForOp bnLoop = openSpatialLoop(
-      shape.N, BN, decisions.fragmentOwner, ValueRange{bmCarried});
+      paddedN, BN, decisions.fragmentOwner, ValueRange{bmCarried});
   BlockArgument bn = bnLoop.getBody().front().getArgument(0);
   Value bnCarried = bnLoop.getBody().front().getArgument(1);
 
@@ -508,14 +539,42 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
       tile(accExtent, context.accumulatorElemType,
            /*tileLayout=*/micro::LayoutAttr(), accSpace, outerOwner);
   SmallVector<Value, 2> accumulators;
-  for (size_t arm = 0; arm < rhsTensors.size(); ++arm)
-    accumulators.push_back(
-        micro::TileAllocOp::create(builder, loc, accTileType).getResult());
+  if (initTensor) {
+    SmallVector<int64_t, 2> initExtent{BM, BN};
+    Type initViewType = tile(initExtent, context.outputElemType, layoutAttr,
+                             srcSpace, /*owner=*/micro::OwnerAttr());
+    Value initView = micro::TileViewOp::create(
+        builder, loc, initViewType, initTensor, ValueRange{bm, bn},
+        DenseI64ArrayAttr::get(ctx, initExtent), layoutAttr);
+    Type initStagedType = tile(initExtent, context.outputElemType, layoutAttr,
+                               stageSpace, outerOwner);
+    auto initStageCopy = micro::TileAsyncCopyOp::create(
+        builder, loc, initStagedType, micro::AsyncTokenType::get(ctx), initView,
+        stageSpace, outerOwner);
+    micro::WaitOp::create(builder, loc, ValueRange{initStageCopy.getToken()});
+    Type initAccumulatorType =
+        tile(initExtent, context.outputElemType,
+             /*tileLayout=*/micro::LayoutAttr(), accSpace, outerOwner);
+    auto initAccumulatorCopy = micro::TileAsyncCopyOp::create(
+        builder, loc, initAccumulatorType, micro::AsyncTokenType::get(ctx),
+        initStageCopy.getResult(), accSpace, outerOwner);
+    micro::WaitOp::create(builder, loc,
+                          ValueRange{initAccumulatorCopy.getToken()});
+    Value initial = initAccumulatorCopy.getResult();
+    if (context.outputElemType != context.accumulatorElemType)
+      initial = micro::VectorOp::create(builder, loc, accTileType, "convert",
+                                        ValueRange{initial}, StringAttr());
+    accumulators.push_back(initial);
+  } else {
+    for (size_t arm = 0; arm < rhsTensors.size(); ++arm)
+      accumulators.push_back(
+          micro::TileAllocOp::create(builder, loc, accTileType).getResult());
+  }
 
   // --- K loop ------------------------------------------------------------
   Value kLower = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
   Value kUpper =
-      arith::ConstantIndexOp::create(builder, loc, shape.K).getResult();
+      arith::ConstantIndexOp::create(builder, loc, paddedK).getResult();
   Value kStep = arith::ConstantIndexOp::create(builder, loc, BK).getResult();
   // What an iteration computes is what the next one accumulates into, and what
   // the last one left is the kernel's result. Without the carry the MMA inside
@@ -684,7 +743,18 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   }
   if (auto terminator = dyn_cast<micro::YieldOp>(kernelBody->getTerminator())) {
     builder.setInsertionPoint(terminator);
-    micro::YieldOp::create(builder, loc, bmLoop.getResults());
+    Value result = bmLoop.getResult(0);
+    if (padTails && (paddedM != shape.M || paddedN != shape.N)) {
+      Type validType =
+          tile({shape.M, shape.N}, context.outputElemType, layoutAttr,
+               outputSpace, /*owner=*/micro::OwnerAttr());
+      result = micro::TilePartitionOp::create(
+                   builder, loc, validType, result,
+                   DenseI64ArrayAttr::get(ctx, {shape.M, shape.N}),
+                   /*owner=*/micro::OwnerAttr(), builder.getBoolAttr(true))
+                   .getResult();
+    }
+    micro::YieldOp::create(builder, loc, ValueRange{result});
     terminator.erase();
   }
 

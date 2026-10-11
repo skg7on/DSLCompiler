@@ -99,6 +99,42 @@ llvm::StringRef mappedExecutor(mlir::Operation &op) {
   return {};
 }
 
+/// The concrete capability node a mapped op *selected* for the compute
+/// requirement of `kind` (`vector_engine`, `matrix_engine`), read from its
+/// `micro.mapping` `compute_bindings` map, or empty when the op carries none.
+/// R1 made this selection identity-bearing; the simulator must honour it rather
+/// than resolving the executor's first attached engine of the kind, or two
+/// plans that selected different engines of one kind would be charged as one.
+llvm::StringRef mappedComputeEngine(mlir::Operation &op, llvm::StringRef kind) {
+  auto mapping = op.getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
+  if (!mapping)
+    return {};
+  auto bindings = mapping.getAs<mlir::DictionaryAttr>("compute_bindings");
+  if (!bindings)
+    return {};
+  if (auto engine = bindings.getAs<mlir::StringAttr>(kind))
+    return engine.getValue();
+  return {};
+}
+
+/// The instance a mapped op recorded, or nullopt when it carries none. `0` is a
+/// legal instance id, so this is an optional rather than a sentinel.
+std::optional<uint64_t> mappedInstance(mlir::Operation &op) {
+  auto mapping = op.getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
+  if (!mapping)
+    return std::nullopt;
+  if (auto instance = mapping.getAs<mlir::IntegerAttr>("instance"))
+    return instance.getValue().getZExtValue();
+  return std::nullopt;
+}
+
+/// The connection a materialized copy records (`micro.connection`), or nullopt.
+std::optional<uint64_t> mappedConnection(mlir::Operation &op) {
+  if (auto connection = op.getAttrOfType<mlir::IntegerAttr>("micro.connection"))
+    return connection.getValue().getZExtValue();
+  return std::nullopt;
+}
+
 /// The executor a materialized `micro.transform` selected: stamped as
 /// `micro.engine` by the binder (task B8), because a conversion is not a
 /// covered workload node and carries no `micro.mapping`. A hand-written or
@@ -112,8 +148,9 @@ llvm::StringRef transformExecutor(mlir::Operation &op) {
 
 class DAGBuilder {
 public:
-  DAGBuilder(const machine::MachineModel &machine, llvm::StringRef kernelName)
-      : machine(machine), kernelName(kernelName.str()) {}
+  DAGBuilder(const machine::MachineModel &machine, llvm::StringRef kernelName,
+             const MeasuredOverrides *measured = nullptr)
+      : machine(machine), kernelName(kernelName.str()), measured(measured) {}
 
   llvm::Expected<MicroDAG> run(mlir::Operation *kernel);
 
@@ -127,6 +164,10 @@ private:
     ResourceKind previousKind = ResourceKind::Dma;
     std::vector<uint32_t> pending;
     std::string owner;
+    /// The concrete executor a mapped op selected, inherited by the events a
+    /// region builds so a nested compute event names the same owner pool its
+    /// enclosing scope did (issue #129, task R6). Empty for unmapped analysis.
+    std::string ownerPool;
     /// Buffers a body must hold at once: pipeline stages, times the owners a
     /// spatial loop spreads its iterations over.
     uint64_t storageFactor = 1;
@@ -155,6 +196,10 @@ private:
                     llvm::ArrayRef<uint32_t> extraDeps = {});
   void noteDiagnostics(const MicroEvent &event);
   void noteWarning(std::string message);
+  /// Records a fact that makes the event stream incomplete: it is a warning
+  /// *and* an incompleteness reason, so a strict analysis can refuse the stream
+  /// without string-matching diagnostics (issue #129, task R6).
+  void noteIncomplete(std::string message);
   void noteLayoutUsage(llvm::StringRef engineName,
                        const std::vector<std::string> &supported,
                        llvm::StringRef layout);
@@ -182,7 +227,8 @@ private:
   pickMatrixEngine(llvm::StringRef requested, std::string &reason,
                    llvm::StringRef executor = "") const;
   const machine::ComputeNode *
-  pickVectorEngine(std::string &reason, llvm::StringRef executor = "") const;
+  pickVectorEngine(llvm::StringRef requested, std::string &reason,
+                   llvm::StringRef executor = "") const;
 
   llvm::SmallVector<uint32_t, 4> producerDeps(mlir::ValueRange values) const;
   void inheritProducer(mlir::Value result, mlir::Value source);
@@ -234,6 +280,61 @@ private:
   llvm::SmallPtrSet<mlir::Operation *, 32> countedStorage;
   llvm::StringSet<> seenWarnings;
   std::map<std::string, uint64_t> liveBytes;
+  /// Measured durations the selected plan recorded, or null when none (issue
+  /// #129 review finding 6).
+  const MeasuredOverrides *measured = nullptr;
+
+  // Each stamped operation's nth execution belongs to the connection's nth
+  // occurrence. This joins distinct hop/transform/consumer operations while
+  // keeping repeated loop executions separate.
+  llvm::DenseMap<mlir::Operation *, uint64_t> opOccurrences;
+  std::map<std::pair<uint64_t, uint64_t>, std::vector<uint32_t>>
+      measuredConnectionEvents;
+
+  void applyMeasuredDuration(mlir::Operation &op, MicroEvent &event) {
+    if (!measured)
+      return;
+    if (std::optional<uint64_t> instance = mappedInstance(op))
+      if (auto found = measured->byInstance.find(*instance);
+          found != measured->byInstance.end()) {
+        event.minCycles = static_cast<uint64_t>(std::ceil(found->second));
+        return;
+      }
+    if (std::optional<uint64_t> connection = mappedConnection(op))
+      if (measured->byConnection.count(*connection))
+        measuredConnectionEvents[{*connection, opOccurrences.lookup(&op)}]
+            .push_back(static_cast<uint32_t>(dag.events.size()));
+  }
+
+  /// A provider measures the whole connection, so its hops and transforms
+  /// share one duration. Retain their static proportions to distribute that
+  /// aggregate across the same resource events. Cumulative rounding keeps the
+  /// sum exactly ceil(measured), even for fractional or sub-hop durations.
+  void applyMeasuredConnections() {
+    for (const auto &[key, events] : measuredConnectionEvents) {
+      const uint64_t cycles = static_cast<uint64_t>(
+          std::ceil(measured->byConnection.lookup(key.first)));
+      long double totalWeight = 0;
+      for (uint32_t id : events)
+        totalWeight += dag.events[id].minCycles;
+      long double prefixWeight = 0;
+      uint64_t previousCycles = 0;
+      for (size_t index = 0; index < events.size(); ++index) {
+        MicroEvent &event = dag.events[events[index]];
+        prefixWeight += event.minCycles;
+        const long double fraction =
+            totalWeight > 0
+                ? prefixWeight / totalWeight
+                : static_cast<long double>(index + 1) / events.size();
+        const uint64_t prefixCycles =
+            index + 1 == events.size()
+                ? cycles
+                : static_cast<uint64_t>(std::floor(cycles * fraction));
+        event.minCycles = prefixCycles - previousCycles;
+        previousCycles = prefixCycles;
+      }
+    }
+  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -243,6 +344,13 @@ private:
 void DAGBuilder::noteWarning(std::string message) {
   if (seenWarnings.insert(message).second)
     dag.warnings.push_back(std::move(message));
+}
+
+void DAGBuilder::noteIncomplete(std::string message) {
+  if (seenWarnings.insert(message).second) {
+    dag.incompleteReasons.push_back(message);
+    dag.warnings.push_back(std::move(message));
+  }
 }
 
 void DAGBuilder::noteDiagnostics(const MicroEvent &event) {
@@ -286,13 +394,13 @@ void DAGBuilder::noteUnsizable(const TileInfo &info, mlir::Operation &op) {
   // dtype vocabulary, which an f64 load would otherwise move for free.
   llvm::StringRef opName = op.getName().getStringRef();
   if (info.hasDynamicShape())
-    noteWarning(opName.str() +
-                " moves or allocates a value with a dynamic extent; its bytes "
-                "are charged as zero");
+    noteIncomplete(opName.str() +
+                   " moves or allocates a value with a dynamic extent; its "
+                   "bytes are charged as zero");
   else if (info.elements() > 0 && info.bytes() == 0)
-    noteWarning(opName.str() +
-                " moves or allocates a value whose element type is not a micro "
-                "dtype; its bytes are charged as zero");
+    noteIncomplete(opName.str() +
+                   " moves or allocates a value whose element type is not a "
+                   "micro dtype; its bytes are charged as zero");
 }
 
 void DAGBuilder::noteStorage(mlir::Operation &op, llvm::StringRef space,
@@ -595,8 +703,20 @@ DAGBuilder::pickMatrixEngine(llvm::StringRef requested, std::string &reason,
 }
 
 const machine::ComputeNode *
-DAGBuilder::pickVectorEngine(std::string &reason,
+DAGBuilder::pickVectorEngine(llvm::StringRef requested, std::string &reason,
                              llvm::StringRef executor) const {
+  // A recorded selection wins outright (issue #129, task R1): the mapped op
+  // says which attached engine ran, so two plans of one rule that selected two
+  // engines of a kind are charged two engines rather than both collapsing onto
+  // the executor's first. A selection the machine does not declare is an error,
+  // never silently replaced.
+  if (!requested.empty()) {
+    if (const machine::ComputeNode *engine = machine.findCompute(requested))
+      return engine;
+    reason = "engine '" + requested.str() + "' is not declared by machine '" +
+             machine.target + "'";
+    return nullptr;
+  }
   // As above: the mapped executor's own vector engine wins over the machine's
   // first, so two engines on two executors are not conflated.
   if (!executor.empty())
@@ -653,6 +773,10 @@ uint32_t DAGBuilder::addEvent(MicroEvent event, State &state,
                               llvm::ArrayRef<uint32_t> extraDeps) {
   if (event.tileOwner.empty())
     event.tileOwner = state.owner;
+  // The owner-occupancy pool the mapped placement selected is inherited from
+  // the enclosing region when the op itself named none (issue #129, task R6).
+  if (event.ownerPool.empty())
+    event.ownerPool = state.ownerPool;
 
   // Every event carries its shared cost category, so a report and a plan can
   // be compared category by category rather than event by event.
@@ -753,8 +877,8 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
   if (std::optional<uint64_t> count = staticTripCount(lower, upper, step))
     trips = *count;
   else
-    noteWarning("a loop has non-static bounds; the simulator runs a single "
-                "iteration for it");
+    noteIncomplete("a loop has non-static bounds; the simulator runs a single "
+                   "iteration for it");
 
   if (trips == 0)
     return llvm::Error::success();
@@ -782,9 +906,9 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
       // Each owner needs its own copy of the tiles the body materializes.
       storageFactor *= std::max<uint64_t>(1, machine.ownerCount(owner));
     } else {
-      noteWarning("micro.spatial_for maps to '" + mapTarget.str() +
-                  "', which is not an owner scope; owner occupancy is not "
-                  "modeled for it");
+      noteIncomplete("micro.spatial_for maps to '" + mapTarget.str() +
+                     "', which is not an owner scope; owner occupancy is not "
+                     "modeled for it");
     }
   }
 
@@ -792,6 +916,10 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
   for (uint64_t iteration = 0; iteration < trips; ++iteration) {
     State inner;
     inner.owner = owner;
+    // A mapped op's executor pool is inherited through the loop nest, so a
+    // compute event the body builds names the placement that selected it
+    // (issue #129, task R6).
+    inner.ownerPool = outer.ownerPool;
     inner.storageFactor = storageFactor;
     if (iteration == 0) {
       inner.hasPrevious = outer.hasPrevious;
@@ -826,6 +954,7 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
 //===----------------------------------------------------------------------===//
 
 llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
+  ++opOccurrences[&op];
   if (auto view = llvm::dyn_cast<micro::TileViewOp>(op))
     return buildLogicalTileOp(op, view.getSource(), view.getResult(),
                               std::nullopt, EventKind::TileView, state);
@@ -892,8 +1021,10 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     if (auto engineAttr = mma.getEngine())
       requested = *engineAttr;
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickMatrixEngine(requested, reason, mappedExecutor(op));
+    const machine::ComputeNode *engine = pickMatrixEngine(
+        requested.empty() ? mappedComputeEngine(op, "matrix_engine")
+                          : requested,
+        reason, mappedExecutor(op));
     if (!engine)
       return invalid("kernel '" + kernelName + "' uses micro.mma: " + reason);
 
@@ -929,8 +1060,10 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     // pool, so two events naming the same engine share its slots instead of
     // each being handed the whole machine.
     event.resourceName = engine->id;
+    event.ownerPool = mappedExecutor(op).str();
     event.workItems = macs;
     event.minCycles = mmaCycles(*engine, shape, 2 * macs);
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(shape);
     event.tileLayout = lhsInfo.layout.empty() ? accInfo.layout : lhsInfo.layout;
@@ -947,8 +1080,8 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
 
   if (auto vector = llvm::dyn_cast<micro::VectorOp>(op)) {
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickVectorEngine(reason, mappedExecutor(op));
+    const machine::ComputeNode *engine = pickVectorEngine(
+        mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.vector: " + reason);
@@ -958,9 +1091,11 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.kind = EventKind::Vector;
     event.resource = ResourceKind::VectorEngine;
     event.resourceName = engine->id;
+    event.ownerPool = mappedExecutor(op).str();
     event.workItems = resultInfo.elements();
     event.minCycles =
         vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(resultInfo.shape);
     event.tileLayout = resultInfo.layout;
@@ -976,8 +1111,8 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
 
   if (auto reduce = llvm::dyn_cast<micro::ReduceOp>(op)) {
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickVectorEngine(reason, mappedExecutor(op));
+    const machine::ComputeNode *engine = pickVectorEngine(
+        mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.reduce: " + reason);
@@ -987,9 +1122,11 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.kind = EventKind::Reduce;
     event.resource = ResourceKind::VectorEngine;
     event.resourceName = engine->id;
+    event.ownerPool = mappedExecutor(op).str();
     event.workItems = inputInfo.elements();
     event.minCycles =
         vectorCycles(engine, inputInfo.dtype, inputInfo.elements());
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(inputInfo.shape);
     event.tileLayout = inputInfo.layout;
@@ -1015,8 +1152,8 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
                      "gather kind '" +
                      gather.getKind().str() + "'");
     std::string reason;
-    const machine::ComputeNode *engine =
-        pickVectorEngine(reason, mappedExecutor(op));
+    const machine::ComputeNode *engine = pickVectorEngine(
+        mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
     if (!engine)
       return invalid("kernel '" + kernelName +
                      "' uses micro.gather: " + reason);
@@ -1026,9 +1163,11 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.kind = EventKind::Reduce;
     event.resource = ResourceKind::VectorEngine;
     event.resourceName = engine->id;
+    event.ownerPool = mappedExecutor(op).str();
     event.workItems = resultInfo.elements();
     event.minCycles =
         vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(resultInfo.shape);
     event.tileLayout = resultInfo.layout;
@@ -1059,7 +1198,7 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
       if (!engine || engine->kind != "vector_engine")
         return invalid("micro.transform selects an invalid vector resource");
     } else {
-      engine = pickVectorEngine(reason, transformExecutor(op));
+      engine = pickVectorEngine("", reason, transformExecutor(op));
     }
     if (!engine)
       return invalid("kernel '" + kernelName +
@@ -1107,10 +1246,12 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
     event.kind = EventKind::Transform;
     event.resource = ResourceKind::VectorEngine;
     event.resourceName = engine->id;
+    event.ownerPool = transformExecutor(op).str();
     event.workItems =
         resultInfo.elements() ? resultInfo.elements() : sourceInfo.elements();
     event.bytes = cost->localBytes;
     event.minCycles = static_cast<uint64_t>(std::ceil(cost->latencyCycles));
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(resultInfo.shape.empty() ? sourceInfo.shape
                                                            : resultInfo.shape);
@@ -1194,8 +1335,8 @@ llvm::Error DAGBuilder::buildLogicalTileOp(
     return llvm::Error::success();
 
   std::string reason;
-  const machine::ComputeNode *engine =
-      pickVectorEngine(reason, mappedExecutor(op));
+  const machine::ComputeNode *engine = pickVectorEngine(
+      mappedComputeEngine(op, "vector_engine"), reason, mappedExecutor(op));
   if (!engine)
     return invalid("kernel '" + kernelName +
                    "' performs a layout transform but " + reason);
@@ -1208,6 +1349,7 @@ llvm::Error DAGBuilder::buildLogicalTileOp(
   event.bytes = resultInfo.bytes();
   event.minCycles =
       vectorCycles(engine, resultInfo.dtype, resultInfo.elements());
+  applyMeasuredDuration(op, event);
   event.sourceOpName = op.getName().getStringRef().str();
   event.tileShape = shapeString(resultInfo.shape);
   event.tileLayout = resultInfo.layout;
@@ -1258,6 +1400,7 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
     event.workItems = shapeInfo.elements();
     event.bytes = bytes;
     event.minCycles = cycles;
+    applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
     event.tileShape = shapeString(shapeInfo.shape);
     event.tileLayout =
@@ -1273,21 +1416,45 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
 
   uint32_t id = 0;
   if (hops.empty()) {
-    MicroEvent event;
-    event.kind = kind;
-    event.resource = ResourceKind::Dma;
-    event.resourceName = "dma";
-    event.workItems = shapeInfo.elements();
-    event.bytes = bytes;
-    event.minCycles = copyCycles(srcMemory, dstMemory, bytes);
-    event.sourceOpName = op.getName().getStringRef().str();
-    event.tileShape = shapeString(shapeInfo.shape);
-    event.tileLayout =
-        resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
-    event.tileMemory = dstMemory.str();
-    event.srcMemory = srcMemory.str();
-    event.tileOwner = resultInfo.owner;
-    id = addEvent(std::move(event), state);
+    // A *mapped*, unrouted movement still crosses a concrete link when the
+    // machine joins the two endpoint kinds: a boundary copy a rule placed (the
+    // `dram -> sram` stage that feeds a compute node) carries no routed hop
+    // identity, but the placement is a decision, and the machine declares the
+    // link its endpoints are carried over. Charging that link names its
+    // transfer engine, so the event's resource is one the machine -- and the
+    // strict stream validator -- models, instead of the abstract `dma` pool no
+    // node declares. The cost is unchanged either way: `copyCycles` already
+    // reads this very link for its latency and bandwidth.
+    //
+    // A hand-written kernel with no `micro.mapping` keeps the abstract pool: an
+    // unmapped analysis has not chosen an engine, and naming one it was never
+    // told would be a claim the plan does not support.
+    const machine::LinkEdge *link =
+        op.getAttrOfType<mlir::DictionaryAttr>("micro.mapping") &&
+                srcMemory != dstMemory
+            ? machine.findLinkByKinds(srcMemory, dstMemory)
+            : nullptr;
+    if (link) {
+      id = addEvent(describe(*link, copyCycles(srcMemory, dstMemory, bytes)),
+                    state);
+    } else {
+      MicroEvent event;
+      event.kind = kind;
+      event.resource = ResourceKind::Dma;
+      event.resourceName = "dma";
+      event.workItems = shapeInfo.elements();
+      event.bytes = bytes;
+      event.minCycles = copyCycles(srcMemory, dstMemory, bytes);
+      applyMeasuredDuration(op, event);
+      event.sourceOpName = op.getName().getStringRef().str();
+      event.tileShape = shapeString(shapeInfo.shape);
+      event.tileLayout =
+          resultInfo.layout.empty() ? sourceInfo.layout : resultInfo.layout;
+      event.tileMemory = dstMemory.str();
+      event.srcMemory = srcMemory.str();
+      event.tileOwner = resultInfo.owner;
+      id = addEvent(std::move(event), state);
+    }
   } else {
     for (size_t hop = 0; hop < hops.size(); ++hop) {
       const machine::LinkEdge &link = *hops[hop];
@@ -1396,6 +1563,8 @@ llvm::Expected<MicroDAG> DAGBuilder::run(mlir::Operation *kernel) {
   if (llvm::Error err = walkBlock(kernel->getRegion(0).front(), state, created))
     return std::move(err);
 
+  applyMeasuredConnections();
+
   if (dag.events.empty())
     noteWarning("kernel '" + kernelName +
                 "' has no schedulable events; every figure below is zero");
@@ -1411,13 +1580,14 @@ llvm::Expected<MicroDAG> DAGBuilder::run(mlir::Operation *kernel) {
 //===----------------------------------------------------------------------===//
 
 llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
-                                       const machine::MachineModel &machine) {
+                                       const machine::MachineModel &machine,
+                                       const MeasuredOverrides *measured) {
   auto kernelOp = llvm::dyn_cast<micro::KernelOp>(kernel);
   if (!kernelOp)
     return invalid("expected a micro.kernel, got '" +
                    kernel->getName().getStringRef() + "'");
 
-  DAGBuilder builder(machine, kernelOp.getSymName());
+  DAGBuilder builder(machine, kernelOp.getSymName(), measured);
   return builder.run(kernel);
 }
 
@@ -1474,10 +1644,22 @@ mapping::PlanCostEvent normalizedPlanEvent(const MicroEvent &event) {
   // cannot differ in their normalized fields (task B8). The event's own
   // `resourceName` is the machine resource both paths name.
   std::vector<uint32_t> deps(event.deps.begin(), event.deps.end());
-  return mapping::makePlanCostEvent(
+  mapping::PlanCostEvent normalized = mapping::makePlanCostEvent(
       costEventKindOf(event.kind), event.resourceName,
       static_cast<double>(event.minCycles), event.workItems, event.bytes,
       std::move(deps));
+  // The execution facts the plan path also records (issue #129, task R6): the
+  // owner-occupancy pool the event runs under -- the mapped executor's id when
+  // the op was placed, otherwise the tile's abstract owner symbol -- and the
+  // two memories a movement crosses. Only an event with traffic charges them
+  // (a compute event's `bytes` is zero), but the owner joins every event's
+  // normalized shape so a plan event and its materialized counterpart occupy
+  // the same pool.
+  normalized.owner =
+      event.ownerPool.empty() ? event.tileOwner : event.ownerPool;
+  normalized.srcMemory = event.srcMemory;
+  normalized.dstMemory = event.tileMemory;
+  return normalized;
 }
 
 mapping::CostEventKind costEventKindOf(EventKind kind) {

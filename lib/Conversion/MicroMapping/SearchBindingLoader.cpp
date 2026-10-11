@@ -357,14 +357,14 @@ std::vector<perf::WorkloadShape> contractionsOf(mlir::Operation *kernel) {
 /// The facts a kernel can supply to its space's constraints. Either field may
 /// be empty; each constraint reads only what it needs, and one that needs a
 /// missing fact is reported as unevaluable rather than blocking the rest.
-perf::BindingFacts bindingFactsOf(mlir::Operation *kernel) {
+} // namespace
+
+perf::BindingFacts extractBindingFacts(mlir::Operation *kernel) {
   perf::BindingFacts facts;
   facts.originalWorkload = originalWorkloadOf(kernel);
   facts.contractions = contractionsOf(kernel);
   return facts;
 }
-
-} // namespace
 
 llvm::Error verifyBindingLegality(mlir::ModuleOp module,
                                   const SearchBinding &binding,
@@ -391,7 +391,7 @@ llvm::Error verifyBindingLegality(mlir::ModuleOp module,
   // Derive only the facts each constraint needs. A kernel with no MMA is not
   // itself a failure: a shape-independent constraint still evaluates, and a
   // shape-dependent one reports the specific fact it is missing.
-  perf::BindingFacts facts = bindingFactsOf(kernel);
+  perf::BindingFacts facts = extractBindingFacts(kernel);
 
   perf::Candidate candidate;
   candidate.id = binding.candidateId;
