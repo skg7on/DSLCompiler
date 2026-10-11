@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml/badge.svg)](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/skg7on/DSLCompiler/badges/badges/coverage.json)](https://github.com/skg7on/DSLCompiler/actions/workflows/coverage.yml)
+[![Developer manual](https://img.shields.io/badge/docs-developer_manual-235c86)](https://skg7on.github.io/DSLCompiler/)
 
 DSLCompiler is an out-of-tree [MLIR](https://mlir.llvm.org/) compiler for DNN/LLM kernels and AI chipset performance exploration. Its goal is to describe how a kernel executes, map it onto a machine, estimate resource use and performance, and search for better schedules. Intel AVX2 is the first validation target; the architecture is intended to support additional AI accelerators.
 
@@ -52,11 +53,11 @@ The mapped path is under active development: physical feasibility, selected-targ
 
 ## Start understanding the project
 
-1. Read the [concepts](docs/manual/source/concepts.rst), then the [architecture](docs/manual/source/architecture.rst) and [feature matrix](docs/manual/source/features.rst).
-2. Follow the tutorials: [first kernel](docs/manual/source/tutorials/01-first-kernel.rst), [mapping](docs/manual/source/tutorials/02-mapping.rst), [performance](docs/manual/source/tutorials/03-performance.rst), and [tuning](docs/manual/source/tutorials/04-tuning.rst).
+1. Read the [concepts](https://skg7on.github.io/DSLCompiler/concepts.html), then the [architecture](https://skg7on.github.io/DSLCompiler/architecture.html) and [feature matrix](https://skg7on.github.io/DSLCompiler/features.html).
+2. Follow the tutorials: [first kernel](https://skg7on.github.io/DSLCompiler/tutorials/01-first-kernel.html), [mapping](https://skg7on.github.io/DSLCompiler/tutorials/02-mapping.html), [performance](https://skg7on.github.io/DSLCompiler/tutorials/03-performance.html), and [tuning](https://skg7on.github.io/DSLCompiler/tutorials/04-tuning.html).
 3. Explore `include/LLK/` and `lib/`: `Dialect/` defines the IR, `Conversion/` and `Transforms/` implement compilation, `Machine/` and `Mapping/` implement target exploration, and `Target/` supplies backend implementations. `tools/` provides the command-line entry points; `test/` shows executable examples.
 
-The [developer manual](docs/manual/README.md) is the main documentation entry point. [ARCHITECTURE.md](ARCHITECTURE.md) covers the established CPU pipeline in more depth.
+The [developer manual](https://skg7on.github.io/DSLCompiler/) is the main documentation entry point, rebuilt from `main` on every merge. Its [sources](docs/manual/source/index.rst) and [build instructions](docs/manual/README.md) live in the repository. [ARCHITECTURE.md](ARCHITECTURE.md) covers the established CPU pipeline in more depth.
 
 ## Build
 

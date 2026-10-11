@@ -23,6 +23,10 @@ pygments_style = "sphinx"
 
 html_theme = "furo"
 html_title = project
+# Canonical base for the published site (GitHub Pages project page). Sphinx
+# emits <link rel="canonical"> from this, so the manual is not indexed twice
+# when it is also reachable from a local preview or a mirror.
+html_baseurl = "https://skg7on.github.io/DSLCompiler/"
 html_static_path = ["_static"]
 html_css_files = ["manual.css"]
 html_show_sourcelink = True
