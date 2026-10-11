@@ -24,6 +24,9 @@ public:
   virtual mlir::Operation &operation() const = 0;
   virtual const machine::MachineModel &machineModel() const = 0;
   virtual llvm::StringRef kernelName() const = 0;
+  /// Explicit IDs in event.deps and extraDeps must name previously emitted
+  /// events in this build. Use the IDs returned here; never retain IDs between
+  /// builds. Value inputs are resolved through the core producer map.
   virtual uint32_t emitEvent(MicroEvent event, mlir::ValueRange inputs,
                              mlir::ValueRange outputs,
                              llvm::ArrayRef<uint32_t> extraDeps = {}) = 0;
@@ -82,8 +85,12 @@ public:
 
 private:
   template <typename OpT, typename Fn> static Callback typed(Fn fn) {
-    return [fn = std::move(fn)](mlir::Operation &op,
-                                OpDAGBuildContext &context) -> llvm::Error {
+    std::function<llvm::Error(OpT, OpDAGBuildContext &)> callback =
+        std::move(fn);
+    if (!callback)
+      return {};
+    return [fn = std::move(callback)](
+               mlir::Operation &op, OpDAGBuildContext &context) -> llvm::Error {
       auto typedOp = llvm::dyn_cast<OpT>(&op);
       if (!typedOp)
         return llvm::make_error<llvm::StringError>(

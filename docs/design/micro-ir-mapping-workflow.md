@@ -309,3 +309,70 @@ and issue [#129](https://github.com/skg7on/DSLCompiler/issues/129).
 - layering and the redesign: `docs/design/m9-canonical-micro-ir-architecture.md`
 - the mapping design: `docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md`
 - the LLKMap grammars: `docs/design/llkmap-layout-grammar.md`, `docs/design/llkmap-rule-grammar.md`
+
+## Extending performance DAG extraction
+
+`buildMicroDAG(kernel, machine)` uses the built-in leaf operation builders.
+To add an interpretation without editing traversal, include
+`LLK/Perf/OpDAGBuilder.h`, create an owning registry, and inject it explicitly:
+
+```cpp
+#include "LLK/Perf/OpDAGBuilder.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+
+llvm::Error buildProbe(mlir::arith::ConstantOp op,
+                       mlir::llk::perf::OpDAGBuildContext &context) {
+  mlir::llk::perf::MicroEvent event;
+  event.kind = mlir::llk::perf::EventKind::Vector;
+  event.resource = mlir::llk::perf::ResourceKind::VectorEngine;
+  event.resourceName = "probe";
+  event.sourceOpName = op->getName().getStringRef().str();
+  event.minCycles = 7;
+  context.emitEvent(std::move(event), {}, op->getResults());
+  return llvm::Error::success();
+}
+
+auto builders = mlir::llk::perf::makeDefaultOpDAGBuilders();
+llvm::Error error = builders.registerBuilder<mlir::arith::ConstantOp>(buildProbe);
+if (error)
+  return error;
+auto dag = mlir::llk::perf::buildMicroDAG(kernel, machine, builders);
+```
+
+The synthetic constant handler above demonstrates extraction only. Choose a
+resource modeled by the machine when scheduling a custom event. A handler may
+return `llvm::Error`; extraction propagates it instead of treating the operation
+as free work. The optional measured-overrides argument is also supported by the
+injected overload.
+
+Use `replaceBuilder<OpT>(callback)` to replace an existing leaf builder explicitly,
+for example `replaceBuilder<mlir::micro::VectorOp>(customVectorBuilder)` with the
+Micro operation definitions included by that extension. Replacement fails if the
+operation was not registered; registration fails for duplicate names. Raw full
+operation names are accepted for externally defined operations. Empty names,
+empty callbacks, and structural operation registration or replacement are errors.
+The registry owns callbacks and their value captures. Referenced captures must
+outlive the build. Configure the registry before extraction and keep it immutable
+until every build using it returns; no global registrations are merged into it.
+Start from `makeDefaultOpDAGBuilders()` when built-in behavior is desired. An empty
+registry leaves all leaves on the existing zero-event fallback.
+
+`OpDAGBuildContext` is non-copyable and valid only during a handler invocation.
+Do not retain it or mutate MLIR through a handler. `emitEvent` accepts explicit
+input values and produced values, plus optional event dependencies; insertion
+assigns IDs, combines producer and region dependencies, deduplicates them, and
+records diagnostics. Explicit event IDs must refer to earlier events in the
+current build; use the IDs returned by `emitEvent` and do not retain them across
+builds. `aliasValue` preserves a logical result's producer.
+`accountStorage` applies the current traversal's storage factor and counts each
+allocation site once across unrolling. Shared movement construction preserves
+selected concrete route identity, chains hops, and binds values and async tokens
+to the final hop. Movement and physical tile-layout changes retain their source
+data dependencies, including between events of the same resource kind;
+independent copies remain eligible to overlap.
+
+`micro.for`, `micro.spatial_for`, `micro.pipeline`, and `micro.yield` remain
+core-owned traversal operations and cannot be overridden. The context exposes
+read-only machine queries and restricted event/storage services, never the graph,
+producer map, or traversal state. `LLK/Perf/TileInfo.h` exposes `TileInfo`,
+`describeType`, and `shapeString` without generated Micro operation headers.

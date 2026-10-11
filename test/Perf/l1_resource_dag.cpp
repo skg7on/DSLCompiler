@@ -41,6 +41,7 @@
 #include "gtest/gtest.h"
 
 #include <memory>
+#include <set>
 #include <string>
 
 namespace mlir::llk::perf {
@@ -1311,7 +1312,26 @@ TEST(L1ResourceDag, SelectedPlanEventsMatchItsMaterializedKernel) {
     EXPECT_DOUBLE_EQ(planDag->events[i].event.cost.latencyCycles,
                      normalized.event.cost.latencyCycles)
         << i;
-    EXPECT_EQ(planDag->events[i].deps, normalized.deps) << i;
+    // The IR records an explicit source data edge even when the hop's wait
+    // already reaches that producer. The hand-built plan stores only the wait
+    // edge. Compare the partial order, retaining the direct-edge regression
+    // tests below for movement correctness.
+    auto ancestors = [](const auto &events, size_t id) {
+      std::set<uint32_t> reached;
+      std::vector<uint32_t> pending(events[id].deps.begin(),
+                                    events[id].deps.end());
+      while (!pending.empty()) {
+        uint32_t dep = pending.back();
+        pending.pop_back();
+        if (!reached.insert(dep).second)
+          continue;
+        pending.insert(pending.end(), events[dep].deps.begin(),
+                       events[dep].deps.end());
+      }
+      return reached;
+    };
+    EXPECT_EQ(ancestors(planDag->events, i), ancestors(kernelDag->events, i))
+        << i;
   }
 }
 

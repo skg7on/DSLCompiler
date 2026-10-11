@@ -363,3 +363,159 @@ module { micro.kernel @route attributes {micro.routes = [{value = 0 : i64, kind 
   EXPECT_EQ(dag->events[3].deps, (std::vector<uint32_t>{1, 2}));
 }
 } // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+TEST(OpDAGBuilders, RegistrationOrderDoesNotChangeTraversalOrDiagnostics) {
+  auto parsed = parseKernel(R"mlir(
+module { micro.kernel @order {
+  %c = arith.constant 0 : index
+  %sum = arith.addi %c, %c : index
+  micro.yield
+} }
+)mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto constant = eventBuilder(7);
+  auto addition = [](mlir::arith::AddIOp op, OpDAGBuildContext &context) {
+    MicroEvent event;
+    event.minCycles = 11;
+    event.resourceName = "sum";
+    context.emitEvent(std::move(event), op->getOperands(), op->getResults());
+    context.noteWarning("ordered warning");
+    context.noteWarning("ordered warning");
+    return llvm::Error::success();
+  };
+  OpDAGBuilderRegistry first, second;
+  ASSERT_FALSE(first.registerBuilder<mlir::arith::ConstantOp>(constant));
+  ASSERT_FALSE(first.registerBuilder<mlir::arith::AddIOp>(addition));
+  ASSERT_FALSE(second.registerBuilder<mlir::arith::AddIOp>(addition));
+  ASSERT_FALSE(second.registerBuilder<mlir::arith::ConstantOp>(constant));
+  const machine::MachineModel model;
+  auto a = buildMicroDAG(parsed->kernel, model, first);
+  auto b = buildMicroDAG(parsed->kernel, model, second);
+  auto repeated = buildMicroDAG(parsed->kernel, model, first);
+  ASSERT_TRUE(static_cast<bool>(a));
+  ASSERT_TRUE(static_cast<bool>(b));
+  ASSERT_TRUE(static_cast<bool>(repeated));
+  expectEqual(*a, *b);
+  expectEqual(*a, *repeated);
+  ASSERT_EQ(a->events.size(), 2u);
+  EXPECT_EQ(a->events[0].minCycles, 7u);
+  EXPECT_EQ(a->events[1].minCycles, 11u);
+  EXPECT_EQ(a->events[1].deps, (std::vector<uint32_t>{0}));
+  EXPECT_EQ(a->warnings, (std::vector<std::string>{"ordered warning"}));
+}
+} // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+TEST(OpDAGBuilders, ContextAliasesAndAccountsStorageUnderUnrolling) {
+  auto parsed = parseKernel(R"mlir(
+module { micro.kernel @context {
+  %c0 = arith.constant 0 : index
+  %c2 = arith.constant 2 : index
+  %c1 = arith.constant 1 : index
+  micro.for %i = %c0 to %c2 step %c1 {
+    micro.pipeline stages = 3 {
+      %c = arith.constant 5 : index
+      %sum = arith.addi %c, %c : index
+      %out = arith.muli %sum, %sum : index
+    }
+  }
+  micro.yield
+} }
+)mlir");
+  ASSERT_NE(parsed, nullptr);
+  OpDAGBuilderRegistry builders;
+  ASSERT_FALSE(builders.registerBuilder<mlir::arith::ConstantOp>(
+      [](mlir::arith::ConstantOp op, OpDAGBuildContext &context) {
+        if (context.operation().getParentOp()->getName().getStringRef() ==
+            "micro.pipeline") {
+          context.emitEvent(MicroEvent{}, {}, op->getResults());
+          context.accountStorage("sram", 64);
+        }
+        return llvm::Error::success();
+      }));
+  ASSERT_FALSE(builders.registerBuilder<mlir::arith::AddIOp>(
+      [](mlir::arith::AddIOp op, OpDAGBuildContext &context) {
+        context.aliasValue(op.getResult(), op.getLhs());
+        return llvm::Error::success();
+      }));
+  ASSERT_FALSE(builders.registerBuilder<mlir::arith::MulIOp>(
+      [](mlir::arith::MulIOp op, OpDAGBuildContext &context) {
+        context.emitEvent(MicroEvent{}, op->getOperands(), op->getResults());
+        return llvm::Error::success();
+      }));
+  auto dag = buildMicroDAG(parsed->kernel, loadModel(), builders);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 4u);
+  EXPECT_EQ(dag->events[1].deps, (std::vector<uint32_t>{0}));
+  EXPECT_EQ(dag->events[3].deps, (std::vector<uint32_t>{2}));
+  EXPECT_EQ(dag->liveTileBytesByMemory.at("sram"), 192u);
+}
+} // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+TEST(OpDAGBuilders, TypedRegistrationRejectsEmptyCallbacksBeforeDispatch) {
+  using TypedCallback =
+      std::function<llvm::Error(mlir::arith::ConstantOp, OpDAGBuildContext &)>;
+  OpDAGBuilderRegistry builders;
+  expectError(
+      builders.registerBuilder<mlir::arith::ConstantOp>(TypedCallback{}),
+      "callback");
+  EXPECT_EQ(builders.lookup("arith.constant"), nullptr);
+  ASSERT_FALSE(
+      builders.registerBuilder<mlir::arith::ConstantOp>(eventBuilder(7)));
+  expectError(builders.replaceBuilder<mlir::arith::ConstantOp>(TypedCallback{}),
+              "callback");
+  auto parsed = parseKernel(probe);
+  ASSERT_NE(parsed, nullptr);
+  auto dag = buildMicroDAG(parsed->kernel, machine::MachineModel{}, builders);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 1u);
+  EXPECT_EQ(dag->events[0].minCycles, 7u);
+}
+} // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+namespace {
+constexpr const char *kInjectedGemmKernel = R"MLIR(
+module {
+  micro.kernel @gemm_tile attributes {workload = "gemm", target = "x86-avx2-cpu"} {
+    %a_ext = tensor.empty() : tensor<16x32xbf16>
+    %b_ext = tensor.empty() : tensor<32x16xbf16>
+    %a_tile, %a_tok = micro.async_copy %a_ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<16x32xbf16> -> tensor<16x32xbf16>, !micro.async_token
+    %b_tile, %b_tok = micro.async_copy %b_ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<32x16xbf16> -> tensor<32x16xbf16>, !micro.async_token
+    micro.wait %a_tok, %b_tok
+    %a_frag = micro.tile_view %a_tile {shape = array<i64: 16, 32>} : tensor<16x32xbf16> -> !micro.tile<16x32xbf16, memory = #micro.memory<sram>>
+    %b_frag = micro.tile_view %b_tile {shape = array<i64: 32, 16>} : tensor<32x16xbf16> -> !micro.tile<32x16xbf16, memory = #micro.memory<sram>>
+    %acc = micro.tile_alloc : !micro.tile<16x16xf32, memory = #micro.memory<acc>>
+    %result = micro.mma %a_frag, %b_frag, %acc {shape = array<i64: 16, 16, 32>, input = #micro.dtype<bf16>, accumulator = #micro.dtype<f32>} : !micro.tile<16x32xbf16, memory = #micro.memory<sram>>, !micro.tile<32x16xbf16, memory = #micro.memory<sram>>, !micro.tile<16x16xf32, memory = #micro.memory<acc>> -> !micro.tile<16x16xf32, memory = #micro.memory<acc>>
+    micro.tile_store %result {dst_memory = #micro.memory<dram>} : !micro.tile<16x16xf32, memory = #micro.memory<acc>>
+    micro.yield
+  }
+}
+)MLIR";
+
+} // namespace
+TEST(OpDAGBuilders, DefaultMmaExtractionMatchesInjectedDefaults) {
+  auto parsed = parseKernel(kInjectedGemmKernel);
+  ASSERT_NE(parsed, nullptr);
+  const auto builders = makeDefaultOpDAGBuilders();
+  for (llvm::StringRef file :
+       {"x86-avx2-v2.yaml", "generic-ai-accel-v2.yaml"}) {
+    auto model = loadModel(file);
+    auto implicit = buildMicroDAG(parsed->kernel, model);
+    auto injected = buildMicroDAG(parsed->kernel, model, builders);
+    ASSERT_TRUE(static_cast<bool>(implicit))
+        << llvm::toString(implicit.takeError());
+    ASSERT_TRUE(static_cast<bool>(injected))
+        << llvm::toString(injected.takeError());
+    expectEqual(*implicit, *injected);
+    ASSERT_EQ(injected->events.size(), 5u);
+    EXPECT_EQ(injected->events[3].kind, EventKind::Mma);
+    EXPECT_EQ(injected->events[3].workItems, 8192u);
+    EXPECT_EQ(injected->events[3].deps, (std::vector<uint32_t>{0, 1, 2}));
+    EXPECT_EQ(injected->events[4].kind, EventKind::Store);
+    EXPECT_EQ(injected->events[4].deps, (std::vector<uint32_t>{3}));
+  }
+}
+} // namespace mlir::llk::perf
