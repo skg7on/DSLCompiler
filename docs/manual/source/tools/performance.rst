@@ -9,10 +9,11 @@ diagnostics. It does not execute the kernel, produce tensors, check numerical
 accuracy, or measure the host CPU. Use it to compare explicit Micro schedules
 under the same model and to inspect assumptions before attempting execution.
 
-This manual describes main revision ``bb82038`` (2026-10-07). The current
-:source:`gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>`
-records remaining mapping and performance-model limitations. Measurement and
-calibration work tracked by #51/#52 is separate from the simulator.
+This manual reflects merged PR #133. Complete-plan selection and materialized
+analysis share normalized events/resources, per-engine DMA capacity and storage
+lifetimes. The :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
+records static parity controls. Measurements and calibration (#51/#52) remain
+separate from the simulator.
 
 .. _tools-performance-first-report:
 
@@ -258,9 +259,7 @@ To make modeled capacity a shell gate:
      --fail-on-capacity-violation test/Perf/micro_perf_cli.mlir
 
 This checked fixture fits the model and returns zero. A capacity violation
-reports the memory, required bytes, and modeled available bytes. The model's
-live-storage accounting can be conservative or incomplete; it is not a complete
-physical-storage proof for a mapped executable. Layout and owner warnings do not
+reports the memory, required bytes, and modeled available bytes. Incomplete model facts or unsupported programs remain analysis limits; a standalone report does not certify executable backend support. Layout and owner warnings do not
 become fatal merely because the capacity flag is enabled.
 
 .. _tools-performance-current-limits-and-contributor-entry-points:
@@ -268,10 +267,9 @@ become fatal merely because the capacity flag is enabled.
 Current limits and contributor entry points
 -------------------------------------------
 
-Do not use these predictions as calibrated hardware measurements. The current
-mapping audit records selected-resource identity gaps, incomplete physical
-storage, per-engine DMA occupancy issues, and planner/perf discrepancies. Those
-limitations also constrain the interpretation of a bound-kernel report.
+Do not use these predictions as calibrated hardware measurements. PR #133 verifies selected-resource identity, per-hop storage, per-engine occupancy
+and static planner/perf parity for the supported acceptance chains. Preserve the
+exact machine and plan identity when comparing reports.
 Selected AVX2 width and layout metadata is not by itself evidence of selected
 AVX2 instruction execution.
 

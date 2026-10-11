@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Exercise the community tutorials with a build from the same source tree.
 
-Checks compilation artifacts and predicted reports, not numerical invocation
-or selected-target instruction fidelity. Uses only the Python standard library.
+Checks compilation artifacts, predictions, source replay and verified reference
+measurement. Selected AVX2 fidelity uses the separate required execution gate.
+Uses only the Python standard library.
 """
 
 import argparse
@@ -162,6 +163,37 @@ def main():
         "-o=%s" % (output / "legacy.json"))
     require(json.loads((output / "legacy.json").read_text()).get("entries"),
             "legacy tuner did not write schedule entries")
+    # Original-source mapped tuning retains the selected source and frozen plan.
+    mapped_schedule = output / "matmul.schedule.yaml"
+    mapped_report = output / "tune.json"
+    candidates = output / "candidates"
+    source_tuning = ["--input=test/Tuning/Inputs/issue129/mapped_tune.mlir",
+                     "--machine=machines/x86-avx2-v2.yaml", "-M=8", "-N=16", "-K=32",
+                     "--mapping-target=x86-avx2", "--mapping-root=.",
+                     "--mapping-mode=exact", "--mapping-backend=reference",
+                     "--candidate-source=semantic", "--source-symbol=matmul",
+                     "--top-k=1", "--mapping-report=%s" % mapped_report,
+                     "--candidate-artifacts=%s" % candidates,
+                     "--output=%s" % mapped_schedule]
+    run("llk-tune", *source_tuning)
+    static_report = mapped_report.read_bytes()
+    selected = json.loads(static_report)["candidates"][0]
+    require(selected["source_mode"] == "semantic" and selected["plan_id"],
+            "source tuner did not retain semantic mapping provenance")
+    candidate_dir = candidates / selected["candidate_id"]
+    run("llk-compile", "--mapping-target=x86-avx2", "--mapping-root=.",
+        "--machine=machines/x86-avx2-v2.yaml", "--mapping-backend=reference",
+        "--mapping-stop=lowered", "--plan-report=%s" % (candidate_dir / "plan.json"),
+        candidate_dir / "source.mlir", "--emit=mlir", artifact="source.replayed.mlir")
+    run("llk-tune", *source_tuning, "--measure-top=1",
+        "--measurement-inputs=test/Tuning/Inputs/issue129/measurement_inputs.json")
+    require(mapped_report.read_bytes() == static_report,
+            "measurement changed the static mapping report")
+    observations = json.loads(Path(str(mapped_report) + ".measurements.json").read_text())
+    require(observations["records"] and
+            observations["records"][0]["candidate_id"] == selected["candidate_id"],
+            "verified timing did not retain selected candidate identity")
+
     run("llk-bench", "-M=2", "-N=16", "-K=16", "--threads=1",
         "--warmup-ms=10", "--measure-ms=20", "--reps=2", artifact="synthetic-bench.txt")
     print("tutorial checks passed: %d commands; artifacts in %s" % (steps, output))

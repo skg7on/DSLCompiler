@@ -2,7 +2,9 @@
 
 ## Verified PR #133 implementation evidence — 2026-10-11
 
-This section supersedes the candidate status below. Implementation head
+PR #133 merged on 2026-10-11 at
+`5ee61b193d85b873497e9a7aecbd07f1fea73c55`. This section supersedes the
+historical candidate status below. Implementation head
 `6c42be938d8f72ef3d66dc2731b3cfdfeb387b85` passed the pinned Linux LLVM/MLIR
 22.1.8 static build and selected execution gate in
 [CI run 38124760443](https://github.com/skg7on/DSLCompiler/actions/runs/38124760443).
@@ -43,9 +45,9 @@ revision is established by the Actions run's `headSha` above.
 
 ### Twelve-criterion implementation matrix
 
-All entries below refer to the same source head and full CI artifact. A passed
-implementation row does not imply that PR #133 has merged. Tracker closure
-still requires merged implementation. Production measurement persistence and
+All entries below refer to the same source head and full CI artifact. PR #133 is merged; the table retains the exact pre-merge CI implementation
+revision so its artifacts remain reproducible. Tracker state is maintained
+separately from this evidence snapshot. Production measurement persistence and
 calibration (#51/#52), accelerator hardware execution and unsupported generic
 programs remain outside this bounded acceptance contract.
 
@@ -69,9 +71,9 @@ programs remain outside this bounded acceptance contract.
 G1–G10's candidate regression crosswalk below is now backed by this passing x86
 run, including previously open G4/G10. #106's four original defects retain their
 merged #108 credit. The remaining #106/#109 integration items and #67 §29 rows
-map to this matrix and the R/E/T ledger. Because #129 requires **merged**
-implementation, historical unchecked closure boxes remain pending PR #133's
-merge; branch proof must not be presented as merged delivery.
+map to this matrix and the R/E/T ledger. PR #133 now supplies merged implementation at `5ee61b1`; the issue checklist
+implementation marks and evidence can be reconciled with that merge. Historical
+pre-merge snapshots below remain pinned to their original revisions.
 
 ## Historical worktree update (local snapshot before `6c42be9`)
 

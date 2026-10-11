@@ -8,10 +8,10 @@ target mapping, and performance exploration. The established CPU compiler remain
 available while the newer mapped path is being strengthened. Use this page to
 choose a workflow and understand what a successful run proves.
 
-This summary describes the source tree after PRs #128 and #130, reviewed on
-2026-10-07. #130 adds repair plans; it does not implement their proposed runtime,
-resource, backend, or tuner changes. The :source:`current gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>`
-is the detailed evidence behind the limits below.
+This summary reflects merged PR #133 (2026-10-11, merge ``5ee61b1``).
+The :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>` records
+revision-pinned tests, execution artifacts and retained limitations. The October 7
+gap assessment is historical; its resource/runtime/tuner repairs are implemented.
 
 .. _features-what-you-can-do-today:
 
@@ -48,27 +48,27 @@ What you can do today
      - :source:`Formal syntax <docs/design/llkmap-syntax.md>`
    * - Match single and fused operations
      - Single-operation rules and bounded fused-group matching
-     - The shipped convert→SiLU→multiply fused rule can be selected and bound but currently fails target lowering; group dispatch is incomplete
+     - Selected fused groups bind, lower and execute in the verified SwiGLU chain; unsupported effects/regions or emitters are rejected
      - :doc:`Mapping tutorial </tutorials/02-mapping>`
    * - Search mappings
      - Deterministic, beam and exact covering modes; placement, route and connection alternatives; search bounds and diagnostics
-     - Physical feasibility is finalized after top-K retention and may lose an available legal plan; beam mode has no optimality guarantee
+     - Complete storage/materialized analysis runs before top-K retention; beam mode has no optimality guarantee and exact search remains bounded
      - :doc:`Optimizer </tools/optimizer>`
    * - Bind, report and replay selections
      - Versioned plan reports and selected metadata; canonical movement/transform/sync materialization; layered verification
-     - Concrete selected compute identities and complete physical storage are not yet preserved or checked across every path
+     - Concrete compute/memory/DMA identities and per-hop storage/lifetimes are retained and verified; unsupported execution-affecting decisions are rejected
      - :doc:`Optimizer </tools/optimizer>`, :doc:`architecture </architecture>`
    * - Estimate performance
      - Level-0 work/bandwidth bounds and level-1 dependency/resource scheduling; cycles, traffic, utilization, bottleneck and capacity reporting
-     - Planner and bound-kernel estimates currently disagree; named DMA concurrency and storage accounting have known defects; predictions are uncalibrated
+     - Selected-plan and materialized static analysis share resource/event accounting with parity controls; predictions remain uncalibrated
      - :doc:`Performance analyzer </tools/performance>`
    * - Tune schedule parameters
-     - Candidate enumeration, legality checks, synthetic GEMM/SwiGLU binding, objective ranking and schedule output; optional library measurement callback
-     - The CLI does not map and compile every original-source candidate; the callback is not a production measurement database
+     - Original-source candidate instantiation, mapped selection/analysis/compilation, static ranking, candidate artifacts, frozen replay and optional verified measurement
+     - Requires explicit mapping target/source mode for original-source tuning; production measurement persistence/calibration remain separate
      - :doc:`Tuner </tools/tuning>`, :doc:`tuning tutorial </tutorials/04-tuning>`
    * - Run supported mapped kernels
-     - Shared mapped compilation and descriptor-pointer ORC invocation; portable numerical GEMM/SwiGLU acceptance fixtures
-     - Selected AVX2 width/ISA realization is unproved; repeated invocations can leak compiler allocations, and descriptor rank/dtype/buffer validation is incomplete
+     - Shared mapped compilation, typed descriptor invocation, caller-buffer ownership and per-call scratch release; selected AVX2 numeric fixtures
+     - Selected-target execution requires x86_64 AVX2; rank-two supported dtypes/strides/bounds are checked by typed invocation; deprecated untagged descriptors cannot check dtype/allocation size
      - :doc:`Compiler </tools/compiler>`
    * - Exercise the benchmark harness
      - ``llk-bench`` runs a synthetic host loop and reports timing
@@ -106,9 +106,7 @@ cycles separate from measured time.
 
 **Explore schedules:** export or load a search space, cap enumeration while
 experimenting, inspect rejected candidates, and follow
-:doc:`tutorial 4 </tutorials/04-tuning>`. The synthetic tuning workflow is useful for
-search-space exploration; it does not yet establish the best mapped executable
-for the original source.
+:doc:`tutorial 4 </tutorials/04-tuning>`. Use explicit target-aware source tuning for replayable selected plans; compatibility tuning remains a separate synthetic mode. Static ranking does not prove the fastest measured executable.
 
 **Explore the timing harness:** read the :doc:`benchmark guide </tools/benchmark>`
 before using ``llk-bench``. Its synthetic host loop measures the harness rather
@@ -125,26 +123,17 @@ conditions; these APIs do not constitute the planned calibrated measurement loop
 Work planned separately
 -----------------------
 
-The :source:`issue #129 gap-closure plan <docs/superpowers/plans/2026-10-07-issue129-gap-closure.md>`
-defines proposed repairs in three areas:
+PR #133 completes the #129 resource, runtime, mapped tuning and acceptance
+repair series within the supported bounded contract. Production measured-record
+persistence, calibration fitting and prediction-error validation remain #51/#52.
+The generic accelerator package has static two-hop conformance, not hardware
+execution. A direct MicroIR emulator and broad Python/model frontend remain deferred.
 
-* **Resources and static scoring:** preserve concrete selections; finalize
-  per-hop storage/liveness before retaining plans; respect each resource's own
-  concurrency; align selected-plan and bound-kernel static analysis.
-
-* **Execution and runtime:** validate typed invocation descriptors; establish
-  output ownership and deterministic scratch release; lower fused selections as
-  groups; realize selected vector widths and ISA requirements in backend code.
-
-* **Tuning and acceptance:** instantiate the original source for each binding;
-  integrate mapping, selected analysis and optional compilation/measurement;
-  strengthen replay and all required numerical/public workflow checks.
-
-These are planned contracts, not available flags or newly delivered APIs.
-Production measured-record persistence, calibration fitting and prediction-error
-validation remain the separate #51/#52 workstream. A direct MicroIR emulator and
-a broad Python/model frontend remain deferred. Existing Python/Triton-related
-scaffolding does not establish a complete general frontend.
+Selected AVX2 acceptance passed 13/13 without required skips. The implementation
+CI suite recorded 1,215 entries, 1,211 passed, three legacy JIT skips and one
+pre-existing disabled test. The legacy skips do not establish numerical legacy
+JIT execution and are not host AVX2 capability skips. See the acceptance matrix
+for their diagnostics and exact revision.
 
 .. _features-reading-status-evidence:
 
@@ -167,7 +156,7 @@ contract. In particular:
 * Shared event primitives do not by themselves establish planner/analyzer cost
   parity, and static parity does not establish calibrated hardware prediction.
 
-For exact reproduced failures and scope, read the
-:source:`current gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>`.
+For current verified scope and retained limits, read the
+:source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`.
 To help close a gap or extend a capability, start with
 :doc:`contributing </contributing>`.

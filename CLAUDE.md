@@ -22,7 +22,7 @@ ctest --output-on-failure        # Same suite, without building first
 ctest -R MicroDialectTileOps     # Run a single FileCheck test
 ./bin/llk-opt input.mlir             # Parse + print IR
 ./bin/llk-opt --llk-to-linalg input.mlir  # Run a specific pass
-./bin/llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store" input.mlir  # Search, bind best plan
+./bin/llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul" input.mlir  # Search, bind best plan
 ./bin/LLKMappingTests --gtest_filter=MappingPlan.*  # Run selected GTest cases
 ```
 
@@ -39,7 +39,7 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 **Two lowering paths from LLK/Linalg:**
 
 1. **CPU validation path** — Linalg → tiled/fused (scf.forall) → Vector SIMD → memref → CF+runtime → LLVM → ORC JIT → AVX2
-2. **Micro-IR path (M9+)** — `LLKToMicro` → `micro.search_space` (parametric) or concrete `micro.kernel` → performance model / future target lowering
+2. **Micro-IR path (M9+)** — `LLKToMicro` → `micro.search_space` (parametric) or concrete `micro.kernel` → target-aware mapping / shared static analysis / selected or reference lowering / ORC JIT
 
 **Micro-IR conceptual layering** (one dialect, one `micro` namespace):
 `uTile` (tile dataflow) → `uMap` (memory placement, owner mapping, pipeline, sync) → `uHW` (instruction fragments, machine-visible events)
@@ -75,7 +75,7 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 - C++20, CMake ≥ 3.20, LLVM/MLIR 20+, GTest, FileCheck
 - Naming: `llk` dialect prefix, `llk-*` tools, CamelCase passes, snake_case files
 - Error handling: MLIR `emitError()` for verifier failures, `llvm::Expected<T>` for JIT ops
-- ABI: C structs (`Tensor2D`, `KernelContext`) — not MLIR memref descriptors
+- ABI: the established CPU wrapper uses `Tensor2D`/`KernelContext`; mapped execution uses typed `InvocationBuffer2D` carrying a `MemRef2D` descriptor, dtype and backing allocation size. Prefer the typed invocation API; the deprecated untagged descriptor overload cannot check dtype or allocation bounds. Caller buffers remain caller-owned; compiler scratch is released per invocation.
 - TDD: every task starts with a failing test, then minimal code; commit per task
 - FileCheck tests are plain `add_test` entries in `test/FileCheck.cmake` — there is no lit runner, and `// RUN:` lines are comments only. Register new `.mlir` tests by hand with `add_llk_filecheck_test(Name test/Dialect/Micro/foo.mlir)` (an optional trailing argument is passed through to the tool, e.g. pass options), or use a raw `add_test` with `--verify-diagnostics --split-input-file` for invalid-IR tests
 - Mapping/target boundary: generic `lib/Mapping` + `lib/Machine` stay target-neutral; target policy is data (`mapping/*.llkmap`, `machines/*.yaml`). `LLKMapping` takes `-fno-rtti -fno-exceptions` and links only `LLVMSupport`/`LLKMachine` (+ `MLIRIR`/`MLIRAsmParser` via `mlir_target_link_libraries`)
@@ -84,9 +84,13 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 
 M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, specialization/tuning, RoPE + Attention). M7 (Python frontend) deferred.
 
-**M9–M12 delivered the epic #67 mapping subsystem's infrastructure; mandatory epic #67 acceptance remains open under issue #129.** Search-space IR (#44), LLKToMicro + search export (#47/#48), MachineModel + `micro-perf` (#45/#46), tuning core + candidate binding/ranking (#49/#50), and the topology-aware mapping subsystem: MachineModel v2 topology, deterministic routing, declarative LLKMap layouts and rules, placement and connection synthesis, deterministic/beam/exact covering search, AVX2 + generic-accelerator target packages, plan binding and emission, §22.3 diagnostics, §22.2 versioned plan report, and an optional `LatencyProvider`. The 27-task improvement plan's A/B/C stages are merged: endpoint identity and layered verification (A), plan materialization, storage, synchronization and joint exact connection search (B), and explicit kernel ABI, target-owned emitter lowering, a descriptor-pointer `MappedExecutable`, shared mapped compilation, tuner integration, fused rules and acceptance chains (C1–C8); C9 removed backend owner vocabulary from generic Micro ODS. A verification review on 2026-10-07 found ten open, verified gaps — recorded in issue #129 — so stage delivery is *not* the same as passing every §29 acceptance gate. `docs/reviews/issue67-final-acceptance.md` publishes interim, revision-pinned evidence; the repair plan is `docs/superpowers/plans/2026-10-07-issue129-gap-closure.md`.
+**M9–M12 and mapped acceptance:** PR #133 merged on 2026-10-11 at `5ee61b193d85b873497e9a7aecbd07f1fea73c55`. It implements the #129 resource, execution and tuning repair series: concrete selected resource identity, feasibility before top-K, per-hop storage/lifetimes, per-engine DMA scheduling, selected-plan/materialized static parity, typed invocation and scratch ownership, explicit selected-width/fused lowering, and original-source mapped tuning with frozen replay.
 
-**Current #129 closure branch:** R/E/T implementation is verified through source head `6c42be938d8f72ef3d66dc2731b3cfdfeb387b85`. Pinned Linux static LLVM/MLIR 22.1.8 CI run `38124760443` passes selected AVX2 (13/13, no skips), full CTest (1,215 registered, 1,211 passed, three legacy JIT skips, one pre-existing disabled test), and both artifact validators. Seven manifests preserve selected target/ABI/plan/machine/LLVM identities with zero reference groups. Coverage, CodeQL and manual checks pass. The revision-pinned twelve-criterion matrix and legacy limitations are in `docs/reviews/issue67-final-acceptance.md`. PR #133 remains unmerged; #129/#67/#106/#109 closure checklists require merged evidence. Production calibration (#51/#52) and accelerator hardware execution remain separate.
+**Verification:** final PR head `d038fed` passed pinned Linux static LLVM/MLIR 22.1.8 CI run `38126440190`. Implementation-head artifacts record selected AVX2 13/13 without skips and full CTest 1,215 registered / 1,211 passed / zero failed / three legacy JIT skips / one disabled test. Seven selected-plan manifests capture exact LLVM IR, target/ABI/plan/machine identity and zero reference groups. Counts depend on registration/toolchain; retain the exact revision and skip reasons. See `docs/reviews/issue67-final-acceptance.md` for the twelve-criterion matrix and historical snapshots.
+
+**Supported boundary:** selected-target execution requires compatible x86_64 AVX2; reference execution is a separate portable correctness mode. Generic-accelerator coverage is static conformance, not hardware execution. Legacy JIT skips remain documented; production persistence/calibration (#51/#52), general frontend coverage and the directly interpreting Micro emulator (#54) remain separate.
+
+**Mapped implementation guidance:** `LLKMapping` remains independent of perf/runtime/JIT libraries. Complete-plan integration finalizes materialization and shared analysis before retention. `compileMappedKernel` is shared by mapped compiler/tuner workflows. Runtime LLVM lowering registers dialect conversion interfaces and uses unified ConvertToLLVM after structural/vector lowering; keep the unit-row transfer rewrite guarded by its shape, index, mask and in-bounds checks. Source-candidate and measurement identities must preserve full content, selected plan, machine, ABI and execution mode; missing measured metrics cannot rank as zero.
 
 ## Key Files
 
@@ -99,8 +103,8 @@ M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, sp
 | `docs/superpowers/specs/2026-08-13-micro-ir-tile-programming-model-spec.md` | Detailed tile programming model |
 | `docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md` | Epic #67 design: mapping engine, MachineModel v2, routing, LLKMap, covering search, plan binding (§-numbered throughout the code) |
 | `docs/design/micro-ir-mapping-workflow.md` | Contributor workflow: extract → match → place → connect → cover → bind → verify |
-| `docs/reviews/issue67-final-acceptance.md` | Interim, revision-pinned §29 acceptance evidence: criterion → tests → result → limitation, and the #51/#52 handoff. Mandatory rows remain open under issue #129 |
-| `docs/reviews/2026-10-07-issue67-current-gap-assessment.md` | Verified, revision-pinned assessment of the ten open #129 gaps — the current authority for what is and is not proved |
+| `docs/reviews/issue67-final-acceptance.md` | Revision-pinned PR #133 §29 evidence, historical snapshots, capability limits and the #51/#52 handoff |
+| `docs/reviews/2026-10-07-issue67-current-gap-assessment.md` | Historical pre-#133 assessment of the ten #129 gaps; use the final acceptance matrix for current evidence |
 | `docs/design/llkmap-layout-grammar.md`, `docs/design/llkmap-rule-grammar.md` | LLKMap declarative grammar: layouts, rules, target bundles |
 | `include/LLK/Machine/` + `lib/Machine/` | `MachineModel` v2 topology, loader, content hash |
 | `include/LLK/Mapping/` + `lib/Mapping/` | Mapping core: workload graph, routing, LLKMap, rules, placement, covering search, plan binder, cost/latency/diagnostics/report |
@@ -108,7 +112,7 @@ M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, sp
 | `mapping/<target>/{layouts,rules}.llkmap` | Declarative target policy (layouts + mapping rules + bundles) |
 | `machines/*-v2.yaml` | MachineModel v2 topology profiles |
 | `docs/superpowers/plans/2026-10-03-micro-ir-gap-closure.md` | Gap-closure plan (31 TDD tasks) |
-| `docs/superpowers/plans/2026-10-07-issue129-gap-closure.md` | Active plan closing the ten verified #129 gaps (R/E/T tasks, release gates) |
+| `docs/superpowers/plans/2026-10-07-issue129-gap-closure.md` | Completed #133 repair plan and R/E/T verification ledger |
 | `include/LLK/Dialect/Micro/` + `lib/Dialect/Micro/` | `micro` dialect implementation |
 | `docs/superpowers/plans/m[1-6]-*.md` | Implementation plans with TDD tasks + complete code |
 | `docs/superpowers/plans/2026-07-14-llk-compiler-implementation.md` | Plan index + file map |

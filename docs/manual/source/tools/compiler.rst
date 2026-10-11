@@ -225,7 +225,13 @@ For example:
    build/bin/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
      --mapping-mode=exact docs/manual/source/examples/matmul.mlir
 
-The shipped matmul example currently reports one target-lowered operation and four reference-lowered operations at the later stages. SwiGLU reports three and six. These count emitter-hook dispatches; they do not certify selected vector width, actual AVX2 instructions, physical resource occupancy, or numerical correctness. Native JIT execution is host-portable, and selected AVX2 width is currently lost by the tensor reference bridge. Read the :source:`current gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>` before treating mapping success as complete target-execution acceptance.
+Mapped lowering reports verified selected groups, backend realization and reference
+lowering separately. ``--mapping-backend=reference`` provides portable correctness;
+``--mapping-backend=selected-target`` preserves selected vector widths/fused groups,
+checks x86_64 AVX2 compatibility and rejects reference fallback. Dispatch counts
+alone do not prove numerical execution. PR #133's selected numerical gate and
+exact LLVM/plan artifacts are recorded in the
+:source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`.
 
 ``--mapping-root`` makes the package load these conventional paths:
 
@@ -245,7 +251,7 @@ The shipped matmul example currently reports one target-lowered operation and fo
 
 The package supplies its emitter keys in code. The compiler does not accept the optimizer's individual ``machine=``, ``layouts=``, ``rules=``, or ``emitters=`` pass options. Use :doc:`llk-opt </tools/optimizer>` when experimenting with policy files. The accelerator's shipped rules cover a smaller operation set; do not assume it can map the tile-level matmul/SwiGLU export or execute accelerator hardware.
 
-Mapped compilation uses an executable binding contract by default. It rejects decisions the binder cannot materialize; the driver has no partial-binding toggle. That contract does not close the known storage, scheduling, selected-width, and fused-lowering gaps described in the assessment. Use the optimizer's report-only mode for analysis without binding.
+Mapped compilation uses an executable binding contract by default. It rejects decisions the binder cannot materialize; the driver has no partial-binding toggle. It preserves concrete selected resources and rejects unresolved storage, scheduling or backend decisions. Use the optimizer's report-only mode for analysis without binding.
 
 .. _tools-compiler-replay-a-saved-selection:
 
@@ -273,9 +279,20 @@ Runtime boundary
 
 The CLI provides neither input buffers nor an invocation command. To run a mapped kernel from C++, use the executable returned by ``compileMappedKernel`` and ``MappedExecutable::invoke``; see :source:`MappedExecutable.h <include/LLK/Runtime/MappedExecutable.h>` and the numerical examples in :source:`mapped_acceptance.cpp <test/Execution/mapped_acceptance.cpp>`.
 
-The mapped API records the kernel's declared input/output ports before type erasure, accepts pointers to ``MemRef2D`` descriptors in port order, and writes caller-owned output buffers. The Micro matmul export has A/B inputs and one result; its source ``%init`` argument is not an input port in that exported ABI. A raw function pointer from the legacy ``JitCache`` uses a separate fixed descriptor signature. ``Tensor2D``, ``MemRef2D``, and ``KernelContext`` are distinct structures; avoid casting between their addresses.
+The mapped API records declared ports before type erasure and invokes them in
+port order. Prefer ``InvocationBuffer2D``: it carries a ``MemRef2D`` descriptor,
+dtype and backing allocation bytes. Typed invocation checks arity, rank-two
+shape, dtype, supported strides, offset/bounds and unsafe aliasing before calling
+machine code. Caller buffers remain caller-owned; compiler scratch is released
+per invocation. Unsupported ranks/dtypes are rejected before publishing an
+executable. ``Tensor2D``, ``MemRef2D`` and ``KernelContext`` are distinct structures.
 
-Current numerical support should be treated as rank-two, row-major descriptor invocation. The descriptor has no runtime dtype tag, unsupported ranks are not comprehensively rejected, and compiler-created temporary allocations are not deterministically freed between mapped calls. A successful CLI compilation checks neither those invocation inputs nor repeated-call allocation behavior. These limitations are recorded in the :source:`current assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>`; do not infer that every ABI claim in a header comment is an enforced runtime check.
+The deprecated untagged ``MemRef2D*`` overload checks arity/shape/stride but cannot
+validate runtime dtype or backing allocation size. Do not treat it as equivalent
+to typed invocation. The Micro matmul exporter has A/B inputs and one result;
+its original ``%init`` is not an input in that exported ABI. Candidate semantic
+instantiation can have a different ABI; read the executable's ``KernelAbi``
+rather than inferring its ports from the original function.
 
 .. _tools-compiler-troubleshooting:
 
@@ -301,9 +318,9 @@ Troubleshooting
    * - Mapping cannot load files
      - Run from the repository root or set ``--mapping-root`` to the directory containing both ``machines/`` and ``mapping/``.
    * - No complete plan
-     - Check operation/dtype support and inspect an optimizer mapping report. Beam/candidate caps can limit the search; exact mode still has finite internal caps and known feasibility limitations.
+     - Check operation/dtype support and inspect an optimizer mapping report. Beam/candidate caps can limit the search; exact mode still has finite internal caps and reports truncation.
    * - No selected vector width / fused emitter failure
-     - Inspect the selected rule and bundle. The shipped fused ``convert → silu → mul`` rule has a known target-lowering integration gap.
+     - Inspect the selected rule and bundle. The shipped fused ``convert → silu → mul`` chain is verified. Inspect unsupported emitter/effect/region diagnostics and use the intended backend policy.
    * - Report hash/version mismatch
      - Use the original pre-mapping Micro input and the exact target configuration that produced the report; regenerate after intentional changes.
    * - Saved mapped output does not parse
@@ -311,4 +328,4 @@ Troubleshooting
    * - JIT symbol/translation error
      - First inspect ``--emit=mlir`` or ``--mapping-stop=lowered``; compilation requires a valid exported entry and all operations to reach the backend.
 
-For cost estimates use :doc:`micro-perf </tools/performance>`. For candidate ranking use :doc:`llk-tune </tools/tuning>`. :doc:`llk-bench </tools/benchmark>` runs the current synthetic host harness; it does not time this compiled kernel. Actual kernel timing requires a C++ caller that supplies descriptors, invokes the executable, checks the result, and measures calls.
+For cost estimates use :doc:`micro-perf </tools/performance>`. For candidate ranking use :doc:`llk-tune </tools/tuning>`. :doc:`llk-bench </tools/benchmark>` runs the current synthetic host harness; it does not time this compiled kernel. For verified candidate timing, use target-aware ``llk-tune --measure-top`` with a typed ``--measurement-inputs`` fixture, or a C++ caller that checks and times invocations.

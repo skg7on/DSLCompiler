@@ -31,7 +31,7 @@ under ``build/tutorial/``. Commands run from the repository root.
      - How to assess a static prediction before comparing machines
    * - Tuning
      - Predicted schedule YAML records
-     - How to bound a search and interpret synthetic candidate ranking
+     - How to distinguish compatibility ranking from original-source mapping, replay and verified measurement
 
 Run the automated companion after building the five tools:
 
@@ -39,7 +39,8 @@ Run the automated companion after building the five tools:
 
    python3 docs/manual/source/tutorials/run_tutorials.py --build-dir build
 
-The :download:`tutorial runner </tutorials/run_tutorials.py>` checks 26 commands
+The :download:`tutorial runner </tutorials/run_tutorials.py>` checks the documented commands
 and their artifacts. It verifies parsing, export, mapping/replay, static work
-and traffic, and schedule persistence. It does not invoke tensor computations
-or prove selected ISA fidelity. See :doc:`/features` for those remaining contracts.
+and traffic, schedule persistence, original-source frozen replay and verified
+reference measurement. It does not prove selected ISA fidelity; that uses the
+required AVX2 acceptance gate. See :doc:`/features` for exact evidence.

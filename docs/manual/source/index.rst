@@ -104,7 +104,7 @@ The tutorials run from the repository root, use binaries in ``build/``, and writ
 Reading the project accurately
 ------------------------------
 
-This guide describes the implementation on ``main`` after PRs #128 and #130, using their source baseline ``bb82038``. It introduces the architecture's intended contracts and identifies where implementation evidence is narrower. A successful parse, mapping, cost estimate, JIT compilation, and numerical invocation establish different things.
+This guide describes the implementation after merged PR #133 (``5ee61b1``, 2026-10-11). It introduces the architecture's intended contracts and identifies where implementation evidence is narrower. A successful parse, mapping, cost estimate, JIT compilation, and numerical invocation establish different things.
 
 .. important::
 
@@ -112,7 +112,14 @@ This guide describes the implementation on ``main`` after PRs #128 and #130, usi
    and calibrated performance predictions need different evidence. Read
    :doc:`features` before treating a successful command as a broader guarantee.
 
-The :doc:`feature guide </features>` summarizes current capabilities. `Issue #129 <https://github.com/skg7on/DSLCompiler/issues/129>`__, its :source:`implementation plan <docs/superpowers/plans/2026-10-07-issue129-gap-closure.md>`, and the :source:`gap assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>` track remaining resource, execution, tuning, and acceptance work. Those plans are not user-facing features already delivered. Measurement calibration is separate work in `#51 <https://github.com/skg7on/DSLCompiler/issues/51>`__ and `#52 <https://github.com/skg7on/DSLCompiler/issues/52>`__.
+The :doc:`feature guide </features>` summarizes current capabilities. Merged
+`PR #133 <https://github.com/skg7on/DSLCompiler/pull/133>`__ delivers #129's resource,
+execution and original-source tuning repairs. The
+:source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>` records the
+supported contract, selected AVX2 evidence and retained legacy limits. Production
+measurement/calibration remains separate in
+`#51 <https://github.com/skg7on/DSLCompiler/issues/51>`__ and
+`#52 <https://github.com/skg7on/DSLCompiler/issues/52>`__.
 
 .. _index-deeper-references:
 

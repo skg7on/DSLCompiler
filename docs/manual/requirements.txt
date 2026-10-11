@@ -1,4 +1,4 @@
-# Python 3.12+. Pin rendering dependencies so committed HTML is reproducible.
+# Python 3.12+. Pin rendering dependencies so generated HTML is reproducible.
 accessible-pygments==0.0.5
 alabaster==1.0.0
 babel==2.18.0

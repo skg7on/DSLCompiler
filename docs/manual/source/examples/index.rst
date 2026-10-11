@@ -25,7 +25,7 @@ These files are small, checked-in inputs for the :doc:`developer tutorials </ind
      - A deliberately small, one-candidate search space
      - A predicted schedule YAML record from ``llk-tune``
 
-The first two are semantic source programs, not tensor data files. Their destination operands express the LLK interface. The current Micro exporter declares the computation's external input operands and creates its result internally; it does not preserve an arbitrary destination accumulator's initial contents. The tile example is an analysis fixture with ``tensor.empty``, not a numerical invocation example. The search example is for the current synthetic candidate binder, not a mapping-driven tuner.
+The first two are semantic source programs, not tensor data files. Their destination operands express the LLK interface. The current Micro exporter declares the computation's external input operands and creates its result internally; it does not preserve an arbitrary destination accumulator's initial contents. The tile example is an analysis fixture with ``tensor.empty``, not a numerical invocation example. The search-only example exercises compatibility binding. The target-aware tuning tutorial uses a source-plus-space fixture and saves frozen mapping artifacts.
 
 The tutorial commands are exercised by :download:`run_tutorials.py </tutorials/run_tutorials.py>`, which checks generated IR, plan replay, prediction reports, and schedule output. It does not claim numerical execution or selected AVX2 instruction verification.
 

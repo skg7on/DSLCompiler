@@ -100,7 +100,7 @@ After building the compiler tools, run the registered documentation checks:
 
 .. code-block:: bash
 
-   ctest --test-dir build -R 'DocReferences|CommunityTutorials' \
+   ctest --test-dir build -R 'DocReferences|CommunityTutorials|WorkflowSmoke' \
      --output-on-failure
 
 ``DocReferences`` checks paths and CLI flag names against the built tools'
@@ -130,7 +130,10 @@ the pinned dependencies, runs checker and Sphinx extension regressions, and
 builds the manual with
 warnings treated as errors. Each successful run uploads a ``developer-manual``
 artifact containing the HTML directory. The compiler CI separately runs
-``DocReferences`` and ``CommunityTutorials`` against freshly built binaries.
+``DocReferences``, ``CommunityTutorials`` and ``WorkflowSmoke`` against freshly
+built binaries. WorkflowSmoke executes the allowlisted documented source-tuning,
+mapping, replay and performance commands; its negative controls reject invalid
+fixtures/options. These checks complement strict Sphinx references.
 
 Published site
 --------------

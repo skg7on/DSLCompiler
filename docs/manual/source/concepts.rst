@@ -157,8 +157,8 @@ execution detail:
 They share the ``micro`` namespace. There are no separate ``uTile``, ``uMap``, or ``uHW``
 dialects, and users do not run a fixed three-pass pipeline with those names.
 The labels explain which decisions a representation contains. Target lowering
-eventually realizes selected facts in backend IR or code; the current mapped
-backend still has realization gaps described in :doc:`features </features>`.
+realizes supported selected widths and fused groups in backend IR/code. Reference
+and selected-target execution have distinct policies; see :doc:`features </features>`.
 
 .. _concepts-time-space-and-dependencies:
 
@@ -179,9 +179,9 @@ backend. Merely writing a pipeline or async copy does not demonstrate hardware
 concurrency.
 
 The performance analyzer recovers structural work and dependencies from these
-operations. Mapping also extracts a workload graph, but the planner and bound
-kernel analyzer do not yet agree on all structural multiplicity and resource
-costs. Their estimates must be compared explicitly.
+operations. Mapping finalizes the selected plan through shared materialized
+analysis before top-K retention. Parity checks cover structural multiplicity,
+traffic, storage and concrete resources. Static parity is not calibration.
 
 .. _concepts-search-ir-and-concrete-ir:
 
@@ -212,9 +212,9 @@ legal candidates are ranked, commonly by latency cycles.
 
 Search IR is not executable. Binding parameters is also distinct from selecting
 a target mapping plan: a tile size can be fixed before the compiler decides which
-executor, layout rule, or transfer route to use. The current tuner generates,
-checks, binds and ranks synthetic GEMM/SwiGLU kernels; integration that maps and
-compiles every original-source candidate is planned under issue #129. See
+executor, layout rule, or transfer route to use. Target-aware tuning instantiates
+the original source, selects and binds a plan, and retains frozen replay artifacts.
+Optional verified measurement compiles and invokes supported candidates. See
 :doc:`tuning </tools/tuning>` for the supported workflow.
 
 .. _concepts-a-kernels-signature-is-its-contract:
@@ -237,7 +237,8 @@ show the explicit form.
 The logical signature should also be distinguished from the runtime interface.
 The mapped runtime uses buffer descriptor pointers; the established CPU runtime
 uses its existing C-struct wrapper. The mapped descriptor and buffer ownership
-contracts still need repairs before broad repeated-invocation use.
+contracts use typed dtype/allocation metadata and checked rank-two descriptors.
+Caller buffers remain caller-owned; compiler scratch is released per invocation.
 
 .. _concepts-abstract-symbols-and-concrete-machine-nodes:
 

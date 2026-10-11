@@ -19,7 +19,7 @@ Two CPU compilation paths
 -------------------------
 
 The established LLK/Linalg CPU path and the newer mapped MicroIR path coexist.
-They share infrastructure but do not yet provide the same execution guarantees.
+They share infrastructure and offer distinct operation coverage and backend policies.
 
 .. figure:: _static/architecture.svg
    :alt: The established CPU pipeline and the mapped MicroIR pipeline share LLVM infrastructure; machine facts and target policy feed mapping and cost analysis.
@@ -39,9 +39,9 @@ LLK-to-Linalg conversion; ``llk.matmul`` is left untouched by that pass and uses
 Micro export plus mapped compilation. RoPE and attention use the established
 CPU path and are not current ``LLKToMicro`` export roots.
 
-The search branch currently evaluates synthetic candidate kernels. The diagram
-does not imply that ``llk-tune`` maps, replays, and compiles the original source for
-every candidate. That integration is planned.
+Target-aware search instantiates the original source, maps and analyzes candidates,
+and saves selected-plan artifacts for replay. Compatibility mode remains synthetic.
+Optional verified measurement uses the shared mapped compiler and typed inputs.
 
 .. _architecture-components-and-ownership:
 
@@ -139,17 +139,16 @@ The main interfaces are :source:`WorkloadGraph.h <include/LLK/Mapping/WorkloadGr
 
 Search supports deterministic, beam, and exact modes with configurable bounds.
 Beam search is an exploration heuristic. Exact search explores its bounded
-candidate/connection space, but the current final-storage check occurs after
-top-K retention and can lose a more expensive feasible plan. Do not interpret
-the mode name as a complete physical-feasibility or global-optimality guarantee.
+candidate/connection space. Complete-plan materialization, storage feasibility and
+shared final cost evaluation occur before top-K retention. Exact mode still has
+explicit finite caps; its name does not imply unbounded global optimality.
 
 The binder clones the source instead of modifying it in place. It stores
 ``micro.plan``, per-operation ``micro.mapping``, and ``micro.routes``, then delegates
 canonical movement construction to a materializer. Copies can carry value and
 destination-node provenance. A partial binding records unmaterialized decisions;
-the executable contract rejects those decisions. Current storage-fact bypasses
-and incomplete compute persistence mean that this contract still needs the
-repairs documented under issue #129.
+the executable contract rejects those decisions. Concrete resource selections,
+per-hop storage IDs, lifetimes and target-content identity survive binding/replay.
 
 .. _architecture-machine-facts-and-target-policy:
 
@@ -206,24 +205,23 @@ Performance and execution boundaries
 The performance analyzer turns concrete operations and structural scopes into a
 MicroDAG, work/byte estimates, dependencies and resource events. Level 0 supplies
 static bounds; level 1 adds resource scheduling. Mapping also uses cost events
-and a scheduler to compare plans. Shared primitives are useful, but current
-planner and bound-kernel costs are not fully equivalent; named DMA occupancy and
-physical-storage accounting also have known defects.
+and a scheduler to compare plans. Complete-plan integration uses shared normalized
+materialized analysis, per-engine capacity and live-storage accounting; public
+chains compare cycles and traffic and reject capacity violations.
 
 Mapped compilation runs plan binding, mapped verification, target emitter
 lowering, then ``MicroToLinalg`` and backend passes. It offers intermediate stopping
 points for inspecting mapped MicroIR and target-lowered/lowered forms.
-``MappedExecutable`` owns an ORC JIT and calls its wrapper through descriptor
-pointers. The current path lowers supported work to scalar Linalg loops and uses
-the native host; a selected vector layout can be lost at the tile-to-tensor
-conversion. Compiler-allocated buffer release and typed descriptor validation
-are also unfinished contracts.
+``MappedExecutable`` owns an ORC JIT and invokes a wrapper with typed rank-two
+buffers. The selected backend preserves explicit vector widths and fused groups,
+checks target ISA compatibility and refuses reference fallback. The reference
+backend provides portable correctness. Both use checked invocation and per-call
+scratch ownership. Backend conversion registers MLIR dialect interfaces and uses
+the unified LLVM conversion pipeline after structural/vector lowering.
 
-These are active extension areas, not reasons to conflate analysis with target
-execution. Read the :source:`current assessment <docs/reviews/2026-10-07-issue67-current-gap-assessment.md>`
-for reproduced cases and the :source:`#129 plan <docs/superpowers/plans/2026-10-07-issue129-gap-closure.md>`
-for proposed repairs. Measurement persistence and calibrated prediction remain
-the separate #51/#52 workstream.
+The :source:`PR #133 acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
+records selected x86_64 AVX2 execution, static parity and retained legacy skips.
+Production measurement persistence and calibrated prediction remain #51/#52.
 
 For the established CPU pipeline's detailed scheduling and runtime design, see
 :source:`ARCHITECTURE.md <ARCHITECTURE.md>`. For the normative mapping design, see
