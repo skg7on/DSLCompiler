@@ -25,6 +25,7 @@
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
@@ -45,6 +46,30 @@
 using namespace mlir;
 
 namespace llk {
+
+namespace {
+struct DumpScalableTransferWritesPass
+    : mlir::PassWrapper<DumpScalableTransferWritesPass,
+                        mlir::OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpScalableTransferWritesPass)
+  llvm::StringRef getArgument() const final { return "dump-scalable-writes"; }
+  void runOnOperation() override {
+    getOperation().walk([&](mlir::Operation *op) {
+      if (op->getName().getStringRef() != "vector.transfer_write")
+        return;
+      auto type = mlir::dyn_cast<mlir::VectorType>(op->getOperand(0).getType());
+      if (!type || !llvm::is_contained(type.getScalableDims(), true))
+        return;
+      llvm::errs() << "SCALABLE WRITE AFTER V2SCF: ";
+      op->dump();
+      if (auto *def = op->getOperand(0).getDefiningOp()) {
+        llvm::errs() << "SCALABLE WRITE VECTOR DEF: ";
+        def->dump();
+      }
+    });
+  }
+};
+} // namespace
 
 // ---------------------------------------------------------------------------
 // CacheLevel method implementations
@@ -177,6 +202,7 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   // cannot lower directly.
   pm.addPass(mlir::createConvertVectorToSCFPass(
       mlir::VectorTransferToSCFOptions().enableLowerScalable()));
+  pm.addPass(std::make_unique<DumpScalableTransferWritesPass>());
   // Lower structured control flow (scf) to basic-block control flow (cf).
 #if LLVM_VERSION_MAJOR >= 21
   pm.addPass(mlir::createSCFToControlFlowPass());
