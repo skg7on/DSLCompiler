@@ -169,6 +169,9 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   // `index` values, which in turn keeps `i64 -> index` materializations alive
   // all the way to LLVM translation, which refuses them.
   pm.addPass(mlir::createLowerAffinePass());
+  // Expose vector transpose producers to VectorToSCF's scalable transfer
+  // lowering patterns.
+  pm.addPass(mlir::createCanonicalizerPass());
   // Reduce vector transfers to rank-one transfers and SCF loops before SCF is
   // lowered. This handles scalable transfer dimensions that VectorToLLVM
   // cannot lower directly.
