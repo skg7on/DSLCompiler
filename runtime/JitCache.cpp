@@ -48,28 +48,56 @@ using namespace mlir;
 namespace llk {
 
 namespace {
-struct DumpScalableTransferWritesPass
-    : mlir::PassWrapper<DumpScalableTransferWritesPass,
+// VectorToLLVM leaves writes of row-broadcast vectors in vector.transfer form
+// on LLVM 22. The mapped kernel's row is a statically sized, in-bounds unit
+// dimension, so project that dimension out of the transfer map and write the
+// source vector directly along the remaining dimension.
+struct LowerBroadcastRowTransferWritesPass
+    : mlir::PassWrapper<LowerBroadcastRowTransferWritesPass,
                         mlir::OperationPass<mlir::ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DumpScalableTransferWritesPass)
-  llvm::StringRef getArgument() const final { return "dump-scalable-writes"; }
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      LowerBroadcastRowTransferWritesPass)
+  llvm::StringRef getArgument() const final {
+    return "lower-broadcast-row-transfer-writes";
+  }
   void runOnOperation() override {
-    unsigned printed = 0;
-    getOperation().walk([&](mlir::Operation *op) {
-      if (op->getName().getStringRef() != "vector.transfer_write" ||
-          printed == 3)
+    llvm::SmallVector<mlir::vector::TransferWriteOp> writes;
+    getOperation().walk([&](mlir::vector::TransferWriteOp write) {
+      auto broadcast =
+          write.getVector().getDefiningOp<mlir::vector::BroadcastOp>();
+      if (!broadcast || write.getMask() ||
+          !write.getPermutationMap().isIdentity())
         return;
-      auto type = mlir::dyn_cast<mlir::VectorType>(op->getOperand(0).getType());
-      llvm::errs() << "TRANSFER WRITE AFTER V2SCF (scalable="
-                   << (type && llvm::is_contained(type.getScalableDims(), true))
-                   << "): ";
-      op->dump();
-      if (auto *def = op->getOperand(0).getDefiningOp()) {
-        llvm::errs() << "TRANSFER WRITE VECTOR DEF: ";
-        def->dump();
-      }
-      ++printed;
+      auto resultType = mlir::dyn_cast<mlir::VectorType>(write.getVectorType());
+      auto sourceType =
+          mlir::dyn_cast<mlir::VectorType>(broadcast.getSource().getType());
+      auto memrefType =
+          mlir::dyn_cast<mlir::MemRefType>(write.getBase().getType());
+      if (!resultType || !sourceType || !memrefType ||
+          resultType.getRank() != 2 || sourceType.getRank() != 1 ||
+          resultType.getDimSize(0) != 1 || memrefType.getRank() != 2 ||
+          memrefType.getDimSize(0) != 1 || write.getIndices().size() != 2 ||
+          !mlir::matchPattern(write.getIndices().front(), mlir::m_Zero()))
+        return;
+      if (!llvm::all_of(write.getInBoundsValues(),
+                        [](bool inBounds) { return inBounds; }))
+        return;
+      writes.push_back(write);
     });
+
+    for (mlir::vector::TransferWriteOp write : writes) {
+      auto broadcast =
+          write.getVector().getDefiningOp<mlir::vector::BroadcastOp>();
+      auto loc = write.getLoc();
+      auto map = mlir::AffineMap::get(
+          2, 0, mlir::getAffineDimExpr(1, write.getContext()));
+      const bool inBounds[] = {true};
+      mlir::OpBuilder builder(write);
+      mlir::vector::TransferWriteOp::create(
+          builder, loc, broadcast.getSource(), write.getBase(),
+          write.getIndices(), map, llvm::ArrayRef<bool>(inBounds));
+      write.erase();
+    }
   }
 };
 } // namespace
@@ -197,15 +225,15 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   // `index` values, which in turn keeps `i64 -> index` materializations alive
   // all the way to LLVM translation, which refuses them.
   pm.addPass(mlir::createLowerAffinePass());
-  // Expose vector transpose producers to VectorToSCF's scalable transfer
-  // lowering patterns.
+  // Canonicalize vector producers before transfer lowering.
   pm.addPass(mlir::createCanonicalizerPass());
   // Reduce vector transfers to rank-one transfers and SCF loops before SCF is
   // lowered. This handles scalable transfer dimensions that VectorToLLVM
   // cannot lower directly.
   pm.addPass(mlir::createConvertVectorToSCFPass(
       mlir::VectorTransferToSCFOptions().enableLowerScalable()));
-  pm.addPass(std::make_unique<DumpScalableTransferWritesPass>());
+  // Handle unit-row broadcasts that VectorToSCF and VectorToLLVM leave behind.
+  pm.addPass(std::make_unique<LowerBroadcastRowTransferWritesPass>());
   // Lower structured control flow (scf) to basic-block control flow (cf).
 #if LLVM_VERSION_MAJOR >= 21
   pm.addPass(mlir::createSCFToControlFlowPass());
