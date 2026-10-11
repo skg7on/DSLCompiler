@@ -350,6 +350,14 @@ target_compile_options(LLKMapping PRIVATE -fno-rtti -fno-exceptions)
 # mlir_target_link_libraries() like every other MLIR dependency here.
 mlir_target_link_libraries(LLKMapping PRIVATE MLIRIR MLIRAsmParser)
 
+add_mlir_library(LLKKernel
+    lib/Conversion/LLKKernel/Registry.cpp
+    DEPENDS LLKDialect MicroDialect LLKCommon
+    LINK_LIBS PUBLIC LLKDialect MicroDialect LLKCommon
+)
+mlir_target_link_libraries(LLKKernel PUBLIC
+    MLIRLinalgDialect MLIRArithDialect MLIRMathDialect MLIRTensorDialect MLIRPass)
+
 # Library: LLKToLinalg conversion
 add_mlir_library(LLKToLinalg
     lib/Conversion/LLKToLinalg/LLKToLinalg.cpp
