@@ -21,10 +21,12 @@ permutation under the target's supported `blocked` layout name; its oracle
 checks the transposed element relation, and a valid plan with that transform
 omitted produces a numeric mismatch. The separate required-target binary was
 run as a negative host-capability check and failed on this arm64 host as
-designed. T8 now requires the explicit `--require-selected-target` flag, runs
-selected AVX2 before full CTest, and archives the JUnit/log, host/compiler/LLVM
-record, and selected width-4/width-8/fused Vector IR emitted by the codegen
-checks. No CI run on this branch head is recorded. T9's current workflow smoke
+designed. T8 now requires the explicit `--require-selected-target` flag, and
+`SelectedTargetFlagContract` injects an unavailable AVX2 feature and confirms
+the required executable fails. CI runs selected AVX2 before full CTest and
+archives the JUnit/log, host/compiler/LLVM record, and selected
+width-4/width-8/fused Vector IR emitted by the codegen checks. No CI run on
+this branch head is recorded. T9's current workflow smoke
 and DocReferences both pass locally; the full closure matrix remains
 incomplete.
 

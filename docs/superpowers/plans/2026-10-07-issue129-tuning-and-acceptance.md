@@ -356,7 +356,7 @@ auto nextValue = [&]() {
 
 **Interfaces:** Register `MappedAVX2Acceptance` with label `selected-avx2`, portable tests with label `mapped-reference`. Add an executable option `--require-selected-target` that treats missing features/JIT or any skipped required case as failure; local portable runs may still diagnose unsupported hosts honestly.
 
-- [ ] **Step 1: Add a parser/control test using saved CTest outcomes.** All required selected cases pass -> success; one skipped/failed/not-run/missing case -> failure. Empty output cannot pass. Include the audited legacy-skip records as a negative documentation control, not a mandatory dependency for new mapped execution.
+- [x] **Step 1: Add a parser/control test using saved CTest outcomes.** All required selected cases pass -> success; one skipped/failed/not-run/missing case -> failure. Empty output cannot pass. Include the audited legacy-skip records as a negative documentation control, not a mandatory dependency for new mapped execution. `RequiredExecutionEvidenceParser` covers pass, skip, failure, missing, and empty reports.
 
 ```python
 required = {"MappedAVX2Acceptance", "MappedAllocationLifetimeTest"}
@@ -365,7 +365,7 @@ for name in required:
     assert outcomes[name] == "passed", f"required execution did not pass: {name}"
 ```
 
-- [ ] **Step 2: Run parser tests and invoke the executable on an injected unsupported-feature case with --require-selected-target.** It must fail; ordinary local diagnostics may report unsupported.
+- [x] **Step 2: Run parser tests and invoke the executable on an injected unsupported-feature case with --require-selected-target.** It must fail; ordinary local diagnostics may report unsupported. `SelectedTargetFlagContract` sets `LLK_TEST_DISABLE_AVX2=1` and confirms that required selected execution fails with the injected-feature diagnostic.
 - [ ] **Step 3: Add an explicit selected-x86 step to pinned LLVM22 static CI.** Record host architecture/features and exact toolchain; run the selected acceptance binary with --require-selected-target and then the full CTest suite. Save CTest result artifacts and selected Vector/LLVM/manifest/numeric/lifetime evidence. If the runner lacks AVX2, use a known compatible runner or report CI blocked; do not silently skip the gate.
 - [ ] **Step 4: Validate new static library dependencies on that job.** Ownership pipelines, target vectorization and runtime math/copy/alloc symbols must resolve without a monolithic MLIR dylib masking missing links. Local LLVM24/arm64 runs the reference and policy tests and cannot replace this x86 gate.
 - [ ] **Step 5: Retain legacy tests with truthful status.** Investigate legacy SwiGLU skips if required by their own regression contract; record actual reason and result. Do not count a legacy SIMD pass as mapped selected-target proof. A legacy path regression caused by these changes must be fixed before integration.

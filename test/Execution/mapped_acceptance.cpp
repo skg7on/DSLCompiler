@@ -54,6 +54,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -93,7 +94,14 @@ float nextSignedValue(uint32_t &state) {
   return static_cast<float>(state & 0xffffu) / 65535.0f - 0.5f;
 }
 
+bool avx2DisabledByTestOverride() {
+  const char *disabled = std::getenv("LLK_TEST_DISABLE_AVX2");
+  return disabled && std::strcmp(disabled, "1") == 0;
+}
+
 bool selectedAvx2Available() {
+  if (avx2DisabledByTestOverride())
+    return false;
   const std::string triple = llvm::sys::getDefaultTargetTriple();
   if (triple.rfind("x86_64-", 0) != 0)
     return false;
@@ -881,7 +889,10 @@ TEST(MappedAcceptance, ExecutesPaddedTailsWithNonzeroAccumulators) {
 TEST(MappedAcceptance, SelectedAvx2ExecutesThePaddedTailFixtures) {
   if (!selectedAvx2Available()) {
 #ifdef LLK_REQUIRE_SELECTED_TARGET
-    FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+    if (avx2DisabledByTestOverride())
+      FAIL() << "test override disabled required selected AVX2 execution";
+    else
+      FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
 #else
     GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
 #endif
@@ -902,7 +913,10 @@ TEST(MappedAcceptance, SelectedAvx2ExecutesThePaddedTailFixtures) {
 TEST(MappedAcceptance, SelectedAvx2BackendExecutesNumerically) {
   if (!selectedAvx2Available()) {
 #ifdef LLK_REQUIRE_SELECTED_TARGET
-    FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+    if (avx2DisabledByTestOverride())
+      FAIL() << "test override disabled required selected AVX2 execution";
+    else
+      FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
 #else
     GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
 #endif
