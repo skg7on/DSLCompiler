@@ -1093,7 +1093,7 @@ llvm::Error DAGBuilder::buildLogicalTileOp(
   noteLayoutUsage(engine->id, engine->supportedLayouts, event.tileLayout);
 
   std::string destination = event.tileMemory;
-  uint32_t id = addEvent(std::move(event), state);
+  uint32_t id = addEvent(std::move(event), state, producerDeps({source}));
   producers[result] = id;
   noteStorage(op, destination, resultInfo.bytes(), state.storageFactor);
   return llvm::Error::success();
@@ -1147,6 +1147,7 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
     return event;
   };
 
+  auto sourceDeps = producerDeps(op.getOperands());
   uint32_t id = 0;
   if (hops.empty()) {
     // A *mapped*, unrouted movement still crosses a concrete link when the
@@ -1169,7 +1170,7 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
             : nullptr;
     if (link) {
       id = addEvent(describe(*link, copyCycles(srcMemory, dstMemory, bytes)),
-                    state);
+                    state, sourceDeps);
     } else {
       MicroEvent event;
       event.kind = kind;
@@ -1186,7 +1187,7 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
       event.tileMemory = dstMemory.str();
       event.srcMemory = srcMemory.str();
       event.tileOwner = resultInfo.owner;
-      id = addEvent(std::move(event), state);
+      id = addEvent(std::move(event), state, sourceDeps);
     }
   } else {
     for (size_t hop = 0; hop < hops.size(); ++hop) {
@@ -1195,9 +1196,11 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
       if (link.bandwidthBytesPerCycle > 0)
         cycles += static_cast<uint64_t>(std::ceil(static_cast<double>(bytes) /
                                                   link.bandwidthBytesPerCycle));
-      llvm::SmallVector<uint32_t, 1> chain;
+      llvm::SmallVector<uint32_t, 4> chain;
       if (hop > 0)
         chain.push_back(id);
+      else
+        chain = sourceDeps;
       id = addEvent(describe(link, cycles), state, chain);
     }
   }
