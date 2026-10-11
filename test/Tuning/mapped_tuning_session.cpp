@@ -220,4 +220,133 @@ TEST(MappedTuningSessionTest, AnalysisOnlyTargetsDoNotClaimExecutableSupport) {
   EXPECT_TRUE(analysis->ranked.front().materializationReady);
 }
 
+TEST(MappedTuningSessionTest, MeasuresExactExecutableAndKeepsIdentity) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseSource(context);
+  ASSERT_TRUE(source);
+  auto target = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  using namespace mlir::llk::tuning;
+  MappedTuningOptions options;
+  options.source.sourceSymbol = "matmul";
+  options.source.sourceRootOrdinal = 0;
+  options.mapping.mode = mlir::llk::mapping::SearchMode::Exact;
+  options.mapping.topK = 4;
+  // The ARM test host can exercise the exact mapped executable contract with
+  // the reference backend. x86 exercises the target's selected AVX2 backend.
+#if defined(__x86_64__) || defined(_M_X64)
+  options.backend = ::llk::MappedBackend::SelectedTarget;
+#else
+  options.backend = ::llk::MappedBackend::Reference;
+#endif
+  bool sawExecutable = false;
+  options.measurement.inputs = [](const ::llk::KernelAbi &abi)
+      -> llvm::Expected<OwnedInvocationBuffers> {
+    OwnedInvocationBuffers owned;
+    auto allocate = [&](const ::llk::KernelAbi::Port &port,
+                        bool initialize) -> ::llk::InvocationBuffer2D {
+      const size_t count = static_cast<size_t>(port.shape[0] * port.shape[1]);
+      owned.storage.emplace_back(count * sizeof(float));
+      auto *data = reinterpret_cast<float *>(owned.storage.back().data());
+      for (size_t i = 0; i < count; ++i)
+        data[i] = initialize ? 3.0f : 0.0f;
+      return {{data, data, 0, port.shape[0], port.shape[1], port.shape[1], 1},
+              ::llk::InvocationElementType::F32,
+              count * sizeof(float)};
+    };
+    for (size_t i = 0; i < abi.inputs.size(); ++i) {
+      auto buffer = allocate(abi.inputs[i], i == 2);
+      if (i == 0)
+        std::fill_n(static_cast<float *>(buffer.descriptor.aligned),
+                    buffer.descriptor.size0 * buffer.descriptor.size1, 1.0f);
+      if (i == 1)
+        std::fill_n(static_cast<float *>(buffer.descriptor.aligned),
+                    buffer.descriptor.size0 * buffer.descriptor.size1, 2.0f);
+      owned.inputs.push_back(buffer);
+    }
+    for (const auto &port : abi.outputs)
+      owned.outputs.push_back(allocate(port, false));
+    return owned;
+  };
+  options.measurement.measure = [&](const MappedMeasurementRequest &request)
+      -> llvm::Expected<std::optional<mlir::llk::perf::CandidateMetrics>> {
+    sawExecutable = true;
+    EXPECT_EQ(request.identity.planId, request.candidate.plan.id);
+    EXPECT_NE(request.identity.abiHash, 0u);
+    EXPECT_FALSE(request.identity.operationKeys.empty());
+    EXPECT_FALSE(request.identity.contentHash.empty());
+    EXPECT_FALSE(request.identity.canonical.empty());
+    EXPECT_EQ(request.executable.abiHash(), request.identity.abiHash);
+    if (llvm::Error error =
+            request.executable.invoke(request.inputs, request.outputs))
+      return std::move(error);
+    mlir::llk::perf::CandidateMetrics measured;
+    measured.measuredNs = 100.0;
+    return std::optional<mlir::llk::perf::CandidateMetrics>(measured);
+  };
+  options.measurement.verify =
+      [](const MappedTuningCandidate &,
+         llvm::ArrayRef<::llk::InvocationBuffer2D>,
+         llvm::ArrayRef<::llk::InvocationBuffer2D> outputs) -> llvm::Error {
+    for (int64_t i = 0; i < outputs.front().descriptor.size0 *
+                                outputs.front().descriptor.size1;
+         ++i)
+      if (static_cast<float *>(outputs.front().descriptor.aligned)[i] != 67.0f)
+        return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                       "scalar reference mismatch");
+    return llvm::Error::success();
+  };
+  auto report = runMappedTuningSession(*source, oneCandidateSpace(),
+                                       testShape(), **target, options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  EXPECT_TRUE(sawExecutable)
+      << (report->rejected.empty() ? ""
+                                   : report->rejected.back().rejectionReason);
+  ASSERT_EQ(report->ranked.size(), 1u)
+      << (report->rejected.empty() ? ""
+                                   : report->rejected.back().rejectionReason);
+  ASSERT_TRUE(report->ranked.front().ranking.metrics.measuredNs);
+  EXPECT_EQ(*report->ranked.front().ranking.metrics.measuredNs, 100.0);
+  ASSERT_TRUE(report->ranked.front().measurementIdentity);
+
+  options.measurement.measure = [](const MappedMeasurementRequest &)
+      -> llvm::Expected<std::optional<mlir::llk::perf::CandidateMetrics>> {
+    return std::optional<mlir::llk::perf::CandidateMetrics>();
+  };
+  auto unavailable = runMappedTuningSession(*source, oneCandidateSpace(),
+                                            testShape(), **target, options);
+  ASSERT_TRUE(bool(unavailable)) << llvm::toString(unavailable.takeError());
+  ASSERT_EQ(unavailable->ranked.size(), 1u);
+  EXPECT_TRUE(unavailable->ranked.front().ranking.legal);
+  EXPECT_FALSE(unavailable->ranked.front().ranking.metrics.measuredNs);
+  EXPECT_FALSE(unavailable->ranked.front().measurementIdentity);
+
+  options.measurement.measure = [](const MappedMeasurementRequest &request)
+      -> llvm::Expected<std::optional<mlir::llk::perf::CandidateMetrics>> {
+    if (llvm::Error error =
+            request.executable.invoke(request.inputs, request.outputs))
+      return std::move(error);
+    mlir::llk::perf::CandidateMetrics measured;
+    measured.measuredNs = 0.0;
+    return std::optional<mlir::llk::perf::CandidateMetrics>(measured);
+  };
+  auto invalidMetric = runMappedTuningSession(*source, oneCandidateSpace(),
+                                              testShape(), **target, options);
+  ASSERT_TRUE(bool(invalidMetric)) << llvm::toString(invalidMetric.takeError());
+  EXPECT_TRUE(invalidMetric->ranked.empty());
+  ASSERT_EQ(invalidMetric->rejected.size(), 3u);
+  EXPECT_TRUE(std::any_of(
+      invalidMetric->rejected.begin(), invalidMetric->rejected.end(),
+      [](const auto &rejected) {
+        return rejected.rejectionReason.find("measurement metric:") !=
+               std::string::npos;
+      }));
+}
+
 } // namespace

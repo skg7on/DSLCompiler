@@ -6,12 +6,68 @@
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Perf/CandidateGenerator.h"
 #include "LLK/Perf/TuningSession.h"
+#include "LLK/Runtime/MappedExecutable.h"
+#include "LLK/Runtime/MappedInvocation.h"
+#include "llvm/ADT/ArrayRef.h"
 
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace mlir::llk::tuning {
+
+/// The complete, length-delimited identity of one mapped executable. The
+/// canonical string is suitable for external measurement records; no such
+/// records are stored by the tuning session.
+struct MappedMeasurementIdentity {
+  std::string canonical;
+  std::string contentHash;
+  uint64_t planId = 0;
+  uint64_t originalGraphHash = 0;
+  uint64_t instantiatedGraphHash = 0;
+  uint64_t bindingHash = 0;
+  uint64_t abiHash = 0;
+  std::vector<std::string> operationKeys;
+  std::vector<std::string> connectionKeys;
+  std::string targetIdentity;
+  std::string backendIdentity;
+};
+
+/// Buffers remain owned for the full provider callback, including its warmup
+/// and timed invocations. The descriptors point into `storage` allocations.
+struct OwnedInvocationBuffers {
+  std::vector<std::vector<uint8_t>> storage;
+  std::vector<::llk::InvocationBuffer2D> inputs;
+  std::vector<::llk::InvocationBuffer2D> outputs;
+};
+
+struct MappedTuningCandidate;
+
+struct MappedMeasurementRequest {
+  const MappedTuningCandidate &candidate;
+  ::llk::MappedExecutable &executable;
+  const MappedMeasurementIdentity &identity;
+  llvm::ArrayRef<::llk::InvocationBuffer2D> inputs;
+  llvm::ArrayRef<::llk::InvocationBuffer2D> outputs;
+};
+
+using MappedInputProvider =
+    std::function<llvm::Expected<OwnedInvocationBuffers>(
+        const ::llk::KernelAbi &)>;
+using MappedMeasurementProvider =
+    std::function<llvm::Expected<std::optional<perf::CandidateMetrics>>(
+        const MappedMeasurementRequest &)>;
+using MappedMeasurementVerifier = std::function<llvm::Error(
+    const MappedTuningCandidate &, llvm::ArrayRef<::llk::InvocationBuffer2D>,
+    llvm::ArrayRef<::llk::InvocationBuffer2D>)>;
+
+struct MappedMeasurementOptions {
+  MappedInputProvider inputs;
+  MappedMeasurementProvider measure;
+  MappedMeasurementVerifier verify;
+};
 
 struct MappedTuningOptions {
   perf::CandidateGeneratorOptions generator;
@@ -20,6 +76,7 @@ struct MappedTuningOptions {
   ::llk::MappedBackend backend = ::llk::MappedBackend::SelectedTarget;
   bool executable = true;
   uint64_t topK = 10;
+  MappedMeasurementOptions measurement;
 };
 
 struct MappedTuningCandidate {
@@ -30,6 +87,7 @@ struct MappedTuningCandidate {
   bool materializationReady = false;
   std::string planReport;
   bool executable = false;
+  std::optional<MappedMeasurementIdentity> measurementIdentity;
 };
 
 struct MappedTuningReport {
