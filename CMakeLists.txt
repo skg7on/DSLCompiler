@@ -810,6 +810,20 @@ target_link_libraries(MappedAcceptance PRIVATE
 target_compile_definitions(MappedAcceptance PRIVATE
     LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME MappedAcceptance COMMAND MappedAcceptance)
+set_tests_properties(MappedAcceptance PROPERTIES LABELS "mapped-reference")
+
+# This duplicate test binary turns a host-feature skip into a failure. CI runs
+# it on the pinned x86_64 runner so selected-target evidence cannot go missing.
+add_llvm_executable(MappedAVX2Acceptance
+    test/Execution/mapped_acceptance.cpp)
+target_link_libraries(MappedAVX2Acceptance PRIVATE
+    LLKMappedCompilation LLKToMicro LLKMicroToLinalg LLKMapping LLKTargetMapping
+    MicroDialect LLKDialect GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+target_compile_definitions(MappedAVX2Acceptance PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
+add_test(NAME MappedAVX2Acceptance COMMAND MappedAVX2Acceptance
+    --gtest_filter=MappedAcceptance.SelectedAvx2*)
+set_tests_properties(MappedAVX2Acceptance PROPERTIES LABELS "selected-avx2")
 
 add_llvm_executable(MicroKernelExecution test/Execution/micro_kernel_execution.cpp)
 target_link_libraries(MicroKernelExecution PRIVATE
@@ -831,6 +845,10 @@ target_link_libraries(MappedAllocationLifetimeTest PRIVATE
 target_compile_definitions(MappedAllocationLifetimeTest PRIVATE
     LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME MappedAllocationLifetimeTest COMMAND MappedAllocationLifetimeTest)
+set_tests_properties(MappedAllocationLifetimeTest PROPERTIES LABELS "mapped-reference")
+add_test(NAME RequiredExecutionEvidenceParser
+    COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Execution/check_required_execution_test.py)
+set_tests_properties(RequiredExecutionEvidenceParser PROPERTIES LABELS "mapped-reference")
 
 add_llvm_executable(SwiGLUFusedMemory test/Execution/swiglu_fused_memory.cpp)
 target_link_libraries(SwiGLUFusedMemory PRIVATE LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights LLKRuntime GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
@@ -1370,6 +1388,13 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME DocReferences
       COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Docs/check_doc_references.py
           ${CMAKE_SOURCE_DIR}
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
+          $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
+  )
+  add_test(NAME WorkflowSmoke
+      COMMAND python3 ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke.py
+          ${CMAKE_SOURCE_DIR}/test/Docs/workflow_smoke_manifest.json
+          ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile>
           $<TARGET_FILE:llk-tune> $<TARGET_FILE:micro-perf>
   )

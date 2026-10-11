@@ -264,18 +264,36 @@ from inside one process:
 - `--micro-verify-mapping` accepts what the mapper wrote;
 - the performance model produces events for it.
 
-Its chains are `vector-add`, `staged-gemm`, `fused-swiglu` and `second-target`
-(the same concrete kernel mapped on the generic accelerator). The
-compiler-generated chains are AVX2-only, because the exported program uses the
-tile-level ops that only the AVX2 rule set covers; the accelerator's rules
-describe the tensor-level movement and vector family.
+Its five chains are `vector-add`, `staged-gemm`, `fused-swiglu`,
+`required-transform` and `second-target-two-hop`. They compare planner and
+`micro-perf` cycle/DRAM totals, replay the selected plan id, and assert stable
+source parse/print, report and mapped IR. The second target checks the concrete
+SRAM→L2→DRAM route and its intermediate reservation. This is static and portable
+pipeline evidence; it does not establish selected AVX2 execution.
 
-These are four of the five chains the acceptance contract requires: a
-required-transform chain and frozen-report replay are still open, and the
-second-target chain does not yet exercise canonical tile/two-hop movement.
-`DocReferences` lints the repo paths and tool flags named in the workflow and
-acceptance documents; it does not run this runner or check its argument values.
-Mandatory issue #67 acceptance is **not** closed by these chains — see the
+The documented commands and the smoke manifest live together here:
+
+```bash
+# Search and save a versioned mapped-plan report.
+llk-opt --micro-map="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store report=build/WorkflowSmoke/plan.json" test/Conversion/MicroMapping/micro_map.mlir -o build/WorkflowSmoke/mapped.mlir
+
+# Replay the selected id from that report with the same source and target.
+llk-opt --micro-bind-plan="plan-id=<selectedPlanId> target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store" test/Conversion/MicroMapping/micro_map.mlir -o build/WorkflowSmoke/replayed.mlir
+
+# Verify and lower the frozen plan, then run static capacity/performance checks.
+llk-opt --micro-verify-mapping="target=x86-avx2 machine=machines/x86-avx2-v2.yaml layouts=mapping/x86-avx2/layouts.llkmap rules=mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store" build/WorkflowSmoke/mapped.mlir
+llk-compile --mapping-target=x86-avx2 --mapping-root=. --machine=machines/x86-avx2-v2.yaml --mapping-backend=reference --mapping-stop=lowered --plan-report=build/WorkflowSmoke/plan.json build/WorkflowSmoke/mapped.mlir --emit=mlir
+micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 --fail-on-capacity-violation build/WorkflowSmoke/mapped.mlir
+
+# Run the checked semantic-source tuner example.
+llk-tune --input=test/Tuning/Inputs/issue129/mapped_tune.mlir --M=8 --N=16 --K=32 --top-k=1 --output=build/WorkflowSmoke/schedule.yaml --mapping-target=x86-avx2 --mapping-root=. --machine=machines/x86-avx2-v2.yaml --mapping-mode=exact --mapping-backend=reference --candidate-source=semantic --source-symbol=matmul --mapping-report=build/WorkflowSmoke/tune-report.json
+```
+
+`test/Docs/workflow_smoke_manifest.json` holds the executable argv arrays and
+expected artifacts. `WorkflowSmoke` runs those arrays without a shell and
+checks the documented option spellings against this section. `DocReferences`
+still performs link/path and help-flag lint. Mandatory issue #67 acceptance is
+**not** closed by static pipeline evidence; see the
 [verified gap assessment](../reviews/2026-10-07-issue67-current-gap-assessment.md)
 and issue [#129](https://github.com/skg7on/DSLCompiler/issues/129).
 

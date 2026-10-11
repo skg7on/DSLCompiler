@@ -85,4 +85,16 @@ jobs:
         run: cd build && ninja
 
       - name: Run tests
-        run: cd build && ctest --output-on-failure
+        run: |
+          uname -a
+          lscpu | grep -E 'Architecture|Model name|Flags' | head -n 3
+          cd build
+          ctest --output-on-failure --output-junit ctest-results.xml
+          python3 ../test/Execution/check_required_execution.py ctest-results.xml
+
+      - name: Save selected execution evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-avx2-ctest-results
+          path: build/ctest-results.xml

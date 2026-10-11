@@ -1,5 +1,32 @@
 # Issue #67 interim acceptance evidence
 
+## Issue #129 worktree update (not a release acceptance)
+
+The 2026-10-07 audited-head results below are historical and remain revision-
+pinned to that head. The current `feat/issue129-gap-closure` worktree has since
+completed R8, T5 and the T6 public-chain work. At T6 commit `5d9a574`, all five
+pipeline chains passed, including required-transform materialization,
+SRAM→L2→DRAM routing with a 256-byte L2 allocation, frozen selected-plan-ID
+replay, parse/print determinism, and planner versus `micro-perf` cycle/DRAM
+parity. The T6 targeted CTest selection passed 4/4.
+
+The current local configuration is LLVM/MLIR 24.0.0git on Darwin arm64. The
+portable mapped numeric binary ran four tests successfully and skipped its two
+selected-AVX2 tests. The separate required-target binary was also run as a
+negative control and failed on this unsupported host, as designed. T7 currently
+adds fixed-seed xorshift32 signed inputs rounded to stored BF16 and aligned plus
+padded-tail matmul checks; fused random, transform numerical, width-specific
+vector, and multi-output invocation cases remain open. T8 adds a required
+selected-AVX2 CTest and a JUnit outcome parser to the pinned LLVM 22 CI workflow,
+but no CI run on this branch head is recorded. T9's current workflow smoke and
+DocReferences both pass locally; the full closure matrix remains incomplete.
+
+Therefore issue #67 and the mandatory #129 release gate remain open. In
+particular, selected AVX2 invocation has not passed on the candidate release
+head, and the full T7 numeric matrix and final whole-suite CI artifact still
+need completion. The `WorkflowSmoke` manifest is an allowlisted argv list; its
+commands use checked-in fixtures and controlled output paths.
+
 Interim, revision-pinned evidence for the twelve normative §29 acceptance
 criteria of the
 [MicroIR-inspired enhancement design](../superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md).
