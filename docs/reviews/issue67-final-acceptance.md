@@ -26,7 +26,8 @@ designed. T8 now requires the explicit `--require-selected-target` flag, and
 the required executable fails. CI runs selected AVX2 before full CTest and
 archives the JUnit/log, host/compiler/LLVM record, and selected
 width-4/width-8/fused Vector IR emitted by the codegen checks. No CI run on
-this branch head is recorded. T9's current workflow smoke
+this branch head is recorded. T8's requested explicit LLVM IR and selected-plan
+manifest files are not yet in the workflow artifact list. T9's current workflow smoke
 and DocReferences both pass locally; the full closure matrix remains
 incomplete.
 

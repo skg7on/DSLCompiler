@@ -76,7 +76,7 @@ acceptance documentation through `149f260` are recorded below.
 | **T5** | `d696879` CLI report and frozen replay | Implemented; replay and CLI tests pass |
 | **T6** | `5d9a574` five public acceptance chains | Verified; all five chains pass locally |
 | **T7** | `0929b53`, `abfcb3b` randomized tails, transforms and multiple outputs | Verified on portable backend: 8 pass, 2 AVX2 cases skip |
-| **T8** | `cce2c6e`, `1c678de` strict selected-target CLI, evidence parser, injected unsupported-feature control and CI artifact capture; local legacy skip investigation recorded in tuning plan | Harness and local legacy skip reasons verified; selected-x86 run, static LLVM22 link gate and CI legacy outcomes remain open |
+| **T8** | `cce2c6e`, `1c678de` strict selected-target CLI, evidence parser, injected unsupported-feature control and CI artifact capture; local legacy skip investigation recorded in tuning plan | Harness and local legacy skip reasons verified. CI currently archives Vector IR, logs/JUnit and host/toolchain facts but not explicit LLVM IR or a selected-plan manifest; add those artifacts. Selected-x86 run, static LLVM22 link gate and CI legacy outcomes remain open |
 | **T9** | `d48a46d` smoke negative controls; `106a1dc`, `841e193`, `118b267`, `149f260` matrix, branch status and G1–G10 crosswalk | Steps 1–3 verified; final CI proof, GitHub checklist reconciliation and release-head review remain open |
 
 At `1c678de`, the full local build succeeded and CTest registered 161 tests:
