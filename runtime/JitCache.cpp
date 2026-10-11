@@ -157,10 +157,11 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   pm.addPass(mlir::createArithToLLVMConversionPass());
   // Lower math ops (exp, erf, etc.) to LLVM dialect.
   pm.addPass(mlir::createConvertMathToLLVMPass());
-  // Lower func ops (function boundaries) to LLVM dialect.
-  pm.addPass(mlir::createConvertFuncToLLVMPass());
   // Lower memref ops to LLVM dialect (finalizes the MemRef→LLVM conversion).
   pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+  // Lower func ops after memref operations so function wrappers do not retain
+  // casts between LLVM descriptors and memref types.
+  pm.addPass(mlir::createConvertFuncToLLVMPass());
   // Arithmetic lowering may materialize `ub.poison` for undefined results.
   // Lower UB after all other types have reached LLVM form so this conversion
   // does not leave casts between pre- and post-conversion types.
