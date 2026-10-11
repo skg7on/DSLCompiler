@@ -737,11 +737,13 @@ endif()
 
 # Documentation is opt-in: normal builds and compiler tests need no Sphinx.
 # Point this at a virtualenv with docs/manual/requirements.txt installed.
+# Output lands in the build tree; the repository holds sources only, and the
+# published copy is rendered by CI.
 set(LLK_DOCS_PYTHON "python3" CACHE STRING "Python interpreter for the Sphinx manual")
 add_custom_target(docs-html
     COMMAND ${LLK_DOCS_PYTHON} -m sphinx -b html -n -W --keep-going
             -d ${CMAKE_BINARY_DIR}/docs/doctrees
-            ${CMAKE_SOURCE_DIR}/docs/manual/source ${CMAKE_SOURCE_DIR}/docs/manual/html
+            ${CMAKE_SOURCE_DIR}/docs/manual/source ${CMAKE_BINARY_DIR}/docs/html
     USES_TERMINAL
     VERBATIM
     COMMENT "Building the MicroIR HTML developer manual"

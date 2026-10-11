@@ -29,8 +29,6 @@ jobs:
         run: python -m unittest discover -s docs/manual/source/_ext/tests -p 'test_*.py'
       - name: Build HTML with strict reference checks
         run: python -m sphinx -b html -n -W --keep-going -d build/docs/doctrees docs/manual/source build/docs/html
-      - name: Check committed HTML is current
-        run: diff -r -x .buildinfo docs/manual/html build/docs/html
       - uses: actions/upload-artifact@v4
         with:
           name: developer-manual
@@ -41,9 +39,9 @@ jobs:
           path: build/docs/html/
 
   # Publishes the manual to https://skg7on.github.io/DSLCompiler/ on main only.
-  # Requires the repository's Pages source to be "GitHub Actions". The deployed
-  # tree is the same build/docs/html that the html job just proved matches the
-  # committed docs/manual/html, so the live site cannot drift from the checkout.
+  # Requires the repository's Pages source to be "GitHub Actions". The manual is
+  # no longer committed as HTML — this build is the only copy, so the live site
+  # is always a fresh render of the sources on main.
   deploy:
     needs: html
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

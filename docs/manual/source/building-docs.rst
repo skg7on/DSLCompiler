@@ -12,29 +12,29 @@ Build HTML
 
 From the repository root or your isolated worktree:
 
-The generated pages are checked in at ``docs/manual/html/``. Open its
-``index.html`` directly for an existing checkout; building is needed when
-editing the manual. Sources, configuration, and examples live together under
-``docs/manual/source/``.
+Only sources are tracked. ``docs/manual/source/`` holds the reStructuredText
+pages, configuration, and examples; the rendered HTML is produced by CI and
+published, so there is no committed copy to open or update.
 
 .. code-block:: bash
 
    python3 -m venv build/docs-venv
    build/docs-venv/bin/python -m pip install -r docs/manual/requirements.txt
    build/docs-venv/bin/python -m sphinx -b html -n -W --keep-going \
-     -d build/docs/doctrees docs/manual/source docs/manual/html
+     -d build/docs/doctrees docs/manual/source build/docs/html
 
-Open ``docs/manual/html/index.html`` in your browser. The complete
-``docs/manual/html/`` directory is the portable manual: retain its assets,
-search index, and download directory when copying or sharing it. The theme
-and architecture diagram are bundled locally; reading the pages needs no CDN.
-Links to repository source and historical design documents open GitHub.
+Open ``build/docs/html/index.html`` in your browser. The generated directory is
+the portable manual: retain its assets, search index, and download directory
+when copying or sharing it. It lives in the ignored build tree, so it is never
+committed. The theme and architecture diagram are bundled locally; reading the
+pages needs no CDN. Links to repository source and historical design documents
+open GitHub.
 
 To preview through HTTP, run:
 
 .. code-block:: bash
 
-   python3 -m http.server 8000 --bind 127.0.0.1 --directory docs/manual/html
+   python3 -m http.server 8000 --bind 127.0.0.1 --directory build/docs/html
 
 Then open ``http://127.0.0.1:8000/``. Use Ctrl-C to stop the preview server.
 
@@ -66,12 +66,11 @@ The older design, review, and implementation-plan documents remain Markdown
 reference material linked from the manual. The repository README remains the
 entry point for GitHub readers.
 
-Commit regenerated ``docs/manual/html/`` files together with source edits.
-Keep Sphinx's environment cache under ignored ``build/docs/doctrees/`` rather
-than in the distributable HTML directory. Documentation CI checks that a fresh
-build into a separate empty output directory matches the committed pages,
-including added or removed files. Remove obsolete HTML pages when renaming or
-deleting a source page.
+Edit sources only; there is no generated HTML to commit. Keep Sphinx's
+environment cache under ignored ``build/docs/doctrees/`` and the output under
+``build/docs/html/``, both inside the build tree. Documentation CI renders the
+manual with warnings treated as errors on every pull request and publishes it on
+merge, so a source page is the single input to both the check and the live site.
 
 Use the `Sphinx reStructuredText guide
 <https://www.sphinx-doc.org/en/master/usage/restructuredtext/index.html>`__
@@ -141,17 +140,16 @@ The manual is served from GitHub Pages at
 workflow deploys the directory it just built to the ``github-pages``
 environment; pull requests build and verify the same way but never publish.
 
-The deployed tree is the one the *Check committed HTML is current* step proved
-identical to ``docs/manual/html/``, so merging is what changes the live site —
-regenerating and committing the HTML is the editor's release step, not an
-extra one. Run ``git pull`` on ``main`` before trusting a local preview that
-should match the public page.
+Merging is what changes the live site: the deployed tree is the one the ``html``
+job just built from the sources in that commit. No HTML is committed, so there
+is nothing to regenerate or keep in sync — editing a source page and merging it
+is the whole release step.
 
 Publication needs the repository's Pages source set to **GitHub Actions**
 (Settings → Pages). Without it the ``deploy`` job fails while ``html`` still
-passes, so a missing setting never blocks the build or the diff check. Once
-the source is set, the deployed URL is reported as the ``github-pages``
-environment URL on the workflow run.
+passes, so a missing setting never blocks the build or a pull request. Once the
+source is set, the deployed URL is reported as the ``github-pages`` environment
+URL on the workflow run.
 
 Any HTML artifact remains servable by any other static host; Pages is the
 project's chosen one.
