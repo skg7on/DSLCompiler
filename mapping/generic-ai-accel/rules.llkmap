@@ -34,9 +34,18 @@ rule accel.mma_bf16 {
   cost 8;
 }
 
+// Like the AVX2 copy rule, `micro.async_copy` is the one operation here whose
+// boundary values are plain `tensor`s and therefore state no memory kind, so
+// the rule names the ports it governs -- DRAM source to SRAM destination, this
+// profile's load path. The compute rules below leave the memory to the tile
+// their operands and results already carry.
 rule accel.async_copy {
   match micro.async_copy();
   require executor kind pe;
+  require memory input "source" kind dram;
+  require memory output "result" kind sram;
+  input "source";
+  output "result";
   bundle "accel.copy";
   emit "accel_copy";
   cost 1;

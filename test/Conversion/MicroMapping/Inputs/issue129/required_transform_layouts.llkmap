@@ -1,0 +1,17 @@
+layout row_major(int N) {
+  param N in [1..8];
+  require rank == 2;
+  implements row_major;
+  map (m, n) -> (m, n);
+}
+
+layout blocked(int M, int N, int VW) {
+  param M in [4..16];
+  param N in [4..16];
+  param VW in [4..8];
+  require rank == 2;
+  require VW == machine.compute("vector_engine").lanes(element_type);
+  require N % VW == 0;
+  implements blocked;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}

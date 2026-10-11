@@ -169,6 +169,32 @@ std::string bundleString(const TargetBundle &bundle) {
 
 } // namespace
 
+std::string
+canonicalComputeBindingsString(const llvm::StringMap<std::string> &bindings) {
+  std::vector<std::string> entries;
+  entries.reserve(bindings.size());
+  for (const auto &entry : bindings) {
+    std::string text = std::to_string(entry.first().size());
+    text += ':';
+    text += entry.first().str();
+    text += '=';
+    text += std::to_string(entry.second.size());
+    text += ':';
+    text += entry.second;
+    entries.push_back(std::move(text));
+  }
+  llvm::sort(entries);
+  return joinStrings(entries, ",");
+}
+
+std::optional<std::string>
+missingComputeBinding(const PlanPlacement &placement) {
+  for (const std::string &kind : placement.computeRequirements)
+    if (!placement.computeBindings.count(kind))
+      return kind;
+  return std::nullopt;
+}
+
 llvm::StringRef stringifyConnectionKind(ConnectionKind kind) {
   switch (kind) {
   case ConnectionKind::Direct:
@@ -308,7 +334,11 @@ std::string canonicalCandidateString(const MappingCandidate &candidate) {
 }
 
 std::string canonicalInstanceString(const CandidateInstance &instance) {
-  std::string out = "candidate=";
+  // The `v3` tag makes the identity explicitly versioned (issue #129, task R1):
+  // a change to what the string folds -- here, dropping the derived
+  // `localCost` and folding the selected compute nodes length-delimited -- must
+  // not silently hash to the same id as the older content.
+  std::string out = "v3|candidate=";
   out += std::to_string(instance.candidate);
   out += "|bundle=";
   out += bundleString(instance.bundle);
@@ -328,13 +358,14 @@ std::string canonicalInstanceString(const CandidateInstance &instance) {
   out += "|solvedlayout=";
   out += solvedLayoutsString(instance.layoutSolutions);
   out += "|compute=";
-  out += joinStrings(sortedEntries(instance.computeBindings), ",");
+  out += canonicalComputeBindingsString(instance.computeBindings);
   out += "|slots=";
   out += std::to_string(instance.resourceUsage.executorSlots);
   out += "|membytes=";
   out += joinStrings(sortedEntries(instance.resourceUsage.memoryBytes), ",");
-  out += "|cost=";
-  out += canonicalCostString(instance.localCost);
+  // `localCost` is deliberately absent (issue #129, task R1): it is a derived
+  // ranking score, not a decision, and folding it in forced a plan to carry its
+  // final score before it could acquire an id.
   return out;
 }
 
@@ -433,6 +464,14 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
     text += joinStrings(sortedEntries(placement.layouts), ",");
     text += ":solvedlayout=";
     text += solvedLayoutsString(placement.layoutSolutions);
+    // The concrete compute node each requirement selected joins the identity
+    // (issue #129, task R1), so two placements that differ only in which
+    // attached engine of a kind ran are distinct plans rather than colliding on
+    // one id and collapsing to the machine's first engine. Length-delimited via
+    // `canonicalComputeBindingsString`, and empty for a rule that requires no
+    // compute capability.
+    text += ":compute=";
+    text += canonicalComputeBindingsString(placement.computeBindings);
     placements.push_back(std::move(text));
   }
   llvm::sort(placements);
@@ -470,18 +509,57 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
         producerPorts.push_back(canonicalPortRefString(port));
       text += ":producerPorts=" + joinStrings(producerPorts, ",");
     }
+    // The physical movement hops join the identity (issue #129, task R4). The
+    // engine a hop runs on and the storage slot it reads and writes are
+    // *decisions*, so two plans that differ only in which buffer a hop uses are
+    // distinct plans rather than colliding on one id. Gated on presence, so a
+    // plan built without storage planning keeps the id it had. Order-bearing:
+    // the hop sequence is the route, so the hops are rendered in route order,
+    // never sorted. The steps that order the hops are derived timing and stay
+    // out, as do the allocation intervals and every diagnostic.
+    if (!connection.hops.empty()) {
+      std::vector<std::string> hopTexts;
+      hopTexts.reserve(connection.hops.size());
+      for (const PlanMovementHop &hop : connection.hops) {
+        // Length-delimited strings, so a memory or engine id containing the
+        // punctuation below cannot be confused with a different hop.
+        auto field = [](llvm::StringRef value) {
+          return std::to_string(value.size()) + ":" + value.str();
+        };
+        std::string hopText = std::to_string(hop.index);
+        hopText += ':';
+        hopText += field(hop.srcMemory);
+        hopText += '>';
+        hopText += field(hop.dstMemory);
+        hopText += ':';
+        hopText += field(hop.engine);
+        hopText += ':';
+        hopText += std::to_string(hop.sourceStorageId);
+        hopText += '>';
+        hopText += std::to_string(hop.destinationStorageId);
+        hopTexts.push_back(std::move(hopText));
+      }
+      text += ":hops=" + joinStrings(hopTexts, ",");
+    }
     connectionPlans.push_back(std::move(text));
   }
   llvm::sort(connectionPlans);
 
   llvm::SmallVector<InstanceId> instances(plan.instances);
   llvm::SmallVector<ConnectionId> connections(plan.connections);
-  std::vector<std::string> errors(plan.diagnostics.errors);
-  std::vector<std::string> warnings(plan.diagnostics.warnings);
-  llvm::sort(errors);
-  llvm::sort(warnings);
 
-  std::string out = "binding=";
+  // The `v3` tag makes the identity explicitly versioned (issue #129, task R1).
+  // The derived ranking score (`totalCost`/`accumulatedCost`) and the
+  // diagnostic/truncation fields are deliberately absent: they are search
+  // outcomes and provenance, not decisions, and folding them in made a plan
+  // unable to acquire an id before it was scored. A plan's id therefore depends
+  // only on what it decided -- binding, selections, placements, routes,
+  // parameters and, once storage planning has run, the physical movement hops
+  // (their memories, engines and storage slots) that R4 added. The derived
+  // timing around those hops -- the plan-step DAG, the allocation intervals --
+  // stays out, so `finalizeStoragePlan` assigns the id exactly once, from the
+  // decisions it built, and re-finalizing reproduces it.
+  std::string out = "v3|binding=";
   out += hexId(plan.sourceBindingHash);
   out += "|instances=";
   out += joinNumbers(instances);
@@ -493,14 +571,6 @@ std::string canonicalPlanString(const CoveringPlan &plan) {
   out += joinStrings(connectionPlans, ";");
   out += "|params=";
   out += canonicalSearchValueString(plan.globalParameters);
-  out += "|cost=";
-  out += canonicalCostString(plan.totalCost);
-  out += "|errors=";
-  out += joinStrings(errors, ";");
-  out += "|warnings=";
-  out += joinStrings(warnings, ";");
-  out += "|truncated=";
-  out += plan.diagnostics.searchTruncated ? "1" : "0";
   return out;
 }
 

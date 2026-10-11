@@ -40,6 +40,7 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CostEvent.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
@@ -130,6 +131,13 @@ struct MicroEvent {
   /// Memory space a movement reads from; empty for compute.
   std::string srcMemory;
   std::string tileOwner;
+
+  /// The owner-occupancy pool this event runs under (issue #129, task R6): the
+  /// concrete *executor* a mapped op selected, so the simulator's owner
+  /// constraint is the plan's own placement rather than an abstract owner
+  /// class. Empty for an unmapped op -- a hand-written kernel, or a movement --
+  /// where the tile's owner symbol (`tileOwner`) is the abstract-kind fallback.
+  std::string ownerPool;
 };
 
 struct MicroDAG {
@@ -145,6 +153,15 @@ struct MicroDAG {
   std::vector<std::string> warnings;
   std::vector<std::string> layoutWarnings;
   std::vector<std::string> ownerWarnings;
+
+  /// The extraction facts that make the event stream *incomplete*: a loop whose
+  /// trip count is unknown (charged one iteration), an allocation or movement
+  /// whose byte count cannot be computed (charged zero). A strict analysis
+  /// (`analyzeSelectedKernel(..., requireComplete = true)`) refuses a stream
+  /// with any of these rather than present a partial cost as a complete one
+  /// (issue #129, task R6). Ordered the way the walk meets them, so two runs of
+  /// equal inputs report equal reasons.
+  std::vector<std::string> incompleteReasons;
 };
 
 /// A route the selected plan chose: the concrete endpoint *nodes* it connects
@@ -169,11 +186,30 @@ struct PlannedRoute {
   std::vector<const machine::LinkEdge *> hops;
 };
 
+/// Measured durations a selected plan recorded for its own work, keyed by the
+/// identity the binder stamped on the mapped op (issue #129 review finding 6):
+/// `byInstance` on `micro.mapping.instance` for a placement's compute work,
+/// `byConnection` on the connection a routed copy records for its movement.
+///
+/// An instance hit replaces its compute event's duration. A connection hit is
+/// one aggregate duration per execution, shared across its hops, transforms
+/// and consumers in proportion to their static event durations. Repeated loop
+/// executions each charge the aggregate again. Work, traffic, dependencies and
+/// capacity are untouched.
+struct MeasuredOverrides {
+  llvm::DenseMap<uint64_t, double> byInstance;
+  llvm::DenseMap<uint64_t, double> byConnection;
+};
+
 /// Builds the event DAG for `kernel` against `machine`. `kernel` must be a
 /// `micro.kernel`. Fails when the kernel uses a memory space the machine does
 /// not model, or expands past kMaxEvents.
-llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
-                                       const machine::MachineModel &machine);
+///
+/// When `measured` is given, an event whose op the plan recorded a measured
+/// duration for charges that duration instead of the machine formula.
+llvm::Expected<MicroDAG>
+buildMicroDAG(mlir::Operation *kernel, const machine::MachineModel &machine,
+              const MeasuredOverrides *measured = nullptr);
 
 /// The normalized view of one DAG event (task B8): the same
 /// `mapping::PlanCostEvent` shape `buildPlanEvents` produces, so a plan's

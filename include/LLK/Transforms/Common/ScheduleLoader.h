@@ -51,6 +51,9 @@ struct ScheduleEntry {
   /// Defaults to mma_shape when an entry does not name one.
   std::string fragment_shape{"16x16x32"};
   bool enable_tile_masks{true};
+  /// Tail contract for Micro export: none rejects non-dividing tiles; pad
+  /// zero-pads input footprints and crops stores to the valid result region.
+  std::string tail_policy{"none"};
 };
 
 /// Load matching schedule entries for the given key.

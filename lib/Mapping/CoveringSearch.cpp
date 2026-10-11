@@ -77,6 +77,10 @@ struct InstanceEntry {
   /// The instance's cost, after any measurement the target provides. Legality
   /// was decided before this and is not revisited.
   Cost cost;
+  /// The measured duration a provider returned for this instance, when one hit
+  /// (issue #129 review finding 6). Carried into the placement so the final
+  /// selected-kernel analysis charges it instead of the static formula.
+  std::optional<double> measuredCycles = std::nullopt;
   /// The resolved values of the rule's constraint-derived parameters, copied
   /// from the candidate so the selected plan can persist the assignment
   /// generation solved (task B1).
@@ -368,8 +372,11 @@ std::string placementIdentity(const CandidateInstance &instance) {
 }
 
 /// Canonical placement order (design §22.1): the executor id, then the sorted
-/// memory bindings, then the sorted layout bindings. Node and instance ids
-/// break a tie so the order over a complete plan is total.
+/// memory bindings, then the sorted layout bindings, then the selected compute
+/// nodes. Node and instance ids break a tie so the order over a complete plan
+/// is total. Two placements that differ only in which attached engine of a kind
+/// they selected are ordered by that selection, not left to the order the
+/// instances happened to be enumerated in.
 bool placementBefore(const PlanPlacement &lhs, const PlanPlacement &rhs) {
   if (lhs.executor != rhs.executor)
     return lhs.executor < rhs.executor;
@@ -387,6 +394,10 @@ bool placementBefore(const PlanPlacement &lhs, const PlanPlacement &rhs) {
   std::vector<std::string> rhsLayouts = sortedBindings(rhs.layouts);
   if (lhsLayouts != rhsLayouts)
     return lhsLayouts < rhsLayouts;
+  std::vector<std::string> lhsComputes = sortedBindings(lhs.computeBindings);
+  std::vector<std::string> rhsComputes = sortedBindings(rhs.computeBindings);
+  if (lhsComputes != rhsComputes)
+    return lhsComputes < rhsComputes;
   if (lhs.node != rhs.node)
     return lhs.node < rhs.node;
   return lhs.instance < rhs.instance;
@@ -431,6 +442,17 @@ CoveringSearch::CoveringSearch(
 llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   const MachineModel &machine = target_.machine();
   MappingSearchResult result;
+
+  // A caller that requires validated complete plans must not silently fall back
+  // to the unvalidated path (issue #129, task R7): the missing evaluator is a
+  // configuration error, and it stops the search before any work is done.
+  const bool hasEvaluator = static_cast<bool>(options_.evaluateCompletePlan);
+  if (options_.requireCompleteEvaluation && !hasEvaluator)
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "covering search: requireCompleteEvaluation is set but no "
+        "evaluateCompletePlan callback was supplied; complete proposals cannot "
+        "be validated");
 
   // Records a stable-coded failure once per (code, message) pair. A cause that
   // recurs on every branch -- a memory overflow, a provider that never caches a
@@ -710,6 +732,15 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                     entry.instance.executorBindings.lookup("executor")))
               signature.placementClass = executor->kind;
             signature.placement = placementIdentity(entry.instance);
+            // The selected concrete compute nodes belong in the key too (issue
+            // #129, task R1): two placements of one rule on one executor that
+            // selected different attached engines are different work, so a
+            // measurement taken on one must not be reused for the other. The
+            // rendering is the same length-delimited one the plan's content key
+            // folds, so a key or node id containing a separator cannot collide
+            // with a different selection inside this field.
+            signature.compute =
+                canonicalComputeBindingsString(entry.instance.computeBindings);
             // The target identity is more than the machine (task B8): a change
             // to the rule or layout library changes what a measurement means,
             // so both content hashes join the context.
@@ -718,9 +749,14 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                 hexId(target_.rules().computeContentHash()),
                 hexId(target_.layouts().computeContentHash())};
             if (std::optional<double> measured =
-                    provider->lookupCycles(signature, context))
+                    provider->lookupCycles(signature, context)) {
               entry.cost.latencyCycles = *measured;
-            else
+              // Carry the hit so the final selected-kernel analysis charges the
+              // measured duration too (issue #129 review finding 6): without it
+              // the search ranks on calibrated numbers while the plan's
+              // reported cost is the static formula.
+              entry.measuredCycles = *measured;
+            } else
               report(DiagnosticCode::LatencyCacheMiss,
                      "rule '" + rule->id + "' (op '" + node->opName +
                          "'): no cached latency; static estimate retained");
@@ -1117,7 +1153,16 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
               "covering search: plan binds unknown memory '" + key.str() + "'");
         return false;
       }
-      if (bytes > memory->capacityBytes) {
+      // With an evaluator set, the per-memory charge is not a rejection
+      // (issue #129, task R7). `state.memoryBytes` is the search's own
+      // *optimistic* live-range accounting: it charges every materialized
+      // output until its last consumer and knows nothing of the aliasing or
+      // reuse the finalized plan may prove, so it is an over-estimate of the
+      // final live footprint and is not a sound bound to reject a partial
+      // state on. Final R5 liveness decides, and the completion evaluator runs
+      // it; here the search only keeps the facts above (an unknown memory is an
+      // error, not a capacity opinion).
+      if (!hasEvaluator && bytes > memory->capacityBytes) {
         ++result.frontier.plansRejectedByCapacity;
         report(DiagnosticCode::MemoryCapacityExceeded,
                "memory '" + key.str() + "' over capacity (" +
@@ -1125,7 +1170,7 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         return false;
       }
     }
-    if (totalBytes > options_.memoryBudgetBytes) {
+    if (!hasEvaluator && totalBytes > options_.memoryBudgetBytes) {
       ++result.frontier.plansRejectedByCapacity;
       report(DiagnosticCode::MemoryCapacityExceeded,
              "plan byte total exceeds the global budget (" +
@@ -1716,9 +1761,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       if (connectionProvider) {
         ConnectionSignature signature =
             connectionSignatureFor(effective, workload_, machine);
-        if (std::optional<double> measured =
-                connectionProvider->lookupCycles(signature, connectionContext))
+        if (std::optional<double> measured = connectionProvider->lookupCycles(
+                signature, connectionContext)) {
           effective.cost.latencyCycles = *measured;
+          // Carried into the plan so the final analysis charges the measured
+          // movement the search ranked on (issue #129 review finding 6).
+          effective.measuredCycles = *measured;
+        }
       }
       staged.push_back(effective);
       state.cost = addCost(state.cost, effective.cost);
@@ -1843,161 +1892,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
     return std::nullopt;
   };
 
-  std::vector<Partial> complete;
-
-  if (options_.mode == SearchMode::Beam) {
-    Partial start;
-    start.chosen.assign(tables.size(), nullptr);
-    std::vector<Partial> beam{std::move(start)};
-    for (size_t depth = 0; depth < tables.size(); ++depth) {
-      std::vector<Partial> next;
-      for (const Partial &partial : beam) {
-        std::optional<size_t> node = lowestUncovered(partial);
-        if (!node)
-          continue;
-        for (const InstanceEntry &entry : tables[*node].instances) {
-          std::vector<Partial> states = extendStates(partial, *node, entry);
-          for (Partial &state : states) {
-            state.lowerBound = boundCost(state);
-            next.push_back(std::move(state));
-          }
-        }
-      }
-      // Bound order: the more promising bound first, direction-aware. An exact
-      // tie falls back to the deeper (more covered) plan, then the stable
-      // partial id. The beam is a bounded heuristic that may sort on a bound
-      // the exact prune would reject; it flags truncation only when a level
-      // exceeds `beamWidth` and is cut below, not unconditionally.
-      llvm::sort(next, [&](const Partial &lhs, const Partial &rhs) {
-        if (boundIsBetterThan(lhs.lowerBound, rhs.lowerBound,
-                              options_.objective))
-          return true;
-        if (boundIsBetterThan(rhs.lowerBound, lhs.lowerBound,
-                              options_.objective))
-          return false;
-        if (lhs.covered != rhs.covered)
-          return lhs.covered > rhs.covered;
-        return lhs.id < rhs.id;
-      });
-      if (next.size() > options_.beamWidth) {
-        next.resize(options_.beamWidth);
-        result.searchTruncated = true;
-        report(DiagnosticCode::SearchTruncated,
-               "beam width reached (beamWidth=" +
-                   std::to_string(options_.beamWidth) + ")");
-      }
-      beam = std::move(next);
-      if (beam.empty())
-        break;
-    }
-    for (Partial &partial : beam)
-      if (!lowestUncovered(partial))
-        complete.push_back(std::move(partial));
-  } else {
-    // Deterministic and exact share a depth-first walk; they differ in when
-    // they stop and in whether the bound prunes.
-    bool exact = options_.mode == SearchMode::Exact;
-    // Best complete costs for the exact-minimize prune, ranked by the declared
-    // objective (best first, so the worst kept plan is `back()`). Only the
-    // prune reads it, and only a minimize objective arms that prune, so a
-    // maximize or deterministic run skips this bookkeeping along with the
-    // prune block below.
-    std::vector<Cost> bestCosts;
-    std::function<void(Partial &, bool &)> visit = [&](Partial &partial,
-                                                       bool &stop) {
-      if (stop)
-        return;
-      std::optional<size_t> node = lowestUncovered(partial);
-      if (!node) {
-        complete.push_back(partial);
-        if (exact && options_.objective.minimize) {
-          bestCosts.push_back(partial.cost);
-          llvm::sort(bestCosts, [&](const Cost &lhs, const Cost &rhs) {
-            return costLess(lhs, rhs, options_.objective);
-          });
-          if (bestCosts.size() > options_.topK)
-            bestCosts.resize(options_.topK);
-        }
-        return;
-      }
-      for (const InstanceEntry &entry : tables[*node].instances) {
-        if (stop)
-          return;
-        std::vector<Partial> states = extendStates(partial, *node, entry);
-        for (Partial &branch : states) {
-          if (stop)
-            return;
-          // Bound-based pruning is sound only for a minimize objective. The
-          // bound omits connection costs (a connection is synthesized only once
-          // both endpoints are chosen), and that term is non-negative: for
-          // minimize an omitted term can only raise a completion, so the bound
-          // stays at or below it; for maximize the same omission makes the
-          // bound too small, and a branch whose real completion would be
-          // largest can look poor. Maximize therefore explores fully -- the
-          // caps (topK, instance, candidate, route, and connection caps) still
-          // bound the run and report `searchTruncated`, so it never silently
-          // returns a non-best plan.
-          if (exact && options_.objective.minimize) {
-            branch.lowerBound = boundCost(branch);
-            if (bestCosts.size() >= options_.topK &&
-                !boundIsBetterThan(branch.lowerBound, bestCosts.back(),
-                                   options_.objective)) {
-              // A full top-K list makes this prune exact for a *strictly
-              // better* cost: it cannot drop a completion strictly cheaper than
-              // the worst kept plan. On an exact cost *tie* it is not exact --
-              // the bound compares against `bestCosts.back()`, which is
-              // cost-only, while the final top-K trim keys on `(cost,
-              // plan.id)`, so a tie can prune a plan whose smaller id the trim
-              // would have kept. Either way the space was not exhausted, and
-              // the caller is told so (`searchTruncated`).
-              result.searchTruncated = true;
-              report(DiagnosticCode::SearchTruncated,
-                     "exact search pruned by the top-K bound (topK=" +
-                         std::to_string(options_.topK) + ")");
-              continue;
-            }
-          }
-          visit(branch, stop);
-          if (!exact && !complete.empty()) {
-            // Deterministic mode is defined as the first legal plan.
-            stop = true;
-            return;
-          }
-        }
-      }
-    };
-
-    Partial start;
-    start.chosen.assign(tables.size(), nullptr);
-    bool stop = false;
-    visit(start, stop);
-  }
-
-  if (pendingError)
-    return std::move(pendingError);
-
-  // --- finalize --------------------------------------------------------
-  // Tally complete plans before the top-K cap drops the tail (design §22.2).
-  result.planCount = complete.size();
-  // The top-K cap, when it bites, is a search truncation like any other. Fold
-  // it into the flag *before* any plan's content id is computed, because the
-  // flag is part of that content (see `canonicalPlanString`); this keeps every
-  // plan's id identical whether the cap was recorded before or after it was
-  // built.
-  if (complete.size() > options_.topK) {
-    result.searchTruncated = true;
-    report(DiagnosticCode::SearchTruncated,
-           "top-K cap reached (topK=" + std::to_string(options_.topK) + ")");
-  }
-
-  // Build every complete plan before trimming, so each one's *exposed* content
-  // id exists. The internal `Partial::id` is a search heuristic over partial
-  // plans; the documented tie-break is the exposed plan id (design §22.1), so
-  // the trim below must see the latter -- trimming on the partial hash would
-  // keep whichever K the search happened to order first.
-  std::vector<CoveringPlan> plans;
-  plans.reserve(complete.size());
-  for (const Partial &partial : complete) {
+  // --- completion evaluation (issue #129, task R7) ------------------------
+  //
+  // A complete *proposal* is the covering of instances and connections the
+  // search synthesized. It is cheap, additive-costed and dialect-free; whether
+  // it is physically *feasible* -- its memories resolve, its hop storage fits,
+  // its occupancy is within capacity -- is only known after the plan is
+  // finalized and its bound kernel analyzed. Every top-K and first-legal
+  // decision must therefore come *after* evaluation: a proposal the evaluator
+  // rejects is not retained and the search keeps enumerating, so a cheap
+  // proposal that fails cannot mask a more expensive legal one.
+  //
+  // The proposal itself is a pure function of the partial, so it is built once
+  // and handed to the evaluator (or, with no evaluator, scored by the shared
+  // scheduler exactly as before R7).
+  auto buildProposal = [&](const Partial &partial) -> CoveringPlan {
     CoveringPlan plan;
     std::vector<InstanceId> instances;
     for (const CandidateInstance *instance : partial.chosen)
@@ -2049,6 +1958,23 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
         // normalized plan event charges this node the same estimate the
         // search ranked it on rather than re-deriving one.
         placement.cost = owner->cost;
+        // A provider hit travels with the placement too, so the final
+        // selected-kernel analysis charges the calibrated duration the search
+        // ranked on rather than the static machine formula (issue #129 review
+        // finding 6).
+        placement.measuredCycles = owner->measuredCycles;
+        // The capability kinds the rule requires travel with the placement so a
+        // later stage can tell "this rule needs no compute capability" from
+        // "the recorded selection is missing" (issue #129, task R1). Sorted and
+        // unique, so it is a function of the recorded rule alone.
+        for (const KindRequirement &requirement : owner->rule->kindRequirements)
+          if (requirement.role == "compute")
+            placement.computeRequirements.push_back(requirement.kind);
+        llvm::sort(placement.computeRequirements);
+        placement.computeRequirements.erase(
+            std::unique(placement.computeRequirements.begin(),
+                        placement.computeRequirements.end()),
+            placement.computeRequirements.end());
       }
       if (const WorkloadNode *node = tables[index].workload)
         if (!node->outputs.empty())
@@ -2063,6 +1989,13 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // The solved parameterization travels with the binding, so a selected
       // plan says which one it chose rather than only naming the layout family.
       placement.layoutSolutions = instance->layoutSolutions;
+      // The concrete compute node each requirement selected travels with the
+      // placement too (issue #129, task R1). This is a *copy* of the selected
+      // instance's decision, never a fresh query against the machine: a fused
+      // instance produces one placement per covered node and every one of them
+      // carries the same selected engines, so a later stage cannot re-derive a
+      // different first engine from executor order.
+      placement.computeBindings = instance->computeBindings;
       plan.placements.push_back(std::move(placement));
     }
     llvm::sort(plan.placements, placementBefore);
@@ -2089,6 +2022,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
       // charges the same movement the search ranked and can re-derive the same
       // transform estimate the materialized kernel uses.
       detail.cost = connection.cost;
+      // A measured movement travels with the connection, so the final analysis
+      // charges the calibrated duration the search ranked on (issue #129 review
+      // finding 6).
+      detail.measuredCycles = connection.measuredCycles;
       detail.workItems = elementsForValue(connection.value);
       if (const WorkloadValue *moved = workload_.findValue(connection.value))
         detail.valueType = moved->type;
@@ -2116,41 +2053,236 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                  return lhs.id < rhs.id;
                });
 
-    // The final candidate score comes from the *shared* resource scheduler
-    // (task B8), not the additive accumulation: the plan's normalized events
-    // are scheduled exactly as the performance model schedules the kernel, so a
-    // candidate is ranked by the overlapped latency it would actually run.
-    // The optimistic additive accumulation stays separately named.
-    plan.accumulatedCost = partial.cost;
-    plan.totalCost = partial.cost;
-    llvm::Expected<PlanEventDAG> planEvents = buildPlanEvents(plan, machine);
-    if (planEvents) {
-      llvm::Expected<Cost> scheduled = schedulePlanEvents(*planEvents, machine);
-      if (scheduled) {
-        plan.totalCost = *scheduled;
-        plan.scoreSource = PlanScoreSource::Schedule;
-      } else {
-        plan.diagnostics.storageNotes.push_back(
-            "plan score: accumulation reported, not scheduled (the shared "
-            "schedule failed: " +
-            llvm::toString(scheduled.takeError()) + ")");
-      }
-    } else {
-      plan.diagnostics.storageNotes.push_back(
-          "plan score: accumulation reported, not scheduled (the plan's events "
-          "could not be built: " +
-          llvm::toString(planEvents.takeError()) + ")");
-    }
-    plan.diagnostics.searchTruncated = result.searchTruncated;
-    // Record the search point this plan came from before its content id is
-    // folded, so two plans differing only by their binding do not collide.
+    // The search point this proposal came from, recorded before any content id
+    // is folded so two proposals differing only by their binding do not
+    // collide.
     if (binding_) {
       plan.sourceBindingHash = binding_->stableHash;
       plan.sourceBindingCandidate = binding_->candidateId;
       plan.globalParameters = binding_->values;
     }
-    plan.id = computePlanId(plan);
-    plans.push_back(std::move(plan));
+    // The additive accumulation of the synthesized work, kept separately named
+    // so it is never confused with the evaluated final score. A proposal the
+    // evaluator does not replace keeps this as its total cost.
+    plan.accumulatedCost = partial.cost;
+    plan.totalCost = partial.cost;
+    plan.diagnostics.searchTruncated = result.searchTruncated;
+    return plan;
+  };
+
+  // Retains one complete proposal: evaluates it when an evaluator is set and
+  // keeps the finalized plan it returns; otherwise keeps the proposal, scored
+  // by the shared scheduler exactly as before R7. Returns true when a plan was
+  // retained. A rejection is reported on the frontier and returns false so the
+  // search keeps enumerating; an evaluator error stops the search.
+  std::vector<CoveringPlan> retained;
+  auto retain = [&](const Partial &partial) -> bool {
+    CoveringPlan proposal = buildProposal(partial);
+    if (!hasEvaluator) {
+      // The final candidate score comes from the *shared* resource scheduler
+      // (task B8), not the additive accumulation: the proposal's normalized
+      // events are scheduled exactly as the performance model schedules the
+      // kernel, so a candidate is ranked by the overlapped latency it would
+      // actually run.
+      llvm::Expected<PlanEventDAG> planEvents =
+          buildPlanEvents(proposal, machine);
+      if (planEvents) {
+        llvm::Expected<Cost> scheduled =
+            schedulePlanEvents(*planEvents, machine);
+        if (scheduled) {
+          proposal.totalCost = *scheduled;
+          proposal.scoreSource = PlanScoreSource::Schedule;
+        } else {
+          proposal.diagnostics.storageNotes.push_back(
+              "plan score: accumulation reported, not scheduled (the shared "
+              "schedule failed: " +
+              llvm::toString(scheduled.takeError()) + ")");
+        }
+      } else {
+        proposal.diagnostics.storageNotes.push_back(
+            "plan score: accumulation reported, not scheduled (the plan's "
+            "events could not be built: " +
+            llvm::toString(planEvents.takeError()) + ")");
+      }
+      proposal.id = computePlanId(proposal);
+      retained.push_back(std::move(proposal));
+      return true;
+    }
+
+    llvm::Expected<CompletePlanEvaluation> evaluated =
+        options_.evaluateCompletePlan(proposal);
+    if (!evaluated) {
+      // An evaluation error names an invalid invocation or an infrastructure
+      // failure, not a property of this candidate: it stops the search.
+      if (!pendingError)
+        pendingError = evaluated.takeError();
+      return false;
+    }
+    // Exactly one of plan/rejection must be set. Both or neither is an invalid
+    // callback, i.e. an infrastructure failure, and stops the search.
+    if (evaluated->plan && evaluated->rejection) {
+      if (!pendingError)
+        pendingError =
+            llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                    "covering search: the completion evaluator "
+                                    "returned both a plan and "
+                                    "a rejection");
+      return false;
+    }
+    if (evaluated->rejection) {
+      // A candidate rejection is a property of *this proposal*, not a cap: it
+      // never sets `searchTruncated`. A capacity rejection is tallied under its
+      // documented category; every rejection's stable code is recorded.
+      if (evaluated->rejection->code == DiagnosticCode::MemoryCapacityExceeded)
+        ++result.frontier.plansRejectedByCapacity;
+      report(evaluated->rejection->code, evaluated->rejection->message);
+      return false;
+    }
+    if (!evaluated->plan) {
+      if (!pendingError)
+        pendingError = llvm::createStringError(
+            llvm::inconvertibleErrorCode(),
+            "covering search: the completion evaluator returned neither a plan "
+            "nor a rejection");
+      return false;
+    }
+    retained.push_back(std::move(*evaluated->plan));
+    return true;
+  };
+
+  // `topK == 0` is no cap: every feasible complete plan is returned, so a
+  // caller asking for the whole feasible set does not have to guess a number.
+  const bool unlimitedTopK = options_.topK == 0;
+
+  // --- search --------------------------------------------------------------
+  //
+  // Every mode retains through `retain`, so evaluation happens before any
+  // top-K or first-legal decision. Deterministic stops at the first proposal
+  // the evaluator *accepts* -- a rejected cheap proposal continues the walk.
+  // Exact explores fully (the additive top-K bound prune below is disabled when
+  // an evaluator is present, because the evaluator's final cost is the
+  // scheduled objective, not the additive bound it would prune on). Beam keeps
+  // its bounded frontier over partials and evaluates the complete ones.
+  if (options_.mode == SearchMode::Beam) {
+    Partial start;
+    start.chosen.assign(tables.size(), nullptr);
+    std::vector<Partial> beam{std::move(start)};
+    for (size_t depth = 0; depth < tables.size(); ++depth) {
+      std::vector<Partial> next;
+      for (const Partial &partial : beam) {
+        std::optional<size_t> node = lowestUncovered(partial);
+        if (!node)
+          continue;
+        for (const InstanceEntry &entry : tables[*node].instances) {
+          std::vector<Partial> states = extendStates(partial, *node, entry);
+          for (Partial &state : states) {
+            state.lowerBound = boundCost(state);
+            next.push_back(std::move(state));
+          }
+        }
+      }
+      // Bound order: the more promising bound first, direction-aware. An exact
+      // tie falls back to the deeper (more covered) plan, then the stable
+      // partial id. The beam is a bounded heuristic that may sort on a bound
+      // the exact prune would reject; it flags truncation only when a level
+      // exceeds `beamWidth` and is cut below, not unconditionally.
+      llvm::sort(next, [&](const Partial &lhs, const Partial &rhs) {
+        if (boundIsBetterThan(lhs.lowerBound, rhs.lowerBound,
+                              options_.objective))
+          return true;
+        if (boundIsBetterThan(rhs.lowerBound, lhs.lowerBound,
+                              options_.objective))
+          return false;
+        if (lhs.covered != rhs.covered)
+          return lhs.covered > rhs.covered;
+        return lhs.id < rhs.id;
+      });
+      if (next.size() > options_.beamWidth) {
+        next.resize(options_.beamWidth);
+        result.searchTruncated = true;
+        report(DiagnosticCode::SearchTruncated,
+               "beam width reached (beamWidth=" +
+                   std::to_string(options_.beamWidth) + ")");
+      }
+      beam = std::move(next);
+      if (beam.empty())
+        break;
+    }
+    // The beam retains only feasible complete proposals -- those the evaluator
+    // accepts -- while still honestly reporting the frontier truncation above.
+    for (Partial &partial : beam) {
+      if (pendingError)
+        break; // a fatal evaluator error stops the retention walk
+      if (!lowestUncovered(partial))
+        retain(partial);
+    }
+  } else {
+    // Deterministic and exact share a depth-first walk; they differ in when
+    // they stop.
+    bool exact = options_.mode == SearchMode::Exact;
+    // The additive top-K bound prune is *gone* (issue #129, task R7). Its bound
+    // was the additive rule-local cost while the plans a caller retains are
+    // ranked by the *scheduled* objective (the shared resource scheduler's
+    // overlapped latency, assigned in `retain`), and the scheduled objective is
+    // not a monotone function of the additive cost. A bound built on one and
+    // applied to the other is inadmissible: it can drop a completion the
+    // evaluator would have accepted and the ranking would have kept. That holds
+    // with or without a completion evaluator -- the evaluator only widens the
+    // gap, because it replaces the attribute cost with physical feasibility and
+    // the kernel's own schedule -- so the walk explores the space in full and
+    // relies on the *reported* caps (topK, instance, candidate, route and
+    // connection caps) for its bounds. A run that hits one sets
+    // `searchTruncated`; a run that does not is exhaustive.
+    std::function<void(Partial &, bool &)> visit = [&](Partial &partial,
+                                                       bool &stop) {
+      if (stop)
+        return;
+      std::optional<size_t> node = lowestUncovered(partial);
+      if (!node) {
+        bool accepted = retain(partial);
+        // A fatal evaluator error stops the search at once: the walk must not
+        // keep enumerating candidates once the run is known to be broken.
+        if (pendingError) {
+          stop = true;
+          return;
+        }
+        if (!exact && accepted)
+          stop = true; // deterministic: the first *feasible* complete plan
+        return;
+      }
+      for (const InstanceEntry &entry : tables[*node].instances) {
+        if (stop)
+          return;
+        std::vector<Partial> states = extendStates(partial, *node, entry);
+        for (Partial &branch : states) {
+          if (stop)
+            return;
+          visit(branch, stop);
+          if (stop)
+            return;
+        }
+      }
+    };
+
+    Partial start;
+    start.chosen.assign(tables.size(), nullptr);
+    bool stop = false;
+    visit(start, stop);
+  }
+
+  if (pendingError)
+    return std::move(pendingError);
+
+  // --- retention -----------------------------------------------------------
+  //
+  // Tally the feasible complete plans before the top-K cap drops the tail
+  // (design §22.2). The top-K cap, when it bites, is a search truncation like
+  // any other.
+  result.planCount = retained.size();
+  if (!unlimitedTopK && retained.size() > options_.topK) {
+    result.searchTruncated = true;
+    report(DiagnosticCode::SearchTruncated,
+           "top-K cap reached (topK=" + std::to_string(options_.topK) + ")");
   }
 
   // §22.1: order and retain by the declared objective and then the *exposed*
@@ -2158,13 +2290,21 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
   // it belongs, inside the beam's frontier heuristic; it never decides which K
   // survive a cap nor the emitted order. An exact cost tie breaks on `plan.id`,
   // so both are reproducible from `(totalCost, plan.id)` alone.
-  llvm::sort(plans, [&](const CoveringPlan &lhs, const CoveringPlan &rhs) {
+  llvm::sort(retained, [&](const CoveringPlan &lhs, const CoveringPlan &rhs) {
     return ranksBefore(lhs.totalCost, lhs.id, rhs.totalCost, rhs.id,
                        options_.objective);
   });
-  if (plans.size() > options_.topK)
-    plans.resize(options_.topK);
-  result.plans = std::move(plans);
+  if (!unlimitedTopK && retained.size() > options_.topK)
+    retained.resize(options_.topK);
+  // A returned plan reports the cap that actually ended its search (issue #129,
+  // task R7 review): `result.searchTruncated` is final only here, after the
+  // top-K trim, so a per-plan snapshot taken while the walk was still running
+  // could miss the very trim that selected it. The flag is provenance, not a
+  // decision, so it stays out of the plan's content id and this assignment
+  // cannot move an id.
+  for (CoveringPlan &plan : retained)
+    plan.diagnostics.searchTruncated = result.searchTruncated;
+  result.plans = std::move(retained);
 
   // §22.1/§22.3: the frontier's codes are the stable interface, so their order
   // must not depend on the order branches happened to be explored.

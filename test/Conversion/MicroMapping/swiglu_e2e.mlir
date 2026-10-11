@@ -59,7 +59,7 @@ func.func @swiglu(%x: tensor<16x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: micro.vector "mul"
 // CHECK-SAME: rule = "avx2.vector_mul"
 // CHECK: micro.vector "convert"
-// CHECK-SAME: rule = "avx2.vector_convert"
+// CHECK-SAME: rule = "avx2.vector_convert_row_major"
 
 // The write back carries a placement too.
 // CHECK: micro.tile_store

@@ -149,6 +149,28 @@ bool memorySupportsLayout(const MemoryNode &memory, llvm::StringRef layout) {
   return llvm::is_contained(memory.supportedLayouts, layout);
 }
 
+std::optional<ExecutorId>
+legalTransferEngine(const MachineModel &model, llvm::StringRef sourceMemory,
+                    llvm::StringRef destinationMemory) {
+  // Scan in link-id order, the order `outgoing()` expands a node's links in, so
+  // the engine recorded for a hop is the first one the router would have tried.
+  // The router additionally filters each candidate by the request's facts --
+  // transaction granule, alignment, intermediate capacity -- which need the
+  // request and are not re-checked here; this answers only "which engine
+  // carries this hop".
+  std::vector<const LinkEdge *> candidates;
+  for (const LinkEdge &link : model.links)
+    if (link.source == sourceMemory && link.destination == destinationMemory)
+      candidates.push_back(&link);
+  llvm::sort(candidates, [](const LinkEdge *lhs, const LinkEdge *rhs) {
+    return lhs->id < rhs->id;
+  });
+  for (const LinkEdge *link : candidates)
+    if (std::optional<ExecutorId> engine = legalEngine(model, *link))
+      return engine;
+  return std::nullopt;
+}
+
 TopologyService::TopologyService(const MachineModel &model,
                                  RouteOptions options)
     : model_(model), options_(options) {}

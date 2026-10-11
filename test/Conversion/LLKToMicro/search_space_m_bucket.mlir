@@ -31,9 +31,9 @@ func.func @large_m(%a: tensor<32x64xbf16>, %b: tensor<64x64xbf16>,
 // dropped rather than kept.
 // CHECK-LABEL: micro.search_space @matmul_M1_N64_K64
 // CHECK: micro.param "BM" {choices = [1], kind = "integer"}
-// BM = 1 does not divide the problem, so the search space keeps the mask tail
-// policy that makes it legal.
-// CHECK: micro.param "tail_policy" {choices = ["mask"], kind = "tail_policy"}
+// BM = 1 does not divide the problem, so the search space retains `pad` as a
+// realization that makes the tail legal.
+// CHECK: micro.param "tail_policy" {choices = ["none", "pad"], kind = "tail_policy"}
 // CHECK: micro.constraint "tail_supported" {params = ["BM", "BN", "BK"]}
 
 // M = 32 is bucket 3: tiles of 4 or fewer rows are rejected, and the scheduled

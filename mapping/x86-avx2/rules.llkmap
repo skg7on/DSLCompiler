@@ -14,7 +14,6 @@
 rule avx2.vector_add v1 {
   match micro.vector(op = "add");
   param VW in [4..8];
-  require VW == machine.compute("vector_engine").lanes(element_type);
   require executor kind worker;
   require compute kind vector_engine;
   require layout operand0 satisfies avx2.blocked_2d;
@@ -50,6 +49,23 @@ rule avx2.vector_convert v1 {
   cost 2;
 }
 
+// The GEMM initializer is read as a row-major tile before promotion into the
+// accumulator dtype. Keep this legal path explicit alongside the blocked
+// accumulator/result conversion above.
+rule avx2.vector_convert_row_major v1 {
+  match micro.vector(op = "convert");
+  param VW in [4..8];
+  require executor kind worker;
+  require compute kind vector_engine;
+  require VW == machine.compute("vector_engine").lanes("f32");
+  require layout operand0 satisfies avx2.row_major;
+  input "operand0";
+  output "result";
+  bundle "avx2.vector.convert.f32" { VW = VW };
+  emit "avx2_vector_convert";
+  cost 2;
+}
+
 rule avx2.vector_silu v1 {
   match micro.vector(op = "silu");
   require executor kind worker;
@@ -77,6 +93,8 @@ rule avx2.vector_mul v1 {
 
 rule avx2.mma_bf16 v1 {
   match micro.mma(input[0].element_type = bf16);
+  param VW in [4..8];
+  require VW == machine.compute("vector_engine").lanes("f32");
   require executor kind worker;
   require compute kind matrix_engine;
   require layout lhs satisfies avx2.row_major;
@@ -84,25 +102,57 @@ rule avx2.mma_bf16 v1 {
   input "rhs";
   input "acc";
   output "result";
-  bundle "avx2.mma.bf16";
+  bundle "avx2.mma.bf16" { VW = VW };
+  emit "avx2_mma";
+  cost 16;
+}
+
+rule avx2.mma_f32 v1 {
+  match micro.mma(input[0].element_type = f32);
+  param VW in [4..8];
+  require VW == machine.compute("vector_engine").lanes("f32");
+  require executor kind worker;
+  require compute kind matrix_engine;
+  require layout lhs satisfies avx2.row_major;
+  input "lhs";
+  input "rhs";
+  input "acc";
+  output "result";
+  bundle "avx2.mma.f32" { VW = VW };
   emit "avx2_mma";
   cost 16;
 }
 
 rule avx2.reduce_sum_f32 v1 {
   match micro.reduce(op = "sum");
+  param VW in [4..8];
+  require VW == machine.compute("vector_engine").lanes("f32");
   require executor kind worker;
   require compute kind vector_engine;
   input "operand0";
   output "result";
-  bundle "avx2.reduce.sum.f32";
+  bundle "avx2.reduce.sum.f32" { VW = VW };
   emit "avx2_reduce";
   cost 3;
 }
 
+// `micro.async_copy` is the one shipped operation whose boundary values are
+// plain `tensor`s: it moves into a low-level memory rather than operating on a
+// tile that already states one, so its endpoint occurrences carry no explicit
+// memory kind. The rule therefore has to *name* the ports it governs -- source
+// DRAM to destination SRAM, the profile's load path -- or a strict binding has
+// no fact saying where the copied value lives. Every other shipped rule leaves
+// the memory to the tile its operands and results already carry, which is why
+// none of them hard-codes `sram`/`acc`: the same `micro.vector "add"` runs in
+// SRAM in the vector-add program and in `acc` in the tiled matmul, and a rule
+// that named one kind would make the other unplaceable.
 rule avx2.async_copy v1 {
   match micro.async_copy();
   require executor kind worker;
+  require memory input "source" kind dram;
+  require memory output "result" kind sram;
+  input "source";
+  output "result";
   bundle "avx2.copy";
   emit "avx2_copy";
   cost 2;
@@ -141,12 +191,16 @@ rule avx2.fused_convert_silu_mul v1 {
     edge act.result -> gate.operand0;
   }
   param VW in [4..8];
+  require VW == machine.compute("vector_engine").lanes(element_type);
   require executor kind worker;
   require compute kind vector_engine;
+  require layout cv.operand0 satisfies avx2.blocked_2d;
+  require layout gate.operand1 satisfies avx2.blocked_2d;
+  require layout gate.result satisfies avx2.blocked_2d;
   input "cv.operand0";
   input "gate.operand1";
   output "gate.result";
-  bundle "avx2.fused.convert_silu_mul";
+  bundle "avx2.fused.convert_silu_mul" { VW = VW };
   emit "avx2_fused_convert_silu_mul";
   cost 3;
 }

@@ -30,6 +30,10 @@
 #include <string>
 #include <vector>
 
+namespace mlir::llk::mapping {
+struct EventScheduleResult;
+} // namespace mlir::llk::mapping
+
 namespace mlir::llk::perf {
 
 /// Roofline-style static bound over the whole kernel.
@@ -98,6 +102,17 @@ L0Report computeL0StaticBound(const MicroDAG &dag,
 
 /// Deterministic list schedule over the event graph.
 L1Report scheduleL1(const MicroDAG &dag, const machine::MachineModel &machine);
+
+/// The L1 report of an event graph whose shared schedule has *already* been
+/// computed (issue #129, task R6): the performance report derives its L1
+/// figures from the schedule the shared selected-kernel analysis produced,
+/// rather than scheduling the same stream a second time. `schedule` must be the
+/// schedule of `dag`'s normalized event stream -- `scheduleL1` builds exactly
+/// that, so a caller that has the analysis in hand and a caller that does not
+/// reach identical numbers.
+L1Report reportL1FromSchedule(const MicroDAG &dag,
+                              const machine::MachineModel &machine,
+                              const mapping::EventScheduleResult &schedule);
 
 /// Compares peak live tile bytes against modeled capacity. Violations make a
 /// candidate illegal, but they do not fail the run.

@@ -11,10 +11,21 @@
 
 #include "LLK/Runtime/JitCache.h"
 
+#include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
+#include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
+#include "mlir/Conversion/ConvertToLLVM/ToLLVMPass.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
+#include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/Passes.h"
-#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.h"
+#include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
+#include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
@@ -35,6 +46,61 @@
 using namespace mlir;
 
 namespace llk {
+
+namespace {
+// VectorToLLVM leaves writes of row-broadcast vectors in vector.transfer form
+// on LLVM 22. The mapped kernel's row is a statically sized, in-bounds unit
+// dimension, so project that dimension out of the transfer map and write the
+// source vector directly along the remaining dimension.
+struct LowerBroadcastRowTransferWritesPass
+    : mlir::PassWrapper<LowerBroadcastRowTransferWritesPass,
+                        mlir::OperationPass<mlir::ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      LowerBroadcastRowTransferWritesPass)
+  llvm::StringRef getArgument() const final {
+    return "lower-broadcast-row-transfer-writes";
+  }
+  void runOnOperation() override {
+    llvm::SmallVector<mlir::vector::TransferWriteOp> writes;
+    getOperation().walk([&](mlir::vector::TransferWriteOp write) {
+      auto broadcast =
+          write.getVector().getDefiningOp<mlir::vector::BroadcastOp>();
+      if (!broadcast || write.getMask() ||
+          !write.getPermutationMap().isIdentity())
+        return;
+      auto resultType = mlir::dyn_cast<mlir::VectorType>(write.getVectorType());
+      auto sourceType =
+          mlir::dyn_cast<mlir::VectorType>(broadcast.getSource().getType());
+      auto memrefType =
+          mlir::dyn_cast<mlir::MemRefType>(write.getBase().getType());
+      if (!resultType || !sourceType || !memrefType ||
+          resultType.getRank() != 2 || sourceType.getRank() != 1 ||
+          resultType.getDimSize(0) != 1 || memrefType.getRank() != 2 ||
+          memrefType.getDimSize(0) != 1 || write.getIndices().size() != 2 ||
+          !mlir::matchPattern(write.getIndices().front(), mlir::m_Zero()))
+        return;
+      if (!llvm::all_of(write.getInBoundsValues(),
+                        [](bool inBounds) { return inBounds; }))
+        return;
+      writes.push_back(write);
+    });
+
+    for (mlir::vector::TransferWriteOp write : writes) {
+      auto broadcast =
+          write.getVector().getDefiningOp<mlir::vector::BroadcastOp>();
+      auto loc = write.getLoc();
+      auto map = mlir::AffineMap::get(
+          2, 0, mlir::getAffineDimExpr(1, write.getContext()));
+      const bool inBounds[] = {true};
+      mlir::OpBuilder builder(write);
+      mlir::vector::TransferWriteOp::create(
+          builder, loc, broadcast.getSource(), write.getBase(),
+          write.getIndices(), map, llvm::ArrayRef<bool>(inBounds));
+      write.erase();
+    }
+  }
+};
+} // namespace
 
 // ---------------------------------------------------------------------------
 // CacheLevel method implementations
@@ -130,10 +196,24 @@ std::string JitCache::weightKeyToString(const WeightKey &key) {
 // ---------------------------------------------------------------------------
 // Lowering pipeline: progressively lower MLIR dialects to LLVM dialect.
 // ---------------------------------------------------------------------------
+void registerKernelToLLVMInterfaces(mlir::MLIRContext &context) {
+  static const mlir::DialectRegistry registry = [] {
+    mlir::DialectRegistry registry;
+    mlir::registerConvertToLLVMDependentDialectLoading(registry);
+    mlir::arith::registerConvertArithToLLVMInterface(registry);
+    mlir::cf::registerConvertControlFlowToLLVMInterface(registry);
+    mlir::registerConvertFuncToLLVMInterface(registry);
+    mlir::index::registerConvertIndexToLLVMInterface(registry);
+    mlir::registerConvertMathToLLVMInterface(registry);
+    mlir::registerConvertMemRefToLLVMInterface(registry);
+    mlir::ub::registerConvertUBToLLVMInterface(registry);
+    mlir::vector::registerConvertVectorToLLVMInterface(registry);
+    return registry;
+  }();
+  context.appendDialectRegistry(registry);
+}
+
 void addKernelToLLVMPasses(mlir::PassManager &pm) {
-  // Lower vector dialect ops to LLVM dialect (must run before SCF→CF
-  // lowering because vector.mask may contain scf ops).
-  pm.addPass(mlir::createConvertVectorToLLVMPass());
   // Expand memref ops that carry layout metadata into explicit
   // `extract_strided_metadata` arithmetic, before anything else looks at them.
   // A windowed tile view lowers to a `memref.subview` whose offsets are affine
@@ -145,26 +225,32 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   // `index` values, which in turn keeps `i64 -> index` materializations alive
   // all the way to LLVM translation, which refuses them.
   pm.addPass(mlir::createLowerAffinePass());
+  // Canonicalize vector producers before transfer lowering.
+  pm.addPass(mlir::createCanonicalizerPass());
+  // Reduce vector transfers to rank-one transfers and SCF loops before SCF is
+  // lowered. This handles scalable transfer dimensions that VectorToLLVM
+  // cannot lower directly.
+  pm.addPass(mlir::createConvertVectorToSCFPass(
+      mlir::VectorTransferToSCFOptions().enableLowerScalable()));
+  // Handle unit-row broadcasts that VectorToSCF and VectorToLLVM leave behind.
+  pm.addPass(std::make_unique<LowerBroadcastRowTransferWritesPass>());
   // Lower structured control flow (scf) to basic-block control flow (cf).
 #if LLVM_VERSION_MAJOR >= 21
   pm.addPass(mlir::createSCFToControlFlowPass());
 #else
   pm.addPass(mlir::createConvertSCFToCFPass());
 #endif
-  // Lower control flow to LLVM dialect.
-  pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-  // Lower arithmetic ops to LLVM dialect.
-  pm.addPass(mlir::createArithToLLVMConversionPass());
-  // Lower math ops (exp, erf, etc.) to LLVM dialect.
-  pm.addPass(mlir::createConvertMathToLLVMPass());
-  // Lower func ops (function boundaries) to LLVM dialect.
-  pm.addPass(mlir::createConvertFuncToLLVMPass());
-  // Lower memref ops to LLVM dialect (finalizes the MemRef→LLVM conversion).
-  pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-  // Drop the materializations the conversions inserted and then left unused --
-  // an `i64 -> index` cast with no users, typically, from lowering a loop's
-  // induction variable. Reconciliation only removes casts whose types agree, so
-  // without this one they survive to LLVM translation, which refuses them.
+  // VectorToSCF exposes transfer operations the vector-to-LLVM pass can lower
+  // directly. Keep it after SCF lowering so scalable transpose transfers are
+  // decomposed while their vector producers are still intact.
+  pm.addPass(mlir::createConvertVectorToLLVMPass());
+  // Convert all dialects with LLVM conversion interfaces in a single partial
+  // conversion. Sharing one LLVMTypeConverter lets vector, memref, function,
+  // arithmetic, and UB patterns agree on converted types instead of leaving
+  // incompatible unrealized casts between separately run conversions.
+  registerKernelToLLVMInterfaces(*pm.getContext());
+  pm.addPass(mlir::createConvertToLLVMPass());
+  // Remove no-op materializations left by the joint partial conversion.
   pm.addPass(mlir::createCanonicalizerPass());
   // Reconcile unrealized casts between conversion passes.
   pm.addPass(mlir::createReconcileUnrealizedCastsPass());

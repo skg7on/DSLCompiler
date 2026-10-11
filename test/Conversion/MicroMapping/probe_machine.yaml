@@ -1,7 +1,7 @@
-# A machine for micro_map_unmaterialized.mlir whose two memories live in
+# A machine for micro_map_unmaterialized.mlir whose SRAM and DRAM live in
 # different visibility scopes, so the node reading DRAM cannot read the SRAM
 # the producer wrote: the edge between them is a real transfer, which is what
-# makes the binder try -- and fail -- to materialize it. The shipped AVX2
+# exercises the binder's canonical materialization. The shipped AVX2
 # profile puts every memory in one cluster, where any worker can read any
 # memory, so under design §10.2 every cross-memory edge there is a Direct read
 # and nothing has to move.
@@ -39,6 +39,14 @@ memories:
     supported_layouts: [row_major]
     bandwidth_bytes_per_cycle: 32
     latency_cycles: 220
+  - id: l2.0
+    kind: l2
+    visible_from: cluster.b
+    capacity_bytes: 262144
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
 compute:
   - id: vpu
     kind: vector_engine
@@ -60,5 +68,20 @@ links:
     destination: dram.0
     bandwidth_bytes_per_cycle: 64
     latency_cycles: 220
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+  # Model the source kernel's input copy and its final store after binding.
+  - id: dram_to_sram.0
+    source: dram.0
+    destination: sram.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 4
+    transaction_bytes: 64
+    transfer_engines: [dma.a]
+  - id: dram_to_l2.0
+    source: dram.0
+    destination: l2.0
+    bandwidth_bytes_per_cycle: 64
+    latency_cycles: 12
     transaction_bytes: 64
     transfer_engines: [dma.a]

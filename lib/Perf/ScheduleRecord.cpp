@@ -79,6 +79,8 @@ void writeScheduleYaml(llvm::raw_ostream &os, const ScheduleRecord &record) {
   os << "  values:\n";
   for (const auto &[name, value] : record.candidate.values)
     os << "    " << name << ": " << value << "\n";
+  for (const auto &[name, value] : record.candidate.symbolicValues)
+    os << "    " << name << ": " << value << "\n";
 
   // The tile decisions are the schedule itself: hierarchy, layout, memory
   // placement, owner mapping, and instruction fragment.
@@ -109,6 +111,15 @@ void writeScheduleYaml(llvm::raw_ostream &os, const ScheduleRecord &record) {
   os << "  dram_bytes: " << record.metrics.dramBytes << "\n";
   os << "  sram_bytes: " << record.metrics.sramBytes << "\n";
   os << "  bottleneck: " << record.metrics.bottleneck << "\n";
+
+  if (record.mappingProvenanceVersion) {
+    os << "mapping_provenance:\n";
+    os << "  schema_version: " << record.mappingProvenanceVersion << "\n";
+    os << "  plan_id: " << record.mappingPlanId << "\n";
+    os << "  binding_hash: " << record.mappingBindingHash << "\n";
+    os << "  source_artifact: \"" << record.mappingSourceArtifact << "\"\n";
+    os << "  plan_report: \"" << record.mappingPlanReport << "\"\n";
+  }
 
   os << "measurement:\n";
   if (!record.measured) {

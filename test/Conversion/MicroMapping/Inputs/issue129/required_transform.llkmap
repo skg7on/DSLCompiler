@@ -1,0 +1,39 @@
+rule issue129.add_row_major {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require memory kind sram;
+  require layout result satisfies row_major;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.add.row_major";
+  emit "avx2_vector_add";
+  cost 4;
+}
+
+rule issue129.async_copy {
+  match micro.async_copy();
+  require executor kind worker;
+  require memory input "source" kind dram;
+  require memory output "result" kind sram;
+  input "source";
+  output "result";
+  bundle "avx2.copy";
+  emit "avx2_copy";
+  cost 1;
+}
+
+rule issue129.mul_blocked {
+  match micro.vector(op = "mul");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require memory kind dram;
+  require layout operand0 satisfies blocked;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.mul.blocked";
+  emit "avx2_vector_mul";
+  cost 4;
+}

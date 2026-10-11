@@ -1,0 +1,46 @@
+{
+  "commands": [
+    {
+      "name": "acceptance-pipeline",
+      "argv": [
+        "{python}",
+        "test/Conversion/MicroMapping/acceptance_pipeline.py",
+        "{llk_opt}",
+        "{llk_compile}",
+        "{micro_perf}",
+        "{repo}",
+        "{artifacts}/acceptance"
+      ],
+      "outputs": [
+        "acceptance/vector-add/report_a.json",
+        "acceptance/vector-add/mapped_a.mlir",
+        "acceptance/staged-gemm/report_a.json",
+        "acceptance/fused-swiglu/report_a.json",
+        "acceptance/required-transform/report_a.json",
+        "acceptance/second-target-two-hop/report_a.json"
+      ]
+    },
+    {
+      "name": "mapped-tune",
+      "argv": [
+        "{python}",
+        "test/Tuning/mapped_tune_cli.py",
+        "{llk_tune}",
+        "{llk_compile}",
+        "{repo}"
+      ],
+      "capture": "mapped-tune.stdout"
+    }
+  ],
+  "documentation_tokens": [
+    "llk-opt --micro-map=",
+    "report=build/WorkflowSmoke/plan.json",
+    "--micro-bind-plan=\"plan-id=<selectedPlanId>",
+    "--micro-verify-mapping=",
+    "--mapping-stop=lowered",
+    "--plan-report=build/WorkflowSmoke/plan.json",
+    "--fail-on-capacity-violation",
+    "--candidate-source=semantic",
+    "--mapping-report=build/WorkflowSmoke/tune-report.json"
+  ]
+}

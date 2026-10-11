@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "warmup": 1,
+  "repeat": 5,
+  "inputs": [
+    {"dtype": "bf16", "shape": [8, 32], "data": 1},
+    {"dtype": "bf16", "shape": [32, 16], "data": 2},
+    {"dtype": "bf16", "shape": [8, 16], "data": 3}
+  ],
+  "outputs": [
+    {"dtype": "bf16", "shape": [8, 16], "data": 67,
+     "absolute_tolerance": 0, "relative_tolerance": 0}
+  ]
+}

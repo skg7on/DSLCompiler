@@ -38,7 +38,13 @@ namespace mlir::llk::mapping {
 /// length-delimited, so a field that merely contains a separator can no longer
 /// make two different pieces of work collide. A measurement taken under the
 /// ambiguous version-1 key is therefore not reused.
-inline constexpr uint64_t kCostModelVersion = 2;
+///
+/// Version 3 (issue #129, task R1) adds the selected concrete compute node(s)
+/// to the operation key: two placements that differ only in which attached
+/// engine of a kind they selected are different work at potentially different
+/// costs, so a measurement taken under version 2 -- which keyed both
+/// placements together -- must not be reused.
+inline constexpr uint64_t kCostModelVersion = 3;
 
 /// Bumped independently of `kCostModelVersion` whenever a *connection*
 /// measurement's identity changes. Version 2 (task B8) gained ordered
@@ -78,6 +84,13 @@ struct OperationSignature {
   /// placement: the executor id bound and its memory bindings.
   std::string placementClass;
   std::string placement;
+  /// The concrete compute nodes the placement selected, one `kind=node` entry
+  /// per requirement, sorted -- the same decision `PlanPlacement::
+  /// computeBindings` persists. Two placements that share a rule, executor and
+  /// memory bindings but select a different attached engine of a kind are
+  /// different work, so an engine change must change the key (issue #129, task
+  /// R1).
+  std::string compute;
   std::string routeClass;
   uint64_t costModelVersion = kCostModelVersion;
 
@@ -132,7 +145,9 @@ struct ConnectionSignature {
   std::string engines;
   /// The concrete source/destination affine maps the connection applies.
   std::string maps;
-  /// The concrete layout and bundle parameters the connection resolved.
+  /// The concrete layout and bundle parameters the connection resolved,
+  /// including the compute resource a layout transform runs on (issue #129,
+  /// task R1): a transform on two different engines is different work.
   std::string parameters;
   /// The storage the connection resolves to (memory plus allocation bytes).
   std::string storage;

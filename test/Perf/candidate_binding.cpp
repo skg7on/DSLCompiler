@@ -92,7 +92,7 @@ SearchSpace swigluSpace() {
           {SearchChoice("worker/lane"), SearchChoice("worker/vector_engine")}),
       symbolicParam("fragment_shape", "fragment_shape",
                     {SearchChoice("16x16x32"), SearchChoice("8x8x32")}),
-      symbolicParam("tail_policy", "tail_policy", {SearchChoice("mask")}),
+      symbolicParam("tail_policy", "tail_policy", {SearchChoice("none")}),
   };
   return space;
 }
@@ -108,7 +108,7 @@ Candidate preferred() {
                               {"memory_path", "dram:sram:acc"},
                               {"owner_mapping", "worker/vector_engine"},
                               {"fragment_shape", "16x16x32"},
-                              {"tail_policy", "mask"}};
+                              {"tail_policy", "none"}};
   candidate.id = computeCandidateId(candidate.values, candidate.symbolicValues);
   return candidate;
 }
@@ -191,7 +191,7 @@ TEST(CandidateBinding, ResolvesTheCandidateIntoConcreteTileDecisions) {
   EXPECT_EQ(decisions.accumulatorSpace, "acc");
   EXPECT_EQ(decisions.outerOwner, "worker");
   EXPECT_EQ(decisions.fragmentOwner, "vector_engine");
-  EXPECT_EQ(decisions.tailPolicy, "mask");
+  EXPECT_EQ(decisions.tailPolicy, "none");
   EXPECT_EQ(decisions.pipelineStages, 1);
   EXPECT_EQ(decisions.vectorWidth, 8);
 }
@@ -289,7 +289,7 @@ TEST(CandidateBinding, BindsAMatmulWithoutTheFusedEpilogue) {
   ModuleOp matmul = scratch->module.get();
   auto matmulKernel = *matmul.getOps<micro::KernelOp>().begin();
   ASSERT_TRUE(matmulKernel.getKernelFunctionType());
-  EXPECT_EQ(matmulKernel.getKernelFunctionType().getNumInputs(), 2u);
+  EXPECT_EQ(matmulKernel.getKernelFunctionType().getNumInputs(), 3u);
   EXPECT_EQ(countOps<micro::MmaOp>(scratch->module.get()), 1u);
   unsigned silu = 0;
   scratch->module.get().walk([&](micro::VectorOp op) {
@@ -297,6 +297,53 @@ TEST(CandidateBinding, BindsAMatmulWithoutTheFusedEpilogue) {
       ++silu;
   });
   EXPECT_EQ(silu, 0u);
+}
+
+TEST(CandidateBinding, PadsTailInputsAndRestrictsTheOutputPartition) {
+  SearchSpace space = swigluSpace();
+  space.workload = "matmul";
+  Candidate candidate = preferred();
+  candidate.symbolicValues["tail_policy"] = "pad";
+  WorkloadShape shape = swigluShape();
+  shape.M = 5;
+  shape.N = 9;
+  shape.K = 7;
+
+  auto scratch = makeScratch();
+  auto bound = bindCandidateToMicroKernel(scratch->module.get(), space,
+                                          candidate, shape);
+  ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+  ASSERT_TRUE(mlir::succeeded(mlir::verify(scratch->module.get())));
+
+  micro::KernelOp kernel = onlyKernel(scratch->module.get());
+  auto lhsType = mlir::dyn_cast<RankedTensorType>(
+      kernel.getKernelFunctionType().getInput(0));
+  ASSERT_TRUE(lhsType);
+  EXPECT_EQ(lhsType.getShape(), (ArrayRef<int64_t>{5, 7}));
+  EXPECT_EQ(countOps<tensor::PadOp>(scratch->module.get()), 3u);
+
+  bool sawValidTail = false;
+  scratch->module.get().walk([&](micro::TilePartitionOp partition) {
+    if (partition.getShape() == ArrayRef<int64_t>{5, 9}) {
+      sawValidTail = true;
+      EXPECT_TRUE(partition->getAttr("tail"));
+    }
+  });
+  EXPECT_TRUE(sawValidTail);
+}
+
+TEST(CandidateBinding, RejectsUnsupportedMaskTailPolicy) {
+  SearchSpace space = swigluSpace();
+  Candidate candidate = preferred();
+  candidate.symbolicValues["tail_policy"] = "mask";
+
+  auto scratch = makeScratch();
+  auto bound = bindCandidateToMicroKernel(scratch->module.get(), space,
+                                          candidate, swigluShape());
+  ASSERT_FALSE(bool(bound));
+  EXPECT_NE(llvm::toString(bound.takeError())
+                .find("tail_policy 'mask' is unsupported"),
+            std::string::npos);
 }
 
 TEST(CandidateBinding, LeavesNoSearchOpBehind) {
@@ -338,7 +385,7 @@ TEST(CandidateBinding, RecordsTheCandidateOnTheKernel) {
   EXPECT_EQ(kernel->getAttrOfType<StringAttr>("tile_layout").getValue(),
             "row_major");
   EXPECT_EQ(kernel->getAttrOfType<StringAttr>("tail_policy").getValue(),
-            "mask");
+            "none");
 }
 
 TEST(CandidateBinding, BindsTileSizesIntoLoopStepsAndTensorExtents) {
@@ -530,7 +577,7 @@ micro.search_space @fused_swiglu_M8_N64_K64 attributes {workload = "fused_swiglu
   micro.param "memory_path" {kind = "memory_path", choices = ["dram:sram:acc"]}
   micro.param "owner_mapping" {kind = "owner_mapping", choices = ["worker/vector_engine"]}
   micro.param "fragment_shape" {kind = "fragment_shape", choices = ["16x16x32"]}
-  micro.param "tail_policy" {kind = "tail_policy", choices = ["mask"]}
+  micro.param "tail_policy" {kind = "tail_policy", choices = ["none"]}
   micro.constraint "sram_capacity" {params = ["BM", "BN", "BK"]}
   micro.objective {direction = "minimize", metric = "latency_cycles", secondary = ["matrix_utilization", "dram_bytes"]}
 }

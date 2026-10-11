@@ -20,6 +20,7 @@
 #include "LLK/Mapping/MappingHelpers.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/StableHash.h"
+#include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Mapping/TileFacts.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
@@ -53,6 +54,10 @@ constexpr llvm::StringLiteral kSrcNodeAttr = "micro.src_node";
 constexpr llvm::StringLiteral kDstNodeAttr = "micro.dst_node";
 constexpr llvm::StringLiteral kConnectionAttr = "micro.connection";
 constexpr llvm::StringLiteral kHopAttr = "micro.hop";
+/// The storage allocation a materialized movement hop reads and writes (issue
+/// #129, task R4).
+constexpr llvm::StringLiteral kSrcStorageAttr = "micro.src_storage";
+constexpr llvm::StringLiteral kDstStorageAttr = "micro.dst_storage";
 
 /// The Micro operations the canonical materializer emits to materialize a
 /// connection's movement: the generic `micro.async_copy` for a shaped value and
@@ -86,7 +91,8 @@ WorkloadNode strippedWorkloadNode(const WorkloadNode &node) {
   for (mlir::NamedAttribute attribute : node.attributes) {
     llvm::StringRef name = attribute.getName().getValue();
     if (name == kMappingAttr || name == kValueAttr || name == kSrcNodeAttr ||
-        name == kDstNodeAttr || name == kConnectionAttr || name == kHopAttr) {
+        name == kDstNodeAttr || name == kConnectionAttr || name == kHopAttr ||
+        name == kSrcStorageAttr || name == kDstStorageAttr) {
       stripped = true;
       continue;
     }
@@ -456,6 +462,124 @@ llvm::Error verifyMaterializedMovement(mlir::Operation *op,
                              "' names no transfer engine its link offers");
   }
 
+  // The physical hop records (issue #129, task R4). A plan that recorded hops
+  // must describe its route exactly -- one hop per transition, in order, each
+  // naming an engine its link offers -- and the movement materialized for a hop
+  // must name the storage that hop reserved. A mutated hop engine or storage
+  // id, or a hop set that does not match the route, is rejected rather than
+  // replayed as if it had been decided.
+  if (mlir::Attribute rawHops = route.get("hops")) {
+    auto hopList = mlir::dyn_cast<mlir::ArrayAttr>(rawHops);
+    if (!hopList)
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": connection " +
+                             std::to_string(*connectionId) +
+                             " 'hops' is not an array");
+    if (hopList.size() + 1 != nodes->size())
+      return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                         where + ": connection " +
+                             std::to_string(*connectionId) + " records " +
+                             std::to_string(hopList.size()) +
+                             " movement hops for a route of " +
+                             std::to_string(nodes->size()) + " memories");
+    for (size_t index = 0; index < hopList.size(); ++index) {
+      auto entry = mlir::dyn_cast<mlir::DictionaryAttr>(hopList[index]);
+      if (!entry)
+        return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                           where + ": connection " +
+                               std::to_string(*connectionId) +
+                               " hop entry is not a dictionary");
+      auto hopIndex = entry.getAs<mlir::IntegerAttr>("index");
+      if (!hopIndex || hopIndex.getValue().getZExtValue() != index)
+        return verifyError(
+            DiagnosticCode::InvalidMappingMetadata,
+            where + ": connection " + std::to_string(*connectionId) + " hop " +
+                std::to_string(index) + " records a different index");
+      llvm::Expected<std::string> src =
+          readMetadataString(entry, "src_memory", where);
+      if (!src)
+        return metadataError(src.takeError());
+      llvm::Expected<std::string> dst =
+          readMetadataString(entry, "dst_memory", where);
+      if (!dst)
+        return metadataError(dst.takeError());
+      if (*src != (*nodes)[index] || *dst != (*nodes)[index + 1])
+        return verifyError(
+            DiagnosticCode::InvalidMappingMetadata,
+            where + ": connection " + std::to_string(*connectionId) + " hop " +
+                std::to_string(index) + " crosses '" + *src + "' -> '" + *dst +
+                "', which its route does not describe");
+      llvm::Expected<std::string> engine =
+          readMetadataString(entry, "engine", where);
+      if (!engine)
+        return metadataError(engine.takeError());
+      if (!engine->empty()) {
+        if (!machine.findTransferEngine(*engine))
+          return verifyError(
+              DiagnosticCode::InvalidMappingMetadata,
+              where + ": connection " + std::to_string(*connectionId) +
+                  " hop " + std::to_string(index) +
+                  " names unsupported transfer engine '" + *engine + "'");
+        // A real engine the machine declares is not enough: the hop must run on
+        // one *its link* offers. Two engine pools of one machine are not
+        // interchangeable -- the router legalized the hop with the link's own
+        // engines -- so a hop re-pointed at another pool is a tampered decision
+        // even though the engine exists.
+        const machine::LinkEdge *hopLink = nullptr;
+        for (const machine::LinkEdge &edge : machine.links)
+          if (edge.source == (*nodes)[index] &&
+              edge.destination == (*nodes)[index + 1]) {
+            hopLink = &edge;
+            break;
+          }
+        if (!hopLink)
+          return verifyError(
+              DiagnosticCode::InvalidMappingMetadata,
+              where + ": connection " + std::to_string(*connectionId) +
+                  " hop " + std::to_string(index) + " crosses '" +
+                  (*nodes)[index] + "' -> '" + (*nodes)[index + 1] +
+                  "', which no machine link joins");
+        if (!llvm::is_contained(hopLink->transferEngines, *engine))
+          return verifyError(
+              DiagnosticCode::InvalidMappingMetadata,
+              where + ": connection " + std::to_string(*connectionId) +
+                  " hop " + std::to_string(index) + " names transfer engine '" +
+                  *engine + "', which its link does not offer");
+      }
+      if (index + 1 != *hop)
+        continue;
+      // The movement materialized for this hop reads and writes the storage the
+      // hop reserved. Both are optional in the plan's record, so the check
+      // applies exactly when the plan made the decision.
+      if (mlir::Attribute rawSource = entry.get("source_storage")) {
+        auto reserved = mlir::dyn_cast<mlir::IntegerAttr>(rawSource);
+        llvm::Expected<uint64_t> stated =
+            movementUintAttr(op, kSrcStorageAttr, where);
+        if (!stated)
+          return stated.takeError();
+        if (!reserved || reserved.getValue().getActiveBits() > 64 ||
+            reserved.getValue().getZExtValue() != *stated)
+          return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                             where +
+                                 ": movement does not read the storage hop " +
+                                 std::to_string(index) + " reserved");
+      }
+      if (mlir::Attribute rawDestination = entry.get("destination_storage")) {
+        auto reserved = mlir::dyn_cast<mlir::IntegerAttr>(rawDestination);
+        llvm::Expected<uint64_t> stated =
+            movementUintAttr(op, kDstStorageAttr, where);
+        if (!stated)
+          return stated.takeError();
+        if (!reserved || reserved.getValue().getActiveBits() > 64 ||
+            reserved.getValue().getZExtValue() != *stated)
+          return verifyError(DiagnosticCode::InvalidMappingMetadata,
+                             where +
+                                 ": movement does not write the storage hop " +
+                                 std::to_string(index) + " reserved");
+      }
+    }
+  }
+
   // Source/destination kind equality is not node identity. A same-kind hop is
   // legal only between two *distinct* concrete nodes, and only when the
   // machine's own facts back the node identity: the link's transaction granule
@@ -681,7 +805,61 @@ bool kernelUsesSchemaV2(mlir::Operation *op) {
   return kernelMetadataIsSchemaV2(kernel);
 }
 
+/// True when the kernel's `micro.plan` records a schema-v3 (or newer) binding.
+/// Delegates to `kernelMetadataIsSchemaV3`, so a deleted `schema_version`
+/// cannot downgrade a binding that still records `compute_bindings` -- the
+/// v3-only field that proves a concrete compute selection was persisted.
+bool kernelUsesSchemaV3(mlir::Operation *op) {
+  mlir::Operation *kernel = enclosingKernel(op);
+  if (!kernel)
+    return false;
+  return kernelMetadataIsSchemaV3(kernel);
+}
+
 } // namespace
+
+llvm::Error
+verifyPlanPhysicalCompleteness(const WorkloadGraph &graph,
+                               const CoveringPlan &plan,
+                               const machine::MachineModel &machine) {
+  llvm::DenseMap<WorkloadNodeId, const PlanPlacement *> placementFor;
+  for (const PlanPlacement &placement : plan.placements)
+    placementFor[placement.node] = &placement;
+
+  // Reasons are collected in graph order -- the same canonical order every
+  // other stage visits nodes in -- so the message is deterministic regardless
+  // of how the plan's own vectors happen to be ordered.
+  std::vector<std::string> reasons;
+  for (const WorkloadNode &node : graph.getNodes()) {
+    auto found = placementFor.find(node.id);
+    if (found == placementFor.end()) {
+      reasons.push_back("node " + std::to_string(node.id) + " ('" +
+                        node.opName + "') has no placement");
+      continue;
+    }
+    const PlanPlacement &placement = *found->second;
+    for (unsigned index = 0; index < node.outputs.size(); ++index) {
+      const PortRef ref{node.id, PortDirection::Output, index};
+      llvm::Expected<EndpointMemory> memory =
+          resolveEndpointMemory(graph, placement, ref, machine);
+      if (!memory) {
+        reasons.push_back("value " + std::to_string(node.outputs[index].value) +
+                          " written by node " + std::to_string(node.id) +
+                          " output " + std::to_string(index) + ": " +
+                          llvm::toString(memory.takeError()));
+        continue;
+      }
+    }
+  }
+  if (reasons.empty())
+    return llvm::Error::success();
+  std::string message = "bindPlan: the plan is not physically complete; " +
+                        std::to_string(reasons.size()) +
+                        " value(s) have no resolved physical memory:";
+  for (const std::string &reason : reasons)
+    message += "\n  " + reason;
+  return bindError(message);
+}
 
 llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                                 const MappingTarget &target) {
@@ -890,6 +1068,14 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
     return {found->second, {}};
   };
 
+  // The compute selection each instance recorded, so the different placements
+  // of one fused instance can be required to agree on it (issue #129, task R1).
+  // Keyed by (kernel, instance id): instance ids are content hashes, but two
+  // kernels in one module are separate bindings and must not be conflated.
+  llvm::DenseMap<std::pair<mlir::Operation *, uint64_t>,
+                 llvm::StringMap<std::string>>
+      instanceComputeBindings;
+
   module->walk([&](mlir::Operation *op) {
     if (failure)
       return;
@@ -904,6 +1090,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       return;
     }
     const bool schemaV2 = kernelUsesSchemaV2(op);
+    const bool schemaV3 = kernelUsesSchemaV3(op);
 
     llvm::Expected<std::string> ruleId =
         readMetadataString(mapping, "rule", where);
@@ -1080,9 +1267,49 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
       }
     }
 
+    // The concrete compute node each requirement selected (issue #129, task
+    // R1). A v3 binding records the container, so deleting it cannot let a
+    // reader re-derive an engine from executor order. Every recorded node must
+    // exist, have the required kind and be attached to the recorded executor --
+    // `verifyRuleSelection` re-checks that against the rule -- and every
+    // placement of one instance must record the *same* selection, so a fused
+    // instance cannot claim two different engines.
+    llvm::StringMap<std::string> computes;
+    bool computeContainerRecorded = false;
+    if (mlir::Attribute rawComputes = mapping.get("compute_bindings")) {
+      llvm::Expected<llvm::StringMap<std::string>> read =
+          readMetadataStringMap(rawComputes, "compute_bindings", where);
+      if (!read) {
+        failMetadata(read.takeError());
+        return;
+      }
+      computes = std::move(*read);
+      computeContainerRecorded = true;
+    } else if (schemaV3) {
+      failMetadata(bindError(
+          where + ": micro.mapping records no 'compute_bindings' for a v3 "
+                  "binding"));
+      return;
+    }
+    if (auto recordedInstance = mapping.getAs<mlir::IntegerAttr>("instance")) {
+      uint64_t instance = recordedInstance.getValue().getZExtValue();
+      std::pair<mlir::Operation *, uint64_t> key{enclosingKernel(op), instance};
+      auto entry = instanceComputeBindings.find(key);
+      if (entry == instanceComputeBindings.end())
+        instanceComputeBindings.insert({key, computes});
+      else if (entry->second != computes) {
+        fail(DiagnosticCode::UnsupportedComputeFragment,
+             where + ": instance " + std::to_string(instance) +
+                 " records differing compute bindings across its placements");
+        return;
+      }
+    }
+
     WorkloadNode endpoint = strippedWorkloadNode(*lookup.node);
     RecordedRuleSelection selection;
     selection.executor = *executor;
+    selection.computeBindings = std::move(computes);
+    selection.computeBindingsRecorded = computeContainerRecorded;
     for (const auto &entry : memories)
       selection.memories[entry.first()] = entry.second;
     selection.portMemories = std::move(portMemories);
@@ -1377,6 +1604,7 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
         // this operation's own source node and resolve, and its concrete map is
         // the one the recorded parameters must rebuild.
         mlir::AffineMap recordedMap;
+        std::optional<PortRef> layoutEndpoint;
         if (schemaV2) {
           auto found = layoutEntries.find(entry.getName().getValue());
           if (found == layoutEntries.end()) {
@@ -1404,10 +1632,24 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
               return;
             }
             auto recordedNode = mapping.getAs<mlir::IntegerAttr>("node");
-            if (!recordedNode || ref->node != recordedNode.getInt()) {
+            mlir::Operation *endpointOp =
+                mappedOpForNode(enclosingKernel(op), ref->node);
+            auto endpointMapping =
+                endpointOp ? endpointOp->getAttrOfType<mlir::DictionaryAttr>(
+                                 kMappingAttr)
+                           : mlir::DictionaryAttr();
+            auto recordedInstance =
+                mapping.getAs<mlir::IntegerAttr>("instance");
+            auto endpointInstance =
+                endpointMapping.getAs<mlir::IntegerAttr>("instance");
+            auto endpointRule = endpointMapping.getAs<mlir::StringAttr>("rule");
+            if (!recordedNode || !endpointOp || !recordedInstance ||
+                !endpointInstance || !endpointRule ||
+                endpointInstance.getValue() != recordedInstance.getValue() ||
+                endpointRule.getValue() != *ruleId) {
               fail(DiagnosticCode::NoLegalLayout,
-                   where + ": layout endpoint does not name this operation's "
-                           "node");
+                   where + ": layout endpoint does not belong to this selected "
+                           "instance");
               return;
             }
             llvm::Expected<SourceGraphView> view =
@@ -1422,12 +1664,40 @@ llvm::Error verifyMappedMicroIR(mlir::ModuleOp module,
                            "graph");
               return;
             }
+            layoutEndpoint = *ref;
           }
           if (auto mapAttr = detail.getAs<mlir::AffineMapAttr>("map"))
             recordedMap = mapAttr.getValue();
         }
         LayoutContext portContext = layoutContextForRule(
             *rule, *lookup.node, *requirement, LayoutContext{});
+        if (layoutEndpoint) {
+          mlir::Operation *endpointOp =
+              mappedOpForNode(enclosingKernel(op), layoutEndpoint->node);
+          NodeLookup endpointLookup = workloadNodeFor(endpointOp);
+          if (!endpointLookup.node) {
+            fail(DiagnosticCode::NoLegalLayout,
+                 where + ": layout endpoint does not resolve to a selected "
+                         "workload operation");
+            return;
+          }
+          llvm::ArrayRef<WorkloadPort> endpointPorts =
+              layoutEndpoint->direction == PortDirection::Input
+                  ? endpointLookup.node->inputs
+                  : endpointLookup.node->outputs;
+          if (layoutEndpoint->index >= endpointPorts.size()) {
+            fail(DiagnosticCode::NoLegalLayout,
+                 where + ": layout endpoint does not resolve on its workload "
+                         "operation");
+            return;
+          }
+          mlir::Type endpointType = endpointPorts[layoutEndpoint->index].type;
+          if (mlir::Type element = elementTypeOf(endpointType))
+            portContext.elementType = printedTypeOf(element);
+          if (std::optional<llvm::SmallVector<int64_t, 4>> shape =
+                  staticShapeOf(endpointType))
+            portContext.rank = static_cast<int64_t>(shape->size());
+        }
         if (llvm::Error error = verifySolvedLayout(
                 *def, machine, *module.getContext(), portContext,
                 recordedValues, recordedMap, {}, where)) {

@@ -50,6 +50,29 @@ struct WorkloadValue {
   Type type;
   std::string name;
   bool external = false;
+  /// True for a *carried* value: a `micro.for` / `micro.spatial_for` /
+  /// `micro.pipeline` block argument (its carried iter-arg) or result. A
+  /// carried value has no producer of its own -- it is the same storage as the
+  /// value the loop carries -- so it is not a boundary descriptor and the
+  /// storage planner neither reserves nor borrows it (issue #129, task R5).
+  ///
+  /// It is a fact *recovered* from the enclosing structural op, not content, so
+  /// it stays out of `canonicalString` and of the projected source-graph
+  /// identity: adding it never churns a value id, a node id or a graph hash.
+  bool loopCarried = false;
+  /// For a carried *result* value, the value the loop yields into it: the
+  /// occurrence whose storage it is. Readers of the carried value are readers
+  /// of that value, which is what extends the producer's live interval across
+  /// the loop's yields (issue #129, task R5). Unset for a carried block
+  /// argument (its init operand is the loop's own `iter_args` operand, which no
+  /// occurrence reads) and for every non-carried value. Derived, so likewise
+  /// outside the identity.
+  std::optional<WorkloadValueId> carriedFrom = std::nullopt;
+  /// The target-independent memory kind an external kernel argument resides
+  /// in. The LLK-to-Micro ABI currently guarantees tensor inputs are DRAM
+  /// backed; retaining that fact lets strict physical planning account for
+  /// staged copies without guessing from a tile produced by `tile_view`.
+  std::optional<std::string> memoryKind = std::nullopt;
 };
 
 /// A value as seen from one node. `accessMap` is the affine relationship
@@ -112,6 +135,23 @@ struct WorkloadNode {
   /// source nodes with their materialized counterparts and must stay
   /// multiplicity-free.
   std::optional<uint64_t> executionMultiplicity;
+  /// How many of this node's `executionMultiplicity` occurrences are
+  /// *simultaneously* live (issue #129, task R5): the product of the enclosing
+  /// `micro.spatial_for` trip counts and `micro.pipeline` stage counts, with
+  /// `micro.for` contributing nothing because a temporal loop reuses its
+  /// storage rather than multiplying it. `1` outside any loop. It is the factor
+  /// storage liveness multiplies a per-occurrence footprint by; the serial
+  /// remainder of `executionMultiplicity` is reuse, not residency.
+  ///
+  /// Unset when any enclosing bound is not statically recoverable -- the same
+  /// condition that makes `executionMultiplicity` unset -- or when the node was
+  /// built by hand without structural facts. A caller that cannot recover it
+  /// must fall back to `executionMultiplicity` (every occurrence simultaneous),
+  /// which is the conservative direction: it can over-count, never under-count.
+  /// Derived, so it stays out of every graph identity exactly as
+  /// `executionMultiplicity`'s *rendering* is confined to
+  /// `canonicalProjectedGraphString`.
+  std::optional<uint64_t> simultaneousMultiplicity = std::nullopt;
 };
 
 /// A target-independent view of one concrete `micro.kernel`'s work.
@@ -136,6 +176,13 @@ public:
 
   const WorkloadNode *findNode(WorkloadNodeId id) const;
   const WorkloadValue *findValue(WorkloadValueId id) const;
+
+  /// Marks `id` as a structural loop's carried value and records the value
+  /// whose storage it is (`carriedFrom`, in the same pre-`finalize` id space).
+  /// Called by extraction; `finalize` carries both facts across the id remap.
+  /// A no-op for an unknown id.
+  void markLoopCarried(WorkloadValueId id,
+                       std::optional<WorkloadValueId> carriedFrom);
 
   /// Deterministic rendering of the finalized graph, used to compare graphs
   /// and to key hashes.

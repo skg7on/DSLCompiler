@@ -120,6 +120,12 @@ static cl::opt<std::string> mappingRoot(
              "and its layout and rule files from"),
     cl::init("."));
 
+static cl::opt<std::string> mappingMachine(
+    "machine",
+    cl::desc(
+        "Machine profile override shared by mapping search and compilation"),
+    cl::init(""));
+
 static cl::opt<std::string>
     mappingMode("mapping-mode",
                 cl::desc("Search mode: deterministic, beam, or exact"),
@@ -131,6 +137,11 @@ static cl::opt<std::string> mappingStop(
              "target-lowered (after the target's emitters), lowered (Linalg "
              "and loops), or executable (the default)"),
     cl::init("executable"));
+
+static cl::opt<std::string>
+    mappingBackend("mapping-backend",
+                   cl::desc("Execution backend: reference or selected-target"),
+                   cl::init("reference"));
 
 static cl::opt<std::string> mappingEntry(
     "mapping-entry",
@@ -329,6 +340,14 @@ std::optional<llk::MappedStop> parseStop(llvm::StringRef name) {
   return std::nullopt;
 }
 
+std::optional<llk::MappedBackend> parseBackend(llvm::StringRef name) {
+  if (name == "reference")
+    return llk::MappedBackend::Reference;
+  if (name == "selected-target")
+    return llk::MappedBackend::SelectedTarget;
+  return std::nullopt;
+}
+
 } // namespace
 
 /// The mapping path: get a kernel, get a plan for it, compile that plan.
@@ -348,10 +367,16 @@ static int runMappedCompilation(mlir::ModuleOp module,
                     "executable\n";
     return 1;
   }
+  std::optional<llk::MappedBackend> backend = parseBackend(mappingBackend);
+  if (!backend) {
+    llvm::errs() << "Unsupported --mapping-backend=" << mappingBackend
+                 << "; expected reference or selected-target\n";
+    return 1;
+  }
 
   llvm::Expected<std::unique_ptr<mlir::llk::mapping::MappingTarget>> target =
-      mlir::llk::mapping::createRegisteredMappingTarget(mappingTargetName,
-                                                        mappingRoot);
+      mlir::llk::mapping::createRegisteredMappingTarget(
+          mappingTargetName, mappingRoot, mappingMachine);
   if (!target) {
     llvm::errs() << llvm::toString(target.takeError()) << "\n";
     return 1;
@@ -466,6 +491,7 @@ static int runMappedCompilation(mlir::ModuleOp module,
 
   llk::MappedCompileOptions options;
   options.stop = *stop;
+  options.backend = *backend;
   // The kernel this run mapped is the one to compile: `--mapping-entry` names a
   // different one deliberately, and leaving it empty does not have to be an
   // error here because the kernel symbol is right there.
@@ -484,9 +510,44 @@ static int runMappedCompilation(mlir::ModuleOp module,
   // all carried by the reference bridge has not exercised the target's code
   // generation, and saying so is the difference between the two claims.
   llvm::outs() << "mapping: target=" << mappingTargetName
+               << " backend=" << mappingBackend
+               << " stop=" << mappingStop.getValue() << " executable="
+               << (compiled->stopped == llk::MappedStop::Executable
+                       ? "ready"
+                       : "not-built")
+               << " invocation=not-run"
+               << " target-identity="
+               << (compiled->codegenRequirements ? mappingTargetName.getValue()
+                                                 : "native-host")
+               << " architecture="
+               << (compiled->codegenRequirements
+                       ? compiled->codegenRequirements->architecture
+                       : "native")
+               << " cpu="
+               << (compiled->codegenRequirements
+                       ? compiled->codegenRequirements->cpu
+                       : "host")
+               << " features=";
+  if (compiled->codegenRequirements) {
+    for (size_t i = 0;
+         i < compiled->codegenRequirements->requiredFeatures.size(); ++i) {
+      if (i)
+        llvm::outs() << ',';
+      llvm::outs() << compiled->codegenRequirements->requiredFeatures[i];
+    }
+  } else {
+    llvm::outs() << "host";
+  }
+  llvm::outs() << " identity=" << compiled->executionIdentity;
+  if (compiled->executable)
+    llvm::outs() << " abi-hash=" << compiled->executable->abiHash();
+  llvm::outs() << " selected-groups-verified="
+               << compiled->selectedGroupsVerified
                << " target-lowered-ops=" << compiled->targetLowered
                << " reference-lowered-ops=" << compiled->referenceLowered
-               << "\n";
+               << " backend-groups-realized=" << compiled->backendGroupsRealized
+               << " reference-groups-lowered="
+               << compiled->referenceGroupsLowered << "\n";
 
   if (compiled->stopped != llk::MappedStop::Executable) {
     compiled->module->print(llvm::outs());

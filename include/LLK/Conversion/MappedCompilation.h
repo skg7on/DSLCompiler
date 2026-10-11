@@ -23,11 +23,14 @@
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Runtime/MappedExecutable.h"
+#include "LLK/Runtime/MappedJitOptions.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/Support/Error.h"
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace llk {
@@ -49,6 +52,8 @@ enum class MappedStop {
   Executable,
 };
 
+enum class MappedBackend { Reference, SelectedTarget };
+
 struct MappedCompileOptions {
   /// The kernel symbol to compile. Empty means the module's single
   /// `micro.kernel`, which is what the binder already requires.
@@ -58,6 +63,9 @@ struct MappedCompileOptions {
   /// what it left out, and must not be mistaken for executable code.
   bool requireExecutable = true;
   MappedStop stop = MappedStop::Executable;
+  MappedBackend backend = MappedBackend::Reference;
+  /// Optional observer for the exact LLVM input handed to the mapped JIT.
+  MappedJitEvidenceSink evidenceSink;
 };
 
 /// What a mapped compilation produced.
@@ -77,6 +85,20 @@ struct MappedCompilation {
   /// a run that is entirely reference execution has said nothing about the
   /// target's code generation.
   unsigned referenceLowered = 0;
+  /// Selected instance groups that passed bundle and plan-context validation.
+  unsigned selectedGroupsVerified = 0;
+  /// Selected groups lowered by a target-owned backend emitter.
+  unsigned backendGroupsRealized = 0;
+  /// Selected groups left to the reference bridge.
+  unsigned referenceGroupsLowered = 0;
+  /// Declared ISA for a selected backend, retained for every reached stop.
+  std::optional<mlir::llk::mapping::TargetCodegenRequirements>
+      codegenRequirements;
+  uint64_t planId = 0;
+  uint64_t machineHash = 0;
+  std::string targetName;
+  /// Compiler, target, math mode, and host/ISA contract identity.
+  std::string executionIdentity;
 };
 
 /// Runs the shared mapped-compilation sequence over `source`.

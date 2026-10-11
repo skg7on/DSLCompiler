@@ -24,6 +24,7 @@
 #ifndef LLK_MAPPING_MAPPINGPLAN_H
 #define LLK_MAPPING_MAPPINGPLAN_H
 
+#include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/SearchBinding.h"
 #include "LLK/Mapping/WorkloadGraph.h"
@@ -273,6 +274,27 @@ struct StorageAllocation {
   std::optional<uint64_t> aliasOf;
   PlanStepId beginStep = 0;
   PlanStepId endStep = 0; // live through this step
+  /// True for a *borrowed* allocation: a boundary descriptor (a kernel
+  /// argument, a `micro.tile_alloc`, a captured constant) that the plan does
+  /// not allocate, but records to say which node the value lives in and how
+  /// many bytes the use spans. Borrowed storage is never reusable compiler
+  /// scratch, so `computePeakStorage` refuses to alias one (issue #129, task
+  /// R3).
+  bool borrowed = false;
+  /// How many occurrences of this allocation are simultaneously resident
+  /// (issue #129, task R5): the producer's `simultaneousMultiplicity` -- the
+  /// product of the enclosing spatial-loop trip counts and pipeline stages.
+  /// `bytes` is the *per-occurrence* footprint, so the reservation this
+  /// allocation contributes while it is live is `bytes *
+  /// simultaneousOccurrences`; a serial loop reuses one buffer and therefore
+  /// contributes `1`.
+  ///
+  /// Derived from the enclosing structural ops, so it stays out of
+  /// `canonicalPlanString`: it is a projection of content the plan already
+  /// carries (the placements' nodes and the source graph they were extracted
+  /// from), never a decision. It *does* travel in the plan report, because a
+  /// reader of the report is what needs the real footprint.
+  uint64_t simultaneousOccurrences = 1;
 };
 
 /// One synchronization decision: a step that waits for a set of connections,
@@ -297,11 +319,19 @@ std::optional<PlanStepKind> symbolizePlanStepKind(llvm::StringRef text);
 /// `Compute` step and the `connection` for a `Movement` or `Synchronization`
 /// step; the other is left 0. A storage allocation's `beginStep`/`endStep` and
 /// every dependency edge name these stable ids.
+///
+/// `hop` narrows a `Movement`/`Synchronization` step to one hop of a multi-hop
+/// connection (issue #129, task R4): a route of `n` memories gets one copy step
+/// and one wait step per hop rather than one pair for the whole route, and this
+/// is which hop the step orders. Unset for a compute step and for a connection
+/// whose movement is a single step. It is the `PlanMovementHop::index` of the
+/// hop the step belongs to.
 struct PlanStep {
   PlanStepId id = 0;
   PlanStepKind kind = PlanStepKind::Compute;
   WorkloadNodeId node = 0;
   ConnectionId connection = 0;
+  std::optional<uint64_t> hop = std::nullopt;
 };
 
 /// A dependency edge in the plan-step DAG: `to` must follow `from`.
@@ -309,6 +339,41 @@ struct PlanStepEdge {
   PlanStepId from = 0;
   PlanStepId to = 0;
   bool operator==(const PlanStepEdge &) const = default;
+};
+
+/// One physical movement hop of a selected connection (issue #129, task R4):
+/// the value crosses `srcMemory` -> `dstMemory` on transfer engine `engine`,
+/// reading the storage `sourceStorageId` and writing the storage
+/// `destinationStorageId`.
+///
+/// A route of `n` memories has `n - 1` hops, in route order, and `index` is the
+/// hop's position in that sequence (`hops[h]` joins `route[h]` to
+/// `route[h + 1]`). Consecutive hops share the intermediate: `hops[h + 1]`'s
+/// `sourceStorageId` *is* `hops[h]`'s `destinationStorageId`, so a value staged
+/// through an intermediate is allocated once per hop destination rather than
+/// once per route. `hops` is the materialization authority; the connection's
+/// `storageIds` stays a compatibility projection of the same decision.
+///
+/// The memories, engine and storage slots are identity-bearing:
+/// `canonicalPlanString` folds them, so a hop that is re-pointed at another
+/// buffer or another engine is a different plan rather than the same id.
+///
+/// `movementStep` and `waitStep` are the plan-step DAG nodes that order this
+/// hop -- the copy and the wait that ends it. They are derived timing: the
+/// step-graph the storage planner builds orders them, so they are persisted for
+/// a reader but deliberately absent from `canonicalPlanString` (the derived
+/// ordering is not a decision; the physical choices above are). Numeric members
+/// default to zero and strings to empty, so a hop that has not been allocated
+/// yet is still a valid value.
+struct PlanMovementHop {
+  uint64_t index = 0;
+  MemoryNodeId srcMemory;
+  MemoryNodeId dstMemory;
+  ExecutorId engine;
+  uint64_t sourceStorageId = 0;
+  uint64_t destinationStorageId = 0;
+  PlanStepId movementStep = 0;
+  PlanStepId waitStep = 0;
 };
 
 enum class ConnectionKind {
@@ -385,6 +450,11 @@ struct ConnectionPlan {
   llvm::SmallVector<AffineMap> consumerMaps;
   std::optional<LayoutTransform> transform;
   Cost cost;
+  /// The measured duration a target's `LatencyProvider` returned for this
+  /// connection, when one hit (issue #129 review finding 6). Carried into the
+  /// plan so the final selected-kernel analysis charges the calibrated duration
+  /// the search ranked on. Absent when no provider hit.
+  std::optional<double> measuredCycles;
 };
 
 /// Structured search outcome. `searchTruncated` is set whenever a cap ended
@@ -396,10 +466,33 @@ struct PlanDiagnostics {
   /// Informational notes a post-search stage emits -- storage finalization's
   /// occupancy and analysis-fallback reports. Deliberately separate from
   /// `warnings`: `canonicalPlanString` does not fold this field, so a staged
-  /// note never changes a plan id and finalization is idempotent. A caller that
-  /// recomputes `plan.id` after `finalizeStoragePlan` gets the same id it had
-  /// before.
+  /// note never changes a plan id. `finalizeStoragePlan` *does* assign the plan
+  /// id (the movement hops it builds are identity-bearing physical decisions),
+  /// but this note is not part of that content, so finalizing an
+  /// already-finalized plan leaves both the hops and the id identical.
   std::vector<std::string> storageNotes;
+  /// True only when every materialized value's physical memory, footprint and
+  /// live interval were resolved and validated (issue #129, task R3). The
+  /// default is `true`, the same optimistic default
+  /// `CoveringPlan::materialized` carries for a hand-built plan; a plan that
+  /// was actually analyzed and found incomplete records `false` here with its
+  /// reasons below, so an analysis artifact never claims physical completeness
+  /// it does not have. A strict
+  /// (`BindContract::Executable`) binding re-derives these facts and refuses a
+  /// plan whose endpoints do not resolve, whatever this flag says.
+  bool physicalComplete = true;
+  /// The ordered reasons `physicalComplete` is false: one entry per value whose
+  /// memory, footprint or live interval could not be resolved, in the
+  /// deterministic order the storage planner visits them. Empty when the plan
+  /// is complete.
+  std::vector<std::string> physicalReasons{};
+  /// The ordered decisions the physical resolution took that the occurrence's
+  /// own stated kind did not force -- today, a rule's single bare requirement
+  /// standing in for a stated kind the executor cannot reach, and a borrowed
+  /// boundary descriptor bound by that class requirement. A decision is still a
+  /// complete, legal binding, so it is deliberately *not* a `physicalReason`;
+  /// it is recorded so an override is never silent.
+  std::vector<std::string> physicalDecisions{};
 };
 
 /// One selected placement: which node an instance covers, and the target facts
@@ -416,6 +509,29 @@ struct PlanPlacement {
   /// The solved instantiation of each layout in `layouts`, so the selected
   /// plan states the parameterization it chose, not just the family name.
   llvm::StringMap<SolvedLayout> layoutSolutions;
+  /// The concrete capability node selected for each compute requirement the
+  /// rule declared, keyed by the requirement's kind (`vector_engine`), copied
+  /// from the selected instance's `computeBindings` -- never re-derived from
+  /// the executor. Two attached engines of one kind are two distinct
+  /// placements, and this is what lets that decision survive report, metadata
+  /// and replay instead of collapsing to the machine's first engine. Empty for
+  /// a rule that requires no compute capability. Part of the plan's canonical
+  /// identity when non-empty; a materializer and the normalized event stream
+  /// read the selected node from here (issue #129, task R1).
+  llvm::StringMap<std::string> computeBindings{};
+  /// The compute capability kinds this placement's rule requires
+  /// (`vector_engine`), sorted and unique. It is what lets a stage reading
+  /// `computeBindings` tell "the rule requires no capability" -- a copy or
+  /// store placement -- from "the recorded selection is missing", which is a
+  /// dropped or tampered decision and must be diagnosed rather than re-derived
+  /// from the executor's first attachment.
+  ///
+  /// Derived from `rule`, exactly as a layout solution's parameters are: it is
+  /// a projection of content the plan already carries, so it is deliberately
+  /// *not* folded into `canonicalPlanString` (two placements of one rule cannot
+  /// differ in it) and a decoder re-derives it from the target's rule registry.
+  std::vector<std::string> computeRequirements{};
+
   /// The resolved values of the rule's own declared parameters (the ones its
   /// `require` constraints derive), so the selected plan states the exact
   /// assignment generation solved rather than leaving a reader to re-derive
@@ -437,6 +553,13 @@ struct PlanPlacement {
   /// The node's output element count (MACs for a matrix op), copied from the
   /// extraction facts. Excluded from `canonicalPlanString`, like `cost`.
   uint64_t workItems = 0;
+  /// The measured duration a target's `LatencyProvider` returned for this
+  /// placement's work, when one hit (issue #129 review finding 6). The search
+  /// ranked on it, so the final selected-kernel analysis must charge the same
+  /// calibrated duration instead of overwriting it with the static machine
+  /// formula. Absent when no provider hit. Derived, not a decision: it stays
+  /// out of `canonicalPlanString`.
+  std::optional<double> measuredCycles;
 };
 
 /// One selected connection, with the route it takes.
@@ -485,7 +608,31 @@ struct PlanConnection {
   /// The storage allocations (design §9.6) this connection reads or writes,
   /// by `StorageAllocation::id`. B1 persists the ids; B3 populates them. Empty
   /// for a plan built before storage planning.
+  ///
+  /// A compatibility projection: it says *which* allocations participate in the
+  /// connection, but not which hop reads or writes one. `hops` becomes the
+  /// materialization authority as soon as it is populated (issue #129, task
+  /// R4); this stays recorded so a reader written against the earlier shape
+  /// still resolves.
   llvm::SmallVector<uint64_t> storageIds;
+  /// The physical movement hops this connection materializes, in route order
+  /// (issue #129, task R4). Empty for a connection that moves nothing (a
+  /// `Direct` connection, a transform-only connection with no route) and for a
+  /// plan that has not been storage-finalized. When non-empty it is the
+  /// materialization authority: each hop names the storage it reads and writes,
+  /// the engine it runs on, and the copy/wait steps that order it.
+  ///
+  /// Only the *chosen* physical facts belong here, and they are what
+  /// `finalizeStoragePlan` reserves storage for. They are identity-bearing:
+  /// `canonicalPlanString` folds each hop's memories, engine and the storage
+  /// slots it reads and writes, so two plans that differ only in which buffer a
+  /// hop uses are distinct plans rather than the same id. That is why
+  /// `finalizeStoragePlan` assigns `CoveringPlan::id` once the hops exist --
+  /// the finalized plan's id names its physical decisions, and re-finalizing
+  /// rebuilds identical hops and therefore an identical id. The steps that
+  /// order a hop are derived timing and stay out of the identity; see
+  /// `PlanStep`.
+  llvm::SmallVector<PlanMovementHop, 2> hops;
   /// The connection's synthesized cost (task B8): the transfer estimate the
   /// route carried, or the shared transform estimate for a conversion. A
   /// derived execution fact, deliberately excluded from `canonicalPlanString`
@@ -498,6 +645,13 @@ struct PlanConnection {
   /// from the shared conversion estimate exactly as the materialized kernel's
   /// is. A derived execution fact, excluded from `canonicalPlanString`.
   mlir::Type valueType;
+  /// The measured duration a target's `LatencyProvider` returned for this
+  /// connection's movement, when one hit (issue #129 review finding 6). The
+  /// search ranked on it, so the final selected-kernel analysis must charge the
+  /// same calibrated duration rather than the static link estimate. Absent when
+  /// no provider hit. A derived execution fact, excluded from
+  /// `canonicalPlanString`.
+  std::optional<double> measuredCycles;
 };
 
 /// Where a plan's final score came from (task B8). A score is only a schedule
@@ -524,7 +678,7 @@ struct CoveringPlan {
   llvm::SmallVector<ConnectionId> connections;
   /// The same selections, resolved: which node each instance covers and how
   /// each connection runs. Placements are ordered by their (executor, memory,
-  /// layout) binding tuple, then node / instance id (design §22.1);
+  /// layout, compute) binding tuple, then node / instance id (design §22.1);
   /// `connectionPlans` by connection id.
   /// Explicit inline capacity: `PlanPlacement` carries the selected bundle,
   /// bindings and now its measured cost, so the default inlined-element
@@ -537,9 +691,11 @@ struct CoveringPlan {
   llvm::StringMap<SearchValue> globalParameters;
   /// The final candidate score (task B8): the overlapped latency the *shared*
   /// resource scheduler produces from the plan's normalized events, not the
-  /// additive sum of rule and connection costs. It folds into
-  /// `canonicalPlanString`, so a plan's id reflects the score a reader ranks it
-  /// by. Falls back to `accumulatedCost` only when the plan's events cannot be
+  /// additive sum of rule and connection costs. It is a derived ranking
+  /// outcome, so it is deliberately excluded from `canonicalPlanString` -- a
+  /// plan must be able to acquire an id before it is scored, and two plans
+  /// whose events schedule identically are not for that reason the same plan.
+  /// Falls back to `accumulatedCost` only when the plan's events cannot be
   /// built (an unknown strict fact), which is reported.
   Cost totalCost;
   /// The additive accumulation of rule-local and connection costs over the
@@ -550,14 +706,32 @@ struct CoveringPlan {
   /// Whether `totalCost` is the shared schedule's latency or the accumulation
   /// fallback. A reader must not treat an `Accumulation` score as scheduled.
   PlanScoreSource scoreSource = PlanScoreSource::Accumulation;
+  /// The derived normalized analysis-event snapshot the shared selected-kernel
+  /// analysis produced from the kernel this plan was bound to (issue #129, task
+  /// R6), attached through `attachPlanAnalysisEvents`. When present and
+  /// verified, `buildPlanEvents` returns exactly this stream -- the
+  /// materialized work's own events, owner pools and dependency edges --
+  /// instead of accumulating rule-local estimates, which is what makes the
+  /// planner's final score and `micro-perf`'s prediction one analysis of one
+  /// kernel.
+  ///
+  /// Excluded from `canonicalPlanString`: it is a derived view of content the
+  /// plan already names (its placements, connections and engine selections), so
+  /// attaching it must never move a plan id. A plan decoded from metadata never
+  /// carries one -- the metadata codec neither writes nor reads it -- so a
+  /// replay re-derives it (or refuses to rank) rather than trusting a snapshot
+  /// that may no longer describe the kernel it would be bound to.
+  std::optional<PlanEventDAG> analysisEvents;
   PlanDiagnostics diagnostics;
 
-  // --- persisted selected state (schema v2, task B1) ------------------------
+  // --- persisted selected state (schema v3, tasks B1/R1) -------------------
   //
   // These are deliberately excluded from `canonicalPlanString`: they are
   // provenance and persisted selection metadata, not fields that change a
   // plan's content id. A plan decoded from metadata keeps the id it was encoded
-  // with.
+  // with. (Version 3 is current: it persists each placement's selected compute
+  // node, and its canonical identity is the `v3|`-tagged form that omits
+  // derived scores and diagnostics.)
   //
   // The metadata schema this plan was persisted under (0 when it was never
   // persisted -- an in-memory search result).
@@ -586,9 +760,13 @@ struct CoveringPlan {
   std::vector<SynchronizationStep> synchronization;
   /// The deterministic plan-step DAG `finalizeStoragePlan` built (design §9.6):
   /// every step's kind and what it names, and the dependency edges between
-  /// them. B3 builds these; B4-B6 consume them to order materialization. Like
-  /// the allocations they annotate, they are deliberately excluded from
-  /// `canonicalPlanString`, so storage planning never changes a plan id.
+  /// them. B3 builds these; B4-B6 consume them to order materialization. They
+  /// -- and the allocation intervals they order -- are *derived timing*, so
+  /// they are deliberately excluded from `canonicalPlanString`. The physical
+  /// decisions `finalizeStoragePlan` makes are not: a connection's `hops` (the
+  /// storage slot each hop reads and writes, and its engine) do join the plan
+  /// id, which is why `finalizeStoragePlan` re-assigns `CoveringPlan::id` after
+  /// building them (issue #129, task R4).
   std::vector<PlanStep> steps;
   std::vector<PlanStepEdge> stepEdges;
 };
@@ -613,6 +791,28 @@ PlanId computePlanId(const CoveringPlan &plan);
 /// placement.
 std::string transformExecutorFor(const CoveringPlan &plan,
                                  const PlanConnection &connection);
+
+/// Length-delimited, sorted canonical rendering of a selected-compute map
+/// (`<keyLen>:<key>=<valueLen>:<value>`), the identical encoding the instance
+/// and plan content keys fold. Exported so a measurement key renders the same
+/// decision the same way -- a plain separator-joined form would let a key or
+/// node id containing the separator collide with a different selection (issue
+/// #129, task R1).
+std::string
+canonicalComputeBindingsString(const llvm::StringMap<std::string> &bindings);
+
+/// The first compute capability kind `placement`'s rule requires but for which
+/// `placement.computeBindings` records no concrete node, or `nullopt` when the
+/// placement is complete.
+///
+/// A recorded selection is authoritative: a rule that requires a capability but
+/// whose plan records no node for it has had that decision dropped or tampered
+/// with, so it is a defect -- never a licence to re-derive an engine from the
+/// executor's declaration order (issue #129, task R1). Shared by the
+/// normalizer, the report reader and the metadata decoder so all three reach
+/// the same verdict.
+std::optional<std::string>
+missingComputeBinding(const PlanPlacement &placement);
 
 std::string canonicalCandidateString(const MappingCandidate &candidate);
 std::string canonicalInstanceString(const CandidateInstance &instance);

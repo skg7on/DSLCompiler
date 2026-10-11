@@ -309,6 +309,140 @@ module {
 }
 
 //===----------------------------------------------------------------------===//
+// Issue #129, task R7: a mapped kernel's occupancy is its plan's, not a sum
+//===----------------------------------------------------------------------===//
+
+/// Three 64x64xf32 kernel allocations (16384 bytes each) is what the extraction
+/// sees -- a monotonic sum of 49152 bytes, which overflows the shipped
+/// `sram.0` (32768). The kernel's recorded plan, though, aliases two of them
+/// onto the first, so the *live* peak is one 16384-byte buffer and it fits. The
+/// report must read the plan's relation rather than the extraction's sum.
+TEST(L0StaticBound, AMappedKernelsOccupancyIsThePlansLivePeak) {
+  auto parsed = parseKernel(R"MLIR(
+module {
+  micro.kernel @planned_fit attributes {micro.plan = {allocations = [
+      {begin_step = 0 : i64, bytes = 16384 : i64, end_step = 2 : i64, id = 1 : i64, memory = "sram.0", value = 0 : i64},
+      {alias_of = 1 : i64, begin_step = 1 : i64, bytes = 16384 : i64, end_step = 2 : i64, id = 2 : i64, memory = "sram.0", value = 1 : i64},
+      {alias_of = 1 : i64, begin_step = 2 : i64, bytes = 16384 : i64, end_step = 2 : i64, id = 3 : i64, memory = "sram.0", value = 2 : i64}
+    ]}} {
+    %a = micro.tile_alloc : !micro.tile<64x64xf32, memory = #micro.memory<sram>>
+    %b = micro.tile_alloc : !micro.tile<64x64xf32, memory = #micro.memory<sram>>
+    %c = micro.tile_alloc : !micro.tile<64x64xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = avx2Model();
+
+  // Premise: the extraction's sum overflows, so this test discriminates the two
+  // accountings rather than passing either way.
+  const machine::MemoryNode *sram = model.findMemoryOfKind("sram");
+  ASSERT_NE(sram, nullptr);
+  ASSERT_GT(3u * 16384u, sram->capacityBytes);
+
+  auto report = analyzeKernel(parsed->kernel, model, /*level=*/0);
+  ASSERT_TRUE(static_cast<bool>(report)) << llvm::toString(report.takeError());
+  ASSERT_EQ(report->l0.liveTileBytesByMemory.count("sram"), 1u);
+  EXPECT_EQ(report->l0.liveTileBytesByMemory.at("sram"), 16384u);
+  EXPECT_TRUE(report->capacityViolations.empty());
+}
+
+/// The complement: reading the plan's peak does not weaken the check. A plan
+/// whose own recorded buffer exceeds its memory is still a violation, named
+/// against the node that cannot hold it.
+TEST(L0StaticBound, AMappedKernelsOverCapacityPlanIsStillRejected) {
+  auto parsed = parseKernel(R"MLIR(
+module {
+  micro.kernel @planned_overflow attributes {micro.plan = {allocations = [
+      {begin_step = 0 : i64, bytes = 40000 : i64, end_step = 2 : i64, id = 1 : i64, memory = "sram.0", value = 0 : i64}
+    ]}} {
+    %a = micro.tile_alloc : !micro.tile<64x64xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = avx2Model();
+
+  auto report = analyzeKernel(parsed->kernel, model, /*level=*/0);
+  ASSERT_TRUE(static_cast<bool>(report)) << llvm::toString(report.takeError());
+  const machine::MemoryNode *sram = model.findMemory("sram.0");
+  ASSERT_NE(sram, nullptr);
+  ASSERT_EQ(report->capacityViolations.size(), 1u);
+  EXPECT_EQ(report->capacityViolations.front(),
+            "memory sram.0 requires 40000 bytes but machine has " +
+                std::to_string(sram->capacityBytes) + " bytes");
+}
+
+/// The complement to the two tests above (issue #129, task R7 review): a kernel
+/// that carries a plan whose allocations *cannot* be summarized must not be
+/// silently treated as if it carried no plan. The extraction accounting the
+/// code would otherwise fall back to is the inflated sum-of-all-buffers this
+/// same file calls wrong; the unreadable plan is reported instead.
+TEST(L0StaticBound, AnUnreadableRecordedPlanIsReportedNotSilentlyIgnored) {
+  auto parsed = parseKernel(R"MLIR(
+module {
+  micro.kernel @broken_plan attributes {micro.plan = {allocations = [
+      {begin_step = 0 : i64, bytes = 16384 : i64, end_step = 2 : i64,
+       id = 1 : i64, memory = "sram.0", value = 0 : i64},
+      {alias_of = 99 : i64, begin_step = 1 : i64, bytes = 16384 : i64,
+       end_step = 2 : i64, id = 2 : i64, memory = "sram.0", value = 1 : i64}
+    ]}} {
+    %a = micro.tile_alloc : !micro.tile<64x64xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = avx2Model();
+
+  auto report = analyzeKernel(parsed->kernel, model, /*level=*/0);
+  ASSERT_TRUE(static_cast<bool>(report)) << llvm::toString(report.takeError());
+  bool reported = false;
+  for (const std::string &warning : report->warnings)
+    if (warning.find("could not be read") != std::string::npos)
+      reported = true;
+  EXPECT_TRUE(reported)
+      << "the plan is present but unreadable; that must be reported";
+}
+
+/// Issue #129 review finding 4: reconstructing the reported occupancy dropped
+/// each allocation's recorded live interval, leaving every allocation at [0,0]
+/// -- live at step 0 -- so disjoint buffers were summed. Two 20,000-byte SRAM
+/// allocations live at `[0,1]` and `[2,3]` are never simultaneous: the peak is
+/// 20,000, not the 40,000 an interval-less reconstruction reports.
+TEST(L0StaticBound, AMappedKernelsDisjointIntervalsAreNotSummed) {
+  auto parsed = parseKernel(R"MLIR(
+module {
+  micro.kernel @disjoint_plan attributes {micro.plan = {allocations = [
+      {begin_step = 0 : i64, bytes = 20000 : i64, end_step = 1 : i64, id = 1 : i64, memory = "sram.0", value = 0 : i64},
+      {begin_step = 2 : i64, bytes = 20000 : i64, end_step = 3 : i64, id = 2 : i64, memory = "sram.0", value = 1 : i64}
+    ]}} {
+    %a = micro.tile_alloc : !micro.tile<64x64xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+  machine::MachineModel model = avx2Model();
+  const machine::MemoryNode *sram = model.findMemory("sram.0");
+  ASSERT_NE(sram, nullptr);
+  // Premise: the true peak fits, but the interval-less sum of both does not --
+  // so the test discriminates the two accountings rather than passing either
+  // way.
+  ASSERT_LT(20000u, sram->capacityBytes) << "one buffer must fit";
+  ASSERT_GT(2u * 20000u, sram->capacityBytes)
+      << "the naive sum must overflow, or the test proves nothing";
+
+  auto report = analyzeKernel(parsed->kernel, model, /*level=*/0);
+  ASSERT_TRUE(static_cast<bool>(report)) << llvm::toString(report.takeError());
+  ASSERT_EQ(report->l0.liveTileBytesByMemory.count("sram"), 1u);
+  EXPECT_EQ(report->l0.liveTileBytesByMemory.at("sram"), 20000u);
+  EXPECT_TRUE(report->capacityViolations.empty());
+}
+
+//===----------------------------------------------------------------------===//
 // Machine-fit diagnostics
 //===----------------------------------------------------------------------===//
 

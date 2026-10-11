@@ -119,6 +119,8 @@ std::vector<ScheduleEntry> loadScheduleDB(llvm::StringRef dbPath, int M_bucket,
       se.fragment_shape = shape->str();
     if (auto masks = sched->getBoolean("enable_tile_masks"))
       se.enable_tile_masks = *masks;
+    if (auto tail = sched->getString("tail_policy"))
+      se.tail_policy = tail->str();
 
     matches.push_back(se);
   }

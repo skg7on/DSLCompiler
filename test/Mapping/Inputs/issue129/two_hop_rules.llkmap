@@ -1,0 +1,27 @@
+// Issue #129, task R4: the rules a two-hop movement is checked against.
+//
+// The vector's work lives in SRAM and the store's in DRAM, so the value between
+// them has to move. `emit` is an opaque key here; the pass is given `emitters=e1`.
+
+rule issue129.vector_add_sram {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require memory kind sram;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.two-hop.vector";
+  emit "e1";
+  cost 4;
+}
+
+rule issue129.store_dram {
+  match micro.tile_store();
+  require executor kind worker;
+  require memory kind dram;
+  input "source";
+  bundle "issue129.two-hop.store";
+  emit "e1";
+  cost 4;
+}

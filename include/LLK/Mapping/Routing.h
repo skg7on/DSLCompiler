@@ -64,6 +64,19 @@ namespace mlir::llk::mapping {
 bool memorySupportsLayout(const machine::MemoryNode &memory,
                           llvm::StringRef layout);
 
+/// The transfer engine a single hop `sourceMemory` -> `destinationMemory` runs
+/// on: the first engine of the first link joining the two memories, in machine
+/// declaration order, whose executor can reach the link's *source* -- exactly
+/// the rule `TopologyService` applies while enumerating a route (§12.2). This
+/// is the one definition routing and storage planning share, so the engine a
+/// hop is costed with and the engine the hop is materialized on cannot
+/// disagree. Nullopt when no link joins the pair or none of its engines can
+/// reach the source.
+std::optional<ExecutorId>
+legalTransferEngine(const machine::MachineModel &model,
+                    llvm::StringRef sourceMemory,
+                    llvm::StringRef destinationMemory);
+
 struct RouteRequest {
   MemoryNodeId source;
   MemoryNodeId destination;

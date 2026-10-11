@@ -47,15 +47,26 @@ namespace mlir::llk::mapping {
 /// bindings, concrete layout maps, storage ids, the source-graph hash and the
 /// target content hashes; it also requires every mapped operation to record its
 /// layout container or an explicit "no layout" marker, so deleting the
-/// container can no longer skip layout verification. It is *not*
-/// `kPlanReportVersion`: that versions the JSON report, this versions the
-/// bound-IR metadata.
-inline constexpr uint64_t kMappingMetadataVersion = 2;
+/// container can no longer skip layout verification.
+///
+/// Version 3 (issue #129, task R1) persists the concrete compute node each
+/// placement selected (`compute_bindings`), so a plan's selected engine
+/// survives report, metadata and replay instead of being re-derived from the
+/// executor's first attached capability. A version-2 binding records no such
+/// selection, so it cannot be replayed under version-3 semantics: the reader
+/// rejects it rather than guessing an engine. It is *not* `kPlanReportVersion`:
+/// that versions the JSON report, this versions the bound-IR metadata.
+inline constexpr uint64_t kMappingMetadataVersion = 3;
 
-/// The largest `micro.plan` schema version this reader understands. A kernel
-/// recording a greater version was written by a newer compiler and must not be
-/// replayed under these semantics.
-inline constexpr uint64_t kSupportedMappingMetadataVersion = 2;
+/// The `micro.plan` schema version this build writes and requires. A kernel
+/// recording a *newer* version was written by a newer compiler and is rejected.
+/// `decodeSelectedPlan` -- strict replay -- also rejects anything *older*: a v1
+/// or v2 binding records no concrete compute selection, so which attached
+/// capability ran cannot be recovered from it. `verifyMappedMicroIR` can still
+/// re-check what an older binding recorded, and enforces the v3-only
+/// requirements (a recorded `compute_bindings` container) whenever a binding
+/// declares or infers v3.
+inline constexpr uint64_t kSupportedMappingMetadataVersion = 3;
 
 /// Canonical, pre-materialization content hash of `graph`: every semantic
 /// (non-binder-movement) node's operation name, its operand occurrences with
@@ -90,28 +101,31 @@ llvm::Expected<SourceGraphView> buildSourceGraphView(mlir::Operation *kernel);
 /// hash differently, so a plan bound for one is rejected against another.
 uint64_t computeTargetContentHash(const MappingTarget &target);
 
-/// Persists `plan` as schema-v2 metadata on the single `micro.kernel` in
+/// Persists `plan` as schema-v3 metadata on the single `micro.kernel` in
 /// `module`: `micro.plan` on the kernel (schema version, id, binding hash,
 /// materialization flag, source-graph and target hashes), `micro.mapping` on
-/// each covered operation (rule, instance, bundle, emitter, executor, memories,
-/// layouts, resolved parameters and per-port layout entries) and
-/// `micro.routes` on the kernel (each connection's endpoints, ordered
-/// route/engines, storage ids and transform). Fails when the module does not
-/// contain exactly one covered kernel or the plan names a rule the target does
-/// not declare. The source-graph hash is computed from the kernel the encoder
-/// sees, so call it before the binder materializes movements.
+/// each covered operation (rule, instance, bundle, emitter, executor, the
+/// selected compute bindings, memories, layouts, resolved parameters and
+/// per-port layout entries) and `micro.routes` on the kernel (each connection's
+/// endpoints, ordered route/engines, storage ids and transform). Fails when the
+/// module does not contain exactly one covered kernel or the plan names a rule
+/// the target does not declare. The source-graph hash is computed from the
+/// kernel the encoder sees, so call it before the binder materializes
+/// movements.
 llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
                                const MappingTarget &target);
 
 /// Reads the selected state `encodeSelectedPlan` recorded on `module` back into
 /// a `CoveringPlan`, restoring the execution-affecting choices (placements,
 /// layout solutions with their concrete maps, endpoints, routes, storage ids
-/// and resource bindings). The recorded source-graph and target hashes must
-/// still match `module` and `target`, so a frozen plan cannot bypass current
-/// verification. A kernel recording a schema version greater than
-/// `kSupportedMappingMetadataVersion` is rejected; a legacy (v1) binding is
-/// read only when its missing endpoint/resource associations are uniquely
-/// recoverable from the graph, and rejected when they are ambiguous.
+/// and resource bindings, including each placement's selected compute nodes).
+/// The recorded source-graph and target hashes must still match `module` and
+/// `target`, so a frozen plan cannot bypass current verification. A kernel
+/// recording any schema version other than `kMappingMetadataVersion` is
+/// rejected: a newer one was written by a newer compiler, and an older one
+/// records no compute selection, so which attached capability ran cannot be
+/// recovered from it and the reader refuses to guess one from executor order.
+/// Regenerate the binding by re-running the mapping search.
 llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
                                                 const MappingTarget &target);
 
@@ -169,6 +183,26 @@ bool planMetadataIsSchemaV2(mlir::DictionaryAttr plan);
 /// a marker: the pre-v2 binder also wrote it, so it cannot distinguish the two
 /// schemas.
 bool kernelMetadataIsSchemaV2(mlir::Operation *kernel);
+
+/// True when a `micro.plan` dictionary denotes a schema-v3 (or newer) binding.
+/// A binding is v3 when it declares `schema_version >= 3` *or* records the
+/// v3-only `compute_bindings` marker, so deleting `schema_version` cannot
+/// silently downgrade a v3 binding and let the reader re-derive the selected
+/// compute node from executor order.
+bool planMetadataIsSchemaV3(mlir::DictionaryAttr plan);
+
+/// True when a `micro.kernel`'s metadata denotes a schema-v3 binding: its
+/// `micro.plan` is v3 (see `planMetadataIsSchemaV3`), or any mapped operation
+/// under it records the v3-only `compute_bindings` field.
+bool kernelMetadataIsSchemaV3(mlir::Operation *kernel);
+
+/// The effective `micro.plan` schema version of a kernel's binding: the version
+/// its `micro.plan` declares, raised to the highest version its recorded fields
+/// prove (3 from `compute_bindings`, else 2 from any v2-only field, else 1).
+/// Zero when the kernel carries no `micro.plan` at all. `decodeSelectedPlan`
+/// compares this against `kMappingMetadataVersion`, so a binding written under
+/// older semantics is rejected for what it is rather than reinterpreted.
+uint64_t kernelMetadataSchemaVersion(mlir::Operation *kernel);
 
 } // namespace mlir::llk::mapping
 

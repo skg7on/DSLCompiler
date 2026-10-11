@@ -13,7 +13,7 @@ micro.search_space @fused_swiglu_M8_N64_K64 attributes {workload = "fused_swiglu
   micro.param "memory_path" {kind = "memory_path", choices = ["dram:sram:acc"]}
   micro.param "owner_mapping" {kind = "owner_mapping", choices = ["worker/vector_engine"]}
   micro.param "fragment_shape" {kind = "fragment_shape", choices = ["16x16x32"]}
-  micro.param "tail_policy" {kind = "tail_policy", choices = ["mask"]}
+  micro.param "tail_policy" {kind = "tail_policy", choices = ["none"]}
   micro.constraint "sram_capacity" {params = ["BM", "BN", "BK"]}
   micro.constraint "acc_capacity" {params = ["BM", "BN"]}
   micro.constraint "mapping_extent" {params = ["num_threads", "BM", "BN"]}

@@ -21,6 +21,9 @@
 #define LLK_RUNTIME_MAPPEDEXECUTABLE_H
 
 #include "LLK/Runtime/JitCache.h"
+#include "LLK/Runtime/MappedInvocation.h"
+#include "LLK/Runtime/MappedJitOptions.h"
+#include "LLK/Runtime/PreparedMappedKernel.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -47,16 +50,12 @@ namespace llk {
 /// reinterpreted: the generated code addresses buffers as if its own types were
 /// the truth, so a descriptor of the wrong shape would read and write memory
 /// the caller never offered.
-struct KernelAbi {
-  struct Port {
-    std::vector<int64_t> shape;
-    std::string elementType;
-  };
-  std::vector<Port> inputs;
-  std::vector<Port> outputs;
-};
 
 class MappedExecutable;
+namespace testing {
+struct TestAllocatorHooks;
+class MappedExecutableTestFactory;
+} // namespace testing
 
 /// Compiles `bufferedModule`'s `entrySymbol` into an executable.
 ///
@@ -71,6 +70,9 @@ class MappedExecutable;
 llvm::Expected<std::unique_ptr<MappedExecutable>>
 createMappedExecutable(mlir::ModuleOp bufferedModule,
                        llvm::StringRef entrySymbol);
+llvm::Expected<std::unique_ptr<MappedExecutable>>
+createMappedExecutable(PreparedMappedKernel prepared,
+                       const MappedJitOptions &options = {});
 
 /// A compiled kernel, callable through descriptor pointers.
 class MappedExecutable {
@@ -82,30 +84,50 @@ public:
 
   /// The ABI this executable was compiled for.
   const KernelAbi &abi() const { return abi_; }
+  uint64_t abiHash() const { return computeKernelAbiHash(abi_); }
+  llvm::StringRef executionIdentity() const { return executionIdentity_; }
+
+  llvm::Error invoke(llvm::ArrayRef<InvocationBuffer2D> inputs,
+                     llvm::ArrayRef<InvocationBuffer2D> outputs);
 
   /// Invokes the kernel with the descriptors its ABI expects, in order.
   ///
   /// The caller owns every buffer: this takes no ownership, frees nothing, and
   /// writes only through the output descriptors it is handed. Descriptors are
-  /// checked against the recorded ABI first, so an arity, shape, element type
-  /// or stride that does not match is reported rather than silently
-  /// reinterpreting the caller's memory.
+  /// checked against the recorded ABI first, so mismatched metadata is rejected
+  /// before machine code runs.
+  ///
+  /// Legacy entry: checks arity, shape and stride only. Untagged pointers
+  /// cannot check element type or backing allocation size.
+  [[deprecated("use typed InvocationBuffer2D buffers")]]
   llvm::Error invoke(llvm::ArrayRef<MemRef2D *> inputs,
                      llvm::ArrayRef<MemRef2D *> outputs);
 
 private:
+  llvm::Error invokeUncheckedLegacy(llvm::ArrayRef<MemRef2D *> inputs,
+                                    llvm::ArrayRef<MemRef2D *> outputs);
   friend llvm::Expected<std::unique_ptr<MappedExecutable>>
   createMappedExecutable(mlir::ModuleOp bufferedModule,
                          llvm::StringRef entrySymbol);
+  friend llvm::Expected<std::unique_ptr<MappedExecutable>>
+  createMappedExecutable(PreparedMappedKernel prepared,
+                         const MappedJitOptions &options);
+  friend class testing::MappedExecutableTestFactory;
+
+  static llvm::Expected<std::unique_ptr<MappedExecutable>>
+  createWithAllocatorHooks(PreparedMappedKernel prepared,
+                           const MappedJitOptions &options,
+                           testing::TestAllocatorHooks *hooks);
 
   MappedExecutable(std::unique_ptr<llvm::orc::LLJIT> jit, void *entry,
-                   KernelAbi abi);
+                   KernelAbi abi, std::string executionIdentity);
 
   /// The JIT that owns the compiled code. It outlives every call, which is
   /// what lets an invocation be a plain indirect call.
   std::unique_ptr<llvm::orc::LLJIT> jit_;
   void *entry_ = nullptr;
   KernelAbi abi_;
+  std::string executionIdentity_;
 };
 
 } // namespace llk

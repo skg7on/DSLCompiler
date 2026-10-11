@@ -53,22 +53,20 @@ func.func @fused_swiglu(%x: tensor<8x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: micro.param "BM" {choices = [1, 4, 8, 16, 32, 64], kind = "integer"}
 // CHECK: micro.param "BN" {choices = [16, 32, 64, 128, 256], kind = "integer"}
 // CHECK: micro.param "BK" {choices = [32, 64, 128, 256], kind = "integer"}
-// CHECK: micro.param "VM" {choices = [1, 2, 4], kind = "integer"}
-// CHECK: micro.param "VN" {choices = [4, 8], kind = "integer"}
 // CHECK: micro.param "vector_width" {choices = [8], kind = "integer"}
-// CHECK: micro.param "num_threads" {choices = [1, 2, 4, 8], kind = "integer"}
-// CHECK: micro.param "grain_size" {choices = [1, 2, 4], kind = "integer"}
+// Parallel thread and grain axes are fixed to the serial lowering actually
+// emitted by the concrete exporter, regardless of schedule database values.
+// CHECK: micro.param "num_threads" {choices = [1], kind = "integer"}
+// CHECK: micro.param "grain_size" {choices = [1], kind = "integer"}
 // CHECK: micro.param "pipeline_stages" {choices = [1, 2], kind = "integer"}
-// The schedule's prefetch_distance = 3 is outside the [1, 2] grid and joins it;
-// 0 is not a choice because the dialect requires positive integer choices.
-// CHECK: micro.param "prefetch_distance" {choices = [1, 2, 3], kind = "integer"}
+// VM/VN and prefetch are omitted until their semantics have concrete lowering.
 
 // Symbolic parameters: the scheduled value first, then legal alternatives.
 // CHECK: micro.param "tile_layout" {choices = ["blocked", "row_major"], kind = "layout"}
 // CHECK: micro.param "memory_path" {choices = ["dram:l2:sram", "dram:sram:acc", "dram:l2:sram:acc"], kind = "memory_path"}
 // CHECK: micro.param "owner_mapping" {choices = ["worker/vector_engine", "worker/lane"], kind = "owner_mapping"}
 // CHECK: micro.param "fragment_shape" {choices = ["8x8x32", "16x16x32"], kind = "fragment_shape"}
-// CHECK: micro.param "tail_policy" {choices = ["mask"], kind = "tail_policy"}
+// CHECK: micro.param "tail_policy" {choices = ["none", "pad"], kind = "tail_policy"}
 
 // Legality records. Every referenced name is a declared parameter.
 // CHECK: micro.constraint "sram_capacity" {params = ["BM", "BN", "BK"]}
@@ -80,9 +78,7 @@ func.func @fused_swiglu(%x: tensor<8x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: micro.constraint "fragment_compatible" {params = ["fragment_shape", "BM", "BN", "BK"]}
 // CHECK: micro.constraint "vector_width_supported" {params = ["vector_width"]}
 // CHECK: micro.constraint "mapping_extent" {params = ["num_threads", "BM", "BN"]}
-// The live-tile count is a function of the pipeline depth and the prefetch
-// distance over the staged tile shape.
-// CHECK: micro.constraint "pipeline_live_tiles" {params = ["pipeline_stages", "prefetch_distance", "BM", "BN", "BK"]}
+// CHECK: micro.constraint "pipeline_live_tiles" {params = ["pipeline_stages", "BM", "BN", "BK"]}
 // CHECK: micro.constraint "tail_supported" {params = ["BM", "BN", "BK"]}
 
 // CHECK: micro.objective {direction = "minimize", metric = "latency_cycles", secondary = ["matrix_utilization", "dram_bytes"]}
@@ -94,10 +90,8 @@ func.func @fused_swiglu(%x: tensor<8x64xbf16>, %wg: tensor<64x64xbf16>,
 
 // CHECK-LABEL: micro.search_space @fused_swiglu_M8_N64_K64 attributes {workload = "fused_swiglu"} {
 
-// The entry names no pipeline/prefetch fields, so the defaults apply: one
-// stage and no prefetch, leaving the prefetch grid untouched.
+// The entry names no pipeline fields, so the default single stage applies.
 // CHECK: micro.param "pipeline_stages" {choices = [1, 2], kind = "integer"}
-// CHECK: micro.param "prefetch_distance" {choices = [1, 2], kind = "integer"}
 
 // The entry keeps the pre-M11 `owner_mapping = "worker"`, a single owner. The
 // export completes it with the machine's innermost scope so the choice is a
@@ -108,7 +102,7 @@ func.func @fused_swiglu(%x: tensor<8x64xbf16>, %wg: tensor<64x64xbf16>,
 // CHECK: micro.param "owner_mapping" {choices = ["worker/lane", "worker/vector_engine"], kind = "owner_mapping"}
 // CHECK: micro.param "fragment_shape" {choices = ["16x16x32", "8x8x32"], kind = "fragment_shape"}
 
-// CHECK: micro.constraint "pipeline_live_tiles" {params = ["pipeline_stages", "prefetch_distance", "BM", "BN", "BK"]}
+// CHECK: micro.constraint "pipeline_live_tiles" {params = ["pipeline_stages", "BM", "BN", "BK"]}
 // CHECK: micro.objective {direction = "minimize", metric = "latency_cycles", secondary = ["matrix_utilization", "dram_bytes"]}
 // CHECK: }
 

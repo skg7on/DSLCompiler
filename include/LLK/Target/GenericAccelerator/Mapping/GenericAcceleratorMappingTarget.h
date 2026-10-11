@@ -31,7 +31,8 @@ llvm::ArrayRef<llvm::StringRef> emitterKeys();
 /// `mapping/generic-ai-accel/layouts.llkmap`, and
 /// `mapping/generic-ai-accel/rules.llkmap`.
 llvm::Expected<std::unique_ptr<mapping::MappingTarget>>
-createMappingTarget(llvm::StringRef configurationRoot);
+createMappingTarget(llvm::StringRef configurationRoot,
+                    llvm::StringRef machinePath = {});
 
 } // namespace mlir::llk::target::generic_accel
 

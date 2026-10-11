@@ -50,7 +50,8 @@ bool isBookkeepingAttribute(llvm::StringRef name) {
   return name == "micro.mapping" || name == "micro.routes" ||
          name == "micro.plan" || name == "micro.value" ||
          name == "micro.dst_node" || name == "micro.connection" ||
-         name == "micro.hop";
+         name == "micro.hop" || name == "micro.src_storage" ||
+         name == "micro.dst_storage";
 }
 
 llvm::Error metadataError(std::string message) {
@@ -235,6 +236,12 @@ SourceProjection buildSourceProjection(const WorkloadGraph &graph,
     if (const WorkloadValue *existing = graph.findValue(resolved))
       copy = *existing;
     copy.id = 0;
+    // The carried-value source is an id in the *source* graph's space, so it is
+    // meaningless here; the projection re-derives its own ids. Nothing in the
+    // projected identity reads it (it is not part of the canonical string), so
+    // it is dropped rather than carried across the renumbering (issue #129,
+    // task R5).
+    copy.carriedFrom.reset();
     WorkloadValueId id = projection.graph.addValue(std::move(copy));
     valueIds[resolved] = id;
     return id;
@@ -671,6 +678,51 @@ bool kernelMetadataIsSchemaV2(mlir::Operation *kernel) {
   return v2;
 }
 
+bool planMetadataIsSchemaV3(mlir::DictionaryAttr plan) {
+  if (!plan)
+    return false;
+  if (auto version = plan.getAs<mlir::IntegerAttr>("schema_version"))
+    return version.getInt() >= 3;
+  return false;
+}
+
+bool kernelMetadataIsSchemaV3(mlir::Operation *kernel) {
+  if (!kernel)
+    return false;
+  if (planMetadataIsSchemaV3(
+          kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr)))
+    return true;
+  // The v3-only marker lives on the mapped operations: only a v3 encoder writes
+  // `compute_bindings`, so its presence proves the binding's version even when
+  // `schema_version` was deleted.
+  bool v3 = false;
+  kernel->walk([&](mlir::Operation *op) {
+    if (v3)
+      return;
+    auto mapping = op->getAttrOfType<mlir::DictionaryAttr>(kMappingAttr);
+    if (mapping && mapping.get("compute_bindings"))
+      v3 = true;
+  });
+  return v3;
+}
+
+uint64_t kernelMetadataSchemaVersion(mlir::Operation *kernel) {
+  if (!kernel)
+    return 0;
+  auto plan = kernel->getAttrOfType<mlir::DictionaryAttr>(kPlanAttr);
+  if (!plan)
+    return 0;
+  uint64_t version = 1;
+  if (auto declared = plan.getAs<mlir::IntegerAttr>("schema_version"))
+    if (declared.getInt() > 0)
+      version = static_cast<uint64_t>(declared.getInt());
+  if (kernelMetadataIsSchemaV2(kernel))
+    version = std::max<uint64_t>(version, 2);
+  if (kernelMetadataIsSchemaV3(kernel))
+    version = std::max<uint64_t>(version, kMappingMetadataVersion);
+  return version;
+}
+
 //===----------------------------------------------------------------------===//
 // Encoding
 //===----------------------------------------------------------------------===//
@@ -716,6 +768,26 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
   planFields.emplace_back(
       mlir::StringAttr::get(context, "truncated"),
       mlir::BoolAttr::get(context, plan.diagnostics.searchTruncated));
+  // The physical-memory verdict and its ordered reasons and decisions (issue
+  // #129, tasks R3/R7). They are provenance, not identity -- they stay out of
+  // `canonicalPlanString`, so persisting them cannot move a plan id -- but a
+  // plan found incomplete must keep that verdict across the `micro.plan`
+  // round-trip instead of reverting to the optimistic default (issue #129, task
+  // R7 review).
+  planFields.emplace_back(
+      mlir::StringAttr::get(context, "physical_complete"),
+      mlir::BoolAttr::get(context, plan.diagnostics.physicalComplete));
+  auto stringArray = [&](llvm::ArrayRef<std::string> values) {
+    llvm::SmallVector<mlir::Attribute> attrs;
+    attrs.reserve(values.size());
+    for (const std::string &value : values)
+      attrs.push_back(mlir::StringAttr::get(context, value));
+    return mlir::ArrayAttr::get(context, attrs);
+  };
+  planFields.emplace_back(mlir::StringAttr::get(context, "physical_reasons"),
+                          stringArray(plan.diagnostics.physicalReasons));
+  planFields.emplace_back(mlir::StringAttr::get(context, "physical_decisions"),
+                          stringArray(plan.diagnostics.physicalDecisions));
   // Concrete storage allocations and synchronization decisions (design §9.6).
   // B1 persists them; B3 populates them. Empty is legal today.
   llvm::SmallVector<mlir::Attribute> allocations;
@@ -732,6 +804,17 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
     if (allocation.aliasOf)
       fields.emplace_back(mlir::StringAttr::get(context, "alias_of"),
                           u64Attr(context, *allocation.aliasOf));
+    // Only written when set, so every allocation recorded before this field
+    // existed keeps its bytes (issue #129, task R3).
+    if (allocation.borrowed)
+      fields.emplace_back(mlir::StringAttr::get(context, "borrowed"),
+                          mlir::BoolAttr::get(context, true));
+    // Only written when greater than one, so every allocation recorded before
+    // this field existed keeps its bytes (issue #129, task R5).
+    if (allocation.simultaneousOccurrences != 1)
+      fields.emplace_back(
+          mlir::StringAttr::get(context, "simultaneous_occurrences"),
+          u64Attr(context, allocation.simultaneousOccurrences));
     fields.emplace_back(mlir::StringAttr::get(context, "begin_step"),
                         u64Attr(context, allocation.beginStep));
     fields.emplace_back(mlir::StringAttr::get(context, "end_step"),
@@ -776,6 +859,11 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
                         u64Attr(context, step.node));
     fields.emplace_back(mlir::StringAttr::get(context, "connection"),
                         u64Attr(context, step.connection));
+    // Which hop of a multi-hop movement a copy or wait step orders (issue #129,
+    // task R4). Written only where the step is hop-scoped.
+    if (step.hop)
+      fields.emplace_back(mlir::StringAttr::get(context, "hop"),
+                          u64Attr(context, *step.hop));
     steps.push_back(mlir::DictionaryAttr::get(context, fields));
   }
   planFields.emplace_back(mlir::StringAttr::get(context, "steps"),
@@ -810,6 +898,9 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
     llvm::StringMap<std::string> layouts;
     for (const auto &entry : placement.layouts)
       layouts[entry.first()] = entry.second;
+    llvm::StringMap<std::string> computes;
+    for (const auto &entry : placement.computeBindings)
+      computes[entry.first()] = entry.second;
 
     llvm::SmallVector<mlir::NamedAttribute> attributes;
     attributes.emplace_back(mlir::StringAttr::get(context, "schema_version"),
@@ -843,6 +934,13 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
         mlir::StringAttr::get(context, placement.bundle.emitterKey));
     attributes.emplace_back(mlir::StringAttr::get(context, "executor"),
                             mlir::StringAttr::get(context, placement.executor));
+    // The concrete compute node each requirement selected (issue #129, task
+    // R1). Always recorded (possibly empty), so a v3 reader can require the
+    // container: deleting it cannot let a reader re-derive the engine from
+    // executor order, and a v2 binding that never recorded one is rejected as
+    // the older schema it is.
+    attributes.emplace_back(mlir::StringAttr::get(context, "compute_bindings"),
+                            stringMapAttr(context, computes));
     attributes.emplace_back(mlir::StringAttr::get(context, "memories"),
                             stringMapAttr(context, memories));
     // The port-to-memory association of every named-port requirement, so the
@@ -937,6 +1035,37 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
       storageIds.push_back(u64Attr(context, id));
     attributes.emplace_back(mlir::StringAttr::get(context, "storage_ids"),
                             mlir::ArrayAttr::get(context, storageIds));
+    // The physical movement hops (issue #129, task R4), in route order. Written
+    // only when the plan has them, so a plan that was never storage-planned
+    // keeps exactly the bytes it always had; a connection whose route crosses
+    // several memories and that carries no hop container is a plan that made no
+    // storage decision, not one whose decisions were dropped.
+    if (!connection.hops.empty()) {
+      llvm::SmallVector<mlir::Attribute> hops;
+      for (const PlanMovementHop &hop : connection.hops) {
+        llvm::SmallVector<mlir::NamedAttribute> fields;
+        fields.emplace_back(mlir::StringAttr::get(context, "index"),
+                            u64Attr(context, hop.index));
+        fields.emplace_back(mlir::StringAttr::get(context, "src_memory"),
+                            mlir::StringAttr::get(context, hop.srcMemory));
+        fields.emplace_back(mlir::StringAttr::get(context, "dst_memory"),
+                            mlir::StringAttr::get(context, hop.dstMemory));
+        fields.emplace_back(mlir::StringAttr::get(context, "engine"),
+                            mlir::StringAttr::get(context, hop.engine));
+        fields.emplace_back(mlir::StringAttr::get(context, "source_storage"),
+                            u64Attr(context, hop.sourceStorageId));
+        fields.emplace_back(
+            mlir::StringAttr::get(context, "destination_storage"),
+            u64Attr(context, hop.destinationStorageId));
+        fields.emplace_back(mlir::StringAttr::get(context, "movement_step"),
+                            u64Attr(context, hop.movementStep));
+        fields.emplace_back(mlir::StringAttr::get(context, "wait_step"),
+                            u64Attr(context, hop.waitStep));
+        hops.push_back(mlir::DictionaryAttr::get(context, fields));
+      }
+      attributes.emplace_back(mlir::StringAttr::get(context, "hops"),
+                              mlir::ArrayAttr::get(context, hops));
+    }
     // A gather's declared semantics, axis and producer occurrences (task B6).
     // Absent for every non-gather connection, so a plan with none encodes the
     // same route it always did.
@@ -971,6 +1100,15 @@ llvm::Error encodeSelectedPlan(mlir::ModuleOp module, const CoveringPlan &plan,
         transform.emplace_back(
             mlir::StringAttr::get(context, "dst_map"),
             mlir::AffineMapAttr::get(connection.transform->dstMap));
+      // The concrete compute resource the transformation runs on (issue #129,
+      // task R1), so a decoded plan normalizes the same transform event the
+      // search selected instead of falling back to executor order. Recorded
+      // only when the plan resolved one; empty for a plan that never did.
+      if (!connection.transform->computeResource.empty())
+        transform.emplace_back(
+            mlir::StringAttr::get(context, "compute"),
+            mlir::StringAttr::get(context,
+                                  connection.transform->computeResource));
       attributes.emplace_back(mlir::StringAttr::get(context, "transform"),
                               mlir::DictionaryAttr::get(context, transform));
     }
@@ -1018,18 +1156,31 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       return metadataError("micro.plan schema_version is negative");
     schemaVersion = static_cast<uint64_t>(version.getInt());
   }
-  if (schemaVersion > kSupportedMappingMetadataVersion)
-    return metadataError("micro.plan records unsupported schema version " +
-                         std::to_string(schemaVersion) +
-                         "; this reader understands at most " +
-                         std::to_string(kSupportedMappingMetadataVersion));
-  // v2 is inferred from any v2-only field -- on the kernel's `micro.plan` or on
-  // any mapped operation -- so deleting `schema_version` (and even the hash
-  // fields) cannot silently downgrade the binding to v1.
-  const bool v2 = kernelMetadataIsSchemaV2(kernel);
-  if (v2)
-    schemaVersion = kMappingMetadataVersion;
-
+  // The effective version is the declared one raised to the highest version the
+  // binding's own recorded fields prove -- v2 from any v2-only field, v3 from
+  // `compute_bindings` -- so deleting `schema_version` (and even the hash
+  // fields) cannot silently downgrade the binding.
+  schemaVersion = std::max(schemaVersion, kernelMetadataSchemaVersion(kernel));
+  // Sub-v3 state is rejected, not reinterpreted (issue #129, task R1). A v1 or
+  // v2 binding records no concrete compute selection, so which attached
+  // capability ran cannot be recovered from it -- and guessing one from
+  // executor order is exactly the defect this repair removes.
+  if (schemaVersion != kMappingMetadataVersion)
+    return metadataError(
+        "micro.plan records unsupported mapping metadata schema version " +
+        std::to_string(schemaVersion) + "; this reader requires version " +
+        std::to_string(kMappingMetadataVersion) +
+        " (issue #129, task R1). A newer binding was written by a newer "
+        "compiler; an older one records no concrete compute selection, so the "
+        "attached capability it selected cannot be recovered from it. Re-run "
+        "the mapping search to regenerate the binding under the current "
+        "schema.");
+  // The check above accepts exactly `kMappingMetadataVersion` (3), so every
+  // accepted binding already satisfies the v2-or-newer requirements these
+  // decoders rely on. The guards that once distinguished v1 from v2 are gone
+  // with the v1 reader: a `v2` predicate over an exactly-v3 version was a
+  // constant, and the older format this reader no longer accepts had no path
+  // through here anyway (CodeQL review, PR #133).
   WorkloadGraphBinding binding;
   llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(kernel, &binding);
   if (!graph)
@@ -1047,37 +1198,54 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
     plan.materialized = materialized.getValue();
   if (auto truncated = planAttr.getAs<mlir::BoolAttr>("truncated"))
     plan.diagnostics.searchTruncated = truncated.getValue();
+  // The physical-memory verdict and its reasons (issue #129, task R7 review).
+  // Restored so a plan found incomplete keeps that verdict across the round
+  // trip; a binding written before this field existed keeps the field's own
+  // optimistic default.
+  if (auto complete = planAttr.getAs<mlir::BoolAttr>("physical_complete"))
+    plan.diagnostics.physicalComplete = complete.getValue();
+  auto readStringArray = [&](llvm::StringRef key,
+                             std::vector<std::string> &out) -> llvm::Error {
+    auto array = planAttr.getAs<mlir::ArrayAttr>(key);
+    if (!array)
+      return llvm::Error::success();
+    for (mlir::Attribute element : array) {
+      auto text = mlir::dyn_cast<mlir::StringAttr>(element);
+      if (!text)
+        return metadataError("micro.plan '" + key.str() +
+                             "' holds a non-string entry");
+      out.push_back(text.getValue().str());
+    }
+    return llvm::Error::success();
+  };
+  if (llvm::Error error =
+          readStringArray("physical_reasons", plan.diagnostics.physicalReasons))
+    return std::move(error);
+  if (llvm::Error error = readStringArray("physical_decisions",
+                                          plan.diagnostics.physicalDecisions))
+    return std::move(error);
 
-  if (v2) {
-    llvm::Expected<std::string> graphHash =
-        readMetadataString(planAttr, "graph_hash", "micro.plan");
-    if (!graphHash)
-      return graphHash.takeError();
-    llvm::Expected<std::string> targetHash =
-        readMetadataString(planAttr, "target_hash", "micro.plan");
-    if (!targetHash)
-      return targetHash.takeError();
-    llvm::Expected<uint64_t> current = computeModuleSourceGraphHash(kernel);
-    if (!current)
-      return current.takeError();
-    if (*graphHash != hexId(*current))
-      return metadataError("micro.plan graph_hash does not match the kernel's "
-                           "source graph");
-    if (*targetHash != hexId(computeTargetContentHash(target)))
-      return metadataError("micro.plan target_hash does not match the target");
-    plan.graphHash = *current;
-    plan.targetHash = computeTargetContentHash(target);
-    plan.machineHash = machine::computeContentHash(target.machine());
-    plan.layoutHash = target.layouts().computeContentHash();
-    plan.ruleHash = target.rules().computeContentHash();
-  } else {
-    // Legacy: still expose the current hashes for a caller that re-encodes, but
-    // do not validate them -- a v1 binding predates the fields.
-    plan.machineHash = machine::computeContentHash(target.machine());
-    plan.layoutHash = target.layouts().computeContentHash();
-    plan.ruleHash = target.rules().computeContentHash();
-    plan.targetHash = computeTargetContentHash(target);
-  }
+  llvm::Expected<std::string> graphHash =
+      readMetadataString(planAttr, "graph_hash", "micro.plan");
+  if (!graphHash)
+    return graphHash.takeError();
+  llvm::Expected<std::string> targetHash =
+      readMetadataString(planAttr, "target_hash", "micro.plan");
+  if (!targetHash)
+    return targetHash.takeError();
+  llvm::Expected<uint64_t> current = computeModuleSourceGraphHash(kernel);
+  if (!current)
+    return current.takeError();
+  if (*graphHash != hexId(*current))
+    return metadataError("micro.plan graph_hash does not match the kernel's "
+                         "source graph");
+  if (*targetHash != hexId(computeTargetContentHash(target)))
+    return metadataError("micro.plan target_hash does not match the target");
+  plan.graphHash = *current;
+  plan.targetHash = computeTargetContentHash(target);
+  plan.machineHash = machine::computeContentHash(target.machine());
+  plan.layoutHash = target.layouts().computeContentHash();
+  plan.ruleHash = target.rules().computeContentHash();
 
   // --- storage and synchronization state (design §9.6) -------------------
   // B1 persists these; B3 populates them. An empty container is legal today.
@@ -1102,10 +1270,15 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         allocation.bytes = value.getValue().getZExtValue();
       if (auto value = dict.getAs<mlir::IntegerAttr>("alias_of"))
         allocation.aliasOf = value.getValue().getZExtValue();
+      if (auto value =
+              dict.getAs<mlir::IntegerAttr>("simultaneous_occurrences"))
+        allocation.simultaneousOccurrences = value.getValue().getZExtValue();
       if (auto value = dict.getAs<mlir::IntegerAttr>("begin_step"))
         allocation.beginStep = value.getValue().getZExtValue();
       if (auto value = dict.getAs<mlir::IntegerAttr>("end_step"))
         allocation.endStep = value.getValue().getZExtValue();
+      if (auto value = dict.getAs<mlir::BoolAttr>("borrowed"))
+        allocation.borrowed = value.getValue();
       plan.allocations.push_back(std::move(allocation));
     }
   }
@@ -1162,6 +1335,10 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       if (auto value = dict.getAs<mlir::IntegerAttr>("connection"))
         step.connection =
             static_cast<ConnectionId>(value.getValue().getZExtValue());
+      // Which hop of a multi-hop movement the step orders (issue #129, task
+      // R4); absent for a compute step and for a single-hop movement.
+      if (auto value = dict.getAs<mlir::IntegerAttr>("hop"))
+        step.hop = value.getValue().getZExtValue();
       plan.steps.push_back(std::move(step));
     }
   }
@@ -1186,6 +1363,10 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
     sourceNodeForOp[entry.second] = entry.first;
 
   bool sawUnrecoverable = false;
+  // A short, specific cause to append to the generic unrecoverable diagnostic,
+  // so a dropped compute selection is named rather than lumped in with every
+  // other ambiguous legacy shape (issue #129, task R1).
+  std::string unrecoverableReason;
   module->walk([&](mlir::Operation *op) {
     if (sawUnrecoverable)
       return;
@@ -1197,30 +1378,21 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
 
     PlanPlacement placement;
     // The source node id: recorded for v2, recovered from the graph for v1.
-    if (v2) {
-      auto node = mapping.getAs<mlir::IntegerAttr>("node");
-      if (!node) {
-        sawUnrecoverable = true;
-        return;
-      }
-      placement.node = static_cast<WorkloadNodeId>(node.getInt());
-      // The recorded node must be the op's own projected source node, so a
-      // mapping cannot be moved onto another operation.
-      auto found = sourceNodeForOp.find(op);
-      if (found == sourceNodeForOp.end() || found->second != placement.node) {
-        sawUnrecoverable = true;
-        return;
-      }
-      if (auto instance = mapping.getAs<mlir::IntegerAttr>("instance"))
-        placement.instance = static_cast<InstanceId>(instance.getInt());
-    } else {
-      auto found = sourceNodeForOp.find(op);
-      if (found == sourceNodeForOp.end()) {
-        sawUnrecoverable = true;
-        return;
-      }
-      placement.node = found->second;
+    auto node = mapping.getAs<mlir::IntegerAttr>("node");
+    if (!node) {
+      sawUnrecoverable = true;
+      return;
     }
+    placement.node = static_cast<WorkloadNodeId>(node.getInt());
+    // The recorded node must be the op's own projected source node, so a
+    // mapping cannot be moved onto another operation.
+    auto found = sourceNodeForOp.find(op);
+    if (found == sourceNodeForOp.end() || found->second != placement.node) {
+      sawUnrecoverable = true;
+      return;
+    }
+    if (auto instance = mapping.getAs<mlir::IntegerAttr>("instance"))
+      placement.instance = static_cast<InstanceId>(instance.getInt());
 
     llvm::Expected<std::string> rule =
         readMetadataString(mapping, "rule", where);
@@ -1229,6 +1401,19 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       return;
     }
     placement.rule = *rule;
+    // The capability kinds the recorded rule requires, re-derived from the
+    // target's rule registry, so a decoded plan still knows which kinds must
+    // have a concrete recorded selection (issue #129, task R1).
+    if (const RuleDef *def = target.rules().find(placement.rule)) {
+      for (const KindRequirement &requirement : def->kindRequirements)
+        if (requirement.role == "compute")
+          placement.computeRequirements.push_back(requirement.kind);
+      llvm::sort(placement.computeRequirements);
+      placement.computeRequirements.erase(
+          std::unique(placement.computeRequirements.begin(),
+                      placement.computeRequirements.end()),
+          placement.computeRequirements.end());
+    }
     llvm::Expected<std::string> executor =
         readMetadataString(mapping, "executor", where);
     if (!executor) {
@@ -1256,6 +1441,31 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
       }
       for (const auto &entry : *read)
         placement.memories[entry.first()] = entry.second;
+    }
+    // The concrete compute node each requirement selected (issue #129, task
+    // R1). A v3 binding always records the container (it may be empty only for
+    // a rule that requires no compute capability), so deleting it cannot skip
+    // the selection and let a reader re-derive an engine from executor order.
+    if (mlir::Attribute computes = mapping.get("compute_bindings")) {
+      llvm::Expected<llvm::StringMap<std::string>> read =
+          readMetadataStringMap(computes, "compute_bindings", where);
+      if (!read) {
+        sawUnrecoverable = true;
+        return;
+      }
+      for (const auto &entry : *read)
+        placement.computeBindings[entry.first()] = entry.second;
+      // A container that omits a kind the recorded rule requires is an
+      // incomplete selection: the concrete node was dropped or tampered with,
+      // and the reader must not fall back to executor order to invent one
+      // (issue #129, task R1).
+      if (std::optional<std::string> missing =
+              missingComputeBinding(placement)) {
+        unrecoverableReason = where + " records no concrete '" + *missing +
+                              "' compute selection, which its rule requires";
+        sawUnrecoverable = true;
+        return;
+      }
     }
     // The named-port memory associations. Each recorded occurrence must resolve
     // in the source graph, so a tampered association cannot point at a made-up
@@ -1293,14 +1503,6 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         placement.portMemoryBindings.push_back(
             PortMemoryBinding{*ref, *memory});
       }
-    } else if (v2) {
-      if (const RuleDef *def = target.rules().find(placement.rule)) {
-        for (const KindRequirement &requirement : def->kindRequirements)
-          if (requirement.role == "memory" && requirement.port) {
-            sawUnrecoverable = true;
-            return;
-          }
-      }
     }
     if (mlir::Attribute layouts = mapping.get("layouts")) {
       llvm::Expected<llvm::StringMap<std::string>> read =
@@ -1331,15 +1533,11 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         }
         placement.resolvedParameters[parameter.getName()] = *value;
       }
-    } else if (v2) {
-      sawUnrecoverable = true;
-      return;
     }
 
     // A v2 solved-layout container must be accompanied by its entries, so
     // deleting `layout_entries` fails on decode as well as on verify.
-    if (v2 && mapping.get("layout_parameters") &&
-        !mapping.get("layout_entries")) {
+    if (mapping.get("layout_parameters") && !mapping.get("layout_entries")) {
       sawUnrecoverable = true;
       return;
     }
@@ -1398,51 +1596,20 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
         // Legacy recovery: a v1 binding records no endpoint, so recover the
         // occurrence the rule names for this class when the declaration makes
         // it unique.
-        if (!v2 && !solved.port) {
-          if (const RuleDef *def = target.rules().find(placement.rule)) {
-            if (const WorkloadNode *node =
-                    sourceGraph.findNode(placement.node)) {
-              for (const RuleLayoutRequirement &requirement :
-                   def->layoutRequirements)
-                if (requirement.layoutId == solved.layoutClass)
-                  if (std::optional<PortRef> ref =
-                          portRefForRulePort(*def, *node, requirement.port)) {
-                    solved.port = ref;
-                    break;
-                  }
-            }
-          }
-        }
         placement.layoutSolutions[entry.getName()] = std::move(solved);
-      }
-    } else if (!v2) {
-      // Legacy recovery: rebuild the solved assignment from the declaration so
-      // an unambiguous v1 binding still replays. A missing assignment the rule
-      // requires is not recoverable.
-      if (const RuleDef *ruleDef = target.rules().find(placement.rule)) {
-        for (const RuleLayoutRequirement &requirement :
-             ruleDef->layoutRequirements) {
-          const WorkloadNode *node = sourceGraph.findNode(placement.node);
-          if (!node) {
-            sawUnrecoverable = true;
-            return;
-          }
-          SolvedLayout solved;
-          solved.layoutClass = requirement.layoutId;
-          if (std::optional<PortRef> ref =
-                  portRefForRulePort(*ruleDef, *node, requirement.port))
-            solved.port = ref;
-          placement.layoutSolutions[requirement.layoutId] = std::move(solved);
-        }
       }
     }
 
     plan.placements.push_back(std::move(placement));
   });
-  if (sawUnrecoverable)
-    return metadataError(
+  if (sawUnrecoverable) {
+    std::string message =
         "legacy or malformed micro.mapping is not uniquely recoverable for "
-        "executable replay");
+        "executable replay";
+    if (!unrecoverableReason.empty())
+      message += ": " + unrecoverableReason;
+    return metadataError(message);
+  }
 
   // --- routes ------------------------------------------------------------
   if (auto routes = kernel->getAttrOfType<mlir::ArrayAttr>(kRoutesAttr)) {
@@ -1514,6 +1681,44 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
           if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(id))
             connection.storageIds.push_back(
                 static_cast<uint64_t>(integer.getInt()));
+      // The physical movement hops (issue #129, task R4). A recorded hop that
+      // is not a well-formed dictionary is rejected rather than decoded with a
+      // guessed memory or storage.
+      if (auto hops = route.getAs<mlir::ArrayAttr>("hops")) {
+        for (mlir::Attribute element : hops) {
+          auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(element);
+          if (!dict)
+            return metadataError("micro.routes 'hops' entry is not a "
+                                 "dictionary");
+          PlanMovementHop hop;
+          if (auto value = dict.getAs<mlir::IntegerAttr>("index"))
+            hop.index = value.getValue().getZExtValue();
+          llvm::Expected<std::string> src =
+              readMetadataString(dict, "src_memory", where);
+          if (!src)
+            return src.takeError();
+          hop.srcMemory = *src;
+          llvm::Expected<std::string> dst =
+              readMetadataString(dict, "dst_memory", where);
+          if (!dst)
+            return dst.takeError();
+          hop.dstMemory = *dst;
+          llvm::Expected<std::string> engine =
+              readMetadataString(dict, "engine", where);
+          if (!engine)
+            return engine.takeError();
+          hop.engine = *engine;
+          if (auto value = dict.getAs<mlir::IntegerAttr>("source_storage"))
+            hop.sourceStorageId = value.getValue().getZExtValue();
+          if (auto value = dict.getAs<mlir::IntegerAttr>("destination_storage"))
+            hop.destinationStorageId = value.getValue().getZExtValue();
+          if (auto value = dict.getAs<mlir::IntegerAttr>("movement_step"))
+            hop.movementStep = value.getValue().getZExtValue();
+          if (auto value = dict.getAs<mlir::IntegerAttr>("wait_step"))
+            hop.waitStep = value.getValue().getZExtValue();
+          connection.hops.push_back(std::move(hop));
+        }
+      }
       // The gather's declared semantics, axis and producer occurrences (task
       // B6). A recorded semantics that is not one of the three known words is
       // rejected rather than silently downgrading the connection to a
@@ -1554,34 +1759,11 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
           layoutTransform.srcMap = srcMap.getValue();
         if (auto dstMap = transform.getAs<mlir::AffineMapAttr>("dst_map"))
           layoutTransform.dstMap = dstMap.getValue();
+        // The concrete compute resource the transformation runs on (issue #129,
+        // task R1), restored so a decoded plan normalizes the recorded engine.
+        if (auto compute = transform.getAs<mlir::StringAttr>("compute"))
+          layoutTransform.computeResource = compute.getValue().str();
         connection.transform = layoutTransform;
-      }
-
-      // Legacy recovery: a v1 connection records no consumer endpoints, and
-      // which operand occurrence a recorded consumer instance reads is not
-      // uniquely recoverable from the instance projection -- two operand uses
-      // of one value list the same instance. A v1 connection that names
-      // consumers is therefore ambiguous executable replay and is rejected. A
-      // consumer-free connection has nothing to recover; its producer endpoint
-      // is recovered when the value has exactly one producing occurrence.
-      if (!v2 && !connection.consumers.empty())
-        return metadataError(
-            "legacy micro.routes has no recoverable consumer endpoints; "
-            "ambiguous executable replay is rejected");
-      if (!v2 && connection.consumerPorts.empty()) {
-        const WorkloadNode *producerNode = nullptr;
-        unsigned producerIndex = 0;
-        unsigned producers = 0;
-        for (const WorkloadNode &node : sourceGraph.getNodes())
-          for (unsigned index = 0; index < node.outputs.size(); ++index)
-            if (node.outputs[index].value == connection.value) {
-              producerNode = &node;
-              producerIndex = index;
-              ++producers;
-            }
-        if (producers == 1 && producerNode)
-          connection.producerPort =
-              PortRef{producerNode->id, PortDirection::Output, producerIndex};
       }
 
       plan.connectionPlans.push_back(std::move(connection));
@@ -1600,33 +1782,61 @@ llvm::Expected<CoveringPlan> decodeSelectedPlan(mlir::ModuleOp module,
   }
   llvm::sort(plan.connections);
 
-  llvm::sort(plan.placements,
-             [](const PlanPlacement &lhs, const PlanPlacement &rhs) {
-               if (lhs.executor != rhs.executor)
-                 return lhs.executor < rhs.executor;
-               auto sorted = [](const llvm::StringMap<std::string> &map) {
-                 std::vector<std::string> parts;
-                 for (const auto &entry : map) {
-                   std::string text = entry.first().str();
-                   text += '=';
-                   text += entry.second;
-                   parts.push_back(std::move(text));
-                 }
-                 llvm::sort(parts);
-                 return parts;
-               };
-               std::vector<std::string> lhsMemories = sorted(lhs.memories);
-               std::vector<std::string> rhsMemories = sorted(rhs.memories);
-               if (lhsMemories != rhsMemories)
-                 return lhsMemories < rhsMemories;
-               std::vector<std::string> lhsLayouts = sorted(lhs.layouts);
-               std::vector<std::string> rhsLayouts = sorted(rhs.layouts);
-               if (lhsLayouts != rhsLayouts)
-                 return lhsLayouts < rhsLayouts;
-               if (lhs.node != rhs.node)
-                 return lhs.node < rhs.node;
-               return lhs.instance < rhs.instance;
-             });
+  llvm::sort(
+      plan.placements, [](const PlanPlacement &lhs, const PlanPlacement &rhs) {
+        if (lhs.executor != rhs.executor)
+          return lhs.executor < rhs.executor;
+        auto sorted = [](const llvm::StringMap<std::string> &map) {
+          std::vector<std::string> parts;
+          for (const auto &entry : map) {
+            std::string text = entry.first().str();
+            text += '=';
+            text += entry.second;
+            parts.push_back(std::move(text));
+          }
+          llvm::sort(parts);
+          return parts;
+        };
+        std::vector<std::string> lhsMemories = sorted(lhs.memories);
+        std::vector<std::string> rhsMemories = sorted(rhs.memories);
+        if (lhsMemories != rhsMemories)
+          return lhsMemories < rhsMemories;
+        // The named-port assignment is part of the canonical order for
+        // the same reason the kind-keyed map is: two placements that bind
+        // the same nodes to swapped occurrences are different work. A
+        // selection without it -- the search's `placementBefore` -- would
+        // decode a plan whose placements are ordered differently from the
+        // one that was encoded (issue #129, task R3).
+        auto sortedPorts = [](llvm::ArrayRef<PortMemoryBinding> ports) {
+          std::vector<std::string> parts;
+          parts.reserve(ports.size());
+          for (const PortMemoryBinding &binding : ports) {
+            std::string text = canonicalPortRefString(binding.port);
+            text += '=';
+            text += binding.memory;
+            parts.push_back(std::move(text));
+          }
+          llvm::sort(parts);
+          return parts;
+        };
+        std::vector<std::string> lhsPortMemories =
+            sortedPorts(lhs.portMemoryBindings);
+        std::vector<std::string> rhsPortMemories =
+            sortedPorts(rhs.portMemoryBindings);
+        if (lhsPortMemories != rhsPortMemories)
+          return lhsPortMemories < rhsPortMemories;
+        std::vector<std::string> lhsLayouts = sorted(lhs.layouts);
+        std::vector<std::string> rhsLayouts = sorted(rhs.layouts);
+        if (lhsLayouts != rhsLayouts)
+          return lhsLayouts < rhsLayouts;
+        std::vector<std::string> lhsComputes = sorted(lhs.computeBindings);
+        std::vector<std::string> rhsComputes = sorted(rhs.computeBindings);
+        if (lhsComputes != rhsComputes)
+          return lhsComputes < rhsComputes;
+        if (lhs.node != rhs.node)
+          return lhs.node < rhs.node;
+        return lhs.instance < rhs.instance;
+      });
   llvm::sort(plan.connectionPlans,
              [](const PlanConnection &lhs, const PlanConnection &rhs) {
                return lhs.id < rhs.id;

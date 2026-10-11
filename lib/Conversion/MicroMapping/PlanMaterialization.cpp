@@ -79,6 +79,13 @@ constexpr llvm::StringLiteral kSrcNodeAttr = "micro.src_node";
 constexpr llvm::StringLiteral kDstNodeAttr = "micro.dst_node";
 constexpr llvm::StringLiteral kConnectionAttr = "micro.connection";
 constexpr llvm::StringLiteral kHopAttr = "micro.hop";
+/// The storage allocation a hop's copy reads and writes (issue #129, task R4).
+/// They are the physical decisions `finalizeStoragePlan` made, carried onto the
+/// operation it materialized them for, so the emitted IR states which planned
+/// buffer a copy uses instead of leaving a reader to infer one from the memory
+/// kind.
+constexpr llvm::StringLiteral kSrcStorageAttr = "micro.src_storage";
+constexpr llvm::StringLiteral kDstStorageAttr = "micro.dst_storage";
 
 /// Stable, greppable reasons a connection is not materialized (design §18.2).
 /// They are part of the report contract, so they are named constants rather
@@ -99,6 +106,13 @@ constexpr llvm::StringLiteral kUnknownMemoryReason =
 constexpr llvm::StringLiteral kMissingFactReason = "missing_static_fact";
 constexpr llvm::StringLiteral kNoConsumerReason =
     "consumer_endpoint_unresolved";
+/// The plan's recorded movement hops do not describe its route (issue #129,
+/// task R4): the two are the storage planner's decision and the materializer
+/// refuses to guess which is right rather than emitting a copy for a hop the
+/// plan never reserved storage for.
+constexpr llvm::StringLiteral kHopRouteMismatchReason =
+    "hop_route_length_mismatch";
+constexpr llvm::StringLiteral kHopStorageReason = "hop_storage_unresolved";
 
 llvm::Error materializeError(const std::string &message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
@@ -475,30 +489,99 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
     builder.create(state);
   };
 
-  // Emits one awaited copy per route hop, landing `value` in the route's final
-  // memory. Returns the final result, or null (with `reason` set) when a hop
-  // names memories the machine cannot carry data between. Every copy's token is
-  // appended to `tokens`, so a barrier can cover exactly this movement.
-  auto emitChain = [&](mlir::Value value, mlir::Operation *producer,
-                       const llvm::SmallVector<MemoryNodeId> &route,
-                       WorkloadValueId connectionValue,
-                       ConnectionId connectionId,
-                       llvm::SmallVectorImpl<mlir::Value> &tokens,
-                       std::string &reason) -> mlir::Value {
+  // The storage allocations the selected plan reserved, so a hop's recorded
+  // storage decision can be proved to name one of *this* plan's buffers rather
+  // than an arbitrary integer (issue #129, task R4).
+  llvm::DenseMap<uint64_t, char> allocatedIds;
+  for (const StorageAllocation &allocation : plan.allocations)
+    allocatedIds[allocation.id] = 1;
+
+  // The movement hops a connection's route materializes. The plan's recorded
+  // hops are the materialization authority when present; a plan built without
+  // storage planning (no hops) gets one hop per route transition, which is
+  // exactly the emission it always had. A recorded hop set that does not
+  // describe the route, or that names a storage the plan never reserved, is
+  // refused with a stable reason rather than guessed at: a copy written for a
+  // hop with no reservation is the defect this contract exists to prevent.
+  auto hopsFor = [&](const PlanConnection &connection, std::string &reason)
+      -> std::optional<llvm::SmallVector<PlanMovementHop, 2>> {
+    if (!connection.hops.empty()) {
+      const bool lengthsMatch =
+          connection.route.size() >= 2 &&
+          connection.hops.size() == connection.route.size() - 1;
+      for (size_t hop = 0; lengthsMatch && hop < connection.hops.size();
+           ++hop) {
+        const PlanMovementHop &recorded = connection.hops[hop];
+        if (recorded.index != hop ||
+            recorded.srcMemory != connection.route[hop] ||
+            recorded.dstMemory != connection.route[hop + 1]) {
+          reason = kHopRouteMismatchReason.str();
+          return std::nullopt;
+        }
+        const bool sourceResolves =
+            recorded.sourceStorageId != 0 &&
+            allocatedIds.count(recorded.sourceStorageId);
+        const bool destinationResolves =
+            recorded.destinationStorageId != 0 &&
+            allocatedIds.count(recorded.destinationStorageId);
+        if (!sourceResolves || !destinationResolves) {
+          reason = kHopStorageReason.str();
+          return std::nullopt;
+        }
+      }
+      if (!lengthsMatch) {
+        reason = kHopRouteMismatchReason.str();
+        return std::nullopt;
+      }
+      return llvm::SmallVector<PlanMovementHop, 2>(connection.hops.begin(),
+                                                   connection.hops.end());
+    }
+    if (connection.route.size() < 2) {
+      reason = kHoplessRouteReason.str();
+      return std::nullopt;
+    }
+    llvm::SmallVector<PlanMovementHop, 2> hops;
+    for (size_t hop = 0; hop + 1 < connection.route.size(); ++hop) {
+      PlanMovementHop synthesized;
+      synthesized.index = hop;
+      synthesized.srcMemory = connection.route[hop];
+      synthesized.dstMemory = connection.route[hop + 1];
+      hops.push_back(std::move(synthesized));
+    }
+    return hops;
+  };
+
+  // Emits one awaited copy per hop, in route order, landing `value` in the
+  // final hop's memory. Returns the final result, or null (with `reason` set)
+  // when a hop names memories the machine cannot carry data between. Every
+  // copy's token is appended to `tokens`, so a barrier can cover exactly this
+  // movement.
+  //
+  // Each copy reads the terminal value of the hop before it and writes its own
+  // hop's destination: consecutive hops share the intermediate, exactly as the
+  // hop records' `sourceStorageId`/`destinationStorageId` chain says. The hop
+  // records are the authority -- this is their materialization (issue #129,
+  // task R4), so a hop's stamped `micro.hop` is its recorded `index` + 1 (the
+  // 1-based numbering the movement verifier and `micro.hop` already use).
+  auto emitChain =
+      [&](mlir::Value value, mlir::Operation *producer,
+          llvm::ArrayRef<PlanMovementHop> hops, WorkloadValueId connectionValue,
+          ConnectionId connectionId, llvm::SmallVectorImpl<mlir::Value> &tokens,
+          std::string &reason) -> mlir::Value {
     if (!producer || !value) {
       reason = kNoProducerReason.str();
       return {};
     }
-    if (route.size() < 2) {
+    if (hops.empty()) {
       reason = kHoplessRouteReason.str();
       return {};
     }
     builder.setInsertionPointAfter(producer);
     mlir::Value current = value;
     mlir::Operation *lastCopy = nullptr;
-    for (size_t hop = 1; hop < route.size(); ++hop) {
-      const machine::MemoryNode *from = machineModel.findMemory(route[hop - 1]);
-      const machine::MemoryNode *to = machineModel.findMemory(route[hop]);
+    for (const PlanMovementHop &hop : hops) {
+      const machine::MemoryNode *from = machineModel.findMemory(hop.srcMemory);
+      const machine::MemoryNode *to = machineModel.findMemory(hop.dstMemory);
       if (!from || !to || from->id == to->id) {
         reason = "a route hop names memories the machine cannot carry data "
                  "between";
@@ -567,7 +650,17 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       copyState.addAttribute(kDstNodeAttr,
                              mlir::StringAttr::get(context, to->id));
       copyState.addAttribute(kConnectionAttr, u64Attr(context, connectionId));
-      copyState.addAttribute(kHopAttr, u64Attr(context, hop));
+      copyState.addAttribute(kHopAttr, u64Attr(context, hop.index + 1));
+      // The storage decisions this hop materializes (issue #129, task R4): the
+      // allocation it reads and the one it writes. Recorded only when the plan
+      // actually made the decision, so a plan built without storage planning
+      // emits exactly the copies it always did.
+      if (hop.sourceStorageId != 0)
+        copyState.addAttribute(kSrcStorageAttr,
+                               u64Attr(context, hop.sourceStorageId));
+      if (hop.destinationStorageId != 0)
+        copyState.addAttribute(kDstStorageAttr,
+                               u64Attr(context, hop.destinationStorageId));
       mlir::Operation *copy = builder.create(copyState);
 
       mlir::OperationState waitState(producer->getLoc(), "micro.wait");
@@ -577,10 +670,6 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       tokens.push_back(copy->getResult(1));
       lastCopy = copy;
       current = copy->getResult(0);
-    }
-    if (!lastCopy) {
-      reason = kHoplessRouteReason.str();
-      return {};
     }
     return lastCopy->getResult(0);
   };
@@ -646,13 +735,19 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       llvm::SmallVector<mlir::Value> tokens;
       std::string reason;
       bool ok = true;
-      for (size_t i = 0; i < feeds.size(); ++i) {
+      std::optional<llvm::SmallVector<PlanMovementHop, 2>> stagingHops;
+      if (staged) {
+        stagingHops = hopsFor(connection, reason);
+        if (!stagingHops)
+          ok = false;
+      }
+      for (size_t i = 0; ok && i < feeds.size(); ++i) {
         if (!staged) {
           stagedFeeds.push_back(feeds[i]);
           continue;
         }
         mlir::Value moved =
-            emitChain(feeds[i], feedProducers[i], connection.route,
+            emitChain(feeds[i], feedProducers[i], *stagingHops,
                       connection.value, connection.id, tokens, reason);
         if (!moved) {
           ok = false;
@@ -775,9 +870,14 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
       continue;
     }
 
-    // A movement needs at least one hop between two memories.
-    if (connection.route.size() < 2) {
-      report(connection, kHoplessRouteReason);
+    // The hops this movement materializes: the plan's recorded storage
+    // decisions when it has them, else one synthesized hop per route
+    // transition.
+    std::string hopReason;
+    std::optional<llvm::SmallVector<PlanMovementHop, 2>> movementHops =
+        hopsFor(connection, hopReason);
+    if (!movementHops) {
+      report(connection, hopReason);
       continue;
     }
 
@@ -822,7 +922,7 @@ llvm::Error CanonicalPlanMaterializer::materialize(mlir::ModuleOp module,
     llvm::SmallVector<mlir::Value> tokens;
     std::string reason;
     mlir::Value moved =
-        emitChain(value, producer, connection.route, connection.value,
+        emitChain(value, producer, *movementHops, connection.value,
                   connection.id, tokens, reason);
     if (!moved) {
       report(connection, reason);

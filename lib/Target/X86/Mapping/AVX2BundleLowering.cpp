@@ -77,6 +77,59 @@ bool isFusedKey(llvm::StringRef key) {
   return key == "avx2_fused_convert_silu_mul";
 }
 
+bool isBackendHandoffKey(llvm::StringRef key) {
+  return key == "avx2_mma" || key == "avx2_reduce" || key == "avx2_copy" ||
+         key == "avx2_tile_copy" || key == "avx2_tile_store";
+}
+
+mlir::ArrayAttr
+encodeSelectedConnections(const mapping::TargetLoweringContext &context,
+                          mlir::MLIRContext *mlirContext) {
+  mlir::Builder builder(mlirContext);
+  llvm::SmallVector<mlir::Attribute> encoded;
+  for (const mapping::PlanConnection &connection : context.connections) {
+    mlir::NamedAttrList record;
+    record.set("id", builder.getI64IntegerAttr(connection.id));
+    record.set("value", builder.getI64IntegerAttr(connection.value));
+    record.set("kind", builder.getStringAttr(
+                           mapping::stringifyConnectionKind(connection.kind)));
+    auto encodeIds = [&](llvm::ArrayRef<uint64_t> ids) {
+      llvm::SmallVector<mlir::Attribute> values;
+      for (uint64_t id : ids)
+        values.push_back(builder.getI64IntegerAttr(id));
+      return builder.getArrayAttr(values);
+    };
+    llvm::SmallVector<mlir::Attribute> route;
+    for (const mapping::MemoryNodeId &memory : connection.route)
+      route.push_back(builder.getStringAttr(memory));
+    record.set("route", builder.getArrayAttr(route));
+    record.set("storage_ids", encodeIds(connection.storageIds));
+    llvm::SmallVector<mlir::Attribute> engines;
+    for (const mapping::ExecutorId &engine : connection.engines)
+      engines.push_back(builder.getStringAttr(engine));
+    record.set("engines", builder.getArrayAttr(engines));
+    llvm::SmallVector<mlir::Attribute> hops;
+    for (const mapping::PlanMovementHop &hop : connection.hops) {
+      mlir::NamedAttrList movement;
+      movement.set("index", builder.getI64IntegerAttr(hop.index));
+      movement.set("src_memory", builder.getStringAttr(hop.srcMemory));
+      movement.set("dst_memory", builder.getStringAttr(hop.dstMemory));
+      movement.set("engine", builder.getStringAttr(hop.engine));
+      movement.set("source_storage_id",
+                   builder.getI64IntegerAttr(hop.sourceStorageId));
+      movement.set("destination_storage_id",
+                   builder.getI64IntegerAttr(hop.destinationStorageId));
+      movement.set("movement_step",
+                   builder.getI64IntegerAttr(hop.movementStep));
+      movement.set("wait_step", builder.getI64IntegerAttr(hop.waitStep));
+      hops.push_back(builder.getDictionaryAttr(movement));
+    }
+    record.set("hops", builder.getArrayAttr(hops));
+    encoded.push_back(builder.getDictionaryAttr(record));
+  }
+  return builder.getArrayAttr(encoded);
+}
+
 /// The element types the AVX2 arithmetic emitters implement. A target's rules
 /// are dtype-parameterized, so a bundle can name an element type this backend
 /// has no vector path for -- that is a target-readiness failure, not a parse
@@ -114,25 +167,45 @@ llvm::Expected<int64_t> checkVectorWidth(mlir::Attribute raw,
 /// real pipeline always takes.
 llvm::Expected<int64_t> resolveVectorWidth(const mapping::TargetBundle &bundle,
                                            mlir::Operation *op) {
+  std::optional<int64_t> bundleWidth;
   if (bundle.parameters)
-    if (mlir::Attribute raw = bundle.parameters.get("VW"))
-      return checkVectorWidth(raw, "bundle '" + bundle.name + "'");
+    if (mlir::Attribute raw = bundle.parameters.get("VW")) {
+      llvm::Expected<int64_t> width =
+          checkVectorWidth(raw, "bundle '" + bundle.name + "'");
+      if (!width)
+        return width.takeError();
+      bundleWidth = *width;
+    }
 
   auto mapping = op->getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
   auto solutions =
       mapping ? mapping.getAs<mlir::DictionaryAttr>("layout_parameters")
               : mlir::DictionaryAttr();
+  std::optional<int64_t> layoutWidth;
   if (solutions) {
-    // Layout ids are sorted on write, so the first solution that carries a
-    // width is a deterministic choice rather than an arbitrary one.
     for (mlir::NamedAttribute entry : solutions) {
       auto solution = mlir::dyn_cast<mlir::DictionaryAttr>(entry.getValue());
       if (!solution)
         continue;
-      if (mlir::Attribute raw = solution.get("VW"))
-        return checkVectorWidth(raw, "layout '" + entry.getName().str() + "'");
+      if (mlir::Attribute raw = solution.get("VW")) {
+        llvm::Expected<int64_t> width =
+            checkVectorWidth(raw, "layout '" + entry.getName().str() + "'");
+        if (!width)
+          return width.takeError();
+        if (layoutWidth && *layoutWidth != *width)
+          return avx2Error("selected layouts disagree on vector width");
+        layoutWidth = *width;
+      }
     }
   }
+
+  if (bundleWidth && layoutWidth && *bundleWidth != *layoutWidth)
+    return avx2Error(
+        "bundle vector width conflicts with selected layout width");
+  if (bundleWidth)
+    return *bundleWidth;
+  if (layoutWidth)
+    return *layoutWidth;
 
   return avx2Error(
       "no vector width was selected: bundle '" + bundle.name +
@@ -152,7 +225,8 @@ public:
   /// contraction keys are declared because rules emit them, and the reference
   /// bridge carries those until this target implements them.
   bool hasLowering() const override {
-    return isArithmeticKey(key()) || isFusedKey(key());
+    return isArithmeticKey(key()) || isFusedKey(key()) ||
+           isBackendHandoffKey(key());
   }
 
   llvm::Error lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
@@ -175,6 +249,42 @@ llvm::Error AVX2Emitter::lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
 
   if (coveredOps.empty())
     return avx2Error("no covered operations to lower");
+
+  // These selected operations are consumed by the AVX2 Vector backend pass or
+  // by the host ABI's explicit movement lowering. Keep their Micro form and
+  // provenance intact until that consumer runs; the handoff is not a claim of
+  // native matrix or accelerator-memory instructions.
+  if (isBackendHandoffKey(key())) {
+    for (mlir::Operation *op : coveredOps) {
+      llvm::StringRef name = op->getName().getStringRef();
+      bool supported =
+          (key() == "avx2_mma" && name == "micro.mma") ||
+          (key() == "avx2_reduce" && name == "micro.reduce") ||
+          (key() == "avx2_copy" && name == "micro.async_copy") ||
+          (key() == "avx2_tile_copy" && name == "micro.tile_async_copy") ||
+          (key() == "avx2_tile_store" && name == "micro.tile_store");
+      if (!supported)
+        return avx2Error("emitter '" + key().str() +
+                         "' cannot hand off covered operation '" + name.str() +
+                         "'");
+    }
+    bool needsVectorWidth = key() == "avx2_mma" || key() == "avx2_reduce";
+    if (needsVectorWidth) {
+      llvm::Expected<int64_t> width =
+          resolveVectorWidth(bundle, coveredOps.front());
+      if (!width)
+        return width.takeError();
+    }
+    for (mlir::Operation *op : coveredOps) {
+      op->setAttr("llk.avx2.selected_handoff",
+                  mlir::UnitAttr::get(rewriter.getContext()));
+      if (key() == "avx2_copy" || key() == "avx2_tile_copy" ||
+          key() == "avx2_tile_store")
+        op->setAttr("micro.selected_connections",
+                    encodeSelectedConnections(context, rewriter.getContext()));
+    }
+    return llvm::Error::success();
+  }
 
   if (!isArithmeticKey(key()) && !isFusedKey(key()))
     return avx2Error("emitter '" + key().str() +
@@ -214,6 +324,50 @@ llvm::Error AVX2Emitter::lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
                        "' has no AVX2 arithmetic implementation");
   }
 
+  if (isFusedKey(key())) {
+    if (coveredOps.size() != 3)
+      return avx2Error("fused convert-silu-mul lowering requires exactly three "
+                       "covered operations");
+    auto convert = mlir::dyn_cast<micro::VectorOp>(coveredOps[0]);
+    auto silu = mlir::dyn_cast<micro::VectorOp>(coveredOps[1]);
+    auto multiply = mlir::dyn_cast<micro::VectorOp>(coveredOps[2]);
+    if (!convert || !silu || !multiply || convert.getOp() != "convert" ||
+        silu.getOp() != "silu" || multiply.getOp() != "mul")
+      return avx2Error("fused lowering requires the ordered convert -> silu -> "
+                       "mul operation group");
+    if (convert.getInputs().size() != 1 || silu.getInputs().size() != 1 ||
+        multiply.getInputs().size() != 2 ||
+        silu.getInputs().front() != convert.getResult() ||
+        multiply.getInputs().front() != silu.getResult())
+      return avx2Error("fused lowering requires connected convert -> silu -> "
+                       "mul dataflow");
+
+    auto sourceTile =
+        mlir::dyn_cast<micro::TileType>(convert.getInputs().front().getType());
+    auto convertedTile =
+        mlir::dyn_cast<micro::TileType>(convert.getResult().getType());
+    if (!sourceTile || !convertedTile ||
+        !convertedTile.getElementType().isF32() ||
+        !(sourceTile.getElementType().isF32() ||
+          sourceTile.getElementType().isBF16()))
+      return avx2Error("fused convert supports only f32 -> f32 and bf16 -> "
+                       "f32 conversions");
+
+    llvm::SmallPtrSet<mlir::Operation *, 4> members;
+    for (mlir::Operation *op : coveredOps)
+      members.insert(op);
+    for (mlir::Value intermediate : {convert.getResult(), silu.getResult()}) {
+      bool internalUse = false;
+      bool externalUse = false;
+      for (mlir::OpOperand &use : intermediate.getUses()) {
+        internalUse |= members.contains(use.getOwner());
+        externalUse |= !members.contains(use.getOwner());
+      }
+      if (internalUse && externalUse)
+        return avx2Error("fused intermediate has a live external use");
+    }
+  }
+
   // The contract holds. Apply it: the bundle's vector width becomes the
   // result tile's physical layout, which is the target-owned decision the
   // reference bridge is not allowed to make.
@@ -238,6 +392,9 @@ llvm::Error AVX2Emitter::lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
     auto replacement = micro::VectorOp::create(
         rewriter, vector.getLoc(), loweredType, vector.getOp(),
         vector.getInputs(), vector.getMathModeAttr());
+    // The target-owned physical rewrite must retain the selected instance and
+    // bundle provenance for the later AVX2 Linalg/Vector backend pass.
+    replacement->setAttrs(vector->getAttrs());
     rewriter.replaceOp(vector, replacement.getResult());
   }
 

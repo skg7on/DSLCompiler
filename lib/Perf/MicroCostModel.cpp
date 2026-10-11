@@ -21,6 +21,7 @@
 #include "LLK/Perf/MicroCostModel.h"
 
 #include "LLK/Mapping/EventSchedule.h"
+#include "LLK/Perf/SelectedKernelAnalysis.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace mlir::llk::perf {
@@ -85,20 +87,16 @@ L0Report computeL0StaticBound(const MicroDAG &dag,
                               const machine::MachineModel &machine) {
   L0Report report;
   report.liveTileBytesByMemory = dag.liveTileBytesByMemory;
+  // The one documented traffic convention, shared with the selected-kernel
+  // analysis (issue #129, task R6) so the L0 byte block and the analysis's
+  // `trafficBytes` are the same numbers.
+  report.bytesByMemory = dagTrafficByMemory(dag);
 
   uint64_t matrixWork = 0;
   uint64_t vectorWork = 0;
   uint64_t syncWork = 0;
 
   for (const MicroEvent &event : dag.events) {
-    // A movement crosses two levels; both see the traffic.
-    if (event.bytes > 0) {
-      if (!event.srcMemory.empty())
-        report.bytesByMemory[event.srcMemory] += event.bytes;
-      if (!event.tileMemory.empty())
-        report.bytesByMemory[event.tileMemory] += event.bytes;
-    }
-
     switch (event.kind) {
     case EventKind::Mma:
       report.totalFlops += 2 * event.workItems;
@@ -184,26 +182,35 @@ L0Report computeL0StaticBound(const MicroDAG &dag,
 //===----------------------------------------------------------------------===//
 
 L1Report scheduleL1(const MicroDAG &dag, const machine::MachineModel &machine) {
+  // Normalize through the shared core (task B8) and schedule the stream, so the
+  // performance prediction and the mapping search's candidate score are
+  // literally one schedule of one event stream. The owner-occupancy constraint
+  // is the event's mapped executor when it has one (issue #129, task R6), and
+  // the abstract owner symbol otherwise -- the same fallback the shared
+  // selected-kernel analysis uses.
+  std::vector<mapping::PlanCostEvent> normalized;
+  std::vector<std::string> owners;
+  normalized.reserve(dag.events.size());
+  owners.reserve(dag.events.size());
+  for (const MicroEvent &event : dag.events) {
+    mapping::PlanCostEvent entry = normalizedPlanEvent(event);
+    owners.push_back(entry.owner);
+    normalized.push_back(std::move(entry));
+  }
+  mapping::EventScheduleResult schedule =
+      mapping::scheduleNormalizedEvents(normalized, machine, owners);
+  return reportL1FromSchedule(dag, machine, schedule);
+}
+
+L1Report reportL1FromSchedule(const MicroDAG &dag,
+                              const machine::MachineModel &machine,
+                              const mapping::EventScheduleResult &schedule) {
   L1Report report;
   const size_t count = dag.events.size();
   if (count == 0) {
     report.bottleneck = kBottleneckUnknown.str();
     return report;
   }
-
-  // Normalize through the shared core (task B8), so the performance prediction
-  // and the mapping search's candidate score are literally one schedule of one
-  // event stream.
-  std::vector<mapping::PlanCostEvent> normalized;
-  std::vector<std::string> owners;
-  normalized.reserve(count);
-  owners.reserve(count);
-  for (const MicroEvent &event : dag.events) {
-    normalized.push_back(normalizedPlanEvent(event));
-    owners.push_back(event.tileOwner);
-  }
-  mapping::EventScheduleResult schedule =
-      mapping::scheduleNormalizedEvents(normalized, machine, owners);
 
   std::vector<uint64_t> start(count, 0);
   std::vector<uint64_t> finish(count, 0);

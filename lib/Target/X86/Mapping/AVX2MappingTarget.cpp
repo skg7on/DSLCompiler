@@ -35,8 +35,28 @@ public:
   bool isKnownEmitter(llvm::StringRef key) const override {
     return configuration_->isKnownEmitter(key);
   }
+  std::optional<mapping::TargetCodegenRequirements>
+  codegenRequirements() const override {
+    return mapping::TargetCodegenRequirements{"x86_64", "generic", {"avx2"}};
+  }
   const mapping::LatencyProvider *latencyProvider() const override {
     return configuration_->latencyProvider();
+  }
+  llvm::Error
+  buildSelectedBackendPipeline(mlir::OpPassManager &pm) const override {
+    const machine::ComputeNode *vectorEngine = machine().findCompute("vpu");
+    if (!vectorEngine)
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "AVX2 selected backend has no vector_engine capability 'vpu'");
+    auto f32 = vectorEngine->lanes.find("f32");
+    auto bf16 = vectorEngine->lanes.find("bf16");
+    if (f32 == vectorEngine->lanes.end() || bf16 == vectorEngine->lanes.end())
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "AVX2 selected backend needs f32 and bf16 vector lane widths");
+    buildAVX2SelectedBackendPipeline(pm, f32->second, bf16->second);
+    return llvm::Error::success();
   }
 
   std::unique_ptr<mapping::TargetEmitter>
@@ -70,15 +90,18 @@ llvm::ArrayRef<llvm::StringLiteral> emitterKeys() {
 }
 
 llvm::Expected<std::unique_ptr<mapping::MappingTarget>>
-createMappingTarget(llvm::StringRef configurationRoot) {
+createMappingTarget(llvm::StringRef configurationRoot,
+                    llvm::StringRef machinePath) {
   std::string root = configurationRoot.str();
+  std::string machine = machinePath.empty()
+                            ? root + "/machines/x86-avx2-v2.yaml"
+                            : machinePath.str();
   std::vector<std::string> keys;
   for (llvm::StringLiteral key : emitterKeys())
     keys.push_back(key.str());
   llvm::Expected<std::unique_ptr<mapping::MappingTarget>> configuration =
       mapping::loadMappingTarget(
-          "x86-avx2", root + "/machines/x86-avx2-v2.yaml",
-          root + "/mapping/x86-avx2/layouts.llkmap",
+          "x86-avx2", machine, root + "/mapping/x86-avx2/layouts.llkmap",
           root + "/mapping/x86-avx2/rules.llkmap", std::move(keys));
   if (!configuration)
     return configuration.takeError();

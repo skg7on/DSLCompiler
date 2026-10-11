@@ -35,6 +35,7 @@ struct TargetLoweringContext {
   const machine::MachineModel &machine;
   llvm::ArrayRef<PlanPlacement> placements;
   llvm::ArrayRef<PlanConnection> connections;
+  InstanceId instance = 0;
 };
 
 } // namespace mlir::llk::mapping

@@ -8,10 +8,17 @@
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
+#include "resource_regression_fixture.h"
+
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/MLIRContext.h"
 
+#include "llvm/Support/Error.h"
+
 #include <gtest/gtest.h>
+
+#include <set>
+#include <string>
 
 using namespace mlir::llk::mapping;
 
@@ -440,8 +447,11 @@ TEST(CostEvent, LayoutTransformEventUsesTheSharedEstimate) {
   PlanConnection &connection = plan.connectionPlans.front();
   connection.kind = ConnectionKind::LayoutTransform;
   connection.route = {"s0"};
-  connection.valueType =
-      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context));
+  // An explicit upcast to `mlir::Type`: a value-semantic handle conversion, not
+  // slicing. Spelling it out keeps the analyzer from reading it as one (CodeQL
+  // review, PR #133).
+  connection.valueType = static_cast<mlir::Type>(
+      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context)));
   LayoutTransform transform;
   transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, &context);
   transform.dstMap = transposeMap(&context);
@@ -459,6 +469,68 @@ TEST(CostEvent, LayoutTransformEventUsesTheSharedEstimate) {
   EXPECT_EQ(transformEvent.bytes, 64u);
   // 16 elements over 8 f32 lanes: 2 one-cycle issues.
   EXPECT_DOUBLE_EQ(transformEvent.event.cost.latencyCycles, 2.0);
+}
+
+// Issue #129, task R1: the transform event names the resource the plan
+// *recorded* for the conversion, not the executor's first attached engine.
+TEST(CostEvent, Issue129TransformEventUsesTheRecordedResource) {
+  mlir::MLIRContext context;
+  CoveringPlan plan = twoHopPlan();
+  PlanConnection &connection = plan.connectionPlans.front();
+  connection.kind = ConnectionKind::LayoutTransform;
+  connection.route = {"s0"};
+  // An explicit upcast to `mlir::Type`: a value-semantic handle conversion, not
+  // slicing. Spelling it out keeps the analyzer from reading it as one (CodeQL
+  // review, PR #133).
+  connection.valueType = static_cast<mlir::Type>(
+      mlir::RankedTensorType::get({4, 4}, mlir::Float32Type::get(&context)));
+
+  // A second vector engine declared *after* `vpu`, so the executor's first
+  // attachment and the recorded resource disagree.
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+  mlir::llk::machine::ComputeNode second = machine.computes.front();
+  second.id = "vpu.z";
+  machine.computes.push_back(second);
+
+  LayoutTransform transform;
+  transform.srcMap = mlir::AffineMap::getMultiDimIdentityMap(2, &context);
+  transform.dstMap = transposeMap(&context);
+  transform.computeResource = "vpu.z";
+  connection.transform = transform;
+  plan.placements[0].executor = "w0";
+
+  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  ASSERT_EQ(dag->events.size(), 3u);
+  EXPECT_EQ(dag->events[1].event.kind, CostEventKind::Transform);
+  EXPECT_EQ(dag->events[1].event.resource, "vpu.z");
+}
+
+// Issue #129, task R1: a dropped compute selection is diagnosed, never
+// replaced by the executor's first attached engine.
+TEST(CostEvent, Issue129DroppedComputeSelectionIsDiagnosed) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+  CoveringPlan plan = result->plans.front();
+  ASSERT_FALSE(plan.placements.empty());
+  ASSERT_FALSE(plan.placements.front().computeRequirements.empty());
+  ASSERT_EQ(plan.placements.front().computeBindings.size(), 1u);
+
+  // The container survives but its entry is gone -- a dropped or tampered
+  // selection, indistinguishable from "no capability required" by the map
+  // alone.
+  plan.placements.front().computeBindings.clear();
+  llvm::Expected<PlanEventDAG> dag =
+      buildPlanEvents(plan, c->target->machine());
+  ASSERT_FALSE(static_cast<bool>(dag));
+  const std::string text = llvm::toString(dag.takeError());
+  EXPECT_NE(text.find("vector_engine"), std::string::npos) << text;
+  EXPECT_NE(text.find("executor order"), std::string::npos) << text;
 }
 
 TEST(CostEvent, PlanEventsNormalizeAGather) {
@@ -684,4 +756,440 @@ TEST(CostEvent, ConnectionSignatureIsNotAmbiguousConcatenation) {
   OperationOnlyProvider provider;
   TargetContext context{"target", "machine", "rules", "layouts"};
   EXPECT_FALSE(provider.lookupCycles(first, context).has_value());
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R1: normalized events use the recorded compute selection
+//===----------------------------------------------------------------------===//
+
+/// The first-engine probe. Two attached vector engines produce two complete
+/// plans; each plan's compute event must name the engine *that plan selected*,
+/// not the executor's first attached capability. Before the repair both plans
+/// normalized their event resource as `vpu.a`.
+TEST(CostModel, Issue129PlanEventsNameTheRecordedComputeSelection) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 2u);
+
+  std::set<std::string> resources;
+  for (const CoveringPlan &plan : result->plans) {
+    llvm::Expected<PlanEventDAG> dag =
+        buildPlanEvents(plan, c->target->machine());
+    ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+    ASSERT_FALSE(dag->events.empty());
+    EXPECT_EQ(dag->events.front().event.kind, CostEventKind::Compute);
+    resources.insert(dag->events.front().event.resource);
+  }
+  EXPECT_EQ(resources, (std::set<std::string>{"vpu.a", "vpu.b"}));
+}
+
+/// A recorded selection that no longer resolves is an error, never silently
+/// replaced by the executor's first engine. The same plan with a tampered
+/// engine id must not normalize to a *different* engine.
+TEST(CostModel, Issue129AnUnknownRecordedComputeNodeIsRejected) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 8;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_FALSE(result->plans.empty());
+
+  CoveringPlan plan = result->plans.front();
+  ASSERT_FALSE(plan.placements.empty());
+  plan.placements.front().computeBindings["vector_engine"] = "vpu.unknown";
+  llvm::Expected<PlanEventDAG> dag =
+      buildPlanEvents(plan, c->target->machine());
+  ASSERT_FALSE(bool(dag));
+  EXPECT_NE(llvm::toString(dag.takeError()).find("vpu.unknown"),
+            std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R2: each named transfer engine pools its own concurrency
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// A machine with one worker and the named DMA engine nodes the caller asks
+/// for. No links are needed: the scheduler resolves an event's resource to its
+/// engine node by id alone.
+mlir::llk::machine::MachineModel
+dmaPoolMachine(llvm::ArrayRef<std::pair<llvm::StringRef, uint32_t>> engines) {
+  using namespace mlir::llk::machine;
+  MachineModel machine;
+  machine.target = "dma-pool";
+  machine.workerThreads = 1;
+  ExecutorNode worker;
+  worker.id = "e0";
+  worker.kind = "worker";
+  machine.executors.push_back(worker);
+  for (const auto &[id, count] : engines) {
+    TransferEngineNode engine;
+    engine.id = id.str();
+    engine.kind = "dma";
+    engine.attachedTo = "e0";
+    engine.count = count;
+    machine.transferEngines.push_back(engine);
+  }
+  return machine;
+}
+} // namespace
+
+// Two ten-cycle transfers that both name `dma.a`. The machine also declares an
+// unused `dma.b`; that second node must not widen `dma.a`'s pool. Before the
+// repair the pool took the whole machine's transfer-engine count, so the mere
+// presence of another engine doubled this one's slots and both transfers
+// started at zero.
+TEST(CostModel, Issue129DmaNamedEngineUsesOnlyItsOwnCount) {
+  mlir::llk::machine::MachineModel machine =
+      dmaPoolMachine({{"dma.a", 1}, {"dma.b", 1}});
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256)};
+
+  EventScheduleResult withUnused = scheduleNormalizedEvents(events, machine);
+  machine.transferEngines.pop_back(); // removes dma.b, not dma.a
+  EventScheduleResult alone = scheduleNormalizedEvents(events, machine);
+
+  EXPECT_EQ(alone.predictedCycles, 20u);
+  EXPECT_EQ(withUnused.predictedCycles, alone.predictedCycles);
+  EXPECT_EQ(withUnused.entries[1].start, 10u);
+}
+
+// The flip side of the same rule: the *named* node's own count is what buys
+// overlap. Two transfers on one engine that declares two slots run together.
+TEST(CostModel, Issue129DmaNodeCountIsItsOwnConcurrency) {
+  mlir::llk::machine::MachineModel machine = dmaPoolMachine({{"dma.a", 2}});
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256)};
+
+  EventScheduleResult result = scheduleNormalizedEvents(events, machine);
+  EXPECT_EQ(result.entries[0].start, 0u);
+  EXPECT_EQ(result.entries[1].start, 0u);
+  EXPECT_EQ(result.predictedCycles, 10u);
+}
+
+// Two events that name two different engines occupy two different pools, so
+// they overlap whatever each node's own count is.
+TEST(CostModel, Issue129DmaDistinctEnginesOverlap) {
+  mlir::llk::machine::MachineModel machine =
+      dmaPoolMachine({{"dma.a", 1}, {"dma.b", 1}});
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.b", 10, 0, 256)};
+
+  EventScheduleResult result = scheduleNormalizedEvents(events, machine);
+  EXPECT_EQ(result.entries[0].start, 0u);
+  EXPECT_EQ(result.entries[1].start, 0u);
+  EXPECT_EQ(result.predictedCycles, 10u);
+}
+
+// A data dependency still serializes two independent engines: more slots never
+// license starting a consumer before its producer finished.
+TEST(CostModel, Issue129DmaDependencySerializesAcrossEngines) {
+  mlir::llk::machine::MachineModel machine =
+      dmaPoolMachine({{"dma.a", 4}, {"dma.b", 4}});
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.b", 10, 0, 256, {0})};
+
+  EventScheduleResult result = scheduleNormalizedEvents(events, machine);
+  EXPECT_EQ(result.entries[1].start, 10u);
+  EXPECT_EQ(result.predictedCycles, 20u);
+}
+
+// The schedule is a function of the machine's *content*, not of the order its
+// engine nodes happen to be listed in.
+TEST(CostModel, Issue129DmaInsertionOrderDoesNotAlterTheSchedule) {
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.b", 7, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 4, 0, 256)};
+
+  mlir::llk::machine::MachineModel forward =
+      dmaPoolMachine({{"dma.a", 1}, {"dma.b", 1}});
+  mlir::llk::machine::MachineModel reversed =
+      dmaPoolMachine({{"dma.b", 1}, {"dma.a", 1}});
+
+  EventScheduleResult first = scheduleNormalizedEvents(events, forward);
+  EventScheduleResult second = scheduleNormalizedEvents(events, reversed);
+  EXPECT_EQ(first.predictedCycles, second.predictedCycles);
+  ASSERT_EQ(first.entries.size(), second.entries.size());
+  for (size_t i = 0; i < first.entries.size(); ++i) {
+    EXPECT_EQ(first.entries[i].start, second.entries[i].start) << i;
+    EXPECT_EQ(first.entries[i].finish, second.entries[i].finish) << i;
+  }
+}
+
+// An unnamed legacy pool ("dma", not a modelled node) is scheduled on a single
+// slot -- a partial answer that never claims the whole machine. Strict
+// validation rejects it rather than accept the partial cost as complete.
+TEST(CostModel, Issue129DmaUnnamedLegacyPoolStaysPartial) {
+  mlir::llk::machine::MachineModel machine =
+      dmaPoolMachine({{"dma.a", 1}, {"dma.b", 2}});
+  ASSERT_EQ(machine.transferEngineCount(), 3u);
+
+  PlanEventDAG dag;
+  dag.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma", 10, 0, 256)};
+  EventScheduleResult result = scheduleNormalizedEvents(dag.events, machine);
+  EXPECT_EQ(result.predictedCycles, 20u); // one slot, so the two serialize
+
+  llvm::Error strict = validateEventResources(dag, machine);
+  EXPECT_TRUE(static_cast<bool>(strict));
+  if (strict)
+    EXPECT_NE(llvm::toString(std::move(strict)).find("dma"), std::string::npos);
+}
+
+// Strict validation accepts a fully modelled stream and rejects the ways it can
+// be incomplete: an engine the machine does not name, a zero slot count, and
+// dependency edges that are self, out of range, duplicated, or cyclic.
+TEST(CostModel, Issue129DmaStrictValidationChecksResourcesAndDependencies) {
+  mlir::llk::machine::MachineModel machine = dmaPoolMachine({{"dma.a", 1}});
+
+  PlanEventDAG valid;
+  valid.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {0})};
+  EXPECT_FALSE(static_cast<bool>(validateEventResources(valid, machine)));
+
+  PlanEventDAG unknownEngine;
+  unknownEngine.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.ghost", 10, 0, 256)};
+  llvm::Error missing = validateEventResources(unknownEngine, machine);
+  ASSERT_TRUE(static_cast<bool>(missing));
+  EXPECT_NE(llvm::toString(std::move(missing)).find("dma.ghost"),
+            std::string::npos);
+
+  mlir::llk::machine::MachineModel zero = dmaPoolMachine({{"dma.a", 0}});
+  PlanEventDAG oneEvent;
+  oneEvent.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256)};
+  llvm::Error zeroCount = validateEventResources(oneEvent, zero);
+  ASSERT_TRUE(static_cast<bool>(zeroCount));
+  EXPECT_NE(llvm::toString(std::move(zeroCount)).find("count 0"),
+            std::string::npos);
+
+  PlanEventDAG selfDep;
+  selfDep.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {0})};
+  EXPECT_TRUE(static_cast<bool>(validateEventResources(selfDep, machine)));
+
+  PlanEventDAG outOfRange;
+  outOfRange.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {7})};
+  EXPECT_TRUE(static_cast<bool>(validateEventResources(outOfRange, machine)));
+
+  // `makePlanCostEvent` sorts and de-duplicates its edges, so a repeated
+  // dependency only reaches the validator from a directly built stream.
+  PlanEventDAG duplicated;
+  duplicated.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256)};
+  duplicated.events[1].deps = {0, 0};
+  EXPECT_TRUE(static_cast<bool>(validateEventResources(duplicated, machine)));
+
+  PlanEventDAG cyclic;
+  cyclic.events = {
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {1}),
+      makePlanCostEvent(CostEventKind::TransferHop, "dma.a", 10, 0, 256, {0})};
+  llvm::Error cycle = validateEventResources(cyclic, machine);
+  ASSERT_TRUE(static_cast<bool>(cycle));
+  EXPECT_NE(llvm::toString(std::move(cycle)).find("cycle"), std::string::npos);
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R6: the owner-occupancy pool of a schedule
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// A machine with the executor ids and per-executor concurrency the caller
+/// names, each carrying its own vector engine, so an event's owner pool and its
+/// resource pool can be varied independently.
+mlir::llk::machine::MachineModel ownerPoolMachine(
+    llvm::ArrayRef<std::pair<llvm::StringRef, uint32_t>> executors) {
+  using namespace mlir::llk::machine;
+  MachineModel machine;
+  machine.target = "owner-pool";
+  machine.workerThreads = 1;
+  uint32_t index = 0;
+  for (const auto &[id, concurrency] : executors) {
+    ExecutorNode worker;
+    worker.id = id.str();
+    worker.kind = "worker";
+    worker.concurrency = concurrency;
+    machine.executors.push_back(worker);
+    ComputeNode engine;
+    engine.id = "vpu." + std::to_string(index++);
+    engine.kind = "vector_engine";
+    engine.attachedTo = id.str();
+    engine.concurrency = 1;
+    machine.computes.push_back(engine);
+  }
+  return machine;
+}
+} // namespace
+
+// Two events that name two *different* engine pools but the *same* executor
+// must still serialize when that executor has one slot: the owner-occupancy
+// pool is a real constraint, not an aggregate of the owner kinds (task R6).
+// Dropping the owner edge, or widening it to the machine's whole worker count,
+// lets the two overlap -- so this test cannot pass a scheduler that fails to
+// honour the selected executor.
+TEST(CostEvent, Issue129OwnerPoolUsesOnlyTheSelectedExecutorsCount) {
+  std::vector<PlanCostEvent> events = {
+      makePlanCostEvent(CostEventKind::Compute, "vpu.0", 10, 8, 0),
+      makePlanCostEvent(CostEventKind::Compute, "vpu.1", 10, 8, 0)};
+  // Two distinct *resource* pools (vpu.0 on e0, vpu.1 on e1), so only the owner
+  // can serialize them.
+  std::vector<std::string> sharedOwner = {"e0", "e0"};
+
+  EventScheduleResult serial = scheduleNormalizedEvents(
+      events, ownerPoolMachine({{"e0", 1}, {"e1", 1}}), sharedOwner);
+  EXPECT_EQ(serial.entries[1].start, 10u);
+  EXPECT_EQ(serial.predictedCycles, 20u);
+
+  // Two independent executors of one slot each is what buys the overlap.
+  std::vector<std::string> splitOwners = {"e0", "e1"};
+  EventScheduleResult split = scheduleNormalizedEvents(
+      events, ownerPoolMachine({{"e0", 1}, {"e1", 1}}), splitOwners);
+  EXPECT_EQ(split.entries[0].start, 0u);
+  EXPECT_EQ(split.entries[1].start, 0u);
+  EXPECT_EQ(split.predictedCycles, 10u);
+
+  // A single executor that declares two slots runs both at once.
+  EventScheduleResult widened = scheduleNormalizedEvents(
+      events, ownerPoolMachine({{"e0", 2}, {"e1", 1}}), sharedOwner);
+  EXPECT_EQ(widened.entries[1].start, 0u);
+  EXPECT_EQ(widened.predictedCycles, 10u);
+}
+
+//===----------------------------------------------------------------------===//
+// Issue #129, task R6: the derived analysis snapshot
+//===----------------------------------------------------------------------===//
+
+// A plan scored before its kernel was bound has no snapshot, so its stream is
+// the accumulation fallback and says so. The label is what stops a reader from
+// treating a rule-local estimate as the materialized kernel's schedule.
+TEST(CostEvent, PlanEventsWithoutASnapshotAreLabelledAccumulation) {
+  CoveringPlan plan = twoHopPlan();
+  llvm::Expected<PlanEventDAG> dag = buildPlanEvents(plan, planEventMachine());
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  EXPECT_EQ(dag->source, PlanEventSource::Accumulation);
+  EXPECT_EQ(stringifyPlanEventSource(dag->source), "accumulation");
+}
+
+// The snapshot is a *derived* execution fact, so attaching it must not move the
+// plan: the content id and the canonical string are unchanged.
+TEST(CostEvent, AnalysisSnapshotIsExcludedFromThePlanIdentity) {
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+  CoveringPlan plan = twoHopPlan();
+  const PlanId idBefore = computePlanId(plan);
+  const std::string textBefore = canonicalPlanString(plan);
+
+  llvm::Expected<PlanEventDAG> events = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(events)) << llvm::toString(events.takeError());
+  ASSERT_FALSE(bool(attachPlanAnalysisEvents(plan, *events, machine)));
+  ASSERT_TRUE(plan.analysisEvents.has_value());
+
+  EXPECT_EQ(computePlanId(plan), idBefore);
+  EXPECT_EQ(canonicalPlanString(plan), textBefore);
+}
+
+// Attaching the shared analysis's stream makes the plan's events *that* stream:
+// a compute event's rule-local estimate is replaced by the bound kernel's own
+// work, and the plan reports the snapshot as its source.
+TEST(CostEvent, PlanEventsUseTheAttachedAnalysisSnapshot) {
+  CoveringPlan plan = twoHopPlan();
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+
+  llvm::Expected<PlanEventDAG> accumulated = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(accumulated))
+      << llvm::toString(accumulated.takeError());
+  ASSERT_EQ(accumulated->events.size(), 6u);
+  // The producer's rule-local estimate is 8; the bound kernel's own work would
+  // be 16 over the machine's 8 lanes.
+  PlanEventDAG snapshot = *accumulated;
+  snapshot.events[0].event.cost.latencyCycles = 2.0;
+  snapshot.events[0].workItems = 16;
+
+  ASSERT_FALSE(bool(attachPlanAnalysisEvents(plan, snapshot, machine)));
+  llvm::Expected<PlanEventDAG> events = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(events)) << llvm::toString(events.takeError());
+  EXPECT_EQ(events->source, PlanEventSource::Snapshot);
+  ASSERT_EQ(events->events.size(), 6u);
+  EXPECT_DOUBLE_EQ(events->events[0].event.cost.latencyCycles, 2.0);
+  EXPECT_EQ(events->events[0].workItems, 16u);
+}
+
+// A snapshot is a claim about the plan's own work, so it is verified: a stream
+// naming a connection the plan does not record, an empty stream, or a stream
+// with an unmodelled resource is refused rather than silently scored.
+TEST(CostEvent, AttachedAnalysisSnapshotIsVerified) {
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+
+  CoveringPlan unknownConnection = twoHopPlan();
+  llvm::Expected<PlanEventDAG> good =
+      buildPlanEvents(unknownConnection, machine);
+  ASSERT_TRUE(static_cast<bool>(good)) << llvm::toString(good.takeError());
+  PlanEventDAG foreign = *good;
+  foreign.events[0].connectionId = 9999;
+  llvm::Error mismatch =
+      attachPlanAnalysisEvents(unknownConnection, foreign, machine);
+  ASSERT_TRUE(static_cast<bool>(mismatch));
+  EXPECT_NE(llvm::toString(std::move(mismatch)).find("9999"),
+            std::string::npos);
+
+  CoveringPlan empty = twoHopPlan();
+  PlanEventDAG nothing;
+  EXPECT_TRUE(
+      static_cast<bool>(attachPlanAnalysisEvents(empty, nothing, machine)));
+
+  CoveringPlan unmodelled = twoHopPlan();
+  PlanEventDAG badResource = *good;
+  badResource.events[0].event.resource = "ghost-engine";
+  llvm::Error missing =
+      attachPlanAnalysisEvents(unmodelled, badResource, machine);
+  ASSERT_TRUE(static_cast<bool>(missing));
+  EXPECT_NE(llvm::toString(std::move(missing)).find("ghost-engine"),
+            std::string::npos);
+}
+
+// A plan decoded from persisted metadata is a replay: it carries no derived
+// facts, so a snapshot handed to it would describe a kernel it has not
+// re-derived. It is refused rather than trusted.
+TEST(CostEvent, AttachedAnalysisSnapshotIsNeverTrustedOnReplay) {
+  mlir::llk::machine::MachineModel machine = planEventMachine();
+  CoveringPlan plan = twoHopPlan();
+  llvm::Expected<PlanEventDAG> good = buildPlanEvents(plan, machine);
+  ASSERT_TRUE(static_cast<bool>(good)) << llvm::toString(good.takeError());
+
+  plan.schemaVersion = 3; // decoded from metadata
+  llvm::Error replay = attachPlanAnalysisEvents(plan, *good, machine);
+  ASSERT_TRUE(static_cast<bool>(replay));
+  EXPECT_NE(llvm::toString(std::move(replay)).find("replay"),
+            std::string::npos);
+}
+
+/// Two placements that differ only in the selected engine are different work,
+/// so a measured cost must not be reused across them: the operation signature's
+/// compute field is what separates the keys.
+TEST(CostModel, Issue129OperationSignatureSeparatesSelectedEngines) {
+  OperationSignature a;
+  a.operation = "micro.vector";
+  a.rule = "issue129.vector_add";
+  a.compute = "vector_engine=vpu.a";
+  OperationSignature b = a;
+  b.compute = "vector_engine=vpu.b";
+  EXPECT_NE(a.canonicalString(), b.canonicalString());
+  OperationSignature same = a;
+  EXPECT_EQ(a.canonicalString(), same.canonicalString());
 }

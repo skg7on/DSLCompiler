@@ -33,6 +33,7 @@
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -53,9 +54,52 @@ enum class SearchMode {
   Exact
 };
 
+/// The outcome of evaluating one complete proposal (issue #129, task R7). A
+/// proposal is *cheap* -- a covering of instances and connections the search
+/// synthesized -- and evaluation is what turns it into a physical, schedulable
+/// plan: its maps, compute nodes and ports resolved, its movement hops and
+/// storage slots decided, its occupancy validated and its final scheduled cost
+/// derived from the kernel it would actually bind to.
+///
+/// Exactly one of `plan` and `rejection` is set. `plan` is a *finalized* plan:
+/// `finalizeStoragePlan` has run over it, its id is its decision-only v3
+/// identity, and its derived event snapshot and final cost describe the bound
+/// kernel. `rejection` is a stable-coded reason the proposal is not feasible --
+/// a memory overflow, an unresolved strict physical fact, an unsupportable
+/// materialization -- and the search must continue enumerating rather than
+/// retain it.
+///
+/// An `llvm::Error` from an evaluation is *not* a rejection: it names an
+/// invalid invocation or an infrastructure failure and stops the search. The
+/// two are deliberately different: a rejection is a property of one candidate,
+/// an error is a property of the run.
+struct CompletePlanEvaluation {
+  std::optional<CoveringPlan> plan;
+  std::optional<Diagnostic> rejection;
+};
+
+/// Evaluates one complete search proposal before it may be retained (task R7).
+///
+/// The search knows nothing about dialect conversion, plan materialization or
+/// the performance model, and it must not: `LLKMapping` links neither `LLKPerf`
+/// nor any JIT library, so the evaluation lives above both (`LLKMicroMapping`)
+/// and is injected here as a callback. The callback owns the whole chain --
+/// finalize storage, bind a preview, run the selected static analysis, validate
+/// occupancy, attach the derived snapshot and final cost -- so the search only
+/// sees the verdict.
+///
+/// A callback must not recursively invoke `CoveringSearch` and must not write
+/// files. It must be deterministic: repeated evaluation of one proposal yields
+/// byte-identical decisions.
+using CompletePlanEvaluator =
+    std::function<llvm::Expected<CompletePlanEvaluation>(const CoveringPlan &)>;
+
 struct MappingSearchOptions {
   SearchMode mode = SearchMode::Beam;
   unsigned beamWidth = 64;
+  /// The most feasible complete plans to retain. Zero means *no cap*: every
+  /// feasible complete plan is returned (issue #129, task R7), so a caller that
+  /// wants the whole feasible set does not have to guess a number.
   unsigned topK = 8;
   unsigned maxCandidatesPerNode = 64;
   /// The most fused graph-pattern matches enumerated for the whole graph. Zero
@@ -76,6 +120,19 @@ struct MappingSearchOptions {
   /// minimized -- preserves the pre-objective behaviour, so a caller that does
   /// not consult `micro.objective` is unaffected.
   ObjectiveOrder objective = {};
+  /// The completion evaluator (issue #129, task R7). When set, every complete
+  /// proposal is evaluated *before* any top-K or first-legal decision is taken:
+  /// a proposal the evaluator rejects is not retained, and the search keeps
+  /// enumerating (a cheap proposal that fails cannot mask a more expensive
+  /// legal one). A default-constructed callback means no evaluation, and a
+  /// search keeps its pre-R7 behaviour -- proposals are scored by the shared
+  /// scheduler directly and retained as they are found.
+  CompletePlanEvaluator evaluateCompletePlan = {};
+  /// When true, `search()` refuses to run without an `evaluateCompletePlan`
+  /// callback. A caller that requires *validated* complete plans must not
+  /// silently fall back to the unvalidated path -- the missing callback is a
+  /// configuration error, reported as an `llvm::Error`, never a default.
+  bool requireCompleteEvaluation = false;
 };
 
 /// Why no complete plan was found (design §16.5), counted per category. The
