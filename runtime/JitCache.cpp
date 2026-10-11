@@ -21,6 +21,7 @@
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
+#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
@@ -173,6 +174,11 @@ void addKernelToLLVMPasses(mlir::PassManager &pm) {
   // `index` values, which in turn keeps `i64 -> index` materializations alive
   // all the way to LLVM translation, which refuses them.
   pm.addPass(mlir::createLowerAffinePass());
+  // Reduce vector transfers to rank-one transfers and SCF loops before SCF is
+  // lowered. This handles scalable transfer dimensions that VectorToLLVM
+  // cannot lower directly.
+  pm.addPass(mlir::createConvertVectorToSCFPass(
+      mlir::VectorTransferToSCFOptions().enableLowerScalable()));
   // Lower structured control flow (scf) to basic-block control flow (cf).
 #if LLVM_VERSION_MAJOR >= 21
   pm.addPass(mlir::createSCFToControlFlowPass());

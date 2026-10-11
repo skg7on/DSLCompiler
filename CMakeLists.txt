@@ -445,6 +445,7 @@ mlir_target_link_libraries(LLKRuntime PUBLIC
     MLIRReconcileUnrealizedCasts
     MLIRSCFToControlFlow
     MLIRUBToLLVM
+    MLIRVectorToSCF
     MLIRVectorToLLVMPass
 )
 
@@ -732,6 +733,7 @@ set(LLK_MLIR_EXEC_LIBS
     MLIRTensorDialect
     MLIRTensorTransforms
     MLIRTransforms
+    MLIRVectorToSCF
     MLIRVectorToLLVMPass
 )
 
