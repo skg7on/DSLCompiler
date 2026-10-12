@@ -1,0 +1,26 @@
+add_llk_library(LLKMapping
+    StableHash.cpp
+    Diagnostics.cpp
+    TileFacts.cpp
+    StoragePlan.cpp
+    StorageLiveness.cpp
+    CostModel.cpp
+    CostEvent.cpp
+    EventSchedule.cpp
+    LatencyProvider.cpp
+    SearchBinding.cpp
+    WorkloadGraph.cpp
+    MappingPlan.cpp
+    LlkMap.cpp
+    LayoutConstraints.cpp
+    MappingRules.cpp
+    MappingTarget.cpp
+    Placement.cpp
+    CoveringSearch.cpp
+    PlanBinder.cpp
+    MappingMetadata.cpp
+    PlanVerification.cpp
+    Routing.cpp
+    PlanReport.cpp
+    LINK_LIBRARIES LLKMachine LLVM LLK::MLIR
+)

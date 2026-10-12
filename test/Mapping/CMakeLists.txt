@@ -29,7 +29,7 @@ add_llk_test_category(Mapping
         LLKMappedCompilation
         LLKMicroToLinalg
         MicroDialect
-        ${LLK_MLIR_EXEC_LIBS}
+        LLK::MLIR
     DEFINITIONS
         LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping"
         LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"

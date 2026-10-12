@@ -88,7 +88,8 @@ Inspect skipped tests and their reasons. A passing portable mapped test does not
 prove selected AVX2 execution, and an x86 host alone does not prove a skipped
 AVX2 test ran. For failures, preserve the exact toolchain revision, host, command,
 input and output. See :source:`CI <.github/workflows/ci.yml>` and
-:source:`CMakeLists.txt <CMakeLists.txt>` for the actual configuration and registrations.
+:source:`CMakeLists.txt <CMakeLists.txt>` for configuration and
+:source:`test/CMakeLists.txt <test/CMakeLists.txt>` for test registration.
 
 .. _contributing-find-the-right-extension-point:
 
@@ -171,7 +172,8 @@ opaque to canonical IR and generic algorithms.
 
 Register a new package's factory through
 :source:`MappingTargets.cpp <lib/Target/MappingTargets.cpp>` and add its sources and
-tests in :source:`CMakeLists.txt <CMakeLists.txt>`. Test policy parsing, a supported
+tests in :source:`lib/Target/CMakeLists.txt <lib/Target/CMakeLists.txt>` and
+:source:`test/Mapping/CMakeLists.txt <test/Mapping/CMakeLists.txt>`. Test policy parsing, a supported
 mapping, rejected capabilities, and any required movement before extending the
 execution surface.
 

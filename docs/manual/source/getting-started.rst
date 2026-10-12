@@ -32,6 +32,10 @@ Run these commands in a parent directory where you want both repositories:
      -DCMAKE_BUILD_TYPE=Release \
      -DLLVM_ENABLE_PROJECTS=mlir \
      -DLLVM_TARGETS_TO_BUILD=Native \
+     -DLLVM_BUILD_LLVM_DYLIB=ON \
+     -DLLVM_LINK_LLVM_DYLIB=ON \
+     -DLLVM_DYLIB_COMPONENTS=all \
+     -DMLIR_LINK_MLIR_DYLIB=ON \
      -DLLVM_BUILD_UTILS=ON \
      -DLLVM_INCLUDE_TESTS=OFF \
      -DLLVM_INCLUDE_EXAMPLES=OFF \
@@ -59,7 +63,7 @@ Configure DSLCompiler
      -DLLK_BUILD_E2E_TESTS=ON
    cmake --build build --parallel 4
 
-Adjust ``LLVM_PROJECT_BUILD_DIR`` to your LLVM build's absolute path. It must contain ``LLVM_BUILD/lib/cmake/mlir`` and ``LLVM_BUILD/lib/cmake/llvm``, where ``LLVM_BUILD`` denotes that directory; this setting prevents accidental mixing with system packages. Without it, CMake's normal ``MLIR_DIR``/``LLVM_DIR`` discovery applies. The project supplies its GTest dependency from :source:`third_party <third_party/CMakeLists.txt>`.
+Adjust ``LLVM_PROJECT_BUILD_DIR`` to your LLVM build's absolute path. It must contain ``LLVM_BUILD/lib/cmake/mlir`` and ``LLVM_BUILD/lib/cmake/llvm``, where ``LLVM_BUILD`` denotes that directory; this setting prevents accidental mixing with system packages. The setting is required; CMake replaces stale ``MLIR_DIR``/``LLVM_DIR`` cache entries with paths under this build. The exported packages supply both source and generated header paths. LLVM and MLIR link through the monolithic shared ``LLVM`` and ``MLIR`` targets; component archives are not a fallback. The project supplies its GTest dependency from :source:`third_party <third_party/CMakeLists.txt>`.
 
 Useful configuration choices:
 
@@ -134,6 +138,8 @@ Common setup failures
      - Check or remedy
    * - MLIR package not found
      - Verify the LLVM build path and the two CMake package directories; a runtime-only package lacks them
+   * - LLVM or MLIR shared library missing
+     - Rebuild LLVM with ``LLVM_BUILD_LLVM_DYLIB=ON``, ``LLVM_LINK_LLVM_DYLIB=ON``, ``LLVM_DYLIB_COMPONENTS=all``, and ``MLIR_LINK_MLIR_DYLIB=ON``
    * - ``FileCheck is required``
      - Reconfigure that LLVM build with ``LLVM_BUILD_UTILS=ON``, build ``FileCheck``, and reconfigure DSLCompiler
    * - API errors or duplicate MLIR linkage

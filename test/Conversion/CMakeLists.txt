@@ -6,7 +6,7 @@ add_llk_test_category(Conversion
     LIBRARIES
         LLKMicroMapping
         MicroDialect
-        ${LLK_MLIR_EXEC_LIBS}
+        LLK::MLIR
     DEFINITIONS
         LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
     INCLUDE_DIRECTORIES
