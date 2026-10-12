@@ -1,5 +1,7 @@
 # Micro-IR AVX2 Simulator and Emulator Implementation Spec
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This specifies machine-based analysis and an AVX2 validation profile. Resource/event analysis is reusable across machine profiles; AVX2-specific costs and execution are target scope. Direct functional MicroIR emulation remains separate work.
+
 **Status:** Draft
 **Date:** 2026-08-11
 **Parent Spec:** [Canonical Micro-IR Redesign Spec](2026-08-11-canonical-micro-ir-redesign.md)

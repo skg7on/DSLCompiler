@@ -1,312 +1,86 @@
-# Domain-Specific LLM Kernel Compiler — Architecture
+# Generic MicroIR DNN Compiler Framework — Architecture
 
-This document preserves the original CPU compiler design and milestone rationale. For the current project-wide MicroIR architecture, mapping/target boundaries, source map, and implementation limits, start with the [community architecture guide](docs/manual/source/architecture.rst) and [feature guide](docs/manual/source/features.rst). Some components and performance goals below are design intent rather than current end-to-end guarantees.
+## 1. Project Goal
 
-## 1. Core Concept
+**Design a generic MicroIR-based, mapping- and search-based DNN compiler framework.**
 
-**What it is:** An out-of-tree MLIR compiler that takes a single, computationally dense LLM operation (SwiGLU, RoPE, Attention) and aggressively optimizes its memory and compute lowering to produce high-performance CPU kernels — essentially a miniature, CPU-focused version of Triton.
+The framework represents DNN computations as tile execution programs, maps them onto explicit machine resources, searches legal implementation choices, and lowers a selected plan for execution or performance analysis. Reusable compilation machinery is the project's central deliverable.
 
-**What it is NOT:** A general model compiler, an ONNX importer, a full Triton GPU backend, or a collection of handwritten intrinsic kernels.
+**Matmul and fused SwiGLU are example operator kernels for testing the framework.** Matmul exercises contraction, tiling, placement and movement; SwiGLU exercises shared inputs, multiple contractions and fused elementwise dataflow. Neither operator defines the compiler's scope. Intel AVX2 is the first executable validation backend. The generic accelerator package tests mapping onto a different topology; its machine profile does not supply hardware execution.
 
-### The Central Principle
+The [framework goal and design specification](docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md) defines project-wide requirements and acceptance criteria. The [developer manual](docs/manual/source/architecture.rst) describes current components, and the [feature matrix](docs/manual/source/features.rst) states delivered support. The [historical CPU architecture](docs/design/legacy-cpu-architecture.md) preserves M1–M7 design details.
 
-```
-LLM-domain semantics        ←  "what" — the mathematical operation
-        ↓
-structured tensor computation  ←  linalg: tiling, fusion, producer-consumer
-        ↓
-parameterized schedule       ←  tile sizes, vector width, thread count (data, not code)
-        ↓
-explicit vector microkernel  ←  vector.contract, transfer_read/write — no auto-vec
-        ↓
-physical memory & thread runtime  ←  memref, persistent thread pool
-        ↓
-LLVM target code             ←  ORC JIT → machine code
-```
+## 2. Compilation Contract
 
-Each arrow is a lowering pass. Each stage can be dumped, inspected, and FileCheck-tested independently.
+```text
+DNN semantics / structured tensor programs
+    -> semantic decomposition and legal transformations
+    -> MicroIR tile dataflow and schedule choices
+    -> source candidate instantiation
+    -> target mapping: match / place / connect / cover
+    -> materialize, verify and score complete plans
+    -> selected bound MicroIR + replayable plan
+    -> target lowering and execution
+       or static performance analysis
 
-### First Target
-
-`Y = SiLU(X·Wg) ⊙ (X·Wu)` — fused SwiGLU with BF16/FP16 inputs, FP32 accumulation, x86-64 AVX2. This operation exercises tiling, register-resident intermediates, vector contraction, weight packing, parallel decomposition, math approximation, and tail handling — all the hard compiler problems in one kernel.
-
-### Progressive Lowering Pipeline
-
-```
-┌──────────────────────────────────────┐
-│ 1. LLK Dialect                       │  Domain semantics: llk.fused_swiglu,
-│    Kernel semantics, assumptions,    │  llk.rope, llk.attention
-│    specialization contracts          │
-└────────────────┬─────────────────────┘
-                 │ LLKToLinalg
-                 ▼
-┌──────────────────────────────────────┐
-│ 2. Tensor-Level Payload IR           │  func + tensor + linalg + arith + math
-│    Structured computation, explicit  │  Producer-consumer relationships visible
-│    producer-consumer edges           │
-└────────────────┬─────────────────────┘
-                 │ Transform dialect schedule
-                 ▼
-┌──────────────────────────────────────┐
-│ 3. Tiled & Fused Structured IR       │  linalg + tensor + scf.forall
-│    Tiling, fusion, interchange       │  Schedule from schedule_db.json
-└────────────────┬─────────────────────┘
-                 │ Structured vectorization
-                 ▼
-┌──────────────────────────────────────┐
-│ 4. Explicit SIMD IR                  │  vector.transfer_read/write, vector.contract,
-│    vector + scf + tensor             │  vector.mask, vector.shuffle, vector.fma
-└────────────────┬─────────────────────┘
-                 │ One-Shot Bufferize
-                 ▼
-┌──────────────────────────────────────┐
-│ 5. Physical Memory IR                │  memref + vector + scf
-│    Allocations, scratch planning     │  Scratch analysis pass audits allocations
-└────────────────┬─────────────────────┘
-                 │ CPU lowering
-                 ▼
-┌──────────────────────────────────────┐
-│ 6. Control Flow + Thread Runtime     │  cf + llvm + omp (prototype) or
-│    Parallel dispatch, barriers       │  llrt.parallel_for (production)
-└────────────────┬─────────────────────┘
-                 │
-                 ▼
-┌──────────────────────────────────────┐
-│ 7. LLVM IR → ORC JIT / Object File   │  Machine code, cached by KernelKey
-└──────────────────────────────────────┘
+MachineModel + LLKMap + target emitters -> mapping and lowering
+Shared resource/event analysis         -> search ranking and reports
+Optional verified measurements         -> ranking feedback and calibration
 ```
 
-**Key rule:** Keep tensor-level transformations (tiling, fusion, vectorization) before bufferization. Tensor semantics make producer-consumer relationships explicit; One-Shot Bufferize converts to memrefs only after all optimizations.
+This is the generic architecture contract. Current semantic export supports LLK matmul and fused SwiGLU; a general structured/Linalg importer remains future work. Directly authored MicroIR can exercise the framework independently of those export roots. The existing LLK/Linalg CPU pipeline remains a validation and comparison path.
 
----
-
-## 2. Major Components
-
-### 2.1 Custom Dialect (llk)
-
-A **small, focused** dialect that only retains domain information unavailable in generic MLIR. Does NOT recreate tensor, linalg, vector, or memref.
-
-| Op | Purpose | Status | Detailed in |
-|----|---------|--------|-------------|
-| `llk.fused_swiglu` | SiLU-gated double projection: `SiLU(X·Wg) ⊙ (X·Wu)` | ✅ Implemented | [m1](docs/design/m1-scalar-pipeline.md), [m3](docs/design/m3-fused-memory.md) |
-| `llk.rope` | Rotary Position Embedding with pairwise permutation | ✅ Implemented | [m6](docs/design/m6-multi-kernel.md) |
-| `llk.attention` | Simplified attention with online softmax | ✅ Implemented | [m6](docs/design/m6-multi-kernel.md) |
-| `llk.assume` | Divisibility and alignment hints | ✅ Implemented | [m1](docs/design/m1-scalar-pipeline.md) |
-| `llk.dispatch` | Multi-variant dispatch guard for shape specialization | ✅ Implemented | [m5](docs/design/m5-specialization-tuning.md) |
-
-**Attributes:** `#llk.activation<silu>` ✅, `#llk.math_mode<strict|bounded_fast|unsafe_fast>` ✅, `#llk.softmax_mode<online>` ✅, `#llk.layout<row_major|packed_kn>` ✅ Implemented
-
-### 2.2 Python Frontend (Milestone 7+)
-
-Designed but deferred to keep the initial scope narrow. Two complementary entry paths converge at the LLK dialect:
-
-- **Explicit DSL:** Triton-inspired `@llk.jit` decorator with block-programming model (`tl.load`, `tl.store`, `tl.dot`, `tl.arange`). Python AST captured via `inspect.getsource`, lowered to LLK IR via MLIR Python bindings.
-- **PyTorch Capture:** `torch.compile(backend="llk")` or `torch.export` → pattern recognition converts recognized ATen ops to `llk.*` ops.
-
-All expensive optimization, code generation, caching, and runtime execution remains in C++.
-
-### 2.3 Scheduling System
-
-**Separation of concerns:** Semantics (what) ≠ Schedule (how) ≠ Target (where).
-
-Schedules are stored as data — Transform dialect IR or JSON configuration — never embedded in lowering passes.
-
-```
-semantic IR + target profile + shape profile → selected schedule (from schedule_db.json)
+```text
+Tile = (shape, dtype, layout, memory_space, owner)
+MicroIR = Tile Dataflow + Tile Mapping + Tile Schedule
+Predicted performance = F(MicroIR, MachineModel, calibration)
 ```
 
-The schedule database maps `(operation, M_bucket, N, K, dtype, ISA, math_mode)` → `{BM, BN, BK, VM, VN, vector_width, num_threads, grain_size, ...}`.
+One `micro` namespace has three conceptual layers: **uTile** describes tile dataflow, **uMap** describes placement, ownership, movement and scheduling, and **uHW** describes canonical instruction fragments and resource events.
 
-Detailed in: [m2](docs/design/m2-explicit-vector.md), [m5](docs/design/m5-specialization-tuning.md)
+`micro.search_space` describes choices, constraints and objectives. A concrete `micro.kernel` has explicit computation and schedule, but may still need target mapping. A selected executable kernel must have all execution-affecting choices bound, materialized and verified. Concrete kernels contain execution primitives rather than high-level DNN semantic operations.
 
-### 2.4 Explicit SIMD (Vector Dialect)
+## 3. Component Responsibilities
 
-The compiler emits explicit `vector` dialect operations; LLVM auto-vectorization is only used as cleanup for residual loops.
+| Component | Responsibility | Extension boundary |
+|---|---|---|
+| Semantic/structured input | Computation, shapes, dtypes, effects and numerical contracts | Frontend adapters and operator decomposition; `llk` is one adapter |
+| Micro dialect | Tile dataflow, execution structure, search intent and structural verification | Canonical primitives; no backend vocabulary |
+| `LLKMachine` | Typed resource topology, capabilities, capacities and costs | Versioned `machines/*.yaml` profiles |
+| `LLKMapping` | Workload extraction, matching, placement, connections, covering and plan verification | Declarative layouts/rules and target interfaces |
+| `LLKMicroMapping` | MLIR integration and canonical plan materialization | Source-to-plan associations and movement/sync construction |
+| `LLKPerf` | Candidate analysis, event extraction, bounds, resource scheduling and tuning | Injected event builders and cost/measurement providers |
+| `LLKTargetMapping` | Target factories, mapping bundles and emitters | `mapping/<target>/` and `lib/Target/<Target>/Mapping/` |
+| `LLKMappedCompilation` | Bind, verify, lower and compile selected plans | Explicit selected-target or reference execution mode |
+| Runtime | Invocation, buffer ownership, scratch lifetime, JIT and execution | Backend ABI/capability validation |
 
-```
-vector.transfer_read   → contiguous/masked load
-vector.contract        → outer-product accumulation with FMA
-vector.fma             → fused multiply-add
-vector.shuffle         → permute/swizzle (critical for RoPE interleaving)
-vector.mask            → predication for tail handling
-vector.transfer_write  → contiguous/masked store
-```
+`LLKMapping` depends on machine facts, not on `LLKPerf`, JIT or runtime. `LLKPerf` consumes shared mapping cost/event primitives. Compilation integrates mapping, analysis and execution without a reverse dependency from the generic planner to the runtime.
 
-**Target profiles:** x86-64 + AVX2 + FMA (milestones 1-6), extensible to AVX-512/BF16, AMX, AArch64+NEON, AArch64+SVE.
+## 4. Mapping and Search
 
-Detailed in: [m2](docs/design/m2-explicit-vector.md)
+Mapping follows **extract → match → place → connect → cover → bind → verify**. It extracts a workload graph, matches single operations or bounded fused subgraphs, places candidates with legal layouts, synthesizes connections, and selects a coherent covering. Complete-plan materialization and shared analysis check live storage, capacity and dependencies before top-K retention. Executable compilation additionally checks backend realizability.
 
-### 2.5 Math Approximation System
+Schedule search and mapping search cooperate. A source candidate describes transformations and parameter choices; mapping search explores implementations, placements and connections for that candidate. Decisions that alter dataflow require a new source candidate. They cannot be introduced by rewriting only a report or workload label.
 
-Nonlinear math (exp, sigmoid, cos, sin) is a first-class compiler concern with explicit IR contracts:
+Search is finite and reproducible. Deterministic, beam and bounded exact strategies share legality and cost contracts; reports record bounds and truncation. Exact mode describes its explored finite domain, not global optimality. Search dimensions come from supported workload transformations and target capabilities. `BM/BN/BK`, two contraction arms and five M-buckets are contraction-example choices, not mandatory framework fields.
 
-| Mode | Behavior |
-|------|----------|
-| `strict` | IEEE-sensitive, accurate exp, preserve NaN/Inf |
-| `bounded_fast` | Documented ULP bound, vector polynomial approximation, finite input range |
-| `unsafe_fast` | Reassociation allowed, reciprocal approximation, reduced exception guarantees |
+## 5. Generic Extension Rules
 
-Example: SiLU uses `exp2(x * log2(e))` polynomial approximation, evaluated with FMA, validated for downstream model error.
+- New workloads contribute semantic contracts and decomposition into supported MicroIR primitives. Shared mapping and analysis operate on primitives and graph facts rather than `swiglu` or `matmul` workload names.
+- New primitive behavior contributes verification, mapping/lowering support and event interpretation. A registry alone does not establish support for arbitrary operations.
+- New targets contribute machine profiles, layouts, mapping rules and emitters. Generic `lib/Machine` and `lib/Mapping` never branch on target names.
+- Abstract owners belong to tile semantics. Concrete resource IDs belong to selected plan metadata and are validated against the machine.
+- Artifact identity preserves source content, shapes/dtypes/layouts, numerical contracts, bindings, plan, machine/policy content, compiler version, ABI and execution mode.
+- Unsupported semantic, mapping, modeling or execution capabilities need explicit diagnostics and evidence limits. Reference and selected-target execution are separately reported.
 
-Detailed in: [m3](docs/design/m3-fused-memory.md) (SiLU), [m6](docs/design/m6-multi-kernel.md) (cos/sin for RoPE, exp for softmax)
+The [operator registration proposal](docs/superpowers/specs/2026-10-11-conversion-kernel-lowering-framework-design.md) improves semantic extensibility, but its M/N/K contract and shared contraction driver are a bounded adapter, not the final generic DNN workload interface. The merged [MicroDAG builder design](docs/superpowers/specs/2026-10-04-micro-dag-ioc-design.md) provides injectable event interpretation while core traversal retains graph invariants.
 
-### 2.6 Memory & Bufferization
+## 6. Validation and Roadmap
 
-Transform in tensor form, bufferize once:
+Framework acceptance is organized by capability: tile/dataflow semantics, non-contraction computation, multi-branch fusion, movement/layout conversion, resource topology and capacity, reproducible search/replay, analysis parity, and target extension. Matmul/SwiGLU numerical results establish exercised contracts on their fixtures; framework success also requires reusable extension boundaries. See the [specification's validation matrix](docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md#7-framework-acceptance).
 
-```
-tile/fuse/vectorize (tensor) → One-Shot Bufferize → allocation hoisting → scratch placement → buffer deallocation
-```
+M1–M6 delivered CPU validation infrastructure; M7 frontend work is deferred. M9–M12 and the mapping repair series established MicroIR, topology-aware mapping, selected plan materialization, shared static analysis and original-source tuning. Their chronological documents remain implementation history.
 
-**Goal for optimized paths:** Zero full-size intermediate buffers. Only: weight packing, per-thread tile scratch, alignment padding, fallback paths.
+Future work is prioritized by framework capability: general workload/structured import, search spaces beyond the contraction template, additional primitive/target conformance, measured feedback and calibration, and broader execution APIs where workloads require them. Each increment names its supported domain and tests extension without operator/target dispatch in generic components.
 
-A scratch analysis pass audits all `memref.alloc` calls post-bufferization to verify this invariant.
-
-Detailed in: [m3](docs/design/m3-fused-memory.md)
-
-### 2.7 CPU Parallel Runtime
-
-**Prototype path:** `scf.forall` → `scf.parallel` → OpenMP dialect → LLVM/OpenMP runtime (fast to functional).
-
-**Production path:** Persistent C++ thread pool with `llrt.parallel_for`, `llrt.barrier`, `llrt.get_worker_id`:
-
-- Workers created once, reused across kernel invocations
-- Static chunking work distribution (predictable cache behavior)
-- Per-worker scratch allocation (no false sharing)
-- NUMA-aware core affinity
-- Dynamic serial dispatch for small shapes (M ≤ 3, or when total_tiles < num_threads)
-
-Detailed in: [m4](docs/design/m4-parallel-execution.md)
-
-### 2.8 JIT & Caching
-
-**Stable public ABI:** C structs (`Tensor2D`, `KernelContext`), not MLIR memref descriptors. A thin wrapper converts C structs ↔ memref descriptors.
-
-**Four-level cache:**
-
-| Level | Key | What's cached | Detailed in |
-|-------|-----|---------------|-------------|
-| L1: IR | (source_hash, op_kind) | Verified MLIR module | [m5](docs/design/m5-specialization-tuning.md) |
-| L2: Optimized MLIR | (source_hash, M_bucket, N, K, dtypes, schedule_version) | Post-optimization MLIR (pre-bufferize) | [m5](docs/design/m5-specialization-tuning.md) |
-| L3: Object Code | KernelKey (13 fields) | Compiled function pointer | [m5](docs/design/m5-specialization-tuning.md) |
-| L4: Packed Weights | (weight_ptr, shape, BK, BN) | Packed weight buffer | [m3](docs/design/m3-fused-memory.md), [m5](docs/design/m5-specialization-tuning.md) |
-
-### 2.9 Shape Specialization
-
-Bounded specialization rather than one fully dynamic kernel:
-
-```
-M buckets:  {1}, [2,4], [5,16], [17,64], [65,∞)
-N, K:       exact match (model architecture determines)
-ISA, dtype: exact match
-```
-
-| Regime | M | Strategy |
-|--------|---|----------|
-| Decode | 1 | Vectorized GEMV, parallelize across N blocks |
-| Small batch | 2–4 | Micro-GEMM, limited threads |
-| Medium batch | 5–64 | Tiled GEMM, full parallelism |
-| Prefill | ≥65 | Conventional M×N tile parallelism |
-
-Detailed in: [m5](docs/design/m5-specialization-tuning.md)
-
----
-
-## 3. Project Structure
-
-```
-llk-compiler/
-├── CMakeLists.txt
-├── include/LLK/
-│   ├── Dialect/         # LLKDialect.td, LLKOps.td, LLKAttributes.td
-│   ├── Conversion/      # LLKToLinalg.h
-│   ├── Transforms/      # TileAndVectorize.h, FuseDoubleContraction.h, PackWeights.h,
-│   │                      ShapeSpecialization.h, ScheduleSelection.h,
-│   │                      LinearizeForall.h, SerialParallelDispatch.h,
-│   │                      ForallToLLRT.h, ForallToOpenMP.h, ScratchAnalysis.h
-│   │                      Common/ (TilingUtils, VectorizationUtils, ScheduleLoader,
-│   │                               MaskGeneration, MathApproximation)
-│   ├── Target/          # X86/TargetAVX2.h, AArch64/TargetSVE.h (stub)
-│   └── Runtime/         # ThreadPool.h, JitCache.h, PackedWeights.h, CpuFeatures.h
-├── lib/
-│   ├── Dialect/LLK/
-│   ├── Conversion/LLKToLinalg/
-│   ├── Transforms/      # Pass implementations + Common/ utilities
-│   ├── Target/X86/, AArch64/
-│   └── Runtime/
-├── tools/
-│   ├── llk-opt/         # IR dump + pass pipeline tool
-│   ├── llk-compile/     # End-to-end compilation driver
-│   ├── llk-bench/       # Benchmarking harness
-│   └── llk-tune/        # Autotuning grid search
-├── python/llk/          # Python frontend (Milestone 7+)
-│   ├── language/        # DSL: tl.load, tl.store, tl.dot, etc.
-│   ├── runtime/         # JIT invocation from Python
-│   └── torch/           # torch.compile backend
-├── runtime/             # C++ runtime library (ThreadPool, JitCache, PackedWeights)
-├── schedules/           # Target-specific schedule definitions (.mlir + schedule_db.json)
-│   ├── x86_avx2/
-│   ├── x86_avx512/
-│   └── aarch64_sve/
-├── test/
-│   ├── Dialect/         # FileCheck: op round-trip + verifier
-│   ├── Conversion/      # FileCheck: lowering correctness
-│   ├── Transforms/      # FileCheck: pass-specific tests
-│   ├── Execution/       # JIT end-to-end + numerical
-│   ├── Numerical/       # Precision + stability
-│   └── benchmark/       # Performance regression suite
-└── docs/
-    ├── design/          # Per-milestone detailed design docs
-    └── superpowers/     # Brainstorming + planning artifacts
-```
-
-**Note:** `LinalgToCPU.h` from the original design was replaced by the explicit pass
-pipeline in llk-compile (see §7). AArch64/TargetSVE.h is a post-M6 stub for future
-SVE support. Attributes (`#llk.activation`, `#llk.math_mode`, etc.) are defined in
-`include/LLK/Dialect/LLKDialect.td`, not in a standalone attributes file.
-
----
-
-## 4. Implementation Sequence
-
-| Milestone | What | Exit Criterion | Design Doc |
-|-----------|------|----------------|------------|
-| M1 | Scalar end-to-end pipeline | Arbitrary shapes execute correctly through JIT | [m1-scalar-pipeline.md](docs/design/m1-scalar-pipeline.md) |
-| M2 | Explicit vector path (AVX2) | No scalar inner-K loop; `vfmadd231ps` in assembly | [m2-explicit-vector.md](docs/design/m2-explicit-vector.md) |
-| M3 | Fused memory lowering | Zero full-size gate/up intermediates | [m3-fused-memory.md](docs/design/m3-fused-memory.md) |
-| M4 | Parallel execution | Monotonic scaling with thread count | [m4-parallel-execution.md](docs/design/m4-parallel-execution.md) |
-| M5 | Specialization & tuning | Deterministic schedule selection; JIT cache hits work | [m5-specialization-tuning.md](docs/design/m5-specialization-tuning.md) |
-| M6 | Second/third kernels (RoPE, Attention) | Both kernels compile + execute via same pipeline | [m6-multi-kernel.md](docs/design/m6-multi-kernel.md) |
-| M7+ | Python frontend | `@llk.jit` + `torch.compile(backend="llk")` functional | (future) |
-
----
-
-## 5. Engineering Rules
-
-1. **Keep semantics, scheduling, and target lowering separate.** Never embed `BM=32` in LLKToLinalg.
-2. **Lower to Linalg before writing custom loop generation.** Linalg already provides tiling, fusion, and vectorization infrastructure.
-3. **Do not lower to memrefs too early.** Tile and fuse while tensor producer-consumer relationships remain explicit.
-4. **Do not rely on LLVM auto-vectorization for the central microkernel.** Emit explicit Vector dialect operations.
-5. **Treat numerical approximation as IR semantics,** not merely compiler command-line flags.
-6. **Specialize on layout and ISA before specializing on every exact shape.**
-7. **Do not introduce autotuning until deterministic schedules work.** Otherwise tuning hides compiler defects.
-8. **Measure packing and parallel dispatch overhead.** A faster inner loop can still produce a slower inference kernel.
-9. **Use external optimized GEMM as a baseline, not necessarily as the final implementation.** The compiler must demonstrate value through fusion, specialization, reduced materialization, or better small-shape behavior.
-10. **Keep the first target narrow:** one operation, one dtype pair, one layout, one ISA, a small number of shape regimes.
-
----
-
-## 6. Design Decisions
-
-| Decision | Rationale |
-|----------|-----------|
-| Out-of-tree MLIR project | Leverages MLIR's multi-level IR infrastructure without forking |
-| First target: fused SwiGLU | Exercises tiling, fusion, register intermediates, vector contract, packing, parallelism, math approximation — all the hard problems |
-| Small custom dialect (llk) | Only retains domain info; reuses linalg/vector/memref for everything else |
-| Transform dialect for schedules | Separates policy from mechanism; enables target-specific schedules as data |
-| Explicit Vector dialect (not LLVM autovec) | Deterministic SIMD; stable performance across compiler versions |
-| Python frontend deferred to M7+ | Stabilize IR and execution model first; C++ builder for testing during M1-M6 |
-| Persistent thread pool (not OpenMP for production) | Low-latency inference; NUMA control; avoids nested parallelism conflicts |
-| Bounded specialization (5 M-buckets) | Handles decode (M=1) vs. prefill (M≥65) divergence without combinatorial explosion |
-| C struct ABI (not memref descriptors) | Stable public interface; framework-agnostic |
-| Four-level JIT cache | Avoids re-parsing, re-optimizing, re-compiling, and re-packing independently |
+[PR #133 acceptance](docs/reviews/issue67-final-acceptance.md) remains revision-pinned resource/execution/tuning evidence. Selected execution is verified on compatible x86_64 AVX2 fixtures; generic accelerator coverage is static. Production persistence/calibration (#51/#52), general frontend coverage and direct MicroIR emulation (#54) remain separate work. The goal revision changes documentation and architectural direction; it does not add operator or backend support.

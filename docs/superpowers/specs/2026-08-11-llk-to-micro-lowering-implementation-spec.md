@@ -1,5 +1,7 @@
 # LLK/Linalg to Micro-IR Lowering Implementation Spec
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This specifies an initial semantic input adapter. Matmul and SwiGLU exports validate reusable tile/dataflow contracts. Contraction shapes, two arms and epilogues below are example-specific; general structured import and non-contraction contracts require separate extension work.
+
 **Status:** Draft
 **Date:** 2026-08-11
 **Parent Spec:** [Canonical Micro-IR Redesign Spec](2026-08-11-canonical-micro-ir-redesign.md)
@@ -8,7 +10,7 @@
 
 ## 1. Goal
 
-Implement an export path from the current LLK/Linalg scheduling pipeline into concrete `micro.kernel` and optional `micro.search_space` IR. The lowering must preserve the current AVX2/JIT pipeline while producing a canonical execution artifact for performance modeling and future backends.
+Provide semantic decomposition/export as an input adapter to the generic MicroIR-based mapping/search compilation framework. The initial LLK matmul and SwiGLU examples produce concrete `micro.kernel` and optional `micro.search_space` IR while preserving the CPU validation pipeline. The framework input contract must extend beyond their contraction template; general Linalg import remains future work.
 
 The exported Micro-IR is tile-centric. Lowering should produce:
 

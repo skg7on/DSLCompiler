@@ -6,8 +6,11 @@ MicroIR concepts
 MicroIR describes how a tensor kernel executes: which tiles it computes, where
 those tiles live, which resources own the work, and when computation and movement
 occur. The project uses the ``micro`` MLIR dialect as its canonical execution IR.
-Its purpose is to make schedules inspectable and machine models usable for
-mapping and performance exploration.
+Its purpose is to provide the canonical execution artifact for a generic DNN
+compiler framework based on mapping and compilation search. Matmul and fused
+SwiGLU are example compositions used to test this artifact, rather than the
+defining workloads of the project. Machine models and target policy guide legal
+implementation choices for supported tile/dataflow programs.
 
 Read this guide before the :doc:`architecture </architecture>`, or follow the
 :doc:`first-kernel tutorial </tutorials/01-first-kernel>` alongside it. The

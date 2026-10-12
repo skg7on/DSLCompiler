@@ -1,8 +1,10 @@
 # MicroIR-Inspired DSLCompiler Enhancement Design
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This remains the detailed generic mapping/search contract. The project goal is the framework itself; AVX2, matmul and SwiGLU validate it. Section numbers remain stable for implementation references. Original rollout/status statements are historical; PR #133 acceptance records delivered mapping repairs.
+
 **Status:** Draft for review
 **Date:** 2026-09-18
-**Scope:** M9-M13 Micro-IR roadmap enhancement
+**Scope:** Generic mapping/search subsystem of the MicroIR-based DNN compiler framework; M9–M13 rollout retained as history
 **Parent roadmap:** [Canonical DNN Micro-IR roadmap](https://github.com/skg7on/DSLCompiler/issues/41)
 **Immediate dependency:** [Issue #44: implement search-space ops](https://github.com/skg7on/DSLCompiler/issues/44)
 
@@ -28,7 +30,7 @@ The reference comparison showed that DSLCompiler is the broader end-to-end compi
 5. keep search spaces persistent in MLIR through `micro.search_space` and related ops;
 6. keep Ampere, warp, TTGIR, and other target-specific concepts outside the target-independent `micro` dialect.
 
-The intended result is a reusable mapping and tuning architecture for AVX2 first, followed by TTGIR, NPUs, and custom accelerators without redesigning the canonical Micro-IR.
+The intended result is the generic mapping and search subsystem of a MicroIR-based DNN compiler framework. It must serve primitive/dataflow compositions independently of high-level operator names. Matmul and fused SwiGLU test the subsystem; AVX2 is the first executable validation target, with additional target packages extending machine facts, rules and emitters without redesigning canonical MicroIR.
 
 This is a conceptual adaptation from the MicroIR prototype as inspected at commit `e9807ec`. DSLCompiler must implement the design in its own types, naming, tests, and target integrations; it must not vendor or create a build-time dependency on the reference repository.
 
@@ -78,7 +80,7 @@ MicroIR addresses these problems with candidate, instance, connection, covering,
 
 ### 3.1 Functional goals
 
-The enhanced architecture shall:
+The generic mapping/search architecture shall operate on primitive/dataflow facts, not a fixed DNN operator catalog. Matmul/SwiGLU acceptance fixtures exercise those contracts without defining the supported workload model. The architecture shall:
 
 - preserve search intent and candidate bindings in MLIR;
 - map concrete `micro` operations or subgraphs to target implementation bundles;

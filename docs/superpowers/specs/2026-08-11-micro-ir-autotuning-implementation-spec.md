@@ -1,5 +1,7 @@
 # Micro-IR Auto-Tuning and Auto-Optimization Implementation Spec
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This specifies schedule-search infrastructure within the generic compilation framework. Workload-specific BM/BN/BK and M-buckets are example domains; the current source-search template is contraction-shaped. Complete mapping/plan search follows the September mapping contract and later repair evidence.
+
 **Status:** Draft
 **Date:** 2026-08-11
 **Parent Spec:** [Canonical Micro-IR Redesign Spec](2026-08-11-canonical-micro-ir-redesign.md)
@@ -12,7 +14,7 @@ Implement an auto-tuning framework based on `micro.search_space`, `micro.candida
 
 The tuning framework is tile-centric. It searches tile hierarchy, tile layout, memory placement, owner mapping, pipeline structure, and instruction-fragment binding, not only loop tile sizes.
 
-The first target is Intel CPU with AVX2. The design must remain generic enough for future accelerator profiles.
+Search is a generic compilation mechanism across supported workloads and target packages. AVX2 is the first executable validation target. Matmul/SwiGLU parameters test the mechanism; they do not define the framework search schema.
 
 ---
 

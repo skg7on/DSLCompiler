@@ -1,5 +1,7 @@
 # Milestone 7: Python Frontend — Design Spec (Stub)
 
+**Scope alignment (2026-10-12):** This is a CPU validation milestone or frontend-adapter proposal within the [generic MicroIR-based DNN compiler framework](../superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md). SwiGLU, matmul, RoPE and attention are example workloads; operator-specific algorithms, schedule fields, ABI and performance criteria below apply to these fixtures rather than the whole framework. Original milestone status and design intent are retained as history.
+
 **Status:** Planned, not yet scheduled
 
 ## Overview
