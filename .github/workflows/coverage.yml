@@ -48,8 +48,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.LLVM_BUILD }}
-          key: llvm-build-${{ env.LLVM_VERSION }}-utils-v2
-          restore-keys: llvm-build-${{ env.LLVM_VERSION }}-v1
+          key: llvm-build-${{ env.LLVM_VERSION }}-shared-v3
 
       - name: Build LLVM
         if: steps.cache-llvm-build.outputs.cache-hit != 'true'
@@ -59,6 +58,10 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS=mlir \
             -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DLLVM_DYLIB_COMPONENTS=all \
+            -DMLIR_LINK_MLIR_DYLIB=ON \
             -DLLVM_BUILD_UTILS=ON \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
