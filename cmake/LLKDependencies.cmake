@@ -37,11 +37,9 @@ endif()
 
 # LLVM is loaded first so MLIR's nested find_package(LLVM) uses this build.
 find_package(MLIR REQUIRED CONFIG PATHS "${MLIR_DIR}" NO_DEFAULT_PATH)
+# MLIR 22 does not export MLIR_LINK_MLIR_DYLIB in MLIRConfig.cmake.
+# Validate the imported target and artifact, which determine our actual linkage.
 llk_require_build_target(MLIR SHARED_LIBRARY)
-if(NOT MLIR_LINK_MLIR_DYLIB)
-  message(FATAL_ERROR "MLIR must export shared linkage. "
-      "Rebuild LLVM with -DMLIR_LINK_MLIR_DYLIB=ON.")
-endif()
 llk_require_build_target(mlir_c_runner_utils SHARED_LIBRARY)
 
 # Use the exported executable so CMake resolves the tool for each build

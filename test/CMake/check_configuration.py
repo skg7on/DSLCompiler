@@ -95,6 +95,50 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("LLVM has not been built", result.stdout)
 
+    def configure_mlir_export(self, library_type):
+        # LLVM 22 exports the shared target but not MLIR_LINK_MLIR_DYLIB.
+        # Exercise dependency discovery independently of dialect generation.
+        build = self.shared_llvm_package(self.root / "llvm/lib/libLLVM.so")
+        (build / "lib/libLLVM.so").touch()
+        modules = build / "cmake"
+        modules.mkdir()
+        for name in ("TableGen", "AddLLVM", "AddMLIR", "HandleLLVMOptions"):
+            (modules / f"{name}.cmake").write_text("")
+        with (build / "lib/cmake/llvm/LLVMConfig.cmake").open("a") as config:
+            config.write(f'set(LLVM_CMAKE_DIR "{modules}")\n')
+        (build / "lib/libMLIR.so").touch()
+        (build / "lib/libmlir_c_runner_utils.so").touch()
+        (build / "bin").mkdir()
+        (build / "bin/mlir-tblgen").touch()
+        (build / "lib/cmake/mlir/MLIRConfig.cmake").write_text(
+            f'add_library(MLIR {library_type} IMPORTED)\n'
+            f'set_target_properties(MLIR PROPERTIES IMPORTED_LOCATION "{build}/lib/libMLIR.so")\n'
+            'add_library(mlir_c_runner_utils SHARED IMPORTED)\n'
+            f'set_target_properties(mlir_c_runner_utils PROPERTIES IMPORTED_LOCATION "{build}/lib/libmlir_c_runner_utils.so")\n'
+            'add_executable(mlir-tblgen IMPORTED)\n'
+            f'set_target_properties(mlir-tblgen PROPERTIES IMPORTED_LOCATION "{build}/bin/mlir-tblgen")\n'
+        )
+        consumer = self.root / "consumer"
+        consumer.mkdir()
+        (consumer / "CMakeLists.txt").write_text(
+            'cmake_minimum_required(VERSION 3.20)\nproject(ExportConsumer NONE)\n'
+            f'include("{SOURCE}/cmake/LLKDependencies.cmake")\n'
+        )
+        return subprocess.run(
+            ["cmake", "-S", str(consumer), "-B", str(self.root / "build"),
+             f"-DLLVM_PROJECT_BUILD_DIR={build}"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+
+    def test_shared_mlir_without_linkage_variable_is_accepted(self):
+        result = self.configure_mlir_export("SHARED")
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_static_mlir_is_rejected(self):
+        result = self.configure_mlir_export("STATIC")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("MLIR must be a shared library", result.stdout)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
