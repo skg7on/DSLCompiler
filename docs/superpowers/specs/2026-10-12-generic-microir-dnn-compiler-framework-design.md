@@ -163,4 +163,6 @@ Retain M1–M6 as CPU validation history and M9–M12/mapping repairs as framewo
 
 Each increment needs its own bounded design and implementation plan. This document does not start those code changes. Operator additions are selected to exercise missing framework contracts, and target additions are selected to exercise different resource/topology constraints.
 
+The [revision-pinned framework implementation plan](../plans/2026-10-12-generic-microir-framework-implementation.md) supplies the current-code assessment, dependencies, detailed increment plans and acceptance gates. It retains the merged foundation and distinguishes pending registry/build changes from delivered support.
+
 Project entry points and architecture documents use the generic framework goal. Specialized specifications state their subsystem or fixture scope and link here. Historical plans and acceptance records are preserved; they cannot override current goals or imply new support. Future performance reports name the source, plan, machine, backend and measured/predicted status so example-kernel results remain interpretable.

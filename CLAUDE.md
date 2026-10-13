@@ -104,6 +104,7 @@ M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, sp
 |------|---------|
 | `ARCHITECTURE.md` | Current generic framework architecture, components, mapping/search and extension rules |
 | `docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md` | Authoritative project goal, subsystem contracts, current genericity gaps and framework acceptance |
+| `docs/superpowers/plans/2026-10-12-generic-microir-framework-implementation.md` | Current-code audit and detailed capability increments for analysis coverage, workload/search, conformance and measurement validation |
 | `docs/design/legacy-cpu-architecture.md` | Historical CPU validation design and M1–M7 rationale |
 | `docs/design/m[1-6]-*.md` | Per-milestone design specs (MLIR defs, algorithms, tests) |
 | `docs/design/m9-canonical-micro-ir-architecture.md` | Micro-IR project-level redesign, layer responsibilities |
