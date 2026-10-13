@@ -604,8 +604,6 @@ TEST(OpDAGBuilders, DataArithmeticIsNotControlScaffolding) {
     %a = arith.constant 1 : i32
     %b = arith.addi %a, %a : i32
     %c = arith.muli %b, %a : i32
-    %v = arith.constant dense<1> : vector<2xindex>
-    %w = arith.addi %v, %v : vector<2xindex>
     %f = arith.constant 1.0 : f32
     %g = arith.addf %f, %f : f32
     micro.yield
@@ -618,6 +616,19 @@ TEST(OpDAGBuilders, DataArithmeticIsNotControlScaffolding) {
             (std::vector<std::string>{"unmodeled_leaf: arith.addi",
                                       "unmodeled_leaf: arith.muli",
                                       "unmodeled_leaf: arith.addf"}));
+}
+TEST(OpDAGBuilders, VectorIndexArithmeticIsNotControlScaffolding) {
+  auto parsed = parseKernel(R"mlir(module { micro.kernel @vector_indices {
+    %v = arith.constant dense<1> : vector<2xindex>
+    %w = arith.addi %v, %v : vector<2xindex>
+    micro.yield
+  } })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto dag = buildMicroDAG(parsed->kernel, machine::MachineModel{},
+                           makeDefaultOpDAGBuilders(), DAGBuildOptions{});
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  EXPECT_EQ(dag->incompleteReasons,
+            (std::vector<std::string>{"unmodeled_leaf: arith.addi"}));
 }
 TEST(OpDAGBuilders, EmptyTensorMetadataDoesNotAllocateTileStorage) {
   auto parsed = parseKernel(R"mlir(module { micro.kernel @metadata {
