@@ -110,6 +110,11 @@ private:
   };
   llvm::StringMap<Entry> builders;
 };
+/// Covers canonical Micro primitives and audited scaffolding: compile-time
+/// constants, scalar index add/multiply, and shape-only tensor.empty metadata.
+/// Data arithmetic and tensor element operations require explicit modeling.
+/// Logical tile handlers retain aliases and charge physical layout changes;
+/// materialized allocation remains the responsibility of Micro alloc handlers.
 OpDAGBuilderRegistry makeDefaultOpDAGBuilders();
 } // namespace mlir::llk::perf
 #endif
