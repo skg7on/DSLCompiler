@@ -139,9 +139,10 @@ class DAGBuilder {
 public:
   DAGBuilder(const machine::MachineModel &machine, llvm::StringRef kernelName,
              const OpDAGBuilderRegistry &builders,
-             const MeasuredOverrides *measured = nullptr)
-      : machine(machine), builders(builders), kernelName(kernelName.str()),
-        measured(measured) {}
+             const MeasuredOverrides *measured = nullptr,
+             DAGBuildOptions options = {CoverageMode::LegacyPermissive})
+      : machine(machine), options(options), builders(builders),
+        kernelName(kernelName.str()), measured(measured) {}
 
   llvm::Expected<MicroDAG> run(mlir::Operation *kernel);
 
@@ -168,6 +169,9 @@ private:
   public:
     Context(DAGBuilder &builder, mlir::Operation &op, State &state)
         : builder(builder), op(op), state(state) {}
+    void noteIncomplete(std::string reason) override {
+      builder.noteIncomplete(std::move(reason));
+    }
     mlir::Operation &operation() const override { return op; }
     const machine::MachineModel &machineModel() const override {
       return builder.machine;
@@ -342,6 +346,7 @@ private:
   const machine::MemoryNode *soleMemoryOfKind(llvm::StringRef kind) const;
 
   const machine::MachineModel &machine;
+  DAGBuildOptions options;
   const OpDAGBuilderRegistry &builders;
   std::string kernelName;
   std::vector<PlannedRoute> routes;
@@ -362,6 +367,7 @@ private:
   llvm::DenseMap<mlir::Value, uint32_t> producers;
   llvm::SmallPtrSet<mlir::Operation *, 32> countedStorage;
   llvm::StringSet<> seenWarnings;
+  llvm::StringSet<> seenIncompleteReasons;
   std::map<std::string, uint64_t> liveBytes;
   /// Measured durations the selected plan recorded, or null when none (issue
   /// #129 review finding 6).
@@ -430,10 +436,9 @@ void DAGBuilder::noteWarning(std::string message) {
 }
 
 void DAGBuilder::noteIncomplete(std::string message) {
-  if (seenWarnings.insert(message).second) {
+  if (seenIncompleteReasons.insert(message).second)
     dag.incompleteReasons.push_back(message);
-    dag.warnings.push_back(std::move(message));
-  }
+  noteWarning(std::move(message));
 }
 
 void DAGBuilder::noteDiagnostics(const MicroEvent &event) {
@@ -1039,8 +1044,11 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
 llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
   ++opOccurrences[&op];
   const auto *handler = builders.lookup(op.getName().getStringRef());
-  if (!handler)
+  if (!handler) {
+    if (options.coverage != CoverageMode::LegacyPermissive)
+      noteIncomplete("unmodeled_leaf: " + op.getName().getStringRef().str());
     return llvm::Error::success();
+  }
   Context context(*this, op, state);
   return (*handler)(op, context);
 }
@@ -1333,6 +1341,32 @@ llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
 
   DAGBuilder builder(machine, kernelOp.getSymName(), builders, measured);
   return builder.run(kernel);
+}
+
+llvm::Expected<MicroDAG> buildMicroDAG(mlir::Operation *kernel,
+                                       const machine::MachineModel &machine,
+                                       const OpDAGBuilderRegistry &builders,
+                                       const DAGBuildOptions &options,
+                                       const MeasuredOverrides *measured) {
+  auto kernelOp = llvm::dyn_cast<micro::KernelOp>(kernel);
+  if (!kernelOp)
+    return invalid("expected a micro.kernel");
+  DAGBuilder builder(machine, kernelOp.getSymName(), builders, measured,
+                     options);
+  auto dag = builder.run(kernel);
+  if (!dag)
+    return dag.takeError();
+  if (options.coverage == CoverageMode::Strict &&
+      !dag->incompleteReasons.empty()) {
+    std::string reasons;
+    for (const auto &reason : dag->incompleteReasons) {
+      if (!reasons.empty())
+        reasons += "; ";
+      reasons += reason;
+    }
+    return invalid(reasons);
+  }
+  return std::move(*dag);
 }
 
 llvm::Expected<mlir::Operation *> findMicroKernel(mlir::Operation *root,
