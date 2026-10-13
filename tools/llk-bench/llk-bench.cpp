@@ -24,8 +24,6 @@ static cl::opt<int64_t> benchN("N", cl::desc("N dimension (hidden)"),
                                cl::init(4096));
 static cl::opt<int64_t> benchK("K", cl::desc("K dimension (input)"),
                                cl::init(4096));
-static cl::opt<int> benchThreads("threads", cl::desc("Thread count"),
-                                 cl::init(8));
 static cl::opt<int> benchWarmup("warmup-ms", cl::desc("Warmup milliseconds"),
                                 cl::init(500));
 static cl::opt<int> benchMeasure("measure-ms",
@@ -53,6 +51,11 @@ static void dummyKernel(float *output, const float *input, int64_t M, int64_t N,
 }
 
 int main(int argc, char **argv) {
+  // Shared libLLVM registers ThinLTO's --threads before main. Keep the
+  // benchmark's established flag by giving the LLVM option its own name.
+  if (auto *llvmThreads = cl::getRegisteredOptions().lookup("threads"))
+    llvmThreads->setArgStr("llvm-thinlto-threads");
+  cl::opt<int> benchThreads("threads", cl::desc("Thread count"), cl::init(8));
   cl::ParseCommandLineOptions(argc, argv, "LLK kernel benchmark\n");
 
   std::cout << "LLK Bench — M=" << benchM << " N=" << benchN << " K=" << benchK

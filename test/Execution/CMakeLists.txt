@@ -1,5 +1,5 @@
-# LLVM permits these sources to be omitted when JIT tests are disabled.
-set(LLVM_OPTIONAL_SOURCES
+# These sources are compiled only when JIT tests are enabled.
+set(_llk_execution_jit_sources
       swiglu_scalar.cpp
       triton_swiglu_staged.cpp
       swiglu_vector_avx2.cpp
@@ -8,16 +8,15 @@ set(LLVM_OPTIONAL_SOURCES
       swiglu_fused_memory.cpp)
 
 if(LLK_BUILD_E2E_TESTS)
-  set(_llk_execution_e2e_sources ${LLVM_OPTIONAL_SOURCES})
+  set(_llk_execution_e2e_sources ${_llk_execution_jit_sources})
   set(_llk_execution_e2e_libs
-      LLKPasses LLKTransforms LLKFuseDoubleContraction LLKPackWeights
+      LLKToLinalg LLKTransforms LLKFuseDoubleContraction LLKPackWeights
       LLKToMicro LLKMicroToLinalg LLKMappedCompilation LLKMapping
       LLKTargetMapping MicroDialect LLKDialect TritonToLLKPasses
-      ${LLK_MLIR_EXEC_LIBS})
+      LLK::MLIR)
 endif()
 
 add_llk_test_category(Execution
-    PARTIAL_SOURCES_INTENDED
     SOURCES
         swiglu_reference.cpp
         edge_cases.cpp
@@ -52,10 +51,9 @@ if(LLK_BUILD_E2E_TESTS)
   set(_llk_mapped_libs
       LLKMappedCompilation LLKToMicro LLKMicroToLinalg LLKMapping
       LLKTargetMapping MicroDialect LLKDialect GTest::gtest_main
-      ${LLK_MLIR_EXEC_LIBS})
+      LLK::MLIR)
 
-  add_llvm_executable(MappedAcceptance mapped_acceptance.cpp
-      PARTIAL_SOURCES_INTENDED)
+  add_executable(MappedAcceptance mapped_acceptance.cpp)
   target_link_libraries(MappedAcceptance PRIVATE ${_llk_mapped_libs})
   target_compile_definitions(MappedAcceptance PRIVATE
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -66,8 +64,7 @@ if(LLK_BUILD_E2E_TESTS)
       LABELS "mapped-reference"
       SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
-  add_llvm_executable(MappedAVX2Acceptance mapped_acceptance.cpp
-      PARTIAL_SOURCES_INTENDED)
+  add_executable(MappedAVX2Acceptance mapped_acceptance.cpp)
   target_link_libraries(MappedAVX2Acceptance PRIVATE ${_llk_mapped_libs})
   target_compile_definitions(MappedAVX2Acceptance PRIVATE
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
@@ -82,33 +79,30 @@ if(LLK_BUILD_E2E_TESTS)
           $<TARGET_FILE:MappedAVX2Acceptance> $<TARGET_FILE:MappedAcceptance>)
   set_tests_properties(SelectedTargetFlagContract PROPERTIES LABELS "selected-avx2")
 
-  add_llvm_executable(MappedInvocationTest mapped_invocation.cpp
-      PARTIAL_SOURCES_INTENDED)
+  add_executable(MappedInvocationTest mapped_invocation.cpp)
   target_link_libraries(MappedInvocationTest PRIVATE LLKRuntime GTest::gtest_main
-      ${LLK_MLIR_EXEC_LIBS})
+      LLK::MLIR)
   add_test(NAME MappedInvocationTest COMMAND MappedInvocationTest)
 
-  add_llvm_executable(MappedAllocationLifetimeTest mapped_allocation_lifetime.cpp
-      PARTIAL_SOURCES_INTENDED)
+  add_executable(MappedAllocationLifetimeTest mapped_allocation_lifetime.cpp)
   target_link_libraries(MappedAllocationLifetimeTest PRIVATE LLKRuntime
-      GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+      GTest::gtest_main LLK::MLIR)
   target_compile_definitions(MappedAllocationLifetimeTest PRIVATE
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME MappedAllocationLifetimeTest COMMAND MappedAllocationLifetimeTest)
   set_tests_properties(MappedAllocationLifetimeTest PROPERTIES
       LABELS "mapped-reference")
 
-  add_llvm_executable(MappedCodegenRequirementsTest
-      mapped_codegen_requirements.cpp PARTIAL_SOURCES_INTENDED)
+  add_executable(MappedCodegenRequirementsTest
+      mapped_codegen_requirements.cpp)
   target_link_libraries(MappedCodegenRequirementsTest PRIVATE LLKRuntime
       GTest::gtest_main)
   add_test(NAME MappedCodegenRequirementsTest
       COMMAND MappedCodegenRequirementsTest)
 
-  add_llvm_executable(SelectedGroupLoweringTest selected_group_lowering.cpp
-      PARTIAL_SOURCES_INTENDED)
+  add_executable(SelectedGroupLoweringTest selected_group_lowering.cpp)
   target_link_libraries(SelectedGroupLoweringTest PRIVATE LLKMappedCompilation
-      LLKMapping GTest::gtest_main ${LLK_MLIR_EXEC_LIBS})
+      LLKMapping GTest::gtest_main LLK::MLIR)
   add_test(NAME SelectedGroupLoweringTest COMMAND SelectedGroupLoweringTest)
 
   add_test(NAME RequiredExecutionEvidenceParser

@@ -1,7 +1,7 @@
 //===- ScheduleSelection.cpp - Deterministic schedule lookup from DB ------===//
 //
 // Loads schedule_db.json and selects the best-matching schedule entry for
-// each llk.fused_swiglu operation based on (M_bucket, N, K).
+// each registered LLK kernel based on its shared contract.
 //
 // Fallback order: exact match → relax K → relax N → bucket default → built-in.
 //
@@ -10,7 +10,7 @@
 #include "LLK/Transforms/ScheduleSelection.h"
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 
-#include "LLK/Dialect/LLKEnums.h"
+#include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
@@ -21,21 +21,12 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
-// Attribute class declarations (needed before LLKOps.h.inc).
-#define GET_ATTRDEF_CLASSES
-#include "LLK/Dialect/LLKAttributes.h.inc"
-
-// Access the generated op interfaces.
-#define GET_OP_CLASSES
-#include "LLK/Dialect/LLKOps.h.inc"
-
 using namespace mlir;
 
 // ---------------------------------------------------------------------------
-// M bucket classifier (duplicated from ShapeSpecialization for pass isolation)
+// Shared schedule loader
 // ---------------------------------------------------------------------------
 
-using llk::classifyM;
 using llk::loadScheduleDB;
 using llk::ScheduleEntry;
 using llk::selectBestSchedule;
@@ -56,55 +47,27 @@ struct ScheduleSelectionPass
   }
 
   void runOnOperation() override {
-    // Walk all LLK ops and annotate with selected schedules.
+    llk::LLKKernelRegistry registry;
+    llk::populateLLKKernelLowerings(registry);
     getOperation().walk([&](Operation *op) {
-      auto xType = [&]() -> ShapedType {
-        if (auto swiglu = dyn_cast<llk::FusedSwiGLUOp>(op))
-          return swiglu.getX().getType();
-        if (auto rope = dyn_cast<llk::RoPEOp>(op)) {
-          // For RoPE, derive shape info for schedule selection.
-          return rope.getX().getType();
-        }
-        if (auto attn = dyn_cast<llk::AttentionOp>(op)) {
-          // For Attention, use Q shape for schedule selection.
-          return attn.getQ().getType();
-        }
-        return nullptr;
-      }();
-
-      if (!xType)
+      if (op->getName().getDialectNamespace() != "llk")
         return;
-
-      if (!xType.hasStaticShape()) {
+      auto *entry = registry.lookup(op->getName().getStringRef());
+      if (!entry)
+        return;
+      llk::KernelContract contract;
+      if (failed(entry->inferContract(op, contract)))
+        return;
+      if (contract.mBucket < 0) {
         op->emitWarning() << "Cannot select schedule for dynamic shape";
         return;
       }
-
-      // Get the operation name for schedule lookup.
-      std::string opName;
-      if (isa<llk::FusedSwiGLUOp>(op))
-        opName = "fused_swiglu";
-      else if (isa<llk::RoPEOp>(op))
-        opName = "rope";
-      else if (isa<llk::AttentionOp>(op))
-        opName = "attention";
-      else
-        return;
-
-      int64_t M = xType.getDimSize(0);
-      int64_t N = 0;
-      if (auto swiglu = dyn_cast<llk::FusedSwiGLUOp>(op)) {
-        N = swiglu.getWg().getType().getDimSize(1);
-      } else if (auto rope = dyn_cast<llk::RoPEOp>(op)) {
-        N = rope.getX().getType().getDimSize(3); // D
-      } else if (auto attn = dyn_cast<llk::AttentionOp>(op)) {
-        N = attn.getQ().getType().getDimSize(3); // D
-      }
-
-      int bucket = classifyM(M);
+      StringRef opName = contract.workload;
+      int64_t N = contract.N, K = contract.K;
+      int bucket = contract.mBucket;
 
       auto matches =
-          loadScheduleDB("schedules/schedule_db.json", bucket, N, 0, opName);
+          loadScheduleDB("schedules/schedule_db.json", bucket, N, K, opName);
 
       if (matches.empty()) {
         op->emitWarning() << "No schedule entry for " << opName
@@ -112,7 +75,7 @@ struct ScheduleSelectionPass
                           << " in schedules/schedule_db.json; using fallback";
       }
 
-      ScheduleEntry selected = selectBestSchedule(matches, N, 0);
+      ScheduleEntry selected = selectBestSchedule(matches, N, K);
 
       op->emitRemark() << "selected schedule for " << opName
                        << ": BM=" << selected.BM << " BN=" << selected.BN

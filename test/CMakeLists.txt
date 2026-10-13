@@ -2,14 +2,10 @@
 include(GoogleTest)
 
 function(add_llk_test_category category)
-  cmake_parse_arguments(ARG "PARTIAL_SOURCES_INTENDED" "" "SOURCES;LIBRARIES;DEFINITIONS;INCLUDE_DIRECTORIES" ${ARGN})
+  cmake_parse_arguments(ARG "" "" "SOURCES;LIBRARIES;DEFINITIONS;INCLUDE_DIRECTORIES" ${ARGN})
   set(test_target "LLK${category}Tests")
-  set(_partial_sources)
-  if(ARG_PARTIAL_SOURCES_INTENDED)
-    set(_partial_sources PARTIAL_SOURCES_INTENDED)
-  endif()
-  add_llvm_executable(${test_target} ${ARG_SOURCES} ${_partial_sources})
-  target_link_libraries(${test_target} PRIVATE GTest::gtest_main ${ARG_LIBRARIES})
+  add_executable(${test_target} ${ARG_SOURCES})
+  target_link_libraries(${test_target} PRIVATE LLKBuildOptions GTest::gtest_main ${ARG_LIBRARIES})
   if(ARG_DEFINITIONS)
     target_compile_definitions(${test_target} PRIVATE ${ARG_DEFINITIONS})
   endif()
@@ -26,6 +22,7 @@ function(add_llk_test_category category)
   set_property(GLOBAL APPEND PROPERTY LLK_TEST_TARGETS ${test_target})
 endfunction()
 
+add_subdirectory(CMake)
 add_subdirectory(Execution)
 add_subdirectory(Numerical)
 add_subdirectory(Transforms)
@@ -47,7 +44,10 @@ if(_llk_ir_tests)
 endif()
 
 get_property(_llk_check_deps GLOBAL PROPERTY LLK_TEST_TARGETS)
-foreach(_llk_tool llk-opt micro-perf llk-tune llk-compile llk-bench)
+foreach(_llk_tool llk-opt micro-perf llk-tune llk-compile llk-bench
+    MappedAcceptance MappedAVX2Acceptance MappedInvocationTest
+    MappedAllocationLifetimeTest MappedCodegenRequirementsTest
+    SelectedGroupLoweringTest MappedTuningSessionTest CandidateInstantiationTest)
   if(TARGET ${_llk_tool})
     list(APPEND _llk_check_deps ${_llk_tool})
   endif()

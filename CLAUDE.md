@@ -28,11 +28,13 @@ ctest -R MicroDialectTileOps     # Run a single FileCheck test
 ./bin/LLKMappingTests --gtest_filter=MappingPlan.*  # Run selected GTest cases
 ```
 
-Root `CMakeLists.txt` builds libraries/tools; `test/CMakeLists.txt` and category subdirectories build one `LLK<Category>Tests` binary per category, with individual CTest cases. FileCheck/verifier registrations live in `test/FileCheck.cmake`; libraries go to `build/lib`, all executables to `build/bin`. `BUILD_TESTING=OFF` disables tests and GoogleTest; `LLK_BUILD_E2E_TESTS=OFF` omits JIT execution tests.
+Root `CMakeLists.txt` orchestrates `cmake/LLK*.cmake` (compiler, dependencies, build options, version, TableGen), `lib/`, `runtime/`, and `tools/`; each library directory declares its own targets; `test/CMakeLists.txt` and category subdirectories build one `LLK<Category>Tests` binary per category, with individual CTest cases. FileCheck/verifier registrations live in `test/FileCheck.cmake`; libraries go to `build/lib`, all executables to `build/bin`. `BUILD_TESTING=OFF` disables tests and GoogleTest; `LLK_BUILD_E2E_TESTS=OFF` omits JIT execution tests.
 
 Configure writes a compilation database to `build/compile_commands.json` for clangd and other editors; pass `-DCMAKE_EXPORT_COMPILE_COMMANDS=OFF` to suppress it.
 
 The compiler is the `clang` on `PATH` — on macOS that is Homebrew's clang, not the Apple toolchain at `/usr/bin/cc`. `CMakeLists.txt` drops an **absolute** `CC`/`CXX` that names a missing file (typically a `brew --prefix llvm@NN` path left behind after the keg was uninstalled) and prints an `Ignoring ...` status line rather than aborting. Bare names such as `CC=gcc` are left alone. Both the fallback and the compiler search apply only to a fresh build tree: a `build/` that already cached a compiler keeps it, so `rm -rf build` before reconfiguring whenever the toolchain changes.
+
+`LLVM_PROJECT_BUILD_DIR` is mandatory. CMake loads LLVM/MLIR packages only from this build, replacing stale `LLVM_DIR`/`MLIR_DIR` cache entries. Header paths (including source headers outside the build tree) come from those packages; TableGen and FileCheck come from that build's exported tool directory (including configuration-specific paths). Link LLVM/MLIR through the monolithic shared `LLVM` and `MLIR` targets, never LLVM component archives. Configure LLVM with `-DLLVM_BUILD_LLVM_DYLIB=ON -DLLVM_LINK_LLVM_DYLIB=ON -DLLVM_DYLIB_COMPONENTS=all -DMLIR_LINK_MLIR_DYLIB=ON`.
 
 CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned LLVM source, so the full registered suite runs. Local LLVM builds must use `-DLLVM_BUILD_UTILS=ON`; configuration fails when `LLK_BUILD_TOOLS=ON` and a matching `FileCheck` is unavailable. `check-llk` is a thin wrapper over CTest, so it runs exactly the registered suite — run it locally before trusting a change.
 
@@ -70,7 +72,7 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 
 **Gotcha — adding a MachineModel field:** give it a default member initializer (e.g. `std::vector<std::string> equivalentTo{};`) or every aggregate test literal emits `-Wmissing-field-initializers`. The loader preserves the minor version (`MachineModel::schemaMinor`) and tolerates *unknown keys only when the file declares a minor greater than `kSupportedSchemaMinor`*; missing required keys, wrong node types, malformed values, and unknown kinds are always rejected. `schemaMinor` is excluded from the content hash.
 
-**Gotcha — compiler version is generated:** `CMakeLists.txt` does `configure_file(include/LLK/Version.h.in → ${CMAKE_BINARY_DIR}/include/LLK/Version.h)` producing `LLK_COMPILER_VERSION` from the project version plus `git describe`. The plan report prints it; there is no hand-written version constant.
+**Gotcha — compiler version is generated:** `cmake/LLKVersion.cmake` does `configure_file(include/LLK/Version.h.in → ${CMAKE_BINARY_DIR}/include/LLK/Version.h)` producing `LLK_COMPILER_VERSION` from the project version plus `git describe`. The plan report prints it; there is no hand-written version constant.
 
 **Schedules and search choices are data:** persistent MicroIR search spaces/bindings and selected plans are the framework contract. The existing CPU contraction adapter also uses Transform dialect `.mlir` files or `schedule_db.json`, keyed by `(operation, M_bucket, N, K, dtype, ISA, math_mode)` with five M-buckets: {1}, [2,4], [5,16], [17,64], ≥65. These fields are example-specific; future workloads need capability-appropriate parameter schemas.
 
@@ -82,7 +84,7 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 - ABI: the established CPU wrapper uses `Tensor2D`/`KernelContext`; mapped execution uses typed `InvocationBuffer2D` carrying a `MemRef2D` descriptor, dtype and backing allocation size. Prefer the typed invocation API; the deprecated untagged descriptor overload cannot check dtype or allocation bounds. Caller buffers remain caller-owned; compiler scratch is released per invocation.
 - TDD: every task starts with a failing test, then minimal code; commit per task
 - FileCheck tests are plain `add_test` entries in `test/FileCheck.cmake` — there is no lit runner, and `// RUN:` lines are comments only. Register new `.mlir` tests by hand with `add_llk_filecheck_test(Name test/Dialect/Micro/foo.mlir)` (an optional trailing argument is passed through to the tool, e.g. pass options), or use a raw `add_test` with `--verify-diagnostics --split-input-file` for invalid-IR tests
-- Mapping/target boundary: generic `lib/Mapping` + `lib/Machine` stay target-neutral; target policy is data (`mapping/*.llkmap`, `machines/*.yaml`). `LLKMapping` takes `-fno-rtti -fno-exceptions` and links only `LLVMSupport`/`LLKMachine` (+ `MLIRIR`/`MLIRAsmParser` via `mlir_target_link_libraries`)
+- Mapping/target boundary: generic `lib/Mapping` + `lib/Machine` stay target-neutral; target policy is data (`mapping/*.llkmap`, `machines/*.yaml`). `LLKMapping` links `LLKMachine` plus shared `LLVM`/`MLIR`; `LLKBuildOptions` matches the LLVM build's RTTI/exception settings for all project targets
 
 ## Milestone Sequence
 

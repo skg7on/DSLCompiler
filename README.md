@@ -66,7 +66,7 @@ The [developer manual](https://skg7on.github.io/DSLCompiler/) is the main docume
 
 ## Build
 
-You need Git, a C++20 compiler, CMake 3.20+, Ninja, Python 3, and a matching LLVM/MLIR development build with headers, CMake packages, TableGen, and FileCheck. CI pins LLVM **22.1.8**. See [setup instructions](docs/manual/source/getting-started.rst) for building LLVM with `LLVM_BUILD_UTILS=ON` and troubleshooting.
+You need Git, a C++20 compiler, CMake 3.20+, Ninja, Python 3, and a matching LLVM/MLIR development build with headers, CMake packages, TableGen, and FileCheck. CI pins LLVM **22.1.8**. See [setup instructions](docs/manual/source/getting-started.rst) for building LLVM with shared LLVM/MLIR libraries and `LLVM_BUILD_UTILS=ON`. Configure LLVM with `LLVM_BUILD_LLVM_DYLIB=ON`, `LLVM_LINK_LLVM_DYLIB=ON`, `LLVM_DYLIB_COMPONENTS=all`, and `MLIR_LINK_MLIR_DYLIB=ON`.
 
 Use an isolated worktree, as required by the [repository policy](.claude/rules/worktree-isolation.md):
 
@@ -85,7 +85,7 @@ cmake --build build --parallel 4
 cmake --build build --target check-llk --parallel 4
 ```
 
-Each worktree needs its own project build directory; the LLVM build can be shared. `check-llk` builds the registered tests and runs CTest.
+`LLVM_PROJECT_BUILD_DIR` is required and supplies all LLVM/MLIR package, header, tool, and library paths. The project links the monolithic shared `LLVM` and `MLIR` targets. Each worktree needs its own project build directory; the LLVM build can be shared. `check-llk` builds the registered tests and runs CTest.
 
 Libraries are written to `build/lib`; tools and category test executables are written to `build/bin`. Test configuration lives under [`test/`](test/CMakeLists.txt), with GTest sources combined by category and individual cases labeled in CTest. For example, run mapping tests with `ctest --test-dir build -L Mapping --output-on-failure` or `build/bin/LLKMappingTests --gtest_filter='MappingPlan.*'`.
 

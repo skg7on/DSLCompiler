@@ -121,7 +121,10 @@ Components and ownership
      - JIT lifetime, descriptor invocation, cache, packed weights and thread pool
      - :source:`runtime <runtime>`, :source:`MappedExecutable.h <include/LLK/Runtime/MappedExecutable.h>`
 
-Root :source:`CMakeLists.txt <CMakeLists.txt>` owns most library and test registrations.
+Root :source:`CMakeLists.txt <CMakeLists.txt>` orchestrates the build.
+Shared setup lives in :source:`cmake/ <cmake>`; library definitions live beside
+their sources, tools in :source:`tools/CMakeLists.txt <tools/CMakeLists.txt>`,
+and test registrations in :source:`test/ <test/CMakeLists.txt>`.
 The tools are integration drivers: :doc:`compiler </tools/compiler>`,
 :doc:`optimizer </tools/optimizer>`, :doc:`performance analyzer </tools/performance>`,
 :doc:`tuner </tools/tuning>`, and :doc:`benchmark </tools/benchmark>`.

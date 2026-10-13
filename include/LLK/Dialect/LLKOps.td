@@ -214,7 +214,8 @@ def LLK_MatmulOp : LLK_Op<"matmul", [
     let summary = "Generic batched matmul fallback";
     let description = [{
         Generic matrix multiplication — fallback when no fusion pattern
-        matches. Lowered identically to linalg.matmul by LLKToLinalg.
+        matches. LLKToLinalg lowers this to linalg.matmul with the declared
+        accumulator type, initialized destination and result element type.
     }];
 
     let arguments = (ins
