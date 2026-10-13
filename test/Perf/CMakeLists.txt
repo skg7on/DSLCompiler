@@ -16,7 +16,7 @@ add_llk_test_category(Perf
         LLKMapping
         LLKMicroMapping
         LLKMappedCompilation
-        ${LLK_MLIR_EXEC_LIBS}
+        LLK::MLIR
     DEFINITIONS
         LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
     INCLUDE_DIRECTORIES
