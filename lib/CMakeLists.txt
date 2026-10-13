@@ -1,0 +1,13 @@
+# Define libraries from lower-level IR/data models to compiler integration.
+add_subdirectory(Dialect/LLK)
+add_subdirectory(Dialect/Micro)
+add_subdirectory(Machine)
+add_subdirectory(Mapping)
+add_subdirectory(Perf)
+add_subdirectory(Transforms)
+add_subdirectory(Target)
+add_subdirectory(Conversion/LLKToLinalg)
+add_subdirectory(Conversion/LLKToMicro)
+add_subdirectory(Conversion/MicroToLinalg)
+add_subdirectory(Conversion/MicroMapping)
+add_subdirectory(Conversion/TritonToLLK)
