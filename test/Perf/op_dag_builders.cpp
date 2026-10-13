@@ -120,7 +120,7 @@ TEST(OpDAGBuilders, InjectsTypedBuilderWithOwnedConfiguration) {
   auto builders = makeDefaultOpDAGBuilders();
   {
     auto name = std::string("owned");
-    ASSERT_FALSE(builders.registerBuilder<mlir::arith::ConstantOp>(
+    ASSERT_FALSE(builders.replaceBuilder<mlir::arith::ConstantOp>(
         eventBuilder(7, name)));
   }
   auto dag = buildMicroDAG(parsed->kernel, model, builders);
@@ -136,9 +136,9 @@ TEST(OpDAGBuilders, RegistriesRemainIndependentAndDefaultFallbackIsFree) {
   machine::MachineModel model;
   auto first = makeDefaultOpDAGBuilders();
   auto second = makeDefaultOpDAGBuilders();
-  ASSERT_FALSE(first.registerBuilder<mlir::arith::ConstantOp>(eventBuilder(7)));
+  ASSERT_FALSE(first.replaceBuilder<mlir::arith::ConstantOp>(eventBuilder(7)));
   ASSERT_FALSE(
-      second.registerBuilder<mlir::arith::ConstantOp>(eventBuilder(11)));
+      second.replaceBuilder<mlir::arith::ConstantOp>(eventBuilder(11)));
   auto a = buildMicroDAG(parsed->kernel, model, first);
   auto b = buildMicroDAG(parsed->kernel, model, second);
   auto fallback = buildMicroDAG(parsed->kernel, model);
@@ -156,7 +156,7 @@ TEST(OpDAGBuilders, HandlerErrorsPropagateAndDoNotPoisonLaterBuilds) {
   ASSERT_NE(parsed, nullptr);
   machine::MachineModel model;
   auto builders = makeDefaultOpDAGBuilders();
-  ASSERT_FALSE(builders.registerBuilder<mlir::arith::ConstantOp>(
+  ASSERT_FALSE(builders.replaceBuilder<mlir::arith::ConstantOp>(
       [](mlir::arith::ConstantOp op,
          OpDAGBuildContext &context) -> llvm::Error {
         context.emitEvent(MicroEvent{}, {}, op->getResults());
@@ -578,5 +578,115 @@ TEST(OpDAGBuilders, DeclaredCoverageAuditStrictAndLegacy) {
   ASSERT_FALSE(bool(refused));
   EXPECT_NE(llvm::toString(refused.takeError()).find("callback_partial"),
             std::string::npos);
+}
+} // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+TEST(OpDAGBuilders, AuditAcceptsIndexScaffoldingWithoutEvents) {
+  auto parsed = parseKernel(R"mlir(module { micro.kernel @indices {
+    %a = arith.constant 1 : index
+    %b = arith.addi %a, %a : index
+    %c = arith.muli %b, %a : index
+    micro.yield
+  } })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto builders = makeDefaultOpDAGBuilders();
+  auto dag = buildMicroDAG(parsed->kernel, machine::MachineModel{}, builders,
+                           DAGBuildOptions{});
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  EXPECT_TRUE(dag->events.empty());
+  EXPECT_TRUE(dag->incompleteReasons.empty());
+  for (auto name : {"arith.constant", "arith.addi", "arith.muli"})
+    EXPECT_EQ(builders.classification(name), DAGLeafKind::ZeroCost);
+}
+TEST(OpDAGBuilders, DataArithmeticIsNotControlScaffolding) {
+  auto parsed = parseKernel(R"mlir(module { micro.kernel @data {
+    %a = arith.constant 1 : i32
+    %b = arith.addi %a, %a : i32
+    %c = arith.muli %b, %a : i32
+    %v = arith.constant dense<1> : vector<2xindex>
+    %w = arith.addi %v, %v : vector<2xindex>
+    %f = arith.constant 1.0 : f32
+    %g = arith.addf %f, %f : f32
+    micro.yield
+  } })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto dag = buildMicroDAG(parsed->kernel, machine::MachineModel{},
+                           makeDefaultOpDAGBuilders(), DAGBuildOptions{});
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  EXPECT_EQ(dag->incompleteReasons,
+            (std::vector<std::string>{"unmodeled_leaf: arith.addi",
+                                      "unmodeled_leaf: arith.muli",
+                                      "unmodeled_leaf: arith.addf"}));
+}
+TEST(OpDAGBuilders, EmptyTensorMetadataDoesNotAllocateTileStorage) {
+  auto parsed = parseKernel(R"mlir(module { micro.kernel @metadata {
+    %empty = tensor.empty() : tensor<8x8xf32>
+    %allocation = micro.tile_alloc : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  } })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto dag = buildMicroDAG(parsed->kernel, loadModel(),
+                           makeDefaultOpDAGBuilders(), DAGBuildOptions{});
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  EXPECT_TRUE(dag->events.empty());
+  EXPECT_TRUE(dag->incompleteReasons.empty());
+  EXPECT_EQ(dag->liveTileBytesByMemory,
+            (std::map<std::string, uint64_t>{{"sram", 256}}));
+}
+TEST(OpDAGBuilders, TensorElementComputationRemainsUnsupported) {
+  auto parsed = parseKernel(R"mlir(module { micro.kernel @elements {
+    %empty = tensor.empty() : tensor<8xf32>
+    %i = arith.constant 0 : index
+    %x = tensor.extract %empty[%i] : tensor<8xf32>
+    %y = tensor.insert %x into %empty[%i] : tensor<8xf32>
+    micro.yield
+  } })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto dag = buildMicroDAG(parsed->kernel, machine::MachineModel{},
+                           makeDefaultOpDAGBuilders(), DAGBuildOptions{});
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  EXPECT_EQ(dag->incompleteReasons,
+            (std::vector<std::string>{"unmodeled_leaf: tensor.extract",
+                                      "unmodeled_leaf: tensor.insert"}));
+}
+TEST(OpDAGBuilders, AuditedLogicalViewsKeepProducerDependencies) {
+  auto parsed = parseKernel(R"mlir(module { micro.kernel @logical {
+    %ext = tensor.empty() : tensor<8x8xf32>
+    %a, %token = micro.async_copy %ext {src_memory = #micro.memory<dram>, dst_memory = #micro.memory<sram>} : tensor<8x8xf32> -> tensor<8x8xf32>, !micro.async_token
+    %v = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %part = micro.tile_partition %v {shape = array<i64: 8, 8>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %out = micro.vector "silu" %part : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.wait %token
+    micro.yield
+  } })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto dag = buildMicroDAG(parsed->kernel, loadModel(),
+                           makeDefaultOpDAGBuilders(), DAGBuildOptions{});
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  EXPECT_TRUE(dag->incompleteReasons.empty());
+  ASSERT_EQ(dag->events.size(), 3u);
+  EXPECT_EQ(dag->events[1].deps, (std::vector<uint32_t>{0}));
+  EXPECT_EQ(dag->liveTileBytesByMemory.at("sram"), 256u);
+}
+TEST(OpDAGBuilders, AuditedPhysicalPartitionChargesWorkTrafficAndStorage) {
+  auto parsed = parseKernel(R"mlir(module { micro.kernel @physical {
+    %buf = micro.tile_alloc : !micro.tile<32x32xbf16, memory = #micro.memory<sram>, layout = #micro.layout<row_major>>
+    %t = micro.vector "silu" %buf : !micro.tile<32x32xbf16, memory = #micro.memory<sram>, layout = #micro.layout<row_major>> -> !micro.tile<32x32xbf16, memory = #micro.memory<sram>, layout = #micro.layout<row_major>>
+    %frag = micro.tile_partition %t {shape = array<i64: 16, 16>} : !micro.tile<32x32xbf16, memory = #micro.memory<sram>, layout = #micro.layout<row_major>> -> !micro.tile<16x16xbf16, memory = #micro.memory<sram>, layout = #micro.layout<vectorized, vector = 8>>
+    micro.yield
+  } })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto dag = buildMicroDAG(parsed->kernel, loadModel(),
+                           makeDefaultOpDAGBuilders(), DAGBuildOptions{});
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  EXPECT_TRUE(dag->incompleteReasons.empty());
+  ASSERT_EQ(dag->events.size(), 2u);
+  EXPECT_EQ(dag->events[1].kind, EventKind::TilePartition);
+  EXPECT_GT(dag->events[1].minCycles, 0u);
+  EXPECT_GT(dag->events[1].bytes, 0u);
+  EXPECT_GT(dag->events[1].workItems, 0u);
+  EXPECT_EQ(dag->events[1].deps, (std::vector<uint32_t>{0}));
+  EXPECT_GT(dag->liveTileBytesByMemory.at("sram"), 2048u);
 }
 } // namespace mlir::llk::perf

@@ -398,6 +398,36 @@ llvm::Error buildBarrier(micro::BarrierOp barrier, OpDAGBuildContext &context) {
 } // namespace
 OpDAGBuilderRegistry makeDefaultOpDAGBuilders() {
   OpDAGBuilderRegistry builders;
+  // Immutable compile-time values do not issue hardware work.
+  auto constant = [](mlir::Operation &, OpDAGBuildContext &) {
+    return llvm::Error::success();
+  };
+  // Only scalar index arithmetic is control scaffolding. Integer/vector data
+  // arithmetic must still report missing modeling coverage.
+  auto indexOnly = [](mlir::Operation &op, OpDAGBuildContext &context) {
+    if (op.getNumResults() != 1 || !op.getResult(0).getType().isIndex() ||
+        op.getNumOperands() != 2 ||
+        !llvm::all_of(op.getOperandTypes(),
+                      [](mlir::Type type) { return type.isIndex(); }))
+      context.noteIncomplete("unmodeled_leaf: " +
+                             op.getName().getStringRef().str());
+    return llvm::Error::success();
+  };
+  // tensor.empty describes shape with unspecified contents, without storage.
+  // Canonical materialized storage is accounted by micro.{tile_alloc,alloc};
+  // copies and physical layout changes retain their existing charged handlers.
+  auto emptyTensor = [](mlir::Operation &op, OpDAGBuildContext &context) {
+    if (op.getNumResults() != 1 ||
+        !llvm::isa<mlir::RankedTensorType>(op.getResult(0).getType()) ||
+        !llvm::all_of(op.getOperandTypes(),
+                      [](mlir::Type type) { return type.isIndex(); }))
+      context.noteIncomplete("unmodeled_leaf: tensor.empty");
+    return llvm::Error::success();
+  };
+  llvm::cantFail(builders.registerZeroCost("arith.constant", constant));
+  llvm::cantFail(builders.registerZeroCost("arith.addi", indexOnly));
+  llvm::cantFail(builders.registerZeroCost("arith.muli", indexOnly));
+  llvm::cantFail(builders.registerZeroCost("tensor.empty", emptyTensor));
   llvm::cantFail(builders.registerBuilder<micro::TileViewOp>(buildTileView));
   llvm::cantFail(
       builders.registerBuilder<micro::TilePartitionOp>(buildTilePartition));

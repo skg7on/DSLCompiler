@@ -19,8 +19,10 @@
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Dialect/Micro/MicroEnums.h"
+#include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Perf/CandidateBinding.h"
 #include "LLK/Perf/CandidateGenerator.h"
+#include "LLK/Perf/OpDAGBuilder.h"
 #include "LLK/Perf/SearchSpace.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -42,6 +44,7 @@
 #define GET_OP_CLASSES
 #include "LLK/Dialect/Micro/MicroOps.h.inc"
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <string>
@@ -243,6 +246,27 @@ TEST(CandidateBinding, ClampsATileToTheProblemExtent) {
 // Emitted IR
 //===----------------------------------------------------------------------===//
 
+TEST(CandidateBinding, AuditedMatmulAndSwiGLUScaffoldingIsComplete) {
+  auto model = machine::loadMachineModel(std::string(LLK_MACHINE_DIR) +
+                                         "/x86-avx2-v2.yaml");
+  ASSERT_TRUE(bool(model)) << llvm::toString(model.takeError());
+  for (auto workload : {"matmul", "fused_swiglu"}) {
+    SCOPED_TRACE(workload);
+    auto space = swigluSpace();
+    space.workload = workload;
+    auto scratch = makeScratch();
+    auto bound = bindCandidateToMicroKernel(scratch->module.get(), space,
+                                            preferred(), swigluShape());
+    ASSERT_TRUE(bool(bound)) << llvm::toString(bound.takeError());
+    auto dag = buildMicroDAG(onlyKernel(scratch->module.get()), *model,
+                             makeDefaultOpDAGBuilders(), DAGBuildOptions{});
+    ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+    EXPECT_TRUE(dag->incompleteReasons.empty());
+    EXPECT_FALSE(dag->events.empty());
+    EXPECT_FALSE(dag->liveTileBytesByMemory.empty());
+  }
+}
+
 TEST(CandidateBinding, EmitsExactlyOneConcreteKernel) {
   SearchSpace space = swigluSpace();
   Candidate candidate = preferred();
@@ -321,6 +345,17 @@ TEST(CandidateBinding, PadsTailInputsAndRestrictsTheOutputPartition) {
   ASSERT_TRUE(lhsType);
   EXPECT_EQ(lhsType.getShape(), (ArrayRef<int64_t>{5, 7}));
   EXPECT_EQ(countOps<tensor::PadOp>(scratch->module.get()), 3u);
+  // Padding creates data; it is not zero-cost control/shape scaffolding.
+  auto model = machine::loadMachineModel(std::string(LLK_MACHINE_DIR) +
+                                         "/x86-avx2-v2.yaml");
+  ASSERT_TRUE(bool(model)) << llvm::toString(model.takeError());
+  auto dag = buildMicroDAG(kernel, *model, makeDefaultOpDAGBuilders(),
+                           DAGBuildOptions{});
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  EXPECT_NE(std::find(dag->incompleteReasons.begin(),
+                      dag->incompleteReasons.end(),
+                      "unmodeled_leaf: tensor.pad"),
+            dag->incompleteReasons.end());
 
   bool sawValidTail = false;
   scratch->module.get().walk([&](micro::TilePartitionOp partition) {
