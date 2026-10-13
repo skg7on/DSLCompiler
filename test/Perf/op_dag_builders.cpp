@@ -434,9 +434,12 @@ module { micro.kernel @context {
         }
         return llvm::Error::success();
       }));
-  ASSERT_FALSE(builders.registerBuilder<mlir::arith::AddIOp>(
-      [](mlir::arith::AddIOp op, OpDAGBuildContext &context) {
-        context.aliasValue(op.getResult(), op.getLhs());
+  ASSERT_FALSE(builders.registerZeroCost(
+      "arith.addi", [](mlir::Operation &op, OpDAGBuildContext &context) {
+        context.aliasValue(op.getResult(0), op.getOperand(0));
+        context.accountStorage("sram", 8);
+        context.noteWarning("custom_alias_limitation");
+        context.noteIncomplete("custom_alias_limitation");
         return llvm::Error::success();
       }));
   ASSERT_FALSE(builders.registerBuilder<mlir::arith::MulIOp>(
@@ -449,7 +452,10 @@ module { micro.kernel @context {
   ASSERT_EQ(dag->events.size(), 4u);
   EXPECT_EQ(dag->events[1].deps, (std::vector<uint32_t>{0}));
   EXPECT_EQ(dag->events[3].deps, (std::vector<uint32_t>{2}));
-  EXPECT_EQ(dag->liveTileBytesByMemory.at("sram"), 192u);
+  EXPECT_EQ(dag->liveTileBytesByMemory.at("sram"), 216u);
+  EXPECT_EQ(builders.classification("arith.addi"), DAGLeafKind::ZeroCost);
+  EXPECT_EQ(dag->incompleteReasons,
+            (std::vector<std::string>{"custom_alias_limitation"}));
 }
 } // namespace mlir::llk::perf
 
@@ -517,5 +523,60 @@ TEST(OpDAGBuilders, DefaultMmaExtractionMatchesInjectedDefaults) {
     EXPECT_EQ(injected->events[4].kind, EventKind::Store);
     EXPECT_EQ(injected->events[4].deps, (std::vector<uint32_t>{3}));
   }
+}
+} // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+TEST(OpDAGBuilders, DeclaredCoverageAuditStrictAndLegacy) {
+  auto parsed = parseKernel(R"mlir(module { micro.kernel @coverage {
+    %a = arith.constant 1.0 : f32
+    %b = arith.addf %a, %a : f32
+    %c = arith.addf %b, %a : f32
+    micro.yield
+  } })mlir");
+  ASSERT_NE(parsed, nullptr);
+  OpDAGBuilderRegistry builders;
+  ASSERT_FALSE(builders.registerZeroCost("arith.constant", noEvent));
+  EXPECT_EQ(builders.classification("arith.constant"), DAGLeafKind::ZeroCost);
+  ASSERT_FALSE(builders.replaceBuilder("arith.constant", noEvent));
+  EXPECT_EQ(builders.classification("arith.constant"), DAGLeafKind::ZeroCost);
+  EXPECT_FALSE(builders.classification("arith.addf"));
+  auto audit = buildMicroDAG(parsed->kernel, machine::MachineModel{}, builders,
+                             DAGBuildOptions{});
+  ASSERT_TRUE(bool(audit)) << llvm::toString(audit.takeError());
+  EXPECT_EQ(audit->incompleteReasons,
+            (std::vector<std::string>{"unmodeled_leaf: arith.addf"}));
+  auto strict = buildMicroDAG(parsed->kernel, machine::MachineModel{}, builders,
+                              DAGBuildOptions{CoverageMode::Strict});
+  ASSERT_FALSE(bool(strict));
+  EXPECT_NE(llvm::toString(strict.takeError()).find("arith.addf"),
+            std::string::npos);
+  auto legacy =
+      buildMicroDAG(parsed->kernel, machine::MachineModel{}, builders);
+  ASSERT_TRUE(bool(legacy));
+  EXPECT_TRUE(legacy->incompleteReasons.empty());
+  ASSERT_FALSE(builders.registerBuilder("arith.addf", noEvent));
+  EXPECT_EQ(builders.classification("arith.addf"), DAGLeafKind::Modeled);
+  auto complete =
+      buildMicroDAG(parsed->kernel, machine::MachineModel{}, builders,
+                    DAGBuildOptions{CoverageMode::Strict});
+  ASSERT_TRUE(bool(complete)) << llvm::toString(complete.takeError());
+  EXPECT_TRUE(complete->events.empty());
+  ASSERT_FALSE(builders.replaceBuilder(
+      "arith.addf", [](mlir::Operation &, OpDAGBuildContext &context) {
+        context.noteWarning("callback_partial");
+        context.noteIncomplete("callback_partial");
+        return llvm::Error::success();
+      }));
+  auto partial = buildMicroDAG(parsed->kernel, machine::MachineModel{},
+                               builders, DAGBuildOptions{});
+  ASSERT_TRUE(bool(partial));
+  EXPECT_EQ(partial->incompleteReasons,
+            (std::vector<std::string>{"callback_partial"}));
+  auto refused = buildMicroDAG(parsed->kernel, machine::MachineModel{},
+                               builders, DAGBuildOptions{CoverageMode::Strict});
+  ASSERT_FALSE(bool(refused));
+  EXPECT_NE(llvm::toString(refused.takeError()).find("callback_partial"),
+            std::string::npos);
 }
 } // namespace mlir::llk::perf

@@ -57,6 +57,10 @@ class Operation;
 namespace mlir::llk::perf {
 
 class OpDAGBuilderRegistry;
+enum class CoverageMode { LegacyPermissive, Audit, Strict };
+struct DAGBuildOptions {
+  CoverageMode coverage = CoverageMode::Audit;
+};
 
 /// Upper bound on unrolled events. Reached only by kernels far outside the MVP
 /// scope; exceeding it is reported as an error so a cycle estimate is never
@@ -219,6 +223,12 @@ buildMicroDAG(mlir::Operation *kernel, const machine::MachineModel &machine,
 llvm::Expected<MicroDAG>
 buildMicroDAG(mlir::Operation *kernel, const machine::MachineModel &machine,
               const OpDAGBuilderRegistry &builders,
+              const MeasuredOverrides *measured = nullptr);
+
+llvm::Expected<MicroDAG>
+buildMicroDAG(mlir::Operation *kernel, const machine::MachineModel &machine,
+              const OpDAGBuilderRegistry &builders,
+              const DAGBuildOptions &options,
               const MeasuredOverrides *measured = nullptr);
 
 /// The normalized view of one DAG event (task B8): the same

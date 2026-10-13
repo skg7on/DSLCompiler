@@ -16,6 +16,7 @@ namespace mlir::llk::perf {
 /// Non-copyable facade valid only for the duration of one handler invocation.
 /// Graph insertion, traversal state, producers and allocation accounting remain
 /// core-owned. Handlers must not retain this context or mutate the IR.
+enum class DAGLeafKind { Modeled, ZeroCost };
 class OpDAGBuildContext {
 public:
   virtual ~OpDAGBuildContext() = default;
@@ -34,6 +35,7 @@ public:
   virtual std::string memoryOf(mlir::Value value) const = 0;
   virtual void accountStorage(llvm::StringRef memory, uint64_t bytes) = 0;
   virtual void noteUnsizable(const TileInfo &info) = 0;
+  virtual void noteIncomplete(std::string reason) = 0;
   virtual void noteWarning(std::string message) = 0;
   virtual void noteLayoutUsage(llvm::StringRef engine,
                                const std::vector<std::string> &supported,
@@ -74,6 +76,8 @@ public:
   using Callback =
       std::function<llvm::Error(mlir::Operation &, OpDAGBuildContext &)>;
   llvm::Error registerBuilder(llvm::StringRef name, Callback callback);
+  llvm::Error registerZeroCost(llvm::StringRef name, Callback callback);
+  std::optional<DAGLeafKind> classification(llvm::StringRef name) const;
   llvm::Error replaceBuilder(llvm::StringRef name, Callback callback);
   const Callback *lookup(llvm::StringRef name) const;
   template <typename OpT, typename Fn> llvm::Error registerBuilder(Fn fn) {
@@ -100,7 +104,11 @@ private:
       return fn(typedOp, context);
     };
   }
-  llvm::StringMap<Callback> builders;
+  struct Entry {
+    Callback callback;
+    DAGLeafKind kind;
+  };
+  llvm::StringMap<Entry> builders;
 };
 OpDAGBuilderRegistry makeDefaultOpDAGBuilders();
 } // namespace mlir::llk::perf

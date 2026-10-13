@@ -24,7 +24,7 @@ llvm::Error OpDAGBuilderRegistry::registerBuilder(llvm::StringRef name,
     return error;
   if (builders.count(name))
     return invalid("duplicate operation builder for '" + name + "'");
-  builders.try_emplace(name, std::move(callback));
+  builders.try_emplace(name, Entry{std::move(callback), DAGLeafKind::Modeled});
   return llvm::Error::success();
 }
 llvm::Error OpDAGBuilderRegistry::replaceBuilder(llvm::StringRef name,
@@ -34,12 +34,26 @@ llvm::Error OpDAGBuilderRegistry::replaceBuilder(llvm::StringRef name,
   auto found = builders.find(name);
   if (found == builders.end())
     return invalid("no operation builder to replace for '" + name + "'");
-  found->second = std::move(callback);
+  found->second.callback = std::move(callback);
   return llvm::Error::success();
 }
 const OpDAGBuilderRegistry::Callback *
 OpDAGBuilderRegistry::lookup(llvm::StringRef name) const {
   auto found = builders.find(name);
-  return found == builders.end() ? nullptr : &found->second;
+  return found == builders.end() ? nullptr : &found->second.callback;
+}
+llvm::Error OpDAGBuilderRegistry::registerZeroCost(llvm::StringRef name,
+                                                   Callback callback) {
+  if (auto error = registerBuilder(name, std::move(callback)))
+    return error;
+  builders.find(name)->second.kind = DAGLeafKind::ZeroCost;
+  return llvm::Error::success();
+}
+std::optional<DAGLeafKind>
+OpDAGBuilderRegistry::classification(llvm::StringRef name) const {
+  auto found = builders.find(name);
+  if (found == builders.end())
+    return std::nullopt;
+  return found->second.kind;
 }
 } // namespace mlir::llk::perf
