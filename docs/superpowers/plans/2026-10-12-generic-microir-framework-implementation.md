@@ -167,3 +167,33 @@ build/docs-venv/bin/python -m sphinx -b html -n -W --keep-going \
 ## 7. Plan self-review
 
 The four child plans cover spec §§3–5's artifact, extension and search contracts and §7's acceptance matrix. Spec §6's broader runtime/frontend/hardware scope is represented by explicit capability rejection and the bounded future-design gates in §4 above. The new contracts below do not claim complete DNN-model import, arbitrary source transformations or hardware execution for every topology. Review-focus cases are assigned to named tasks; proposed APIs are distinguished from current APIs, and all source registrations use the audited root CMake structure.
+
+## 8. GitHub implementation tracking
+
+Created on **2026-10-13**: architecture tracker [#145](https://github.com/skg7on/DSLCompiler/issues/145) owns 19 native sub-issues, one per task below. Each issue includes its codebase gap, deliverable, acceptance criteria, validation evidence and explicit scope bounds. GitHub blocked-by relationships mirror the direct prerequisites in this table; transitive prerequisites are omitted. Issue state and implementation evidence live in GitHub.
+
+| Task | Independently deliverable issue | Direct prerequisites |
+|---|---|---|
+| A1 | [#146 — Declared leaf interpretation coverage](https://github.com/skg7on/DSLCompiler/issues/146) | None |
+| A2 | [#147 — Control and logical scaffolding coverage](https://github.com/skg7on/DSLCompiler/issues/147) | A1 |
+| A3 | [#148 — Shared analysis/report completeness](https://github.com/skg7on/DSLCompiler/issues/148) | A2 |
+| A4 | [#149 — Complete analysis before top-K](https://github.com/skg7on/DSLCompiler/issues/149) | A3 |
+| B1 | [#150 — Rank-neutral workload contract](https://github.com/skg7on/DSLCompiler/issues/150) | None |
+| B2 | [#151 — Exact direct non-contraction MicroIR](https://github.com/skg7on/DSLCompiler/issues/151) | A4, B1 |
+| B3 | [#152 — Adapter dispatch and realized bindings](https://github.com/skg7on/DSLCompiler/issues/152) | B2 |
+| B4 | [#153 — Contraction compatibility adapter](https://github.com/skg7on/DSLCompiler/issues/153) | B3 |
+| B5 | [#154 — Bounded Linalg elementwise adapter](https://github.com/skg7on/DSLCompiler/issues/154) | B4 |
+| B6 | [#155 — Realized tiled mapped search](https://github.com/skg7on/DSLCompiler/issues/155) | B5 |
+| B7 | [#156 — Generic CLI, replay and numerical acceptance](https://github.com/skg7on/DSLCompiler/issues/156) | B6 |
+| C1 | [#157 — Stage-specific capability receipts](https://github.com/skg7on/DSLCompiler/issues/157) | B7 |
+| C2 | [#158 — Movement/storage/resource conformance](https://github.com/skg7on/DSLCompiler/issues/158) | C1 |
+| C3 | [#159 — Vector composition, reduction and target coverage](https://github.com/skg7on/DSLCompiler/issues/159) | C2 |
+| C4 | [#160 — Target extension and published acceptance](https://github.com/skg7on/DSLCompiler/issues/160) | C3 |
+| D1 | [#161 — Verified measurement record schema](https://github.com/skg7on/DSLCompiler/issues/161) | None |
+| D2 | [#162 — Atomic exact measurement store](https://github.com/skg7on/DSLCompiler/issues/162) | D1 |
+| D3 | [#163 — Optional verified persistence/reuse](https://github.com/skg7on/DSLCompiler/issues/163) | D2, C4 |
+| D4 | [#164 — Held-out prediction validation](https://github.com/skg7on/DSLCompiler/issues/164) | D3 |
+
+A1, B1 and D1 can start independently. B1/D1 schema delivery can prepare before the dependent increment's integration; generic integration still follows the A→B→C→D release gates in §2. The recommended first compiler PR is A1–A4. Keep implementation PRs separate from documentation PR #144.
+
+Existing [#51](https://github.com/skg7on/DSLCompiler/issues/51) retains measurement-workflow acceptance, [#52](https://github.com/skg7on/DSLCompiler/issues/52) retains record/report acceptance, and [#53](https://github.com/skg7on/DSLCompiler/issues/53) retains workflow documentation/test acceptance. Their bodies link the relevant new implementation slices; none was closed by creating these issues. Earlier roadmap [#41](https://github.com/skg7on/DSLCompiler/issues/41) links the architecture tracker. [#138](https://github.com/skg7on/DSLCompiler/issues/138)/PR #142 remains optional reuse work for B4 rather than a new hard prerequisite.
