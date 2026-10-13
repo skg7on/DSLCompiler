@@ -146,8 +146,8 @@ ScheduleEntry selectBestSchedule(const std::vector<ScheduleEntry> &matches,
   }
 
   // All entries from loadScheduleDB already match M_bucket.
-  // Return the first match; a fuller implementation would
-  // compare N and K against the entry values for exact fit.
+  // N and K are accepted but currently unused for filtering or ranking.
+  // Both consumers pass the actual contraction dimensions.
   return matches.front();
 }
 

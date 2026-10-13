@@ -1,6 +1,6 @@
 # Operator-Kernel Lowering Framework Design
 
-**Status:** Draft for review
+**Status:** Implementation refinements approved 2026-10-11
 **Date:** 2026-10-11
 **Scope:** `lib/Conversion/` (LLK→Linalg, LLK→Micro) and the two Transforms passes that consume the same per-op facts
 **Parent roadmap:** [Canonical DNN Micro-IR roadmap](https://github.com/skg7on/DSLCompiler/issues/41)
@@ -212,6 +212,8 @@ struct MicroKernelFragment {
   /// MMA/accumulator arms. Each arm after the first is a separate tile the
   /// epilogue combines; llk.fused_swiglu has 2, llk.matmul has 1.
   unsigned armCount = 1;
+  /// Matmul stages its caller-provided initialized destination.
+  bool hasOutputInit = false;
   /// External operand types in signature order, `armCount` entries, normally
   /// [K, N]. The shared lhs ([M, K]) is implied and supplied by the driver.
   SmallVector<Type> rhsOperandTypes;
@@ -220,7 +222,7 @@ struct MicroKernelFragment {
   /// Builds the elementwise epilogue from the accumulated arms, in accumulator
   /// element type. The driver emits the accumulator→output convert afterwards,
   /// uniformly for every operator.
-  function_ref<Value(OpBuilder &, Location, ArrayRef<Value> accumulators)>
+  std::function<Value(OpBuilder &, Location, ArrayRef<Value> accumulators)>
       buildEpilogue;
 };
 
@@ -544,3 +546,37 @@ than requested.
 6. CI is green, including the static link.
 7. No deprecated MLIR/LLVM API is introduced; the libraries still build under
    `-fno-rtti -fno-exceptions`.
+
+## 12. Approved implementation refinements (2026-10-11)
+
+Review of baseline `fb99595` found additional compatibility requirements. The
+implementation plan records the approved amendments:
+
+- `linalg.matmul` is already a supported Micro source. An explicitly registered
+  `LinalgMatmul.cpp` adapter preserves its export and source-root ordinal behavior.
+  It is Micro-only; transforms continue to consider only the `llk` namespace.
+- Matmul exports include a caller-provided init tensor and seed the accumulator
+  from it. `MicroKernelFragment::hasOutputInit` declares this independently of
+  arm count. Both Matmul adapters set it; SwiGLU does not.
+- Epilogues use an owning `std::function` because captured math mode must survive
+  return from the description hook. A non-owning function_ref cannot safely
+  express that lifetime.
+- `inferContract` describes dynamic shapes without imposing Micro restrictions.
+  Dynamic contracts have `mBucket = -1`; description hooks perform strict Micro
+  validation before emission. This preserves transform warnings/generic remarks.
+- Linalg collection preserves registration order and walk order within each
+  operator kind, collecting all roots before any mutation.
+- Byte equality is checked on complete captured Micro outputs; FileCheck alone
+  does not prove complete textual equality. Matmul Linalg conversion and the
+  generalized transform remarks remain the deliberate behavior changes in §5.
+
+The explicit populate anchor documents each registration's sink capabilities.
+Adding an operator requires its source file, build-source registration and one
+line in that anchor; conversion and transform drivers require no operator edits.
+
+The new Matmul Linalg hook honors `accumulator_type`: it promotes or converts
+the initialized destination, performs the reduction in that element type, and
+converts the completed result once to the declared output type. Directly using
+a bf16 destination for f32 accumulation changes the numerical contract. This
+refines the simplified §5.3 estimate; existing SwiGLU/RoPE/Attention lowerings
+remain unchanged.

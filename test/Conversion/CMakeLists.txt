@@ -1,9 +1,13 @@
 add_llk_test_category(Conversion
     SOURCES
+        LLKKernel/registry.cpp
+        LLKKernel/contract.cpp
+        LLKKernel/fragments.cpp
         MicroMapping/search_binding_loader.cpp
         MicroMapping/complete_plan_evaluation.cpp
         ../Mapping/resource_regression_fixture.cpp
     LIBRARIES
+        LLKKernel
         LLKMicroMapping
         MicroDialect
         LLK::MLIR

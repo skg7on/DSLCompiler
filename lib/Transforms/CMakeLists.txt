@@ -51,10 +51,10 @@ add_llk_library(LLKForallToOpenMP
 
 add_llk_library(LLKShapeSpecialization
     ShapeSpecialization.cpp
-    LINK_LIBRARIES LLKDialect LLK::MLIR
+    LINK_LIBRARIES LLKDialect LLKKernel LLK::MLIR
 )
 
 add_llk_library(LLKScheduleSelection
     ScheduleSelection.cpp
-    LINK_LIBRARIES LLKDialect LLK::MLIR
+    LINK_LIBRARIES LLKDialect LLKKernel LLK::MLIR
 )
