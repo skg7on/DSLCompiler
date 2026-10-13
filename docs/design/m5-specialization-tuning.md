@@ -1,6 +1,8 @@
 # Milestone 5: Specialization & Tuning
 
-**Parent:** [ARCHITECTURE.md](../../ARCHITECTURE.md) — See §4 Implementation Sequence
+**Scope alignment (2026-10-12):** This is a CPU validation milestone or frontend-adapter proposal within the [generic MicroIR-based DNN compiler framework](../superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md). SwiGLU, matmul, RoPE and attention are example workloads; operator-specific algorithms, schedule fields, ABI and performance criteria below apply to these fixtures rather than the whole framework. Original milestone status and design intent are retained as history.
+
+**Historical parent:** [CPU validation architecture](legacy-cpu-architecture.md) — See §4 Implementation Sequence
 **Previous:** [Milestone 4: Parallel Execution](m4-parallel-execution.md)
 **Next:** [Milestone 6: Multi-Kernel](m6-multi-kernel.md)
 **Status:** Design Approved | **Level:** Algorithm & Data Structure

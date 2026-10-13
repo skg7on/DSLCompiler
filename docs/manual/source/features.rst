@@ -3,8 +3,10 @@
 Features and current limits
 ===========================
 
-MicroIR provides a common representation for scheduled tensor kernels, declarative
-target mapping, and performance exploration. The established CPU compiler remains
+The project goal is a generic MicroIR-based, mapping- and search-based DNN compiler
+framework. Matmul and fused SwiGLU are example kernels used to validate reusable
+contracts. MicroIR provides a common representation for scheduled tensor kernels,
+declarative target mapping and performance exploration. The established CPU compiler remains
 available while the newer mapped path is being strengthened. Use this page to
 choose a workflow and understand what a successful run proves.
 
@@ -78,6 +80,11 @@ What you can do today
      - Generic accelerator topology, layouts, rules and mapping through the same canonical IR
      - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered
      - :doc:`Mapping tutorial </tutorials/02-mapping>`
+
+The broader goal does not imply arbitrary DNN support today. Semantic export and
+source-search templates remain contraction-shaped, and typed mapped invocation
+is rank-two. The :source:`framework design spec <docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md>`
+records these genericity gaps and capability-based acceptance requirements.
 
 The implemented operation inventory is
 :source:`MicroOps.td <include/LLK/Dialect/Micro/MicroOps.td>`. Broad operation lists in

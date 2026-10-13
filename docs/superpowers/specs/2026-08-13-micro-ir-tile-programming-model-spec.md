@@ -1,5 +1,7 @@
 # Micro-IR Tile Programming Model Spec
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This specifies the generic tile execution contract. Contraction and SwiGLU examples illustrate tile dataflow, mapping and schedule; target-specific and operator-specific details are validation fixtures rather than universal requirements.
+
 **Status:** Draft
 **Date:** 2026-08-13
 **Parent Spec:** [Canonical Micro-IR Redesign Spec](2026-08-11-canonical-micro-ir-redesign.md)

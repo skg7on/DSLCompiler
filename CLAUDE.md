@@ -8,7 +8,9 @@ See [.claude/rules/worktree-isolation.md](.claude/rules/worktree-isolation.md) f
 
 ## Project Overview
 
-An out-of-tree MLIR compiler centered on a canonical DNN **Micro-IR** (`micro` dialect) for AI-chipset performance evaluation and auto-scheduling. Semantic/structured IR lowers into `micro`, a hardware-near execution IR modeling compute engines, memory hierarchy, data movement, spatial mapping, pipeline overlap, synchronization, and tunable schedule choices. Intel AVX2 CPU is the first validation backend and machine profile — not the final scope.
+**Project goal: design a generic MicroIR-based, mapping- and search-based DNN compiler framework.** Matmul and fused SwiGLU are example operator kernels used to test the IR, mapping, search and lowering contracts; their operator-specific assumptions must not define shared framework interfaces.
+
+An out-of-tree MLIR compiler centered on a canonical DNN **Micro-IR** (`micro` dialect) for AI-chipset performance evaluation and auto-scheduling. Semantic/structured IR lowers into `micro`, a hardware-near execution IR modeling compute engines, memory hierarchy, data movement, spatial mapping, pipeline overlap, synchronization, and tunable schedule choices. Intel AVX2 CPU is the first executable validation backend and machine profile. The generic accelerator package supplies static mapping conformance. The [framework goal and design spec](docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project scope; the feature matrix and revision-pinned reviews govern delivered support.
 
 ## Build & Test
 
@@ -38,7 +40,9 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 
 ## Architecture
 
-**Two lowering paths from LLK/Linalg:**
+**Primary framework path:** semantic/structured input or directly authored MicroIR → source/schedule candidates → workload graph → mapping/covering search → complete-plan materialization and shared feasibility/analysis → selected bound MicroIR → target lowering/execution or performance reports. Current LLK semantic export covers matmul and fused SwiGLU; general structured/Linalg import remains future work.
+
+**Two implemented integration paths:**
 
 1. **CPU validation path** — Linalg → tiled/fused (scf.forall) → Vector SIMD → memref → CF+runtime → LLVM → ORC JIT → AVX2
 2. **Micro-IR path (M9+)** — `LLKToMicro` → `micro.search_space` (parametric) or concrete `micro.kernel` → target-aware mapping / shared static analysis / selected or reference lowering / ORC JIT
@@ -48,17 +52,17 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 
 **Primary `micro` value is a tile:** `Tile = (shape, dtype, layout, memory_space, owner)`. Four cost classes: *logical* (zero-cost views/slices/partitions), *memory* (materialized), *execution* (owner-mapped), *instruction fragment* (MMA/vector/DMA granularity). Concrete `micro.kernel` must contain no DNN semantic ops.
 
-**Key design rules (from ARCHITECTURE.md):**
-1. Semantics, scheduling, and target lowering are separate — never embed tile sizes in lowering passes
-2. Lower to Linalg first; do not write custom loop generation before using Linalg's tiling/fusion/vectorization
-3. Keep tensor form through tiling/fusion; One-Shot Bufferize only after all optimizations
-4. Emit explicit Vector dialect ops; do not rely on LLVM auto-vectorization for the microkernel
-5. Numerical approximation (exp, sigmoid, cos, sin) is IR semantics, not compiler flags — use `#llk.math_mode`
-6. Specialize on layout and ISA before exact shapes
-7. No autotuning until deterministic schedules work
-8. Measure packing and parallel dispatch overhead — a faster inner loop can still slow inference
-9. Use external GEMM as baseline, not necessarily final implementation
-10. Keep first target narrow: one op, one dtype, one layout, one ISA
+**Key framework rules (from ARCHITECTURE.md):**
+1. Separate semantic computation, schedule/search choices, machine facts and target lowering.
+2. Keep canonical MicroIR tile/dataflow semantics independent of workload and target names.
+3. Use semantic adapters and primitive coverage to extend workloads; shared mapping/analysis must not branch on `swiglu` or `matmul` labels.
+4. Keep target policy in machine profiles, LLKMap and target emitters; generic machine/mapping code never branches on target names.
+5. Materialize complete plans and check storage/capacity with shared static analysis before top-K retention; executable compilation also verifies backend realizability.
+6. Preserve original-source semantics, concrete resource identity, numerical contracts and frozen replay identity across search and lowering. Numerical approximation is explicit IR semantics (e.g. `#llk.math_mode`), not a compiler-flag side effect.
+7. Record deterministic search bounds and truncation. Keep predicted metrics separate from verified measurement; missing measured metrics never rank as zero.
+8. Validate framework capabilities with contraction, non-contraction, fusion, movement, topology and extension fixtures; matmul/SwiGLU alone do not establish general DNN support.
+9. Treat M/N/K, `BM/BN/BK`, contraction arm counts, five M-buckets and rank-two invocation as current adapter/runtime limits rather than generic framework requirements.
+10. For the existing CPU validation path, reuse Linalg tensor tiling/fusion before bufferization, emit explicit Vector operations, and measure packing/dispatch overhead. Those CPU rules do not mandate a Linalg-first route for every future MicroIR input.
 
 **Custom dialects:** `llk` is small — only retains domain info unavailable in generic MLIR (`llk.fused_swiglu`, `llk.rope`, `llk.attention`); never recreate tensor/linalg/vector/memref. `micro` (`include/LLK/Dialect/Micro/`) is the tile-centric execution IR. Implemented: `!micro.tile`, `#micro.layout`, `#micro.owner`, `#micro.memory`; ops `micro.kernel`, `micro.{tile_view,tile_alloc,tile_partition,tile_async_copy,tile_store}`, `micro.{mma,vector,reduce}`, `micro.{for,spatial_for,pipeline,alloc,async_copy,wait,store}`, and `micro.transform` (a layout conversion naming each side by its affine map, not a target layout id). Search-space ops (`micro.search_space`, `micro.param`, `micro.constraint`, `micro.objective`, `micro.candidate`) are implemented (#44). A bound plan adds target-neutral metadata attributes to the kernel: `micro.plan`, `micro.mapping`, `micro.routes`, plus `micro.value`/`micro.dst_node` on each emitted copy.
 
@@ -70,7 +74,7 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 
 **Gotcha — compiler version is generated:** `cmake/LLKVersion.cmake` does `configure_file(include/LLK/Version.h.in → ${CMAKE_BINARY_DIR}/include/LLK/Version.h)` producing `LLK_COMPILER_VERSION` from the project version plus `git describe`. The plan report prints it; there is no hand-written version constant.
 
-**Schedules are data:** Transform dialect `.mlir` files or `schedule_db.json`. Keyed by `(operation, M_bucket, N, K, dtype, ISA, math_mode)`. 5 M-buckets: {1}, [2,4], [5,16], [17,64], ≥65.
+**Schedules and search choices are data:** persistent MicroIR search spaces/bindings and selected plans are the framework contract. The existing CPU contraction adapter also uses Transform dialect `.mlir` files or `schedule_db.json`, keyed by `(operation, M_bucket, N, K, dtype, ISA, math_mode)` with five M-buckets: {1}, [2,4], [5,16], [17,64], ≥65. These fields are example-specific; future workloads need capability-appropriate parameter schemas.
 
 ## Conventions
 
@@ -83,6 +87,8 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 - Mapping/target boundary: generic `lib/Mapping` + `lib/Machine` stay target-neutral; target policy is data (`mapping/*.llkmap`, `machines/*.yaml`). `LLKMapping` links `LLKMachine` plus shared `LLVM`/`MLIR`; `LLKBuildOptions` matches the LLVM build's RTTI/exception settings for all project targets
 
 ## Milestone Sequence
+
+Historical milestone numbers record delivery order. Future goals are framework capabilities: broader workload/import and search contracts, explicit modeling coverage, primitive/target extension, analysis parity, measured feedback/calibration and wider runtime integration as required. Choose example operators to test those capabilities.
 
 M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, specialization/tuning, RoPE + Attention). M7 (Python frontend) deferred.
 
@@ -98,7 +104,10 @@ M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, sp
 
 | File | Purpose |
 |------|---------|
-| `ARCHITECTURE.md` | Full component map, pipeline diagram, design decisions |
+| `ARCHITECTURE.md` | Current generic framework architecture, components, mapping/search and extension rules |
+| `docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md` | Authoritative project goal, subsystem contracts, current genericity gaps and framework acceptance |
+| `docs/superpowers/plans/2026-10-12-generic-microir-framework-implementation.md` | Current-code audit and detailed capability increments for analysis coverage, workload/search, conformance and measurement validation |
+| `docs/design/legacy-cpu-architecture.md` | Historical CPU validation design and M1–M7 rationale |
 | `docs/design/m[1-6]-*.md` | Per-milestone design specs (MLIR defs, algorithms, tests) |
 | `docs/design/m9-canonical-micro-ir-architecture.md` | Micro-IR project-level redesign, layer responsibilities |
 | `docs/design/m9-micro-ir-core-concepts.md` | `micro` dialect semantics: tile model, op families, attrs, verifier rules |

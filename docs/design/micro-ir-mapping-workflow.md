@@ -5,6 +5,8 @@ mapping tile-centric Micro-IR. It assumes the build works (`README.md`) and that
 you have read the tile programming model spec
 (`docs/superpowers/specs/2026-08-13-micro-ir-tile-programming-model-spec.md`).
 
+**Project goal:** a [generic MicroIR-based, mapping- and search-based DNN compiler framework](../superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md). Matmul and SwiGLU commands below are example workflows for validating shared contracts; their M/N/K options are current contraction-adapter limits.
+
 ## The idea in one line
 
 **DNN Micro-IR = Tile Dataflow + Tile Mapping + Tile Schedule.**
@@ -292,18 +294,13 @@ llk-tune --input=test/Tuning/Inputs/issue129/mapped_tune.mlir --M=8 --N=16 --K=3
 `test/Docs/workflow_smoke_manifest.json` holds the executable argv arrays and
 expected artifacts. `WorkflowSmoke` runs those arrays without a shell and
 checks the documented option spellings against this section. `DocReferences`
-still performs link/path and help-flag lint. Mandatory issue #67 acceptance is
-**not** closed by static pipeline evidence; see the
-[verified gap assessment](../reviews/2026-10-07-issue67-current-gap-assessment.md)
-and issue [#129](https://github.com/skg7on/DSLCompiler/issues/129).
+still performs link/path and help-flag lint. Static pipeline evidence establishes only its exercised contracts. The [PR #133 acceptance matrix](../reviews/issue67-final-acceptance.md) records the delivered resource/execution/tuning repairs and retained limits. The October 7 gap assessment is historical.
 
 ## Where to go deeper
 
-- the design's acceptance criteria — interim, revision-pinned evidence for each,
-  with mandatory rows still open under issue #129:
+- the design's acceptance criteria — revision-pinned PR #133 evidence and retained limits:
   `docs/reviews/issue67-final-acceptance.md`
-- the verified assessment of the remaining gaps, and what each release gate must
-  repair: `docs/reviews/2026-10-07-issue67-current-gap-assessment.md`,
+- the historical pre-repair assessment and completed repair plan: `docs/reviews/2026-10-07-issue67-current-gap-assessment.md`,
   `docs/superpowers/plans/2026-10-07-issue129-gap-closure.md`
 - tile model, ops, and verifier rules: `docs/design/m9-micro-ir-core-concepts.md`
 - layering and the redesign: `docs/design/m9-canonical-micro-ir-architecture.md`

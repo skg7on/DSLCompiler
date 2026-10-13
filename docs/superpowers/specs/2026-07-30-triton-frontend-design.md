@@ -1,7 +1,9 @@
 # Triton Frontend + LLK Backend — Design Spec
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This is a frontend-adapter design for the framework. Triton compatibility and CPU execution are adapter/validation scope, not the project goal; general frontend coverage remains separate capability work.
+
 **Status:** Design Approved | **Date:** 2026-07-30
-**Parent:** [ARCHITECTURE.md](../../../ARCHITECTURE.md) — extends §2.2 Python Frontend
+**Historical parent:** [CPU validation architecture](../../design/legacy-cpu-architecture.md) — extends §2.2 Python Frontend
 **Supersedes:** [m7-python-frontend.md](../../design/m7-python-frontend.md) (stub)
 
 ---

@@ -1,5 +1,7 @@
 # Micro-IR Dialect Implementation Spec
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This specifies canonical execution/search primitives for the generic framework. Matmul/SwiGLU examples illustrate composition; they do not constrain the primitive set or define workload coverage. Draft syntax and operation lists are design intent; use the feature matrix for delivered support.
+
 **Status:** Draft
 **Date:** 2026-08-11
 **Parent Spec:** [Canonical Micro-IR Redesign Spec](2026-08-11-canonical-micro-ir-redesign.md)

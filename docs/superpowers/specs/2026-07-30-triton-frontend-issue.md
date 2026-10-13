@@ -1,5 +1,7 @@
 # M8: Triton-Compatible Python Frontend with Multi-Stage Lowering to LLK Dialect
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This is a historical frontend proposal. A Triton-compatible interface is one possible input adapter; it does not define framework scope or establish delivered frontend coverage.
+
 **Type:** Feature / Epic
 **Status:** Proposal
 **Depends on:** M1-M6 (complete)

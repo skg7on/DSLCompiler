@@ -1,5 +1,7 @@
 # MicroDAG operation-builder inversion of control
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This specifies a reusable operation-interpretation seam in framework analysis, merged in PR #141. Handler injection preserves traversal invariants; it does not by itself establish complete modeling of arbitrary DNN operations.
+
 Date: 2026-10-04
 Status: Proposed written specification; registry/context direction approved, written-spec review pending.
 Baseline: main at 31fd9eb. Concurrent mapping work must be integrated without losing its route-identity fixes.

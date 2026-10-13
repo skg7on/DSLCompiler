@@ -1,5 +1,7 @@
 # Canonical Micro-IR Redesign Spec
 
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. The original redesign below records the transition from the CPU validation pipeline. Its project-level scope is superseded by the generic framework goal; tile/execution contracts remain applicable. Initial rollout descriptions are historical, not current support claims.
+
 **Status:** Draft
 **Date:** 2026-08-11
 **Related Design Docs:**
@@ -17,7 +19,7 @@
 
 ## 1. Goal
 
-Redesign the project around a canonical DNN micro-IR that is lower level than LLK/Linalg, closer to AI hardware execution, and useful for both performance evaluation and auto-search/auto-optimization.
+Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Canonical tile execution IR is the shared artifact for reusable mapping, search, lowering and performance analysis. Matmul and fused SwiGLU are validation examples; AVX2 is the first executable validation backend.
 
 The refined design is tile-centric:
 

@@ -1,6 +1,8 @@
 # Operator-Kernel Lowering Framework Design
 
-**Status:** Implementation refinements approved 2026-10-11
+**Project scope alignment (2026-10-12):** Design a generic MicroIR-based, mapping- and search-based DNN compiler framework. Matmul and fused SwiGLU are example operator kernels used to test it. The [framework goal and design spec](2026-10-12-generic-microir-dnn-compiler-framework-design.md) governs project-level goals. This is an incremental semantic-adapter refactor, not the final generic DNN workload interface. Its M/N/K contract and shared contraction driver serve the current example kernels; broader rank, iteration and dataflow contracts remain future capability work. Original draft implementation/status statements retain their revision scope.
+
+**Status:** Draft for review
 **Date:** 2026-10-11
 **Scope:** `lib/Conversion/` (LLK→Linalg, LLK→Micro) and the two Transforms passes that consume the same per-op facts
 **Parent roadmap:** [Canonical DNN Micro-IR roadmap](https://github.com/skg7on/DSLCompiler/issues/41)
@@ -155,6 +157,10 @@ same numbers.
 - **Not** a generic plugin/ABI boundary. Registration is compile-time and static.
 
 ---
+
+### Framework scope boundary
+
+Registration is an adapter extension seam. The generic project is not a catalog of registered contraction kernels. `KernelContract::M/N/K` and `MicroKernelFragment`'s shared lhs/RHS arms and epilogue describe the current matmul/SwiGLU export family. A future generic workload interface must express non-contraction iteration/dataflow, arbitrary applicable port/rank structure, effects and capability-specific search parameters. Do not force new operator families into this template or add workload-name dispatch to mapping/analysis. This proposal's implementation remains bounded; that generalization needs a separate design and plan.
 
 ## 4. Design
 

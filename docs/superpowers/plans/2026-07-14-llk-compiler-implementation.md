@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement these plans task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an out-of-tree MLIR compiler for tiled CPU LLM kernels across 6 sequential milestones.
+**Historical milestone goal:** Build the CPU validation pipeline across six sequential milestones. The current project goal is a [generic MicroIR-based, mapping- and search-based DNN compiler framework](../specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md); example kernels exercise its capabilities. The original tasks below remain execution history, not the current framework roadmap.
 
 **Architecture:** Progressive lowering through 7 MLIR stages: LLK dialect → Linalg tensor IR → tiled+fused IR → explicit Vector SIMD → memref physical memory → CF+LLVM+runtime → ORC JIT machine code.
 
@@ -79,4 +79,4 @@ llk-compiler/
 
 ## Architecture Reference
 
-See [ARCHITECTURE.md](../../ARCHITECTURE.md) for the full component map, 7-stage lowering pipeline diagram, and engineering rules.
+See [ARCHITECTURE.md](../../design/legacy-cpu-architecture.md) for the full component map, 7-stage lowering pipeline diagram, and engineering rules.

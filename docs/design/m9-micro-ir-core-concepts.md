@@ -1,8 +1,8 @@
 # Micro-IR Core Concepts
 
 **Parent:** [m9-canonical-micro-ir-architecture.md](m9-canonical-micro-ir-architecture.md)
-**Status:** Draft Design
-**Scope:** Core semantics of the canonical `micro` dialect.
+**Status:** Semantic design reference; examples include design intent.
+**Scope:** Generic canonical tile/execution semantics within the [MicroIR-based mapping/search DNN compiler framework](../superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md). Matmul and SwiGLU illustrate primitive composition; they do not define the framework workload model. Use the feature matrix for implemented syntax and coverage.
 
 ---
 
@@ -21,7 +21,7 @@
 - communication
 - tunable schedule choices
 
-It sits below LLK/Linalg and above target-specific ISA dialects or runtime lowerings.
+It sits below semantic/structured input adapters (currently LLK export, with general Linalg import as future work) and above target-specific lowerings. Directly authored MicroIR is also a framework input.
 
 `micro` should answer:
 
@@ -155,7 +155,7 @@ micro.kernel @swiglu_candidate_17
 }
 ```
 
-Concrete IR is consumed by performance models and future target lowerings.
+Concrete IR is consumed by performance analysis and mapping/target lowering. A concrete schedule may still need target mapping; final executable plans require resource binding, materialization and verification. The SwiGLU syntax above is a conceptual example rather than a support guarantee.
 
 ---
 
@@ -560,12 +560,12 @@ Unknown keys are errors unless explicitly versioned. This keeps machine profiles
 
 ### 7.1 From LLK/Linalg to Micro
 
-The `LLKToMicro` pass consumes scheduled structured IR and emits one or both of:
+Semantic/structured adapters lower supported computations into one or both of:
 
 - `micro.search_space`
 - concrete `micro.kernel`
 
-For early milestones, `LLKToMicro` can start with direct scheduled patterns for matmul and fused SwiGLU.
+The current `LLKToMicro` adapter exports LLK matmul and fused SwiGLU roots using the contraction schedule template. General structured/Linalg import and non-contraction contracts remain future work. Direct MicroIR input can test mapping/search independently of that adapter.
 
 ### 7.2 From Search Micro to Concrete Micro
 
@@ -596,13 +596,15 @@ tile_load/tile_store -> memory event
 
 ### 7.4 From Concrete Micro to Target Lowering
 
-Target lowering is future work. The first target can map concrete `micro` to the existing AVX2 path, but the first milestone should focus on export and evaluation.
+Mapping selects a complete implementation plan, materializes its movement/layout/synchronization decisions, and verifies it before backend lowering. The shared mapped compiler supports selected AVX2 and portable reference execution for its tested fixtures. Additional hardware backends remain future work; a machine profile alone supplies static mapping/analysis support. See the [feature matrix](../manual/source/features.rst) and [revision-pinned acceptance record](../reviews/issue67-final-acceptance.md).
 
 ---
 
 ## 8. Verifier Requirements
 
-Concrete `micro.kernel` verifier:
+The requirements below span structural IR verification, machine/mapping feasibility and selected-backend verification. Structural validity alone does not establish a feasible or executable plan. They describe semantic obligations; the feature matrix records implemented coverage.
+
+Concrete `micro.kernel` and selected-plan verification:
 
 - a declared signature is a contract: the entry block arguments match its
   declared inputs exactly, and `micro.yield` produces exactly its declared

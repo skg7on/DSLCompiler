@@ -3,7 +3,9 @@
 MicroIR Developer Manual
 ========================
 
-DSLCompiler is an MLIR compiler and hardware evaluation project built around **MicroIR**, the ``micro`` dialect. It describes a kernel's tile computation, placement, movement, and schedule so developers can inspect how it executes on a machine profile. AVX2 is the first validation target; the generic accelerator package demonstrates how target policy can change without changing the mapping core.
+DSLCompiler aims to **design a generic MicroIR-based, mapping- and search-based DNN compiler framework**. The ``micro`` dialect describes tile computation, placement, movement and schedule; reusable mapping and search select a plan for lowering or analysis. **Matmul and fused SwiGLU are example operator kernels for testing the framework.** AVX2 is the first executable validation target; the generic accelerator package demonstrates policy/topology extension through the same mapping core.
+
+The :source:`framework goal and design specification <docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md>` defines project scope, extension contracts and capability-based acceptance. Current implementation coverage is narrower and is recorded in :doc:`features`.
 
 Start with the concepts, build the five tools, then follow the four tutorials.
 Each tutorial states what its result establishes; the tool reference explains
@@ -130,6 +132,6 @@ Deeper references
 
 * :source:`Mapping workflow <docs/design/micro-ir-mapping-workflow.md>`, :source:`layout grammar <docs/design/llkmap-layout-grammar.md>`, and :source:`rule grammar <docs/design/llkmap-rule-grammar.md>`.
 
-* :source:`Normative mapping design <docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md>` and :source:`historical CPU architecture <ARCHITECTURE.md>`.
+* :source:`Current framework architecture <ARCHITECTURE.md>`, :source:`normative mapping design <docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md>` and :source:`historical CPU validation architecture <docs/design/legacy-cpu-architecture.md>`.
 
 * :source:`Milestone design documents <docs/design>` and :source:`implementation plans <docs/superpowers/plans>` explain decisions and task history; start with this guide for current usage.

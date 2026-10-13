@@ -3,6 +3,13 @@
 Architecture
 ============
 
+The project goal is a **generic MicroIR-based, mapping- and search-based DNN
+compiler framework**. Matmul and fused SwiGLU are validation examples, and AVX2
+is the first executable validation backend. The reusable IR, mapping, search and
+selected-plan lowering contracts define the architecture. The
+:source:`framework design spec <docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md>`
+governs project direction; :doc:`features` describes delivered support.
+
 The compiler separates mathematical semantics, schedule choices, machine facts,
 and target implementation. It uses MLIR's existing tensor, Linalg, Vector, SCF,
 memref, and LLVM infrastructure, plus a small semantic ``llk`` dialect and the
@@ -15,24 +22,28 @@ For runnable commands, use :doc:`getting started </getting-started>` and the
 
 .. _architecture-two-cpu-compilation-paths:
 
-Two CPU compilation paths
--------------------------
+Framework path and CPU validation
+---------------------------------
 
-The established LLK/Linalg CPU path and the newer mapped MicroIR path coexist.
-They share infrastructure and offer distinct operation coverage and backend policies.
+The MicroIR path is the framework center: source candidates feed mapping and
+covering search, complete-plan materialization and shared feasibility/scoring,
+then selected-plan lowering or analysis. Direct MicroIR input can exercise these
+contracts independently of semantic export. The established LLK/Linalg CPU path
+provides validation and comparison infrastructure. The two routes have distinct
+operation coverage and backend policies.
 
 .. figure:: _static/architecture.svg
-   :alt: The established CPU pipeline and the mapped MicroIR pipeline share LLVM infrastructure; machine facts and target policy feed mapping and cost analysis.
+   :alt: The primary MicroIR mapping/search framework and CPU validation path share lowering infrastructure; machine facts, search choices and target policy guide compilation.
    :width: 100%
 
-   The two compilation paths and their analysis inputs.
+   The framework path, CPU validation route, and search/target inputs. Labels describe current integration coverage.
 
 The left path is the existing CPU validation pipeline: tensor optimizations,
 explicit vectorization, bufferization, runtime dispatch, and LLVM lowering. The
-middle path maps MicroIR and can execute supported kernels through a portable
-Linalg-based lowering. Its numerical tests establish portable correctness on
-their fixtures; they do not establish selected AVX2 vector-width or ISA
-realization. That distinction is central to the current :doc:`feature limits </features>`.
+middle path maps MicroIR and can execute supported kernels through selected AVX2
+or portable reference lowering. Reference numerical tests establish portable
+correctness; selected AVX2 tests separately establish chosen vector-width and ISA
+realization within their fixture scope. See the current :doc:`feature limits </features>`.
 
 The routes have different semantic coverage. Fused SwiGLU supports the legacy
 LLK-to-Linalg conversion; ``llk.matmul`` is left untouched by that pass and uses
@@ -42,6 +53,27 @@ CPU path and are not current ``LLKToMicro`` export roots.
 Target-aware search instantiates the original source, maps and analyzes candidates,
 and saves selected-plan artifacts for replay. Compatibility mode remains synthetic.
 Optional verified measurement uses the shared mapped compiler and typed inputs.
+
+.. _architecture-generic-contracts-and-current-limits:
+
+Generic contracts and current limits
+------------------------------------
+
+New workloads contribute semantic decomposition into supported MicroIR primitives.
+New targets contribute machine profiles, layouts/rules and emitters. Shared mapping
+and analysis consume operation/dataflow facts rather than operator-name switches.
+The current exporter and source-search templates are contraction-shaped; M/N/K,
+BM/BN/BK and two contraction arms are adapter limits, not generic workload fields.
+Typed mapped invocation currently accepts rank-two buffers. General structured
+import, non-contraction source-search contracts and wider invocation remain
+capability work.
+
+Framework validation covers tile semantics, non-contraction computation, fusion,
+movement/layout, resource capacity, search/replay, analysis parity and extension.
+Matmul/SwiGLU tests prove only the contracts and fixtures they exercise. The
+:source:`operator registration proposal <docs/superpowers/specs/2026-10-11-conversion-kernel-lowering-framework-design.md>`
+and merged :source:`MicroDAG event-builder seam <docs/superpowers/specs/2026-10-04-micro-dag-ioc-design.md>`
+advance extensibility without establishing arbitrary DNN coverage.
 
 .. _architecture-components-and-ownership:
 
@@ -227,7 +259,9 @@ records selected x86_64 AVX2 execution, static parity and retained legacy skips.
 Production measurement persistence and calibrated prediction remain #51/#52.
 
 For the established CPU pipeline's detailed scheduling and runtime design, see
-:source:`ARCHITECTURE.md <ARCHITECTURE.md>`. For the normative mapping design, see
+:source:`historical CPU architecture <docs/design/legacy-cpu-architecture.md>`.
+For the current framework architecture, see :source:`ARCHITECTURE.md <ARCHITECTURE.md>`.
+For the normative mapping design, see
 :source:`the September 18 specification <docs/superpowers/specs/2026-09-18-microir-inspired-dslcompiler-enhancement-design.md>`.
 Those documents include design goals and historical status; use
 :doc:`features </features>` for the current community-facing capability summary.
