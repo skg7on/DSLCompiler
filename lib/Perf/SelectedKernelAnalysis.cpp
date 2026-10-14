@@ -6,6 +6,7 @@
 // #129, task R6). See the header for the contract and the library boundary.
 
 #include "LLK/Perf/SelectedKernelAnalysis.h"
+#include "LLK/Perf/OpDAGBuilder.h"
 
 #include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Mapping/StorageLiveness.h"
@@ -179,7 +180,9 @@ llvm::Expected<SelectedKernelAnalysis>
 analyzeSelectedKernel(mlir::Operation *kernel,
                       const machine::MachineModel &machine,
                       bool requireComplete) {
-  llvm::Expected<MicroDAG> dag = buildMicroDAG(kernel, machine);
+  llvm::Expected<MicroDAG> dag =
+      buildMicroDAG(kernel, machine, makeDefaultOpDAGBuilders(),
+                    DAGBuildOptions{CoverageMode::Audit});
   if (!dag)
     return dag.takeError();
   return analyzeSelectedDag(*dag, machine, requireComplete);
@@ -248,8 +251,9 @@ llvm::Expected<SelectedKernelAnalysis> analyzeSelectedKernel(
   const bool haveMeasured =
       !measured.byInstance.empty() || !measured.byConnection.empty();
 
-  llvm::Expected<MicroDAG> dag =
-      buildMicroDAG(kernel, machine, haveMeasured ? &measured : nullptr);
+  llvm::Expected<MicroDAG> dag = buildMicroDAG(
+      kernel, machine, makeDefaultOpDAGBuilders(),
+      DAGBuildOptions{CoverageMode::Audit}, haveMeasured ? &measured : nullptr);
   if (!dag)
     return dag.takeError();
   llvm::Expected<SelectedKernelAnalysis> analysis =

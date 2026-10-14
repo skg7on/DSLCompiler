@@ -23,3 +23,11 @@ add_llk_test_category(Perf
         ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
         ${CMAKE_SOURCE_DIR}/test/Mapping
 )
+
+if(LLK_BUILD_TOOLS)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME AnalysisCoverageCLI
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/analysis_coverage_cli.py
+            $<TARGET_FILE:micro-perf> ${CMAKE_SOURCE_DIR})
+endif()

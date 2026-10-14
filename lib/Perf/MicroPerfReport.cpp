@@ -16,6 +16,7 @@
 
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/StoragePlan.h"
+#include "LLK/Perf/OpDAGBuilder.h"
 #include "LLK/Perf/SelectedKernelAnalysis.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
@@ -230,7 +231,8 @@ analyzeKernel(mlir::Operation *kernel, const machine::MachineModel &machine,
                    "; micro-perf knows level 0 (static bound) and level 1 "
                    "(resource schedule)");
 
-  auto dag = buildMicroDAG(kernel, machine);
+  auto dag = buildMicroDAG(kernel, machine, makeDefaultOpDAGBuilders(),
+                           DAGBuildOptions{CoverageMode::Audit});
   if (!dag)
     return dag.takeError();
 
@@ -245,6 +247,8 @@ analyzeKernel(mlir::Operation *kernel, const machine::MachineModel &machine,
     return analysis.takeError();
 
   MicroPerfReport report;
+  report.complete = analysis->complete;
+  report.incompleteReasons = analysis->incompleteReasons;
   report.machine = machine.target;
   report.level = level;
   report.clockHz = machine.clockHz.value_or(0);
@@ -337,6 +341,9 @@ void printMicroPerfYaml(llvm::raw_ostream &os, const MicroPerfReport &report) {
   os << "kernel: " << report.kernel << "\n";
   os << "level: " << report.level << "\n";
 
+  os << "complete: " << (report.complete ? "true" : "false") << "\n";
+  emitStringList(os, "", "incomplete_reasons", report.incompleteReasons);
+
   os << "totals:\n";
   os << "  flops: " << report.l0.totalFlops << "\n";
   emitCounterMap(os, "  ", "bytes", report.l0.bytesByMemory);
@@ -385,6 +392,9 @@ void printMicroPerfText(llvm::raw_ostream &os, const MicroPerfReport &report) {
   os << "kernel: " << report.kernel << "\n";
   os << "machine: " << report.machine << " @ " << report.clockHz << " Hz\n";
   os << "level: " << report.level << "\n\n";
+
+  os << "complete: " << (report.complete ? "true" : "false") << "\n";
+  emitTextList(os, "incomplete reasons", report.incompleteReasons);
 
   os << "work\n";
   os << "  flops         " << report.l0.totalFlops << "\n";
