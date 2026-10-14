@@ -44,6 +44,9 @@ struct MicroPerfReport {
   unsigned level = 1;
   uint64_t clockHz = 0;
 
+  bool complete = true;
+  std::vector<std::string> incompleteReasons;
+
   L0Report l0;
   /// Present only when level == 1.
   std::optional<L1Report> l1;

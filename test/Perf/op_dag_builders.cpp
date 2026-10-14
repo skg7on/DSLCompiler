@@ -701,3 +701,73 @@ TEST(OpDAGBuilders, AuditedPhysicalPartitionChargesWorkTrafficAndStorage) {
   EXPECT_GT(dag->liveTileBytesByMemory.at("sram"), 2048u);
 }
 } // namespace mlir::llk::perf
+
+#include "LLK/Perf/SelectedKernelAnalysis.h"
+namespace mlir::llk::perf {
+TEST(OpDAGBuilders, UnknownCoverageRefusesStrictAnalysis) {
+  auto parsed = parseKernel(R"mlir(
+module { micro.kernel @unknown {
+  %a = arith.constant 1.0 : f32
+  %b = arith.addf %a, %a : f32
+  micro.yield
+} })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto partial =
+      analyzeSelectedKernel(parsed->kernel, machine::MachineModel{}, false);
+  ASSERT_TRUE(bool(partial)) << llvm::toString(partial.takeError());
+  EXPECT_FALSE(partial->complete);
+  ASSERT_EQ(partial->incompleteReasons.size(), 1u);
+  EXPECT_EQ(partial->incompleteReasons[0], "unmodeled_leaf: arith.addf");
+  auto strict =
+      analyzeSelectedKernel(parsed->kernel, machine::MachineModel{}, true);
+  ASSERT_FALSE(bool(strict));
+  EXPECT_NE(llvm::toString(strict.takeError()).find("arith.addf"),
+            std::string::npos);
+}
+} // namespace mlir::llk::perf
+
+namespace mlir::llk::perf {
+TEST(OpDAGBuilders, RepeatedUnknownCoverageHasOneReason) {
+  auto parsed = parseKernel(R"mlir(
+module { micro.kernel @loop {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  micro.for %i = %c0 to %c2 step %c1 {
+    %a = arith.constant 1.0 : f32
+    %b = arith.addf %a, %a : f32
+  }
+  micro.yield
+} })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto partial =
+      analyzeSelectedKernel(parsed->kernel, machine::MachineModel{}, false);
+  ASSERT_TRUE(bool(partial)) << llvm::toString(partial.takeError());
+  EXPECT_FALSE(partial->complete);
+  EXPECT_TRUE(partial->events.events.empty());
+  EXPECT_EQ(partial->incompleteReasons,
+            (std::vector<std::string>{"unmodeled_leaf: arith.addf"}));
+}
+TEST(OpDAGBuilders, AuditedAliasOnlyHandlerRemainsComplete) {
+  auto parsed = parseKernel(R"mlir(
+module { micro.kernel @alias {
+  %a = arith.constant 1.0 : f32
+  %b = arith.addf %a, %a : f32
+  micro.yield
+} })mlir");
+  ASSERT_NE(parsed, nullptr);
+  auto builders = makeDefaultOpDAGBuilders();
+  ASSERT_FALSE(builders.registerZeroCost(
+      "arith.addf", [](Operation &op, OpDAGBuildContext &context) {
+        context.aliasValue(op.getResult(0), op.getOperand(0));
+        return llvm::Error::success();
+      }));
+  auto dag = buildMicroDAG(parsed->kernel, machine::MachineModel{}, builders,
+                           DAGBuildOptions{CoverageMode::Audit});
+  ASSERT_TRUE(bool(dag)) << llvm::toString(dag.takeError());
+  auto analysis = analyzeSelectedDag(*dag, machine::MachineModel{}, true);
+  ASSERT_TRUE(bool(analysis)) << llvm::toString(analysis.takeError());
+  EXPECT_TRUE(analysis->complete);
+  EXPECT_TRUE(analysis->events.events.empty());
+}
+} // namespace mlir::llk::perf
