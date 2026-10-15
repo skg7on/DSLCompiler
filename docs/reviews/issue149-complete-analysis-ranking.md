@@ -31,7 +31,7 @@ snapshot parity remains separately covered.
 The new complete-plan tests first failed on retained unknown scalar computation,
 extraction-error fallback, missing physical facts, incomplete alternatives
 masking complete ones, and partial artifacts entering ranking. After the fix,
-22/22 CompletePlanEvaluationTest cases passed. They include fully modeled ranking
+23/23 CompletePlanEvaluationTest cases passed. They include fully modeled ranking
 without a backend and executable strictness despite a PartialReport argument.
 Existing capacity/topK, exact-resource, measured-cost and static-parity tests
 are covered by the full registered suite.
@@ -68,3 +68,22 @@ Disabled: `TritonStagedExecution.SwiGLUCorrectness`.
 The required-selected test is deliberately unchanged. Local results do not
 establish AVX2 execution. Linux CI must supply the full green selected gate.
 Sphinx is unavailable in the local Python environment; CI validates the manual.
+
+## Independent review fix
+
+The independent reviewer reproduced a stale consumer endpoint that the canonical
+materializer reported as `consumer_endpoint_unresolved`. Surviving-IR analysis
+was complete, but the selected decision was omitted. A new regression first
+failed on Complete acceptance and loss of the PartialReport reason. Evaluation
+now checks `BoundPlan::unmaterialized` before analysis: Complete rejects it;
+PartialReport preserves its ordered reasons and `materialized=false`.
+The final verification below supersedes the pre-review counts above.
+
+## Final local verification after review fix
+
+At the commit containing this section, reran `check-llk` from the same fresh
+implementation build: **1269 registered; 1261 passed, six skipped, one disabled,
+one failed**. The only failed CTest remains `MappedAVX2Acceptance` on arm64 with
+the six required-selected inner cases named above; no checks were disabled or
+relaxed. All 23 complete-plan tests, 188 Perf cases, capacity/topK/resource/parity
+regressions, CLI coverage and documentation reference checks passed.

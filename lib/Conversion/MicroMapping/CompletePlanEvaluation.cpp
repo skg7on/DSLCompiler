@@ -220,6 +220,20 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
     return llvm::createStringError(llvm::inconvertibleErrorCode(), reason);
   }
 
+  // Partial binding may leave selected decisions unmaterialized. Successful
+  // analysis of the surviving IR cannot prove those omitted decisions happened.
+  if (!bound->unmaterialized.empty()) {
+    if (requireComplete)
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      "analysis_incomplete: selected decisions were not "
+                      "materialized: " +
+                          llvm::join(bound->unmaterialized, "; "));
+    plan.materialized = false;
+    for (const std::string &reason : bound->unmaterialized)
+      plan.diagnostics.warnings.push_back(
+          "plan evaluation: selected decision was not materialized: " + reason);
+  }
+
   // --- 4. selected static analysis ----------------------------------------
   //
   // The plan-carrying overload attaches R5 storage liveness, so `peakBytes` is

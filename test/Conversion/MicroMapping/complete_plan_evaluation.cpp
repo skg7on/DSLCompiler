@@ -669,3 +669,38 @@ TEST(CompletePlanEvaluationTest, ExecutableCannotOptIntoPartialAnalysis) {
   EXPECT_NE(evaluated->rejection->message.find("unmodeled_leaf: arith.addf"),
             std::string::npos);
 }
+
+TEST(CompletePlanEvaluationTest, CompleteRejectsMaterializerOmissions) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto proposals = proposalsFor(*c);
+  ASSERT_EQ(proposals.size(), 1u);
+  auto proposal = proposals.front();
+  ASSERT_EQ(proposal.connectionPlans.size(), 1u);
+  ASSERT_EQ(proposal.connectionPlans.front().consumerPorts.size(), 1u);
+  // A stale endpoint names a nonexistent second input on the store. Physical
+  // storage and surviving IR can still analyze, but the selected rewire failed.
+  proposal.connectionPlans.front().consumerPorts.front().index = 1;
+  auto complete = evaluateCompletePlan(*c->source, c->graph, *c->target,
+                                       proposal, BindContract::Partial);
+  ASSERT_TRUE(bool(complete)) << llvm::toString(complete.takeError());
+  EXPECT_FALSE(complete->plan.has_value());
+  EXPECT_TRUE(complete->rejection.has_value());
+  if (complete->rejection) {
+    EXPECT_EQ(complete->rejection->code,
+              DiagnosticCode::UnsupportedMaterialization);
+    EXPECT_NE(complete->rejection->message.find("consumer_endpoint_unresolved"),
+              std::string::npos);
+  }
+
+  auto partial = evaluateCompletePlan(
+      *c->source, c->graph, *c->target, proposal, BindContract::Partial,
+      std::nullopt, AnalysisRequirement::PartialReport);
+  ASSERT_TRUE(bool(partial)) << llvm::toString(partial.takeError());
+  ASSERT_TRUE(partial->plan.has_value());
+  EXPECT_FALSE(partial->plan->materialized);
+  bool named = false;
+  for (const auto &warning : partial->plan->diagnostics.warnings)
+    named |= warning.find("consumer_endpoint_unresolved") != std::string::npos;
+  EXPECT_TRUE(named);
+}
