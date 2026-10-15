@@ -1,5 +1,12 @@
 //===- SearchBindingLoader.cpp - micro.candidate -> SearchBinding ---------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of phase-4 of epic #67. See SearchBindingLoader.h.
 //
 // The dialect verifier already rejects a malformed candidate when it runs, but
@@ -8,8 +15,6 @@
 // no verifier has run. The checks here therefore mirror the dialect's and are
 // deliberately duplicated -- they are the startup diagnostic the tuning stage
 // relies on (ruling S2).
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MicroMapping/SearchBindingLoader.h"
 

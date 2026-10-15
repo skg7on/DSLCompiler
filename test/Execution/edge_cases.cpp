@@ -1,9 +1,14 @@
 //===- edge_cases.cpp - Edge case tests for SwiGLU computation ------------===//
 //
-// Tests edge cases: unit dimensions, K=1 (no reduction), zero dimensions.
-// Standalone — no MLIR dependencies, tests reference algorithm directly.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Tests edge cases: unit dimensions, K=1 (no reduction), zero dimensions.
+// Standalone — no MLIR dependencies, tests reference algorithm directly.
 
 #include <gtest/gtest.h>
 
@@ -15,8 +20,8 @@
 // FP64 reference — local copy for edge case testing
 // ---------------------------------------------------------------------------
 
-static void swiglu_reference_fp64(const double* x, const double* wg,
-                                  const double* wu, double* y, int64_t M,
+static void swiglu_reference_fp64(const double *x, const double *wg,
+                                  const double *wu, double *y, int64_t M,
                                   int64_t N, int64_t K) {
   std::vector<double> gate(M * N, 0.0);
   std::vector<double> up(M * N, 0.0);
@@ -54,24 +59,21 @@ TEST(EdgeCases, UnitDimensions) {
   // gate = 2.0*0.5 = 1.0, SiLU(1.0) = 1.0/(1+exp(-1)) ≈ 0.7310586
   // up = 2.0*0.3 = 0.6
   // result = 0.7310586 * 0.6 ≈ 0.438635
-  double expected =
-      (1.0 / (1.0 + std::exp(-1.0))) * (2.0 * 0.3);
+  double expected = (1.0 / (1.0 + std::exp(-1.0))) * (2.0 * 0.3);
   EXPECT_NEAR(y[0], expected, 1e-12);
 }
 
 TEST(EdgeCases, K_equals_1) {
   // No reduction to accumulate over — single multiply per output element
   int64_t M = 3, N = 2, K = 1;
-  std::vector<double> x(M * K, 1.0), wg(K * N, 0.5), wu(K * N, 0.3),
-      y(M * N);
+  std::vector<double> x(M * K, 1.0), wg(K * N, 0.5), wu(K * N, 0.3), y(M * N);
   swiglu_reference_fp64(x.data(), wg.data(), wu.data(), y.data(), M, N, K);
 
   // Each output element: gate = 1.0*0.5 = 0.5, up = 1.0*0.3 = 0.3
   // SiLU(0.5) = 0.5/(1+exp(-0.5)) ≈ 0.5/1.6065 ≈ 0.3112
   // result = 0.3112 * 0.3 ≈ 0.09337
   for (int64_t i = 0; i < M * N; i++) {
-    EXPECT_TRUE(std::isfinite(y[i]))
-        << "Output[" << i << "] should be finite";
+    EXPECT_TRUE(std::isfinite(y[i])) << "Output[" << i << "] should be finite";
   }
 
   // All outputs should be identical since inputs are broadcasted
@@ -100,8 +102,9 @@ TEST(EdgeCases, NegativeInputs) {
   // SiLU is well-defined for negative inputs (asymptotically 0 for large
   // negatives, linear for large positives)
   int64_t M = 1, N = 4, K = 2;
-  std::vector<double> x = {-2.0, 3.0};          // M*K = 2
-  std::vector<double> wg = {0.5, -1.0, 0.0, 2.0, -3.0, 0.5, 1.0, 0.0};  // K*N = 8
+  std::vector<double> x = {-2.0, 3.0}; // M*K = 2
+  std::vector<double> wg = {0.5,  -1.0, 0.0, 2.0,
+                            -3.0, 0.5,  1.0, 0.0}; // K*N = 8
   std::vector<double> wu = {1.0, 0.5, -0.5, 0.0, 2.0, -1.0, 0.0, -2.0};
   std::vector<double> y(N);
 
@@ -118,7 +121,7 @@ TEST(EdgeCases, LargeValues) {
   // Large negative inputs: SiLU(g) ≈ 0 for large negative g
   int64_t M = 1, N = 2, K = 2;
   std::vector<double> x = {10.0, -10.0};
-  std::vector<double> wg = {1.0, 0.0, 0.0, 1.0};  // Identity-like
+  std::vector<double> wg = {1.0, 0.0, 0.0, 1.0}; // Identity-like
   std::vector<double> wu = {1.0, 0.0, 0.0, 1.0};
   std::vector<double> y(N);
 
@@ -139,8 +142,7 @@ TEST(EdgeCases, LargeValues) {
 TEST(EdgeCases, AllZeros) {
   // Zeros everywhere: SiLU(0) = 0, all outputs = 0
   int64_t M = 2, N = 3, K = 4;
-  std::vector<double> x(M * K, 0.0), wg(K * N, 0.0), wu(K * N, 0.0),
-      y(M * N);
+  std::vector<double> x(M * K, 0.0), wg(K * N, 0.0), wu(K * N, 0.0), y(M * N);
 
   swiglu_reference_fp64(x.data(), wg.data(), wu.data(), y.data(), M, N, K);
 

@@ -1,9 +1,14 @@
 //===- jit_cache_miss.cpp - JIT cache miss behavior tests -----------------===//
 //
-// Verifies that different shapes produce different cache entries
-// (cache miss), and same shapes reuse cached entries (cache hit).
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Verifies that different shapes produce different cache entries
+// (cache miss), and same shapes reuse cached entries (cache hit).
 
 #include "LLK/Runtime/JitCache.h"
 #include "LLK/Runtime/KernelKey.h"

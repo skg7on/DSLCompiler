@@ -1,5 +1,12 @@
-//===- EventSchedule.h - Shared resource scheduler (task B8) -------------===//
+//===- EventSchedule.h - Shared resource scheduler (task B8) ----*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67).
 //
 // The selected-plan score and the performance prediction must be the *same*
@@ -12,8 +19,6 @@
 // it to compute a candidate's final score; `lib/Perf` wraps it rather than
 // re-implementing it. Resource identities are machine node ids and kinds, never
 // target-name branches.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_EVENTSCHEDULE_H
 #define LLK_MAPPING_EVENTSCHEDULE_H

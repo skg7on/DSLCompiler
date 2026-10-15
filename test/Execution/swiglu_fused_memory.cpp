@@ -1,5 +1,12 @@
-//===- swiglu_fused_memory.cpp - Fused memory execution test -------------===//
+//===- swiglu_fused_memory.cpp - Fused memory execution test --------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Tests the full M3 fused memory pipeline:
 //   1. Build SwiGLU module with M=128,N=4096,K=4096 (programmatic, avoids
 //      func.func text-parsing issues)
@@ -11,8 +18,6 @@
 // tensor that bufferization converts to a memref.alloc: 2 * 128*4096*4B ~=
 // 4 MB. With FuseDoubleContraction, the dual matmul is fused into a single
 // generic op, eliminating the intermediate [M,N] allocations.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"

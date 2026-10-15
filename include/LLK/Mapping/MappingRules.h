@@ -1,5 +1,12 @@
-//===- MappingRules.h - LLKMap mapping rules (D4) -------------------------===//
+//===- MappingRules.h - LLKMap mapping rules (D4) ---------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, workstream D4).
 //
 // A mapping rule says: when the workload contains this Micro operation, with
@@ -14,8 +21,6 @@
 //
 // Parsing reuses the shared LLKMap expression grammar, so a rule's `param`,
 // `require`, and machine queries behave exactly like a layout's.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_MAPPINGRULES_H
 #define LLK_MAPPING_MAPPINGRULES_H

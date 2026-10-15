@@ -1,5 +1,12 @@
-//===- Placement.h - Placement and connection synthesis (D5) -------------===//
+//===- Placement.h - Placement and connection synthesis (D5) ----*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, workstream D5).
 //
 // Placement turns an unplaced `MappingCandidate` into legal `CandidateInstance`
@@ -11,8 +18,6 @@
 //
 // Everything is target-independent. Executor requirements are matched by
 // abstract owner kind (design §11.5); a rule never names a concrete executor.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_PLACEMENT_H
 #define LLK_MAPPING_PLACEMENT_H

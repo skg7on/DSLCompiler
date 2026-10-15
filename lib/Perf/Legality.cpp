@@ -1,5 +1,12 @@
 //===- Legality.cpp - Machine-aware candidate legality --------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #49). See Legality.h.
 //
 // Each rule below reads the parameters it needs and compares them against the
@@ -14,8 +21,6 @@
 // answer different questions. Legality asks "could this ever be bound?" before
 // any IR exists; the simulator asks "did this particular kernel fit?" after.
 // Where they disagree, the simulator is authoritative.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/Legality.h"
 

@@ -1,10 +1,15 @@
-//===- TritonToStructured.cpp - tt.dot → linalg.matmul -------------------===//
+//===- TritonToStructured.cpp - tt.dot → linalg.matmul --------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Lowers Triton compute ops to MLIR structured ops. The simple (generic)
 // fallback rewrites every tt.dot into a linalg.matmul, keeping the Triton
 // accumulator operand as the linalg output (destination-passing style).
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
 

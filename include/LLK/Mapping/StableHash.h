@@ -1,5 +1,12 @@
-//===- StableHash.h - Toolchain-stable hashing for mapping ids ------------===//
+//===- StableHash.h - Toolchain-stable hashing for mapping ids --*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (issue #80, epic #67 D1).
 //
 // Mapping objects are compared, sorted, and persisted by stable id, so the
@@ -10,8 +17,6 @@
 //
 // Ordering is canonical at the call site: `stableHashSortedSet` sorts before
 // folding, so a caller that collects ids in any order still gets one hash.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_STABLEHASH_H
 #define LLK_MAPPING_STABLEHASH_H

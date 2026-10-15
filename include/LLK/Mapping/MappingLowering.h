@@ -1,5 +1,12 @@
-//===- MappingLowering.h - The target lowering contract (issue #67, C2) ---===//
+//===- MappingLowering.h - The target lowering contract ---------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67).
 //
 // A `MappingTarget` verifies that a selected bundle is complete; this header is
@@ -10,8 +17,6 @@
 // The separation is the same one §14.3 draws for verification: the generic core
 // passes a bundle through as an opaque value and never reads a field as target
 // semantics. Only the plugin interprets `name`, `parameters` and `emitterKey`.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_MAPPINGLOWERING_H
 #define LLK_MAPPING_MAPPINGLOWERING_H

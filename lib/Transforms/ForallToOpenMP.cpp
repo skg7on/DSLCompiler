@@ -1,18 +1,17 @@
 //===- ForallToOpenMP.cpp - Lower scf.forall to OpenMP --------------------===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Lowers scf.forall to OpenMP via the chain:
 //   scf.forall -> scf.parallel -> omp.parallel + omp.wsloop
 //
 // Uses MLIR's built-in conversion chain. This is a prototype alternative
 // to the ForallToLLRT (ThreadPool) path.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/ForallToOpenMP.h"
 

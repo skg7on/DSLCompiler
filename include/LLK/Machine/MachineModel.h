@@ -1,5 +1,12 @@
-//===- MachineModel.h - Versioned machine topology ------------------------===//
+//===- MachineModel.h - Versioned machine topology --------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the v2 machine model (issue #82, epic #67).
 //
 // A machine is a graph of stable-ID nodes and directed edges, not a flat bag
@@ -24,8 +31,6 @@
 // `micro::MemorySpace` names. The model stores them as strings so it carries no
 // dependency on the dialect headers at its public surface; the terminology
 // (and the validation) lives in the dialect enums.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MACHINE_MACHINEMODEL_H
 #define LLK_MACHINE_MACHINEMODEL_H

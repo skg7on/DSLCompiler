@@ -1,3 +1,12 @@
+//===- mapped_allocation_lifetime.cpp - Mapped allocation lifetime tests --===//
+//
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 #include "LLK/Conversion/MappedKernelAbi.h"
 #include "LLK/Runtime/MappedExecutable.h"
 #include "mapped_jit_test_factory.h"

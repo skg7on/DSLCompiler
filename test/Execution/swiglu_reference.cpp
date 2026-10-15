@@ -1,9 +1,14 @@
 //===- swiglu_reference.cpp - Naive C++ SwiGLU reference implementation ---===//
 //
-// Standalone reference: FP32 naive triple-loop matmul + SiLU, plus FP64
-// ground truth for error measurement. No MLIR dependencies.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Standalone reference: FP32 naive triple-loop matmul + SiLU, plus FP64
+// ground truth for error measurement. No MLIR dependencies.
 
 #include <gtest/gtest.h>
 
@@ -35,8 +40,8 @@ static uint16_t f32_to_bf16(float f) {
 // Naive SwiGLU: Y = SiLU(X @ Wg) * (X @ Wu)   (FP32 arithmetic)
 // ---------------------------------------------------------------------------
 
-static void swiglu_reference(const float* x, const float* wg, const float* wu,
-                             float* y, int64_t M, int64_t N, int64_t K) {
+static void swiglu_reference(const float *x, const float *wg, const float *wu,
+                             float *y, int64_t M, int64_t N, int64_t K) {
   std::vector<float> gate(M * N, 0.0f);
   std::vector<float> up(M * N, 0.0f);
 
@@ -74,8 +79,8 @@ static void swiglu_reference(const float* x, const float* wg, const float* wu,
 // FP64 reference for error measurement
 // ---------------------------------------------------------------------------
 
-void swiglu_reference_fp64(const double* x, const double* wg, const double* wu,
-                           double* y, int64_t M, int64_t N, int64_t K) {
+void swiglu_reference_fp64(const double *x, const double *wg, const double *wu,
+                           double *y, int64_t M, int64_t N, int64_t K) {
   std::vector<double> gate(M * N, 0.0);
   std::vector<double> up(M * N, 0.0);
 

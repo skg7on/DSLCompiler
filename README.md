@@ -3,6 +3,7 @@
 [![CI](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml/badge.svg)](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/skg7on/DSLCompiler/badges/badges/coverage.json)](https://github.com/skg7on/DSLCompiler/actions/workflows/coverage.yml)
 [![Developer manual](https://img.shields.io/badge/docs-developer_manual-235c86)](https://skg7on.github.io/DSLCompiler/)
+[![License](https://img.shields.io/badge/license-Apache--2.0%20WITH%20LLVM--exception-blue)](LICENSE)
 
 DSLCompiler is an out-of-tree [MLIR](https://mlir.llvm.org/) project whose goal is to **design a generic MicroIR-based, mapping- and search-based DNN compiler framework**. It represents tile execution, maps computations onto machine resources, searches legal compilation choices, and lowers or analyzes the selected plan. **Matmul and fused SwiGLU are example operator kernels for testing the framework.** Intel AVX2 is the first executable validation target; additional targets extend machine descriptions, mapping policy and backend emitters.
 
@@ -149,4 +150,8 @@ Follow the [project tracker](https://github.com/skg7on/DSLCompiler/issues/41) fo
 
 ## License
 
-MIT
+The LLK Compiler Project is licensed under the **Apache License 2.0 with LLVM
+Exceptions**. The full license text is in [LICENSE](LICENSE) and the LLVM
+exceptions are in [EXCEPTIONS](EXCEPTIONS). Every source file carries the SPDX
+identifier `Apache-2.0 WITH LLVM-exception`, checked in CI by
+`scripts/check-license-headers.py`.

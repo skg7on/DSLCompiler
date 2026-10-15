@@ -1,16 +1,15 @@
 //===- ScratchAnalysis.cpp - Audit memref allocs for intermediates --------===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Post-bufferization pass that walks all memref.alloc ops and warns on
 // allocations larger than 1 MB, flagging potential full-size intermediates
 // that could be fused away.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/ScratchAnalysis.h"
 

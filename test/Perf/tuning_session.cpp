@@ -1,6 +1,12 @@
-//===- tuning_session.cpp - Ranking, session loop, and schedule YAML
-//-------===//
+//===- tuning_session.cpp - Ranking, session loop, and schedule YAML ------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Covers issue #50, ranking half:
 //   - ranking is by the space's primary metric, then its secondary metrics,
 //     then the candidate id, so the order is deterministic
@@ -13,8 +19,6 @@
 // without depending on the simulator's numbers. The session test uses the
 // shipped AVX2 model and a two-choice space, so one candidate is legal and one
 // is rejected by a known constraint.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Machine/MachineModelLoader.h"

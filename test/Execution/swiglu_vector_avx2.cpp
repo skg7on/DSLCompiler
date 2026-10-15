@@ -1,5 +1,12 @@
 //===- swiglu_vector_avx2.cpp - E2E vector-pipeline JIT tests -------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Tests the full M2 vector pipeline end-to-end:
 //   1. Build SwiGLU module programmatically (avoiding func.func text-parse
 //   issues)
@@ -7,8 +14,6 @@
 //   3. JIT compile via JitCache
 //   4. Execute JIT-compiled kernel and validate against FP64 reference
 //   5. Test shapes include odd N=127 for masked-tail coverage
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"

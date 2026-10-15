@@ -1,4 +1,11 @@
-//===- covering_search.cpp - Complete-plan search (D6) -------------------===//
+//===- covering_search.cpp - Complete-plan search (D6) --------------------===//
+//
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/Diagnostics.h"

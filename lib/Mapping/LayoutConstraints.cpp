@@ -1,5 +1,12 @@
 //===- LayoutConstraints.cpp - LLKMap layout declarations (D3) ------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Parses `layout` declarations on top of the shared LLKMap expression grammar
 // (LlkMap.h) and solves them by bounded enumeration. Diagnostics carry file,
 // line, and column.

@@ -1,5 +1,12 @@
 //===- properties.cpp - Bounded property tests for the mapping core -------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Design §25.6 asks for bounded randomized property tests over the mapping
 // engine's structural invariants. The hand-written fixtures elsewhere in this
 // directory pin each property on one shape; this file draws many small random
@@ -23,8 +30,6 @@
 // so a failure reproduces from the seed alone and the harness adds no fuzz
 // dependency. Iteration counts are bounded so the whole binary runs in well
 // under a second.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CostEvent.h"

@@ -1,5 +1,12 @@
 //===- storage_liveness.cpp - Live storage from execution events ----------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Task R5 (issue #129). Exercises `analyzeStorageLiveness`: the peak residency
 // of each memory, derived from the plan's *scheduled* events, over fixtures
 // whose expected peaks are literal values. The three structural fixtures make
@@ -16,8 +23,6 @@
 // physical image, so an 8x8xf32 result under a row-major layout whose physical
 // row is twice the logical one occupies an 8x15 image -- 480 bytes, not the
 // logical 256.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/StorageLiveness.h"
 

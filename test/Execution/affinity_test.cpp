@@ -1,9 +1,14 @@
-//===- affinity_test.cpp - NUMA affinity and thread pinning tests --------===//
+//===- affinity_test.cpp - NUMA affinity and thread pinning tests ---------===//
 //
-// Verifies that ThreadPool workers can be configured with CPU affinity
-// masks and that affinity settings survive the pool lifecycle.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Verifies that ThreadPool workers can be configured with CPU affinity
+// masks and that affinity settings survive the pool lifecycle.
 
 #include "LLK/Runtime/ThreadPool.h"
 

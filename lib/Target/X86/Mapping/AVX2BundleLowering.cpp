@@ -1,5 +1,12 @@
 //===- AVX2BundleLowering.cpp - AVX2 bundle lowering (issue #67, C2) ------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The AVX2 target's lowering: what a *selected* bundle means for the code this
 // backend emits.
 //
@@ -13,8 +20,6 @@
 // Everything in this file is AVX2 policy: the vector width a bundle selected,
 // the element types this backend has arithmetic for, and the physical layout
 // the lowered tile carries. None of it lives in the mapping core.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 

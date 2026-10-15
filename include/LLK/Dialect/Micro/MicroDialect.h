@@ -1,10 +1,14 @@
-//===- MicroDialect.h - Micro dialect public header --------------*- C++
-//-*-===//
+//===- MicroDialect.h - Micro dialect public header -------------*- C++ -*-===//
 //
-// Public header for the Micro dialect.  Includes the necessary MLIR headers
-// before the TableGen-generated dialect declaration.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Public header for the Micro dialect.  Includes the necessary MLIR headers
+// before the TableGen-generated dialect declaration.
 
 #ifndef LLK_DIALECT_MICRO_MICRODIALECT_H
 #define LLK_DIALECT_MICRO_MICRODIALECT_H

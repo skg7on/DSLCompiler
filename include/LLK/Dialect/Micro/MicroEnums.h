@@ -1,13 +1,17 @@
-//===- MicroEnums.h - Micro dialect enums
-//----------------------------------===//
+//===- MicroEnums.h - Micro dialect enums -----------------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Manual enum definitions for Micro dialect attributes.
 // These are hand-written because the CMake tablegen configuration currently
 // does not include -gen-enum-decls/-gen-enum-defs generators (the enum
 // stringification/symbolization functions are needed by the generated
 // attribute parser in MicroAttributes.cpp.inc).
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_DIALECT_MICRO_MICROENUMS_H
 #define LLK_DIALECT_MICRO_MICROENUMS_H

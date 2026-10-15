@@ -1,5 +1,12 @@
-//===- SearchSpace.h - Typed tuning search space for Micro-IR -------------===//
+//===- SearchSpace.h - Typed tuning search space for Micro-IR ---*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #49).
 //
 // A `micro.search_space` is the auto-scheduler's input: a set of tunable
@@ -14,8 +21,6 @@
 // declared precisely so consumers do not infer semantics from names.
 //
 // loadSearchSpace() is the only entry point that touches MLIR.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_SEARCHSPACE_H
 #define LLK_PERF_SEARCHSPACE_H

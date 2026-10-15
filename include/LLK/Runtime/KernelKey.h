@@ -1,9 +1,14 @@
-//===- KernelKey.h - Deterministic cache key for compiled kernels ---------===//
+//===- KernelKey.h - Deterministic compiled-kernel cache key ----*- C++ -*-===//
 //
-// 13-field KernelKey uniquely identifies a compiled kernel variant.
-// Also defines WeightKey for the packed-weight cache (L4).
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// 13-field KernelKey uniquely identifies a compiled kernel variant.
+// Also defines WeightKey for the packed-weight cache (L4).
 
 #ifndef LLK_RUNTIME_KERNELKEY_H
 #define LLK_RUNTIME_KERNELKEY_H

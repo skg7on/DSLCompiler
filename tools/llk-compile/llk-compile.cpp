@@ -1,12 +1,17 @@
 //===- llk-compile.cpp - LLK kernel compiler driver -----------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // CLI tool that parses an MLIR module containing LLK dialect ops,
 // runs the full progressive lowering pipeline (LLK→Linalg→...→LLVM IR),
 // JIT-compiles the result, and reports success.
 //
 // Usage: llk-compile <input.mlir> [--M=<dim>] [--N=<dim>] [--K=<dim>]
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"

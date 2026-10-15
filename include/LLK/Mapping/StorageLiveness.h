@@ -1,5 +1,12 @@
-//===- StorageLiveness.h - Live storage from execution events -------------===//
+//===- StorageLiveness.h - Live storage from execution events ---*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Task R5 (issue #129). Occupancy used to be summarized from a *serial
 // topological index*: every allocation was charged its producer's whole
 // execution multiplicity, so sequential loop iterations that reuse one buffer
@@ -21,8 +28,6 @@
 // buffer's last read (an in-place update) -- and the edge that orders them is
 // reported as a required reuse edge for the caller to materialize. Nothing here
 // invents overlap.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_STORAGELIVENESS_H
 #define LLK_MAPPING_STORAGELIVENESS_H

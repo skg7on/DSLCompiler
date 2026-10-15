@@ -1,15 +1,11 @@
 #!/bin/bash
-# Pre-commit hook: run clang-format on staged C/C++ files
+# Pre-commit hook: license-header and clang-format checks on staged sources.
 
 set -e
 
-if ! command -v clang-format &>/dev/null; then
-  echo "WARNING: clang-format not found, skipping formatting check."
-  exit 0
-fi
-
-# Collect staged C/C++ files
-STAGED=$(git diff --cached --name-only --diff-filter=ACM -- '*.cpp' '*.h' '*.c' '*.hpp' '*.cc' '*.cxx' '*.hxx')
+# C/C++ sources are clang-formatted; TableGen only gets the header check.
+STAGED=$(git diff --cached --name-only --diff-filter=ACM -- \
+  '*.cpp' '*.h' '*.c' '*.hpp' '*.cc' '*.cxx' '*.hxx' '*.td')
 
 if [ -z "$STAGED" ]; then
   exit 0
@@ -17,16 +13,30 @@ fi
 
 HAS_ERRORS=0
 
-for FILE in $STAGED; do
-  if ! clang-format --dry-run --Werror "$FILE" 2>/dev/null; then
-    echo "clang-format would reformat: $FILE"
-    HAS_ERRORS=1
-  fi
-done
+# License headers: every staged source must carry the project banner.
+if ! python3 scripts/check-license-headers.py $STAGED; then
+  HAS_ERRORS=1
+fi
+
+# Formatting: clang-format is optional on this machine.
+if command -v clang-format &>/dev/null; then
+  for FILE in $STAGED; do
+    case "$FILE" in
+      *.td) continue ;;
+    esac
+    if ! clang-format --dry-run --Werror "$FILE" 2>/dev/null; then
+      echo "clang-format would reformat: $FILE"
+      HAS_ERRORS=1
+    fi
+  done
+else
+  echo "WARNING: clang-format not found, skipping formatting check."
+fi
 
 if [ $HAS_ERRORS -ne 0 ]; then
   echo ""
-  echo "Rejected: clang-format reported style violations."
-  echo "Run 'clang-format -i' on the files above and stage the changes."
+  echo "Rejected: fix the issues above and stage the changes."
+  echo "  headers:    scripts/check-license-headers.py documents the format"
+  echo "  formatting: run 'clang-format -i' on the files above"
   exit 1
 fi

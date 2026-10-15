@@ -1,5 +1,12 @@
-//===- CoveringSearch.h - Complete-plan search (D6) -----------------------===//
+//===- CoveringSearch.h - Complete-plan search (D6) -------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, workstream D6).
 //
 // Covering search picks one placement per workload node and one connection per
@@ -16,8 +23,6 @@
 // Cost is the candidate's declared lower bound plus the synthesized connection
 // cost. The performance evaluator (#46) replaces that later; it does not
 // change which plans are legal (design §16.2).
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_COVERINGSEARCH_H
 #define LLK_MAPPING_COVERINGSEARCH_H

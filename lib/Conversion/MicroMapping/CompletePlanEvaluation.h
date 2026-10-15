@@ -1,5 +1,12 @@
-//===- CompletePlanEvaluation.h - Evaluate a complete proposal (R7) -------===//
+//===- CompletePlanEvaluation.h - Evaluate a complete plan ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Issue #129, task R7. `CoveringSearch` synthesizes *proposals* -- cheap
 // coverings of instances and connections -- and must know nothing about dialect
 // conversion, plan materialization or the performance model. Whether a proposal
@@ -16,8 +23,6 @@
 // Library boundary: this translation unit lives in `LLKMicroMapping`, the layer
 // above `LLKMapping` and `LLKPerf`, so the mapping core never links the
 // performance model, a dialect or a JIT.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_CONVERSION_MICROMAPPING_COMPLETEPLANEVALUATION_H
 #define LLK_CONVERSION_MICROMAPPING_COMPLETEPLANEVALUATION_H

@@ -1,9 +1,14 @@
 //===- llk-bench.cpp - LLK kernel benchmarking harness --------------------===//
 //
-// Measures GFLOPS and execution time for LLK kernels across different
-// shape regimes (M bucket, N, K) and thread counts.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Measures GFLOPS and execution time for LLK kernels across different
+// shape regimes (M bucket, N, K) and thread counts.
 
 #include "LLK/Runtime/ThreadPool.h"
 

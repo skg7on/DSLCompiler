@@ -1,9 +1,14 @@
 //===- ScheduleLoader.h - Shared schedule_db.json reader --------*- C++ -*-===//
 //
-// JSON-based schedule database loader used by ScheduleSelection pass.
-// Decoupled from the pass itself so autotuning and benchmarking can reuse it.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// JSON-based schedule database loader used by ScheduleSelection pass.
+// Decoupled from the pass itself so autotuning and benchmarking can reuse it.
 
 #ifndef LLK_TRANSFORMS_COMMON_SCHEDULELOADER_H
 #define LLK_TRANSFORMS_COMMON_SCHEDULELOADER_H

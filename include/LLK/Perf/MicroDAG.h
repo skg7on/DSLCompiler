@@ -1,5 +1,12 @@
-//===- MicroDAG.h - Event DAG extracted from concrete Micro-IR ------------===//
+//===- MicroDAG.h - Event DAG extracted from concrete Micro-IR --*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M10 AVX2 performance simulator (issue #46).
 //
 // buildMicroDAG() turns one concrete tile-centric `micro.kernel` into the flat
@@ -31,8 +38,6 @@
 // Loops with non-static bounds are executed once and reported as a warning,
 // because a run of unknown length cannot be charged. A kernel that unrolls past
 // kMaxEvents is rejected rather than silently approximated.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_MICRODAG_H
 #define LLK_PERF_MICRODAG_H

@@ -1,5 +1,12 @@
 //===- MappedCompilation.cpp - Compile a selected mapping plan (C5) -------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The shared sequence, in the order the stages depend on each other:
 //
 //   bind (clone + materialize + persist selected state)
@@ -13,8 +20,6 @@
 // target does not declare, and the emitters are asked whether they lower before
 // they are called -- so "the target ran this kernel" and "the reference bridge
 // ran this kernel" stay different statements.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/MappedKernelAbi.h"

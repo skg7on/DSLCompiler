@@ -1,13 +1,18 @@
 //===- triton_swiglu_staged.cpp - Triton IR → LLK staged pipeline ---------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Integration test that builds Triton IR for SwiGLU programmatically, runs it
 // through the staged lowering pipeline (TritonToStructured → GridToForall →
 // existing LLK pipeline), JIT-executes, and compares against a reference.
 //
 // SKELETON: For M8b, this starts as a manual IR construction test and evolves
 // into a full pipeline test once all stages are integrated.
-//
-//===----------------------------------------------------------------------===//
 
 #include <gtest/gtest.h>
 

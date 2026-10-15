@@ -1,5 +1,12 @@
 //===- MicroBindPlanPass.cpp - `micro-bind-plan` (design §21) -------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Binds one specific plan, named by its stable content-derived id, onto the
 // module's kernel. A plan id is a hash of the plan's content, so the only way
 // to reproduce it is to re-run the search -- plans are never persisted between
@@ -10,8 +17,6 @@
 // emitters). A different search can order, cap, or constrain the plans
 // differently and so fail to contain the id, which is reported rather than
 // silently binding a different plan.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MicroMapping/MicroMappingPasses.h"
 #include "MicroMappingCommon.h"

@@ -1,5 +1,12 @@
-//===- AVX2MappingTarget.h - AVX2 mapping package (D7) --------------------===//
+//===- AVX2MappingTarget.h - AVX2 mapping package (D7) ----------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target package layer (epic #67, workstream D7).
 //
 // This header is the *only* place that knows the AVX2 mapping configuration by
@@ -10,8 +17,6 @@
 //
 // Emitter keys are code, not configuration: they name C++ emitters the plugin
 // provides, which is why they live here rather than in rules.llkmap.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_TARGET_X86_MAPPING_AVX2MAPPINGTARGET_H
 #define LLK_TARGET_X86_MAPPING_AVX2MAPPINGTARGET_H

@@ -1,5 +1,12 @@
 //===- complete_plan_evaluation.cpp - Evaluate a complete proposal (R7) ---===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Issue #129, task R7. `evaluateCompletePlan` turns a cheap search *proposal*
 // into exactly one of a finalized, physically validated, schedulable plan or a
 // stable-coded rejection. These tests exercise it directly -- rather than
@@ -7,8 +14,6 @@
 // `MappingCoveringSearchTest` regressions) -- against the shared
 // `capacity-topk` fixture, whose two rules bind an `8x8xf32` result with four
 // live versions (1024 bytes) to a 512-byte SRAM and a 4096-byte DRAM.
-//
-//===----------------------------------------------------------------------===//
 
 #include "CompletePlanEvaluation.h"
 

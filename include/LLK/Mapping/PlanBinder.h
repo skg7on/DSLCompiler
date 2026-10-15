@@ -1,5 +1,12 @@
-//===- PlanBinder.h - Materialize a selected plan (D7/#50) ---------------===//
+//===- PlanBinder.h - Materialize a selected plan (D7/#50) ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, #50 revision).
 //
 // The binder takes a selected `CoveringPlan` and writes it onto a private
@@ -12,8 +19,6 @@
 // nothing about what any of those ids mean -- resolving them is the
 // machine-aware phase below, and interpreting a bundle is the target
 // emitter's job.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_PLANBINDER_H
 #define LLK_MAPPING_PLANBINDER_H

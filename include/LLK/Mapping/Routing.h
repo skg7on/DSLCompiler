@@ -1,5 +1,12 @@
-//===- Routing.h - Deterministic memory-to-memory routing (D2) ------------===//
+//===- Routing.h - Deterministic memory-to-memory routing (D2) --*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, workstream D2).
 //
 // Direct source-to-destination copies are not enough for a memory hierarchy:
@@ -20,8 +27,6 @@
 //
 // Materializing a chosen route as copies/waits is a later step (design §12.4,
 // D5/plan binding); this layer only enumerates and ranks.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_ROUTING_H
 #define LLK_MAPPING_ROUTING_H

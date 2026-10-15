@@ -1,5 +1,12 @@
 //===- MicroMappingCommon.h - Shared mapping-pass plumbing ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The two passes in this directory differ only in which plan they select --
 // `micro-map` takes the best one, `micro-bind-plan` takes the one a stable id
 // names -- so the chain that turns a module plus a target specification into a
@@ -7,8 +14,6 @@
 //
 // Everything here is target-neutral: a target is loaded from files and the
 // kernel is found by dialect op name, never by a backend branch.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_CONVERSION_MICROMAPPING_MICROMAPPINGCOMMON_H
 #define LLK_CONVERSION_MICROMAPPING_MICROMAPPINGCOMMON_H

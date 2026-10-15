@@ -1,5 +1,12 @@
 //===- MicroToLinalg.cpp - Lower micro kernels to Linalg over tensors -----===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // `micro` is the canonical execution IR, and until this pass it was a sink:
 // nothing lowered it to anything a backend consumes. This is the bridge that
 // lets a `micro.kernel` -- hand-written, exported by `--llk-to-micro`, or bound
@@ -35,8 +42,6 @@
 // unused, so the lowered function computes dead work. Binding real inputs and
 // outputs is a later slice, and is what the JIT harness needs to observe a
 // result.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MicroToLinalg.h"
 

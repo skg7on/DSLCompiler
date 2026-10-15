@@ -1,9 +1,14 @@
 //===- ScheduleLoader.cpp - Shared schedule_db.json reader ----------------===//
 //
-// Extracted from ScheduleSelection pass for reuse by autotuning (llk-tune)
-// and benchmarking (llk-bench).
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Extracted from ScheduleSelection pass for reuse by autotuning (llk-tune)
+// and benchmarking (llk-bench).
 
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 

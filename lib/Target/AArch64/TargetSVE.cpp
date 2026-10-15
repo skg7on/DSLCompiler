@@ -1,8 +1,13 @@
-//===- TargetSVE.cpp - AArch64 SVE feature detection ---------------------===//
+//===- TargetSVE.cpp - AArch64 SVE feature detection ----------------------===//
 //
-// Part of the LLK Compiler Project
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Part of the LLK Compiler Project
 
 #include "LLK/Target/AArch64/TargetSVE.h"
 

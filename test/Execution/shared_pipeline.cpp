@@ -1,10 +1,15 @@
 //===- shared_pipeline.cpp - Shared pipeline tests ------------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Verifies that all three kernel ops (SwiGLU, RoPE, Attention) can compile
 // through the same pipeline infrastructure, that KernelKey distinguishes
 // between them, and that no SwiGLU-specific code leaks into generic passes.
-//
-//===----------------------------------------------------------------------===//
 
 #include <cstdint>
 #include <gtest/gtest.h>

@@ -1,11 +1,12 @@
-//===- FuseDoubleContraction.cpp - Fuse 2 matmuls sharing X + SiLU -------===//
+//===- FuseDoubleContraction.cpp - Fuse 2 matmuls sharing X + SiLU --------===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Fuses 2 linalg.matmul ops (sharing the same X operand) + their linalg.generic
 // SiLU consumer into a single linalg.generic with 2 reduction outputs, plus
 // a separate elementwise epilogue for the SiLU(gate) * up computation.
@@ -20,8 +21,6 @@
 //   - Both inputs are results of linalg::MatmulOp
 //   - Both matmuls share the same X (first input) operand
 //   - Both matmul results have one use (the consumer)
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/FuseDoubleContraction.h"
 

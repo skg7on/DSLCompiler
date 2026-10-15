@@ -1,5 +1,12 @@
-//===- OpDAGBuilder.h - Injectable leaf-operation DAG extraction
-//-----------===//
+//===- OpDAGBuilder.h - Injectable leaf-op DAG extraction -------*- C++ -*-===//
+//
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 #ifndef LLK_PERF_OPDAGBUILDER_H
 #define LLK_PERF_OPDAGBUILDER_H
 

@@ -1,5 +1,12 @@
-//===- SearchBinding.h - Immutable point in a search space ----------------===//
+//===- SearchBinding.h - Immutable point in a search space ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (issue #80, epic #67 D1).
 //
 // A `SearchBinding` is the handoff from the persistent search IR to the
@@ -13,8 +20,6 @@
 // only in their symbolic candidate name are recognisably the same point; the
 // name is preserved for diagnostics and report provenance, and breaks ties in
 // canonical ordering.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_SEARCHBINDING_H
 #define LLK_MAPPING_SEARCHBINDING_H

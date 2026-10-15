@@ -1,5 +1,12 @@
-//===- GenericAcceleratorMappingTarget.h - second target (D7) -------------===//
+//===- GenericAcceleratorMappingTarget.h - second target (D7) ---*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target package layer (epic #67, workstream D7).
 //
 // The second complete mapping target. It exists to prove a claim: a target
@@ -7,8 +14,6 @@
 // different layouts, different emitters -- needs no change to generic Micro
 // ODS, to `LLK/Mapping`, or to the search. Everything that differs lives in
 // this package and in `mapping/generic-ai-accel/`.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_TARGET_GENERICACCELERATOR_MAPPING_GENERICACCELERATORMAPPINGTARGET_H
 #define LLK_TARGET_GENERICACCELERATOR_MAPPING_GENERICACCELERATORMAPPINGTARGET_H

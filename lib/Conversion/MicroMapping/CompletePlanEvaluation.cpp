@@ -1,12 +1,17 @@
 //===- CompletePlanEvaluation.cpp - Evaluate a complete proposal (R7) -----===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // See CompletePlanEvaluation.h. The evaluation is the one place a search
 // proposal becomes a physical, schedulable plan, and it is deliberately built
 // only from functions the planner and the performance model already share
 // (`finalizeStoragePlan`, `bindPlan`, `analyzeSelectedKernel`) so a plan's
 // feasibility and its predicted cost are one analysis of one kernel.
-//
-//===----------------------------------------------------------------------===//
 
 #include "CompletePlanEvaluation.h"
 

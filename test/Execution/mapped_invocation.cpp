@@ -1,3 +1,12 @@
+//===- mapped_invocation.cpp - Tests for typed mapped invocation ----------===//
+//
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 #include "LLK/Runtime/MappedExecutable.h"
 #include "LLK/Runtime/MappedInvocation.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"

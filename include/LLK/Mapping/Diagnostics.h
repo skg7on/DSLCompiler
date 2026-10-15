@@ -1,5 +1,12 @@
-//===- Diagnostics.h - Stable diagnostic codes (D6, §22.3) ----------------===//
+//===- Diagnostics.h - Stable diagnostic codes (D6, §22.3) ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67). A mapping failure is
 // reported by a *stable code*, not by prose: the string form is the interface a
 // caller may switch on, log, or group by, while the accompanying message is
@@ -12,8 +19,6 @@
 // mapping search today (each is noted at its declaration):
 // `no_layout_transform` and `global_constraint_failed` are decided outside the
 // search, and `target_bundle_invalid` is caught when a target is loaded.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_DIAGNOSTICS_H
 #define LLK_MAPPING_DIAGNOSTICS_H

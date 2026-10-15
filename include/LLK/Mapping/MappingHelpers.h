@@ -1,5 +1,12 @@
-//===- MappingHelpers.h - Shared, mechanical mapping helpers --------------===//
+//===- MappingHelpers.h - Shared, mechanical mapping helpers ----*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Small, target-neutral helpers used by more than one component of the mapping
 // subsystem. They live here rather than duplicated per translation unit so the
 // copies cannot drift before later work adds callers: the rule-port resolver
@@ -7,8 +14,6 @@
 // attribute spelling must match the Micro dialect's `#micro.memory<...>` form,
 // and the transparent-logical-op walk must resolve the same indirection the
 // verifier and the materializer see.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_MAPPINGHELPERS_H
 #define LLK_MAPPING_MAPPINGHELPERS_H

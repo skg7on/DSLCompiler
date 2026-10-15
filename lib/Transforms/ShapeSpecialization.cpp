@@ -1,5 +1,12 @@
 //===- ShapeSpecialization.cpp - M dimension bucketing pass ---------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Classifies the M dimension of registered LLK kernels into one of
 // 5 buckets used by the schedule selection system.
 //
@@ -9,8 +16,6 @@
 //   Bucket 2: M ∈ [5, 16]     → Small tile
 //   Bucket 3: M ∈ [17, 64]    → Medium tile
 //   Bucket 4: M ≥ 65          → Large tile
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/ShapeSpecialization.h"
 

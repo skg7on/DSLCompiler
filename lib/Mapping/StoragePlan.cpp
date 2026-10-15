@@ -1,8 +1,13 @@
 //===- StoragePlan.cpp - Physical footprints and value live ranges --------===//
 //
-// Task B3 (issue #67, stage B).
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Task B3 (issue #67, stage B).
 
 #include "LLK/Mapping/StoragePlan.h"
 

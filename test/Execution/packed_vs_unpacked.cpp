@@ -1,9 +1,14 @@
-//===- packed_vs_unpacked.cpp - Packed vs unpacked weight equivalence ----===//
+//===- packed_vs_unpacked.cpp - Packed vs unpacked weight equivalence -----===//
 //
-// Verifies that packed weight kernels produce numerically identical
-// results to unpacked kernels within tolerance.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Verifies that packed weight kernels produce numerically identical
+// results to unpacked kernels within tolerance.
 
 #include <gtest/gtest.h>
 

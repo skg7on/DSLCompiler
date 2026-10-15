@@ -1,9 +1,14 @@
 //===- rope_correctness.cpp - RoPE end-to-end correctness tests -----------===//
 //
-// Verifies llk.rope against FP64 reference. Uses the JIT compilation
-// pipeline to compile and execute RoPE kernels.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Verifies llk.rope against FP64 reference. Uses the JIT compilation
+// pipeline to compile and execute RoPE kernels.
 
 #include <cmath>
 #include <gtest/gtest.h>

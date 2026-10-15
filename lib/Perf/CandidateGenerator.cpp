@@ -1,13 +1,18 @@
-//===- CandidateGenerator.cpp - Deterministic candidate enumeration ------===//
+//===- CandidateGenerator.cpp - Deterministic candidate enumeration -------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #49). See CandidateGenerator.h.
 //
 // Both generators share one `buildCandidate()` so a grid point and a random
 // point with the same bindings are byte-identical, ids included. That is what
 // lets a random study be compared against the grid without a second notion of
 // equality.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/CandidateGenerator.h"
 

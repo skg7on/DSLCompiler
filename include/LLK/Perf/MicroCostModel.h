@@ -1,5 +1,12 @@
-//===- MicroCostModel.h - L0 static bound and L1 resource scheduling ------===//
+//===- MicroCostModel.h - L0 bounds and L1 scheduling -----------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M10 AVX2 performance simulator (issue #46).
 //
 // Both levels consume the same MicroDAG, so they can never disagree about what
@@ -16,8 +23,6 @@
 //
 // Diagnostics (capacity, layout, owner) are returned alongside rather than
 // inside L1Report, so that `micro-perf --level=0` can report them too.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_MICROCOSTMODEL_H
 #define LLK_PERF_MICROCOSTMODEL_H

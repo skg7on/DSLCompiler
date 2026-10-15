@@ -1,5 +1,12 @@
 //===- legality.cpp - Machine-aware legality tests ------------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Covers issue #49, legality half. Every constraint kind the dialect accepts
 // has a rejection case here, plus a legal baseline the exporter's constraint
 // set accepts and the first candidate of a space shaped like the M11 export's
@@ -17,8 +24,6 @@
 //
 // Rejection tests use a space with a single constraint so the stable reason
 // string is the one under test; the baseline uses the exporter's full set.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/Legality.h"
 #include "LLK/Machine/MachineModelLoader.h"

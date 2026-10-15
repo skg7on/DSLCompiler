@@ -1,5 +1,12 @@
 //===- llk-tune.cpp - LLK schedule tuning driver --------------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Two modes, selected by whether a Micro search space is given:
 //
 //   * Micro mode (--input=<space.mlir>): load one `micro.search_space` and a
@@ -10,8 +17,6 @@
 //     num_threads, and grain_size, filtered by an L1 footprint estimate and
 //     written as a JSON schedule_db entry to -o. Preserved so the existing
 //     schedule-consumption pipeline keeps working.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
 #include "LLK/Conversion/MicroMapping/MappedTuningSession.h"

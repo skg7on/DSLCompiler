@@ -1,5 +1,12 @@
-//===- StoragePlan.h - Physical footprints and value live ranges ----------===//
+//===- StoragePlan.h - Physical footprints and live ranges ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Task B3 (issue #67, stage B). Two contracts live here:
 //
 //   * `physicalFootprintFor` sizes a value the way memory actually holds it --
@@ -17,8 +24,6 @@
 //
 // The core stays target-neutral: memory identities are machine node ids, never
 // target-name branches. All arithmetic is checked; overflow is a rejection.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_STORAGEPLAN_H
 #define LLK_MAPPING_STORAGEPLAN_H

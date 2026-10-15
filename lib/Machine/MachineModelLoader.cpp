@@ -1,5 +1,12 @@
 //===- MachineModelLoader.cpp - Load a v2 machine model from YAML ---------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Walks the document with LLVM's low-level YAML parser rather than
 // MappingTraits, for the same reasons the v1 loader does: the original key has
 // to survive into the diagnostic ("unknown key 'warp_size'" is only useful if
@@ -10,8 +17,6 @@
 // acyclic containment, known kinds, resolvable references -- live in
 // verifyMachineModel(), so a parsed model and a hand-built one face the same
 // checks.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Machine/MachineModelLoader.h"
 

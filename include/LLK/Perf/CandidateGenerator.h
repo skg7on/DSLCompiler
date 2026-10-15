@@ -1,5 +1,12 @@
-//===- CandidateGenerator.h - Deterministic candidate enumeration --------===//
+//===- CandidateGenerator.h - Candidate enumeration -------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #49).
 //
 // The MVP generator is a Cartesian grid: every parameter's choices are crossed
@@ -15,8 +22,6 @@
 // Neither generator performs legality checks. Legality is a property of the
 // candidate, the workload, and the machine, and it is evaluated by Legality.h
 // so generation stays cheap and side-effect free.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_CANDIDATEGENERATOR_H
 #define LLK_PERF_CANDIDATEGENERATOR_H

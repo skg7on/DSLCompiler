@@ -1,6 +1,12 @@
-//===- SelectedKernelAnalysis.cpp - One static analysis of a selected kernel
-//==//
+//===- SelectedKernelAnalysis.cpp - Selected-kernel analysis --------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Implements analyzeSelectedKernel() / analyzeSelectedDag(): the single
 // extraction both the mapping planner and the performance report read (issue
 // #129, task R6). See the header for the contract and the library boundary.

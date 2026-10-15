@@ -1,13 +1,18 @@
 //===- route_identity.cpp - Binder->perf route identity -------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The binder materializes a selected multi-hop route as one `micro.async_copy`
 // per hop (design §18.2). The performance model must charge each of those
 // copies its own link -- identified by the connection value and destination
 // node the binder stamps on it -- not the first link of the movement's endpoint
 // memory *kind*. This test drives the real binder and then builds the DAG, so
 // the identity is proven end to end rather than assumed from route order.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Machine/MachineModelLoader.h"

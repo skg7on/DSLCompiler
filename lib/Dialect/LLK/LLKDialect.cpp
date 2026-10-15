@@ -1,9 +1,14 @@
 //===- LLKDialect.cpp - LLK dialect implementation ------------------------===//
 //
-// Implements the LLK dialect: registration, attribute parsing/printing,
-// and operation initialization.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Implements the LLK dialect: registration, attribute parsing/printing,
+// and operation initialization.
 
 #include "LLK/Dialect/LLKEnums.h"
 
@@ -65,8 +70,8 @@ void mlir::llk::LLKDialect::initialize() {
 // constant materialization yet.
 //===----------------------------------------------------------------------===//
 
-mlir::Type mlir::llk::LLKDialect::parseType(
-    mlir::DialectAsmParser &parser) const {
+mlir::Type
+mlir::llk::LLKDialect::parseType(mlir::DialectAsmParser &parser) const {
   parser.emitError(parser.getCurrentLocation(),
                    "LLK dialect has no custom types");
   return {};

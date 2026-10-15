@@ -1,5 +1,12 @@
-//===- MicroMappingPasses.h - Mapping entry points (design §21) -----------===//
+//===- MicroMappingPasses.h - Mapping entry points --------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The composable, user-facing entry points into the target-independent mapping
 // engine (epic #67, design §21):
 //
@@ -17,8 +24,6 @@
 // files on disk (`target`/`machine`/`layouts`/`rules`/`emitters`), and no pass
 // branch ever mentions a specific backend. The target plugin gives its own ids
 // meaning, exactly as the mapping core does.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_CONVERSION_MICROMAPPING_MICROMAPPINGPASSES_H
 #define LLK_CONVERSION_MICROMAPPING_MICROMAPPINGPASSES_H

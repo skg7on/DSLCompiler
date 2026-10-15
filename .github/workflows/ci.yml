@@ -11,6 +11,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  license-headers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check source file license headers
+        run: python3 scripts/check-license-headers.py
+
   build-and-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 120

@@ -1,4 +1,11 @@
-//===- layout_constraints.cpp - LLKMap layout language (D3) --------------===//
+//===- layout_constraints.cpp - LLKMap layout language (D3) ---------------===//
+//
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/LayoutConstraints.h"
 

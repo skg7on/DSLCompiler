@@ -1,10 +1,15 @@
 //===- BlockPointerToVector.cpp - block ptr → vector.transfer -------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Lowers Triton block pointers and load/store to explicit vector.transfer
 // operations with boundary masking. tt.make_block_ptr becomes a memref.subview;
 // tt.advance folds to index arithmetic.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/TritonToLLK/BlockPointerToVector.h"
 #include "LLK/Transforms/Common/VectorizationUtils.h"

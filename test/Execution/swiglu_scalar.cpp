@@ -1,5 +1,12 @@
 //===- swiglu_scalar.cpp - End-to-end JIT execution tests -----------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Tests the full M1 scalar pipeline:
 //   1. Verify LLK dialect loads and module can be constructed
 //   2. Lower: LLK -> Linalg -> OneShotBufferize (via llk-opt subprocess)
@@ -13,8 +20,6 @@
 // runs the same parser) and handle failures gracefully. JIT tests use
 // parseSourceString with the custom format — these will succeed when
 // built against a working LLVM build (e.g., LLVM 24 from source).
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"

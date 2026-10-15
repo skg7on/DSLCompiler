@@ -1,6 +1,12 @@
-//===- MappingTargets.h - Register the mapping target packages
-//-------------===//
+//===- MappingTargets.h - Register the mapping target packages --*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target package layer (epic #67).
 //
 // The mapping core never names a backend. A tool that has to honour
@@ -11,8 +17,6 @@
 // It is the same shape MLIR uses for dialects and passes -- the tool says
 // "register everything", and what "everything" means is decided where the
 // packages can be seen.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_TARGET_MAPPINGTARGETS_H
 #define LLK_TARGET_MAPPINGTARGETS_H

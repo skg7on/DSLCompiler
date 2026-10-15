@@ -1,12 +1,16 @@
-//===- MathApproximation.h - Polynomial function approximations --*- C++
-//-*-===//
+//===- MathApproximation.h - Polynomial approximations ----------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Polynomial approximations for nonlinear functions used by all kernels:
 //   exp, sigmoid, cos, sin
 // Each function takes (builder, loc, Value x, MathMode mode) and returns
 // a Value with the approximated result.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_TRANSFORMS_COMMON_MATHAPPROXIMATION_H
 #define LLK_TRANSFORMS_COMMON_MATHAPPROXIMATION_H

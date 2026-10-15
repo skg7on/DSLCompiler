@@ -1,10 +1,14 @@
-//===- TilingUtils.h - Generic tile-size computation -------------*- C++
-//-*-===//
+//===- TilingUtils.h - Generic tile-size computation ------------*- C++ -*-===//
 //
-// Common utilities for computing tile sizes and constructing loop nests
-// from schedule parameters. Used by all three kernel types.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Common utilities for computing tile sizes and constructing loop nests
+// from schedule parameters. Used by all three kernel types.
 
 #ifndef LLK_TRANSFORMS_COMMON_TILINGUTILS_H
 #define LLK_TRANSFORMS_COMMON_TILINGUTILS_H

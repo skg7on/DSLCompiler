@@ -1,5 +1,12 @@
-//===- MachineHash.h - Stable content hashing for machine models ----------===//
+//===- MachineHash.h - Stable machine-model hashing -------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Internal to LLKMachine. The machine content hash keys the latency cache
 // (design §17.4), so it must be stable across toolchain and standard-library
 // changes -- FNV-1a 64, fixed by specification, not `llvm::hash_value`.
@@ -7,8 +14,6 @@
 // NOTE: the mapping core (LLK/Mapping) carries an equivalent helper that
 // LLKMachine must not depend on. When both land, these belong in a shared
 // LLK/Support header; until then the duplication is deliberate.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MACHINE_MACHINEHASH_H
 #define LLK_MACHINE_MACHINEHASH_H

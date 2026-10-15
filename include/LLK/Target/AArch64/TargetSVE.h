@@ -1,9 +1,14 @@
-//===- TargetSVE.h - AArch64 SVE feature detection -----------------------===//
+//===- TargetSVE.h - AArch64 SVE feature detection --------------*- C++ -*-===//
 //
-// CPU feature queries for AArch64 Scalable Vector Extension.
-// Stub implementation for post-M6 target expansion.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// CPU feature queries for AArch64 Scalable Vector Extension.
+// Stub implementation for post-M6 target expansion.
 
 #ifndef LLK_TARGET_AARCH64_TARGETSVE_H
 #define LLK_TARGET_AARCH64_TARGETSVE_H
@@ -17,11 +22,11 @@ namespace llk::aarch64 {
 
 /// CPU feature flags for AArch64 targets.
 struct CpuFeatures {
-  bool neon{false};   // Advanced SIMD (NEON)
-  bool sve{false};    // Scalable Vector Extension (SVE)
-  bool sve2{false};   // SVE2
-  bool bf16{false};   // BF16 support (BFMMLA/BFDOT or SVE BF16)
-  bool i8mm{false};   // 8-bit integer matrix multiply
+  bool neon{false};            // Advanced SIMD (NEON)
+  bool sve{false};             // Scalable Vector Extension (SVE)
+  bool sve2{false};            // SVE2
+  bool bf16{false};            // BF16 support (BFMMLA/BFDOT or SVE BF16)
+  bool i8mm{false};            // 8-bit integer matrix multiply
   uint32_t sve_vector_bits{0}; // 0 = unknown/minimum, 128/256/512 = known VL
 
   /// Summary string for logging.

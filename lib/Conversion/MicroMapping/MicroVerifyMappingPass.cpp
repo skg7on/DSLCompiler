@@ -1,6 +1,12 @@
-//===- MicroVerifyMappingPass.cpp - `micro-verify-mapping` (design §21)
-//----===//
+//===- MicroVerifyMappingPass.cpp - `micro-verify-mapping` (design §21) ---===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Phase 2 of the layered verification (design §18.3): an already-mapped
 // Micro-IR module is checked against a target, so the ids the binder recorded
 // are *resolved* rather than trusted. Phase 1 -- the dialect verifier -- knows
@@ -16,8 +22,6 @@
 // violation as a §22.3-coded diagnostic. It never mutates the module: a
 // successful verification leaves the input IR byte-identical, so it can be
 // dropped into a pipeline or run over a checked-in mapped kernel either way.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MicroMapping/MicroMappingPasses.h"
 #include "MicroMappingCommon.h"

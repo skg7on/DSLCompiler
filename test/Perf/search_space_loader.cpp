@@ -1,5 +1,12 @@
 //===- search_space_loader.cpp - micro.search_space -> SearchSpace tests --===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Covers issue #49, loader half:
 //   - integer and symbolic choices load in declaration order
 //   - a parameter's dialect kind is preserved, so symbolic roles can be
@@ -11,8 +18,6 @@
 //
 // The fixture is what the M11 exporter emits, so the loader is exercised on
 // the shape of IR the tuner will actually see.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Perf/SearchSpace.h"

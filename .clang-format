@@ -1,1 +1,7 @@
 BasedOnStyle: LLVM
+# Keep comment lines exactly as authored. LLVM style reflows comments, which
+# splits the `//===- File.h - Description ----*- C++ -*-===//` banner across two
+# lines whenever it exceeds the column limit. Every source file carries such a
+# banner, so reflowing it would defeat the header convention; see
+# scripts/check-license-headers.py, which enforces the single-line shape.
+ReflowComments: false

@@ -1,4 +1,11 @@
-//===- cost_model.cpp - Multi-dimensional Cost tests (issue #80 / D1) ----===//
+//===- cost_model.cpp - Multi-dimensional Cost tests (issue #80 / D1) -----===//
+//
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
 
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CostEvent.h"

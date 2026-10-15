@@ -1,6 +1,12 @@
-//===- MappingMetadata.cpp - Persisted selected-plan metadata (task B1)
-//-----===//
+//===- MappingMetadata.cpp - Persisted selected-plan metadata (task B1) ---===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Generic, target-neutral encoding/decoding of a selected plan's
 // execution-affecting state (see MappingMetadata.h). Target ids are only ever
 // compared, hashed and reported here; nothing in this file branches on a target
@@ -13,8 +19,6 @@
 // The same rendering therefore hashes a source kernel and the materialized
 // kernel built from it identically -- which is what lets a materialized graph
 // be validated against the source identity its metadata recorded.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/MappingMetadata.h"
 

@@ -1,5 +1,12 @@
 //===- micro_kernel_execution.cpp - The kernel ABI, lowered and JIT-able --===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Two checks along the #109 item-4 chain, both about the *signature* a micro
 // kernel acquires on its way to the backend:
 //
@@ -33,8 +40,6 @@
 // (`!llvm.ptr` parameters) so it matches the runtime, or give the runtime a
 // trampoline that adapts `MemRef2D *` to the expanded form. Until then "it
 // compiles" is as far as this test can honestly go.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MappedKernelAbi.h"
 #include "LLK/Conversion/MicroToLinalg.h"
