@@ -20,6 +20,8 @@
 #include "resource_regression_fixture.h"
 
 #include "mlir/AsmParser/AsmParser.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/MLIRContext.h"
 
 #include "llvm/Support/Error.h"
@@ -103,6 +105,9 @@ TEST(CompletePlanEvaluationTest, ExecutableRejectsSelectedAnalysisFailure) {
 TEST(CompletePlanEvaluationTest, ExecutableRejectsIncompleteSelectedAnalysis) {
   auto c = issue129::resourceCase("two-hop");
   ASSERT_TRUE(static_cast<bool>(c)) << llvm::toString(c.takeError());
+  // The ordinary fixture now models its DRAM-to-L2 store. Deliberately use
+  // an unmodeled DRAM-to-SRAM boundary to retain the negative control.
+  setStoreDestination(*c, "sram");
   const auto proposals = proposalsFor(*c);
   ASSERT_EQ(proposals.size(), 1u);
   auto evaluated =
@@ -126,7 +131,8 @@ TEST(CompletePlanEvaluationTest, PartialAnalysisFailureStillEnforcesBudget) {
   ASSERT_EQ(proposals.size(), 1u);
   auto tight = evaluateCompletePlan(*c->source, c->graph, *c->target,
                                     proposals.front(), BindContract::Partial,
-                                    /*memoryBudgetBytes=*/1);
+                                    /*memoryBudgetBytes=*/1,
+                                    AnalysisRequirement::PartialReport);
   ASSERT_TRUE(static_cast<bool>(tight)) << llvm::toString(tight.takeError());
   EXPECT_FALSE(tight->plan.has_value());
   ASSERT_TRUE(tight->rejection.has_value());
@@ -138,7 +144,8 @@ TEST(CompletePlanEvaluationTest, PartialAnalysisFailureStillEnforcesBudget) {
   // missing budget check.
   auto roomy = evaluateCompletePlan(*c->source, c->graph, *c->target,
                                     proposals.front(), BindContract::Partial,
-                                    /*memoryBudgetBytes=*/2048);
+                                    /*memoryBudgetBytes=*/2048,
+                                    AnalysisRequirement::PartialReport);
   ASSERT_TRUE(static_cast<bool>(roomy)) << llvm::toString(roomy.takeError());
   EXPECT_FALSE(roomy->rejection.has_value());
   ASSERT_TRUE(roomy->plan.has_value());
@@ -488,4 +495,212 @@ TEST(CompletePlanEvaluationTest, LeavesTheSourceModuleUnchanged) {
       ASSERT_TRUE(static_cast<bool>(evaluateCompletePlan(
           *c->source, c->graph, *c->target, proposal, BindContract::Partial)));
   EXPECT_EQ(before, printed(*c->source));
+}
+
+namespace {
+void addUnknownComputation(mlir::ModuleOp module) {
+  auto kernel = mlir::llk::perf::findMicroKernel(module, "");
+  ASSERT_TRUE(bool(kernel)) << llvm::toString(kernel.takeError());
+  auto *context = (*kernel)->getContext();
+  context->getOrLoadDialect<mlir::arith::ArithDialect>();
+  mlir::OpBuilder builder(context);
+  builder.setInsertionPoint((*kernel)->getRegion(0).front().getTerminator());
+  mlir::Value one = mlir::arith::ConstantOp::create(
+      builder, (*kernel)->getLoc(), builder.getF32FloatAttr(1.0));
+  mlir::arith::AddFOp::create(builder, (*kernel)->getLoc(), one, one);
+}
+} // namespace
+
+TEST(CompletePlanEvaluationTest, UnknownComputationCannotEnterTopK) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  addUnknownComputation(*c->source);
+  MappingSearchOptions options;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  bool named = false;
+  for (const auto &diagnostic : result->frontier.diagnostics)
+    named |= diagnostic.code == DiagnosticCode::UnsupportedMaterialization &&
+             diagnostic.message.find("unmodeled_leaf: arith.addf") !=
+                 std::string::npos;
+  EXPECT_TRUE(named);
+}
+
+TEST(CompletePlanEvaluationTest, AnalysisOnlyRejectsExtractionFailure) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  setStoreDestination(*c, "acc");
+  const auto proposals = proposalsFor(*c);
+  ASSERT_EQ(proposals.size(), 1u);
+  auto evaluated =
+      evaluateCompletePlan(*c->source, c->graph, *c->target, proposals.front(),
+                           BindContract::Partial);
+  ASSERT_TRUE(bool(evaluated)) << llvm::toString(evaluated.takeError());
+  EXPECT_FALSE(evaluated->plan.has_value());
+  ASSERT_TRUE(evaluated->rejection.has_value());
+  EXPECT_EQ(evaluated->rejection->code,
+            DiagnosticCode::UnsupportedMaterialization);
+  EXPECT_NE(evaluated->rejection->message.find("acc"), std::string::npos);
+}
+
+TEST(CompletePlanEvaluationTest, AnalysisOnlyRejectsMissingPhysicalFacts) {
+  auto c = issue129::resourceCase("missing-memory");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(result->frontier.has(DiagnosticCode::UnsupportedMaterialization));
+}
+
+TEST(CompletePlanEvaluationTest,
+     AnalysisOnlyRanksCompleteModelsWithoutBackend) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  MappingSearchOptions options;
+  options.topK = 1;
+  auto result = issue129::searchCase(*c, options);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 1u);
+  EXPECT_TRUE(result->plans.front().diagnostics.physicalComplete);
+  EXPECT_TRUE(result->plans.front().analysisEvents.has_value());
+  // This fixture declares synthetic emitter keys; no executable lowering is
+  // installed.
+  auto emitter = c->target->createEmitter("issue129_vector_add");
+  ASSERT_NE(emitter, nullptr);
+  EXPECT_FALSE(emitter->hasLowering());
+}
+
+TEST(CompletePlanEvaluationTest,
+     IncompleteProposalDoesNotMaskCompleteAlternative) {
+  class EngineProvider : public LatencyProvider {
+  public:
+    std::optional<double> lookupCycles(const OperationSignature &signature,
+                                       const TargetContext &) const override {
+      return signature.compute.find("vpu.a") != std::string::npos ? 1.0 : 100.0;
+    }
+  } provider;
+  auto c = issue129::resourceCase("two-compute", &provider);
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  mlir::OwningOpRef<mlir::ModuleOp> incomplete(c->source->clone());
+  addUnknownComputation(*incomplete);
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  options.enableSymmetryReduction = false;
+  options.requireCompleteEvaluation = true;
+  unsigned refused = 0;
+  options.evaluateCompletePlan = [&](const CoveringPlan &proposal) {
+    const bool cheap = proposal.placements.front().computeBindings.lookup(
+                           "vector_engine") == "vpu.a";
+    auto evaluated =
+        evaluateCompletePlan(cheap ? *incomplete : *c->source, c->graph,
+                             *c->target, proposal, BindContract::Partial);
+    if (evaluated && evaluated->rejection)
+      ++refused;
+    return evaluated;
+  };
+  LayoutContext layout;
+  layout.rank = 2;
+  layout.elementType = "f32";
+  CoveringSearch search(c->graph, *c->target, *c->context, layout, options);
+  auto result = search.search();
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  ASSERT_EQ(result->plans.size(), 1u);
+  EXPECT_EQ(result->plans.front().placements.front().computeBindings.lookup(
+                "vector_engine"),
+            "vpu.b");
+  EXPECT_DOUBLE_EQ(result->plans.front().totalCost.latencyCycles, 100.0);
+  EXPECT_GT(refused, 0u);
+  EXPECT_FALSE(result->searchTruncated);
+}
+
+TEST(CompletePlanEvaluationTest, PartialReportIsInspectableButNotRankable) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  addUnknownComputation(*c->source);
+  const auto proposals = proposalsFor(*c);
+  ASSERT_FALSE(proposals.empty());
+  auto partial = evaluateCompletePlan(
+      *c->source, c->graph, *c->target, proposals.front(),
+      BindContract::Partial, std::nullopt, AnalysisRequirement::PartialReport);
+  ASSERT_TRUE(bool(partial)) << llvm::toString(partial.takeError());
+  ASSERT_TRUE(partial->plan.has_value());
+  EXPECT_FALSE(partial->plan->materialized);
+  bool named = false;
+  for (const auto &warning : partial->plan->diagnostics.warnings)
+    named |= warning.find("unmodeled_leaf: arith.addf") != std::string::npos;
+  EXPECT_TRUE(named);
+
+  MappingSearchOptions options;
+  options.topK = 1;
+  options.requireCompleteEvaluation = true;
+  options.evaluateCompletePlan = [&](const CoveringPlan &proposal) {
+    return evaluateCompletePlan(*c->source, c->graph, *c->target, proposal,
+                                BindContract::Partial, std::nullopt,
+                                AnalysisRequirement::PartialReport);
+  };
+  LayoutContext layout;
+  layout.rank = 2;
+  layout.elementType = "f32";
+  CoveringSearch search(c->graph, *c->target, *c->context, layout, options);
+  auto result = search.search();
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(result->plans.empty());
+  EXPECT_TRUE(result->frontier.has(DiagnosticCode::UnsupportedMaterialization));
+}
+
+TEST(CompletePlanEvaluationTest, ExecutableCannotOptIntoPartialAnalysis) {
+  auto c = issue129::resourceCase("two-compute");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  addUnknownComputation(*c->source);
+  const auto proposals = proposalsFor(*c);
+  ASSERT_FALSE(proposals.empty());
+  auto evaluated =
+      evaluateCompletePlan(*c->source, c->graph, *c->target, proposals.front(),
+                           BindContract::Executable, std::nullopt,
+                           AnalysisRequirement::PartialReport);
+  ASSERT_TRUE(bool(evaluated)) << llvm::toString(evaluated.takeError());
+  EXPECT_FALSE(evaluated->plan.has_value());
+  ASSERT_TRUE(evaluated->rejection.has_value());
+  EXPECT_NE(evaluated->rejection->message.find("unmodeled_leaf: arith.addf"),
+            std::string::npos);
+}
+
+TEST(CompletePlanEvaluationTest, CompleteRejectsMaterializerOmissions) {
+  auto c = issue129::resourceCase("two-hop");
+  ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
+  auto proposals = proposalsFor(*c);
+  ASSERT_EQ(proposals.size(), 1u);
+  auto proposal = proposals.front();
+  ASSERT_EQ(proposal.connectionPlans.size(), 1u);
+  ASSERT_EQ(proposal.connectionPlans.front().consumerPorts.size(), 1u);
+  // A stale endpoint names a nonexistent second input on the store. Physical
+  // storage and surviving IR can still analyze, but the selected rewire failed.
+  proposal.connectionPlans.front().consumerPorts.front().index = 1;
+  auto complete = evaluateCompletePlan(*c->source, c->graph, *c->target,
+                                       proposal, BindContract::Partial);
+  ASSERT_TRUE(bool(complete)) << llvm::toString(complete.takeError());
+  EXPECT_FALSE(complete->plan.has_value());
+  EXPECT_TRUE(complete->rejection.has_value());
+  if (complete->rejection) {
+    EXPECT_EQ(complete->rejection->code,
+              DiagnosticCode::UnsupportedMaterialization);
+    EXPECT_NE(complete->rejection->message.find("consumer_endpoint_unresolved"),
+              std::string::npos);
+  }
+
+  auto partial = evaluateCompletePlan(
+      *c->source, c->graph, *c->target, proposal, BindContract::Partial,
+      std::nullopt, AnalysisRequirement::PartialReport);
+  ASSERT_TRUE(bool(partial)) << llvm::toString(partial.takeError());
+  ASSERT_TRUE(partial->plan.has_value());
+  EXPECT_FALSE(partial->plan->materialized);
+  bool named = false;
+  for (const auto &warning : partial->plan->diagnostics.warnings)
+    named |= warning.find("consumer_endpoint_unresolved") != std::string::npos;
+  EXPECT_TRUE(named);
 }

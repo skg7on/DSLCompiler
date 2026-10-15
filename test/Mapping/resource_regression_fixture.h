@@ -59,6 +59,11 @@ llvm::Expected<ResourceCase>
 resourceCase(llvm::StringRef name,
              const mlir::llk::mapping::LatencyProvider *provider = nullptr);
 
+/// Inspects a raw proposal as an explicitly partial artifact, outside ranked
+/// results. Used by tests of intentionally unresolved physical facts.
+llvm::Expected<mlir::llk::mapping::CoveringPlan>
+partialReportForCase(ResourceCase &c);
+
 /// Runs the *ordinary* mapping search over the case's extracted source graph
 /// with `options`. Once R7 defines the completion callback, this is where the
 /// evaluator is supplied; before then a case is searched exactly as a CLI run

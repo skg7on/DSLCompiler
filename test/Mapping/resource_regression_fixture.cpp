@@ -413,7 +413,17 @@ machine::MachineModel twoHopMachine(uint64_t l2CapacityBytes) {
   toDram.latencyCycles = 220;
   toDram.transactionBytes = 64;
   toDram.transferEngines = {"dma.b"};
-  model.links = {toL2, toDram};
+  // The consumer store writes the landed DRAM tile back to L2. Model that
+  // boundary movement too: complete ranking cannot charge an abstract DMA.
+  machine::LinkEdge fromDram;
+  fromDram.id = "dram_to_l2.0";
+  fromDram.source = "dram.0";
+  fromDram.destination = "l2.0";
+  fromDram.bandwidthBytesPerCycle = 32;
+  fromDram.latencyCycles = 0;
+  fromDram.transactionBytes = 64;
+  fromDram.transferEngines = {"dma.b"};
+  model.links = {toL2, toDram, fromDram};
   return model;
 }
 
@@ -1030,6 +1040,30 @@ llvm::Expected<ResourceCase> resourceCase(llvm::StringRef name,
   }
   return fixtureError("issue129 fixture: unknown resource case '" + name +
                       "'; known cases are " + known);
+}
+
+llvm::Expected<CoveringPlan> partialReportForCase(ResourceCase &c) {
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  LayoutContext layout;
+  layout.rank = 2;
+  layout.elementType = "f32";
+  // Raw proposals are not ranked analysis results. Inspect one explicitly.
+  CoveringSearch search(c.graph, *c.target, *c.context, layout, options);
+  auto proposals = search.search();
+  if (!proposals)
+    return proposals.takeError();
+  if (proposals->plans.empty())
+    return fixtureError("issue129 fixture: no proposal to inspect");
+  auto evaluated = evaluateCompletePlan(
+      *c.source, c.graph, *c.target, proposals->plans.front(),
+      BindContract::Partial, std::nullopt, AnalysisRequirement::PartialReport);
+  if (!evaluated)
+    return evaluated.takeError();
+  if (evaluated->rejection)
+    return fixtureError(evaluated->rejection->message);
+  return std::move(*evaluated->plan);
 }
 
 llvm::Expected<MappingSearchResult>

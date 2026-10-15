@@ -4310,9 +4310,11 @@ TEST(PlanBinder, Issue129PhysicalMemoryAmbiguityRefusesStrictBinding) {
   ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
   MappingSearchOptions options;
   options.mode = SearchMode::Exact;
-  auto result = issue129::searchCase(*c, options);
-  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
-  ASSERT_FALSE(result->plans.empty());
+  auto artifact = issue129::partialReportForCase(*c);
+  ASSERT_TRUE(bool(artifact)) << llvm::toString(artifact.takeError());
+  MappingSearchResult reportArtifacts;
+  reportArtifacts.plans.push_back(std::move(*artifact));
+  auto *result = &reportArtifacts;
 
   // Partial analysis: the plan is retained, and it records that it is not
   // physically complete, naming the ambiguous memory rather than guessing.
@@ -4377,9 +4379,12 @@ TEST(PlanBinder, Issue129PhysicalMemoryReportRecordsIncompleteStatus) {
   ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
   MappingSearchOptions options;
   options.mode = SearchMode::Exact;
-  auto result = issue129::searchCase(*c, options);
-  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
-  ASSERT_FALSE(result->plans.empty());
+  auto artifact = issue129::partialReportForCase(*c);
+  ASSERT_TRUE(bool(artifact)) << llvm::toString(artifact.takeError());
+  MappingSearchResult reportArtifacts;
+  reportArtifacts.workloadHash = computeSourceGraphHash(c->graph);
+  reportArtifacts.plans.push_back(std::move(*artifact));
+  auto *result = &reportArtifacts;
   result->plans.front().materialized = false;
   ASSERT_FALSE(bool(finalizeStoragePlan(c->graph, result->plans.front(),
                                         c->target->machine())));
@@ -4410,9 +4415,11 @@ TEST(PlanBinder, Issue129PhysicalVerdictSurvivesMetadataRoundTrip) {
   ASSERT_TRUE(bool(c)) << llvm::toString(c.takeError());
   MappingSearchOptions options;
   options.mode = SearchMode::Exact;
-  auto result = issue129::searchCase(*c, options);
-  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
-  ASSERT_FALSE(result->plans.empty());
+  auto artifact = issue129::partialReportForCase(*c);
+  ASSERT_TRUE(bool(artifact)) << llvm::toString(artifact.takeError());
+  MappingSearchResult reportArtifacts;
+  reportArtifacts.plans.push_back(std::move(*artifact));
+  auto *result = &reportArtifacts;
 
   CoveringPlan plan = result->plans.front();
   plan.materialized = false;

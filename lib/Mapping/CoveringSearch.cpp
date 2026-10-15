@@ -2146,6 +2146,20 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
             "nor a rejection");
       return false;
     }
+    // Report-only artifacts are inspectable through direct evaluation, never
+    // ranked, even if a caller wires a partial evaluator into this search.
+    if (!evaluated->plan->materialized ||
+        !evaluated->plan->diagnostics.physicalComplete) {
+      std::string reason =
+          "analysis_incomplete: partial report is not rankable";
+      for (const std::string &warning : evaluated->plan->diagnostics.warnings)
+        reason += "; " + warning;
+      for (const std::string &physical :
+           evaluated->plan->diagnostics.physicalReasons)
+        reason += "; " + physical;
+      report(DiagnosticCode::UnsupportedMaterialization, reason);
+      return false;
+    }
     retained.push_back(std::move(*evaluated->plan));
     return true;
   };
