@@ -378,9 +378,9 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
          &target, memoryBudget = searchOptions.memoryBudgetBytes](
             const mapping::CoveringPlan &proposal)
         -> llvm::Expected<mapping::CompletePlanEvaluation> {
-      return mapping::evaluateCompletePlan(module, *graph, target, proposal,
-                                           mapping::BindContract::Executable,
-                                           memoryBudget);
+      return mapping::evaluateCompletePlan(
+          module, *graph, target, proposal, mapping::BindContract::Executable,
+          memoryBudget, mapping::AnalysisRequirement::Complete);
     };
     mapping::CoveringSearch search(
         instance->workloadGraph, target, *instance->module->getContext(),
@@ -583,8 +583,9 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
         [module = instance->module.get(), graph = &instance->workloadGraph,
          &target, contract, memoryBudget](const mapping::CoveringPlan &proposal)
         -> llvm::Expected<mapping::CompletePlanEvaluation> {
-      return mapping::evaluateCompletePlan(module, *graph, target, proposal,
-                                           contract, memoryBudget);
+      return mapping::evaluateCompletePlan(
+          module, *graph, target, proposal, contract, memoryBudget,
+          mapping::AnalysisRequirement::Complete);
     };
     searchOptions.requireCompleteEvaluation = true;
     mapping::CoveringSearch search(

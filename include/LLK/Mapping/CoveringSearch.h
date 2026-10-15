@@ -67,7 +67,8 @@ enum class SearchMode {
 /// kernel. `rejection` is a stable-coded reason the proposal is not feasible --
 /// a memory overflow, an unresolved strict physical fact, an unsupportable
 /// materialization -- and the search must continue enumerating rather than
-/// retain it.
+/// retain it. An explicit report artifact (`materialized=false` or incomplete
+/// physical facts) is also rejected before retention.
 ///
 /// An `llvm::Error` from an evaluation is *not* a rejection: it names an
 /// invalid invocation or an infrastructure failure and stops the search. The

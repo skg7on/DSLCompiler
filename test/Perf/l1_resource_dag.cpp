@@ -1264,8 +1264,8 @@ TEST(L1ResourceDag, MeasuredRoutedConnectionReachesTheEvaluatedCostOnce) {
   ASSERT_FALSE(result->plans.empty());
   for (const mapping::CoveringPlan &plan : result->plans)
     // The vector takes 64 cycles, the connection 1,000, and the destination
-    // store has no modeled endpoint latency. The route is serial with compute.
-    EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, 1064.0);
+    // store takes 8 cycles on the explicit DRAM-to-L2 link. Both are serial.
+    EXPECT_DOUBLE_EQ(plan.totalCost.latencyCycles, 1072.0);
 }
 
 // A selected plan and its materialized kernel account for the same normalized

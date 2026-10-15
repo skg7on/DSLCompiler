@@ -37,6 +37,10 @@
 
 namespace mlir::llk::mapping {
 
+/// Complete is required for ranking, independently of executable lowering.
+/// PartialReport is an inspectable, explicitly non-ranked artifact.
+enum class AnalysisRequirement { Complete, PartialReport };
+
 /// Evaluates one complete proposal against `target`, in the context of the
 /// `source` module it would be bound to and the `graph` it was planned from.
 ///
@@ -71,19 +75,23 @@ namespace mlir::llk::mapping {
 /// be executable, and a cheap non-executable one must not end the search. The
 /// rejection carries the binder's own message, so a caller that ends up with no
 /// plan reads exactly the refusal a direct `bindPlan` under the executable
-/// contract would give. Under `BindContract::Partial` an incomplete plan is
-/// kept as an explicit analysis artifact -- its `physicalComplete` verdict and
-/// ordered reasons are recorded -- which is what the `report-only` workflow
-/// needs. Either way the strict finalize attempt runs first, so a physically
-/// complete plan is always preferred.
-/// Executable evaluation also requires successful, complete selected-kernel
-/// analysis; failed or incomplete analysis is a candidate rejection. Only the
-/// partial contract permits modeling warnings and fallback scoring.
+/// contract would give. `BindContract::Partial` permits binding without an
+/// executable backend; it does not relax the analysis requirement.
 ///
-/// An `llvm::Error` is reserved for a malformed invocation and for
-/// infrastructure failures (a structural binder failure under the partial
-/// contract, an unbuildable stream): those stop the search, because they are
-/// properties of the run rather than of one candidate.
+/// `AnalysisRequirement::Complete` (the default) requires resolved physical
+/// facts and successful complete audited selected-kernel analysis before a plan
+/// can be ranked. Analysis errors reject the candidate; synthesized-event
+/// fallback is forbidden. Complete modeling does not require target lowering.
+/// Executable binding always requires complete analysis, even when the caller
+/// asks for `PartialReport`.
+///
+/// `PartialReport` with partial binding permits an incomplete analysis artifact
+/// with ordered warnings and fallback estimates. It is labeled
+/// `materialized=false` and is refused by covering search before retention.
+/// Use it directly for inspection, never for ranking.
+///
+/// An `llvm::Error` is reserved for malformed invocations and infrastructure
+/// failures (including structural binder failures under partial binding).
 ///
 /// `memoryBudgetBytes`, when set, is the whole-plan live-byte budget (design
 /// §9.3). It is checked against the *finalized* plan's honest live peak -- the
@@ -95,11 +103,12 @@ namespace mlir::llk::mapping {
 /// coverings. Analysis-error fallback also enforces the budget using finalized
 /// storage liveness, or the same weighted plan-step peak used by finalization
 /// when the event model is unavailable.
-llvm::Expected<CompletePlanEvaluation>
-evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
-                     const MappingTarget &target, const CoveringPlan &proposal,
-                     BindContract contract,
-                     std::optional<uint64_t> memoryBudgetBytes = std::nullopt);
+llvm::Expected<CompletePlanEvaluation> evaluateCompletePlan(
+    mlir::ModuleOp source, const WorkloadGraph &graph,
+    const MappingTarget &target, const CoveringPlan &proposal,
+    BindContract contract,
+    std::optional<uint64_t> memoryBudgetBytes = std::nullopt,
+    AnalysisRequirement requirement = AnalysisRequirement::Complete);
 
 /// Applies a selected-kernel analysis's completeness verdict to `plan` (issue
 /// #129, task R7 review): a **complete** analysis records nothing; an
@@ -109,9 +118,8 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
 /// travels with the plan instead of a score being presented as if it were
 /// exact.
 ///
-/// This helper records diagnostics for partial artifacts. Executable evaluation
-/// requires complete analysis and refuses such artifacts before this helper is
-/// called.
+/// This helper records diagnostics for partial artifacts. Complete evaluation
+/// refuses incomplete analysis before this helper is called.
 void recordAnalysisCompleteness(const perf::SelectedKernelAnalysis &analysis,
                                 CoveringPlan &plan);
 

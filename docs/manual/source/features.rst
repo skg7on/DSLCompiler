@@ -125,6 +125,32 @@ that timing. For actual supported kernel invocation, use the C++
 the mapped runtime limits above and record host, inputs, schedule and timing
 conditions; these APIs do not constitute the planned calibrated measurement loop.
 
+Analysis completeness and ranked plans
+--------------------------------------
+
+Ranked mapping and mapped-tuning results require complete audited analysis
+before top-K retention. Unknown computational leaves, unresolved physical facts
+and selected-analysis failures reject a proposal with diagnostics. Complete
+analysis-only targets can still rank modeled plans without an executable
+backend; executable binding and selected lowering remain separate requirements.
+
+The integration API defaults to ``AnalysisRequirement::Complete``. Explicit
+``PartialReport`` with partial binding returns an inspectable artifact with
+ordered warnings and ``materialized=false``; such artifacts cannot enter ranked
+results, even through a custom completion callback. Only this report mode may
+fall back to synthesized-event estimates after extraction fails. Capacity and
+whole-plan byte budgets still apply. Executable binding always requires complete
+analysis, regardless of the requested report mode.
+
+``micro-perf`` uses audited extraction and reports ``complete`` and
+``incomplete_reasons`` in YAML (and the corresponding text output). Direct
+MicroDAG users may choose ``Audit`` for annotated partial results or ``Strict``
+for rejection. Existing custom-builder overloads retain ``LegacyPermissive``
+behavior. Registered alias-only or explicit zero-cost handlers remain supported;
+an unknown effect-free arithmetic operation is not automatically zero cost.
+See the :source:`mapping workflow <docs/design/micro-ir-mapping-workflow.md>`
+for the integration boundary and supported modes.
+
 .. _features-work-planned-separately:
 
 Work planned separately

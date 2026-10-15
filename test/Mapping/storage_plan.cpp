@@ -1469,6 +1469,8 @@ TEST(StoragePlan, APerHopMovementEmitsOneTransferEventPerHop) {
   ASSERT_TRUE(static_cast<bool>(built)) << llvm::toString(built.takeError());
   issue129::ResourceCase &c = built->c;
   CoveringPlan &plan = built->plan;
+  // Exercise synthesis from plan steps, not the selected-kernel snapshot.
+  plan.analysisEvents.reset();
   ASSERT_FALSE(bool(finalizeStoragePlan(c.graph, plan, c.target->machine())));
   ASSERT_EQ(plan.connectionPlans.front().hops.size(), 2u);
 
@@ -1494,6 +1496,8 @@ TEST(StoragePlan, APerHopWaitOrdersAMultichannelDmaWithoutABarrier) {
   auto built = twoHopCase();
   ASSERT_TRUE(bool(built)) << llvm::toString(built.takeError());
   CoveringPlan &plan = built->plan;
+  // Exercise synthesis from plan steps, not the selected-kernel snapshot.
+  plan.analysisEvents.reset();
   MachineModel machine = built->c.target->machine();
   for (LinkEdge &link : machine.links)
     link.transferEngines = {"dma.a"};
@@ -1536,6 +1540,8 @@ TEST(StoragePlan, AMultihopTransformRunsOnceAfterTheFinalTransfer) {
   auto built = twoHopCase();
   ASSERT_TRUE(bool(built)) << llvm::toString(built.takeError());
   CoveringPlan &plan = built->plan;
+  // Exercise synthesis from plan steps, not the selected-kernel snapshot.
+  plan.analysisEvents.reset();
   PlanConnection &connection = plan.connectionPlans.front();
   mlir::MLIRContext *context = connection.valueType.getContext();
   const mlir::AffineExpr d0 = mlir::getAffineDimExpr(0, context);

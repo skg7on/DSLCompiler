@@ -214,6 +214,36 @@ concrete micro.kernel
 Each step is deterministic: the same kernel and target produce the same ids,
 the same plan, and byte-identical metadata.
 
+### Analysis coverage before ranking
+
+Ranked plans require complete semantic and physical analysis, including on
+analysis-only targets. The integration evaluator finalizes storage, binds one
+preview and runs shared audited selected-kernel analysis before top-K retention.
+Unknown computation such as scalar `arith.addf`, unresolved physical facts and
+extraction errors reject the proposal with reasons on the failure frontier.
+They never receive a fallback score that can displace a complete alternative.
+A complete modeled ranking does not imply an executable backend: binding with
+`BindContract::Partial` remains available without target lowering, while
+`AnalysisRequirement::Complete` is the ranking default. Executable binding is
+always strict.
+
+Direct inspection may explicitly request `AnalysisRequirement::PartialReport`.
+It retains ordered incompleteness warnings and may report synthesized-event
+estimates when extraction fails, subject to the same capacity/budget checks.
+These artifacts carry `materialized=false`; covering search refuses them before
+retention, even if supplied by a custom completion callback. A report artifact
+must not be treated as a ranked or executable plan.
+
+MicroDAG coverage has three modes: `Audit` returns an annotated partial DAG,
+`Strict` refuses one with incomplete reasons, and `LegacyPermissive` preserves
+the old custom-builder overload behavior. Shared analysis and `micro-perf` use
+`Audit`; strict consumers enforce completeness at their analysis boundary.
+Registered modeled or explicit zero-cost handlers may intentionally emit no
+events, including alias-only handlers. An unregistered computational leaf is
+not inferred to be free merely because it has no side effects. The registry
+owns interpretation; the core continues to own traversal, dependency and event
+bounds. YAML/text reports expose `complete` and ordered incomplete reasons.
+
 ### What the binder writes
 
 `bindPlan` clones the module — the source is never mutated — and records the

@@ -30,6 +30,10 @@ rule binding.vector_add v1 {
 rule binding.async_copy v1 {
   match micro.async_copy();
   require executor kind worker;
+  require memory input "source" kind dram;
+  require memory output "result" kind sram;
+  input "source";
+  output "result";
   bundle "binding.copy";
   emit "binding_copy";
   cost 2;

@@ -18,6 +18,7 @@
 
 #include "LLK/Perf/SelectedKernelAnalysis.h"
 
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Error.h"
 
 #include <memory>
@@ -134,9 +135,12 @@ llvm::Expected<CompletePlanEvaluation>
 evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
                      const MappingTarget &target, const CoveringPlan &proposal,
                      BindContract contract,
-                     std::optional<uint64_t> memoryBudgetBytes) {
+                     std::optional<uint64_t> memoryBudgetBytes,
+                     AnalysisRequirement requirement) {
   const machine::MachineModel &machine = target.machine();
   const bool strict = contract == BindContract::Executable;
+  const bool requireComplete =
+      strict || requirement == AnalysisRequirement::Complete;
 
   // --- 1. clone, provenance, contract -------------------------------------
   CoveringPlan plan = proposal;
@@ -147,21 +151,16 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
   // This resolves the maps/compute/ports the placement decided, decides the
   // movement hops and their storage slots and steps, validates occupancy
   // against each memory's capacity, and assigns the decision-only v3 id (the
-  // hops are identity-bearing decisions). The strict attempt runs first. Under
-  // the *partial* contract, when only a physical fact is incomplete it is
-  // re-run as an analysis artifact, which succeeds and records
-  // `physicalComplete=false` plus its ordered reasons. Under the *executable*
-  // contract there is no such fallback: a plan whose strict finalize refused a
-  // physical fact is not an executable plan, and accepting the artifact would
-  // offer one whose `micro.plan` is `materialized=false` (issue #129 review
-  // finding 2). A genuine rejection -- a capacity overflow, a cyclic graph, a
-  // coverage gap -- fails both passes and is dropped.
+  // hops are identity-bearing decisions). Complete scoring requires this pass
+  // to succeed, including on an analysis-only target. Only PartialReport with
+  // partial binding may retry unresolved facts as an explicitly partial
+  // artifact. Capacity/structural failures are rejected in either mode.
   plan.materialized = true;
   bool strictCapacity = false;
   if (llvm::Error error =
           finalizeStoragePlan(graph, plan, machine, &strictCapacity)) {
     std::string reason = llvm::toString(std::move(error));
-    if (strict)
+    if (requireComplete)
       return rejected(strictCapacity
                           ? DiagnosticCode::MemoryCapacityExceeded
                           : DiagnosticCode::UnsupportedMaterialization,
@@ -188,6 +187,11 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
     }
     plan = std::move(analysis);
   }
+
+  if (requireComplete && !plan.diagnostics.physicalComplete)
+    return rejected(DiagnosticCode::UnsupportedMaterialization,
+                    "analysis_incomplete: " +
+                        llvm::join(plan.diagnostics.physicalReasons, "; "));
 
   // --- 3. bind a preview onto a private clone -----------------------------
   //
@@ -220,21 +224,19 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
   //
   // The plan-carrying overload attaches R5 storage liveness, so `peakBytes` is
   // the plan's own capacity-verdict peak and not a second, weaker relation.
-  // Under the executable contract the analysis must be *complete* (issue #129
-  // review finding 2): a plan whose final cost is a schedule of a kernel the
-  // extractor admitted it approximated -- a non-static loop bound charged one
-  // iteration, a value charged zero bytes -- must not be offered as executable.
-  // Under the partial contract it is taken leniently and its incompleteness is
-  // recorded on the plan below.
+  // Complete scoring and executable binding both require complete audited
+  // analysis. Only explicit PartialReport may preserve unknown work or use
+  // synthesized-event fallback; backend availability is a separate contract.
   llvm::Expected<perf::SelectedKernelAnalysis> analysis =
       perf::analyzeSelectedKernel(bound->kernel, machine, /*requireComplete=*/
-                                  strict, plan, graph);
+                                  requireComplete, plan, graph);
   if (!analysis) {
     std::string reason = llvm::toString(analysis.takeError());
-    if (strict)
-      return rejected(DiagnosticCode::UnsupportedMaterialization,
-                      "selected analysis refused the executable plan: " +
-                          reason);
+    if (requireComplete)
+      return rejected(
+          DiagnosticCode::UnsupportedMaterialization,
+          "analysis_incomplete: selected analysis refused the plan: " + reason);
+    plan.materialized = false;
     // Only an explicitly partial artifact may retain a modeling failure and
     // fall back to the plan's own synthesized events.
     plan.diagnostics.warnings.push_back(
@@ -278,6 +280,10 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
   // reasons on the plan rather than scoring it as if it were exact (issue #129,
   // task R7 review). Strict analysis has already refused incompleteness;
   // partial analysis records the same reasons `micro-perf` reports.
+  if (requireComplete && !analysis->complete)
+    return rejected(DiagnosticCode::UnsupportedMaterialization,
+                    "analysis_incomplete: " +
+                        llvm::join(analysis->incompleteReasons, "; "));
   recordAnalysisCompleteness(*analysis, plan);
 
   // --- 5. validate occupancy ----------------------------------------------
@@ -343,7 +349,7 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
       }
     }
     if (!stable) {
-      if (strict)
+      if (requireComplete)
         return rejected(
             DiagnosticCode::UnsupportedMaterialization,
             "plan evaluation: the finalized plan's decisions do not "
@@ -354,6 +360,11 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
     }
   }
 
+  if (!requireComplete) {
+    plan.materialized = false;
+    plan.diagnostics.warnings.push_back(
+        "plan evaluation: partial report artifact; not eligible for ranking");
+  }
   CompletePlanEvaluation evaluation;
   evaluation.plan = std::move(plan);
   return evaluation;

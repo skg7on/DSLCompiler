@@ -508,8 +508,8 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   // library is the layer above both, so it is where a proposal becomes a
   // physical, schedulable plan. The caller's module is only *read* (the binder
   // clones it), and the evaluator never writes files. A plan whose physical
-  // facts do not resolve is a candidate rejection under the executable contract
-  // and an analysis artifact under the partial one.
+  // facts or interpretation do not resolve is rejected before ranking, even
+  // under partial binding for targets without an executable backend.
   const mapping::BindContract contract = options.requireExecutable
                                              ? mapping::BindContract::Executable
                                              : mapping::BindContract::Partial;
@@ -519,8 +519,9 @@ runMappingSearch(ModuleOp module, llvm::StringRef passName,
   searchOptions.evaluateCompletePlan =
       [&, memoryBudgetBytes](const mapping::CoveringPlan &proposal)
       -> llvm::Expected<mapping::CompletePlanEvaluation> {
-    return mapping::evaluateCompletePlan(module, *graph, *run.target, proposal,
-                                         contract, memoryBudgetBytes);
+    return mapping::evaluateCompletePlan(
+        module, *graph, *run.target, proposal, contract, memoryBudgetBytes,
+        mapping::AnalysisRequirement::Complete);
   };
   searchOptions.requireCompleteEvaluation = true;
 
