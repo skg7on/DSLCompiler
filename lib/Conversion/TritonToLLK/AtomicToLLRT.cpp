@@ -1,12 +1,17 @@
 //===- AtomicToLLRT.cpp - atomics → llrt runtime calls --------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Lowers Triton atomic ops (tt.atomic_add, tt.atomic_max, tt.atomic_min,
 // tt.atomic_and, tt.atomic_or, tt.atomic_xor, tt.atomic_xchg, tt.atomic_cas)
 // to llrt runtime calls wrapping std::atomic or CPU CAS instructions. Each
 // callee is declared as a private func.func on demand and called with the
 // original operands, preserving the old-value result.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/TritonToLLK/AtomicToLLRT.h"
 

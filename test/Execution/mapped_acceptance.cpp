@@ -1,5 +1,12 @@
 //===- mapped_acceptance.cpp - Numeric acceptance for mapped kernels ------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Stage C8's numeric chains. Everything before this proves that IR traverses,
 // that a plan binds, that an ABI is declared; none of it runs a *compiler-
 // generated* kernel and checks what it computed. These tests do exactly that,
@@ -12,8 +19,6 @@
 // numbers are the same on arm64 and on x86. What cannot be checked here is that
 // AVX2 *instructions* were emitted -- that needs an AVX2 runner, and this file
 // does not pretend otherwise.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/MappedCompilation.h"

@@ -1,5 +1,12 @@
-//===- SearchBindingLoader.h - micro.candidate -> SearchBinding -----------===//
+//===- SearchBindingLoader.h - micro.candidate -> binding -------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of phase-4 of epic #67: the producer for `mapping::SearchBinding`.
 //
 // A `micro.candidate` is a complete assignment of its space's parameters, so
@@ -37,8 +44,6 @@
 // The loader lives in the MicroMapping pass library rather than in LLKMapping
 // because it reads the space through `llk::perf::loadSearchSpace`, and LLKPerf
 // depends on LLKMapping -- the reverse dependency is forbidden.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_CONVERSION_MICROMAPPING_SEARCHBINDINGLOADER_H
 #define LLK_CONVERSION_MICROMAPPING_SEARCHBINDINGLOADER_H

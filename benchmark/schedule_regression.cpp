@@ -1,9 +1,14 @@
-//===- schedule_regression.cpp - Performance regression baseline ---------===//
+//===- schedule_regression.cpp - Performance regression baseline ----------===//
 //
-// Records baseline GFLOPS per M-bucket for schedule regression detection.
-// CI should fail if GFLOPS drops >5% below baseline for any bucket.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Records baseline GFLOPS per M-bucket for schedule regression detection.
+// CI should fail if GFLOPS drops >5% below baseline for any bucket.
 
 #include <gtest/gtest.h>
 

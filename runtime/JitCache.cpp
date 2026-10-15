@@ -1,13 +1,18 @@
-//===- JitCache.cpp - ORC LLJIT cache for LLK kernels --------------------===//
+//===- JitCache.cpp - ORC LLJIT cache for LLK kernels ---------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Implements on-demand compilation of MLIR modules to native code via ORC.
 // The lowering pipeline converts from partially-lowered MLIR dialects
 // (SCF, Arith, Math, Func, MemRef) down to the LLVM dialect, then
 // translates to LLVM IR, compiles via LLJIT, and returns a function pointer.
 //
 // M5 upgrade: 4-level cache with LRU eviction.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Runtime/JitCache.h"
 

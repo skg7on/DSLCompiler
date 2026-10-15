@@ -1,5 +1,12 @@
-//===- TileFacts.h - Bytes and alignment of a moving value ----------------===//
+//===- TileFacts.h - Bytes and alignment of a moving value ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, phase 3).
 //
 // A connection, a capacity charge, and a staging entry all need the size of the
@@ -11,8 +18,6 @@
 // re-parsed as the `tensor<shape x element>` its head spells. That unwrapping
 // lives here, once, so matching and placement cannot drift into a second and
 // third answer for the same concept.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_TILE_FACTS_H
 #define LLK_MAPPING_TILE_FACTS_H

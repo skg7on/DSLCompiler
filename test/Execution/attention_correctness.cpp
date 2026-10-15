@@ -1,9 +1,14 @@
 //===- attention_correctness.cpp - Attention end-to-end tests -------------===//
 //
-// Verifies llk.attention against FP64 reference with scaled dot-product
-// attention, causal mask, and stable softmax.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Verifies llk.attention against FP64 reference with scaled dot-product
+// attention, causal mask, and stable softmax.
 
 #include <cmath>
 #include <gtest/gtest.h>

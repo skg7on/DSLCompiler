@@ -1,5 +1,12 @@
 //===- TargetAVX2.cpp - CPU feature detection implementation --------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the LLK Compiler Project
 //
 //===----------------------------------------------------------------------===//
@@ -8,7 +15,6 @@
 /// Detects x86-64 AVX2+FMA via CPUID leaf 1 / leaf 7, and AArch64 NEON/SVE
 /// via /proc/cpuinfo or HWCAP (arm64 macOS or Linux).
 ///
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Target/X86/TargetAVX2.h"
 

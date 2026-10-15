@@ -1,6 +1,12 @@
-//===- exact_resource_oracle.cpp - Independent exact-search oracle (R8)
-//----===//
+//===- exact_resource_oracle.cpp - Independent exact-search oracle (R8) ---===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Issue #129, task R8. The exact covering search's feasibility verdict must be
 // provable without the search: this file enumerates the `joint-oracle`
 // fixture's finite assignment space with *plain fixture arithmetic* --
@@ -27,8 +33,6 @@
 // so only (vpu.a, dram.0, direct) and (vpu.b, dram.0, direct) survive: SRAM
 // (512) cannot hold 1024, and the 256-byte value cannot traverse the 128-byte
 // L2.
-//
-//===----------------------------------------------------------------------===//
 
 #include "resource_regression_fixture.h"
 

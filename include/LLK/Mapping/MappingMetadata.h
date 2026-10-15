@@ -1,5 +1,12 @@
-//===- MappingMetadata.h - Persisted selected-plan metadata (task B1) -----===//
+//===- MappingMetadata.h - Persisted selected-plan metadata -----*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, stage B, task B1).
 //
 // The binder used to stamp a selected plan onto a kernel as ad hoc metadata
@@ -17,8 +24,6 @@
 // JSON report schema version (`kPlanReportVersion` in PlanReport.h). A reader
 // keys its parser on the `micro.plan` `schema_version`; a schema change that
 // alters the meaning of an existing field bumps it.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_MAPPINGMETADATA_H
 #define LLK_MAPPING_MAPPINGMETADATA_H

@@ -1,5 +1,12 @@
-//===- LlkMap.cpp - Shared LLKMap language core (D3/D4) ------------------===//
+//===- LlkMap.cpp - Shared LLKMap language core (D3/D4) -------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The lexer, expression grammar, and evaluator shared by every LLKMap
 // declaration kind. Diagnostics carry file, line, and column. Identifier
 // validation happens here rather than at solve time, so an unknown parameter,

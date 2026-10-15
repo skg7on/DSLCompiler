@@ -1,13 +1,18 @@
 //===- schedule_loader.cpp - schedule_db.json loader tests ----------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Covers issue #48:
 //   - the shipped schedule database still loads after ScheduleEntry gained the
 //     Micro-IR fields
 //   - the Micro/tile fields load when an entry spells them out
 //   - a missing Micro/tile field falls back to a deterministic default, and
 //     fragment_shape follows mma_shape when only the latter is given
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 

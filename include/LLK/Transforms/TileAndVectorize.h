@@ -1,16 +1,15 @@
-//===- TileAndVectorize.h - Tiling + Vectorization Pass -----------------*- C++ -*-===//
+//===- TileAndVectorize.h - Tiling + Vectorization Pass ---------*- C++ -*-===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Applies a Transform dialect schedule to tile, fuse, and vectorize LLK
 // operations that have been lowered to Linalg. Reads schedule from a
 // .mlir transform file or uses built-in defaults keyed by target ISA.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_TRANSFORMS_TILEANDVECTORIZE_H
 #define LLK_TRANSFORMS_TILEANDVECTORIZE_H
@@ -28,7 +27,8 @@ struct TileAndVectorizeOptions {
 };
 
 std::unique_ptr<Pass> createTileAndVectorizePass();
-std::unique_ptr<Pass> createTileAndVectorizePass(const TileAndVectorizeOptions &opts);
+std::unique_ptr<Pass>
+createTileAndVectorizePass(const TileAndVectorizeOptions &opts);
 
 } // namespace llk
 } // namespace mlir

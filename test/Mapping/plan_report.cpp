@@ -1,5 +1,12 @@
 //===- plan_report.cpp - Versioned JSON plan report (§22.2) ---------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The plan report is reproducibility and diagnostic metadata: it names the
 // exact inputs a search ran on (module, machine, layout and rule libraries),
 // the options it used, how much of the space it covered, and the plans it
@@ -8,8 +15,6 @@
 // This test pins the report's shape and, above all, its byte-for-byte
 // determinism: two runs over identical inputs have to produce the same bytes
 // (§29.12), so no key may depend on iteration order, addresses, or the clock.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/LayoutConstraints.h"

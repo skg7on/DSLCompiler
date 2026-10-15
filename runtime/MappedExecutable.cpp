@@ -1,5 +1,12 @@
 //===- MappedExecutable.cpp - Invoke a compiled micro kernel (C4) ---------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The calling convention a mapped kernel needs, and the code that calls it.
 //
 // MLIR expands a memref parameter into its seven descriptor fields and a memref
@@ -18,8 +25,6 @@
 // Nothing here casts an expanded LLVM entry point to a descriptor signature. A
 // cast like that would be an assertion with no evidence behind it, and the
 // first kernel whose arity differed would corrupt its caller's memory.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Runtime/MappedExecutable.h"
 #include "LLK/Conversion/MappedKernelAbi.h"

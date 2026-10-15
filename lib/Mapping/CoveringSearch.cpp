@@ -1,5 +1,12 @@
 //===- CoveringSearch.cpp - Complete-plan search (D6) ---------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Three searches over one table of legal instances:
 //
 //   deterministic  depth-first in canonical order, first complete plan wins
@@ -28,8 +35,6 @@
 // completion) for a minimize objective, while for maximize it makes the bound
 // too small to prune on, so maximize explores fully and relies on the caps
 // instead.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/CoveringSearch.h"
 

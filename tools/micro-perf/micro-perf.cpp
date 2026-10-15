@@ -1,5 +1,12 @@
 //===- micro-perf.cpp - Micro-IR performance simulator driver -------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Reads concrete tile-centric Micro IR and a machine model, and reports what
 // the kernel would cost on that machine.
 //
@@ -12,8 +19,6 @@
 //   0  the kernel was analyzed
 //   1  the input, machine model, or kernel selection could not be read
 //   2  --fail-on-capacity-violation was given and the kernel does not fit
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"

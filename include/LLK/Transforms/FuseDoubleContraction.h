@@ -1,16 +1,15 @@
-//===- FuseDoubleContraction.h - Fuse 2 matmuls + SiLU consumer -*- C++ -*-===//
+//===- FuseDoubleContraction.h - Fuse two matmuls + SiLU --------*- C++ -*-===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Fuses two linalg.matmul ops sharing the same X operand with their
 // elementwise SiLU consumer into a single linalg.generic with 2 reduction
 // outputs and an epilogue generic.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_TRANSFORMS_FUSEDOUBLECONTRACTION_H
 #define LLK_TRANSFORMS_FUSEDOUBLECONTRACTION_H

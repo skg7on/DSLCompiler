@@ -1,6 +1,12 @@
-//===- MicroCostModel.cpp - L0 static bound and L1 resource scheduler
-//------===//
+//===- MicroCostModel.cpp - L0 static bound and L1 resource scheduler -----===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // L0 answers "how fast could this kernel possibly run on this machine", by
 // dividing total work by peak throughput and total bytes by memory bandwidth.
 // It deliberately ignores dependencies, so it is a bound and not a prediction.
@@ -15,8 +21,6 @@
 // Bandwidth is reported but never scheduled. An event occupies a compute or
 // DMA slot; DRAM does not get a slot, so a utilization figure above 1 means the
 // schedule outruns memory and the prediction is optimistic.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/MicroCostModel.h"
 

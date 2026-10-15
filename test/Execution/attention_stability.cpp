@@ -1,8 +1,13 @@
 //===- attention_stability.cpp - Long-sequence stability tests ------------===//
 //
-// Verifies online softmax produces no NaN/Inf for L=2048 and extreme inputs.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Verifies online softmax produces no NaN/Inf for L=2048 and extreme inputs.
 
 #include <cmath>
 #include <gtest/gtest.h>

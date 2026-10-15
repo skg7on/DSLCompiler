@@ -1,5 +1,12 @@
-//===- TuningSession.h - Generate, check, bind, and rank candidates -------===//
+//===- TuningSession.h - Generate, check and rank candidates ----*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #50).
 //
 // A tuning session is the whole loop the driver runs:
@@ -19,8 +26,6 @@
 // A candidate that is legal but cannot be bound, and a kernel whose analysis
 // fails, are rejected with a stable reason rather than silently dropped: the
 // report has to account for every generated candidate.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_TUNINGSESSION_H
 #define LLK_PERF_TUNINGSESSION_H

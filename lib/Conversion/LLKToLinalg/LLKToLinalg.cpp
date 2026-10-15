@@ -1,8 +1,13 @@
 //===- LLKToLinalg.cpp - Lower LLK ops to Linalg + Arith + Math -----------===//
 //
-// Dispatches registered kernel lowerings into Linalg + Arith + Math.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Dispatches registered kernel lowerings into Linalg + Arith + Math.
 
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"

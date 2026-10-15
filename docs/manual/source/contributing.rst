@@ -91,6 +91,32 @@ input and output. See :source:`CI <.github/workflows/ci.yml>` and
 :source:`CMakeLists.txt <CMakeLists.txt>` for configuration and
 :source:`test/CMakeLists.txt <test/CMakeLists.txt>` for test registration.
 
+.. _contributing-source-file-headers:
+
+Match the source file header convention
+---------------------------------------
+
+Every tracked C++ or TableGen source file begins with a single-line banner
+followed by the project license notice:
+
+.. code-block:: cpp
+
+   //===- Foo.h - Short description -------------*- C++ -*-===//
+   //
+   // Part of the LLK Compiler Project, under the Apache License v2.0 with
+   // LLVM Exceptions.
+   // See https://llvm.org/LICENSE.txt for license information.
+   // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+   //
+   //===----------------------------------------------------------------------===//
+
+Keep the banner on one line and within 80 columns; ``.h`` and ``.td`` files
+carry a ``-*- C++ -*-`` or ``-*- tablegen -*-`` mode marker, ``.cpp`` files do
+not. ``.clang-format`` sets ``ReflowComments: false`` so clang-format never
+reflows the banner into a second line. :source:`scripts/check-license-headers.py`
+enforces the shape; the ``license-headers`` CI job and the pre-commit hook both
+run it. Vendored code under ``third_party/`` is exempt.
+
 .. _contributing-find-the-right-extension-point:
 
 Find the right extension point

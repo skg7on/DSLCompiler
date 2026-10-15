@@ -1,11 +1,16 @@
-//===- vector_vs_scalar.cpp - Cross-validation: vector vs scalar ---------===//
+//===- vector_vs_scalar.cpp - Cross-validation: vector vs scalar ----------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Verifies that vectorized results match the FP64 ground truth for all
 // shapes from the M1 test suite.  This test validates that the FP64
 // reference produces finite, well-behaved values for the shapes used
 // by the vector-pipeline E2E tests.
-//
-//===----------------------------------------------------------------------===//
 
 #include <gtest/gtest.h>
 
@@ -37,8 +42,8 @@ static uint16_t f32_to_bf16(float f) {
 // FP64 reference: SwiGLU computed in double precision.
 // ---------------------------------------------------------------------------
 
-static void swiglu_fp64(const double* x, const double* wg, const double* wu,
-                        double* y, int64_t M, int64_t N, int64_t K) {
+static void swiglu_fp64(const double *x, const double *wg, const double *wu,
+                        double *y, int64_t M, int64_t N, int64_t K) {
   std::vector<double> gate(M * N, 0.0);
   std::vector<double> up(M * N, 0.0);
 
@@ -71,9 +76,9 @@ TEST(VectorVsScalar, AllM1ShapesFinite) {
   // used by the vector-pipeline E2E tests; this guards against NaN/Inf
   // in the reference itself before we compare vector results against it.
   std::vector<std::tuple<int64_t, int64_t, int64_t>> shapes = {
-      {1, 128, 256},    // M1 unit-batch, typical hidden dimension
-      {16, 512, 512},   // M1 mid-batch, large projections
-      {64, 256, 128},   // M1 larger batch
+      {1, 128, 256},  // M1 unit-batch, typical hidden dimension
+      {16, 512, 512}, // M1 mid-batch, large projections
+      {64, 256, 128}, // M1 larger batch
   };
 
   for (auto [M, N, K] : shapes) {
@@ -91,8 +96,8 @@ TEST(VectorVsScalar, AllM1ShapesFinite) {
     }
 
     std::vector<double> y_ref(M * N);
-    swiglu_fp64(x_f64.data(), wg_f64.data(), wu_f64.data(),
-                y_ref.data(), M, N, K);
+    swiglu_fp64(x_f64.data(), wg_f64.data(), wu_f64.data(), y_ref.data(), M, N,
+                K);
 
     // Verify reference produces finite values.
     int nonFiniteCount = 0;
@@ -110,11 +115,10 @@ TEST(VectorVsScalar, AllM1ShapesFinite) {
     // with normal(0,1) weights can be large, but should not be extreme.
     for (int64_t i = 0; i < M * N; i++) {
       EXPECT_GE(y_ref[i], -1e6)
-          << "Unexpectedly large negative value at M=" << M
-          << " N=" << N << " K=" << K;
-      EXPECT_LE(y_ref[i], 1e6)
-          << "Unexpectedly large positive value at M=" << M
-          << " N=" << N << " K=" << K;
+          << "Unexpectedly large negative value at M=" << M << " N=" << N
+          << " K=" << K;
+      EXPECT_LE(y_ref[i], 1e6) << "Unexpectedly large positive value at M=" << M
+                               << " N=" << N << " K=" << K;
     }
   }
 }
@@ -122,10 +126,8 @@ TEST(VectorVsScalar, AllM1ShapesFinite) {
 TEST(VectorVsScalar, BF16RoundtripConsistent) {
   // Verify bf16→f32→bf16 roundtrip is consistent — the identity
   // bf16_to_f32(f32_to_bf16(x)) ≈ x for a range of values.
-  std::vector<float> testValues = {
-      -100.0f, -10.0f, -1.0f, -0.5f, -0.01f,
-      0.0f, 0.01f, 0.5f, 1.0f, 10.0f, 100.0f
-  };
+  std::vector<float> testValues = {-100.0f, -10.0f, -1.0f, -0.5f, -0.01f, 0.0f,
+                                   0.01f,   0.5f,   1.0f,  10.0f, 100.0f};
 
   for (float v : testValues) {
     uint16_t bf16 = f32_to_bf16(v);
@@ -133,8 +135,7 @@ TEST(VectorVsScalar, BF16RoundtripConsistent) {
     float absErr = std::abs(v - recovered);
     // BF16 has ~7 bits of mantissa, so relative error can be ~0.8%.
     float relErr = (std::abs(v) > 1e-6f) ? absErr / std::abs(v) : absErr;
-    EXPECT_LT(relErr, 2e-2f)
-        << "BF16 roundtrip error too large for value " << v
-        << ": recovered=" << recovered;
+    EXPECT_LT(relErr, 2e-2f) << "BF16 roundtrip error too large for value " << v
+                             << ": recovered=" << recovered;
   }
 }

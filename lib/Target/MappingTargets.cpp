@@ -1,10 +1,15 @@
 //===- MappingTargets.cpp - Register the mapping target packages ----------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The composition root for target packages: the one translation unit that names
 // them, so nothing else has to. Each name here is the label its package already
 // writes into its own configuration, and it is what `--target=<name>` resolves.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Target/MappingTargets.h"
 

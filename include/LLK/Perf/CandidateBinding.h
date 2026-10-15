@@ -1,5 +1,12 @@
-//===- CandidateBinding.h - Bind a candidate into a concrete kernel -------===//
+//===- CandidateBinding.h - Bind a candidate into a kernel ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #50).
 //
 // A Candidate is one point in a search space: numbers for the tile sizes,
@@ -24,8 +31,6 @@
 // and the VM/VN vector tile sizes -- stay in the schedule record as candidate
 // values. Nothing in this dialect represents thread count today, so a kernel
 // cannot carry it; legality has already checked it against the machine.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_CANDIDATEBINDING_H
 #define LLK_PERF_CANDIDATEBINDING_H

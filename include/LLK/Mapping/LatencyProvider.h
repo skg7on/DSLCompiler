@@ -1,5 +1,12 @@
-//===- LatencyProvider.h - Optional measured latencies --------------------===//
+//===- LatencyProvider.h - Optional measured latencies ----------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67).
 //
 // Static cost is always available and always admissible for pruning; a
@@ -15,8 +22,6 @@
 // placement classes, the route class, and the cost-model version. A caller
 // that cannot fill a field leaves it empty rather than guessing, which makes
 // the entry unreachable rather than wrong.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_LATENCYPROVIDER_H
 #define LLK_MAPPING_LATENCYPROVIDER_H

@@ -1,8 +1,13 @@
 //===- StorageLiveness.cpp - Live storage from execution events -----------===//
 //
-// Task R5 (issue #129). See StorageLiveness.h for the model.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Task R5 (issue #129). See StorageLiveness.h for the model.
 
 #include "LLK/Mapping/StorageLiveness.h"
 

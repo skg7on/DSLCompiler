@@ -1,12 +1,17 @@
 //===- PlanReport.cpp - Versioned JSON plan report (design §22.2) ---------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The report is written with `llvm::json::OStream`'s imperative API rather than
 // from a `json::Object`: an Object is backed by a `DenseMap`, whose iteration
 // order is not a contract, whereas OStream emits attributes in exactly the
 // order the code writes them. That gives the fixed key order and the
 // byte-for-byte determinism the report needs (§29.12).
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/PlanReport.h"
 

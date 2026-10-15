@@ -1,5 +1,12 @@
-//===- PlanBinder.cpp - Materialize a selected plan (D7/#50) -------------===//
+//===- PlanBinder.cpp - Materialize a selected plan (D7/#50) --------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // `bindPlan` clones the source kernel and persists the selected plan as
 // schema-v2 metadata (`encodeSelectedPlan`, see MappingMetadata.h). The
 // concrete operations the plan implies are constructed by a `PlanMaterializer`

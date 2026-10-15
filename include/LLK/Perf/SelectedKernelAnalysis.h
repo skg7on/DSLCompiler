@@ -1,5 +1,12 @@
-//===- SelectedKernelAnalysis.h - One static analysis of a selected kernel =//
+//===- SelectedKernelAnalysis.h - Selected-kernel analysis ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M10 performance simulator (issue #46); the shared extraction the
 // mapping planner and `micro-perf` both read (issue #129, task R6).
 //
@@ -29,8 +36,6 @@
 // `EventScheduleResult`, `scheduleNormalizedEvents`, `validateEventResources`).
 // The dependency is one-way -- LLKPerf -> LLKMapping -- and LLKMapping never
 // links this library. Nothing here is reachable from the mapping core.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_SELECTEDKERNELANALYSIS_H
 #define LLK_PERF_SELECTEDKERNELANALYSIS_H

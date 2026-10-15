@@ -1,12 +1,16 @@
-//===- Diagnostics.cpp - Stable diagnostic codes (D6, §22.3)
-//---------------===//
+//===- Diagnostics.cpp - Stable diagnostic codes (D6, §22.3) --------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Hand-written stringify/symbolize, matching the project idiom for a small,
 // closed enum (see MicroEnums.h): a plain switch for the one direction and
 // `StringSwitch` for the other, so the compiler flags a case added to the enum
 // but forgotten here.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/Diagnostics.h"
 

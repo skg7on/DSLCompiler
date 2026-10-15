@@ -1,6 +1,12 @@
-//===- MicroToLinalg.h - Lower micro kernels to Linalg + SCF + MemRef --*- C++
-//-*-===//
+//===- MicroToLinalg.h - Lower micro kernels to Linalg ----------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Pass header for the Micro-to-Linalg lowering conversion.
 //
 // `micro` is the canonical execution IR and, until this pass, a sink: nothing
@@ -8,8 +14,6 @@
 // a `micro.kernel` -- hand-written, exported by `--llk-to-micro`, or bound from
 // a mapping plan -- flow through the same downstream pipeline the legacy path
 // uses (Linalg -> loops -> LLVM -> ORC JIT).
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_CONVERSION_MICROTOLINALG_H
 #define LLK_CONVERSION_MICROTOLINALG_H

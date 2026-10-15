@@ -1,11 +1,12 @@
 //===- PackWeights.cpp - Weight packing annotation pass -------------------===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Annotates weight operands in Linalg matmul/generic ops with packed layout
 // attributes so the downstream TileAndVectorize pass can read them.
 //
@@ -17,8 +18,6 @@
 //   - For linalg::MatmulOp: annotates the RHS (second dps input) operand.
 //   - For linalg::GenericOp: annotates operands whose indexing maps contain
 //     a reduction iterator.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/PackWeights.h"
 

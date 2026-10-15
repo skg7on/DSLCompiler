@@ -1,5 +1,12 @@
 //===- MappingRules.cpp - LLKMap mapping rules (D4) -----------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Parses `rule` declarations on top of the shared LLKMap expression grammar.
 // A rule must name one Micro operation from the workload vocabulary, declare
 // exactly one bundle and one emitter, and is otherwise free-form: predicates,
@@ -9,8 +16,6 @@
 // the operation name against the workload vocabulary, parameters against their
 // declarations, and layout ids, capability kinds, and emitter keys against the
 // target's other registries.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/MappingRules.h"
 

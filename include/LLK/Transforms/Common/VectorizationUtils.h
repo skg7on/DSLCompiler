@@ -1,9 +1,14 @@
 //===- VectorizationUtils.h - Generic vectorization utilities ---*- C++ -*-===//
 //
-// Common patterns for vectorizing linalg operations:
-//   transfer_read → vector contract / arith → transfer_write
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Common patterns for vectorizing linalg operations:
+//   transfer_read → vector contract / arith → transfer_write
 
 #ifndef LLK_TRANSFORMS_COMMON_VECTORIZATIONUTILS_H
 #define LLK_TRANSFORMS_COMMON_VECTORIZATIONUTILS_H

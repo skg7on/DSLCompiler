@@ -1,12 +1,17 @@
-//===- JitCache.h - JIT cache for compiled LLK kernels -------------------===//
+//===- JitCache.h - JIT cache for compiled LLK kernels ----------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // 4-level JIT cache with LRU eviction per level:
 //   L1: IR Cache        — verified MLIR module (pre-lowering)
 //   L2: Optimized Cache  — post-optimization MLIR (pre-bufferization)
 //   L3: Object Cache     — compiled function pointer (KernelKey → fn ptr)
 //   L4: Weight Cache     — packed weight buffer (WeightKey → PackedWeights)
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_RUNTIME_JITCACHE_H
 #define LLK_RUNTIME_JITCACHE_H

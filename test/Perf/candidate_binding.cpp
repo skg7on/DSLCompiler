@@ -1,5 +1,12 @@
 //===- candidate_binding.cpp - Candidate -> concrete kernel tests ---------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Covers issue #50, binding half. A candidate is a point in the search space;
 // binding turns it into a concrete `micro.kernel` the performance model can
 // cost. The tests assert three things:
@@ -14,8 +21,6 @@
 //
 // The returned decisions are asserted too: the schedule record persists them,
 // so they have to be the values the kernel actually embodies.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Dialect/Micro/MicroEnums.h"

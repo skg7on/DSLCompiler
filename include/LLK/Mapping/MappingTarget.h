@@ -1,5 +1,12 @@
-//===- MappingTarget.h - A validated target configuration (D4) ------------===//
+//===- MappingTarget.h - A validated target configuration (D4) --*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, workstream D4).
 //
 // A `MappingTarget` is one validated bundle of target facts: the machine
@@ -11,8 +18,6 @@
 // A target bundle is opaque: a name, typed parameters, and an emitter key.
 // Generic code may compare, hash, report, and hand a bundle to the plugin; it
 // must not read any field as target semantics (design §14.3).
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_MAPPINGTARGET_H
 #define LLK_MAPPING_MAPPINGTARGET_H

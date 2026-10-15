@@ -1,6 +1,12 @@
-//===- MappedExecutable.h - Invoke a compiled micro kernel (issue #67, C4)
-//-===//
+//===- MappedExecutable.h - Invoke a compiled micro kernel ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the runtime (epic #67, stage C4).
 //
 // A lowered `micro.kernel` reaches machine code through the same ORC pipeline
@@ -14,8 +20,6 @@
 // caller owns. It is the ABI boundary the mapping pipeline was missing: a plan
 // that selects a target and a schedule is only tested when the program it
 // produced is actually run.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_RUNTIME_MAPPEDEXECUTABLE_H
 #define LLK_RUNTIME_MAPPEDEXECUTABLE_H

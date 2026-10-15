@@ -1,5 +1,12 @@
 //===- l1_resource_dag.cpp - L1 resource scheduler tests ------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Covers issue #46, L1 half:
 //   - copy -> wait -> mma is scheduled in that order
 //   - independent copies overlap once the machine has more than one DMA engine
@@ -12,8 +19,6 @@
 // deliberately extreme -- one flop per cycle per engine, long DMA transfers --
 // so that a scheduling difference is visible as a doubling, not as a rounding
 // error.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Machine/MachineModelLoader.h"

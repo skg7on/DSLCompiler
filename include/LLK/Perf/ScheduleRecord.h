@@ -1,5 +1,12 @@
-//===- ScheduleRecord.h - Persisted selected schedule (YAML) --------------===//
+//===- ScheduleRecord.h - Persisted selected schedule (YAML) ----*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #50).
 //
 // A ScheduleRecord is one row of `llk-tune`'s output: the workload identity,
@@ -13,8 +20,6 @@
 // The YAML is written by hand rather than through a serializer so the field
 // order is stable and readable. Every collection is emitted in a deterministic
 // order, so two runs over the same candidate produce byte-identical YAML.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_SCHEDULERECORD_H
 #define LLK_PERF_SCHEDULERECORD_H

@@ -1,10 +1,15 @@
-//===- schedule_determinism.cpp - Schedule selection determinism tests ---===//
+//===- schedule_determinism.cpp - Schedule selection determinism tests ----===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Verifies that the schedule selection is deterministic: same inputs
 // always produce the same schedule. Tests KernelKey hash stability
 // and schedule lookup idempotency.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Runtime/KernelKey.h"
 

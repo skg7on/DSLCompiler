@@ -1,13 +1,18 @@
-//===- MicroTileInfo.h - Tile metadata read off an MLIR type -------------===//
+//===- MicroTileInfo.h - Tile metadata read off an MLIR type ----*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Internal to the perf library. The cost model must read shape, dtype, layout,
 // memory space, and owner out of whatever a `micro` op produced or consumed,
 // and those live on two different carriers: `!micro.tile` for execution values,
 // and a plain shaped type for the tensors a kernel reads from and writes back
 // to external memory. describeType() flattens both into one struct so no cost
 // computation has to care which one it got.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_MICROTILEINFO_H
 #define LLK_PERF_MICROTILEINFO_H

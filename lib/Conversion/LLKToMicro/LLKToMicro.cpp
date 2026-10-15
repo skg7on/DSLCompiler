@@ -1,5 +1,12 @@
 //===- LLKToMicro.cpp - LLK -> concrete micro.kernel lowering -------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Exports the LLK pipeline's semantic structure as tile-centric Micro-IR. One
 // concrete `micro.kernel` is appended to the module per supported LLK root
 // operation; the original functions are left untouched, so the AVX2/JIT
@@ -30,8 +37,6 @@
 // `micro.pipeline` sits inside the K loop rather than around it because that is
 // the position MicroDAG reads as loop pipelining; with one stage the two
 // spellings are equivalent.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/MicroMapping/TileExtent.h"

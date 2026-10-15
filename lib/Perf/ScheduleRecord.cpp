@@ -1,12 +1,17 @@
 //===- ScheduleRecord.cpp - Persisted selected schedule (YAML) ------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #50). See ScheduleRecord.h.
 //
 // The YAML is assembled by hand so the key order is the order in the spec and
 // byte-identical across runs. `std::map` already iterates in key order, so the
 // candidate bindings are deterministic without an explicit sort.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/ScheduleRecord.h"
 

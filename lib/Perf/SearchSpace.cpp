@@ -1,5 +1,12 @@
 //===- SearchSpace.cpp - micro.search_space loader ------------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #49). See SearchSpace.h.
 //
 // The dialect verifier already accepts or rejects the IR; the loader's job is
@@ -7,8 +14,6 @@
 // The few checks here are the ones that matter once the records have left
 // MLIR, where no verifier will run again: a parameter with no choices, a
 // duplicated choice, or a constraint kind with no C++ evaluator.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/SearchSpace.h"
 

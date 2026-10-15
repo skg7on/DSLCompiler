@@ -1,6 +1,12 @@
-//===- MathApproximation.cpp - Polynomial function approximations
-//----------===//
+//===- MathApproximation.cpp - Polynomial function approximations ---------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Fast polynomial approximations for exp, sigmoid, cos, sin.
 //
 // exp(x):  range-reduce x * log2(e) → integer n + fraction r ∈ [-0.5, 0.5],
@@ -8,8 +14,6 @@
 // sigmoid: implemented via createApproxExp.
 // cos/sin:  for bounded_fast / unsafe_fast, use Cody-Waite range reduction
 //           followed by minimax polynomial approximations (~1 ULP for f32).
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/Common/MathApproximation.h"
 

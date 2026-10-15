@@ -1,5 +1,12 @@
 //===- l0_static_bound.cpp - L0 static bound tests ------------------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Covers issue #46, L0 half:
 //   - a tiny tile GEMM reports its flops and its bytes per memory space
 //   - live materialized tile bytes are attributed to the right memory
@@ -13,8 +20,6 @@
 // The kernel sources are the fixture: they are what a lowering would emit, so
 // the numbers here are derived from tile shapes and dtypes rather than from
 // anything the test hard-codes about the operation.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Machine/MachineModelLoader.h"

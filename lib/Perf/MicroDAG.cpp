@@ -1,5 +1,12 @@
 //===- MicroDAG.cpp - Event DAG extraction from concrete Micro-IR ---------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Implements buildMicroDAG(): the single traversal that turns a concrete
 // `micro.kernel` into schedulable events plus the program properties the
 // capacity check needs. See MicroDAG.h for the dependency rules.
@@ -8,8 +15,6 @@
 // event's `minCycles` is the machine's own answer for the work the tile
 // metadata describes. That is what keeps a second target from needing a second
 // extractor.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/MicroDAG.h"
 #include "LLK/Perf/OpDAGBuilder.h"

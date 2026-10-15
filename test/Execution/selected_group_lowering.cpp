@@ -1,3 +1,12 @@
+//===- selected_group_lowering.cpp - Tests for selected-group lowering ----===//
+//
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "selected_group_lowering_test_hooks.h"

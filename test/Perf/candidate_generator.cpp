@@ -1,5 +1,12 @@
 //===- candidate_generator.cpp - Candidate enumeration tests --------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Covers issue #49, generator half:
 //   - grid search emits the whole Cartesian product
 //   - the order is deterministic: parameters in declaration order, the last
@@ -10,8 +17,6 @@
 //   - candidate ids are stable hashes of the bindings
 //   - random search is reproducible from its seed and samples without
 //     replacement
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/Candidate.h"
 #include "LLK/Perf/CandidateGenerator.h"

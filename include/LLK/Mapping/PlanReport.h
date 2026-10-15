@@ -1,5 +1,12 @@
-//===- PlanReport.h - Versioned JSON plan report (design §22.2) -----------===//
+//===- PlanReport.h - Versioned JSON plan report ----------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, workstream D7).
 //
 // A plan report is reproducibility and diagnostic metadata, never executable
@@ -18,8 +25,6 @@
 // reaches the output), and no timestamp, address, or unordered iteration is
 // included. Costs render through `canonicalCostString` / a fixed `%.6f`, both
 // byte-stable across runs and platforms.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_PLANREPORT_H
 #define LLK_MAPPING_PLANREPORT_H

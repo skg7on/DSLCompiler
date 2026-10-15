@@ -1,5 +1,12 @@
 //===- MicroPerfReport.cpp - Analysis entry point and reporting -----------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // analyzeKernel() extracts the DAG once and derives everything else from it, so
 // `micro-perf --level=0` and `--level=1` can never disagree about what the
 // kernel does.
@@ -9,8 +16,6 @@
 // generality: `llk-tune` reads this output, and FileCheck compares it. Every
 // collection is a std::map or is sorted, so equal inputs always print equal
 // bytes.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/MicroPerfReport.h"
 

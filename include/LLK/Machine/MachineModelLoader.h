@@ -1,5 +1,12 @@
-//===- MachineModelLoader.h - Load a v2 machine model from YAML -----------===//
+//===- MachineModelLoader.h - Load a v2 machine model -----------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the v2 machine model (issue #82, epic #67).
 //
 // The loader reads the `schema: llk.machine.v2` shape -- a list of nodes per
@@ -21,8 +28,6 @@
 // to reject a newer-minor file it cannot fully understand, and the schema major
 // plus `verifyMachineModel` still guard structure, required fields, and kinds,
 // so tolerance never extends past unknown keys.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MACHINE_MACHINEMODELLOADER_H
 #define LLK_MACHINE_MACHINEMODELLOADER_H

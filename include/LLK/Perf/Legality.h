@@ -1,5 +1,12 @@
-//===- Legality.h - Machine-aware candidate legality ----------------------===//
+//===- Legality.h - Machine-aware candidate legality ------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #49).
 //
 // A candidate is legal when every `micro.constraint` its search space declares
@@ -19,8 +26,6 @@
 // rejection can be shown to a user and asserted on in a test. The first
 // failing constraint in declaration order wins, which makes the verdict
 // deterministic for a given space.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_LEGALITY_H
 #define LLK_PERF_LEGALITY_H

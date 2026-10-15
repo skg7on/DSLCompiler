@@ -1,8 +1,13 @@
 //===- GridToForall.h - tt.get_program_id → scf.forall ----------*- C++ -*-===//
 //
-// Pass header for lowering Triton grid dispatch to scf.forall.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Pass header for lowering Triton grid dispatch to scf.forall.
 
 #ifndef LLK_CONVERSION_TRITONTOLLK_GRIDTOFORALL_H
 #define LLK_CONVERSION_TRITONTOLLK_GRIDTOFORALL_H

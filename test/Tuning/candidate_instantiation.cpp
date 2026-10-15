@@ -1,3 +1,12 @@
+//===- candidate_instantiation.cpp - Tests for candidate instantiation ----===//
+//
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
 #include "LLK/Dialect/LLKDialect.h"

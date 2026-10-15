@@ -1,5 +1,12 @@
-//===- CostEvent.h - Shared cost-event vocabulary -------------------------===//
+//===- CostEvent.h - Shared cost-event vocabulary ---------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67).
 //
 // The mapping search and the performance evaluator account for the same kinds
@@ -10,8 +17,6 @@
 // These five categories are the whole vocabulary. They are deliberately coarse
 // -- what the work *is*, not how much of it -- because cost stays
 // multi-dimensional until an objective ranks it.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_COSTEVENT_H
 #define LLK_MAPPING_COSTEVENT_H

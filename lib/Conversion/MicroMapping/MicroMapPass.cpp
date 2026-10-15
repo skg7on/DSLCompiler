@@ -1,11 +1,15 @@
-//===- MicroMapPass.cpp - `micro-map`: bind the best plan (design §21)
-//-----===//
+//===- MicroMapPass.cpp - `micro-map`: bind the best plan (design §21) ----===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // A compiler front door for the mapping engine: load a target by path, extract
 // the module's workload graph, search it, and bind the best covering plan onto
 // the kernel. The pass is target-neutral -- it never names a backend.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MicroMapping/MicroMappingPasses.h"
 #include "MicroMappingCommon.h"

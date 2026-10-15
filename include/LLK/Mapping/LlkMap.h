@@ -1,5 +1,12 @@
-//===- LlkMap.h - Shared LLKMap language core (D3/D4) ---------------------===//
+//===- LlkMap.h - Shared LLKMap language core (D3/D4) -----------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // LLKMap is one small language with several declaration kinds: layouts (D3)
 // and mapping rules (D4). They share a token set, an expression grammar, and
 // an evaluator, so those live here rather than being duplicated per
@@ -8,8 +15,6 @@
 //
 // Everything in this header is target-independent: it knows about Micro
 // vocabulary names and `MachineModel` queries, never about a specific target.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_LLKMAP_H
 #define LLK_MAPPING_LLKMAP_H

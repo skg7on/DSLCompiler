@@ -1,5 +1,12 @@
-//===- search_binding_loader.cpp - micro.candidate -> SearchBinding ----===//
+//===- search_binding_loader.cpp - micro.candidate -> SearchBinding -------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Covers phase-4 task 1 (epic #67): the producer for mapping::SearchBinding.
 // A `micro.candidate` is a complete assignment of a space's parameters, so
 // loading one is a *binding-level* global legality check (ruling S2): every
@@ -17,8 +24,6 @@
 // and then *mutate* a candidate's `bindings`, which is the state the loader
 // must survive when no verifier has blessed the IR -- exactly the startup path
 // ruling S2 is about.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MicroMapping/SearchBindingLoader.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"

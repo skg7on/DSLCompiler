@@ -1,10 +1,15 @@
 //===- VectorizationUtils.cpp - Generic vectorization utilities -----------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Convenience builders for vector.transfer_read, vector.transfer_write,
 // boundary masks, and zero-index helpers.  Extracts common patterns that
 // were previously duplicated across lowering passes.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/Common/VectorizationUtils.h"
 

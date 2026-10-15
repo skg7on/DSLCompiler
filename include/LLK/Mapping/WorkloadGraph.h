@@ -1,5 +1,12 @@
-//===- WorkloadGraph.h - Target-independent work graph from Micro-IR ------===//
+//===- WorkloadGraph.h - Target-independent work graph ----------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (issue #80, epic #67 D1).
 //
 // The mapping engine does not pattern-match Micro-IR directly. It first
@@ -16,8 +23,6 @@
 // serialized, compared, and re-derived. `finalize()` canonicalizes by content,
 // which is what makes a graph assembled in any insertion order hash and
 // serialize identically.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_WORKLOADGRAPH_H
 #define LLK_MAPPING_WORKLOADGRAPH_H

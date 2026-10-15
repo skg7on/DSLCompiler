@@ -1,9 +1,14 @@
-//===- cache_eviction.cpp - JIT cache LRU eviction tests -----------------===//
+//===- cache_eviction.cpp - JIT cache LRU eviction tests ------------------===//
 //
-// Verifies multi-level cache behavior: hits, misses, evictions,
-// and LRU ordering.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Verifies multi-level cache behavior: hits, misses, evictions,
+// and LRU ordering.
 
 #include "LLK/Runtime/JitCache.h"
 #include "LLK/Runtime/KernelKey.h"

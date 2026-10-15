@@ -1,11 +1,16 @@
-//===- e2e_workflow.cpp - The whole mapping workflow, end to end ---------===//
+//===- e2e_workflow.cpp - The whole mapping workflow, end to end ----------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Issue #53: one test that runs the documented chain on the same fixture
 // against two targets, so a break anywhere along it -- extraction, matching,
 // placement, connections, covering, binding, verification -- fails here rather
 // than in a per-layer test that no longer reflects the whole.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Mapping/CoveringSearch.h"

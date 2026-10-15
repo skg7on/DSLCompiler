@@ -1,17 +1,15 @@
-//===- ScratchAnalysis.h - Audit memref allocs for intermediates -*- C++
-//-*-===//
+//===- ScratchAnalysis.h - Audit memref allocations -------------*- C++ -*-===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Post-bufferization pass that walks all memref.alloc ops and warns on
 // allocations larger than 1 MB, flagging potential full-size intermediates
 // that could be fused away.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_TRANSFORMS_SCRATCHANALYSIS_H
 #define LLK_TRANSFORMS_SCRATCHANALYSIS_H

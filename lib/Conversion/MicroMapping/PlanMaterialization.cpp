@@ -1,5 +1,12 @@
 //===- PlanMaterialization.cpp - Construct a selected plan's Micro ops ----===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // The canonical `PlanMaterializer` (design §18.2, "Materialization versus
 // target readiness"). `bindPlan` persists a selected plan as target-neutral
 // metadata; this component is the dialect-aware half that turns the selected

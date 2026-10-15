@@ -1,9 +1,14 @@
-//===- MaskGeneration.h - Masked load/store for vector tails ---*- C++ -*-===//
+//===- MaskGeneration.h - Masked load/store for vector tails ----*- C++ -*-===//
 //
-// Utilities for generating vector.create_mask and vector.mask operations
-// to handle non-aligned trailing elements after tiling.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Utilities for generating vector.create_mask and vector.mask operations
+// to handle non-aligned trailing elements after tiling.
 
 #ifndef LLK_TRANSFORMS_COMMON_MASKGENERATION_H
 #define LLK_TRANSFORMS_COMMON_MASKGENERATION_H

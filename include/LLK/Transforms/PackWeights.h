@@ -1,11 +1,12 @@
 //===- PackWeights.h - Weight packing annotation pass -----------*- C++ -*-===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Annotates weight operands in Linalg matmul/generic ops with packed layout
 // attributes. The downstream TileAndVectorize pass reads these attributes to
 // choose the correct interpretation when tiling/vectorizing the K dimension.
@@ -17,8 +18,6 @@
 //
 // Weights identified as function arguments or tensor::EmptyOp producers are
 // annotated with "llk.packed_layout" = block_size.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_TRANSFORMS_PACKWEIGHTS_H
 #define LLK_TRANSFORMS_PACKWEIGHTS_H

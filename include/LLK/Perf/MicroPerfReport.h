@@ -1,5 +1,12 @@
-//===- MicroPerfReport.h - Analysis entry point and reporting -------------===//
+//===- MicroPerfReport.h - Analysis entry point and reporting ---*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M10 AVX2 performance simulator (issue #46).
 //
 // analyzeKernel() is the one call `micro-perf`, the GTests, and any later
@@ -12,8 +19,6 @@
 //
 // Both formatters are deterministic: every collection is ordered by key, so the
 // YAML is stable enough for FileCheck and for a later `llk-tune` to read.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_MICROPERFREPORT_H
 #define LLK_PERF_MICROPERFREPORT_H

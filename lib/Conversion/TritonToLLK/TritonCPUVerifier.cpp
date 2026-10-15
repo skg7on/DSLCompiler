@@ -1,9 +1,14 @@
 //===- TritonCPUVerifier.cpp - reject unsupported GPU ops -----------------===//
 //
-// Runs before Stage 2. Checks every Triton IR op against a CPU-support
-// whitelist. Emits actionable errors for GPU-only constructs.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Runs before Stage 2. Checks every Triton IR op against a CPU-support
+// whitelist. Emits actionable errors for GPU-only constructs.
 
 #include "LLK/Conversion/TritonToLLK/TritonCPUVerifier.h"
 

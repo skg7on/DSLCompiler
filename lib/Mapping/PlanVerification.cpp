@@ -1,5 +1,12 @@
 //===- PlanVerification.cpp - Layered verification of mapped Micro-IR -----===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Split out of PlanBinder.cpp (task B1) so the binder stays a materializer and
 // semantic checking lives on its own. The public entry point
 // `verifyMappedMicroIR` is declared in PlanBinder.h and keeps its contract.

@@ -1,5 +1,12 @@
-//===- MappedCompilation.h - Compile a selected mapping plan (C5) ---------===//
+//===- MappedCompilation.h - Compile a selected mapping plan ----*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the mapping-integration layer (epic #67, stage C5).
 //
 // This is the one path from "a plan the search selected" to "code that runs".
@@ -14,8 +21,6 @@
 // an operation a *selected emitter* rewrote is selected-bundle execution, and
 // an operation the reference bridge carried is reference execution. They are
 // reported separately because only the first is evidence about a target.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_CONVERSION_MAPPEDCOMPILATION_H
 #define LLK_CONVERSION_MAPPEDCOMPILATION_H

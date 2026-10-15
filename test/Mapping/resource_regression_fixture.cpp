@@ -1,12 +1,17 @@
 //===- resource_regression_fixture.cpp - Issue #129 shared test fixtures --===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // See resource_regression_fixture.h. Every case is a `CaseSpec`: Micro-IR text,
 // LLKMap rule text, an in-memory MachineModel, and the emitter keys the target
 // declares. Nothing here consults the production search, storage planner or
 // cost model to decide what a case *should* produce -- the test states that in
 // literal assertions.
-//
-//===----------------------------------------------------------------------===//
 
 #include "resource_regression_fixture.h"
 

@@ -1,6 +1,12 @@
-//===- storage_plan.cpp - Physical storage footprints and value lifetimes
-//--===//
+//===- storage_plan.cpp - Physical storage footprints and value lifetimes -===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Task B3 (issue #67, stage B). Exercises the two storage-planning contracts:
 // `computePeakStorage` summarizes a validated deterministic schedule's live
 // ranges, and `finalizeStoragePlan` builds the dependency-aware intervals and

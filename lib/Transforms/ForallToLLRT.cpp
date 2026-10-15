@@ -1,11 +1,12 @@
 //===- ForallToLLRT.cpp - Lower scf.forall to runtime calls ---------------===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Lowers remaining scf.forall ops (post-bufferization) to runtime
 // parallel_for calls. Outlines the forall body into a worker function.
 //
@@ -13,8 +14,6 @@
 // the runtime `llrtParallelFor` call is done by the JIT driver or a
 // subsequent lowering pass. This pass emits the call with tile/grain
 // arguments; the driver resolves the worker symbol at link time.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/ForallToLLRT.h"
 

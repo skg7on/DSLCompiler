@@ -1,5 +1,12 @@
-//===- resource_regression_fixture.h - Issue #129 shared test fixtures ----===//
+//===- resource_regression_fixture.h - Regression fixtures ------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Test-support only (issue #129). ONE fixture builds the small mapping
 // scenarios the resource/cost repair regresses against, directly from finite
 // MachineModel data, LLKMap text and parsed Micro-IR -- never by calling the
@@ -15,8 +22,6 @@
 //
 // It is linked only into integration regression tests, never into a production
 // library.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_TEST_RESOURCE_REGRESSION_FIXTURE_H
 #define LLK_TEST_RESOURCE_REGRESSION_FIXTURE_H

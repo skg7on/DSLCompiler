@@ -1,10 +1,15 @@
 //===- SharedMemToScratch.cpp - shared mem → scratch allocs ---------------===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Lowers Triton tt.alloc (shared memory space 3) to per-worker memref.alloc
 // scratch buffers. tt.async_copy becomes synchronous memref.copy since CPU
 // threads are independent workers — no barrier is needed.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/TritonToLLK/SharedMemToScratch.h"
 

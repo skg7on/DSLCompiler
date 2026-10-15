@@ -1,13 +1,18 @@
 //===- TuningSession.cpp - Generate, check, bind, and rank candidates -----===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #50). See TuningSession.h.
 //
 // Each candidate is bound into its own scratch module: the bound kernel is IR,
 // and the session needs one alive only long enough to cost it. A fresh module
 // per candidate also means a candidate that fails to bind cannot leave half a
 // kernel behind for the next one to trip over.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/TuningSession.h"
 

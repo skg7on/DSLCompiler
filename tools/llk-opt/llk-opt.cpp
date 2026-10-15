@@ -1,9 +1,14 @@
 //===- llk-opt.cpp - LLK optimizer driver ---------------------------------===//
 //
-// Main entry point for the LLK optimizer tool. Parses MLIR input, runs
-// optimization passes, and emits the result.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Main entry point for the LLK optimizer tool. Parses MLIR input, runs
+// optimization passes, and emits the result.
 
 #include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
 #include "mlir/InitAllDialects.h"

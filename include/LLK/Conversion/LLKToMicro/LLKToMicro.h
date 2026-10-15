@@ -1,5 +1,12 @@
 //===- LLKToMicro.h - LLK -> Micro-IR export --------------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Export path from the LLK scheduling pipeline into tile-centric Micro-IR.
 //
 // Two passes, both non-destructive: they add IR to the module and leave the
@@ -10,8 +17,6 @@
 //     root operation -- the selected schedule bound to execution tiles.
 //   * LLKToMicroSearchSpacePass exports one `micro.search_space` per root
 //     operation -- the legal choices around that schedule, for the tuner.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_CONVERSION_LLKTOMICRO_LLKTOMICRO_H
 #define LLK_CONVERSION_LLKTOMICRO_LLKTOMICRO_H

@@ -1,11 +1,12 @@
 //===- TileAndVectorize.cpp - Tiling + Vectorization Pass -----------------===//
 //
-// Part of the LLK Compiler Project, under the Apache License v2.0.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-//
+
 // Applies tiling and vectorization to Linalg operations produced by lowering
 // LLK ops.  Uses scf::tileUsingSCF for two-pass tiling (reduction K with
 // scf.for, then parallel M/N with scf.forall), followed by linalg::vectorize.
@@ -17,8 +18,6 @@
 //   4. Vectorize innermost tiles (VM = 4, VN = 8)
 //
 // Produces: scf.forall + scf.for + vector.contract + vector.transfer_read/write
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Transforms/TileAndVectorize.h"
 #include "LLK/Conversion/LLKToLinalg.h"
@@ -104,12 +103,11 @@ struct TileAndVectorizePass
       //     that blocks linalg.matmul.
       scf::SCFTilingOptions kOpts;
       kOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
-      kOpts.setTileSizes(
-          {rewriter.getI64IntegerAttr(0), rewriter.getI64IntegerAttr(0),
-           rewriter.getI64IntegerAttr(kBK)});
-      auto kTiled = scf::tileUsingSCF(rewriter,
-                                       cast<TilingInterface>(matmul.getOperation()),
-                                       kOpts);
+      kOpts.setTileSizes({rewriter.getI64IntegerAttr(0),
+                          rewriter.getI64IntegerAttr(0),
+                          rewriter.getI64IntegerAttr(kBK)});
+      auto kTiled = scf::tileUsingSCF(
+          rewriter, cast<TilingInterface>(matmul.getOperation()), kOpts);
       if (failed(kTiled))
         continue;
 
@@ -119,9 +117,9 @@ struct TileAndVectorizePass
         continue;
       scf::SCFTilingOptions mnOpts;
       mnOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
-      mnOpts.setTileSizes(
-          {rewriter.getI64IntegerAttr(kBM), rewriter.getI64IntegerAttr(kBN),
-           rewriter.getI64IntegerAttr(0)});
+      mnOpts.setTileSizes({rewriter.getI64IntegerAttr(kBM),
+                           rewriter.getI64IntegerAttr(kBN),
+                           rewriter.getI64IntegerAttr(0)});
       auto tiledOp = cast<TilingInterface>(kTiled->tiledOps.front());
       auto mnTiled = scf::tileUsingSCF(rewriter, tiledOp, mnOpts);
       if (succeeded(mnTiled) && !mnTiled->tiledOps.empty()) {
@@ -147,39 +145,34 @@ struct TileAndVectorizePass
           // Inner M tile: scf.for step VM=4.
           scf::SCFTilingOptions mInnerOpts;
           mInnerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
-          mInnerOpts.setTileSizes(
-              {rewriter.getI64IntegerAttr(kVM), rewriter.getI64IntegerAttr(0),
-               rewriter.getI64IntegerAttr(0)});
+          mInnerOpts.setTileSizes({rewriter.getI64IntegerAttr(kVM),
+                                   rewriter.getI64IntegerAttr(0),
+                                   rewriter.getI64IntegerAttr(0)});
           auto mInnerTiled = scf::tileUsingSCF(rewriter, innerOp, mInnerOpts);
           if (failed(mInnerTiled) || mInnerTiled->tiledOps.empty())
             continue;
 
           // Inner N tile: scf.for step VN=8.
-          auto innerMOp =
-              cast<TilingInterface>(mInnerTiled->tiledOps.front());
+          auto innerMOp = cast<TilingInterface>(mInnerTiled->tiledOps.front());
           scf::SCFTilingOptions nInnerOpts;
           nInnerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
-          nInnerOpts.setTileSizes(
-              {rewriter.getI64IntegerAttr(0), rewriter.getI64IntegerAttr(kVN),
-               rewriter.getI64IntegerAttr(0)});
-          auto nInnerTiled =
-              scf::tileUsingSCF(rewriter, innerMOp, nInnerOpts);
+          nInnerOpts.setTileSizes({rewriter.getI64IntegerAttr(0),
+                                   rewriter.getI64IntegerAttr(kVN),
+                                   rewriter.getI64IntegerAttr(0)});
+          auto nInnerTiled = scf::tileUsingSCF(rewriter, innerMOp, nInnerOpts);
           if (succeeded(nInnerTiled) && !nInnerTiled->tiledOps.empty()) {
             SmallVector<bool> scalableDims(3, false);
 #if LLVM_VERSION_MAJOR >= 21
-            auto vecResult = linalg::vectorize(rewriter,
-                                               nInnerTiled->tiledOps.front(),
-                                               {kVM, kVN, kBK},
-                                               scalableDims);
+            auto vecResult =
+                linalg::vectorize(rewriter, nInnerTiled->tiledOps.front(),
+                                  {kVM, kVN, kBK}, scalableDims);
             if (succeeded(vecResult)) {
               rewriter.replaceOp(nInnerTiled->tiledOps.front(),
                                  vecResult->replacements);
             }
 #else
-            (void)linalg::vectorize(rewriter,
-                                    nInnerTiled->tiledOps.front(),
-                                    {kVM, kVN, kBK},
-                                    scalableDims);
+            (void)linalg::vectorize(rewriter, nInnerTiled->tiledOps.front(),
+                                    {kVM, kVN, kBK}, scalableDims);
 #endif
           }
         } else {
@@ -203,9 +196,8 @@ struct TileAndVectorizePass
       opts.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
       opts.setTileSizes(
           {rewriter.getI64IntegerAttr(kBM), rewriter.getI64IntegerAttr(kBN)});
-      auto tiled = scf::tileUsingSCF(rewriter,
-                                      cast<TilingInterface>(generic.getOperation()),
-                                      opts);
+      auto tiled = scf::tileUsingSCF(
+          rewriter, cast<TilingInterface>(generic.getOperation()), opts);
       if (succeeded(tiled) && !tiled->tiledOps.empty()) {
         auto *tiledOp = tiled->tiledOps.front();
         auto linalgOp = cast<linalg::LinalgOp>(tiledOp);
@@ -232,30 +224,25 @@ struct TileAndVectorizePass
           if (failed(mInnerTiled) || mInnerTiled->tiledOps.empty())
             continue;
 
-          auto innerMOp =
-              cast<TilingInterface>(mInnerTiled->tiledOps.front());
+          auto innerMOp = cast<TilingInterface>(mInnerTiled->tiledOps.front());
           scf::SCFTilingOptions nInnerOpts;
           nInnerOpts.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
           nInnerOpts.setTileSizes(
               {rewriter.getI64IntegerAttr(0), rewriter.getI64IntegerAttr(kVN)});
-          auto nInnerTiled =
-              scf::tileUsingSCF(rewriter, innerMOp, nInnerOpts);
+          auto nInnerTiled = scf::tileUsingSCF(rewriter, innerMOp, nInnerOpts);
           if (succeeded(nInnerTiled) && !nInnerTiled->tiledOps.empty()) {
             SmallVector<bool> scalableDims(2, false);
 #if LLVM_VERSION_MAJOR >= 21
-            auto vecResult = linalg::vectorize(rewriter,
-                                               nInnerTiled->tiledOps.front(),
-                                               {kVM, kVN},
-                                               scalableDims);
+            auto vecResult =
+                linalg::vectorize(rewriter, nInnerTiled->tiledOps.front(),
+                                  {kVM, kVN}, scalableDims);
             if (succeeded(vecResult)) {
               rewriter.replaceOp(nInnerTiled->tiledOps.front(),
                                  vecResult->replacements);
             }
 #else
-            (void)linalg::vectorize(rewriter,
-                                    nInnerTiled->tiledOps.front(),
-                                    {kVM, kVN},
-                                    scalableDims);
+            (void)linalg::vectorize(rewriter, nInnerTiled->tiledOps.front(),
+                                    {kVM, kVN}, scalableDims);
 #endif
           }
         } else {
@@ -285,8 +272,8 @@ std::unique_ptr<Pass> createTileAndVectorizePass() {
   return std::make_unique<TileAndVectorizePass>();
 }
 
-std::unique_ptr<Pass> createTileAndVectorizePass(
-    const TileAndVectorizeOptions &opts) {
+std::unique_ptr<Pass>
+createTileAndVectorizePass(const TileAndVectorizeOptions &opts) {
   return std::make_unique<TileAndVectorizePass>(opts);
 }
 

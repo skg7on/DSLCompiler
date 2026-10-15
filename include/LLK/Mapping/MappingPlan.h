@@ -1,5 +1,12 @@
-//===- MappingPlan.h - Mapping candidates, instances, connections, plans --===//
+//===- MappingPlan.h - Mapping candidates and plans -------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (issue #80, epic #67 D1).
 //
 // These are the transient structures the mapping search produces (design
@@ -18,8 +25,6 @@
 // Canonical ids are derived from content, with insertion-order-insensitive
 // fields (covered node sets, consumer sets, route sequences) sorted before
 // hashing, so two equivalently-built objects share an id.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_MAPPINGPLAN_H
 #define LLK_MAPPING_MAPPINGPLAN_H

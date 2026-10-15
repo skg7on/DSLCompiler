@@ -1,5 +1,12 @@
-//===- CostModel.h - Multi-dimensional mapping cost -----------------------===//
+//===- CostModel.h - Multi-dimensional mapping cost -------------*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (issue #80, epic #67 D1).
 //
 // Mapping cost is deliberately multi-dimensional. A candidate is never
@@ -10,8 +17,6 @@
 //
 // Dimension spellings match the `micro.objective` metric vocabulary so a
 // report, a constraint, and an objective all name the same thing.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_COSTMODEL_H
 #define LLK_MAPPING_COSTMODEL_H

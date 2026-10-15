@@ -1,5 +1,12 @@
-//===- LayoutConstraints.h - LLKMap layout declarations (D3) --------------===//
+//===- LayoutConstraints.h - LLKMap layout declarations (D3) ----*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the target-independent mapping core (epic #67, workstream D3).
 //
 // LLKMap is a small declarative language for target layout legality. A
@@ -14,8 +21,6 @@
 //
 // The grammar this parser accepts is documented in
 // `docs/design/llkmap-layout-grammar.md`.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_MAPPING_LAYOUTCONSTRAINTS_H
 #define LLK_MAPPING_LAYOUTCONSTRAINTS_H

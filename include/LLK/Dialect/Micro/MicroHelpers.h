@@ -1,10 +1,14 @@
-//===- MicroHelpers.h - Micro dialect shared helpers -------------*- C++
-//-*-===//
+//===- MicroHelpers.h - Micro dialect shared helpers ------------*- C++ -*-===//
 //
-// Small shared helpers for the Micro dialect, used by both the dialect
-// implementation (MicroDialect.cpp) and the op verifiers (MicroOps.cpp).
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Small shared helpers for the Micro dialect, used by both the dialect
+// implementation (MicroDialect.cpp) and the op verifiers (MicroOps.cpp).
 
 #ifndef LLK_DIALECT_MICRO_MICROHELPERS_H
 #define LLK_DIALECT_MICRO_MICROHELPERS_H

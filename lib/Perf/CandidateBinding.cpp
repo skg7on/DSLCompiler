@@ -1,5 +1,12 @@
 //===- CandidateBinding.cpp - Bind a candidate into a concrete kernel -----===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #50). See CandidateBinding.h.
 //
 // The binder is the tuning stage's counterpart to the LLKToMicro export: same
@@ -27,8 +34,6 @@
 // A role the space does not declare falls back to the export's default rather
 // than failing: binding a space that declines to search a dimension should use
 // the conservative value, not error out.
-//
-//===----------------------------------------------------------------------===//
 
 #include "LLK/Perf/CandidateBinding.h"
 #include "LLK/Conversion/MicroMapping/TileExtent.h"

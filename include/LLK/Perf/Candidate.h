@@ -1,5 +1,12 @@
-//===- Candidate.h - One search-space binding and its metrics -------------===//
+//===- Candidate.h - One search-space binding and its metrics ---*- C++ -*-===//
 //
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 // Part of the M12 tuning core (issue #49).
 //
 // A Candidate is one point in the search space: every declared parameter bound
@@ -13,8 +20,6 @@
 // same point gets the same name no matter how it was generated or in what
 // order it was visited. That is what makes ranking and schedule records
 // reproducible across runs.
-//
-//===----------------------------------------------------------------------===//
 
 #ifndef LLK_PERF_CANDIDATE_H
 #define LLK_PERF_CANDIDATE_H

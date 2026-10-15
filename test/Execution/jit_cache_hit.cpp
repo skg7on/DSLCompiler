@@ -1,8 +1,13 @@
-//===- jit_cache_hit.cpp - JIT cache hit/miss and eviction tests ---------===//
+//===- jit_cache_hit.cpp - JIT cache hit/miss and eviction tests ----------===//
 //
-// Tests for the 4-level JIT cache: KernelKey hashing, cache hit/miss/eviction.
+// Part of the LLK Compiler Project, under the Apache License v2.0 with
+// LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+
+// Tests for the 4-level JIT cache: KernelKey hashing, cache hit/miss/eviction.
 
 #include "LLK/Runtime/JitCache.h"
 #include "LLK/Runtime/KernelKey.h"
