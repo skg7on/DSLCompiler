@@ -73,35 +73,35 @@ SVL = 512 bits is chosen because it is a legal SME length (SME permits 128, 256 
 
 Both profiles model an ARMv9-A core with SVE2. The scheme is the schema's: a target invents its own labels and each declares the abstract class it refines.
 
-`machines/arm-sve-v2.yaml` — executors `cluster.0` (`cluster`, refines `group`) → `core.0` (`core`, refines `worker`) → `svp.0` (`svp`, refines `vector`). Memory chain `dram.0` → `l2.0` → `l1d.0` (`sram`) → `rf.0`, each with capacity, alignment, bandwidth, latency and banks; a `dma.0` transfer engine refining `transfer`; `links` carrying the cost of each hop. One compute node:
+`machines/arm-sve-v2.yaml` — executors `cluster.0` (`cluster`, refines `group`) → `worker.0` (`worker`, already the abstract spelling, so it refines nothing) → `sve_eng.0` (`sve_engine`, refines `vector`). Memory chain `dram.0` → `l2.0` → `sram.0` → `rf.0`, each with capacity, alignment, bandwidth, latency and banks; a `dma.0` transfer engine refining `transfer`; `links` carrying the cost of each hop. One compute node:
 
 ```yaml
 compute:
   - id: svp
     kind: vector_engine
     refines: [vector]
-    attached_to: core.0
+    attached_to: worker.0
     element_types: [f32, bf16, i8]
     supported_layouts: [row_major, vectorized]
     shapes: [[16], [32], [64]]
     lanes: {f32: 16, bf16: 32, i8: 64}
 ```
 
-`machines/arm-sme-v2.yaml` — the same profile plus a `za_unit.0` executor (`za_unit`, refines `matrix`, parent `core.0`), so an abstract owner of matrix kind resolves as it does in the AVX2 profile, and:
+`machines/arm-sme-v2.yaml` — the same profile plus a `za_eng.0` executor (`za_engine`, refines `matrix`, parent `worker.0`), so an abstract owner of matrix kind resolves as it does in the AVX2 profile, and:
 
 ```yaml
 memories:
   - id: za.0
     kind: acc
-    visible_from: core.0
+    visible_from: worker.0
     capacity_bytes: 4096      # SVL/8 x SVL/8 bytes = 64 x 64 at SVL=512
     alignment_bytes: 64
     banks: 4                  # ZA0..ZA3
 compute:
-  - id: za_engine
+  - id: za
     kind: matrix_engine
     refines: [matrix]
-    attached_to: core.0
+    attached_to: worker.0
     shapes: [[16, 16, 16]]
     element_types: [f32, bf16]
     accumulator_dtypes: [f32]
@@ -130,7 +130,7 @@ layout sve.blocked_2d(int M, int N, int VW) {
 
 The domain widens to `[4..16]` because the modeled machine has 16 f32 lanes; AVX2's `[4..8]` reflects its 8. This is the mechanism that lets a scalable-width ISA be modeled without a scalable-width type: the profile pins the length, the layout reads it back.
 
-`mapping/arm-sme/layouts.llkmap` repeats those two and adds a ZA-aware layout implementing `blocked` for a tile resident in `acc`.
+`mapping/arm-sme/layouts.llkmap` repeats those two and adds `sme.za_blocked_2d`, a ZA-resident tiling for the `acc` space, referenced by id from the matrix rule below. It deliberately carries no `implements` clause: that clause bridges a Micro layout *kind* to a target layout id and is rejected as ambiguous when two layouts claim one kind, so `sme.blocked_2d` remains the only layout implementing `blocked`.
 
 ## 7. Target Rules
 
@@ -165,6 +165,7 @@ rule sme.mma_f32 v1 {
   match micro.mma(input[0].element_type = f32);
   require executor kind worker;
   require compute kind matrix_engine;
+  require layout acc satisfies sme.za_blocked_2d;
   require memory output "result" kind acc;
   input "lhs";
   input "rhs";
