@@ -130,7 +130,7 @@ public:
   SourceAdapterRegistry(SourceAdapterRegistry &&) = default;
   SourceAdapterRegistry &operator=(SourceAdapterRegistry &&) = default;
 
-  /// Registers `adapter`. Fails when it is null or its key is already taken.
+  /// Registers `adapter`. Fails for null adapters, empty keys or duplicate keys.
   llvm::Error add(std::unique_ptr<SourceAdapter> adapter);
 
   /// Resolves `root` to the one adapter that accepts it. With an empty key: no
@@ -181,6 +181,8 @@ llvm::Error validateCandidateBindings(const perf::SearchSpace &space,
 /// declaration, and at `stage` every parameter the stage requires must appear
 /// exactly once in its owner's list -- and nowhere else. Diagnostics name the
 /// parameter, role or adapter that failed.
+/// Source axes cannot be deferred to mapping; layout/owner/path placement
+/// kinds cannot be claimed by source realization through a port-role override.
 llvm::Error validateBindingReceipt(const perf::SearchSpace &space,
                                    const perf::Candidate &candidate,
                                    llvm::ArrayRef<ParameterBinding> schema,

@@ -40,6 +40,10 @@ constexpr llvm::StringLiteral axisRolePrefix = "axis:";
 
 llvm::Error validateCandidateBindings(const perf::SearchSpace &space,
                                       const perf::Candidate &candidate) {
+  llvm::StringSet<> declared;
+  for (const perf::SearchParam &param : space.params)
+    if (!declared.insert(param.name).second)
+      return error("duplicate_parameter: " + param.name);
   for (const auto &entry : candidate.values)
     if (!space.findParam(entry.first))
       return error("unknown_binding: " + entry.first);
@@ -87,6 +91,19 @@ llvm::Error validateBindingReceipt(const perf::SearchSpace &space,
       return error("unknown_parameter: " + binding.parameter);
     if (binding.role.empty())
       return error("role_mismatch: " + binding.parameter);
+    if (binding.owner == BindingOwner::Source && binding.role == axisRolePrefix)
+      return error("role_mismatch: " + binding.parameter);
+    // An explicit port role refines a decision; it cannot move that decision
+    // to a stage that does not implement it. Source axes remain source-owned,
+    // and the existing placement/layout/path kinds remain mapping-owned.
+    const bool mappingKind = param->kind == "layout" ||
+                             param->kind == "owner_mapping" ||
+                             param->kind == "memory_path";
+    if ((binding.owner == BindingOwner::Source && mappingKind) ||
+        (binding.owner == BindingOwner::Mapping &&
+         (param->kind == "integer" ||
+          llvm::StringRef(binding.role).starts_with(axisRolePrefix))))
+      return error("owner_mismatch: " + binding.parameter);
     if (!param->role.empty()) {
       if (binding.role != param->role)
         return error("role_mismatch: " + binding.parameter);

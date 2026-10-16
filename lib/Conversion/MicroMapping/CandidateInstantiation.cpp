@@ -420,12 +420,25 @@ instantiateAdapterSource(ModuleOp source, const perf::SearchSpace &space,
   auto schema = (*adapter)->bindings(*root, space);
   if (!schema)
     return schema.takeError();
+  // Realization may replace the selected root or its entire source function.
+  // Capture identity while the selected operation is still alive.
+  const std::string symbol = enclosingSymbol(*instance.module, *root);
   auto realization =
       (*adapter)->realize(*instance.module, *root, contract, space, candidate);
   if (!realization)
     return realization.takeError();
   if (!realization->kernel)
     return error("source_adapter_produced_no_kernel: " + adapterKey);
+  if (realization->kernel->getParentOfType<ModuleOp>() != *instance.module)
+    return error("source adapter returned kernel outside source clone: " +
+                 adapterKey);
+  if (realization->kernel->getName().getStringRef() != "micro.kernel")
+    return error("source_adapter_produced_non_kernel: " + adapterKey);
+  if (llvm::Error invalid =
+          verifyConcreteContract(realization->kernel, contract))
+    return std::move(invalid);
+  if (failed(verify(*instance.module)))
+    return error("source adapter module verification failed: " + adapterKey);
   if (llvm::Error invalid = workload::validateBindingReceipt(
           space, candidate, *schema, realization->receipt,
           workload::ReceiptStage::Source))
@@ -439,7 +452,6 @@ instantiateAdapterSource(ModuleOp source, const perf::SearchSpace &space,
 
   const std::string semanticText = printOperation(source);
   const std::string canonical = workload::canonicalWorkloadContract(contract);
-  const std::string symbol = enclosingSymbol(*instance.module, *root);
   const std::string ordinal = std::to_string(options.sourceRootOrdinal);
   // Source identity is the original source content, the contract it implements,
   // and the exact adapter and root that produced this kernel.

@@ -73,6 +73,8 @@ llvm::Expected<Operation *> resolveFunction(ModuleOp module,
 llvm::Error SourceAdapterRegistry::add(std::unique_ptr<SourceAdapter> adapter) {
   if (!adapter)
     return error("null_source_adapter");
+  if (adapter->key().empty())
+    return error("empty_source_adapter_key");
   if (findByKey(adapter->key()))
     return error("duplicate_source_adapter: " + adapter->key());
   adapters.push_back(std::move(adapter));
@@ -147,10 +149,9 @@ selectSourceRoot(ModuleOp module, const SourceSelection &selection,
     if (!op.hasTrait<OpTrait::IsTerminator>())
       roots.push_back(&op);
 
-  const SourceAdapter *adapter = nullptr;
   SmallVector<Operation *, 4> accepted;
   if (!adapterKey.empty()) {
-    adapter = registry.findByKey(adapterKey);
+    const SourceAdapter *adapter = registry.findByKey(adapterKey);
     if (!adapter)
       return error("unknown_source_adapter: " + adapterKey);
     for (Operation *root : roots)
@@ -159,26 +160,21 @@ selectSourceRoot(ModuleOp module, const SourceSelection &selection,
     if (accepted.empty())
       return error("adapter_rejects_source: " + adapterKey);
   } else {
-    for (Operation *root : roots) {
-      llvm::SmallVector<const SourceAdapter *, 2> matching =
-          registry.matches(root);
-      if (matching.size() > 1)
-        return error("ambiguous_source_adapter: @" + symbol);
-      if (matching.empty())
-        continue;
-      if (adapter && adapter != matching.front())
-        return error("ambiguous_source_adapter: @" + symbol);
-      adapter = matching.front();
-      accepted.push_back(root);
-    }
-    if (!adapter)
+    for (Operation *root : roots)
+      if (!registry.matches(root).empty())
+        accepted.push_back(root);
+    if (accepted.empty())
       return error("unsupported_source_adapter: @" + symbol);
   }
 
   if (selection.rootOrdinal >= accepted.size())
     return error("source_root_ordinal " + Twine(selection.rootOrdinal) +
                  " is out of range for @" + symbol);
-  return accepted[selection.rootOrdinal];
+  Operation *selected = accepted[selection.rootOrdinal];
+  auto adapter = registry.resolve(selected, adapterKey);
+  if (!adapter)
+    return adapter.takeError();
+  return selected;
 }
 
 } // namespace mlir::llk::workload

@@ -237,10 +237,10 @@ void expectDiagnostic(llvm::Error error, llvm::StringRef expected) {
 
 /// A minimal, test-only adapter. It recognizes one operation name, describes a
 /// contract the test supplies, declares a schema the test supplies, and emits a
-/// parsed template kernel. `realized` names the source-owned parameters it
-/// actually realizes: a receipt entry appears only for those, which is what
-/// makes "an offered choice cannot disappear" observable rather than assumed.
-class TestAdapter final : public workload::SourceAdapter {
+/// parsed template kernel. Its test-only axis repeats identical elementwise
+/// work without changing the yielded result. A receipt follows each actual
+/// expansion; parameters outside `realized` deliberately remain unrealized.
+class TestAdapter : public workload::SourceAdapter {
 public:
   TestAdapter(std::string key, std::string acceptsOp,
               workload::WorkloadContract described,
@@ -268,7 +268,8 @@ public:
 
   llvm::Expected<workload::SourceRealization>
   realize(ModuleOp clone, Operation *, const workload::WorkloadContract &,
-          const perf::SearchSpace &, const perf::Candidate &) const override {
+          const perf::SearchSpace &,
+          const perf::Candidate &candidate) const override {
     mlir::OwningOpRef<ModuleOp> parsed =
         mlir::parseSourceString<ModuleOp>(emittedKernel, clone.getContext());
     if (!parsed)
@@ -288,8 +289,23 @@ public:
     for (const workload::ParameterBinding &binding : schema)
       if (binding.owner == workload::BindingOwner::Source &&
           std::find(realized.begin(), realized.end(), binding.parameter) !=
-              realized.end())
+              realized.end()) {
+        auto copies = candidate.integer(binding.parameter);
+        if (binding.role != "axis:d0" || !copies || *copies <= 0 ||
+            *copies > 16)
+          return llvm::make_error<llvm::StringError>(
+              "unsupported test repetition axis",
+              llvm::inconvertibleErrorCode());
+        Operation *work = nullptr;
+        kernel->walk([&](Operation *op) {
+          if (!work && op->getName().getStringRef() == "micro.vector")
+            work = op;
+        });
+        for (int64_t copy = 1; copy < *copies; ++copy)
+          work->getBlock()->getOperations().insert(work->getIterator(),
+                                                   work->clone());
         realization.receipt.source.push_back(binding.parameter);
+      }
     return realization;
   }
 
@@ -339,6 +355,165 @@ struct SplitOwnership {
 };
 
 } // namespace
+
+TEST(SourceAdapterRegistry, EmptyKeysCannotBeRegistered) {
+  workload::SourceAdapterRegistry registry;
+  expectDiagnostic(registry.add(acceptingElementwise("")),
+                   "empty_source_adapter_key");
+  EXPECT_TRUE(registry.empty());
+}
+
+TEST(BindingSchema, DuplicateParameterDeclarationsCannotShareOneBinding) {
+  auto space = spaceWith(
+      {integerParam("T0", "axis:d0", {4}), integerParam("T0", "axis:d0", {4})});
+  expectDiagnostic(workload::validateCandidateBindings(
+                       space, candidateWith({{"T0", 4}}, {})),
+                   "duplicate_parameter: T0");
+}
+
+TEST(BindingSchema, SourceAxisRoleRequiresAnAxisName) {
+  auto space = spaceWith({integerParam("choice", "axis:", {4})});
+  workload::BindingReceipt receipt;
+  receipt.source = {"choice"};
+  expectDiagnostic(workload::validateBindingReceipt(
+                       space, candidateWith({{"choice", 4}}, {}),
+                       {sourceBinding("choice", "axis:")}, receipt),
+                   "role_mismatch: choice");
+}
+
+TEST(BindingSchema, ExplicitRolesCannotChangeDecisionOwnership) {
+  auto sourceAxis = spaceWith({integerParam("T0", "axis:d0", {4})});
+  workload::BindingReceipt receipt;
+  receipt.mapping = {"T0"};
+  expectDiagnostic(workload::validateBindingReceipt(
+                       sourceAxis, candidateWith({{"T0", 4}}, {}),
+                       {mappingBinding("T0", "axis:d0")}, receipt),
+                   "owner_mismatch: T0");
+  auto layout =
+      spaceWith({symbolicParam("L0", "layout", "operand0", "row_major")});
+  receipt.mapping.clear();
+  receipt.source = {"L0"};
+  expectDiagnostic(workload::validateBindingReceipt(
+                       layout, candidateWith({}, {{"L0", "row_major"}}),
+                       {sourceBinding("L0", "operand0")}, receipt,
+                       workload::ReceiptStage::Source),
+                   "owner_mismatch: L0");
+}
+
+namespace {
+enum class AdapterBehavior {
+  ForeignKernel,
+  BadSignature,
+  BadNumerics,
+  InvalidIR,
+  EraseSourceFunction
+};
+
+class BoundaryAdapter final : public TestAdapter {
+public:
+  explicit BoundaryAdapter(AdapterBehavior behavior,
+                           Operation *foreign = nullptr)
+      : TestAdapter("boundary", "linalg.generic", addContract(), {}, {}),
+        behavior(behavior), foreign(foreign) {}
+
+  llvm::Expected<workload::SourceRealization>
+  realize(ModuleOp clone, Operation *selected,
+          const workload::WorkloadContract &contract,
+          const perf::SearchSpace &space,
+          const perf::Candidate &candidate) const override {
+    auto result =
+        TestAdapter::realize(clone, selected, contract, space, candidate);
+    if (!result)
+      return result.takeError();
+    switch (behavior) {
+    case AdapterBehavior::ForeignKernel:
+      result->kernel = foreign;
+      break;
+    case AdapterBehavior::BadSignature: {
+      auto type = cast<FunctionType>(
+          result->kernel->getAttrOfType<TypeAttr>("function_type").getValue());
+      SmallVector<Type> inputs(type.getInputs());
+      inputs[0] =
+          RankedTensorType::get({8, 8}, Float16Type::get(clone.getContext()));
+      result->kernel->setAttr(
+          "function_type", TypeAttr::get(FunctionType::get(
+                               clone.getContext(), inputs, type.getResults())));
+      break;
+    }
+    case AdapterBehavior::BadNumerics:
+      result->kernel->setAttr(
+          "micro.numerical_contract",
+          StringAttr::get(clone.getContext(), "approximate-f32"));
+      break;
+    case AdapterBehavior::InvalidIR:
+      result->kernel->walk([](Operation *op) {
+        if (op->getName().getStringRef() == "micro.vector")
+          op->removeAttr("op");
+      });
+      break;
+    case AdapterBehavior::EraseSourceFunction:
+      selected->getParentOp()->erase();
+      break;
+    }
+    return std::move(*result);
+  }
+
+private:
+  AdapterBehavior behavior;
+  Operation *foreign;
+};
+} // namespace
+
+TEST_F(FrameworkTest, AdapterOutputMustBelongToPrivateCloneAndMatchContract) {
+  auto foreign = parse(emittedKernel);
+  ASSERT_TRUE(foreign);
+  auto *foreignKernel = SymbolTable::lookupSymbolIn(*foreign, "emitted");
+  for (const auto &[behavior, reason] :
+       {std::pair{AdapterBehavior::ForeignKernel, "outside source clone"},
+        std::pair{AdapterBehavior::BadSignature, "dtype"},
+        std::pair{AdapterBehavior::BadNumerics, "numerical"},
+        std::pair{AdapterBehavior::InvalidIR, "verification"}}) {
+    SCOPED_TRACE(reason);
+    auto source = parse(elementwiseSource);
+    ASSERT_TRUE(source);
+    auto before = print(source->getOperation());
+    auto foreignBefore = print(foreign->getOperation());
+    workload::SourceAdapterRegistry registry;
+    ASSERT_FALSE(registry.add(
+        std::make_unique<BoundaryAdapter>(behavior, foreignKernel)));
+    tuning::CandidateInstantiationOptions options;
+    options.sourceSymbol = "elementwise";
+    auto result = tuning::instantiateCandidate(
+        *source, spaceWith({}), candidateWith({}, {}), addContract(), options,
+        registry);
+    EXPECT_FALSE(bool(result));
+    if (result)
+      continue;
+    EXPECT_NE(llvm::toString(result.takeError()).find(reason),
+              std::string::npos);
+    EXPECT_EQ(print(source->getOperation()), before);
+    EXPECT_EQ(print(foreign->getOperation()), foreignBefore);
+  }
+}
+
+TEST_F(FrameworkTest, AdapterMayReplaceSelectedFunctionWithoutLosingIdentity) {
+  auto source = parse(elementwiseSource);
+  ASSERT_TRUE(source);
+  auto before = print(source->getOperation());
+  workload::SourceAdapterRegistry registry;
+  ASSERT_FALSE(registry.add(
+      std::make_unique<BoundaryAdapter>(AdapterBehavior::EraseSourceFunction)));
+  tuning::CandidateInstantiationOptions options;
+  options.sourceSymbol = "elementwise";
+  auto result = tuning::instantiateCandidate(*source, spaceWith({}),
+                                             candidateWith({}, {}),
+                                             addContract(), options, registry);
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  EXPECT_EQ(
+      result->kernel->getAttrOfType<StringAttr>("source_symbol").getValue(),
+      "elementwise");
+  EXPECT_EQ(print(source->getOperation()), before);
+}
 
 //===----------------------------------------------------------------------===//
 // BindingSchema
@@ -740,6 +915,56 @@ TEST(SourceSelection, UnrelatedFunctionsDoNotContributeOrdinals) {
       "source function");
 }
 
+namespace {
+class ScalarBodyAdapter final : public TestAdapter {
+public:
+  explicit ScalarBodyAdapter(std::string scalar)
+      : TestAdapter(scalar, "linalg.generic", addContract(), {}, {}),
+        scalar(std::move(scalar)) {}
+  bool accepts(Operation *root) const override {
+    if (!TestAdapter::accepts(root))
+      return false;
+    bool found = false;
+    root->walk([&](Operation *op) {
+      found |= op->getName().getStringRef() == scalar;
+    });
+    return found;
+  }
+
+private:
+  std::string scalar;
+};
+} // namespace
+
+TEST(SourceSelection, DistinctFamiliesResolveAtTheSelectedRoot) {
+  auto source = parseIn(twoRootSource);
+  ASSERT_TRUE(source);
+  workload::SourceAdapterRegistry registry;
+  ASSERT_FALSE(registry.add(std::make_unique<ScalarBodyAdapter>("arith.addf")));
+  ASSERT_FALSE(registry.add(std::make_unique<ScalarBodyAdapter>("arith.mulf")));
+  for (uint64_t ordinal : {0u, 1u}) {
+    auto root =
+        workload::selectSourceRoot(*source, {"pair", ordinal}, registry);
+    ASSERT_TRUE(bool(root)) << llvm::toString(root.takeError());
+    auto adapter = registry.resolve(*root);
+    ASSERT_TRUE(bool(adapter)) << llvm::toString(adapter.takeError());
+    EXPECT_EQ((*adapter)->key(), ordinal == 0 ? "arith.addf" : "arith.mulf");
+  }
+}
+
+TEST(SourceSelection, UnselectedAmbiguityDoesNotMaskExactRoot) {
+  auto source = parseIn(twoRootSource);
+  ASSERT_TRUE(source);
+  workload::SourceAdapterRegistry registry;
+  ASSERT_FALSE(registry.add(acceptingElementwise("all")));
+  ASSERT_FALSE(registry.add(std::make_unique<ScalarBodyAdapter>("arith.mulf")));
+  auto first = workload::selectSourceRoot(*source, {"pair", 0}, registry);
+  ASSERT_TRUE(bool(first)) << llvm::toString(first.takeError());
+  expectDiagnostic(
+      workload::selectSourceRoot(*source, {"pair", 1}, registry).takeError(),
+      "ambiguous_source_adapter");
+}
+
 //===----------------------------------------------------------------------===//
 // Adapter dispatch through candidate instantiation
 //===----------------------------------------------------------------------===//
@@ -764,7 +989,7 @@ TEST_F(FrameworkTest, AdapterRealizesOfferedSourceBindings) {
   EXPECT_TRUE(instance->receipt.mapping.empty());
   EXPECT_EQ(print(source->getOperation()), before);
   EXPECT_NE(instance->sourceGraphHash, 0u);
-  ASSERT_EQ(instance->workloadGraph.getNodes().size(), 1u);
+  ASSERT_EQ(instance->workloadGraph.getNodes().size(), 4u);
   EXPECT_EQ(instance->workloadGraph.getNodes()[0].opName, "micro.vector");
   EXPECT_EQ(
       instance->kernel->getAttrOfType<StringAttr>("source_adapter").getValue(),
@@ -884,4 +1109,23 @@ TEST_F(FrameworkTest, DefaultAdaptersRejectASemanticSource) {
   ASSERT_FALSE(bool(synthetic));
   EXPECT_NE(llvm::toString(synthetic.takeError()).find("synthetic"),
             std::string::npos);
+}
+
+TEST_F(FrameworkTest, SourceRoleBindingChangesActualEmittedWork) {
+  auto source = parse(elementwiseSource);
+  ASSERT_TRUE(source);
+  auto space = spaceWith({integerParam("unroll", "axis:d0", {2, 4})});
+  workload::SourceAdapterRegistry registry;
+  ASSERT_FALSE(registry.add(acceptingElementwise(
+      "repeat-axis", {sourceBinding("unroll", "axis:d0")}, {"unroll"})));
+  tuning::CandidateInstantiationOptions options;
+  options.sourceSymbol = "elementwise";
+  for (int64_t copies : {2, 4}) {
+    auto result = tuning::instantiateCandidate(
+        *source, space, candidateWith({{"unroll", copies}}, {}), addContract(),
+        options, registry);
+    ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+    EXPECT_EQ(result->workloadGraph.getNodes().size(), copies);
+    EXPECT_EQ(result->receipt.source, std::vector<std::string>{"unroll"});
+  }
 }

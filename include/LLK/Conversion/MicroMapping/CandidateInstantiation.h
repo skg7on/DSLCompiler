@@ -84,6 +84,9 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
 /// `contract`, every source-owned parameter must be realized by the returned
 /// receipt, and mapping-owned parameters must still be pending -- the receipt
 /// is source-stage evidence, not a claim about work that has not happened.
+/// The emitted kernel must belong to the private clone, match the concrete
+/// tensor/numerical contract and pass IR verification. An adapter may erase
+/// the original root/function while replacing it; identity is retained first.
 ///
 /// The overload without a registry constructs makeDefaultSourceAdapters().
 llvm::Expected<CandidateInstance>
