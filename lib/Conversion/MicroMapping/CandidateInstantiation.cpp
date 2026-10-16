@@ -22,6 +22,7 @@
 
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Verifier.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -214,7 +215,177 @@ std::string printOperation(Operation *op) {
   return text;
 }
 
+llvm::Expected<Operation *>
+selectConcreteKernel(ModuleOp module, const CandidateInstantiationOptions &o) {
+  if (o.sourceRootOrdinal != 0)
+    return error("ConcreteMicro source root ordinal must be zero");
+  SmallVector<Operation *> kernels;
+  for (Operation &op : module.getBody()->getOperations()) {
+    if (op.getName().getStringRef() != "micro.kernel")
+      continue;
+    auto symbol =
+        op.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    if (o.sourceSymbol.empty() ||
+        (symbol && symbol.getValue() == o.sourceSymbol))
+      kernels.push_back(&op);
+  }
+  if (kernels.empty())
+    return error("unknown ConcreteMicro kernel symbol '" + o.sourceSymbol +
+                 "'");
+  if (kernels.size() != 1)
+    return error("ambiguous ConcreteMicro kernel symbol '" + o.sourceSymbol +
+                 "'");
+  return kernels.front();
+}
+
+llvm::Error verifyConcreteContract(Operation *kernel,
+                                   const workload::WorkloadContract &contract) {
+  auto typeAttr = kernel->getAttrOfType<TypeAttr>("function_type");
+  auto type =
+      typeAttr ? dyn_cast<FunctionType>(typeAttr.getValue()) : FunctionType{};
+  if (!type)
+    return error(
+        "ConcreteMicro kernel requires function_type for port validation");
+  if (contract.ports.size() != type.getNumInputs() + type.getNumResults())
+    return error(
+        "workload_contract: port count does not match kernel signature");
+  for (size_t i = 0; i < contract.ports.size(); ++i) {
+    const auto &port = contract.ports[i];
+    bool input = i < type.getNumInputs();
+    auto direction = input ? workload::PortDirection::Input
+                           : workload::PortDirection::Output;
+    auto effect =
+        input ? workload::PortEffect::Read : workload::PortEffect::Write;
+    if (port.direction != direction || port.effect != effect)
+      return error("workload_contract: port '" + port.name +
+                   "' direction/effect does not match tensor signature");
+    Type signatureType =
+        input ? type.getInput(i) : type.getResult(i - type.getNumInputs());
+    auto tensor = dyn_cast<RankedTensorType>(signatureType);
+    if (!tensor || !tensor.hasStaticShape() ||
+        tensor.getShape() != ArrayRef<int64_t>(port.shape))
+      return error("workload_contract: port '" + port.name +
+                   "' shape does not match static tensor signature");
+    std::string dtype;
+    llvm::raw_string_ostream out(dtype);
+    tensor.getElementType().print(out);
+    if (dtype != port.elementType)
+      return error("workload_contract: port '" + port.name +
+                   "' dtype does not match kernel signature");
+  }
+  Attribute numericalAttr = kernel->getAttr("micro.numerical_contract");
+  auto numerical = dyn_cast_or_null<StringAttr>(numericalAttr);
+  if ((!contract.numericalContract.empty() || numericalAttr) &&
+      (!numerical || numerical.getValue() != contract.numericalContract))
+    return error(
+        "workload_contract: numerical metadata is missing or mismatched");
+
+  // Requirements describe actual operations, never the diagnostic workload
+  // label. Include logical and structural ops when explicitly requested too.
+  llvm::StringSet<> primitives;
+  kernel->walk([&](Operation *op) {
+    if (op != kernel)
+      primitives.insert(op->getName().getStringRef());
+  });
+  for (const std::string &primitive : contract.requiredPrimitives)
+    if (!primitives.contains(primitive))
+      return error("workload_contract: required primitive '" + primitive +
+                   "' is absent from selected kernel");
+  if (Attribute retained = kernel->getAttr("micro.workload_contract")) {
+    auto decoded =
+        workload::decodeWorkloadContract(dyn_cast<DictionaryAttr>(retained));
+    if (!decoded)
+      return decoded.takeError();
+    if (workload::canonicalWorkloadContract(*decoded) !=
+        workload::canonicalWorkloadContract(contract))
+      return error(
+          "workload_contract: retained source contract does not match");
+  }
+  return llvm::Error::success();
+}
+
 } // namespace
+
+llvm::Expected<CandidateInstance>
+instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
+                     const perf::Candidate &candidate,
+                     const workload::WorkloadContract &contract,
+                     const CandidateInstantiationOptions &options) {
+  if (!source)
+    return error("candidate instantiation requires a source module");
+  if (options.sourceMode != SourceMode::ConcreteMicro)
+    return error(
+        "workload contract instantiation currently requires ConcreteMicro");
+  if (llvm::Error invalid = workload::validateWorkloadContract(contract))
+    return std::move(invalid);
+  if (llvm::Error invalid = validateCandidate(space, candidate))
+    return std::move(invalid);
+  if (!space.params.empty())
+    return error("axis_not_realized: " + space.params.front().name);
+
+  CandidateInstance instance;
+  instance.module = OwningOpRef<ModuleOp>(cast<ModuleOp>(source->clone()));
+  auto selected = selectConcreteKernel(*instance.module, options);
+  if (!selected)
+    return selected.takeError();
+  instance.kernel = *selected;
+  if (llvm::Error invalid = verifyConcreteContract(instance.kernel, contract))
+    return std::move(invalid);
+  SmallVector<Operation *> searchSpaces;
+  instance.module->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.search_space")
+      searchSpaces.push_back(op);
+  });
+  for (Operation *op : searchSpaces)
+    op->erase();
+  if (failed(verify(*instance.module)))
+    return error("ConcreteMicro source module verification failed");
+
+  instance.sourceMode = options.sourceMode;
+  instance.workloadContract = contract;
+  instance.bindingFacts = mapping::extractBindingFacts(instance.kernel);
+  instance.bindingHash =
+      mapping::makeSearchBinding(candidate.id, {}).stableHash;
+  const std::string semanticText = printOperation(source);
+  const std::string canonical = workload::canonicalWorkloadContract(contract);
+  StringRef symbol = SymbolTable::getSymbolName(instance.kernel).getValue();
+  // Keep each full component in provenance; the length-delimited hash input
+  // includes the exact selection even when two roots share a signature/body.
+  std::string identity = "concrete-micro-v1:";
+  for (StringRef field :
+       {StringRef(semanticText), StringRef(canonical), symbol}) {
+    identity += std::to_string(field.size()) + ":";
+    identity.append(field.data(), field.size());
+  }
+  instance.sourceGraphHash = mapping::stableHash(identity);
+  auto *ctx = source.getContext();
+  auto i64 = IntegerType::get(ctx, 64);
+  instance.kernel->setAttr("micro.workload_contract",
+                           workload::encodeWorkloadContract(ctx, contract));
+  instance.kernel->setAttr("source_symbol", StringAttr::get(ctx, symbol));
+  instance.kernel->setAttr("source_semantics",
+                           StringAttr::get(ctx, semanticText));
+  instance.kernel->setAttr(
+      "source_graph_hash",
+      IntegerAttr::get(i64, llvm::APInt(64, instance.sourceGraphHash)));
+  instance.kernel->setAttr("candidate", StringAttr::get(ctx, candidate.id));
+  instance.kernel->setAttr(
+      "candidate_hash",
+      IntegerAttr::get(i64, llvm::APInt(64, instance.bindingHash)));
+  auto graph = mapping::extractWorkloadGraph(instance.kernel);
+  if (!graph)
+    return graph.takeError();
+  // Derive execution/movement requirements from the existing graph, rather
+  // than maintaining a second operation classifier at the source boundary.
+  for (const mapping::WorkloadNode &node : graph->getNodes())
+    if (std::find(contract.requiredPrimitives.begin(),
+                  contract.requiredPrimitives.end(),
+                  node.opName) == contract.requiredPrimitives.end())
+      return error("workload_contract: required primitives omit actual '" +
+                   node.opName + "'");
+  instance.workloadGraph = std::move(*graph);
+  return instance;
+}
 
 llvm::Expected<CandidateInstance>
 instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
