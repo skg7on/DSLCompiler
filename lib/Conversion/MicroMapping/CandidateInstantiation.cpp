@@ -109,30 +109,40 @@ llvm::Expected<Operation *> selectRoot(ModuleOp module,
   return root;
 }
 
-llvm::Error validateCandidate(const perf::SearchSpace &space,
-                              const perf::Candidate &candidate) {
-  if (candidate.values.size() + candidate.symbolicValues.size() !=
-      space.params.size())
-    return error("candidate binding is incomplete or contains undeclared axes");
-  for (const perf::SearchParam &param : space.params) {
-    bool hasInteger = candidate.values.count(param.name) != 0;
-    bool hasSymbol = candidate.symbolicValues.count(param.name) != 0;
-    if (hasInteger == hasSymbol)
-      return error("candidate must bind parameter '" + param.name +
-                   "' exactly once");
-    for (const perf::SearchChoice &choice : param.choices) {
-      if (hasInteger && choice.isInteger() &&
-          choice.integer() == candidate.values.at(param.name))
-        goto in_domain;
-      if (hasSymbol && choice.isSymbolic() &&
-          choice.symbol() == candidate.symbolicValues.at(param.name))
-        goto in_domain;
-    }
-    return error("candidate value for '" + param.name +
-                 "' is not one of the declared choices");
-  in_domain:;
-  }
-  return llvm::Error::success();
+/// Drops the tuning directives from a private clone. A `micro.search_space` is
+/// input metadata for this instantiation, not part of the executable candidate,
+/// so the compiler never sees an unlowered directive when materializing or
+/// replaying the selected kernel. The caller's module keeps them.
+void eraseSearchSpaces(ModuleOp module) {
+  SmallVector<Operation *> searchSpaces;
+  module.walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "micro.search_space")
+      searchSpaces.push_back(op);
+  });
+  for (Operation *op : searchSpaces)
+    op->erase();
+}
+
+/// The stable hash of every binding the candidate carries. A parameterized
+/// source realizes its bindings in IR, so they belong in the identity rather
+/// than being recoverable only from the candidate id.
+uint64_t candidateBindingHash(const perf::Candidate &candidate) {
+  llvm::StringMap<mapping::SearchValue> values;
+  for (const auto &entry : candidate.values)
+    values[entry.first] = entry.second;
+  for (const auto &entry : candidate.symbolicValues)
+    values[entry.first] = entry.second;
+  return mapping::makeSearchBinding(candidate.id, std::move(values)).stableHash;
+}
+
+/// The symbol of the module-level operation that contains `nested`. Source
+/// identity names the function a root belongs to, never the emitted kernel.
+std::string enclosingSymbol(ModuleOp module, Operation *nested) {
+  Operation *owner = nested;
+  while (owner->getParentOp() && owner->getParentOp() != module.getOperation())
+    owner = owner->getParentOp();
+  StringAttr symbol = SymbolTable::getSymbolName(owner);
+  return symbol ? symbol.getValue().str() : std::string();
 }
 
 llvm::Expected<ScheduleEntry> toSchedule(const perf::SearchSpace &space,
@@ -304,22 +314,14 @@ llvm::Error verifyConcreteContract(Operation *kernel,
   return llvm::Error::success();
 }
 
-} // namespace
-
+/// The direct MicroIR path: an exact, parameter-free concrete kernel. Source
+/// parameter realization belongs to an adapter, so an offered parameter here is
+/// an unrealized axis rather than something to guess at.
 llvm::Expected<CandidateInstance>
-instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
-                     const perf::Candidate &candidate,
-                     const workload::WorkloadContract &contract,
-                     const CandidateInstantiationOptions &options) {
-  if (!source)
-    return error("candidate instantiation requires a source module");
-  if (options.sourceMode != SourceMode::ConcreteMicro)
-    return error(
-        "workload contract instantiation currently requires ConcreteMicro");
-  if (llvm::Error invalid = workload::validateWorkloadContract(contract))
-    return std::move(invalid);
-  if (llvm::Error invalid = validateCandidate(space, candidate))
-    return std::move(invalid);
+instantiateConcreteMicro(ModuleOp source, const perf::SearchSpace &space,
+                         const perf::Candidate &candidate,
+                         const workload::WorkloadContract &contract,
+                         const CandidateInstantiationOptions &options) {
   if (!space.params.empty())
     return error("axis_not_realized: " + space.params.front().name);
 
@@ -331,13 +333,7 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
   instance.kernel = *selected;
   if (llvm::Error invalid = verifyConcreteContract(instance.kernel, contract))
     return std::move(invalid);
-  SmallVector<Operation *> searchSpaces;
-  instance.module->walk([&](Operation *op) {
-    if (op->getName().getStringRef() == "micro.search_space")
-      searchSpaces.push_back(op);
-  });
-  for (Operation *op : searchSpaces)
-    op->erase();
+  eraseSearchSpaces(*instance.module);
   if (failed(verify(*instance.module)))
     return error("ConcreteMicro source module verification failed");
 
@@ -387,6 +383,154 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
   return instance;
 }
 
+/// The adapter path: the semantic source is dispatched to the one adapter that
+/// accepts the selected root, which declares the parameter ownership and
+/// realizes it. The receipt it returns is checked at the source stage, so a
+/// mapping-owned choice is still pending here rather than assumed.
+llvm::Expected<CandidateInstance>
+instantiateAdapterSource(ModuleOp source, const perf::SearchSpace &space,
+                         const perf::Candidate &candidate,
+                         const workload::WorkloadContract &contract,
+                         const CandidateInstantiationOptions &options,
+                         const workload::SourceAdapterRegistry &registry) {
+  CandidateInstance instance;
+  instance.module = OwningOpRef<ModuleOp>(cast<ModuleOp>(source->clone()));
+  eraseSearchSpaces(*instance.module);
+  const workload::SourceSelection selection{options.sourceSymbol,
+                                            options.sourceRootOrdinal};
+  auto root = workload::selectSourceRoot(*instance.module, selection, registry,
+                                         options.adapterKey);
+  if (!root)
+    return root.takeError();
+  auto adapter = registry.resolve(*root, options.adapterKey);
+  if (!adapter)
+    return adapter.takeError();
+  const std::string adapterKey = (*adapter)->key().str();
+
+  // The adapter describes what the root actually implements. Comparing that
+  // against the supplied contract is what stops a label from standing in for
+  // semantics: the two must agree in full, not merely by name.
+  auto described = (*adapter)->describe(*root);
+  if (!described)
+    return described.takeError();
+  if (workload::canonicalWorkloadContract(*described) !=
+      workload::canonicalWorkloadContract(contract))
+    return error("source_contract_mismatch: adapter '" + adapterKey +
+                 "' describes a different contract");
+  auto schema = (*adapter)->bindings(*root, space);
+  if (!schema)
+    return schema.takeError();
+  // Realization may replace the selected root or its entire source function.
+  // Capture identity while the selected operation is still alive.
+  const std::string symbol = enclosingSymbol(*instance.module, *root);
+  auto realization =
+      (*adapter)->realize(*instance.module, *root, contract, space, candidate);
+  if (!realization)
+    return realization.takeError();
+  if (!realization->kernel)
+    return error("source_adapter_produced_no_kernel: " + adapterKey);
+  if (realization->kernel->getParentOfType<ModuleOp>() != *instance.module)
+    return error("source adapter returned kernel outside source clone: " +
+                 adapterKey);
+  if (realization->kernel->getName().getStringRef() != "micro.kernel")
+    return error("source_adapter_produced_non_kernel: " + adapterKey);
+  if (llvm::Error invalid =
+          verifyConcreteContract(realization->kernel, contract))
+    return std::move(invalid);
+  if (failed(verify(*instance.module)))
+    return error("source adapter module verification failed: " + adapterKey);
+  if (llvm::Error invalid = workload::validateBindingReceipt(
+          space, candidate, *schema, realization->receipt,
+          workload::ReceiptStage::Source))
+    return std::move(invalid);
+  instance.kernel = realization->kernel;
+  instance.sourceMode = options.sourceMode;
+  instance.workloadContract = contract;
+  instance.receipt = realization->receipt;
+  instance.bindingFacts = mapping::extractBindingFacts(instance.kernel);
+  instance.bindingHash = candidateBindingHash(candidate);
+
+  const std::string semanticText = printOperation(source);
+  const std::string canonical = workload::canonicalWorkloadContract(contract);
+  const std::string ordinal = std::to_string(options.sourceRootOrdinal);
+  // Source identity is the original source content, the contract it implements,
+  // and the exact adapter and root that produced this kernel.
+  std::string identity = "source-adapter-v1:";
+  for (StringRef field :
+       {StringRef(semanticText), StringRef(canonical), StringRef(adapterKey),
+        StringRef(symbol), StringRef(ordinal)}) {
+    identity += std::to_string(field.size()) + ":";
+    identity.append(field.data(), field.size());
+  }
+  instance.sourceGraphHash = mapping::stableHash(identity);
+  auto graph = mapping::extractWorkloadGraph(instance.kernel);
+  if (!graph)
+    return graph.takeError();
+  for (const mapping::WorkloadNode &node : graph->getNodes())
+    if (std::find(contract.requiredPrimitives.begin(),
+                  contract.requiredPrimitives.end(),
+                  node.opName) == contract.requiredPrimitives.end())
+      return error("workload_contract: required primitives omit actual '" +
+                   node.opName + "'");
+  instance.workloadGraph = std::move(*graph);
+
+  auto *ctx = source.getContext();
+  auto i64 = IntegerType::get(ctx, 64);
+  instance.kernel->setAttr("micro.workload_contract",
+                           workload::encodeWorkloadContract(ctx, contract));
+  instance.kernel->setAttr("source_adapter", StringAttr::get(ctx, adapterKey));
+  instance.kernel->setAttr("source_symbol", StringAttr::get(ctx, symbol));
+  instance.kernel->setAttr("source_root_ordinal",
+                           IntegerAttr::get(i64, options.sourceRootOrdinal));
+  instance.kernel->setAttr("source_semantics",
+                           StringAttr::get(ctx, semanticText));
+  instance.kernel->setAttr(
+      "source_graph_hash",
+      IntegerAttr::get(i64, llvm::APInt(64, instance.sourceGraphHash)));
+  instance.kernel->setAttr("candidate", StringAttr::get(ctx, candidate.id));
+  instance.kernel->setAttr(
+      "candidate_hash",
+      IntegerAttr::get(i64, llvm::APInt(64, instance.bindingHash)));
+  return instance;
+}
+
+} // namespace
+
+llvm::Expected<CandidateInstance>
+instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
+                     const perf::Candidate &candidate,
+                     const workload::WorkloadContract &contract,
+                     const CandidateInstantiationOptions &options,
+                     const workload::SourceAdapterRegistry &registry) {
+  if (!source)
+    return error("candidate instantiation requires a source module");
+  if (options.sourceMode == SourceMode::Synthetic)
+    return error("the workload contract path does not realize the synthetic "
+                 "binder; synthetic mode is explicitly requested legacy "
+                 "behavior");
+  if (llvm::Error invalid = workload::validateWorkloadContract(contract))
+    return std::move(invalid);
+  if (llvm::Error invalid =
+          workload::validateCandidateBindings(space, candidate))
+    return std::move(invalid);
+  if (options.sourceMode == SourceMode::ConcreteMicro)
+    return instantiateConcreteMicro(source, space, candidate, contract,
+                                    options);
+  return instantiateAdapterSource(source, space, candidate, contract, options,
+                                  registry);
+}
+
+llvm::Expected<CandidateInstance>
+instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
+                     const perf::Candidate &candidate,
+                     const workload::WorkloadContract &contract,
+                     const CandidateInstantiationOptions &options) {
+  workload::SourceAdapterRegistry registry =
+      workload::makeDefaultSourceAdapters();
+  return instantiateCandidate(source, space, candidate, contract, options,
+                              registry);
+}
+
 llvm::Expected<CandidateInstance>
 instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
                      const perf::Candidate &candidate,
@@ -394,7 +538,8 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
                      const CandidateInstantiationOptions &options) {
   if (!source)
     return error("candidate instantiation requires a source module");
-  if (llvm::Error invalid = validateCandidate(space, candidate))
+  if (llvm::Error invalid =
+          workload::validateCandidateBindings(space, candidate))
     return std::move(invalid);
 
   CandidateInstance instance;
@@ -411,16 +556,7 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
   for (Operation *op : searchSpaces)
     op->erase();
   instance.sourceMode = options.sourceMode;
-  mapping::SearchBinding binding =
-      mapping::makeSearchBinding(candidate.id, [&] {
-        llvm::StringMap<mapping::SearchValue> values;
-        for (const auto &entry : candidate.values)
-          values[entry.first] = entry.second;
-        for (const auto &entry : candidate.symbolicValues)
-          values[entry.first] = entry.second;
-        return values;
-      }());
-  instance.bindingHash = binding.stableHash;
+  instance.bindingHash = candidateBindingHash(candidate);
 
   if (options.sourceMode == SourceMode::Synthetic) {
     auto bound = perf::bindCandidateToMicroKernel(*instance.module, space,

@@ -11,7 +11,7 @@ add_llk_library(LLKMicroMapping
     CandidateInstantiation.cpp
     PlanMaterialization.cpp
     CompletePlanEvaluation.cpp
-    LINK_LIBRARIES LLKMapping LLKTargetMapping LLKMachine LLKPerf LLKToMicro LLKWorkloadContracts LLK::MLIR
+    LINK_LIBRARIES LLKMapping LLKTargetMapping LLKMachine LLKPerf LLKToMicro LLKWorkloadContracts LLKSourceCandidates LLK::MLIR
 )
 
 add_llk_library(LLKMappedCompilation

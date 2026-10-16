@@ -1,7 +1,8 @@
 # The framework source tests must run without an E2E/JIT guard.
-add_executable(FrameworkSourceTest workload_contract.cpp generic_source_candidates.cpp)
+add_executable(FrameworkSourceTest workload_contract.cpp
+    generic_source_candidates.cpp source_adapter_registry.cpp)
 target_link_libraries(FrameworkSourceTest PRIVATE LLKWorkloadContracts
-    LLKMicroMapping LLKDialect MicroDialect
+    LLKSourceCandidates LLKMicroMapping LLKDialect MicroDialect
     GTest::gtest_main LLK::MLIR)
 add_test(NAME FrameworkSourceTest COMMAND FrameworkSourceTest)
 

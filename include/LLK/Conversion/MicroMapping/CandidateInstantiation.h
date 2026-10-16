@@ -10,6 +10,7 @@
 #ifndef LLK_CONVERSION_MICROMAPPING_CANDIDATEINSTANTIATION_H
 #define LLK_CONVERSION_MICROMAPPING_CANDIDATEINSTANTIATION_H
 
+#include "LLK/Conversion/Workload/SourceAdapter.h"
 #include "LLK/Conversion/Workload/WorkloadContract.h"
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/WorkloadGraph.h"
@@ -32,6 +33,9 @@ struct CandidateInstantiationOptions {
   SourceMode sourceMode = SourceMode::SemanticSource;
   std::string sourceSymbol;
   uint64_t sourceRootOrdinal = 0;
+  /// Names the source adapter to dispatch to. Empty means the source root must
+  /// be accepted by exactly one registered adapter.
+  std::string adapterKey;
   const machine::MachineModel *machine = nullptr;
 };
 
@@ -45,6 +49,9 @@ struct CandidateInstance {
   perf::BindingFacts bindingFacts;
   /// Populated by the contract-based source path; no contraction facts needed.
   workload::WorkloadContract workloadContract;
+  /// What the source stage realized. Mapping-owned choices stay pending here;
+  /// the mapping stage completes the receipt before retention and reporting.
+  workload::BindingReceipt receipt;
   mapping::WorkloadGraph workloadGraph;
 };
 
@@ -64,13 +71,30 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
 /// source metadata. Required primitives must occur in the selected body and
 /// cover every execution/movement primitive derived from its workload graph.
 /// sourceSymbol selects an exact kernel; empty requires a unique kernel.
-/// The caller's module is never modified. Semantic adapters and source
-/// parameter realization are separate capabilities.
+/// The caller's module is never modified.
 llvm::Expected<CandidateInstance>
 instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
                      const perf::Candidate &candidate,
                      const workload::WorkloadContract &contract,
                      const CandidateInstantiationOptions &options);
+
+/// The same, with the source adapters injected. SemanticSource dispatches to
+/// the adapter that accepts the selected root: exactly one must, unless
+/// options.adapterKey names it. The adapter's described contract must match
+/// `contract`, every source-owned parameter must be realized by the returned
+/// receipt, and mapping-owned parameters must still be pending -- the receipt
+/// is source-stage evidence, not a claim about work that has not happened.
+/// The emitted kernel must belong to the private clone, match the concrete
+/// tensor/numerical contract and pass IR verification. An adapter may erase
+/// the original root/function while replacing it; identity is retained first.
+///
+/// The overload without a registry constructs makeDefaultSourceAdapters().
+llvm::Expected<CandidateInstance>
+instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
+                     const perf::Candidate &candidate,
+                     const workload::WorkloadContract &contract,
+                     const CandidateInstantiationOptions &options,
+                     const workload::SourceAdapterRegistry &registry);
 
 } // namespace mlir::llk::tuning
 

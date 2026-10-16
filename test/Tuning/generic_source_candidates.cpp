@@ -348,9 +348,18 @@ TEST_F(FrameworkTest, RejectsUnsupportedSourceModeAndNullModule) {
   ASSERT_TRUE(source);
   auto o = options();
   o.sourceMode = tuning::SourceMode::SemanticSource;
+  // A concrete MicroIR module is not a semantic source: the adapter path
+  // selects a source *function*, so a kernel symbol is not a function.
   expectError(tuning::instantiateCandidate(*source, singleton(), candidate(),
                                            addContract(), o),
-              "ConcreteMicro");
+              "@add' is not a function");
+  // The synthetic binder is explicitly requested legacy behavior; the contract
+  // path does not realize it.
+  auto synthetic = options();
+  synthetic.sourceMode = tuning::SourceMode::Synthetic;
+  expectError(tuning::instantiateCandidate(*source, singleton(), candidate(),
+                                           addContract(), synthetic),
+              "synthetic");
   expectError(tuning::instantiateCandidate(ModuleOp{}, singleton(), candidate(),
                                            addContract(), options()),
               "module");
