@@ -1,3 +1,11 @@
+# The framework source tests are static contract/descriptor checks: they must
+# run without an E2E/JIT guard. Later increments add source-candidate and
+# mapping/target libraries to this target.
+add_executable(FrameworkSourceTest workload_contract.cpp)
+target_link_libraries(FrameworkSourceTest PRIVATE LLKWorkloadContracts
+    GTest::gtest_main LLK::MLIR)
+add_test(NAME FrameworkSourceTest COMMAND FrameworkSourceTest)
+
 if(LLK_BUILD_E2E_TESTS)
   add_executable(MappedTuningSessionTest mapped_tuning_session.cpp)
   target_link_libraries(MappedTuningSessionTest PRIVATE LLKMappedTuning
