@@ -375,6 +375,14 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
   auto graph = mapping::extractWorkloadGraph(instance.kernel);
   if (!graph)
     return graph.takeError();
+  // Derive execution/movement requirements from the existing graph, rather
+  // than maintaining a second operation classifier at the source boundary.
+  for (const mapping::WorkloadNode &node : graph->getNodes())
+    if (std::find(contract.requiredPrimitives.begin(),
+                  contract.requiredPrimitives.end(),
+                  node.opName) == contract.requiredPrimitives.end())
+      return error("workload_contract: required primitives omit actual '" +
+                   node.opName + "'");
   instance.workloadGraph = std::move(*graph);
   return instance;
 }

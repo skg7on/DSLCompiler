@@ -61,7 +61,8 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
 /// Instantiates an exact, parameter-free ConcreteMicro kernel. Tensor inputs
 /// and results match the ordered contract ports (Read and Write respectively).
 /// A nonempty numerical contract requires matching micro.numerical_contract
-/// source metadata. Required primitives must occur in the selected body.
+/// source metadata. Required primitives must occur in the selected body and
+/// cover every execution/movement primitive derived from its workload graph.
 /// sourceSymbol selects an exact kernel; empty requires a unique kernel.
 /// The caller's module is never modified. Semantic adapters and source
 /// parameter realization are separate capabilities.

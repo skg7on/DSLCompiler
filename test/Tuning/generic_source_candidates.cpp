@@ -268,6 +268,18 @@ TEST_F(FrameworkTest, RejectsAbsentRequiredPrimitive) {
               "primitive");
 }
 
+TEST_F(FrameworkTest, RequiredPrimitivesMustCoverActualWorkloadGraph) {
+  auto source = parse(addSource);
+  ASSERT_TRUE(source);
+  auto c = addContract();
+  c.requiredPrimitives.clear();
+  const auto before = print(source->getOperation());
+  expectError(tuning::instantiateCandidate(*source, singleton(), candidate(), c,
+                                           options()),
+              "micro.vector");
+  EXPECT_EQ(print(source->getOperation()), before);
+}
+
 TEST_F(FrameworkTest, RejectsMalformedNumericalMetadataEvenForEmptyContract) {
   auto source = parse(addSource);
   ASSERT_TRUE(source);
