@@ -7,6 +7,7 @@ __pycache__/
 *.a
 *.so
 .cache/
+.zed/
 .claude/worktrees/
 # The manual is built by CI and published to GitHub Pages; only sources are
 # tracked. Ignore the whole directory so a leftover local build cannot be
