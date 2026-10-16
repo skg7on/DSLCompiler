@@ -10,6 +10,7 @@
 #ifndef LLK_CONVERSION_MICROMAPPING_CANDIDATEINSTANTIATION_H
 #define LLK_CONVERSION_MICROMAPPING_CANDIDATEINSTANTIATION_H
 
+#include "LLK/Conversion/Workload/WorkloadContract.h"
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Perf/Candidate.h"
@@ -42,6 +43,8 @@ struct CandidateInstance {
   uint64_t bindingHash = 0;
   SourceMode sourceMode = SourceMode::SemanticSource;
   perf::BindingFacts bindingFacts;
+  /// Populated by the contract-based source path; no contraction facts needed.
+  workload::WorkloadContract workloadContract;
   mapping::WorkloadGraph workloadGraph;
 };
 
@@ -53,6 +56,19 @@ llvm::Expected<CandidateInstance>
 instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
                      const perf::Candidate &candidate,
                      const perf::WorkloadShape &shape,
+                     const CandidateInstantiationOptions &options);
+
+/// Instantiates an exact, parameter-free ConcreteMicro kernel. Tensor inputs
+/// and results match the ordered contract ports (Read and Write respectively).
+/// A nonempty numerical contract requires matching micro.numerical_contract
+/// source metadata. Required primitives must occur in the selected body.
+/// sourceSymbol selects an exact kernel; empty requires a unique kernel.
+/// The caller's module is never modified. Semantic adapters and source
+/// parameter realization are separate capabilities.
+llvm::Expected<CandidateInstance>
+instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
+                     const perf::Candidate &candidate,
+                     const workload::WorkloadContract &contract,
                      const CandidateInstantiationOptions &options);
 
 } // namespace mlir::llk::tuning
