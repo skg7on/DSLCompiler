@@ -1,0 +1,13 @@
+{
+  "cmake.sourceDirectory": "${workspaceFolder}",
+  "cmake.buildDirectory": "${workspaceFolder}/build",
+  "cmake.generator": "Ninja",
+  "cmake.configureOnOpen": true,
+  "cmake.configureSettings": {
+    "LLVM_PROJECT_BUILD_DIR": "${userHome}/Workspace/Projects/llvm-project/build",
+    "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+    "BUILD_TESTING": true,
+    "LLK_BUILD_TOOLS": true,
+    "LLK_BUILD_E2E_TESTS": true
+  }
+}
