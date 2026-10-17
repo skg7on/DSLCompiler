@@ -22,6 +22,7 @@
 #include "LLK/Conversion/Workload/SourceAdapter.h"
 #include "LLK/Conversion/Workload/WorkloadContract.h"
 #include "LLK/Perf/Candidate.h"
+#include "LLK/Perf/CandidateGenerator.h"
 #include "LLK/Perf/SearchSpace.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -31,7 +32,9 @@
 #include "llvm/Support/MemoryBuffer.h"
 
 #include <algorithm>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace mlir;
@@ -50,6 +53,36 @@ perf::SearchSpace singletonSpace() {
 perf::Candidate singletonCandidate() {
   perf::Candidate candidate;
   candidate.id = perf::computeCandidateId({}, {});
+  return candidate;
+}
+
+/// A space whose source-owned tile choices name the source axes they tile. The
+/// parameter *names* are arbitrary; the `role` is what makes them source axes.
+perf::SearchSpace tiledSpace(std::vector<int64_t> t0, std::vector<int64_t> t1) {
+  perf::SearchSpace space;
+  space.name = "elementwise";
+  perf::SearchParam outer;
+  outer.name = "T0";
+  outer.kind = "integer";
+  outer.role = "axis:d0";
+  for (int64_t value : t0)
+    outer.choices.emplace_back(value);
+  perf::SearchParam inner;
+  inner.name = "T1";
+  inner.kind = "integer";
+  inner.role = "axis:d1";
+  for (int64_t value : t1)
+    inner.choices.emplace_back(value);
+  space.params.push_back(std::move(outer));
+  space.params.push_back(std::move(inner));
+  return space;
+}
+
+perf::Candidate candidateFor(int64_t t0, int64_t t1) {
+  perf::Candidate candidate;
+  candidate.values["T0"] = t0;
+  candidate.values["T1"] = t1;
+  candidate.id = perf::computeCandidateId(candidate.values, {});
   return candidate;
 }
 
@@ -559,7 +592,7 @@ TEST_F(ElementwiseSourceAdapter, RejectsExplicitRoundingModes) {
   }
 }
 
-TEST_F(ElementwiseSourceAdapter, SourceTileRoleIsDeclaredButNotYetRealized) {
+TEST_F(ElementwiseSourceAdapter, TileRolesAreSourceOwnedAndRealized) {
   auto source = loadFixture("elementwise.mlir");
   ASSERT_TRUE(source);
   workload::SourceAdapterRegistry registry =
@@ -572,26 +605,146 @@ TEST_F(ElementwiseSourceAdapter, SourceTileRoleIsDeclaredButNotYetRealized) {
   auto contract = (*adapter)->describe(*root);
   ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
 
-  perf::SearchSpace space = singletonSpace();
-  perf::SearchParam tile;
-  tile.name = "T0";
-  tile.kind = "integer";
-  tile.role = "axis:d0";
-  tile.choices = {perf::SearchChoice(int64_t{8})};
-  space.params.push_back(tile);
-
+  auto space = tiledSpace({8}, {16});
   auto schema = (*adapter)->bindings(*root, space);
   ASSERT_TRUE(bool(schema)) << llvm::toString(schema.takeError());
-  ASSERT_EQ(schema->size(), 1u);
+  ASSERT_EQ(schema->size(), 2u);
   EXPECT_EQ((*schema)[0].owner, workload::BindingOwner::Source);
   EXPECT_EQ((*schema)[0].role, "axis:d0");
+  EXPECT_EQ((*schema)[1].owner, workload::BindingOwner::Source);
+  EXPECT_EQ((*schema)[1].role, "axis:d1");
 
-  perf::Candidate candidate;
-  candidate.values["T0"] = 8;
+  auto instance =
+      tuning::instantiateCandidate(*source, space, candidateFor(8, 16),
+                                   *contract, sourceOptions(), registry);
+  ASSERT_TRUE(bool(instance)) << llvm::toString(instance.takeError());
+  EXPECT_EQ(instance->receipt.source, (std::vector<std::string>{"T0", "T1"}));
+  EXPECT_TRUE(instance->receipt.mapping.empty());
+}
+
+/// A bound tile axis realizes as a nested spatial loop, a windowed view, staged
+/// movement, one vector operation and one tile store into the loop-carried
+/// output. The tile extent is the view's shape.
+TEST_F(ElementwiseSourceAdapter, TiledCandidatesProduceDistinctSchedules) {
+  auto source = loadFixture("elementwise.mlir");
+  ASSERT_TRUE(source);
+  const std::string before = print(source->getOperation());
+
+  workload::SourceAdapterRegistry registry =
+      workload::makeDefaultSourceAdapters();
+  auto root = workload::selectSourceRoot(*source, {"elementwise", 0}, registry,
+                                         elementwiseKey);
+  ASSERT_TRUE(bool(root)) << llvm::toString(root.takeError());
+  auto adapter = registry.resolve(*root, elementwiseKey);
+  ASSERT_TRUE(bool(adapter)) << llvm::toString(adapter.takeError());
+  auto contract = (*adapter)->describe(*root);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  auto space = tiledSpace({4, 8}, {8, 16});
+  auto generated = perf::generateCandidates(space, {});
+  ASSERT_EQ(generated.size(), 4u);
+
+  std::set<std::string> scheduleIdentities;
+  std::set<std::string> viewShapes;
+  std::set<uint64_t> sourceIdentities;
+  for (const perf::Candidate &candidate : generated) {
+    SCOPED_TRACE(candidate.id);
+    auto instance = tuning::instantiateCandidate(
+        *source, space, candidate, *contract, sourceOptions(), registry);
+    ASSERT_TRUE(bool(instance)) << llvm::toString(instance.takeError());
+    EXPECT_TRUE(succeeded(verify(*instance->module)));
+    EXPECT_EQ(instance->receipt.source, (std::vector<std::string>{"T0", "T1"}));
+
+    int spatialLoops = 0;
+    int stores = 0;
+    instance->kernel->walk([&](Operation *op) {
+      llvm::StringRef name = op->getName().getStringRef();
+      if (name == "micro.spatial_for")
+        ++spatialLoops;
+      if (name == "micro.tile_store")
+        ++stores;
+      if (name == "micro.tile_view") {
+        std::string shape;
+        llvm::raw_string_ostream stream(shape);
+        op->getAttr("shape").print(stream);
+        viewShapes.insert(stream.str());
+      }
+    });
+    EXPECT_EQ(spatialLoops, 2);
+    EXPECT_EQ(stores, 1);
+    sourceIdentities.insert(instance->sourceGraphHash);
+
+    // Candidate identity is not schedule content: drop it before comparing the
+    // realized schedules themselves.
+    instance->kernel->removeAttr("candidate");
+    instance->kernel->removeAttr("candidate_hash");
+    scheduleIdentities.insert(print(instance->kernel));
+  }
+  EXPECT_EQ(sourceIdentities.size(), 1u);
+  EXPECT_EQ(viewShapes.size(), 4u);
+  EXPECT_EQ(scheduleIdentities.size(), 4u);
+  EXPECT_EQ(print(source->getOperation()), before);
+}
+
+/// Nondividing tiles are rejected as a source-legality fact. No padding,
+/// masking or reassociation is invented to make them fit.
+TEST_F(ElementwiseSourceAdapter, NondividingTilesReject) {
+  auto source = loadFixture("elementwise.mlir");
+  ASSERT_TRUE(source);
+  workload::SourceAdapterRegistry registry =
+      workload::makeDefaultSourceAdapters();
+  auto root = workload::selectSourceRoot(*source, {"elementwise", 0}, registry,
+                                         elementwiseKey);
+  ASSERT_TRUE(bool(root)) << llvm::toString(root.takeError());
+  auto adapter = registry.resolve(*root, elementwiseKey);
+  ASSERT_TRUE(bool(adapter)) << llvm::toString(adapter.takeError());
+  auto contract = (*adapter)->describe(*root);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  const std::pair<int64_t, int64_t> cases[] = {{3, 16}, {4, 5}, {3, 5}};
+  for (auto [t0, t1] : cases) {
+    SCOPED_TRACE(std::to_string(t0) + "x" + std::to_string(t1));
+    auto space = tiledSpace({t0}, {t1});
+    auto instance =
+        tuning::instantiateCandidate(*source, space, candidateFor(t0, t1),
+                                     *contract, sourceOptions(), registry);
+    ASSERT_FALSE(bool(instance));
+    std::string reason = llvm::toString(instance.takeError());
+    EXPECT_NE(reason.find("source_legality: tile_divisibility"),
+              std::string::npos)
+        << reason;
+  }
+}
+
+/// An integer choice the family does not implement is an unrealized axis, not a
+/// value to ignore.
+TEST_F(ElementwiseSourceAdapter, RejectsUnrealizedIntegerChoice) {
+  auto source = loadFixture("elementwise.mlir");
+  ASSERT_TRUE(source);
+  workload::SourceAdapterRegistry registry =
+      workload::makeDefaultSourceAdapters();
+  auto root = workload::selectSourceRoot(*source, {"elementwise", 0}, registry,
+                                         elementwiseKey);
+  ASSERT_TRUE(bool(root)) << llvm::toString(root.takeError());
+  auto adapter = registry.resolve(*root, elementwiseKey);
+  ASSERT_TRUE(bool(adapter)) << llvm::toString(adapter.takeError());
+  auto contract = (*adapter)->describe(*root);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  auto space = tiledSpace({4}, {16});
+  perf::SearchParam width;
+  width.name = "vector_width";
+  width.kind = "integer";
+  width.choices = {perf::SearchChoice(int64_t{8})};
+  space.params.push_back(width);
+
+  perf::Candidate candidate = candidateFor(4, 16);
+  candidate.values["vector_width"] = 8;
   candidate.id = perf::computeCandidateId(candidate.values, {});
   auto instance = tuning::instantiateCandidate(
       *source, space, candidate, *contract, sourceOptions(), registry);
   ASSERT_FALSE(bool(instance));
-  EXPECT_NE(llvm::toString(instance.takeError()).find("axis_not_realized: T0"),
+  EXPECT_NE(llvm::toString(instance.takeError())
+                .find("axis_not_realized: vector_width"),
             std::string::npos);
 }
