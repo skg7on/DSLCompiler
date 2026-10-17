@@ -1,0 +1,49 @@
+[
+  {
+    "label": "Debug llk-compile",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "build": "Build LLK tools (Debug)",
+    "program": "$ZED_WORKTREE_ROOT/build/bin/llk-compile",
+    "args": [
+      "--emit=micro",
+      "$ZED_WORKTREE_ROOT/docs/manual/source/examples/matmul.mlir"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "stopOnEntry": true
+  },
+  {
+    "label": "Debug llk-opt",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "build": "Build LLK tools (Debug)",
+    "program": "$ZED_WORKTREE_ROOT/build/bin/llk-opt",
+    "args": [
+      "--llk-to-micro",
+      "$ZED_WORKTREE_ROOT/docs/manual/source/examples/matmul.mlir"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "stopOnEntry": true
+  },
+  {
+    "label": "Debug llk-tune (predicted Micro search)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "build": "Build LLK tools (Debug)",
+    "program": "$ZED_WORKTREE_ROOT/build/bin/llk-tune",
+    "args": [
+      "--input=$ZED_WORKTREE_ROOT/docs/manual/source/examples/swiglu.search.mlir",
+      "--machine=$ZED_WORKTREE_ROOT/machines/x86-avx2-v2.yaml",
+      "-M=8",
+      "-N=64",
+      "-K=64",
+      "--search=grid",
+      "--max-candidates=1",
+      "--top-k=1",
+      "--perf-level=1",
+      "--output=$ZED_WORKTREE_ROOT/build/llk-tune-debug.schedule.yaml"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "stopOnEntry": true
+  }
+]
