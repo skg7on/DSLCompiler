@@ -14,4 +14,6 @@ The project goal is a **generic MicroIR-based, mapping- and search-based DNN com
 
 The [framework implementation plan](superpowers/plans/2026-10-12-generic-microir-framework-implementation.md) audits current code at `fb99595` and sequences 19 tasks across analysis coverage, generic workload/source search, primitive/target conformance and verified measurement persistence/validation. Its linked increment plans distinguish proposed APIs from merged foundations and pending PRs.
 
+The proposed [dynamic-shape design](superpowers/specs/2026-10-17-dynamic-shape-llk-microir-design.md) reviews baseline `45560cb` and defines runtime M/N/K with fixed-capacity MicroIR tiles, checked shape relationships, bounded movement, explicit output destinations and shape-aware analysis/replay. Its [implementation plan](superpowers/plans/2026-10-17-dynamic-shape-llk-microir.md) makes fully dynamic contractions the first execution milestone. These documents are proposals, not delivered dynamic-shape support.
+
 The framework specification governs project-level goal/scope statements in earlier specs. Detailed subsystem contracts remain applicable where consistent with it. Milestone plans and revision-pinned reviews preserve history and evidence; the [historical CPU architecture](design/legacy-cpu-architecture.md) records the original validation design.
