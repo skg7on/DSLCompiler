@@ -9,6 +9,7 @@
 
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
+#include "LLK/Conversion/Workload/SourceAdapter.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Perf/Candidate.h"
@@ -22,6 +23,7 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -262,6 +264,7 @@ TEST(CandidateInstantiationTest, RetainsSwiGLUProjectionAndEpilogueOrder) {
   auto source =
       mlir::parseSourceString<mlir::ModuleOp>((*buffer)->getBuffer(), &context);
   ASSERT_TRUE(source);
+  const std::string original = printModule(*source);
   auto space = testSpace();
   space.workload = "fused_swiglu";
   mlir::llk::perf::WorkloadShape shape;
@@ -294,6 +297,248 @@ TEST(CandidateInstantiationTest, RetainsSwiGLUProjectionAndEpilogueOrder) {
   ASSERT_NE(silu, vectorOps.end());
   ASSERT_NE(multiply, vectorOps.end());
   EXPECT_LT(silu, multiply);
+  // The gated projection is two arms and one silu/mul epilogue followed by the
+  // accumulator-to-output conversion, not a single widened contraction.
+  auto conversion = std::find(vectorOps.begin(), vectorOps.end(), "convert");
+  ASSERT_NE(conversion, vectorOps.end());
+  EXPECT_LT(multiply, conversion);
+  EXPECT_EQ(printModule(*source), original);
+}
+
+/// The built-in contraction family is what the WorkloadShape entry point now
+/// dispatches to. Both overloads must describe the same source root and emit
+/// the same kernel, because the shape overload is only a translation of the
+/// supplied workload into the generic contract.
+TEST(CandidateInstantiationTest,
+     ShapeAndContractOverloadsAgreeOnTheSelectedRoot) {
+  mlir::DialectRegistry dialects;
+  dialects.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(dialects);
+  context.loadAllAvailableDialects();
+  std::string path = std::string(LLK_SOURCE_DIR) +
+                     "/test/Tuning/Inputs/issue129/two_roots.mlir";
+  auto buffer = llvm::MemoryBuffer::getFile(path);
+  ASSERT_TRUE(bool(buffer)) << buffer.getError().message();
+  auto source =
+      mlir::parseSourceString<mlir::ModuleOp>((*buffer)->getBuffer(), &context);
+  ASSERT_TRUE(source);
+  const std::string originalSource = printModule(*source);
+
+  // Resolve and describe the selected root through the default registry: the
+  // adapter is the authority on what the source implements.
+  mlir::llk::workload::SourceAdapterRegistry registry =
+      mlir::llk::workload::makeDefaultSourceAdapters();
+  EXPECT_FALSE(registry.empty()) << "the contraction family must be registered";
+  auto root = mlir::llk::workload::selectSourceRoot(*source, {"two_roots", 1},
+                                                    registry);
+  ASSERT_TRUE(bool(root)) << llvm::toString(root.takeError());
+  auto adapter = registry.resolve(*root);
+  ASSERT_TRUE(bool(adapter)) << llvm::toString(adapter.takeError());
+  EXPECT_EQ((*adapter)->key(), "llk-contraction-v1");
+  auto described = (*adapter)->describe(*root);
+  ASSERT_TRUE(bool(described)) << llvm::toString(described.takeError());
+
+  // The described contract is a contraction of M=8, N=16, K=32 with three read
+  // inputs and a written output, in the emitted kernel's order.
+  EXPECT_EQ(described->axes.at("M"), 8);
+  EXPECT_EQ(described->axes.at("N"), 16);
+  EXPECT_EQ(described->axes.at("K"), 32);
+  ASSERT_EQ(described->ports.size(), 4u);
+  EXPECT_EQ(described->ports[0].shape, (std::vector<int64_t>{8, 32}));
+  EXPECT_EQ(described->ports[1].shape, (std::vector<int64_t>{32, 16}));
+  EXPECT_EQ(described->ports[2].shape, (std::vector<int64_t>{8, 16}));
+  EXPECT_EQ(described->ports[3].direction,
+            mlir::llk::workload::PortDirection::Output);
+  EXPECT_EQ(described->ports[3].effect, mlir::llk::workload::PortEffect::Write);
+
+  mlir::llk::perf::WorkloadShape shape;
+  shape.M = 8;
+  shape.N = 16;
+  shape.K = 32;
+  shape.inputDType = "bf16";
+  shape.weightDType = "bf16";
+  shape.accumulatorDType = "f32";
+  shape.outputDType = "bf16";
+  mlir::llk::machine::MachineModel machine;
+  mlir::llk::tuning::CandidateInstantiationOptions options;
+  options.sourceSymbol = "two_roots";
+  options.sourceRootOrdinal = 1;
+  options.machine = &machine;
+
+  auto legacy = mlir::llk::tuning::instantiateCandidate(
+      *source, testSpace(), candidate(8), shape, options);
+  ASSERT_TRUE(bool(legacy)) << llvm::toString(legacy.takeError());
+  auto generic = mlir::llk::tuning::instantiateCandidate(
+      *source, testSpace(), candidate(8), *described, options, registry);
+  ASSERT_TRUE(bool(generic)) << llvm::toString(generic.takeError());
+
+  // Ordered signature types, primitive sequences, contraction facts, init
+  // reads and source numerical attributes all survive the translation.
+  EXPECT_EQ(legacy->bindingFacts.contractions.size(),
+            generic->bindingFacts.contractions.size());
+  EXPECT_EQ(legacy->kernel->getAttr("function_type"),
+            generic->kernel->getAttr("function_type"));
+  EXPECT_EQ(legacy->kernel->getAttr("source_math_mode"),
+            generic->kernel->getAttr("source_math_mode"));
+  EXPECT_EQ(printModule(*legacy->module), printModule(*generic->module));
+  EXPECT_EQ(legacy->receipt.source, generic->receipt.source);
+  EXPECT_EQ(printModule(*source), originalSource);
+
+  // The versioned generic provenance names the adapter and the workload
+  // contract, and the compatibility metadata is still there beside it.
+  EXPECT_EQ(legacy->kernel->getAttrOfType<mlir::StringAttr>("source_adapter")
+                .getValue(),
+            "llk-contraction-v1");
+  EXPECT_TRUE(legacy->kernel->getAttr("micro.workload_contract"));
+  EXPECT_TRUE(legacy->kernel->getAttr("original_workload"));
+  EXPECT_EQ(legacy->bindingFacts.contractions.size(), 1u);
+  EXPECT_EQ(legacy->bindingFacts.contractions[0].M, 8);
+  EXPECT_EQ(legacy->bindingFacts.contractions[0].N, 16);
+  EXPECT_EQ(legacy->bindingFacts.contractions[0].K, 32);
+
+  // Changed contract metadata cannot be substituted for the contract the root
+  // describes: a record recorded against the old contract is not silently
+  // reused under a new one.
+  auto relabelled = *described;
+  relabelled.ports[0].name = "renamed";
+  auto mismatch = mlir::llk::tuning::instantiateCandidate(
+      *source, testSpace(), candidate(8), relabelled, options, registry);
+  ASSERT_FALSE(bool(mismatch));
+  EXPECT_NE(
+      llvm::toString(mismatch.takeError()).find("source_contract_mismatch"),
+      std::string::npos);
+}
+
+/// A contraction whose output element type equals the accumulator needs no
+/// conversion, and an operator without an activation epilogue emits no vector
+/// operation at all. The described primitives must say so, because a required
+/// primitive that the export never emits is a false contract.
+TEST(CandidateInstantiationTest,
+     DescribedPrimitivesMatchWhatEachContractionRootEmits) {
+  mlir::DialectRegistry dialects;
+  dialects.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(dialects);
+  context.loadAllAvailableDialects();
+  mlir::llk::workload::SourceAdapterRegistry registry =
+      mlir::llk::workload::makeDefaultSourceAdapters();
+
+  auto describeRoot = [&](llvm::StringRef file,
+                          llvm::StringRef symbol) -> mlir::Attribute {
+    std::string path = std::string(LLK_SOURCE_DIR) +
+                       "/test/Tuning/Inputs/issue129/" + file.str();
+    auto buffer = llvm::MemoryBuffer::getFile(path);
+    EXPECT_TRUE(bool(buffer)) << path;
+    if (!buffer)
+      return {};
+    auto module = mlir::parseSourceString<mlir::ModuleOp>(
+        (*buffer)->getBuffer(), &context);
+    EXPECT_TRUE(bool(module));
+    if (!module)
+      return {};
+    auto root = mlir::llk::workload::selectSourceRoot(
+        *module, {symbol.str(), 0}, registry);
+    EXPECT_TRUE(bool(root)) << llvm::toString(root.takeError());
+    if (!root)
+      return {};
+    auto adapter = registry.resolve(*root);
+    EXPECT_TRUE(bool(adapter)) << llvm::toString(adapter.takeError());
+    if (!adapter)
+      return {};
+    auto described = (*adapter)->describe(*root);
+    EXPECT_TRUE(bool(described)) << llvm::toString(described.takeError());
+    if (!described)
+      return {};
+    return mlir::llk::workload::encodeWorkloadContract(&context, *described);
+  };
+
+  // linalg.matmul: accumulator and output are both f32, and there is no
+  // epilogue, so no `micro.vector` is emitted.
+  auto linalg = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+      describeRoot("linalg_matmul.mlir", "linalg_source"));
+  ASSERT_TRUE(linalg);
+  auto linalgContract = mlir::llk::workload::decodeWorkloadContract(linalg);
+  ASSERT_TRUE(bool(linalgContract))
+      << llvm::toString(linalgContract.takeError());
+  EXPECT_EQ(linalgContract->requiredPrimitives,
+            (std::vector<std::string>{"micro.mma", "micro.tile_async_copy",
+                                      "micro.tile_store"}));
+
+  // llk.matmul: bf16 output over an f32 accumulator needs a conversion.
+  auto llkMatmul = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+      describeRoot("two_roots.mlir", "two_roots"));
+  ASSERT_TRUE(llkMatmul);
+  auto matmulContract = mlir::llk::workload::decodeWorkloadContract(llkMatmul);
+  ASSERT_TRUE(bool(matmulContract))
+      << llvm::toString(matmulContract.takeError());
+  EXPECT_EQ(matmulContract->requiredPrimitives,
+            (std::vector<std::string>{"micro.mma", "micro.tile_async_copy",
+                                      "micro.tile_store", "micro.vector"}));
+
+  // SwiGLU: two arms, no initialized destination, and a silu/mul epilogue.
+  auto swiglu = mlir::dyn_cast_or_null<mlir::DictionaryAttr>(
+      describeRoot("swiglu.mlir", "swiglu"));
+  ASSERT_TRUE(swiglu);
+  auto swigluContract = mlir::llk::workload::decodeWorkloadContract(swiglu);
+  ASSERT_TRUE(bool(swigluContract))
+      << llvm::toString(swigluContract.takeError());
+  EXPECT_EQ(swigluContract->axes.at("K"), 32);
+  ASSERT_EQ(swigluContract->ports.size(), 4u);
+  for (const mlir::llk::workload::WorkloadPort &port : swigluContract->ports)
+    EXPECT_NE(port.shape, (std::vector<int64_t>{8, 16, 32}))
+        << "a contraction port is rank two, never a fabricated rank three";
+  EXPECT_TRUE(
+      llvm::is_contained(swigluContract->requiredPrimitives, "micro.vector"));
+}
+
+/// Generic dispatch is structural: the workload *label* never picks an adapter
+/// and never changes what is emitted. Two spaces that differ only in their
+/// diagnostic label must produce byte-identical kernels.
+TEST(CandidateInstantiationTest, WorkloadLabelCannotChangeTheAdapterOrKernel) {
+  mlir::DialectRegistry dialects;
+  dialects.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(dialects);
+  context.loadAllAvailableDialects();
+  std::string path = std::string(LLK_SOURCE_DIR) +
+                     "/test/Tuning/Inputs/issue129/two_roots.mlir";
+  auto buffer = llvm::MemoryBuffer::getFile(path);
+  ASSERT_TRUE(bool(buffer));
+  auto source =
+      mlir::parseSourceString<mlir::ModuleOp>((*buffer)->getBuffer(), &context);
+  ASSERT_TRUE(source);
+
+  mlir::llk::perf::WorkloadShape shape;
+  shape.M = 8;
+  shape.N = 16;
+  shape.K = 32;
+  mlir::llk::machine::MachineModel machine;
+  mlir::llk::tuning::CandidateInstantiationOptions options;
+  options.sourceSymbol = "two_roots";
+  options.sourceRootOrdinal = 1;
+  options.machine = &machine;
+
+  auto matmulSpace = testSpace();
+  matmulSpace.workload = "matmul";
+  auto swigluSpace = testSpace();
+  swigluSpace.workload = "fused_swiglu";
+
+  auto first = mlir::llk::tuning::instantiateCandidate(
+      *source, matmulSpace, candidate(8), shape, options);
+  auto second = mlir::llk::tuning::instantiateCandidate(
+      *source, swigluSpace, candidate(8), shape, options);
+  ASSERT_TRUE(bool(first)) << llvm::toString(first.takeError());
+  ASSERT_TRUE(bool(second)) << llvm::toString(second.takeError());
+  EXPECT_EQ(printModule(*first->module), printModule(*second->module));
+  EXPECT_EQ(first->sourceGraphHash, second->sourceGraphHash);
+  EXPECT_EQ(first->kernel->getAttrOfType<mlir::StringAttr>("source_adapter")
+                .getValue(),
+            second->kernel->getAttrOfType<mlir::StringAttr>("source_adapter")
+                .getValue());
 }
 
 TEST(CandidateInstantiationTest, AcceptsAnExactLinalgMatmulSourceRoot) {

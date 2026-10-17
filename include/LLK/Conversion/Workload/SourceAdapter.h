@@ -45,6 +45,10 @@ class ModuleOp;
 class Operation;
 } // namespace mlir
 
+namespace mlir::llk::perf {
+struct BindingFacts;
+} // namespace mlir::llk::perf
+
 namespace mlir::llk::workload {
 
 /// Whether a search parameter is realized by the source adapter or by the later
@@ -109,6 +113,18 @@ public:
   /// Declaring a binding is not evidence of realizing it.
   virtual llvm::Expected<std::vector<ParameterBinding>>
   bindings(mlir::Operation *root, const perf::SearchSpace &space) const = 0;
+
+  /// The workload facts `candidate` realizes, reported without emitting
+  /// anything. Machine-aware legality is the cheap analytical half of the
+  /// verdict and is evaluated before realization, so the facts it reads come
+  /// from the family that knows them rather than from a half-built kernel.
+  /// Reporting facts is not a claim that they were realized: the receipt and
+  /// the emitted IR are that evidence. The default reports none, which is what
+  /// a family with no contraction content has to say.
+  virtual llvm::Expected<perf::BindingFacts>
+  realizedFacts(mlir::Operation *selectedRoot, const WorkloadContract &contract,
+                const perf::SearchSpace &space,
+                const perf::Candidate &candidate) const;
 
   /// Realizes `candidate` inside `clone`, appending a receipt entry only for
   /// each binding it actually realized. The returned kernel is owned by

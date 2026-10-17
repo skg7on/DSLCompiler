@@ -21,6 +21,9 @@
 
 #include "LLK/Conversion/Workload/SourceAdapter.h"
 
+#include "LLK/Conversion/Workload/ContractionSourceAdapter.h"
+#include "LLK/Perf/Legality.h"
+
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/SymbolTable.h"
@@ -123,11 +126,22 @@ SourceAdapterRegistry::resolve(Operation *root, llvm::StringRef key) const {
 
 bool SourceAdapterRegistry::empty() const { return adapters.empty(); }
 
+llvm::Expected<perf::BindingFacts>
+SourceAdapter::realizedFacts(mlir::Operation *, const WorkloadContract &,
+                             const perf::SearchSpace &,
+                             const perf::Candidate &) const {
+  // A family that realizes no contraction reports no facts; a constraint that
+  // needs one is unevaluable for it, which its own rule then reports.
+  return perf::BindingFacts{};
+}
+
 SourceAdapterRegistry makeDefaultSourceAdapters() {
   // The families are registered by the increments that implement them. An
-  // unregistered family is unsupported rather than guessed at, so this stays
-  // empty until a real adapter exists to add.
-  return SourceAdapterRegistry();
+  // unregistered family is unsupported rather than guessed at, so a family is
+  // added only once an adapter exists to recognize it.
+  SourceAdapterRegistry registry;
+  (void)registry.add(makeContractionSourceAdapter());
+  return registry;
 }
 
 llvm::Expected<Operation *>
