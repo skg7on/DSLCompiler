@@ -567,6 +567,56 @@ TEST(MappedTuningSessionTest, UnconsumedMappingChoiceRejectsBeforeRetention) {
                                   : report->rejected.front().rejectionReason);
 }
 
+TEST(MappedTuningSessionTest, OwnerReceiptResolvesIntermediateOwners) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseElementwiseSource(context);
+  ASSERT_TRUE(source);
+  auto target = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto contract = describeElementwise(*source);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  struct OwnerCase {
+    const char *path;
+    size_t ranked;
+  };
+  // The target models worker.0 -> lane.0 -> veng.0. Merely selecting both
+  // compute kinds, or seeing the same owners in a different order, is not a
+  // realization of that hierarchy.
+  for (const OwnerCase &test :
+       {OwnerCase{"worker/lane/vector_engine", 1},
+        OwnerCase{"worker/vector_engine/lane", 0},
+        OwnerCase{"worker/matrix_engine/vector_engine", 0}}) {
+    SCOPED_TRACE(test.path);
+    auto space = elementwiseTiledSpace();
+    space.params[0].choices = {mlir::llk::perf::SearchChoice(int64_t{4})};
+    space.params[1].choices = {mlir::llk::perf::SearchChoice(int64_t{8})};
+    mlir::llk::perf::SearchParam owners;
+    owners.name = "Owners";
+    owners.kind = "owner_mapping";
+    owners.choices = {mlir::llk::perf::SearchChoice(test.path)};
+    space.params.push_back(owners);
+    auto options = elementwiseOptions();
+    options.executable = false;
+    options.mapping.topK = 1;
+    auto report = mlir::llk::tuning::runMappedTuningSession(
+        *source, space, *contract, **target, options);
+    ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+    ASSERT_EQ(report->ranked.size(), test.ranked)
+        << (report->rejected.empty()
+                ? ""
+                : report->rejected.front().rejectionReason);
+    if (test.ranked)
+      EXPECT_EQ(report->ranked.front().receipt.mapping,
+                (std::vector<std::string>{"Owners"}));
+  }
+}
+
 /// A rejected candidate does not end the search: the nondividing tile choice
 /// rejects while the dividing one still ranks.
 TEST(MappedTuningSessionTest, SourceRejectionDoesNotEndTheSearch) {

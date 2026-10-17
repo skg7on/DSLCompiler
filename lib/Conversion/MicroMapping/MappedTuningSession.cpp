@@ -382,37 +382,65 @@ bool layoutConsumed(const perf::SearchSpace &space, llvm::StringRef parameter,
   return false;
 }
 
-/// True when the selected executors and compute bindings carry the owner path
-/// the candidate bound.
+bool executorNestedUnder(const machine::MachineModel &machine,
+                         llvm::StringRef inner, llvm::StringRef outer) {
+  const machine::ExecutorNode *current = machine.findExecutor(inner);
+  llvm::StringSet<> visited;
+  while (current && current->parent && visited.insert(current->id).second) {
+    if (*current->parent == outer)
+      return true;
+    current = machine.findExecutor(*current->parent);
+  }
+  return false;
+}
+
+/// Resolve the path under one selected executor. Intermediate owners belong to
+/// machine containment; they need not each run a separate selected operation.
+/// A final compute-only kind is realized by its selected attached capability.
 bool ownerMappingConsumed(llvm::StringRef value,
                           const mapping::CoveringPlan &plan,
                           const machine::MachineModel &machine) {
   llvm::SmallVector<llvm::StringRef, 4> owners;
   value.split(owners, '/');
-  if (owners.empty() || owners.front().empty())
+  if (owners.empty() ||
+      llvm::any_of(owners, [](llvm::StringRef owner) { return owner.empty(); }))
     return false;
-  auto matches = [&](llvm::StringRef owner) {
-    return llvm::any_of(plan.placements, [&](const mapping::PlanPlacement &p) {
-      return !p.executor.empty() && machine.ownerMatches(owner, p.executor);
-    });
-  };
-  if (!matches(owners.front()))
-    return false;
-  for (llvm::StringRef inner : llvm::drop_begin(owners)) {
-    if (inner.empty())
-      return false;
-    bool found =
-        llvm::any_of(plan.placements, [&](const mapping::PlanPlacement &p) {
-          if (!p.executor.empty() && machine.ownerMatches(inner, p.executor))
+  for (const mapping::PlanPlacement &placement : plan.placements) {
+    if (!machine.ownerMatches(owners.front(), placement.executor))
+      continue;
+    llvm::SmallVector<const machine::ExecutorNode *, 4> scopes{
+        machine.findExecutor(placement.executor)};
+    for (size_t index = 1; index < owners.size(); ++index) {
+      llvm::SmallVector<const machine::ExecutorNode *, 4> nested;
+      for (const machine::ExecutorNode &executor : machine.executors)
+        if (machine.ownerMatches(owners[index], executor.id) &&
+            llvm::any_of(scopes, [&](const machine::ExecutorNode *scope) {
+              return executorNestedUnder(machine, executor.id, scope->id);
+            }))
+          nested.push_back(&executor);
+
+      if (index + 1 == owners.size())
+        for (const auto &binding : placement.computeBindings) {
+          const machine::ComputeNode *compute =
+              machine.findCompute(binding.second);
+          if (compute &&
+              (compute->kind == owners[index] ||
+               llvm::is_contained(compute->refines, owners[index])) &&
+              llvm::any_of(scopes, [&](const machine::ExecutorNode *scope) {
+                return compute->attachedTo == scope->id ||
+                       executorNestedUnder(machine, compute->attachedTo,
+                                           scope->id);
+              }))
             return true;
-          if (p.computeBindings.count(inner))
-            return true;
-          return llvm::is_contained(p.computeRequirements, inner);
-        });
-    if (!found)
-      return false;
+        }
+      scopes = std::move(nested);
+      if (scopes.empty())
+        break;
+    }
+    if (!scopes.empty())
+      return true;
   }
-  return true;
+  return false;
 }
 
 /// True when the selected plan's resolved memories are constrained by the bound
