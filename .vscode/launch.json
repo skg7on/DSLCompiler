@@ -1,0 +1,50 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "llk-compile: sample matmul",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/bin/llk-compile",
+      "args": [
+        "${workspaceFolder}/test/Conversion/MicroMapping/matmul_e2e.mlir",
+        "--emit=micro"
+      ],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": true,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "osx": {
+        "MIMode": "lldb"
+      },
+      "preLaunchTask": "Build llk-compile (Debug)"
+    },
+    {
+      "name": "llk-compile: current MLIR file",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/bin/llk-compile",
+      "args": [
+        "${file}",
+        "--emit=${input:llkCompileEmit}"
+      ],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": true,
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "osx": {
+        "MIMode": "lldb"
+      },
+      "preLaunchTask": "Build llk-compile (Debug)"
+    }
+  ],
+  "inputs": [
+    {
+      "id": "llkCompileEmit",
+      "type": "pickString",
+      "description": "llk-compile output mode",
+      "options": ["micro", "micro-search", "mlir", "llvm"],
+      "default": "micro"
+    }
+  ]
+}
