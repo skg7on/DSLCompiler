@@ -9,11 +9,9 @@
 
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
 
-#include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/MicroMapping/SearchBindingLoader.h"
 #include "LLK/Conversion/MicroMapping/TileExtent.h"
-#include "LLK/Dialect/Micro/MicroEnums.h"
-#include "LLK/Dialect/Micro/MicroHelpers.h"
+#include "LLK/Conversion/Workload/ContractionSourceAdapter.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/SearchBinding.h"
 #include "LLK/Mapping/StableHash.h"
@@ -42,71 +40,6 @@ namespace {
 llvm::Error error(const llvm::Twine &message) {
   return llvm::make_error<llvm::StringError>(message.str(),
                                              llvm::inconvertibleErrorCode());
-}
-
-llvm::Expected<perf::WorkloadShape> rootShape(Operation *root) {
-  bool fused = root->getName().getStringRef() == "llk.fused_swiglu";
-  if (!fused && root->getName().getStringRef() != "llk.matmul" &&
-      root->getName().getStringRef() != "linalg.matmul")
-    return error("unsupported semantic source root '" +
-                 root->getName().getStringRef() + "'");
-  if (root->getNumOperands() < (fused ? 4u : 3u))
-    return error("source root does not have the expected operand list");
-  auto lhs = dyn_cast<ShapedType>(root->getOperand(0).getType());
-  auto rhs = dyn_cast<ShapedType>(root->getOperand(1).getType());
-  auto out = dyn_cast<ShapedType>(root->getOperand(fused ? 3 : 2).getType());
-  if (!lhs || !rhs || !out || !lhs.hasRank() || !rhs.hasRank() ||
-      !out.hasRank() || lhs.getRank() != 2 || rhs.getRank() != 2 ||
-      out.getRank() != 2 || !lhs.hasStaticShape() || !rhs.hasStaticShape() ||
-      !out.hasStaticShape())
-    return error("source root must have static rank-2 tensor operands");
-  if (lhs.getDimSize(0) != out.getDimSize(0) ||
-      lhs.getDimSize(1) != rhs.getDimSize(0) ||
-      rhs.getDimSize(1) != out.getDimSize(1))
-    return error("source root has mismatched contraction shapes");
-  perf::WorkloadShape shape;
-  shape.M = lhs.getDimSize(0);
-  shape.N = rhs.getDimSize(1);
-  shape.K = lhs.getDimSize(1);
-  auto dtypeName = [](Type type) -> std::string {
-    auto dtype = micro::dtypeOfElementType(type);
-    return dtype ? micro::stringifyDType(*dtype).str() : "unsupported";
-  };
-  shape.inputDType = dtypeName(lhs.getElementType());
-  shape.weightDType = dtypeName(rhs.getElementType());
-  shape.outputDType = dtypeName(out.getElementType());
-  TypeAttr accum;
-  if (Attribute attr = root->getAttr("accumulator_type"))
-    accum = dyn_cast<TypeAttr>(attr);
-  if (!accum && root->getName().getStringRef() == "linalg.matmul")
-    accum = TypeAttr::get(out.getElementType());
-  if (!accum)
-    return error("source root has no typed accumulator_type");
-  shape.accumulatorDType = dtypeName(accum.getValue());
-  if (shape.inputDType == "unsupported" || shape.weightDType == "unsupported" ||
-      shape.outputDType == "unsupported" ||
-      shape.accumulatorDType == "unsupported")
-    return error("source root uses a dtype unsupported by Micro");
-  return shape;
-}
-
-llvm::Expected<Operation *> selectRoot(ModuleOp module,
-                                       const CandidateInstantiationOptions &o) {
-  Operation *function = SymbolTable::lookupSymbolIn(module, o.sourceSymbol);
-  if (!function || function->getName().getStringRef() != "func.func")
-    return error("unknown source function '" + o.sourceSymbol + "'");
-  SmallVector<Operation *> roots;
-  function->walk([&](Operation *op) {
-    StringRef name = op->getName().getStringRef();
-    if (name == "llk.matmul" || name == "llk.fused_swiglu" ||
-        name == "linalg.matmul")
-      roots.push_back(op);
-  });
-  if (o.sourceRootOrdinal >= roots.size())
-    return error("source root ordinal " + Twine(o.sourceRootOrdinal) +
-                 " is out of range for @" + o.sourceSymbol);
-  Operation *root = roots[o.sourceRootOrdinal];
-  return root;
 }
 
 /// Drops the tuning directives from a private clone. A `micro.search_space` is
@@ -143,78 +76,6 @@ std::string enclosingSymbol(ModuleOp module, Operation *nested) {
     owner = owner->getParentOp();
   StringAttr symbol = SymbolTable::getSymbolName(owner);
   return symbol ? symbol.getValue().str() : std::string();
-}
-
-llvm::Expected<ScheduleEntry> toSchedule(const perf::SearchSpace &space,
-                                         const perf::Candidate &candidate) {
-  ScheduleEntry schedule;
-  llvm::StringSet<> realizedKinds;
-  for (const perf::SearchParam &param : space.params) {
-    auto integer = candidate.integer(param.name);
-    auto symbol = candidate.symbol(param.name);
-    if (param.kind == "integer") {
-      if (!integer || symbol)
-        return error("candidate value for '" + param.name +
-                     "' is not an integer");
-      int64_t value = *integer;
-      if ((param.name == "BM" || param.name == "BN" || param.name == "BK" ||
-           param.name == "vector_width" || param.name == "pipeline_stages") &&
-          value <= 0)
-        return error("candidate parameter '" + param.name +
-                     "' must be positive");
-      if (param.name == "BM")
-        schedule.BM = value;
-      else if (param.name == "BN")
-        schedule.BN = value;
-      else if (param.name == "BK")
-        schedule.BK = value;
-      else if (param.name == "VM") {
-        return error("axis_not_realized: VM");
-      } else if (param.name == "VN") {
-        return error("axis_not_realized: VN");
-      } else if (param.name == "vector_width")
-        schedule.vector_width = value;
-      else if (param.name == "num_threads") {
-        if (value != 1)
-          return error("axis_not_realized: num_threads");
-        schedule.num_threads = value;
-      } else if (param.name == "grain_size") {
-        if (value != 1)
-          return error("axis_not_realized: grain_size");
-        schedule.grain_size = value;
-      } else if (param.name == "pipeline_stages")
-        schedule.pipeline_stages = value;
-      else if (param.name == "prefetch_distance") {
-        return error("axis_not_realized: prefetch_distance");
-      } else
-        return error("axis_not_realized: " + param.name);
-      continue;
-    }
-    if (!symbol || integer)
-      return error("candidate value for '" + param.name + "' is not symbolic");
-    if (param.kind == "layout" || param.kind == "memory_path" ||
-        param.kind == "owner_mapping" || param.kind == "fragment_shape" ||
-        param.kind == "tail_policy") {
-      if (!realizedKinds.insert(param.kind).second)
-        return error("axis_not_realized: " + param.name);
-    }
-    if (param.kind == "layout")
-      schedule.tile_layout = symbol->str();
-    else if (param.kind == "memory_path")
-      schedule.memory_path = symbol->str();
-    else if (param.kind == "owner_mapping")
-      schedule.owner_mapping = symbol->str();
-    else if (param.kind == "fragment_shape") {
-      schedule.fragment_shape = symbol->str();
-      schedule.mma_shape = symbol->str();
-    } else if (param.kind == "tail_policy")
-      schedule.tail_policy = symbol->str();
-    else
-      return error("axis_not_realized: " + param.name);
-  }
-  if (schedule.BM <= 0 || schedule.BN <= 0 || schedule.BK <= 0)
-    return error("candidate must bind positive BM, BN, and BK tiles");
-  return schedule;
 }
 
 std::string printOperation(Operation *op) {
@@ -342,7 +203,10 @@ instantiateConcreteMicro(ModuleOp source, const perf::SearchSpace &space,
   instance.bindingFacts = mapping::extractBindingFacts(instance.kernel);
   instance.bindingHash =
       mapping::makeSearchBinding(candidate.id, {}).stableHash;
-  const std::string semanticText = printOperation(source);
+  // Provenance names the source the kernel came from as the compiler sees it:
+  // the tuning directives are input metadata that never reach lowering, so a
+  // materialized or replayed artifact must not carry them back in.
+  const std::string semanticText = printOperation(*instance.module);
   const std::string canonical = workload::canonicalWorkloadContract(contract);
   StringRef symbol = SymbolTable::getSymbolName(instance.kernel).getValue();
   // Keep each full component in provenance; the length-delimited hash input
@@ -396,6 +260,13 @@ instantiateAdapterSource(ModuleOp source, const perf::SearchSpace &space,
   CandidateInstance instance;
   instance.module = OwningOpRef<ModuleOp>(cast<ModuleOp>(source->clone()));
   eraseSearchSpaces(*instance.module);
+  // Provenance names the source the kernel came from as the compiler sees it:
+  // the tuning directives are input metadata that never reach lowering, so a
+  // materialized or replayed artifact must not carry them back in. Capture it
+  // before realization, or the text would describe the kernel this candidate
+  // produced rather than the source it came from -- and two schedules of one
+  // source would no longer share a source identity.
+  const std::string semanticText = printOperation(*instance.module);
   const workload::SourceSelection selection{options.sourceSymbol,
                                             options.sourceRootOrdinal};
   auto root = workload::selectSourceRoot(*instance.module, selection, registry,
@@ -420,6 +291,24 @@ instantiateAdapterSource(ModuleOp source, const perf::SearchSpace &space,
   auto schema = (*adapter)->bindings(*root, space);
   if (!schema)
     return schema.takeError();
+
+  // Machine-resource legality is the cheap analytical half of the verdict and
+  // runs before anything is emitted, so a candidate the machine rejects is
+  // reported as illegal rather than as a realization failure. The facts come
+  // from the adapter, because only the family knows what its candidate
+  // realizes; declaring them is not evidence they were realized, which is what
+  // the receipt and the emitted IR are for.
+  auto realized = (*adapter)->realizedFacts(*root, contract, space, candidate);
+  if (!realized)
+    return realized.takeError();
+  if (!options.machine && !space.constraints.empty())
+    return error("candidate legality requires a machine model");
+  machine::MachineModel emptyMachine;
+  perf::LegalityResult legality =
+      perf::checkLegality(space, candidate, *realized,
+                          options.machine ? *options.machine : emptyMachine);
+  if (!legality.legal)
+    return error("candidate is illegal: " + legality.reason);
   // Realization may replace the selected root or its entire source function.
   // Capture identity while the selected operation is still alive.
   const std::string symbol = enclosingSymbol(*instance.module, *root);
@@ -450,7 +339,6 @@ instantiateAdapterSource(ModuleOp source, const perf::SearchSpace &space,
   instance.bindingFacts = mapping::extractBindingFacts(instance.kernel);
   instance.bindingHash = candidateBindingHash(candidate);
 
-  const std::string semanticText = printOperation(source);
   const std::string canonical = workload::canonicalWorkloadContract(contract);
   const std::string ordinal = std::to_string(options.sourceRootOrdinal);
   // Source identity is the original source content, the contract it implements,
@@ -542,6 +430,41 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
           workload::validateCandidateBindings(space, candidate))
     return std::move(invalid);
 
+  // A semantic source is realized behind the generic adapter boundary. This
+  // entry point is now only a translation: the selected root still has to
+  // match the supplied workload exactly, but the adapter -- not this file --
+  // owns what a contraction is, and the realization itself runs the same path
+  // every other source family uses.
+  if (options.sourceMode == SourceMode::SemanticSource) {
+    workload::SourceAdapterRegistry registry =
+        workload::makeDefaultSourceAdapters();
+    workload::SourceSelection selection{options.sourceSymbol,
+                                        options.sourceRootOrdinal};
+    auto selected = workload::selectSourceRoot(source, selection, registry,
+                                               options.adapterKey);
+    if (!selected)
+      return selected.takeError();
+    auto sourceShape = workload::describeContractionShape(*selected);
+    if (!sourceShape)
+      return sourceShape.takeError();
+    if (sourceShape->M != shape.M || sourceShape->N != shape.N ||
+        sourceShape->K != shape.K ||
+        sourceShape->inputDType != shape.inputDType ||
+        sourceShape->weightDType != shape.weightDType ||
+        sourceShape->accumulatorDType != shape.accumulatorDType ||
+        sourceShape->outputDType != shape.outputDType)
+      return error("original source contraction facts do not match the "
+                   "supplied workload");
+    auto adapter = registry.resolve(*selected, options.adapterKey);
+    if (!adapter)
+      return adapter.takeError();
+    auto contract = (*adapter)->describe(*selected);
+    if (!contract)
+      return contract.takeError();
+    return instantiateCandidate(source, space, candidate, *contract, options,
+                                registry);
+  }
+
   CandidateInstance instance;
   instance.module = OwningOpRef<ModuleOp>(cast<ModuleOp>(source->clone()));
   // The search-space op is input metadata for this instantiation, not part of
@@ -587,116 +510,6 @@ instantiateCandidate(ModuleOp source, const perf::SearchSpace &space,
                    "supplied workload");
     if (instance.bindingFacts.contractions.empty())
       return error("ConcreteMicro source has no retained contraction facts");
-  } else {
-    auto selected = selectRoot(*instance.module, options);
-    if (!selected)
-      return selected.takeError();
-    auto sourceShape = rootShape(*selected);
-    if (!sourceShape)
-      return sourceShape.takeError();
-    if (sourceShape->M != shape.M || sourceShape->N != shape.N ||
-        sourceShape->K != shape.K ||
-        sourceShape->inputDType != shape.inputDType ||
-        sourceShape->weightDType != shape.weightDType ||
-        sourceShape->accumulatorDType != shape.accumulatorDType ||
-        sourceShape->outputDType != shape.outputDType)
-      return error("original source contraction facts do not match the "
-                   "supplied workload");
-    instance.bindingFacts.originalWorkload = *sourceShape;
-    std::optional<int64_t> bm = candidate.integer("BM");
-    std::optional<int64_t> bn = candidate.integer("BN");
-    std::optional<int64_t> bk = candidate.integer("BK");
-    std::optional<StringRef> tail = std::nullopt;
-    if (const perf::SearchParam *tailParam =
-            space.findParamOfKind("tail_policy"))
-      tail = candidate.symbol(tailParam->name);
-    if (!bm || !bn || !bk)
-      return error(
-          "candidate must bind BM, BN, and BK before legality checking");
-    const bool padded = tail && *tail == "pad";
-    perf::WorkloadShape contraction = *sourceShape;
-    contraction.M = padded ? *bm : std::min(*bm, sourceShape->M);
-    contraction.N = padded ? *bn : std::min(*bn, sourceShape->N);
-    contraction.K = padded ? *bk : std::min(*bk, sourceShape->K);
-    contraction.outputDType = sourceShape->accumulatorDType;
-    instance.bindingFacts.contractions.push_back(contraction);
-    if ((*selected)->getName().getStringRef() == "llk.fused_swiglu")
-      instance.bindingFacts.contractions.push_back(contraction);
-
-    if (!options.machine && !space.constraints.empty())
-      return error("candidate legality requires a machine model");
-    machine::MachineModel emptyMachine;
-    perf::LegalityResult legality =
-        perf::checkLegality(space, candidate, instance.bindingFacts,
-                            options.machine ? *options.machine : emptyMachine);
-    if (!legality.legal)
-      return error("candidate is illegal: " + legality.reason);
-    auto schedule = toSchedule(space, candidate);
-    if (!schedule)
-      return schedule.takeError();
-
-    std::string semanticText = printOperation(*selected);
-    instance.sourceGraphHash = mapping::stableHash(semanticText);
-    auto exported =
-        exportMicroKernelFromSchedule(*instance.module, options.sourceSymbol,
-                                      options.sourceRootOrdinal, *schedule);
-    if (!exported)
-      return exported.takeError();
-    instance.kernel = *exported;
-    llvm::SmallVector<SmallVector<int64_t, 3>, 2> emittedContractions;
-    instance.kernel->walk([&](Operation *op) {
-      if (op->getName().getStringRef() != "micro.mma")
-        return;
-      auto dims = op->getAttrOfType<DenseI64ArrayAttr>("shape");
-      if (dims && dims.size() == 3)
-        emittedContractions.push_back({dims[0], dims[1], dims[2]});
-    });
-    if (emittedContractions.size() != instance.bindingFacts.contractions.size())
-      return error(
-          "bound Micro-IR contraction count does not match source semantics");
-    for (size_t i = 0; i < emittedContractions.size(); ++i) {
-      const perf::WorkloadShape &fact = instance.bindingFacts.contractions[i];
-      if (emittedContractions[i][0] != fact.M ||
-          emittedContractions[i][1] != fact.N ||
-          emittedContractions[i][2] != fact.K)
-        return error("bound Micro-IR contraction facts do not match the "
-                     "candidate and original extents");
-    }
-    perf::BindingFacts emittedFacts =
-        mapping::extractBindingFacts(instance.kernel);
-    auto sameShape = [](const perf::WorkloadShape &lhs,
-                        const perf::WorkloadShape &rhs) {
-      return lhs.M == rhs.M && lhs.N == rhs.N && lhs.K == rhs.K &&
-             lhs.inputDType == rhs.inputDType &&
-             lhs.weightDType == rhs.weightDType &&
-             lhs.accumulatorDType == rhs.accumulatorDType &&
-             lhs.outputDType == rhs.outputDType;
-    };
-    if (!emittedFacts.originalWorkload ||
-        !sameShape(*emittedFacts.originalWorkload, *sourceShape) ||
-        emittedFacts.contractions.size() !=
-            instance.bindingFacts.contractions.size())
-      return error("exported original/bound contraction facts do not match the "
-                   "selected source root");
-    for (size_t i = 0; i < emittedFacts.contractions.size(); ++i)
-      if (!sameShape(emittedFacts.contractions[i],
-                     instance.bindingFacts.contractions[i]))
-        return error("exported contraction dtype or extent does not match the "
-                     "selected source root");
-    instance.bindingFacts = std::move(emittedFacts);
-    instance.kernel->setAttr(
-        "source_symbol",
-        StringAttr::get(source.getContext(), options.sourceSymbol));
-    instance.kernel->setAttr(
-        "source_root_ordinal",
-        IntegerAttr::get(IntegerType::get(source.getContext(), 64),
-                         options.sourceRootOrdinal));
-    instance.kernel->setAttr(
-        "source_graph_hash",
-        IntegerAttr::get(IntegerType::get(source.getContext(), 64),
-                         llvm::APInt(64, instance.sourceGraphHash)));
-    instance.kernel->setAttr(
-        "source_semantics", StringAttr::get(source.getContext(), semanticText));
   }
 
   instance.kernel->setAttr("candidate",
