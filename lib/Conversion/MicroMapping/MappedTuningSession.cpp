@@ -512,6 +512,44 @@ llvm::Error completeMappingReceipt(
                                           workload::ReceiptStage::Complete);
 }
 
+using PlanReceipts = std::map<uint64_t, workload::BindingReceipt>;
+
+/// Initial selection and measurement replay must retain the same receipt-valid
+/// domain. Check realization before top-K in both searches; only the initial
+/// search needs to keep the accepted receipt for reporting.
+auto makeCompletePlanEvaluator(const CandidateInstance &instance,
+                               const perf::SearchSpace &space,
+                               const perf::Candidate &candidate,
+                               const mapping::MappingTarget &target,
+                               mapping::BindContract contract,
+                               uint64_t memoryBudget,
+                               PlanReceipts *acceptedReceipts = nullptr) {
+  return [&instance, &space, &candidate, &target, contract, memoryBudget,
+          acceptedReceipts](const mapping::CoveringPlan &proposal)
+             -> llvm::Expected<mapping::CompletePlanEvaluation> {
+    auto evaluation = mapping::evaluateCompletePlan(
+        instance.module.get(), instance.workloadGraph, target, proposal,
+        contract, memoryBudget, mapping::AnalysisRequirement::Complete);
+    if (!evaluation)
+      return evaluation.takeError();
+    if (!evaluation->plan || instance.schema.empty())
+      return evaluation;
+    workload::BindingReceipt receipt = instance.receipt;
+    if (llvm::Error invalid =
+            completeMappingReceipt(space, candidate, instance.schema,
+                                   *evaluation->plan, target, receipt)) {
+      evaluation->rejection = mapping::Diagnostic{
+          mapping::DiagnosticCode::GlobalConstraintFailed,
+          "mapping_receipt: " + llvm::toString(std::move(invalid))};
+      evaluation->plan.reset();
+      return evaluation;
+    }
+    if (acceptedReceipts)
+      (*acceptedReceipts)[evaluation->plan->id] = std::move(receipt);
+    return evaluation;
+  };
+}
+
 llvm::Error measureSelectedCandidates(ModuleOp source,
                                       const perf::SearchSpace &space,
                                       const mapping::MappingTarget &target,
@@ -575,15 +613,9 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
     auto binding = toBinding(candidate.ranking.candidate);
     mapping::MappingSearchOptions searchOptions = options.mapping;
     searchOptions.requireCompleteEvaluation = true;
-    searchOptions.evaluateCompletePlan =
-        [module = instance->module.get(), graph = &instance->workloadGraph,
-         &target, memoryBudget = searchOptions.memoryBudgetBytes](
-            const mapping::CoveringPlan &proposal)
-        -> llvm::Expected<mapping::CompletePlanEvaluation> {
-      return mapping::evaluateCompletePlan(
-          module, *graph, target, proposal, mapping::BindContract::Executable,
-          memoryBudget, mapping::AnalysisRequirement::Complete);
-    };
+    searchOptions.evaluateCompletePlan = makeCompletePlanEvaluator(
+        *instance, space, candidate.ranking.candidate, target,
+        mapping::BindContract::Executable, searchOptions.memoryBudgetBytes);
     mapping::CoveringSearch search(
         instance->workloadGraph, target, *instance->module->getContext(),
         layoutContext(instance->workloadGraph), searchOptions, binding,
@@ -785,35 +817,10 @@ runMappedTuningSessionImpl(ModuleOp source, const perf::SearchSpace &space,
     // retained, so the plan-specific mapping receipt is completed and checked
     // here. A failed receipt rejects that proposal and the search keeps
     // enumerating; it is never a post-top-K filter.
-    std::map<uint64_t, workload::BindingReceipt> acceptedReceipts;
-    const CandidateInstance *instancePtr = &*instance;
+    PlanReceipts acceptedReceipts;
     searchOptions.evaluateCompletePlan =
-        [module = instance->module.get(), graph = &instance->workloadGraph,
-         &target, contract, memoryBudget, &space, &candidate, instancePtr,
-         &acceptedReceipts](const mapping::CoveringPlan &proposal)
-        -> llvm::Expected<mapping::CompletePlanEvaluation> {
-      auto evaluation = mapping::evaluateCompletePlan(
-          module, *graph, target, proposal, contract, memoryBudget,
-          mapping::AnalysisRequirement::Complete);
-      if (!evaluation)
-        return evaluation.takeError();
-      if (!evaluation->plan)
-        return evaluation;
-      if (instancePtr->schema.empty())
-        return evaluation;
-      workload::BindingReceipt receipt = instancePtr->receipt;
-      if (llvm::Error invalid =
-              completeMappingReceipt(space, candidate, instancePtr->schema,
-                                     *evaluation->plan, target, receipt)) {
-        evaluation->rejection = mapping::Diagnostic{
-            mapping::DiagnosticCode::GlobalConstraintFailed,
-            "mapping_receipt: " + llvm::toString(std::move(invalid))};
-        evaluation->plan.reset();
-        return evaluation;
-      }
-      acceptedReceipts[evaluation->plan->id] = std::move(receipt);
-      return evaluation;
-    };
+        makeCompletePlanEvaluator(*instance, space, candidate, target, contract,
+                                  memoryBudget, &acceptedReceipts);
     searchOptions.requireCompleteEvaluation = true;
     mapping::CoveringSearch search(
         instance->workloadGraph, target, *instance->module->getContext(),

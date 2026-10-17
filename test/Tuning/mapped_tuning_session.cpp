@@ -88,6 +88,38 @@ private:
   const mlir::llk::mapping::MappingTarget &base_;
 };
 
+class RulesOverrideTarget final : public mlir::llk::mapping::MappingTarget {
+public:
+  RulesOverrideTarget(const mlir::llk::mapping::MappingTarget &base,
+                      mlir::llk::mapping::RuleRegistry rules)
+      : base_(base), rules_(std::move(rules)) {}
+  llvm::StringRef name() const override { return base_.name(); }
+  const mlir::llk::machine::MachineModel &machine() const override {
+    return base_.machine();
+  }
+  const mlir::llk::mapping::LayoutRegistry &layouts() const override {
+    return base_.layouts();
+  }
+  const mlir::llk::mapping::RuleRegistry &rules() const override {
+    return rules_;
+  }
+  bool isKnownEmitter(llvm::StringRef key) const override {
+    return base_.isKnownEmitter(key);
+  }
+  std::unique_ptr<mlir::llk::mapping::TargetEmitter>
+  createEmitter(llvm::StringRef key) const override {
+    return base_.createEmitter(key);
+  }
+  std::optional<mlir::llk::mapping::TargetCodegenRequirements>
+  codegenRequirements() const override {
+    return base_.codegenRequirements();
+  }
+
+private:
+  const mlir::llk::mapping::MappingTarget &base_;
+  mlir::llk::mapping::RuleRegistry rules_;
+};
+
 mlir::OwningOpRef<mlir::ModuleOp> parseSource(mlir::MLIRContext &context) {
   constexpr llvm::StringLiteral sourceText = R"mlir(
     module {
@@ -615,6 +647,113 @@ TEST(MappedTuningSessionTest, OwnerReceiptResolvesIntermediateOwners) {
       EXPECT_EQ(report->ranked.front().receipt.mapping,
                 (std::vector<std::string>{"Owners"}));
   }
+}
+
+TEST(MappedTuningSessionTest, MeasurementReplayRetainsReceiptValidPlan) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseElementwiseSource(context);
+  ASSERT_TRUE(source);
+  auto base = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(base)) << llvm::toString(base.takeError());
+  auto contract = describeElementwise(*source);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  // This competing rule implements add without consuming the bound layout.
+  // Initial selection and replay must both reject it before retaining top-1.
+  mlir::llk::mapping::RuleRegistry rules = (*base)->rules();
+  const auto *add = rules.find("avx2.vector_add");
+  ASSERT_NE(add, nullptr);
+  auto alternate = *add;
+  alternate.id = "review.no_layout_0";
+  alternate.layoutRequirements.clear();
+  std::string error;
+  ASSERT_TRUE(rules.add(std::move(alternate), error)) << error;
+  RulesOverrideTarget target(**base, std::move(rules));
+
+  auto space = elementwiseTiledSpace();
+  space.params[0].choices = {mlir::llk::perf::SearchChoice(int64_t{4})};
+  space.params[1].choices = {mlir::llk::perf::SearchChoice(int64_t{8})};
+  mlir::llk::perf::SearchParam layout;
+  layout.name = "L";
+  layout.kind = "layout";
+  layout.role = "operand0";
+  layout.choices = {mlir::llk::perf::SearchChoice("blocked")};
+  space.params.push_back(layout);
+  auto options = elementwiseOptions();
+  options.executable = false;
+  options.backend = ::llk::MappedBackend::Reference;
+  options.mapping.topK = 1;
+  auto initial = mlir::llk::tuning::runMappedTuningSession(
+      *source, space, *contract, target, options);
+  ASSERT_TRUE(bool(initial)) << llvm::toString(initial.takeError());
+  ASSERT_EQ(initial->ranked.size(), 1u);
+  const uint64_t selectedId = initial->ranked.front().plan.id;
+  EXPECT_EQ(initial->ranked.front().receipt.mapping,
+            (std::vector<std::string>{"L"}));
+
+  using namespace mlir::llk::tuning;
+  options.measurement.inputs = [](const ::llk::KernelAbi &abi)
+      -> llvm::Expected<OwnedInvocationBuffers> {
+    OwnedInvocationBuffers owned;
+    auto allocate = [&](const ::llk::KernelAbi::Port &port,
+                        float value) -> ::llk::InvocationBuffer2D {
+      const size_t count = static_cast<size_t>(port.shape[0] * port.shape[1]);
+      owned.storage.emplace_back(count * sizeof(float));
+      auto *data = reinterpret_cast<float *>(owned.storage.back().data());
+      std::fill_n(data, count, value);
+      return {{data, data, 0, port.shape[0], port.shape[1], port.shape[1], 1},
+              ::llk::InvocationElementType::F32,
+              count * sizeof(float)};
+    };
+    for (size_t i = 0; i < abi.inputs.size(); ++i)
+      owned.inputs.push_back(allocate(abi.inputs[i], i == 0 ? 1.0f : 2.0f));
+    for (const auto &port : abi.outputs)
+      owned.outputs.push_back(allocate(port, 0.0f));
+    return owned;
+  };
+  bool measured = false;
+  options.measurement.measure = [&](const MappedMeasurementRequest &request)
+      -> llvm::Expected<std::optional<mlir::llk::perf::CandidateMetrics>> {
+    measured = true;
+    EXPECT_EQ(request.identity.planId, selectedId);
+    EXPECT_EQ(request.candidate.receipt.mapping,
+              (std::vector<std::string>{"L"}));
+    if (llvm::Error invalid =
+            request.executable.invoke(request.inputs, request.outputs))
+      return std::move(invalid);
+    mlir::llk::perf::CandidateMetrics metrics;
+    metrics.measuredNs = 100.0;
+    return std::optional<mlir::llk::perf::CandidateMetrics>(metrics);
+  };
+  options.measurement.verify =
+      [](const MappedTuningCandidate &,
+         llvm::ArrayRef<::llk::InvocationBuffer2D>,
+         llvm::ArrayRef<::llk::InvocationBuffer2D> outputs) -> llvm::Error {
+    for (const auto &output : outputs)
+      for (int64_t i = 0; i < output.descriptor.size0 * output.descriptor.size1;
+           ++i)
+        if (static_cast<float *>(output.descriptor.aligned)[i] != 3.0f)
+          return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                         "elementwise reference mismatch");
+    return llvm::Error::success();
+  };
+  auto report = mlir::llk::tuning::runMappedTuningSession(
+      *source, space, *contract, target, options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  EXPECT_TRUE(measured);
+  ASSERT_EQ(report->ranked.size(), 1u)
+      << (report->rejected.empty() ? ""
+                                   : report->rejected.front().rejectionReason);
+  EXPECT_EQ(report->ranked.front().plan.id, selectedId);
+  ASSERT_TRUE(report->ranked.front().measurementIdentity);
+  EXPECT_EQ(report->ranked.front().measurementIdentity->planId, selectedId);
+  ASSERT_TRUE(report->ranked.front().ranking.metrics.measuredNs);
+  EXPECT_EQ(*report->ranked.front().ranking.metrics.measuredNs, 100.0);
 }
 
 /// A rejected candidate does not end the search: the nondividing tile choice
