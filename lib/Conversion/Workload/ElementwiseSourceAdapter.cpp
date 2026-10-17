@@ -284,6 +284,11 @@ resolveTiles(const ElementwiseProgram &program, const perf::SearchSpace &space,
   for (const ParameterBinding &binding : elementwiseSchema(space)) {
     if (binding.owner != BindingOwner::Source)
       continue;
+    const perf::SearchParam *param = space.findParam(binding.parameter);
+    // A source-owned choice this family does not implement -- a fragment
+    // shape, a tail policy, an unrelated integer -- has no realization here.
+    if (!param || param->kind != "integer")
+      return error("axis_not_realized: " + binding.parameter);
     std::optional<int64_t> value = candidate.integer(binding.parameter);
     if (!value)
       return error("source_binding: " + binding.parameter +

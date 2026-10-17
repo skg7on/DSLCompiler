@@ -747,4 +747,22 @@ TEST_F(ElementwiseSourceAdapter, RejectsUnrealizedIntegerChoice) {
   EXPECT_NE(llvm::toString(instance.takeError())
                 .find("axis_not_realized: vector_width"),
             std::string::npos);
+
+  // A symbolic choice this family does not own is equally unrealized.
+  auto symbolicSpace = tiledSpace({4}, {16});
+  perf::SearchParam fragment;
+  fragment.name = "fragment";
+  fragment.kind = "fragment_shape";
+  fragment.choices = {perf::SearchChoice("8x8x8")};
+  symbolicSpace.params.push_back(fragment);
+  perf::Candidate symbolic = candidateFor(4, 16);
+  symbolic.symbolicValues["fragment"] = "8x8x8";
+  symbolic.id =
+      perf::computeCandidateId(symbolic.values, symbolic.symbolicValues);
+  auto symbolicInstance = tuning::instantiateCandidate(
+      *source, symbolicSpace, symbolic, *contract, sourceOptions(), registry);
+  ASSERT_FALSE(bool(symbolicInstance));
+  EXPECT_NE(llvm::toString(symbolicInstance.takeError())
+                .find("axis_not_realized: fragment"),
+            std::string::npos);
 }
