@@ -1404,8 +1404,13 @@ LogicalResult SearchSpaceOp::verify() {
   if (getWorkload().empty())
     return emitOpError("workload must be non-empty");
 
+  // A space is a singleton only when it says so explicitly. The empty space is
+  // otherwise an error: "no parameters" is not the same as "one schedule".
+  const bool singleton = getSingleton().value_or(false);
+
   llvm::StringMap<ParamOp> params;
   llvm::StringSet<> candidateNames;
+  unsigned candidateCount = 0;
   unsigned objectiveCount = 0;
 
   // First pass: structural rules and the parameter declarations.
@@ -1425,6 +1430,14 @@ LogicalResult SearchSpaceOp::verify() {
       if (!candidateNames.insert(candidate.getSymName()).second)
         return candidate.emitOpError("duplicate candidate name '")
                << candidate.getSymName() << "'";
+      if (singleton) {
+        if (++candidateCount > 1)
+          return emitOpError(
+              "singleton search space admits at most one candidate");
+        if (!candidate.getBindings().empty())
+          return candidate.emitOpError(
+              "singleton candidate must not bind parameters");
+      }
       continue;
     }
     if (isa<ConstraintOp>(op))
@@ -1433,8 +1446,12 @@ LogicalResult SearchSpaceOp::verify() {
         "only search ops are allowed in a micro.search_space");
   }
 
-  if (params.empty())
+  if (singleton) {
+    if (!params.empty())
+      return emitOpError("singleton search space cannot declare parameters");
+  } else if (params.empty()) {
     return emitOpError("search space requires at least one micro.param");
+  }
 
   // Second pass: references between records, which need the parameter set.
   for (Operation &op : getBody().front().without_terminator()) {
@@ -1460,8 +1477,10 @@ LogicalResult SearchSpaceOp::verify() {
       }
       continue;
     }
+    // A singleton candidate binds nothing by construction and was checked in
+    // the first pass; the parameter-binding rules do not apply to it.
     if (auto candidate = dyn_cast<CandidateOp>(op))
-      if (failed(verifyCandidate(candidate, params)))
+      if (!singleton && failed(verifyCandidate(candidate, params)))
         return failure();
   }
 

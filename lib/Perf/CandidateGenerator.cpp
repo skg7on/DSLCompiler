@@ -127,6 +127,17 @@ std::vector<Candidate> generateRandomCandidates(const SearchSpace &space,
 std::vector<Candidate>
 generateCandidates(const SearchSpace &space,
                    const CandidateGeneratorOptions &options) {
+  // A source with no tunable parameter has exactly one schedule, and only an
+  // explicitly declared singleton space says so. An ordinary empty space has
+  // an empty domain, not a one-point one.
+  if (space.params.empty()) {
+    if (!space.singleton ||
+        (options.maxCandidates && *options.maxCandidates == 0))
+      return {};
+    Candidate candidate;
+    candidate.id = computeCandidateId(candidate.values, {});
+    return {std::move(candidate)};
+  }
   switch (options.mode) {
   case SearchMode::Grid:
     return generateGridCandidates(space, options.maxCandidates);

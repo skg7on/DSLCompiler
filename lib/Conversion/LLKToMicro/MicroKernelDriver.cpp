@@ -892,7 +892,8 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
   OpBuilder builder(context);
   builder.setInsertionPointToEnd(module.getBody());
   auto space = micro::SearchSpaceOp::create(
-      builder, loc, symName, StringAttr::get(context, info.workload));
+      builder, loc, symName, StringAttr::get(context, info.workload),
+      /*singleton=*/BoolAttr());
   startRegionBody(builder, space.getBody(), loc);
 
   auto addParam = [&](StringRef name, StringRef kind, ArrayAttr choices) {

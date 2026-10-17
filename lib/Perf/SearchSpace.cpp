@@ -237,6 +237,7 @@ llvm::Expected<SearchSpace> loadSearchSpace(micro::SearchSpaceOp op) {
   SearchSpace space;
   space.name = op.getSymName().str();
   space.workload = op.getWorkload().str();
+  space.singleton = op.getSingleton().value_or(false);
 
   for (Operation &nested : op.getBody().front().without_terminator()) {
     if (auto param = dyn_cast<micro::ParamOp>(nested)) {

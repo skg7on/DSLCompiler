@@ -33,6 +33,8 @@ if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
   add_llk_filecheck_test(MicroDialectSearchSpace test/Dialect/Micro/search_space.mlir)
+  add_llk_filecheck_test(MicroDialectSearchSpaceSingleton
+      test/Dialect/Micro/search_space_singleton.mlir)
   add_llk_filecheck_test(MicroMappingSearchBinding test/Conversion/MicroMapping/search_binding.mlir)
 
   # MicroMappingMap: the --micro-map pass runs the mapping chain (extract ->
@@ -592,6 +594,10 @@ add_test(NAME MicroDialectTileOpsInvalid
 add_test(NAME MicroDialectSearchSpaceInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
             ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/search_space_invalid.mlir
+)
+add_test(NAME MicroDialectSearchSpaceSingletonInvalid
+    COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+            ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/search_space_singleton_invalid.mlir
 )
 # LLKToMicro rejection tests: shapes and schedules the export must refuse with
 # a diagnostic naming the offending axis.
