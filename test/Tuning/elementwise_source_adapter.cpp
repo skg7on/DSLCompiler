@@ -494,6 +494,43 @@ TEST_F(ElementwiseSourceAdapter, RejectsUnsupportedStructures) {
   }
 }
 
+TEST_F(ElementwiseSourceAdapter, RejectsExplicitRoundingModes) {
+  auto fixture = loadFixture("elementwise.mlir");
+  ASSERT_TRUE(fixture);
+  const std::string addText = print(fixture->getOperation());
+  const arith::RoundingMode modes[] = {
+      arith::RoundingMode::to_nearest_even, arith::RoundingMode::downward,
+      arith::RoundingMode::upward, arith::RoundingMode::toward_zero,
+      arith::RoundingMode::to_nearest_away};
+  for (llvm::StringRef operation : {"arith.addf", "arith.mulf"}) {
+    SCOPED_TRACE(operation.str());
+    std::string text = addText;
+    text.replace(text.find("arith.addf"), std::string("arith.addf").size(),
+                 operation.str());
+    for (arith::RoundingMode mode : modes) {
+      SCOPED_TRACE(arith::stringifyRoundingMode(mode).str());
+      auto source = parse(text);
+      ASSERT_TRUE(source);
+      auto registry = workload::makeDefaultSourceAdapters();
+      auto root = workload::selectSourceRoot(*source, {"elementwise", 0},
+                                             registry, elementwiseKey);
+      ASSERT_TRUE(bool(root)) << llvm::toString(root.takeError());
+      Operation &scalar = (*root)->getRegion(0).front().front();
+      scalar.setAttr("roundingmode",
+                     arith::RoundingModeAttr::get(context.get(), mode));
+      ASSERT_TRUE(succeeded(verify(*source)));
+      const std::string before = print(source->getOperation());
+      auto adapter = registry.resolve(*root, elementwiseKey);
+      ASSERT_TRUE(bool(adapter)) << llvm::toString(adapter.takeError());
+      auto described = (*adapter)->describe(*root);
+      ASSERT_FALSE(bool(described));
+      EXPECT_NE(llvm::toString(described.takeError()).find("rounding"),
+                std::string::npos);
+      EXPECT_EQ(print(source->getOperation()), before);
+    }
+  }
+}
+
 TEST_F(ElementwiseSourceAdapter, SourceTileRoleIsDeclaredButNotYetRealized) {
   auto source = loadFixture("elementwise.mlir");
   ASSERT_TRUE(source);

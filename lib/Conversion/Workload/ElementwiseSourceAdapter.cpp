@@ -187,6 +187,11 @@ llvm::Expected<ElementwiseProgram> analyze(Operation *root) {
   auto fastmath = scalarOp->getAttrOfType<arith::FastMathFlagsAttr>("fastmath");
   if (fastmath && fastmath.getValue() != arith::FastMathFlags::none)
     return reject("fastmath", "strict floating-point semantics are required");
+  // MicroIR's vector primitive does not carry an explicit rounding mode.
+  // Reject it rather than silently changing the source's numerical contract.
+  if (scalarOp->hasAttr("roundingmode"))
+    return reject("rounding", "explicit floating-point rounding modes are not "
+                              "supported");
 
   auto yield = dyn_cast<linalg::YieldOp>(body.getTerminator());
   if (!yield || yield.getNumOperands() != 1 ||
