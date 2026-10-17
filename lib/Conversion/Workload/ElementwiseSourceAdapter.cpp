@@ -85,7 +85,7 @@ struct ElementwiseProgram {
   Type elementType;
   SmallVector<Value, 2> inputs;
   Value destination;
-  Value result;
+  OpResult result;
 };
 
 /// The one supported operation is a floating add or multiply. The mnemonic is
