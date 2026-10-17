@@ -43,10 +43,10 @@ Candidate buildCandidate(const SearchSpace &space,
 }
 
 /// The number of points in the space, saturating rather than wrapping. Zero
-/// when any parameter declares no choices.
+/// for an ordinary empty space or when any parameter declares no choices.
 uint64_t domainSize(const SearchSpace &space) {
   if (space.params.empty())
-    return 0;
+    return space.singleton ? 1 : 0;
   uint64_t size = 1;
   for (const SearchParam &param : space.params) {
     if (param.choices.empty())
@@ -73,6 +73,8 @@ generateGridCandidates(const SearchSpace &space,
   std::vector<size_t> indices(space.params.size(), 0);
   while (candidates.size() < cap) {
     candidates.push_back(buildCandidate(space, indices));
+    if (indices.empty())
+      break; // the singleton's empty binding is its only point
 
     size_t position = indices.size();
     while (position > 0) {
@@ -127,17 +129,6 @@ std::vector<Candidate> generateRandomCandidates(const SearchSpace &space,
 std::vector<Candidate>
 generateCandidates(const SearchSpace &space,
                    const CandidateGeneratorOptions &options) {
-  // A source with no tunable parameter has exactly one schedule, and only an
-  // explicitly declared singleton space says so. An ordinary empty space has
-  // an empty domain, not a one-point one.
-  if (space.params.empty()) {
-    if (!space.singleton ||
-        (options.maxCandidates && *options.maxCandidates == 0))
-      return {};
-    Candidate candidate;
-    candidate.id = computeCandidateId(candidate.values, {});
-    return {std::move(candidate)};
-  }
   switch (options.mode) {
   case SearchMode::Grid:
     return generateGridCandidates(space, options.maxCandidates);
