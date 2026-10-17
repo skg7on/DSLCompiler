@@ -287,6 +287,34 @@ protected:
   }
 };
 
+TEST(ElementwiseSourceAdapterContext, LoadsMicroDialectBeforeRealization) {
+  DialectRegistry dialects;
+  dialects.insert<micro::MicroDialect, func::FuncDialect, linalg::LinalgDialect,
+                  tensor::TensorDialect, arith::ArithDialect>();
+  MLIRContext context(dialects);
+  auto buffer = llvm::MemoryBuffer::getFile(
+      std::string(LLK_SOURCE_DIR) +
+      "/test/Tuning/Inputs/framework/elementwise.mlir");
+  ASSERT_TRUE(bool(buffer));
+  auto source = parseSourceString<ModuleOp>((*buffer)->getBuffer(), &context);
+  ASSERT_TRUE(source);
+  ASSERT_EQ(context.getLoadedDialect<micro::MicroDialect>(), nullptr);
+
+  auto registry = workload::makeDefaultSourceAdapters();
+  auto root = workload::selectSourceRoot(*source, {"elementwise", 0}, registry,
+                                         elementwiseKey);
+  ASSERT_TRUE(bool(root)) << llvm::toString(root.takeError());
+  auto adapter = registry.resolve(*root, elementwiseKey);
+  ASSERT_TRUE(bool(adapter)) << llvm::toString(adapter.takeError());
+  auto contract = (*adapter)->describe(*root);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+  auto instance = tuning::instantiateCandidate(*source, singletonSpace(),
+                                               singletonCandidate(), *contract,
+                                               sourceOptions(), registry);
+  ASSERT_TRUE(bool(instance)) << llvm::toString(instance.takeError());
+  EXPECT_TRUE(succeeded(verify(*instance->module)));
+}
+
 TEST_F(ElementwiseSourceAdapter, DescribesBoundedElementwiseContract) {
   auto source = loadFixture("elementwise.mlir");
   ASSERT_TRUE(source);

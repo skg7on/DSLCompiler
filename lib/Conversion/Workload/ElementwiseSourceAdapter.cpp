@@ -335,6 +335,8 @@ public:
         return error("axis_not_realized: " + binding.parameter);
 
     MLIRContext *context = clone.getContext();
+    // Parsing a Linalg-only source does not load the output dialect.
+    context->getOrLoadDialect<micro::MicroDialect>();
     Location loc = selectedRoot->getLoc();
 
     std::string base = enclosingSymbol(selectedRoot);
