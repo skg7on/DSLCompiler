@@ -22,6 +22,7 @@
 #include "LLK/Conversion/Workload/SourceAdapter.h"
 
 #include "LLK/Conversion/Workload/ContractionSourceAdapter.h"
+#include "LLK/Conversion/Workload/ElementwiseSourceAdapter.h"
 #include "LLK/Perf/Legality.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -141,6 +142,7 @@ SourceAdapterRegistry makeDefaultSourceAdapters() {
   // added only once an adapter exists to recognize it.
   SourceAdapterRegistry registry;
   (void)registry.add(makeContractionSourceAdapter());
+  (void)registry.add(makeElementwiseSourceAdapter());
   return registry;
 }
 

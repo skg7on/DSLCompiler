@@ -17,6 +17,7 @@ add_llk_library(LLKSourceCandidates
     SourceAdapter.cpp
     BindingSchema.cpp
     ContractionSourceAdapter.cpp
+    ElementwiseSourceAdapter.cpp
     LINK_LIBRARIES LLKWorkloadContracts LLKPerf LLKKernel LLKToMicro
                    MicroDialect LLKDialect LLK::MLIR
 )

@@ -125,9 +125,15 @@ llvm::Error verifyConcreteContract(Operation *kernel,
     bool input = i < type.getNumInputs();
     auto direction = input ? workload::PortDirection::Input
                            : workload::PortDirection::Output;
-    auto effect =
-        input ? workload::PortEffect::Read : workload::PortEffect::Write;
-    if (port.direction != direction || port.effect != effect)
+    // An input port is read, except when it is a destination whose contents
+    // are never consumed (`PortEffect::None`). Such a port is still part of
+    // the ordered signature -- a local `tensor.empty` destination is passed,
+    // not fabricated -- but the kernel must not read it.
+    const bool effectMatches =
+        input ? port.effect == workload::PortEffect::Read ||
+                    port.effect == workload::PortEffect::None
+              : port.effect == workload::PortEffect::Write;
+    if (port.direction != direction || !effectMatches)
       return error("workload_contract: port '" + port.name +
                    "' direction/effect does not match tensor signature");
     Type signatureType =
