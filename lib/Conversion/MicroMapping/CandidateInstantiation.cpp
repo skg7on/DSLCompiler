@@ -136,6 +136,15 @@ llvm::Error verifyConcreteContract(Operation *kernel,
     if (port.direction != direction || !effectMatches)
       return error("workload_contract: port '" + port.name +
                    "' direction/effect does not match tensor signature");
+    if (input && port.effect == workload::PortEffect::None) {
+      // Only completely unused inputs have no incoming data effect. Keep this
+      // conservative until logical-only uses have an explicit effect analysis.
+      if (kernel->getNumRegions() != 1 || kernel->getRegion(0).empty() ||
+          i >= kernel->getRegion(0).front().getNumArguments() ||
+          !kernel->getRegion(0).front().getArgument(i).use_empty())
+        return error("workload_contract: port '" + port.name +
+                     "' with effect none requires an unused kernel input");
+    }
     Type signatureType =
         input ? type.getInput(i) : type.getResult(i - type.getNumInputs());
     auto tensor = dyn_cast<RankedTensorType>(signatureType);
