@@ -125,11 +125,26 @@ llvm::Error verifyConcreteContract(Operation *kernel,
     bool input = i < type.getNumInputs();
     auto direction = input ? workload::PortDirection::Input
                            : workload::PortDirection::Output;
-    auto effect =
-        input ? workload::PortEffect::Read : workload::PortEffect::Write;
-    if (port.direction != direction || port.effect != effect)
+    // An input port is read, except when it is a destination whose contents
+    // are never consumed (`PortEffect::None`). Such a port is still part of
+    // the ordered signature -- a local `tensor.empty` destination is passed,
+    // not fabricated -- but the kernel must not read it.
+    const bool effectMatches =
+        input ? port.effect == workload::PortEffect::Read ||
+                    port.effect == workload::PortEffect::None
+              : port.effect == workload::PortEffect::Write;
+    if (port.direction != direction || !effectMatches)
       return error("workload_contract: port '" + port.name +
                    "' direction/effect does not match tensor signature");
+    if (input && port.effect == workload::PortEffect::None) {
+      // Only completely unused inputs have no incoming data effect. Keep this
+      // conservative until logical-only uses have an explicit effect analysis.
+      if (kernel->getNumRegions() != 1 || kernel->getRegion(0).empty() ||
+          i >= kernel->getRegion(0).front().getNumArguments() ||
+          !kernel->getRegion(0).front().getArgument(i).use_empty())
+        return error("workload_contract: port '" + port.name +
+                     "' with effect none requires an unused kernel input");
+    }
     Type signatureType =
         input ? type.getInput(i) : type.getResult(i - type.getNumInputs());
     auto tensor = dyn_cast<RankedTensorType>(signatureType);

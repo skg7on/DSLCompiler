@@ -764,8 +764,11 @@ TEST(SourceAdapterRegistry, ZeroMatchesIsUnsupported) {
   auto source = parseIn(elementwiseSource);
   ASSERT_TRUE(source);
   Operation *root = nullptr;
+  // A root no registered family claims. The elementwise source's own
+  // `linalg.generic` is claimed by the structured family (B5), so the
+  // unmatched-root property is exercised on a value producer instead.
   (*source).walk([&](Operation *op) {
-    if (!root && op->getName().getStringRef() == "linalg.generic")
+    if (!root && op->getName().getStringRef() == "tensor.empty")
       root = op;
   });
   ASSERT_TRUE(root);
@@ -1088,7 +1091,17 @@ TEST_F(FrameworkTest, DescribedContractMustMatchTheSuppliedContract) {
 }
 
 TEST_F(FrameworkTest, DefaultAdaptersRejectASemanticSource) {
-  auto source = parseIn(elementwiseSource);
+  // A function whose top-level roots no built-in family recognizes: the
+  // structured family claims `linalg.generic`, so only an unclaimed root
+  // exercises the unsupported-source path.
+  constexpr llvm::StringLiteral unrecognizedSource = R"mlir(
+module {
+  func.func @elementwise(%a: tensor<8x16xf32>) -> tensor<8x16xf32> {
+    %empty = tensor.empty() : tensor<8x16xf32>
+    return %empty : tensor<8x16xf32>
+  }
+})mlir";
+  auto source = parseIn(unrecognizedSource);
   ASSERT_TRUE(source);
   tuning::CandidateInstantiationOptions options;
   options.sourceMode = tuning::SourceMode::SemanticSource;

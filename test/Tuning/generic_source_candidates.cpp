@@ -111,6 +111,41 @@ TEST_F(FrameworkTest, DirectElementwiseNeedsNoMmaFacts) {
             workload::canonicalWorkloadContract(addContract()));
 }
 
+TEST_F(FrameworkTest, RejectsReadInputsMarkedAsNone) {
+  auto source = parse(addSource);
+  ASSERT_TRUE(source);
+  const auto before = print(source->getOperation());
+  for (unsigned input = 0; input != 2; ++input) {
+    SCOPED_TRACE(input);
+    auto contract = addContract();
+    contract.ports[input].effect = workload::PortEffect::None;
+    expectError(tuning::instantiateCandidate(*source, singleton(), candidate(),
+                                             contract, options()),
+                "effect none");
+    EXPECT_EQ(print(source->getOperation()), before);
+  }
+}
+
+TEST_F(FrameworkTest, AcceptsUnusedInputMarkedAsNone) {
+  std::string text = addSource.str();
+  const std::string arg = "%b: tensor<8x8xf32>";
+  text.replace(text.find(arg), arg.size(), arg + ", %init: tensor<8x8xf32>");
+  auto source = parse(text);
+  ASSERT_TRUE(source);
+  auto contract = addContract();
+  contract.ports.insert(contract.ports.begin() + 2,
+                        {"init",
+                         workload::PortDirection::Input,
+                         workload::PortEffect::None,
+                         {8, 8},
+                         "f32"});
+  auto result = tuning::instantiateCandidate(*source, singleton(), candidate(),
+                                             contract, options());
+  ASSERT_TRUE(bool(result)) << llvm::toString(result.takeError());
+  EXPECT_TRUE(succeeded(verify(*result->module)));
+  EXPECT_TRUE(result->kernel->getRegion(0).front().getArgument(2).use_empty());
+}
+
 TEST_F(FrameworkTest, RejectsMismatchedOrderedPorts) {
   auto source = parse(addSource);
   ASSERT_TRUE(source);
