@@ -8,8 +8,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Conversion/MicroMapping/MappedTuningSession.h"
+#include "LLK/Conversion/Workload/SourceAdapter.h"
+#include "LLK/Conversion/Workload/WorkloadContract.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
+#include "LLK/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -24,6 +27,8 @@
 #include "gtest/gtest.h"
 
 #include <algorithm>
+#include <set>
+#include <string>
 
 #ifndef LLK_SOURCE_DIR
 #error "LLK_SOURCE_DIR must name the repository root"
@@ -97,6 +102,63 @@ mlir::OwningOpRef<mlir::ModuleOp> parseSource(mlir::MLIRContext &context) {
     }
   )mlir";
   return mlir::parseSourceString<mlir::ModuleOp>(sourceText, &context);
+}
+
+constexpr llvm::StringLiteral elementwiseAdapterKey = "linalg-elementwise-v1";
+
+/// The bounded structured source fixture: a rank-two f32 elementwise add.
+mlir::OwningOpRef<mlir::ModuleOp>
+parseElementwiseSource(mlir::MLIRContext &context) {
+  auto buffer = llvm::MemoryBuffer::getFile(
+      std::string(LLK_SOURCE_DIR) +
+      "/test/Tuning/Inputs/framework/elementwise.mlir");
+  if (!buffer)
+    return {};
+  return mlir::parseSourceString<mlir::ModuleOp>((*buffer)->getBuffer(),
+                                                 &context);
+}
+
+/// Two source-owned tile axes: d0 (8) by T0 and d1 (16) by T1.
+mlir::llk::perf::SearchSpace elementwiseTiledSpace() {
+  using namespace mlir::llk::perf;
+  SearchSpace space;
+  space.name = "elementwise";
+  SearchParam t0;
+  t0.name = "T0";
+  t0.kind = "integer";
+  t0.role = "axis:d0";
+  t0.choices = {SearchChoice(int64_t{4}), SearchChoice(int64_t{8})};
+  SearchParam t1;
+  t1.name = "T1";
+  t1.kind = "integer";
+  t1.role = "axis:d1";
+  t1.choices = {SearchChoice(int64_t{8}), SearchChoice(int64_t{16})};
+  space.params = {std::move(t0), std::move(t1)};
+  return space;
+}
+
+llvm::Expected<mlir::llk::workload::WorkloadContract>
+describeElementwise(mlir::ModuleOp source) {
+  using namespace mlir::llk;
+  workload::SourceAdapterRegistry registry =
+      workload::makeDefaultSourceAdapters();
+  auto root = workload::selectSourceRoot(source, {"elementwise", 0}, registry,
+                                         elementwiseAdapterKey);
+  if (!root)
+    return root.takeError();
+  auto adapter = registry.resolve(*root, elementwiseAdapterKey);
+  if (!adapter)
+    return adapter.takeError();
+  return (*adapter)->describe(*root);
+}
+
+mlir::llk::tuning::MappedTuningOptions elementwiseOptions() {
+  mlir::llk::tuning::MappedTuningOptions options;
+  options.source.sourceSymbol = "elementwise";
+  options.source.adapterKey = elementwiseAdapterKey.str();
+  options.mapping.mode = mlir::llk::mapping::SearchMode::Exact;
+  options.mapping.topK = 8;
+  return options;
 }
 
 mlir::llk::perf::WorkloadShape testShape() {
@@ -381,6 +443,312 @@ TEST(MappedTuningSessionTest, MeasuresExactExecutableAndKeepsIdentity) {
   EXPECT_TRUE(noMeasuredResult->unrankable.front().ranking.legal);
   EXPECT_FALSE(noMeasuredResult->hasMeasuredResult);
   EXPECT_TRUE(noMeasuredResult->measuredCohortOnly);
+}
+
+/// The contract-based overload takes a source family that is not a contraction:
+/// four tile bindings realize four schedules of one source and all enter the
+/// existing complete-plan search.
+TEST(MappedTuningSessionTest, ContractOverloadRanksElementwiseTiledSchedules) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseElementwiseSource(context);
+  ASSERT_TRUE(source);
+  auto target = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto contract = describeElementwise(*source);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  auto options = elementwiseOptions();
+  options.executable = false;
+  auto report = mlir::llk::tuning::runMappedTuningSession(
+      *source, elementwiseTiledSpace(), *contract, **target, options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  EXPECT_EQ(report->generated, 4u);
+  ASSERT_EQ(report->ranked.size(), 4u)
+      << (report->rejected.empty() ? ""
+                                   : report->rejected.front().rejectionReason);
+
+  std::set<uint64_t> sourceIdentities;
+  std::set<uint64_t> planIdentities;
+  std::set<std::string> bindings;
+  for (const auto &selected : report->ranked) {
+    sourceIdentities.insert(selected.sourceGraphHash);
+    planIdentities.insert(selected.plan.id);
+    bindings.insert(selected.ranking.candidate.id);
+    EXPECT_EQ(selected.receipt.source, (std::vector<std::string>{"T0", "T1"}));
+    EXPECT_TRUE(selected.receipt.mapping.empty());
+    EXPECT_EQ(selected.plan.sourceBindingHash, selected.bindingHash);
+    EXPECT_TRUE(selected.materializationReady);
+  }
+  EXPECT_EQ(sourceIdentities.size(), 1u);
+  EXPECT_EQ(planIdentities.size(), 4u);
+  EXPECT_EQ(bindings.size(), 4u);
+}
+
+/// The same four schedules compile through the selected target down to lowered
+/// IR (not executable code), which is the integration point this increment
+/// claims. Execution stays B7.
+TEST(MappedTuningSessionTest,
+     ContractOverloadLowersElementwiseForSelectedTarget) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseElementwiseSource(context);
+  ASSERT_TRUE(source);
+  auto target = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto contract = describeElementwise(*source);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  auto options = elementwiseOptions();
+  options.executable = true;
+  options.backend = ::llk::MappedBackend::SelectedTarget;
+  auto report = mlir::llk::tuning::runMappedTuningSession(
+      *source, elementwiseTiledSpace(), *contract, **target, options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  EXPECT_EQ(report->generated, 4u);
+  ASSERT_FALSE(report->ranked.empty())
+      << (report->rejected.empty() ? ""
+                                   : report->rejected.front().rejectionReason);
+  for (const auto &selected : report->ranked)
+    EXPECT_TRUE(selected.executable);
+}
+
+/// A mapping-owned choice that the selected plan does not consume is an
+/// unrealized axis. It rejects the candidate inside the completion evaluator,
+/// before top-K retention, rather than being filtered after the search.
+TEST(MappedTuningSessionTest, UnconsumedMappingChoiceRejectsBeforeRetention) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseElementwiseSource(context);
+  ASSERT_TRUE(source);
+  auto target = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto contract = describeElementwise(*source);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  auto space = elementwiseTiledSpace();
+  mlir::llk::perf::SearchParam layout;
+  layout.name = "L";
+  layout.kind = "layout";
+  layout.role = "operand9";
+  layout.choices = {mlir::llk::perf::SearchChoice("row_major")};
+  space.params.push_back(layout);
+
+  auto options = elementwiseOptions();
+  options.executable = false;
+  auto report = mlir::llk::tuning::runMappedTuningSession(
+      *source, space, *contract, **target, options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  EXPECT_EQ(report->generated, 4u);
+  EXPECT_TRUE(report->ranked.empty());
+
+  bool sawReceipt = false;
+  for (const auto &rejected : report->rejected) {
+    if (rejected.rejectionReason.find("mapping_receipt") == std::string::npos)
+      continue;
+    if (rejected.rejectionReason.find("axis_not_realized: L") !=
+        std::string::npos)
+      sawReceipt = true;
+  }
+  EXPECT_TRUE(sawReceipt) << (report->rejected.empty()
+                                  ? ""
+                                  : report->rejected.front().rejectionReason);
+}
+
+/// A rejected candidate does not end the search: the nondividing tile choice
+/// rejects while the dividing one still ranks.
+TEST(MappedTuningSessionTest, SourceRejectionDoesNotEndTheSearch) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseElementwiseSource(context);
+  ASSERT_TRUE(source);
+  auto target = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto contract = describeElementwise(*source);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  auto space = elementwiseTiledSpace();
+  space.params.front().choices = {mlir::llk::perf::SearchChoice(int64_t{3}),
+                                  mlir::llk::perf::SearchChoice(int64_t{4})};
+  auto options = elementwiseOptions();
+  options.executable = false;
+  auto report = mlir::llk::tuning::runMappedTuningSession(
+      *source, space, *contract, **target, options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  EXPECT_EQ(report->generated, 4u);
+  EXPECT_EQ(report->rejectedBySource, 2u);
+  ASSERT_EQ(report->ranked.size(), 2u);
+  for (const auto &rejected : report->rejected)
+    EXPECT_NE(rejected.rejectionReason.find("tile_divisibility"),
+              std::string::npos)
+        << rejected.rejectionReason;
+}
+
+/// A source that offers no tunable choice is serialized as an explicit
+/// singleton space. The loaded space yields its one empty binding and searches
+/// the single schedule; an ordinary empty space would yield no candidates.
+TEST(MappedTuningSessionTest, ExplicitSingletonSearchesItsOnlySchedule) {
+  constexpr llvm::StringLiteral text = R"mlir(
+#id = affine_map<(d0, d1) -> (d0, d1)>
+module {
+  func.func @elementwise(%a: tensor<8x16xf32>, %b: tensor<8x16xf32>)
+      -> tensor<8x16xf32> {
+    %init = tensor.empty() : tensor<8x16xf32>
+    %out = linalg.generic {
+      indexing_maps = [#id, #id, #id],
+      iterator_types = ["parallel", "parallel"]
+    } ins(%a, %b : tensor<8x16xf32>, tensor<8x16xf32>)
+      outs(%init : tensor<8x16xf32>) {
+    ^bb0(%x: f32, %y: f32, %unused: f32):
+      %sum = arith.addf %x, %y : f32
+      linalg.yield %sum : f32
+    } -> tensor<8x16xf32>
+    return %out : tensor<8x16xf32>
+  }
+  micro.search_space @direct attributes {singleton = true, workload = "elementwise"} {
+  }
+}
+)mlir";
+
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = mlir::parseSourceString<mlir::ModuleOp>(text, &context);
+  ASSERT_TRUE(source);
+  auto space = mlir::llk::perf::loadSearchSpace(*source, "direct");
+  ASSERT_TRUE(bool(space)) << llvm::toString(space.takeError());
+  EXPECT_TRUE(space->singleton);
+  EXPECT_TRUE(space->params.empty());
+
+  auto target = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto contract = describeElementwise(*source);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+  auto options = elementwiseOptions();
+  options.executable = false;
+  auto report = mlir::llk::tuning::runMappedTuningSession(
+      *source, *space, *contract, **target, options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  EXPECT_EQ(report->generated, 1u);
+  ASSERT_EQ(report->ranked.size(), 1u)
+      << (report->rejected.empty() ? ""
+                                   : report->rejected.front().rejectionReason);
+  EXPECT_TRUE(report->ranked.front().receipt.source.empty());
+  EXPECT_TRUE(report->ranked.front().receipt.mapping.empty());
+}
+
+/// A contraction-only constraint has no facts on a source that performs no MMA:
+/// it rejects instead of silently passing or fabricating M/N/K. A generic
+/// shape-independent constraint over a mapping-owned choice still evaluates.
+TEST(MappedTuningSessionTest, ContractionConstraintRequiresContractionFacts) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseElementwiseSource(context);
+  ASSERT_TRUE(source);
+  auto target = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto contract = describeElementwise(*source);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+  auto options = elementwiseOptions();
+  options.executable = false;
+
+  auto mmaSpace = elementwiseTiledSpace();
+  mmaSpace.constraints = {
+      {mlir::llk::perf::ConstraintKind::MmaCompatible, {"T0", "T1"}, {}}};
+  auto rejected = mlir::llk::tuning::runMappedTuningSession(
+      *source, mmaSpace, *contract, **target, options);
+  ASSERT_TRUE(bool(rejected)) << llvm::toString(rejected.takeError());
+  EXPECT_TRUE(rejected->ranked.empty());
+  EXPECT_EQ(rejected->rejectedByLegality, 4u);
+  ASSERT_FALSE(rejected->rejected.empty());
+  EXPECT_NE(rejected->rejected.front().rejectionReason.find("mma_compatible"),
+            std::string::npos);
+  EXPECT_NE(rejected->rejected.front().rejectionReason.find("no contraction"),
+            std::string::npos);
+
+  // `layout_supported` needs only the bound symbolic choice and the machine, so
+  // it remains evaluable for a non-contraction source.
+  auto layoutSpace = elementwiseTiledSpace();
+  mlir::llk::perf::SearchParam layout;
+  layout.name = "L";
+  layout.kind = "layout";
+  layout.role = "operand0";
+  layout.choices = {mlir::llk::perf::SearchChoice("blocked")};
+  layoutSpace.params.push_back(layout);
+  layoutSpace.constraints = {
+      {mlir::llk::perf::ConstraintKind::LayoutSupported, {"L"}, {}}};
+  auto accepted = mlir::llk::tuning::runMappedTuningSession(
+      *source, layoutSpace, *contract, **target, options);
+  ASSERT_TRUE(bool(accepted)) << llvm::toString(accepted.takeError());
+  ASSERT_EQ(accepted->ranked.size(), 4u)
+      << (accepted->rejected.empty()
+              ? ""
+              : accepted->rejected.front().rejectionReason);
+  for (const auto &selected : accepted->ranked)
+    EXPECT_EQ(selected.receipt.mapping, (std::vector<std::string>{"L"}));
+}
+
+/// The generic accelerator's audited package implements `micro.vector "add"`
+/// but not the movement primitives realization emits. The report names the
+/// exact unimplemented boundary instead of pretending portability.
+TEST(MappedTuningSessionTest, GenericAcceleratorReportsPrimitiveBoundary) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseElementwiseSource(context);
+  ASSERT_TRUE(source);
+  auto target =
+      mlir::llk::target::generic_accel::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto contract = describeElementwise(*source);
+  ASSERT_TRUE(bool(contract)) << llvm::toString(contract.takeError());
+
+  auto options = elementwiseOptions();
+  options.executable = false;
+  auto report = mlir::llk::tuning::runMappedTuningSession(
+      *source, elementwiseTiledSpace(), *contract, **target, options);
+  ASSERT_TRUE(bool(report)) << llvm::toString(report.takeError());
+  EXPECT_TRUE(report->ranked.empty());
+  ASSERT_FALSE(report->rejected.empty());
+
+  bool sawNoRule = false;
+  bool sawPrimitive = false;
+  for (const auto &rejected : report->rejected) {
+    sawNoRule |=
+        rejected.rejectionReason.find("no_matching_rule") != std::string::npos;
+    sawPrimitive |=
+        rejected.rejectionReason.find("micro.tile_async_copy") !=
+            std::string::npos ||
+        rejected.rejectionReason.find("micro.tile_store") != std::string::npos;
+  }
+  EXPECT_TRUE(sawNoRule) << report->rejected.front().rejectionReason;
+  EXPECT_TRUE(sawPrimitive) << report->rejected.front().rejectionReason;
 }
 
 } // namespace
