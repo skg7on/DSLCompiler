@@ -639,9 +639,16 @@ def Micro_SearchSpaceOp
 
         Candidate bindings are named assignments of the declared parameters,
         and are symbols so that later stages can refer to a specific candidate.
+
+        A source with no tunable parameter has exactly one schedule. Such a
+        space states that explicitly with `singleton = true`, declares no
+        `micro.param`, and carries at most one candidate, which binds nothing.
+        An ordinary empty space remains an error rather than silently becoming
+        a one-point domain.
     }];
 
-  let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$workload);
+  let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$workload,
+      OptionalAttr<BoolAttr>:$singleton);
 
   let regions = (region SizedRegion<1>:$body);
 

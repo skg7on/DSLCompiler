@@ -128,6 +128,11 @@ struct SearchSpace {
   std::vector<SearchParam> params;
   std::vector<SearchConstraint> constraints;
   SearchObjective objective;
+  /// True only when `micro.search_space` explicitly declares `singleton =
+  /// true`: a source with no tunable parameter has exactly one schedule, and
+  /// generation yields that empty binding rather than an empty (unsolved)
+  /// space. An ordinary empty space stays an error.
+  bool singleton = false;
 
   const SearchParam *findParam(llvm::StringRef name) const;
   /// The parameter declared with `kind`, or null when the space declares none
