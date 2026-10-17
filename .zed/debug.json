@@ -26,6 +26,23 @@
     "stopOnEntry": true
   },
   {
+    "label": "Debug TileAndVectorizePass (llk-opt)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "build": "Build LLK tools (Debug)",
+    "program": "$ZED_WORKTREE_ROOT/build/bin/llk-opt",
+    "args": [
+      "--tile-and-vectorize",
+      "--mlir-disable-threading",
+      "$ZED_WORKTREE_ROOT/test/Transforms/tile_and_vectorize.mlir"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "preRunCommands": [
+      "breakpoint set --name 'TileAndVectorizePass::runOnOperation'"
+    ],
+    "stopOnEntry": false
+  },
+  {
     "label": "Debug llk-tune (predicted Micro search)",
     "adapter": "CodeLLDB",
     "request": "launch",
