@@ -2,1573 +2,342 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add `arm-sve` and `arm-sme` as static-conformance mapping targets — machine profiles, LLKMap policy, thin target packages and registration — with contraction bound to the vector engine on SVE and to a ZA matrix engine on SME.
+**Goal:** Deliver two static-conformance ARM targets with typed, capacity-feasible vector/contraction mappings and explicit rejection of executable compilation.
 
-**Architecture:** Each target is pure data plus a ~40-line loader. A machine profile (`machines/arm-*-v2.yaml`) declares topology, lanes and memory spaces; LLKMap files (`mapping/arm-*/`) declare layouts whose vector width is read back from the machine and rules that name bundles and emit keys; a package (`lib/Target/AArch64/Mapping/`) calls `mapping::loadMappingTarget` and returns the resulting `FileMappingTarget` unchanged. Nothing in `lib/Mapping`, `lib/Machine`, the `micro` dialect or the search changes.
+**Architecture:** Repair shared contraction analysis to honor selected vector or matrix compute resources. Add declarative profiles/policy plus file-backed target packages. Prove extraction, complete-plan evaluation, materialization, analysis parity and replay through typed public pipelines; no ARM code generator is implemented.
 
-**Tech Stack:** C++20, MLIR/LLVM 22–24, CMake + Ninja, GoogleTest, the project's own `LLKMap` declarative grammar and `MachineModel` v2 YAML schema.
+**Tech Stack:** C++20, CMake/Ninja, MLIR/LLVM (local configured build; CI 22.1.8), GTest, FileCheck, Python CLI integration, LLKMap and MachineModel v2.
 
-**Spec:** `docs/superpowers/specs/2026-10-17-arm-sve-sme-mapping-targets-design.md`
+**Spec:** [ARM SVE/SME mapping targets](../specs/2026-10-17-arm-sve-sme-mapping-targets-design.md). This revision replaces the original seven-task, configuration-only plan.
 
 ## Global Constraints
 
-- **Worktree only.** All work happens in the isolated worktree; the repository root is read-only.
-- **Build dir:** `build/` at the worktree root, configured with `-DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build`. Configure once; `ninja` thereafter.
-- **Test invocation:** `ninja check-llk` runs the whole registered suite. For a single case use the built binary, e.g. `./build/bin/LLKMappingTests --gtest_filter=ArmSveTarget.*`.
-- **License header:** every new `.h`/`.cpp` starts with the project banner, verbatim:
-  ```
-  //===- <file> - <description> ----------*- C++ -*-===//
-  //
-  // Part of the LLK Compiler Project, under the Apache License v2.0 with
-  // LLVM Exceptions.
-  // See https://llvm.org/LICENSE.txt for license information.
-  // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-  //
-  //===----------------------------------------------------------------------===//
-  ```
-  Copy the banner from `lib/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.cpp`. Do not clang-format it (commit #169 stopped the formatter wrapping banners).
-- **Deprecated API is a hard error** (`-Werror=deprecated-declarations`): use `Op::create(builder, loc, ...)`, `mlir::cast<T>(x)`, `isa<T>(x)`. No `.create<T>()`, `.cast<T>()`, `.isa<T>()`.
-- **No target-name branching in generic code.** `lib/Mapping` and `lib/Machine` must not learn the words `sve`, `sme` or `arm`. Everything target-specific stays in the new files.
-- **No dialect or schema change.** Do not touch `include/LLK/Dialect/Micro/`, `MicroEnums.h`, `MicroDialect.td`, or the MachineModel loader/schema.
-- **Emitter keys are declared, not implemented.** Neither package subclasses `MappingTarget`; both must leave `codegenRequirements()` returning `nullopt` and lowering rejecting with `target_lowering_unsupported`.
-- **Comment density:** match the surrounding files. The shipped profiles and policy files carry substantive header comments explaining *why*; new files are expected to do the same.
-- **Commit per task**, with the trailer `Co-Authored-By: Claude Code <noreply@anthropic.com>`.
+- Work in an isolated worktree under `.claude/worktrees/`; the main checkout is read-only. Do not edit another active session's locked worktree.
+- Run every command below from the worktree root. Configure `build/` using `-DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build`; use `ninja -C build` and `./build/bin/...` consistently.
+- C++20; existing shared LLVM/MLIR linkage; preserve current RTTI/exception settings. No `LLKMapping` dependency on `LLKPerf`, runtime or JIT.
+- Target-neutral shared analysis only: no branching on `arm-sve`, `arm-sme`, target bundle names or emitter prefixes in generic code.
+- No Micro dialect or machine-schema change. No SVE/SME executable emitters, `codegenRequirements`, default tuner-machine selection or legacy SVE stub repair.
+- VL=512 and SVL=512 are independent modeled choices. SVE accumulator capacity 2048 bytes; SME ZA capacity 4096 bytes. No additional disjoint RF pool; never inflate capacities to accept a fixture.
+- Preserve source/numerical semantics, selected resource identity, per-hop storage and complete-plan feasibility before top-K retention. Static completeness does not claim hardware realizability.
+- Prefix/profile/policy/package names and APIs are fixed by spec §§6–8. f32/bf16/i8 vector widths are 16/32/64; use the three-value layout domain, not `[4..16]`.
+- Follow existing license banners and deprecated-API errors. Global test code fully qualifies `mlir::llk::machine` or uses `auto`. Check `llvm::Expected` before dereferencing; propagate errors from non-void helpers.
+- Commit each task with a message describing its deliverable. Do not add fabricated authorship trailers.
+- Register every new C++ source in its category CMake list and every CLI/FileCheck test explicitly. `// RUN:` is documentation only.
+- Historical specs/reviews remain revision-pinned. Update current support enumerations only after implementation and evidence exist.
 
----
+## Review Focus
 
-### Task 1: `arm-sve` machine profile
+- A typed contraction mapped to a vector engine must survive shared analysis, retain `svp`, and contend with vector epilogues on that same pool (Task 1).
+- Initialized accumulators and result extraction must retain their storage/routes; a 512-byte override must reject the 1024-byte live fixture before retention (Tasks 2–4).
+- Mixed-dtype conversion/fusion must solve each operand's layout at its own width, including BF16=32 and i8=64 (Tasks 2 and 4).
+- Both registry names, machine overrides and explicit pass-spec entry points must resolve actual packages, not merely direct factory calls (Tasks 2 and 4).
+- A physically complete static plan must still refuse selected-target compilation; replay/parity must not introduce reference-mode or fabricated measurement claims (Tasks 3–5).
 
-**Files:**
-- Create: `machines/arm-sve-v2.yaml`
-- Modify: `test/Machine/machine_model_loader.cpp` (add one test near the end; add `#include "llvm/Support/MemoryBuffer.h"` to the include block at the top)
+## File map
 
-**Interfaces:**
-- Consumes: nothing.
-- Produces: a profile at `machines/arm-sve-v2.yaml` whose `target` is `arm-sve`, with executor kinds `cluster` (refines `group`), `worker`, `sve_engine` (refines `vector`); a compute node with **id `svp`**, kind `vector_engine`, `lanes: {f32: 16, bf16: 32, i8: 64}`; memory kinds `dram`, `l2`, `sram`, `rf`; and **no** memory of kind `acc`. Tasks 2, 5 and 6 depend on every one of these names.
+| Area | Files and responsibility |
+|---|---|
+| Capability predicate | New `include/LLK/Perf/ContractionSupport.h`, `lib/Perf/ContractionSupport.cpp`; shared vector/matrix dtype-pair predicate |
+| Interpretation | `include/LLK/Perf/OpDAGBuilder.h`, `lib/Perf/{MicroDAG,MicroOpDAGBuilders,Legality}.cpp`, `lib/Perf/CMakeLists.txt` |
+| Analysis tests | Existing `test/Perf/{op_dag_builders,l0_static_bound,l1_resource_dag,legality}.cpp`; extend these fixtures without global target registration |
+| Profiles/policy | New `machines/arm-{sve,sme}-v2.yaml`, `mapping/arm-{sve,sme}/{layouts,rules}.llkmap` |
+| Packages | New `include/LLK/Target/AArch64/Mapping/{SVEMappingTarget,SMEMappingTarget}.h`, `lib/Target/AArch64/Mapping/{SVEMappingTarget,SMEMappingTarget}.cpp`; modify `lib/Target/{CMakeLists.txt,MappingTargets.cpp}` |
+| Loader/package tests | `test/Machine/machine_model_loader.cpp`; new `test/Mapping/arm_targets.cpp`; modify `test/Mapping/CMakeLists.txt` |
+| Public fixture support | New `test/Mapping/arm_target_fixture.{h,cpp}`, `test/Mapping/arm_placement.cpp`; existing canonical materializer and complete-plan evaluator |
+| CLI inputs and tests | New `test/Conversion/MicroMapping/Inputs/arm/{contraction_f32,contraction_bf16}.mlir`, `arm_target_pipeline.py`; explicit CTest registration in `test/FileCheck.cmake` |
+| Current documentation | `docs/manual/source/features.rst`, current target-list paragraphs in `ARCHITECTURE.md`, `CLAUDE.md` and developer manual as applicable |
 
-- [ ] **Step 1: Write the failing test**
+## Preparation and baseline
 
-Append to `test/Machine/machine_model_loader.cpp`:
+- [ ] Read `CLAUDE.md`, its worktree policy, the revised spec and actual target/analysis interfaces before changing code.
+- [ ] Configure and build the baseline:
 
-```cpp
-TEST(MachineModelLoader, LoadsTheShippedArmSveProfile) {
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
-      llvm::MemoryBuffer::getFile(std::string(LLK_MACHINE_DIR) +
-                                  "/arm-sve-v2.yaml");
-  ASSERT_TRUE(static_cast<bool>(buffer)) << "arm-sve profile must ship";
-  llvm::Expected<MachineModel> model =
-      parseMachineModel(buffer.get()->getBuffer(), "arm-sve-v2.yaml");
-  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
-
-  EXPECT_EQ(model->target, "arm-sve");
-
-  // The hierarchy a rule's `require executor kind worker` resolves against.
-  EXPECT_NE(model->findExecutor("worker.0"), nullptr);
-  EXPECT_TRUE(model->ownerMatches("worker", "worker.0"));
-  EXPECT_TRUE(model->ownerMatches("vector", "sve_eng.0"));
-  EXPECT_EQ(model->ownerClass("cluster"), std::optional<std::string>("group"));
-  EXPECT_EQ(model->ownerClass("sve_engine"),
-            std::optional<std::string>("vector"));
-
-  // A modeled 512-bit SVE core: a vector engine, and no accumulator space.
-  const ComputeNode *svp = model->findCompute("svp");
-  ASSERT_NE(svp, nullptr);
-  EXPECT_EQ(svp->kind, "vector_engine");
-  EXPECT_EQ(svp->lanes.at("f32"), 16u);
-  EXPECT_EQ(svp->lanes.at("bf16"), 32u);
-  EXPECT_EQ(svp->lanes.at("i8"), 64u);
-  EXPECT_EQ(model->findMemoryOfKind("acc"), nullptr);
-}
-```
-
-Add to the includes at the top of that file:
-
-```cpp
-#include "llvm/Support/MemoryBuffer.h"
-```
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-```bash
-ninja LLKMachineTests && ./build/bin/LLKMachineTests --gtest_filter=MachineModelLoader.LoadsTheShippedArmSveProfile
-```
-
-Expected: FAIL — the assertion `arm-sve profile must ship` fires because the file does not exist.
-
-- [ ] **Step 3: Write the profile**
-
-Create `machines/arm-sve-v2.yaml`:
-
-```yaml
-# Machine model (v2): ARMv9-A core with SVE2, at a pinned modeled vector length.
-#
-# SVE's defining property is a vector length the implementation chooses at
-# runtime; this profile pins one so the model carries concrete numbers. Nothing
-# downstream hard-codes it: `sve.blocked_2d` requires
-# `VW == machine.compute("vector_engine").lanes(element_type)`, so a profile
-# with a different length is a new file rather than a schema change. Per the
-# Arm Architecture Reference Manual, SVL is a multiple of 128 within
-# [128, 2048]; 512 is also the longest length SME permits, which keeps this
-# profile and arm-sme-v2.yaml describing the same core.
-#
-# The numbers are calibration seeds for a class of ARMv9-A cores, not
-# measurements of any part.
-
-schema: llk.machine.v2
-target: arm-sve
-description: >-
-  ARMv9-A core with SVE2 at a modeled 512-bit vector length, behind a private
-  L1, a shared L2 and DRAM, with one DMA engine.
-clock_hz: 3000000000
-worker_threads: 8
-sync:
-  barrier_cycles: 100
-  wait_cycles: 0
-
-executors:
-  # `worker` is already the abstract spelling, so it refines nothing; the
-  # rules that ask for `kind worker` resolve against it directly. `cluster`
-  # refines `group` and `sve_engine` refines `vector`. The kernel writes these
-  # labels as owner *symbols*; this table is what turns a symbol into a class.
-  - id: cluster.0
-    kind: cluster
-    refines: [group]
-    concurrency: 1
-  - id: worker.0
-    kind: worker
-    parent: cluster.0
-    concurrency: 8
-  - id: sve_eng.0
-    kind: sve_engine
-    refines: [vector]
-    parent: worker.0
-    concurrency: 8
-
-memories:
-  - id: dram.0
-    kind: dram
-    visible_from: cluster.0
-    capacity_bytes: 68719476736
-    alignment_bytes: 64
-    supported_layouts: [row_major]
-    bandwidth_bytes_per_cycle: 32
-    latency_cycles: 220
-  - id: l2.0
-    kind: l2
-    visible_from: cluster.0
-    capacity_bytes: 1048576
-    alignment_bytes: 64
-    supported_layouts: [row_major, vectorized]
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 12
-  - id: sram.0
-    kind: sram
-    visible_from: worker.0
-    capacity_bytes: 65536
-    alignment_bytes: 64
-    supported_layouts: [row_major, vectorized, blocked]
-    banks: 1
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 4
-  - id: rf.0
-    kind: rf
-    visible_from: worker.0
-    # 32 SVE Z registers of SVL bits each, at SVL=512: 32 x 64 B = 2048 B.
-    capacity_bytes: 2048
-    alignment_bytes: 64
-    supported_layouts: [row_major, vectorized]
-    banks: 32
-    bandwidth_bytes_per_cycle: 256
-    latency_cycles: 1
-
-compute:
-  # The vector engine is attached to the worker scope a placement picks; the
-  # `sve_eng.0` executor above exists so an abstract owner of vector kind, and
-  # an owner path through it, still resolve.
-  - id: svp
-    kind: vector_engine
-    refines: [vector]
-    attached_to: worker.0
-    element_types: [f32, bf16, i8]
-    supported_layouts: [row_major, vectorized]
-    # One instruction of the modeled length: 512 / 32, / 16 and / 8 bits.
-    shapes: [[16], [32], [64]]
-    lanes: {f32: 16, bf16: 32, i8: 64}
-    issue_cycles: 1
-    latency_cycles: 4
-    concurrency: 8
-
-transfer_engines:
-  - id: dma.0
-    kind: dma
-    refines: [transfer]
-    attached_to: worker.0
-    count: 1
-    max_outstanding: 8
-    setup_cycles: 0
-
-links:
-  - id: dram_to_l2.0
-    source: dram.0
-    destination: l2.0
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 220
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: l2_to_sram.0
-    source: l2.0
-    destination: sram.0
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 12
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: dram_to_sram.0
-    source: dram.0
-    destination: sram.0
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 220
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: sram_to_rf.0
-    source: sram.0
-    destination: rf.0
-    bandwidth_bytes_per_cycle: 256
-    latency_cycles: 4
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: rf_to_sram.0
-    source: rf.0
-    destination: sram.0
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 4
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: sram_to_dram.0
-    source: sram.0
-    destination: dram.0
-    bandwidth_bytes_per_cycle: 32
-    latency_cycles: 220
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-```
-
-- [ ] **Step 4: Run the test to verify it passes**
-
-```bash
-ninja LLKMachineTests && ./build/bin/LLKMachineTests --gtest_filter=MachineModelLoader.LoadsTheShippedArmSveProfile
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Run the whole machine suite for regressions**
-
-```bash
+```sh
+cmake -S . -B build -G Ninja \
+  -DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build \
+  -DBUILD_TESTING=ON -DLLK_BUILD_E2E_TESTS=ON
+ninja -C build LLKMachineTests LLKMappingTests LLKPerfTests llk-opt micro-perf
 ./build/bin/LLKMachineTests
+./build/bin/LLKMappingTests
+./build/bin/LLKPerfTests
 ```
 
-Expected: all tests pass. If `LoadsTheShippedArmSveProfile` fails on a field name, read `include/LLK/Machine/MachineModel.h` for the real accessor and fix the test — do not change the profile to suit the test.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add machines/arm-sve-v2.yaml test/Machine/machine_model_loader.cpp
-git commit -m "feat(machine): add the arm-sve v2 profile
-
-Co-Authored-By: Claude Code <noreply@anthropic.com>"
-```
+Record source/LLVM/compiler and baseline failures/skips. A known required AVX2 host-capability failure on arm64 is not ARM execution evidence. New static ARM tests must run on every host. Do not claim the full suite is green without a successful full run.
 
 ---
 
-### Task 2: `arm-sve` mapping target
+### Task 1: Selected vector contraction analysis and legality
 
-**Files:**
-- Create: `mapping/arm-sve/layouts.llkmap`
-- Create: `mapping/arm-sve/rules.llkmap`
-- Create: `include/LLK/Target/AArch64/Mapping/SVEMappingTarget.h`
-- Create: `lib/Target/AArch64/Mapping/SVEMappingTarget.cpp`
-- Modify: `lib/Target/CMakeLists.txt` (add one source line to `LLKTargetMapping`)
-- Modify: `lib/Target/MappingTargets.cpp` (one include, one registration)
-- Create: `test/Mapping/arm_sve_target.cpp`
-- Modify: `test/Mapping/CMakeLists.txt` (add `arm_sve_target.cpp` to `SOURCES`)
+**Files:** Shared interpretation/capability files and existing Perf tests in the file map.
 
 **Interfaces:**
-- Consumes: `machines/arm-sve-v2.yaml` from Task 1 — it must declare executor kind `worker`, compute id `svp` of kind `vector_engine` with 16 f32 lanes, and memory kinds `dram`/`sram`.
-- Produces: namespace `mlir::llk::target::sve` with `llvm::ArrayRef<llvm::StringRef> emitterKeys()` returning the ten keys listed in Step 3, and `llvm::Expected<std::unique_ptr<mapping::MappingTarget>> createMappingTarget(llvm::StringRef configurationRoot, llvm::StringRef machinePath = {})`. Registered under the name `arm-sve`. Tasks 5 and 6 consume the emitted keys `sve_mma` and the rule ids `sve.vector_add` / `sve.mma_f32`.
-
-- [ ] **Step 1: Write the failing test**
-
-Create `test/Mapping/arm_sve_target.cpp`. Use the banner from the Global Constraints, with `- the ARM SVE mapping target ` as the description.
+- Consumes: `ComputeNode::{kind,elementTypes,accumulatorDTypes,lanes,throughputPerCycle,shapes}`, mapped compute/executor metadata and existing `EventKind`/`ResourceKind`.
+- Produces in `mlir::llk::perf`:
 
 ```cpp
-#include "LLK/Mapping/CoveringSearch.h"
-#include "LLK/Target/AArch64/Mapping/SVEMappingTarget.h"
-
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/MLIRContext.h"
-#include "mlir/IR/PatternMatch.h"
-
-#include "llvm/Support/Error.h"
-
-#include <gtest/gtest.h>
-
-#include <memory>
-#include <string>
-#include <vector>
-
-using namespace mlir::llk::mapping;
-
-/// Aliased because the tests also have locals named `target`.
-namespace sve_mapping = mlir::llk::target::sve;
-
-#ifndef LLK_SOURCE_DIR
-#error "LLK_SOURCE_DIR must name the repository root"
-#endif
-
-namespace {
-
-mlir::DictionaryAttr vectorAttributes(mlir::MLIRContext &context,
-                                      llvm::StringRef op) {
-  return mlir::DictionaryAttr::get(
-      &context, {mlir::NamedAttribute(mlir::StringAttr::get(&context, "op"),
-                                      mlir::StringAttr::get(&context, op))});
-}
-
-WorkloadGraph vectorGraph(mlir::MLIRContext &context) {
-  WorkloadGraph graph;
-  WorkloadValueId input =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "in", /*external=*/true});
-  WorkloadValueId output =
-      graph.addValue(WorkloadValue{0, mlir::Type(), "out", /*external=*/false});
-  WorkloadNode node;
-  node.opName = "micro.vector";
-  node.attributes = vectorAttributes(context, "add");
-  node.inputs.push_back(WorkloadPort{input, mlir::Type(), std::nullopt});
-  node.outputs.push_back(WorkloadPort{output, mlir::Type(), std::nullopt});
-  graph.addNode(std::move(node));
-  graph.finalize();
-  return graph;
-}
-
-llvm::Expected<std::unique_ptr<MappingTarget>> loadTarget() {
-  return sve_mapping::createMappingTarget(LLK_SOURCE_DIR);
-}
-
-/// A bundle naming `emitterKey` with one well-typed integer parameter.
-TargetBundle makeBundle(llvm::StringRef emitterKey, mlir::MLIRContext &context) {
-  TargetBundle bundle;
-  bundle.name = "sve.vector.add.f32";
-  bundle.emitterKey = emitterKey.str();
-  bundle.parameters = mlir::DictionaryAttr::get(
-      &context,
-      {mlir::NamedAttribute(
-          mlir::StringAttr::get(&context, "tile"),
-          mlir::IntegerAttr::get(mlir::IntegerType::get(&context, 64), 16))});
-  return bundle;
-}
-
-} // namespace
-
-TEST(ArmSveTarget, LoadsAndVerifiesItsConfiguration) {
-  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
-  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
-  EXPECT_EQ((*target)->name(), "arm-sve");
-  EXPECT_NE((*target)->rules().find("sve.vector_add"), nullptr);
-  EXPECT_NE((*target)->layouts().find("sve.row_major"), nullptr);
-  EXPECT_NE((*target)->machine().findExecutor("worker.0"), nullptr);
-  EXPECT_TRUE((*target)->machine().ownerMatches("worker", "worker.0"));
-  EXPECT_TRUE((*target)->machine().ownerMatches("vector", "sve_eng.0"));
-}
-
-TEST(ArmSveTarget, EveryRuleEmitterIsDeclared) {
-  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
-  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
-  for (const RuleDef &rule : (*target)->rules().all())
-    EXPECT_TRUE((*target)->isKnownEmitter(rule.emitter)) << rule.id;
-  EXPECT_FALSE(sve_mapping::emitterKeys().empty());
-}
-
-TEST(ArmSveTarget, ExposesAnEmitterForEachDeclaredKey) {
-  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
-  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
-
-  std::unique_ptr<TargetEmitter> primary = (*target)->createEmitter();
-  ASSERT_NE(primary, nullptr);
-  EXPECT_TRUE((*target)->isKnownEmitter(primary->key()));
-
-  for (llvm::StringRef key : sve_mapping::emitterKeys()) {
-    std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter(key);
-    ASSERT_NE(emitter, nullptr) << key.data();
-    EXPECT_EQ(emitter->key(), key);
-  }
-  EXPECT_EQ((*target)->createEmitter("sve_missing"), nullptr);
-}
-
-TEST(ArmSveTarget, EmitterVerifiesBundleCompleteness) {
-  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
-  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
-  std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter();
-  ASSERT_NE(emitter, nullptr);
-  mlir::MLIRContext context;
-
-  EXPECT_FALSE(
-      static_cast<bool>(emitter->verify(makeBundle(emitter->key(), context))));
-
-  // A parameterless bundle carries a null DictionaryAttr; that is the common
-  // shape and must be accepted, not dereferenced.
-  TargetBundle parameterless = makeBundle(emitter->key(), context);
-  parameterless.parameters = {};
-  EXPECT_FALSE(static_cast<bool>(emitter->verify(parameterless)));
-
-  llvm::Error unknown = emitter->verify(makeBundle("sve_missing", context));
-  ASSERT_TRUE(static_cast<bool>(unknown));
-  EXPECT_NE(llvm::toString(std::move(unknown)).find("sve_missing"),
-            std::string::npos);
-
-  llvm::ArrayRef<llvm::StringRef> keys = sve_mapping::emitterKeys();
-  ASSERT_GE(keys.size(), 2u);
-  std::unique_ptr<TargetEmitter> first = (*target)->createEmitter(keys[0]);
-  ASSERT_NE(first, nullptr);
-  llvm::Error otherKey = first->verify(makeBundle(keys[1], context));
-  ASSERT_TRUE(static_cast<bool>(otherKey));
-  EXPECT_NE(llvm::toString(std::move(otherKey)).find("handles"),
-            std::string::npos);
-
-  TargetBundle malformed = makeBundle(emitter->key(), context);
-  malformed.parameters = mlir::DictionaryAttr::get(
-      &context, {mlir::NamedAttribute(mlir::StringAttr::get(&context, "tile"),
-                                      mlir::UnitAttr::get(&context))});
-  llvm::Error badParameters = emitter->verify(malformed);
-  ASSERT_TRUE(static_cast<bool>(badParameters));
-  EXPECT_NE(llvm::toString(std::move(badParameters)).find("tile"),
-            std::string::npos);
-}
-
-TEST(ArmSveTarget, MapsAVectorNodeEndToEnd) {
-  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
-  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
-  mlir::MLIRContext context;
-  WorkloadGraph graph = vectorGraph(context);
-
-  LayoutContext layoutContext;
-  layoutContext.rank = 2;
-  layoutContext.elementType = "f32";
-  MappingSearchOptions options;
-  options.mode = SearchMode::Deterministic;
-
-  CoveringSearch search(graph, **target, context, layoutContext, options);
-  llvm::Expected<MappingSearchResult> result = search.search();
-  ASSERT_TRUE(static_cast<bool>(result)) << llvm::toString(result.takeError());
-  ASSERT_EQ(result->plans.size(), 1u);
-  EXPECT_EQ(result->plans[0].instances.size(), 1u);
-}
-
-/// The SVE half of the target pair: a vector engine and no accumulator space.
-/// Task 5 contrasts this with arm-sme.
-TEST(ArmSveTarget, ModelsAVectorEngineAndNoAccumulatorSpace) {
-  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
-  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
-  const machine::MachineModel &model = (*target)->machine();
-
-  ASSERT_NE(model.findCompute("svp"), nullptr);
-  EXPECT_EQ(model.findCompute("svp")->kind, "vector_engine");
-  EXPECT_EQ(model.findMemoryOfKind("acc"), nullptr);
-  EXPECT_EQ(model.findCompute("za"), nullptr);
-  EXPECT_EQ(model.ownerClass("sve_engine"),
-            std::optional<std::string>("vector"));
-}
-
-TEST(ArmSveTarget, DoesNotClaimAnExecutableBackend) {
-  // This package ships no lowering: SVE execution is out of scope, and saying
-  // so is the honest answer. A lowering hook that returned success and emitted
-  // nothing would be worse, because the compiler could not then tell a
-  // configured target from an executable one.
-  llvm::Expected<std::unique_ptr<MappingTarget>> target =
-      sve_mapping::createMappingTarget(LLK_SOURCE_DIR);
-  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
-
-  llvm::ArrayRef<llvm::StringRef> keys = sve_mapping::emitterKeys();
-  ASSERT_FALSE(keys.empty());
-
-  mlir::MLIRContext context;
-  mlir::DictionaryAttr noParameters;
-  TargetBundle bundle;
-  bundle.name = "sve.vector.add.f32";
-  bundle.emitterKey = keys.front().str();
-  bundle.parameters = noParameters;
-
-  for (llvm::StringRef key : keys) {
-    std::unique_ptr<TargetEmitter> emitter = (*target)->createEmitter(key);
-    ASSERT_TRUE(emitter) << key.str();
-    bundle.emitterKey = key.str();
-    EXPECT_FALSE(static_cast<bool>(emitter->verify(bundle)))
-        << "a well-formed bundle must still verify for " << key.str();
-
-    TargetLoweringContext lowering{(*target)->machine(), {}, {}};
-    mlir::IRRewriter rewriter(&context);
-    llvm::Error error =
-        emitter->lower(/*coveredOps=*/{}, bundle, lowering, rewriter);
-    ASSERT_TRUE(static_cast<bool>(error)) << key.str();
-    EXPECT_NE(
-        llvm::toString(std::move(error)).find("target_lowering_unsupported"),
-        std::string::npos)
-        << key.str();
-  }
-}
+bool supportsContractionTypes(const machine::ComputeNode &engine,
+                               llvm::StringRef inputDtype,
+                               llvm::StringRef accumulatorDtype);
+// Add non-pure virtual to OpDAGBuildContext; default calls pickMatrixEngine.
+virtual const machine::ComputeNode *
+pickContractionEngine(llvm::StringRef requested, std::string &reason) const;
+// Non-pure compatibility default returns existing mmaCycles(...).
+virtual llvm::Expected<uint64_t>
+contractionCycles(const machine::ComputeNode &engine,
+                  llvm::ArrayRef<int64_t> shape, uint64_t flops,
+                  llvm::StringRef accumulatorDtype) const;
 ```
 
-Add `arm_sve_target.cpp` to `SOURCES` in `test/Mapping/CMakeLists.txt`, after `generic_accelerator_target.cpp`.
+`DAGBuilder::Context` overrides both methods. Keep the existing `pickMatrixEngine` API for injected/reference contexts. No target names enter these signatures.
 
-- [ ] **Step 2: Run the test to verify it fails**
-
-```bash
-ninja LLKMappingTests
-```
-
-Expected: FAIL to compile — `LLK/Target/AArch64/Mapping/SVEMappingTarget.h` does not exist.
-
-- [ ] **Step 3: Write the package, the policy and the wiring**
-
-Create `include/LLK/Target/AArch64/Mapping/SVEMappingTarget.h` — banner, then:
+- [ ] **Step 1: Write failing tests.** In the existing Perf fixtures add `SelectedContraction` tests for a synthetic vector-only profile and fully typed MMA. Build mapped attributes with `compute = {vector_engine = "v0"}` and executor `w0` using the existing metadata shape. Use a second node `v1` to ensure selected identity cannot fall back to declaration order. Assert the following facts on the emitted `MicroEvent` (the variables below are fixture-local, not new production APIs):
 
 ```cpp
-// Part of the target package layer. The first ARM mapping target.
-//
-// SVE is modelled at the profile's pinned vector length, read back through
-// `machine.compute("vector_engine").lanes(...)`; nothing here knows that
-// number. The package is deliberately the same shape as the generic
-// accelerator's: it loads configuration and returns it, and it claims no
-// backend.
+EXPECT_EQ(event.kind, EventKind::Mma);
+EXPECT_EQ(event.resource, ResourceKind::VectorEngine);
+EXPECT_EQ(event.resourceName, "v1");
+EXPECT_EQ(event.ownerPool, "w0");
+EXPECT_EQ(event.workItems, 4096u); // M=N=K=16 MACs.
+EXPECT_EQ(event.minCycles, 256u); // 8192 FLOPs / throughput 32.
+```
 
-#ifndef LLK_TARGET_AARCH64_MAPPING_SVEMAPPINGTARGET_H
-#define LLK_TARGET_AARCH64_MAPPING_SVEMAPPINGTARGET_H
+Add predicate tests accepting f32/f32 and bf16/f32 on compatible vector and matrix nodes, rejecting absent accumulator dtype, unsupported kind and unsupported input. Test missing, dual vector+matrix, foreign-executor and unknown selected ids, and explicit-engine disagreement. All must return an analysis error with no fallback. Add a matrix-only control and unmapped legacy matrix-default control.
 
-#include "LLK/Mapping/MappingTarget.h"
+In `legality.cpp`, add `MmaCompatible` cases: vector-only N=16/f32 accepts; N=15 rejects without masking and accepts with mask; missing f32 lanes rejects; matrix fragment behavior remains; a mixed machine accepts a later compatible engine even if an earlier one fails. Missing referenced bindings must still fail.
 
-#include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/StringRef.h"
-#include "llvm/Support/Error.h"
+- [ ] **Step 2: Run the new tests and confirm failures originate in the current matrix-only selection/legality.**
 
-#include <memory>
+```sh
+ninja -C build LLKPerfTests
+./build/bin/LLKPerfTests --gtest_filter='SelectedContraction.*:ContractionSupport.*:*MmaCompatible*'
+```
 
-namespace mlir::llk::target::sve {
+- [ ] **Step 3: Implement the predicate, context override, event resource selection and legality contract from spec §5.** `supportsContractionTypes` lives in the new Perf library files. `buildMma` calls the new picker and checked cycle method, propagates `llvm::Error` before event emission, and fails selected dtype incompatibility. Validate positive shape and checked MAC/FLOP products before calling either cycle method; the new Expected return carries missing-lane, cost-range and overflow errors. Keep existing matrix costing through the checked core adapter and old injected-context defaults. Preserve MAC dependencies, owner and measured-cycle overrides. Matrix costing retains its existing path. Vector fallback without throughput is M*K*ceil(N/accumulator-lanes)*issue; add a no-throughput test expecting 256 cycles at lanes=16/issue=1, and zero/missing lanes plus overflow error tests. Do not hide overflow or unavailable cost facts behind a one-cycle event.
 
-/// The emitter keys this target declares.
+- [ ] **Step 4: Add resource/parity regression controls.** A vector contraction and independent vector op both bound to `v0`, with concurrency=1, must serialize; bind the vector op to `v1` for an overlap control. Compare normalized owner/resource/cycles and scheduled costs with the existing selected analysis path. Confirm ResourceKind and bottleneck/utilization reports classify vector contraction as vector work.
+
+```sh
+ninja -C build LLKPerfTests LLKMappingTests
+./build/bin/LLKPerfTests
+./build/bin/LLKMappingTests
+```
+
+Expected: new synthetic cases and existing matrix/AVX2/accelerator analysis controls pass. If a new assumption is found in a downstream consumer, repair that target-neutral assumption in this task and add its specific regression.
+
+- [ ] **Step 5: Commit** `feat(perf): analyze contractions on selected vector resources`.
+
+### Task 2: Profiles, finite policy, packages and registry
+
+**Files:** Profiles/policy/packages/loader/package tests from the file map.
+
+**Interfaces:**
+- Consumes: Task 1's selected vector contraction support; spec §§6–8's normative topology, budgets, ids, widths and rule table.
+- Produces the following APIs in both `mlir::llk::target::sve` and `::sme`:
+
+```cpp
 llvm::ArrayRef<llvm::StringRef> emitterKeys();
-
-/// Loads the SVE mapping target from a configuration root, which must contain
-/// `machines/arm-sve-v2.yaml`, `mapping/arm-sve/layouts.llkmap`, and
-/// `mapping/arm-sve/rules.llkmap`.
 llvm::Expected<std::unique_ptr<mapping::MappingTarget>>
 createMappingTarget(llvm::StringRef configurationRoot,
                     llvm::StringRef machinePath = {});
-
-} // namespace mlir::llk::target::sve
-
-#endif // LLK_TARGET_AARCH64_MAPPING_SVEMAPPINGTARGET_H
 ```
 
-Create `lib/Target/AArch64/Mapping/SVEMappingTarget.cpp` — banner, then:
+Targets register as `arm-sve` and `arm-sme`. No new target subclass or native backend API is added.
+
+- [ ] **Step 1: Write failing loader and registry tests.** `MachineModelLoader.LoadsArmSve` asserts f32/bf16/i8 lanes 16/32/64, accumulator `acc.0` kind acc/capacity2048, no `rf` memory and no matrix compute. `LoadsArmSme` asserts `za.0` capacity4096, `za` matrix compute and both vector/matrix owner refinements. Assert all link endpoints and compute attachments resolve. Use `auto` or fully qualified machine types.
+
+Add `ArmTargets.RegistryLoadsBoth` in `arm_targets.cpp`:
 
 ```cpp
-#include "LLK/Target/AArch64/Mapping/SVEMappingTarget.h"
-
-#include <string>
-#include <vector>
-
-namespace mlir::llk::target::sve {
-
-llvm::ArrayRef<llvm::StringRef> emitterKeys() {
-  static const llvm::StringRef kKeys[] = {
-      "sve_vector_add",     "sve_vector_convert", "sve_vector_silu",
-      "sve_vector_mul",     "sve_mma",            "sve_reduce",
-      "sve_copy",           "sve_tile_copy",      "sve_tile_store",
-      "sve_fused_convert_silu_mul"};
-  return kKeys;
-}
-
-llvm::Expected<std::unique_ptr<mapping::MappingTarget>>
-createMappingTarget(llvm::StringRef configurationRoot,
-                    llvm::StringRef machinePath) {
-  std::string root = configurationRoot.str();
-  std::string machine = machinePath.empty()
-                            ? root + "/machines/arm-sve-v2.yaml"
-                            : machinePath.str();
-  std::vector<std::string> keys;
-  for (llvm::StringRef key : emitterKeys())
-    keys.push_back(key.str());
-  return mapping::loadMappingTarget("arm-sve", machine,
-                                    root + "/mapping/arm-sve/layouts.llkmap",
-                                    root + "/mapping/arm-sve/rules.llkmap",
-                                    std::move(keys));
-}
-
-} // namespace mlir::llk::target::sve
-```
-
-Create `mapping/arm-sve/layouts.llkmap`:
-
-```
-// ARM SVE target layouts.
-//
-// Layout ids are target-owned mapping results, not `#micro.layout` enumerants.
-// The vector width is read from the machine, so these declarations follow the
-// profile's modeled vector length instead of hard-coding 16.
-
-// Plain row-major: the logical index is the physical index.
-layout sve.row_major(int N) {
-  param N in [1..8];
-  require rank == 2;
-  implements row_major;
-  map (m, n) -> (m, n);
-}
-
-// Two-dimensional blocking with a vector inner dimension. `VW in [4..16]`
-// spans the 16 f32 lanes of the 512-bit modeled machine; the equality below
-// pins it to whatever the profile declares, so a profile at another vector
-// length needs no edit here -- only a wider or narrower domain.
-layout sve.blocked_2d(int M, int N, int VW) {
-  param M in [4..16];
-  param N in [4..16];
-  param VW in [4..16];
-  require rank == 2;
-  require VW == machine.compute("vector_engine").lanes(element_type);
-  require N % VW == 0;
-  implements blocked;
-  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+mlir::llk::target::registerAllMappingTargets();
+for (llvm::StringRef name : {"arm-sve", "arm-sme"}) {
+  auto target = mlir::llk::mapping::createRegisteredMappingTarget(
+      name, LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  EXPECT_EQ((*target)->name(), name);
+  EXPECT_FALSE((*target)->codegenRequirements().has_value());
 }
 ```
 
-Create `mapping/arm-sve/rules.llkmap`:
+Include `LLK/Target/MappingTargets.h`, `LLK/Mapping/MappingTarget.h` and LLVM Error. Add source to the category before running the red test. Also test a same-target machine override with modified capacity: loaded machine hash/capacity must reflect the file. A missing override file must return an error. `--help` is not part of this test.
 
-```
-// ARM SVE mapping rules.
-//
-// A rule names one Micro operation pattern and the bundle that implements it.
-// `bundle` and `emit` are opaque: this file names them, the SVE package gives
-// them meaning. Layout ids refer to layouts.llkmap and are never redefined
-// here. Capability kinds must be ones machines/arm-sve-v2.yaml declares --
-// `verifyMappingTarget` rejects the file otherwise.
-//
-// `micro.mma` binds to the *vector* engine here. SVE has no matrix engine, so
-// the contraction is modelled as vector FMLA/BFDOT work. That is a real
-// implementation strategy for SVE, and it is what lets this target be
-// exercised on the project's matmul fixture; arm-sme places the same
-// operation on a ZA matrix engine instead.
+- [ ] **Step 2: Verify missing profiles/packages cause the expected failures.**
 
-rule sve.vector_add v1 {
-  match micro.vector(op = "add");
-  param VW in [4..16];
-  require executor kind worker;
-  require compute kind vector_engine;
-  require layout operand0 satisfies sve.blocked_2d;
-  input "operand0";
-  input "operand1";
-  output "result";
-  bundle "sve.vector.add.f32";
-  emit "sve_vector_add";
-  cost 4;
-}
-
-rule sve.vector_convert v1 {
-  match micro.vector(op = "convert");
-  require executor kind worker;
-  require compute kind vector_engine;
-  require layout operand0 satisfies sve.blocked_2d;
-  input "operand0";
-  output "result";
-  bundle "sve.vector.convert.f32";
-  emit "sve_vector_convert";
-  cost 2;
-}
-
-// The GEMM initializer is read as a row-major tile before promotion into the
-// accumulator dtype. Keep this legal path explicit alongside the blocked
-// accumulator/result conversion above.
-rule sve.vector_convert_row_major v1 {
-  match micro.vector(op = "convert");
-  param VW in [4..16];
-  require executor kind worker;
-  require compute kind vector_engine;
-  require VW == machine.compute("vector_engine").lanes("f32");
-  require layout operand0 satisfies sve.row_major;
-  input "operand0";
-  output "result";
-  bundle "sve.vector.convert.f32" { VW = VW };
-  emit "sve_vector_convert";
-  cost 2;
-}
-
-rule sve.vector_silu v1 {
-  match micro.vector(op = "silu");
-  require executor kind worker;
-  require compute kind vector_engine;
-  require layout operand0 satisfies sve.blocked_2d;
-  input "operand0";
-  output "result";
-  bundle "sve.vector.silu.f32";
-  emit "sve_vector_silu";
-  cost 4;
-}
-
-rule sve.vector_mul v1 {
-  match micro.vector(op = "mul");
-  require executor kind worker;
-  require compute kind vector_engine;
-  require layout operand0 satisfies sve.blocked_2d;
-  input "operand0";
-  input "operand1";
-  output "result";
-  bundle "sve.vector.mul.f32";
-  emit "sve_vector_mul";
-  cost 4;
-}
-
-rule sve.mma_bf16 v1 {
-  match micro.mma(input[0].element_type = bf16);
-  param VW in [4..16];
-  require VW == machine.compute("vector_engine").lanes("f32");
-  require executor kind worker;
-  require compute kind vector_engine;
-  require layout lhs satisfies sve.row_major;
-  input "lhs";
-  input "rhs";
-  input "acc";
-  output "result";
-  bundle "sve.mma.bf16" { VW = VW };
-  emit "sve_mma";
-  cost 16;
-}
-
-rule sve.mma_f32 v1 {
-  match micro.mma(input[0].element_type = f32);
-  param VW in [4..16];
-  require VW == machine.compute("vector_engine").lanes("f32");
-  require executor kind worker;
-  require compute kind vector_engine;
-  require layout lhs satisfies sve.row_major;
-  input "lhs";
-  input "rhs";
-  input "acc";
-  output "result";
-  bundle "sve.mma.f32" { VW = VW };
-  emit "sve_mma";
-  cost 16;
-}
-
-rule sve.reduce_sum_f32 v1 {
-  match micro.reduce(op = "sum");
-  param VW in [4..16];
-  require VW == machine.compute("vector_engine").lanes("f32");
-  require executor kind worker;
-  require compute kind vector_engine;
-  input "operand0";
-  output "result";
-  bundle "sve.reduce.sum.f32" { VW = VW };
-  emit "sve_reduce";
-  cost 3;
-}
-
-// `micro.async_copy` is the one shipped operation whose boundary values are
-// plain `tensor`s: it moves into a low-level memory rather than operating on a
-// tile that already states one, so its endpoint occurrences carry no explicit
-// memory kind. The rule therefore names the ports it governs -- source DRAM to
-// destination SRAM, this profile's load path.
-rule sve.async_copy v1 {
-  match micro.async_copy();
-  require executor kind worker;
-  require memory input "source" kind dram;
-  require memory output "result" kind sram;
-  input "source";
-  output "result";
-  bundle "sve.copy";
-  emit "sve_copy";
-  cost 2;
-}
-
-rule sve.tile_async_copy v1 {
-  match micro.tile_async_copy();
-  require executor kind worker;
-  input "source";
-  output "result";
-  bundle "sve.tile.copy";
-  emit "sve_tile_copy";
-  cost 2;
-}
-
-rule sve.tile_store v1 {
-  match micro.tile_store();
-  require executor kind worker;
-  input "source";
-  bundle "sve.tile.store";
-  emit "sve_tile_store";
-  cost 2;
-}
-
-// The SwiGLU epilogue's shape, implemented as one unit: a convert feeding a
-// SiLU feeding the gating multiply. A graph rule matches a *subgraph*, so the
-// three operations are placed and emitted together.
-rule sve.fused_convert_silu_mul v1 {
-  match graph {
-    node cv: micro.vector(op = "convert");
-    node act: micro.vector(op = "silu");
-    node gate: micro.vector(op = "mul");
-    edge cv.result -> act.operand0;
-    edge act.result -> gate.operand0;
-  }
-  param VW in [4..16];
-  require VW == machine.compute("vector_engine").lanes(element_type);
-  require executor kind worker;
-  require compute kind vector_engine;
-  require layout cv.operand0 satisfies sve.blocked_2d;
-  require layout gate.operand1 satisfies sve.blocked_2d;
-  require layout gate.result satisfies sve.blocked_2d;
-  input "cv.operand0";
-  input "gate.operand1";
-  output "gate.result";
-  bundle "sve.fused.convert_silu_mul" { VW = VW };
-  emit "sve_fused_convert_silu_mul";
-  cost 3;
-}
+```sh
+ninja -C build LLKMachineTests LLKMappingTests
+./build/bin/LLKMachineTests --gtest_filter='MachineModelLoader.LoadsArm*'
+./build/bin/LLKMappingTests --gtest_filter='ArmTargets.*'
 ```
 
-In `lib/Target/CMakeLists.txt`, add to the `LLKTargetMapping` source list, after the `GenericAccelerator/...` line:
+- [ ] **Step 3: Implement profiles and packages.** Build each YAML from the current AVX2 v2 schema, replacing its executor/memory/compute/link sections with the exact spec §6 tables; do not carry lane executors, `mxu`, 8192-byte accumulators, RF links or target-name comments across accidentally. Copy only the existing loader's shape, not executable AVX2 overrides. Preserve common seed comments and label all ARM values modeled.
+
+Declare the ten emitter keys per target from spec §7, with `sve_mma` / `sme_mma_za`. Factory roots resolve the three exact target files. Add package sources to `LLKTargetMapping`, includes and registrations to its composition root. Keep `codegenRequirements()==nullopt` and base backend rejection.
+
+- [ ] **Step 4: Implement bounded typed LLKMap policy.** Use parameterless row-major and the exact three-assignment blocked layout in spec §7; no `za_blocked_2d`. Generate the separately typed rules listed there with stable ids, exact port order and costs. For contraction the complete f32 predicate is:
 
 ```
-    AArch64/Mapping/SVEMappingTarget.cpp
+match micro.mma(input[0].element_type = f32,
+                input[1].element_type = f32,
+                input[2].element_type = f32,
+                output[0].element_type = f32);
 ```
 
-In `lib/Target/MappingTargets.cpp`, add the include next to the existing two:
+The bf16 variant changes only the first two types. Both require input `acc` and output `result` in memory kind acc, row-major layouts on lhs/rhs/acc/result, worker executor, and the target's vector/matrix compute kind. No duplicate bundle width parameter is needed. Use typed graph-node predicates for fusion and per-port layout requirements; never use a graph-global dtype to decide a mixed-dtype operand's width. Do not claim unsupported i8 contractions or non-f32 SiLU.
 
-```cpp
-#include "LLK/Target/AArch64/Mapping/SVEMappingTarget.h"
+- [ ] **Step 5: Verify configuration and finite width domains.** Extend `ArmTargets` to load every rule emitter, instantiate every key and verify well-formed/parameterless bundles; reject unknown keys, cross-key bundles and malformed parameters. Solve blocked layouts for each dtype, asserting exactly one VW solution of 16/32/64 and no undecided result. f64 must have no legal mapping. These tests are typed; do not copy the original untyped vector graph.
+
+```sh
+ninja -C build LLKMachineTests LLKMappingTests
+./build/bin/LLKMachineTests
+./build/bin/LLKMappingTests --gtest_filter='ArmTargets.*'
 ```
 
-and inside `registerAllMappingTargets()`:
+- [ ] **Step 6: Commit** `feat(target): register modeled SVE and SME target packages`.
 
-```cpp
-  mapping::registerMappingTarget("arm-sve", &sve::createMappingTarget);
-```
+### Task 3: Real contraction placement, storage and static-only boundary
 
-- [ ] **Step 4: Run the test to verify it passes**
-
-```bash
-ninja LLKMappingTests && ./build/bin/LLKMappingTests --gtest_filter=ArmSveTarget.*
-```
-
-Expected: 7 tests PASS.
-
-If `LoadsAndVerifiesItsConfiguration` fails with a load error, the message names the offending file and line (the loader reports unknown layout ids, unknown capability kinds and undeclared emitters). Read it rather than guessing.
-
-If `MapsAVectorNodeEndToEnd` finds zero plans, the cause is the layout domain: `sve.blocked_2d` requires `N % VW == 0` with `VW` pinned to 16 and `N in [4..16]`, so `N` must be 16. Widen `param N` to `[16..32]` in `mapping/arm-sve/layouts.llkmap` if the solver needs more than one candidate.
-
-- [ ] **Step 5: Run the full mapping suite**
-
-```bash
-./build/bin/LLKMappingTests
-```
-
-Expected: all tests pass, including the pre-existing AVX2 and generic-accelerator target tests.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add mapping/arm-sve include/LLK/Target/AArch64/Mapping/SVEMappingTarget.h \
-        lib/Target/AArch64/Mapping/SVEMappingTarget.cpp lib/Target/CMakeLists.txt \
-        lib/Target/MappingTargets.cpp test/Mapping/arm_sve_target.cpp \
-        test/Mapping/CMakeLists.txt
-git commit -m "feat(target): add the arm-sve mapping target
-
-Co-Authored-By: Claude Code <noreply@anthropic.com>"
-```
-
----
-
-### Task 3: `arm-sme` machine profile
-
-**Files:**
-- Create: `machines/arm-sme-v2.yaml`
-- Modify: `test/Machine/machine_model_loader.cpp` (add one test)
+**Files:** New public fixture support, `arm_placement.cpp` and both contraction inputs from the file map; `test/Mapping/CMakeLists.txt`.
 
 **Interfaces:**
-- Consumes: nothing (it is written to mirror `machines/arm-sve-v2.yaml` from Task 1 and must agree with it on every shared name).
-- Produces: a profile at `machines/arm-sme-v2.yaml` whose `target` is `arm-sme`, containing everything the SVE profile has **plus** executor `za_eng.0` (kind `za_engine`, refines `matrix`), compute node **id `za`** (kind `matrix_engine`, `shapes: [[16, 16, 16]]`), and a memory of kind `acc` (id `za.0`, 4096 bytes, 4 banks). Tasks 4, 5 and 6 depend on these names.
-
-- [ ] **Step 1: Write the failing test**
-
-Append to `test/Machine/machine_model_loader.cpp`:
+- Consumes: registered packages and Task 1 analysis; existing `CoveringSearch`, canonical complete-plan evaluator/materializer, `bindPlan`, `verifyMappedMicroIR` and `analyzeSelectedKernel`.
+- Produces test-only namespace `arm_test` in `arm_target_fixture.h/.cpp`:
 
 ```cpp
-TEST(MachineModelLoader, LoadsTheShippedArmSmeProfile) {
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
-      llvm::MemoryBuffer::getFile(std::string(LLK_MACHINE_DIR) +
-                                  "/arm-sme-v2.yaml");
-  ASSERT_TRUE(static_cast<bool>(buffer)) << "arm-sme profile must ship";
-  llvm::Expected<MachineModel> model =
-      parseMachineModel(buffer.get()->getBuffer(), "arm-sme-v2.yaml");
-  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
-
-  EXPECT_EQ(model->target, "arm-sme");
-
-  // SME is SVE plus a matrix engine: the vector side must be identical in
-  // shape, or the two profiles describe different cores.
-  const ComputeNode *svp = model->findCompute("svp");
-  ASSERT_NE(svp, nullptr);
-  EXPECT_EQ(svp->lanes.at("f32"), 16u);
-  EXPECT_TRUE(model->ownerMatches("worker", "worker.0"));
-  EXPECT_TRUE(model->ownerMatches("matrix", "za_eng.0"));
-  EXPECT_EQ(model->ownerClass("za_engine"), std::optional<std::string>("matrix"));
-
-  // The ZA accumulator array, as an `acc`-kind memory of SVL x SVL bits.
-  const MemoryNode *za = model->findMemoryOfKind("acc");
-  ASSERT_NE(za, nullptr);
-  EXPECT_EQ(za->id, "za.0");
-  EXPECT_EQ(za->capacityBytes, 4096u);
-  EXPECT_EQ(za->banks, 4u);
-
-  const ComputeNode *matrix = model->findCompute("za");
-  ASSERT_NE(matrix, nullptr);
-  EXPECT_EQ(matrix->kind, "matrix_engine");
-  ASSERT_EQ(matrix->shapes.size(), 1u);
-  EXPECT_EQ(matrix->shapes[0],
-            std::vector<int64_t>({16, 16, 16}));
-}
-```
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-```bash
-ninja LLKMachineTests && ./build/bin/LLKMachineTests --gtest_filter=MachineModelLoader.LoadsTheShippedArmSmeProfile
-```
-
-Expected: FAIL — `arm-sme profile must ship`.
-
-- [ ] **Step 3: Write the profile**
-
-Create `machines/arm-sme-v2.yaml` — the SVE profile plus the SME additions. Copy the whole of `machines/arm-sve-v2.yaml` (Task 1) and change the header, `target`, `description`, and add the three marked blocks:
-
-```yaml
-# Machine model (v2): ARMv9-A core with SVE2 and SME, at a pinned modeled
-# vector length.
-#
-# This is the SVE profile plus the scalable matrix extension. SVL is shared
-# between SVE and SME on a real core, which is why both profiles pin 512 bits:
-# the pair differs in *capability*, not in vector length, so a ranking
-# difference between them is attributable to the matrix engine rather than to
-# a different width.
-#
-# ZA geometry is arithmetic, not estimation. Per the Arm Architecture
-# Reference Manual (B1.4.8) ZA is an (SVL/8) x (SVL/8) byte array: at SVL=512
-# that is 64 x 64 = 4096 bytes. For 32-bit elements the non-widening FMOPA
-# computes an SVL_S x SVL_S sum of outer products with SVL_S = SVL/32, so
-# ZA.S is four (SVL/32) x (SVL/32) = 16x16 f32 quadrants, ZA0.S..ZA3.S. The
-# matrix engine below models one quadrant per issue; the four quadrants are
-# the memory's `banks`.
-#
-# The numbers are calibration seeds for a class of ARMv9-A cores, not
-# measurements of any part.
-
-schema: llk.machine.v2
-target: arm-sme
-description: >-
-  ARMv9-A core with SVE2 and SME at a modeled 512-bit vector length, with a
-  ZA matrix engine alongside the SVE vector engine.
-clock_hz: 3000000000
-worker_threads: 8
-sync:
-  barrier_cycles: 100
-  wait_cycles: 0
-
-executors:
-  - id: cluster.0
-    kind: cluster
-    refines: [group]
-    concurrency: 1
-  - id: worker.0
-    kind: worker
-    parent: cluster.0
-    concurrency: 8
-  - id: sve_eng.0
-    kind: sve_engine
-    refines: [vector]
-    parent: worker.0
-    concurrency: 8
-  # The matrix capability. It exists so an abstract owner of matrix kind, and
-  # an owner path through it, still resolve.
-  - id: za_eng.0
-    kind: za_engine
-    refines: [matrix]
-    parent: worker.0
-    concurrency: 8
-
-memories:
-  - id: dram.0
-    kind: dram
-    visible_from: cluster.0
-    capacity_bytes: 68719476736
-    alignment_bytes: 64
-    supported_layouts: [row_major]
-    bandwidth_bytes_per_cycle: 32
-    latency_cycles: 220
-  - id: l2.0
-    kind: l2
-    visible_from: cluster.0
-    capacity_bytes: 1048576
-    alignment_bytes: 64
-    supported_layouts: [row_major, vectorized]
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 12
-  - id: sram.0
-    kind: sram
-    visible_from: worker.0
-    capacity_bytes: 65536
-    alignment_bytes: 64
-    supported_layouts: [row_major, vectorized, blocked]
-    banks: 1
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 4
-  - id: rf.0
-    kind: rf
-    visible_from: worker.0
-    capacity_bytes: 2048
-    alignment_bytes: 64
-    supported_layouts: [row_major, vectorized]
-    banks: 32
-    bandwidth_bytes_per_cycle: 256
-    latency_cycles: 1
-  # ZA: SVL/8 x SVL/8 bytes = 64 x 64 at SVL=512. `acc` is already a member
-  # of the Micro memory-space vocabulary, so ZA needs no new word.
-  - id: za.0
-    kind: acc
-    visible_from: worker.0
-    capacity_bytes: 4096
-    alignment_bytes: 64
-    supported_layouts: [row_major, blocked]
-    banks: 4
-    bandwidth_bytes_per_cycle: 256
-    latency_cycles: 1
-
-compute:
-  - id: svp
-    kind: vector_engine
-    refines: [vector]
-    attached_to: worker.0
-    element_types: [f32, bf16, i8]
-    supported_layouts: [row_major, vectorized]
-    shapes: [[16], [32], [64]]
-    lanes: {f32: 16, bf16: 32, i8: 64}
-    issue_cycles: 1
-    latency_cycles: 4
-    concurrency: 8
-  # One ZA quadrant per issue: (SVL/32) x (SVL/32) = 16x16 f32, accumulating
-  # over a modeled K of 16.
-  - id: za
-    kind: matrix_engine
-    refines: [matrix]
-    attached_to: worker.0
-    element_types: [f32, bf16]
-    accumulator_dtypes: [f32]
-    supported_layouts: [row_major, blocked]
-    shapes: [[16, 16, 16]]
-    issue_cycles: 1
-    latency_cycles: 5
-    throughput_per_cycle: 16
-    concurrency: 8
-
-transfer_engines:
-  - id: dma.0
-    kind: dma
-    refines: [transfer]
-    attached_to: worker.0
-    count: 1
-    max_outstanding: 8
-    setup_cycles: 0
-
-links:
-  - id: dram_to_l2.0
-    source: dram.0
-    destination: l2.0
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 220
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: l2_to_sram.0
-    source: l2.0
-    destination: sram.0
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 12
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: dram_to_sram.0
-    source: dram.0
-    destination: sram.0
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 220
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: sram_to_rf.0
-    source: sram.0
-    destination: rf.0
-    bandwidth_bytes_per_cycle: 256
-    latency_cycles: 4
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: rf_to_sram.0
-    source: rf.0
-    destination: sram.0
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 4
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: sram_to_za.0
-    source: sram.0
-    destination: za.0
-    bandwidth_bytes_per_cycle: 256
-    latency_cycles: 4
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: za_to_sram.0
-    source: za.0
-    destination: sram.0
-    bandwidth_bytes_per_cycle: 64
-    latency_cycles: 4
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-  - id: sram_to_dram.0
-    source: sram.0
-    destination: dram.0
-    bandwidth_bytes_per_cycle: 32
-    latency_cycles: 220
-    transaction_bytes: 64
-    transfer_engines: [dma.0]
-```
-
-- [ ] **Step 4: Run the test to verify it passes**
-
-```bash
-ninja LLKMachineTests && ./build/bin/LLKMachineTests --gtest_filter=MachineModelLoader.LoadsTheShippedArmSmeProfile
-```
-
-Expected: PASS. If a field name in the test does not exist (`za->id`, `za->capacityBytes`, `za->banks`, `matrix->shapes`), read `include/LLK/Machine/MachineModel.h` for the real member and fix the test — do not reshape the profile.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add machines/arm-sme-v2.yaml test/Machine/machine_model_loader.cpp
-git commit -m "feat(machine): add the arm-sme v2 profile with a ZA matrix engine
-
-Co-Authored-By: Claude Code <noreply@anthropic.com>"
-```
-
----
-
-### Task 4: `arm-sme` mapping target
-
-**Files:**
-- Create: `mapping/arm-sme/layouts.llkmap`
-- Create: `mapping/arm-sme/rules.llkmap`
-- Create: `include/LLK/Target/AArch64/Mapping/SMEMappingTarget.h`
-- Create: `lib/Target/AArch64/Mapping/SMEMappingTarget.cpp`
-- Modify: `lib/Target/CMakeLists.txt` (one more source line)
-- Modify: `lib/Target/MappingTargets.cpp` (one include, one registration)
-- Create: `test/Mapping/arm_sme_target.cpp`
-- Modify: `test/Mapping/CMakeLists.txt` (add `arm_sme_target.cpp`)
-
-**Interfaces:**
-- Consumes: `machines/arm-sme-v2.yaml` from Task 3 (compute id `za` of kind `matrix_engine`, memory of kind `acc`, executor kind `worker`).
-- Produces: namespace `mlir::llk::target::sme` with `emitterKeys()` (the ten keys in Step 3) and `createMappingTarget(configurationRoot, machinePath = {})`, registered as `arm-sme`. Task 5 consumes the emitted key `sme_mma_za` and the rule id `sme.mma_f32`.
-
-- [ ] **Step 1: Write the failing test**
-
-Copy `test/Mapping/arm_sve_target.cpp` (created in Task 2), save it as `test/Mapping/arm_sme_target.cpp`, and apply these substitutions. That file is on disk by the time this task runs; read it and edit it rather than reconstructing 200 lines from the table:
-
-| In `arm_sve_target.cpp` | In `arm_sme_target.cpp` |
-|---|---|
-| `namespace sve_mapping = mlir::llk::target::sve;` | `namespace sme_mapping = mlir::llk::target::sme;` |
-| `#include ".../SVEMappingTarget.h"` | `#include ".../SMEMappingTarget.h"` |
-| `Test(ArmSveTarget, ...)` | `Test(ArmSmeTarget, ...)` |
-| `sve_mapping::` | `sme_mapping::` |
-| `"arm-sve"` | `"arm-sme"` |
-| `"sve.vector_add"`, `"sve.row_major"` | `"sme.vector_add"`, `"sme.row_major"` |
-| `"sve_missing"` | `"sme_missing"` |
-| `bundle.name = "sve.vector.add.f32"` | `bundle.name = "sme.vector.add.f32"` |
-| `"sve_engine"`, `"sve_eng.0"` | `"za_engine"`, `"za_eng.0"` for matrix, plus keep `"sve_eng.0"` for the vector check |
-| `"vector"` in the `ownerMatches`/`ownerClass` assertions | keep the vector assertions **and** add `matrix` for `za_eng.0` |
-
-Also replace the `ModelsAVectorEngineAndNoAccumulatorSpace` test with its SME counterpart:
-
-```cpp
-/// The SME half of the target pair: the SVE vector engine is still present,
-/// and so is a ZA matrix engine backed by an `acc` memory. Task 5 contrasts
-/// this with arm-sve.
-TEST(ArmSmeTarget, ModelsAVectorEngineAndAZaMatrixEngine) {
-  llvm::Expected<std::unique_ptr<MappingTarget>> target = loadTarget();
-  ASSERT_TRUE(static_cast<bool>(target)) << llvm::toString(target.takeError());
-  const machine::MachineModel &model = (*target)->machine();
-
-  ASSERT_NE(model.findCompute("svp"), nullptr);
-  EXPECT_EQ(model.findCompute("svp")->kind, "vector_engine");
-  ASSERT_NE(model.findCompute("za"), nullptr);
-  EXPECT_EQ(model.findCompute("za")->kind, "matrix_engine");
-  EXPECT_NE(model.findMemoryOfKind("acc"), nullptr);
-  EXPECT_EQ(model.ownerClass("za_engine"),
-            std::optional<std::string>("matrix"));
-}
-```
-
-Add `arm_sme_target.cpp` to `SOURCES` in `test/Mapping/CMakeLists.txt`.
-
-- [ ] **Step 2: Run the test to verify it fails**
-
-```bash
-ninja LLKMappingTests
-```
-
-Expected: FAIL to compile — `SMEMappingTarget.h` does not exist.
-
-- [ ] **Step 3: Write the package, the policy and the wiring**
-
-Copy `include/LLK/Target/AArch64/Mapping/SVEMappingTarget.h` (Task 2) and apply these replacements, keeping the banner: guard `LLK_TARGET_AARCH64_MAPPING_SMEMAPPINGTARGET_H`, namespace `mlir::llk::target::sme`, doc `machines/arm-sme-v2.yaml` / `mapping/arm-sme/`, and a comment noting that this target adds the ZA matrix engine to the SVE vector model.
-
-Copy `lib/Target/AArch64/Mapping/SVEMappingTarget.cpp` (Task 2), keep the banner, and replace `emitterKeys()` with:
-
-```cpp
-llvm::ArrayRef<llvm::StringRef> emitterKeys() {
-  static const llvm::StringRef kKeys[] = {
-      "sme_vector_add",     "sme_vector_convert", "sme_vector_silu",
-      "sme_vector_mul",     "sme_mma_za",         "sme_reduce",
-      "sme_copy",           "sme_tile_copy",      "sme_tile_store",
-      "sme_fused_convert_silu_mul"};
-  return kKeys;
-}
-```
-
-and a `createMappingTarget` that loads `arm-sme`, `machines/arm-sme-v2.yaml`, `mapping/arm-sme/layouts.llkmap`, `mapping/arm-sme/rules.llkmap`.
-
-Copy `mapping/arm-sve/layouts.llkmap` to `mapping/arm-sme/layouts.llkmap`, rename `sve.` to `sme.` throughout, update the header comment, and append:
-
-```
-// A ZA-resident tiling for the accumulator.
-//
-// This layout deliberately carries no `implements` clause. `implements`
-// bridges a Micro layout *kind* to a target layout id, and two layouts
-// claiming one kind is rejected as ambiguous -- so only `sme.blocked_2d`
-// implements `blocked`, and this one is referenced by id from the matrix rule.
-layout sme.za_blocked_2d(int M, int N) {
-  param M in [4..16];
-  param N in [4..16];
-  require rank == 2;
-  require N % 16 == 0;
-  map (m, n) -> (m, n);
-}
-```
-
-Create `mapping/arm-sme/rules.llkmap`: the twelve `sve.*` rules from Task 2, renamed `sme.*` with `sme_*` emit keys, except that the two contraction rules bind the matrix engine:
-
-```
-rule sme.mma_bf16 v1 {
-  match micro.mma(input[0].element_type = bf16);
-  require executor kind worker;
-  require compute kind matrix_engine;
-  require layout acc satisfies sme.za_blocked_2d;
-  require memory output "result" kind acc;
-  input "lhs";
-  input "rhs";
-  input "acc";
-  output "result";
-  bundle "sme.mma.bf16";
-  emit "sme_mma_za";
-  cost 8;
-}
-
-rule sme.mma_f32 v1 {
-  match micro.mma(input[0].element_type = f32);
-  require executor kind worker;
-  require compute kind matrix_engine;
-  require layout acc satisfies sme.za_blocked_2d;
-  require memory output "result" kind acc;
-  input "lhs";
-  input "rhs";
-  input "acc";
-  output "result";
-  bundle "sme.mma.f32";
-  emit "sme_mma_za";
-  cost 8;
-}
-```
-
-Add a header comment stating that this file is the SVE rule set with the contraction re-bound to the ZA matrix engine, and that the vector rules are byte-for-byte the SVE ones apart from their `sme.` prefix.
-
-In `lib/Target/CMakeLists.txt`, add:
-
-```
-    AArch64/Mapping/SMEMappingTarget.cpp
-```
-
-In `lib/Target/MappingTargets.cpp`, add the include and:
-
-```cpp
-  mapping::registerMappingTarget("arm-sme", &sme::createMappingTarget);
-```
-
-- [ ] **Step 4: Run the test to verify it passes**
-
-```bash
-ninja LLKMappingTests && ./build/bin/LLKMappingTests --gtest_filter=ArmSmeTarget.*
-```
-
-Expected: 7 tests PASS. A load error names the offending file and line; read it rather than guessing.
-
-- [ ] **Step 5: Verify both registrations resolve**
-
-```bash
-./build/bin/llk-compile --help 2>&1 | head -20
-```
-
-Then confirm the registry accepts the new names by running the full mapping suite (the target tests load through the packages, and Task 6 exercises the registry path directly):
-
-```bash
-./build/bin/LLKMappingTests
-```
-
-Expected: all tests pass.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add mapping/arm-sme include/LLK/Target/AArch64/Mapping/SMEMappingTarget.h \
-        lib/Target/AArch64/Mapping/SMEMappingTarget.cpp lib/Target/CMakeLists.txt \
-        lib/Target/MappingTargets.cpp test/Mapping/arm_sme_target.cpp \
-        test/Mapping/CMakeLists.txt
-git commit -m "feat(target): add the arm-sme mapping target
-
-Co-Authored-By: Claude Code <noreply@anthropic.com>"
-```
-
----
-
-### Task 5: Cross-target placement and engine difference
-
-**Files:**
-- Create: `test/Mapping/arm_placement.cpp`
-- Modify: `test/Mapping/CMakeLists.txt` (add `arm_placement.cpp`)
-
-**Interfaces:**
-- Consumes: both packages from Tasks 2 and 4 — `mlir::llk::target::sve` and `mlir::llk::target::sme`, their `createMappingTarget(LLK_SOURCE_DIR)` entry points, and the rule ids `sve.mma_f32` / `sme.mma_f32`.
-- Produces: nothing consumed by later tasks.
-
-This is the task that pins the design's central claim: the two targets map the same contraction on different engines, so a ranking difference between them cannot be a relabelled one.
-
-- [ ] **Step 1: Write the test**
-
-Create `test/Mapping/arm_placement.cpp` — banner, then:
-
-```cpp
-#include "LLK/Mapping/MappingTarget.h"
-#include "LLK/Target/AArch64/Mapping/SMEMappingTarget.h"
-#include "LLK/Target/AArch64/Mapping/SVEMappingTarget.h"
-
-#include "llvm/Support/Error.h"
-
-#include <gtest/gtest.h>
-
-#include <memory>
-
-using namespace mlir::llk::mapping;
-
-namespace sve_mapping = mlir::llk::target::sve;
-namespace sme_mapping = mlir::llk::target::sme;
-
-#ifndef LLK_SOURCE_DIR
-#error "LLK_SOURCE_DIR must name the repository root"
-#endif
-
-namespace {
-
-/// Both targets, or a failed assertion that says which one did not load.
-struct Pair {
-  std::unique_ptr<MappingTarget> sve;
-  std::unique_ptr<MappingTarget> sme;
+struct MappedFixture {
+  std::unique_ptr<mlir::MLIRContext> context;
+  mlir::OwningOpRef<mlir::ModuleOp> source;
+  std::unique_ptr<mlir::llk::mapping::MappingTarget> target;
+  mlir::llk::mapping::WorkloadGraph graph;
+  mlir::llk::mapping::CoveringPlan plan;
+  mlir::llk::mapping::BoundPlan bound;
+  mlir::llk::perf::SelectedKernelAnalysis analysis;
 };
-
-Pair loadPair() {
-  llvm::Expected<std::unique_ptr<MappingTarget>> sve =
-      sve_mapping::createMappingTarget(LLK_SOURCE_DIR);
-  EXPECT_TRUE(static_cast<bool>(sve)) << llvm::toString(sve.takeError());
-  llvm::Expected<std::unique_ptr<MappingTarget>> sme =
-      sme_mapping::createMappingTarget(LLK_SOURCE_DIR);
-  EXPECT_TRUE(static_cast<bool>(sme)) << llvm::toString(sme.takeError());
-  return Pair{std::move(*sve), std::move(*sme)};
-}
-
-} // namespace
-
-/// SME is SVE plus a matrix engine. If this ever stops holding, the two
-/// profiles have drifted apart and the placement comparison below is void.
-TEST(ArmPlacement, SveHasNoMatrixEngineAndSmeDoes) {
-  Pair pair = loadPair();
-  ASSERT_TRUE(pair.sve);
-  ASSERT_TRUE(pair.sme);
-
-  // The vector engine is common to both, at the same modeled width.
-  ASSERT_NE(pair.sve->machine().findCompute("svp"), nullptr);
-  ASSERT_NE(pair.sme->machine().findCompute("svp"), nullptr);
-  EXPECT_EQ(pair.sve->machine().findCompute("svp")->lanes.at("f32"), 16u);
-  EXPECT_EQ(pair.sme->machine().findCompute("svp")->lanes.at("f32"), 16u);
-
-  // Only SME has an accumulator space and a matrix engine.
-  EXPECT_EQ(pair.sve->machine().findMemoryOfKind("acc"), nullptr);
-  EXPECT_EQ(pair.sve->machine().findCompute("za"), nullptr);
-  EXPECT_NE(pair.sme->machine().findMemoryOfKind("acc"), nullptr);
-  ASSERT_NE(pair.sme->machine().findCompute("za"), nullptr);
-  EXPECT_EQ(pair.sme->machine().findCompute("za")->kind, "matrix_engine");
-}
-
-/// The same Micro operation, bound to a different engine on each target. The
-/// rule text carries the binding (`require compute kind ...`); these are the
-/// observable consequences -- the rule exists on both, matches the same
-/// operation, and names a different implementation.
-TEST(ArmPlacement, ContractionBindsDifferentImplementationsOnEachTarget) {
-  Pair pair = loadPair();
-  ASSERT_TRUE(pair.sve);
-  ASSERT_TRUE(pair.sme);
-
-  const RuleDef *sveMma = pair.sve->rules().find("sve.mma_f32");
-  const RuleDef *smeMma = pair.sme->rules().find("sme.mma_f32");
-  ASSERT_NE(sveMma, nullptr) << "arm-sve must map micro.mma";
-  ASSERT_NE(smeMma, nullptr) << "arm-sme must map micro.mma";
-
-  EXPECT_EQ(sveMma->matchOp, "micro.mma");
-  EXPECT_EQ(smeMma->matchOp, "micro.mma");
-
-  // Different emitter keys, so the two targets cannot collapse into the same
-  // implementation.
-  EXPECT_EQ(sveMma->emitter, "sve_mma");
-  EXPECT_EQ(smeMma->emitter, "sme_mma_za");
-  EXPECT_NE(sveMma->emitter, smeMma->emitter);
-
-  // Each emitter is declared by its own target and by no other.
-  EXPECT_TRUE(pair.sve->isKnownEmitter("sve_mma"));
-  EXPECT_FALSE(pair.sme->isKnownEmitter("sve_mma"));
-  EXPECT_TRUE(pair.sme->isKnownEmitter("sme_mma_za"));
-  EXPECT_FALSE(pair.sve->isKnownEmitter("sme_mma_za"));
-}
+llvm::Expected<MappedFixture>
+mapFixture(llvm::StringRef targetName, llvm::StringRef inputPath,
+           llvm::StringRef machineOverride = {});
+const mlir::llk::mapping::PlanPlacement *
+contractionPlacement(const MappedFixture &fixture);
 ```
 
-Add `arm_placement.cpp` to `SOURCES` in `test/Mapping/CMakeLists.txt`.
+`inputPath` is a source-root-relative fixture path, resolved using `LLK_SOURCE_DIR`. Own context before modules/attrs so it is destroyed last. `mapFixture` propagates errors, including zero complete plans; it never dereferences a failed `Expected`. Preserve source and graph while plan attrs/source associations are used. `contractionPlacement` returns null unless exactly one graph node is `micro.mma`, locating its actual selected placement by node id.
 
-- [ ] **Step 2: Run the test**
+- [ ] **Step 1: Add the fixed typed source fixtures.** Use this dataflow for `contraction_f32.mlir`; spell all tiles rank-two 16×16, `layout = #micro.layout<row_major>`, `owner = #micro.owner<worker>`. Every copy returns a token awaited before use:
 
-```bash
-ninja LLKMappingTests && ./build/bin/LLKMappingTests --gtest_filter=ArmPlacement.*
+```text
+micro.kernel @arm_contraction(a: tensor<16x16xf32>,
+                             b: tensor<16x16xf32>,
+                             init: tensor<16x16xf32>) -> tensor<16x16xf32>
+  av/bv/iv = tile_view arguments in dram
+  as/bs/is = tile_async_copy av/bv/iv to sram; wait
+  c = tile_async_copy is to acc; wait
+  r = micro.mma as, bs, c {shape=[16,16,16], input=f32, accumulator=f32}
+  out = tile_async_copy r to sram; wait
+  micro.yield out
 ```
 
-Expected: 2 tests PASS.
+`contraction_bf16.mlir` changes only a/b tensor and viewed/staged tile element types to bf16 and MMA `input=bf16`; init/acc/output remain f32. Use actual MicroIR assembly syntax from `tile_ops.mlir`/existing compiler exports. No engine attr, target-specific owner, tensor.empty initializer, uninitialized accumulator, spatial replication or implicit output is allowed. Parse/verify both fixtures before mapping. The dataflow and shapes are normative; the implementer supplies assembly spelling.
 
-- [ ] **Step 3: Commit**
+The review's revised configuration probe already maps both variants on SME, with a 1024-byte ZA peak. An explicit-engine SVE probe establishes the same storage peak but is not acceptance evidence: it bypasses the missing picker and mislabels the resource under old code. The final tests use the canonical source above and require Task 1's correct vector resource classification.
 
-```bash
-git add test/Mapping/arm_placement.cpp test/Mapping/CMakeLists.txt
-git commit -m "test(mapping): pin the arm-sve/arm-sme contraction placement difference
+- [ ] **Step 2: Write the failing public-pipeline test and helper.** `mapFixture` must register/load through the registry, parse/extract the real kernel, use deterministic search with the existing canonical complete-plan evaluator, bind with the canonical materializer under the static/partial contract, verify mapped IR, and analyze with `(kernel,machine,requireComplete=true,finalizedPlan,graph)`. Inject `mapping::evaluateCompletePlan(source,graph,target,proposal,BindContract::Partial,memoryBudgetBytes,AnalysisRequirement::Complete)` via the existing evaluator callback; include `CompletePlanEvaluation.h`/`PlanMaterialization.h` using the category's existing integration include directory. Link `LLKPerf` explicitly in the Mapping category for its direct analysis calls. A raw `CoveringSearch` without complete-plan evaluation is insufficient; follow the integration used by `MicroMapPass`, not only `test/Mapping/e2e_workflow.cpp`'s bare-search helper.
 
-Co-Authored-By: Claude Code <noreply@anthropic.com>"
+`ArmPlacement.SameTypedContractionSelectsDifferentEngines` maps the exact same input path on both targets, for both dtypes. Assert:
+
+```cpp
+const auto *placement = arm_test::contractionPlacement(*mapped);
+ASSERT_NE(placement, nullptr);
+EXPECT_EQ(placement->executor, "worker.0");
+// SVE case; SME case uses matrix_engine/za.
+EXPECT_EQ(placement->computeBindings.lookup("vector_engine"), "svp");
+EXPECT_TRUE(mapped->analysis.complete);
+EXPECT_TRUE(mapped->analysis.incompleteReasons.empty());
+EXPECT_TRUE(mapped->analysis.storageLivenessFromPlan);
+EXPECT_EQ(mapped->analysis.peakBytes.at("acc.0"), 1024u);
+EXPECT_TRUE(mapped->bound.unmaterialized.empty());
 ```
 
----
+SME uses `peakBytes.at("za.0")==1024`. Also inspect the selected memory bindings and copy storage ids: initializer reaches accumulator, MMA consumes it, result reaches SRAM and is yielded. Compare unchanged source hashes across targets. Hashing target-specific plan ids does not prove source equivalence.
 
-### Task 6: `--micro-map` pass-spec path and full-suite verification
+- [ ] **Step 3: Run and inspect the new tests.**
 
-**Files:**
-- Create: `test/Mapping/arm_sve_micro_map.sh` (or a `.mlir` FileCheck test if the pre-existing mapping tests use that form — check `test/Conversion/MicroMapping/` for the shipped convention first and follow it)
-- Modify: the matching registration in `test/FileCheck.cmake` if a FileCheck test is used, or `test/Mapping/CMakeLists.txt` if a script test is used
+```sh
+ninja -C build LLKMappingTests
+./build/bin/LLKMappingTests --gtest_filter='ArmPlacement.*'
+```
+
+Expected: both dtypes select the concrete engine and exact 1024-byte accumulator peak stated above. Diagnose failures in the shared path or fixture lifetimes; do not increase capacities, add a fake matrix node or replace the initializer. A changed fixture requires revising the spec and both targets' source together.
+
+- [ ] **Step 4: Pin the static capability boundary.** Add `ArmTargets.NoExecutableBackend` for both targets: `codegenRequirements` absent; each emitter `hasLowering()==false`; `verify(validBundle)` succeeds; `lower(validBundle)` returns `target_lowering_unsupported`. Then call `compileMappedKernel` with `MappedCompileOptions.backend=MappedBackend::SelectedTarget` on an otherwise valid mapped fixture and assert the existing missing-ISA-requirements rejection. Do not use `require-executable=1` to demand ARM instruction lowering from this increment.
+
+- [ ] **Step 5: Commit** `test(mapping): verify typed ARM contraction placement and storage`.
+
+### Task 4: Typed coverage, negative controls, CLI parity and replay
+
+**Files:** `arm_targets.cpp`, `arm_placement.cpp`, fixture helper, `arm_target_pipeline.py`, new typed vector inputs under `Inputs/arm/`, and `test/FileCheck.cmake`.
 
 **Interfaces:**
-- Consumes: the policy files from Tasks 2 and 4, and the emitter key lists in those packages.
-- Produces: nothing.
+- Consumes: Tasks 1–3, the ten emitter keys, fixed fixture paths and concrete plan metadata.
+- Produces CTest `ArmTargetPipeline`, invoked as:
 
-The registry path was covered by Tasks 2 and 4. This task covers the *other* dispatch path — `--micro-map target=... machine=... layouts=... rules=... emitters=...` — which consults no registry and needs only configuration. It is the path the shipped mapping shell tests use.
-
-- [ ] **Step 1: Find the shipped convention**
-
-```bash
-ls test/Conversion/MicroMapping/ && sed -n '1,60p' test/Conversion/MicroMapping/micro_bind_plan_id.sh
+```text
+python3 arm_target_pipeline.py <llk-opt> <micro-perf> <source-dir> <work-dir>
 ```
 
-Read whichever test drives `--micro-map` with explicit `target=`/`machine=`/`layouts=`/`rules=`/`emitters=` options, and copy its structure exactly.
+Use `sys.executable`/`Python3_EXECUTABLE` from CMake, subprocess argument arrays, a per-test work directory and parsed JSON assertions. No network or native ARM host is required.
 
-- [ ] **Step 2: Write the test**
+- [ ] **Step 1: Add typed positive and negative policy tests.** Add/mul each of f32/bf16/i8, both conversion directions, f32 silu/reduce, and bf16→f32→silu→f32-mul fusion must produce complete static plans. In mixed-dtype tests inspect per-port solved VW: 32 for BF16 and 16 for f32. Include unsupported f64 vector input, i8 contraction and non-f32 silu negatives. Example assertion on a layout solution's parameter:
 
-Write the new test against `mapping/arm-sve/` and `machines/arm-sve-v2.yaml`, running `llk-opt --micro-map` with:
-
-```
-target=arm-sve machine=machines/arm-sve-v2.yaml layouts=mapping/arm-sve/layouts.llkmap rules=mapping/arm-sve/rules.llkmap emitters=sve_vector_add,sve_vector_convert,sve_vector_silu,sve_vector_mul,sve_mma,sve_reduce,sve_copy,sve_tile_copy,sve_tile_store,sve_fused_convert_silu_mul
-```
-
-The input `.mlir` is the same minimal MicroIR kernel the shipped mapping tests use; take it from the test read in Step 1 rather than writing a new one. Register it the same way the shipped test is registered.
-
-- [ ] **Step 3: Run it**
-
-```bash
-ninja check-llk
+```cpp
+ASSERT_TRUE(std::holds_alternative<int64_t>(solution.parameters.lookup("VW")));
+EXPECT_EQ(std::get<int64_t>(solution.parameters.lookup("VW")), 32);
 ```
 
-Expected: the new test passes and appears in the CTest listing.
+Use distinct tests/fixture operands for each signature; one generic untyped node cannot establish the table. Keep integer/float semantics as verified by MicroIR and do not add conversion/numerical approximations through flags.
 
-- [ ] **Step 4: Run the entire suite and confirm no regressions**
+- [ ] **Step 2: Add materialization and feasibility negative controls.** Create temporary same-target profile copies from shipped data, recompute identities through the loader, and mutate one fact per test: remove accumulator memory (and its links to keep YAML structurally valid), reduce accumulator capacity to512, or remove `sram_to_acc.0`/`sram_to_za.0`. Add a typed fixture requesting an absent memory kind. The corresponding search must retain no complete plan and report a memory/capacity/route reason. Do not assert a plan is valid merely because a rule matched. Keep topK=1 to pin rejection before retention. Add selected metadata tampering tests for unknown/foreign compute ids, agreeing with Task 1's direct-analysis controls.
 
-```bash
-ninja check-llk
+- [ ] **Step 3: Implement both explicit pass-spec CLI paths.** For each target and contraction dtype run `llk-opt --micro-map` with absolute machine/layout/rule paths, all declared emitter keys, `mode=deterministic` and `report=<work-dir>/...json`. Check JSON selected compute ids, memory ids, physicalComplete, empty physicalReasons, source hash and bounded-search metadata. Run `--micro-verify-mapping` using its existing target options and preserve its diagnostic behavior. Obtain the reported selectedPlanId, then replay via `--micro-bind-plan` with identical target/options/top-k in a fresh subprocess. Compare parsed selected state and normalized emitted IR, not regex presence of `micro.plan` alone.
+
+- [ ] **Step 4: Compare analysis/report parity.** Run `micro-perf --machine=<absolute-profile> --level=1 --fail-on-capacity-violation --format=yaml <bound.mlir>`, as in `acceptance_pipeline.py`; parse the named YAML fields with that test's standard-library approach (no new package dependency). Compare planner/materialized latency, per-level traffic and live storage under the documented conventions; preserve concrete compute identity and complete-analysis status. The fixture inputs and profiles must be identical across processes. A bounded exact control must agree on the best explored cost or explicitly report truncation; no claim of global optimality is made. Add fresh-process repeatability controls. Never assert that different emitter strings guarantee different costs or that modeled costs are measurements.
+
+- [ ] **Step 5: Register and run the integration test.** Follow the existing Python pipeline CTest registrations in `test/FileCheck.cmake` and pass the built `llk-opt`/`micro-perf` paths, source root and a unique binary-dir output path. Ensure test discovery includes it:
+
+```sh
+ninja -C build LLKMappingTests llk-opt micro-perf
+./build/bin/LLKMappingTests --gtest_filter='ArmTargets.*:ArmPlacement.*'
+ctest --test-dir build -R '^ArmTargetPipeline$' --output-on-failure
 ```
 
-Expected: every test that passed before this branch still passes, plus the new ones. Record the pass/fail/skip counts. Do not report the work complete on a partial run.
+Expected: typed positives pass, each negative rejects for its changed fact, registry tests remain active, and both pass-spec paths replay/analyze with parity.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit** `test(mapping): cover ARM dtype domains, rejection and replay`.
 
-```bash
-git add test/Conversion/MicroMapping test/FileCheck.cmake test/Mapping/CMakeLists.txt
-git commit -m "test(mapping): drive the arm-sve target through the micro-map pass spec
+### Task 5: Regression evidence and current support documentation
 
-Co-Authored-By: Claude Code <noreply@anthropic.com>"
-```
-
----
-
-### Task 7: Documentation
-
-**Files:**
-- Modify: `docs/manual/source/features.rst` (the delivered-support matrix)
-- Modify: `ARCHITECTURE.md` §3 / §5 if either enumerates the shipped targets
+**Files:** Current support documents from the file map; a revision-pinned evidence ledger at `docs/reviews/arm-mapping-targets-acceptance.md` created only when implementation evidence exists.
 
 **Interfaces:**
-- Consumes: everything above.
-- Produces: nothing.
+- Consumes: all implementation tasks, baseline records and actual CI/local artifacts.
+- Produces: current support wording and evidence identifying the exact implementation head; no executable ARM claim.
 
-The repository's review culture distinguishes design intent from delivered support, and `features.rst` is named in `CLAUDE.md` as a source for delivered support. Two new targets must appear there, described with the same boundary language the generic accelerator uses.
+- [ ] **Step 1: Run the full registered suite once changes are final.**
 
-- [ ] **Step 1: Find every place the shipped targets are enumerated**
-
-```bash
-grep -rn "generic-ai-accel" --include='*.rst' --include='*.md' docs/ ARCHITECTURE.md README.md 2>/dev/null
+```sh
+ninja -C build check-llk
 ```
 
-- [ ] **Step 2: Update each**
+Record registered/passed/failed/skipped/disabled counts, toolchain, source head and reasons. Compare any expected local host capability limitation to the baseline; do not suppress or relabel failures. CI LLVM22.1.8 on its supported x86 host must pass required selected AVX2 and full suite. The ARM tests themselves must have no host skips. Repeat only for new changes/failures or unresolved concerns.
 
-For each hit that enumerates target support, add `arm-sve` and `arm-sme` and state plainly that they are **mapping/analysis targets**: they model, rank and report plans, and they ship no executable backend — the same boundary sentence `features.rst` already carries for the generic accelerator. Do not claim SVE/SME execution, and do not describe the pinned vector length as a hardware fact.
+- [ ] **Step 2: Write the acceptance ledger from actual artifacts.** Record both contraction dtypes' selected engines, exact1024-byte accumulator peak, initializer/output movement, per-dtype layout widths, storage/route negatives, registry and pass-spec results, static-only rejection, parity and replay identity. Record any remaining limits. Preserve the original CPU-schedule rejection audit as history; it is not delivery evidence for retargeting those schedules.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Update current documentation.** In `features.rst` and current target lists describe SVE/SME as static mapping/analysis targets at modeled VL=SVL512, with shared selected-vector-contraction support and the bounded direct-MicroIR fixture domain. Explicitly exclude executable SVE/SME, physical ZA realization, calibrated timing and unchanged CPU adapter schedules. Preserve historical review claims and source revisions. Correct blanket NEON-only or fixed maximum512 hardware claims wherever they describe these new targets.
 
-```bash
-git add docs/manual/source/features.rst ARCHITECTURE.md
-git commit -m "docs: record the arm-sve and arm-sme mapping targets
+- [ ] **Step 4: Verify documentation and commit.** Run the developer-manual build using the repository's documented command, `git diff --check`, and review the evidence ledger against artifacts. Commit as `docs: record bounded ARM mapping support and acceptance`.
 
-Co-Authored-By: Claude Code <noreply@anthropic.com>"
-```
+## Self-review and handoff
 
----
-
-## Self-Review
-
-**Spec coverage.** Every spec section maps to a task: §5 profiles → Tasks 1 and 3; §6 layouts → Tasks 2 and 4; §7 rules → Tasks 2 and 4; §8 packaging and both dispatch paths → Tasks 2, 4 and 6; §9 acceptance, including `DoesNotClaimAnExecutableBackend` and the placement difference → Tasks 2, 4 and 5; §10 limits → Task 7's wording constraints; §11 sequencing → the task order. §3's non-goals are enforced by the Global Constraints (no dialect, no schema, no `llk-tune` default machine, no hook cleanup).
-
-**Placeholder scan.** No `TBD`/`TODO`. Task 4 does not repeat Task 2's near-identical files verbatim: it names each file to copy and gives a substitution table covering every value that changes, with the one genuinely different test written out in full. This is a deliberate deviation from "repeat the code", because the copied files are committed and on disk by the time Task 4 runs, so a fresh executor reads them rather than reconstructing them — and repeating ~400 lines of near-duplicate policy would obscure the handful of lines that actually differ. Task 6 Step 1 directs the implementer to read the shipped convention before writing, because the repository's existing mapping shell tests are the authority on that form and this plan should not invent a second one.
-
-**Type consistency.** `createMappingTarget(configurationRoot, machinePath = {})` matches the shipped `GenericAcceleratorMappingTarget` signature in both packages. `emitterKeys()` returns `llvm::ArrayRef<llvm::StringRef>` in both. The emitter keys declared in Tasks 2 and 4 are exactly the keys named by the `emit` directives in the matching `rules.llkmap`, and Task 5 asserts that correspondence rather than assuming it. Profile names are consistent across tasks: compute ids `svp`/`za`, memory kind `acc`, executor kinds `worker`/`sve_engine`/`za_engine`, rule ids `sve.*`/`sme.*`.
+- Spec §§1–5 → Task1; §§6–8 → Task2; §9 positive contraction/storage/static boundary → Task3; typed signatures/negatives/registry/pass-spec/parity/replay → Tasks2/4; regression/claims → Task5.
+- Five Review Focus items each have explicit owning tests. Required success is actual complete-plan evaluation and bound analysis, not a declared rule or plan marker.
+- Signatures use existing package/plan/analysis types; proposed production additions are declared in Task1 and test-only helpers in Task3. `PlanPlacement::computeBindings`, `BoundPlan::unmaterialized` and `SelectedKernelAnalysis::{complete,peakBytes,storageLivenessFromPlan}` are real fields.
+- The plan gives decisions, test assertions and fixture contracts rather than duplicating hundreds of lines of package boilerplate. Shared profile differences are specified by normative tables; no unchecked substitution table remains.
+- Spec §11 constrains a future executable-backend design; it is deliberately not implemented here. No canonical scalable or ZA dialect extension is prescribed without a separate design comparison, and no remote issue edit is included.
+- This document is a plan. None of its unchecked tasks, expected outcomes or future evidence ledger establishes delivered support. The next action after document review is implementation through the chosen execution workflow.
