@@ -1,0 +1,7 @@
+[
+  {
+    "label": "Build LLK tools (Debug)",
+    "command": "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DLLVM_PROJECT_BUILD_DIR=\"$HOME/Workspace/Projects/llvm-project/build\" && cmake --build build --target llk-compile llk-opt llk-tune --parallel 4",
+    "cwd": "$ZED_WORKTREE_ROOT"
+  }
+]
