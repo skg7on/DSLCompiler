@@ -69,6 +69,46 @@ source or already-materialized input is not equivalent. ``--candidate-source``
 also accepts ``concrete-micro`` and explicit ``synthetic`` compatibility mode.
 ``--source-symbol`` identifies the semantic source root.
 
+Non-contraction sources and contract inference
+----------------------------------------------
+
+``--source-adapter=<key>`` selects the source family explicitly. When it is
+omitted, the selected root is resolved against the registered families; zero
+matches is unsupported and more than one requires the key. The adapter describes
+the root's versioned workload contract, so candidate generation and search use
+the source's own ports and axes rather than a workload label.
+
+The delivered non-contraction family is ``linalg-elementwise-v1``: static
+rank-two f32 tensors, two read inputs, an unwritten destination, and one
+``arith.addf`` or ``arith.mulf`` with identity maps and two parallel iterators.
+Two source axes (``axis:d0`` and ``axis:d1``) produce genuinely different tile
+schedules:
+
+.. code-block:: bash
+
+   build/bin/llk-tune --input=test/Tuning/Inputs/framework/elementwise_search.mlir \
+     --mapping-target=x86-avx2 --mapping-root=. \
+     --machine=machines/x86-avx2-v2.yaml --mapping-mode=exact \
+     --mapping-backend=reference --candidate-source=semantic \
+     --source-symbol=elementwise --source-adapter=linalg-elementwise-v1 \
+     --top-k=1 --mapping-report=build/tutorial/elementwise.json \
+     --candidate-artifacts=build/tutorial/elementwise-candidates \
+     --output=build/tutorial/elementwise.schedule.yaml
+
+The report records ``source_adapter``, ``source_adapter_version`` and a
+``source_contract`` object with the contract ``version`` and canonical content.
+Each retained candidate carries its ``source_receipt`` (which source-owned
+choices were realized, here ``T0`` and ``T1``) and a ``replay_identity`` folding
+the source graph hash, binding hash and plan id. The schedule YAML's
+``source_provenance`` block repeats the adapter, contract version/content,
+receipt and replay identity, and the instantiated ``source.mlir`` retains both
+``source_adapter`` and ``micro.workload_contract`` attributes.
+
+``--M``/``--N``/``--K`` and the dtype options remain contraction-adapter inputs.
+Supplying them for a family that describes its own contract is an error; the
+contract already answers which ports and axes exist. ``--source-adapter`` is
+valid only with ``--candidate-source=semantic``.
+
 Backend and measurement
 -----------------------
 
@@ -109,8 +149,12 @@ Options and ranking
   Zero candidate cap requests the finite domain; start with a small cap.
 * ``--top-k`` limits retained records; ``--perf-level=0|1`` selects static analysis
   in compatibility mode. Target-aware mode evaluates the complete selected plan.
-* Explicit ``-M``, ``-N``, ``-K`` and dtype options must agree with the chosen source
-  and binding contract; the semantic source is not replaced by the workload label.
+* Explicit ``-M``, ``-N``, ``-K`` and dtype options must agree with the chosen
+  contraction source and binding contract; the semantic source is not replaced by
+  the workload label. They are rejected for a non-contraction adapter, whose
+  contract supplies the shape.
+* ``--source-adapter`` names the registered family explicitly; otherwise exactly
+  one adapter must accept the selected root.
 
 The objective comes from ``micro.objective``. Unknown metrics are diagnosed;
 missing measurement metrics are unavailable, not zero-cost winners. Reports
@@ -137,5 +181,6 @@ Neither mode establishes the fastest executable for arbitrary original source.
 
 Implementation references: :source:`mapped tuning session <include/LLK/Conversion/MicroMapping/MappedTuningSession.h>`,
 :source:`candidate instantiation <include/LLK/Conversion/MicroMapping/CandidateInstantiation.h>`,
-:source:`CLI <tools/llk-tune/llk-tune.cpp>` and
-:source:`CLI integration tests <test/Tuning/mapped_tune_cli.py>`.
+:source:`CLI <tools/llk-tune/llk-tune.cpp>`,
+:source:`CLI integration tests <test/Tuning/mapped_tune_cli.py>` and
+:source:`generic source CLI tests <test/Tuning/generic_tune_cli.py>`.

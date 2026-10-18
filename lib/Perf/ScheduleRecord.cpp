@@ -48,6 +48,19 @@ void writeStringList(llvm::raw_ostream &os, llvm::StringRef key,
   os << "]\n";
 }
 
+/// Writes a double-quoted YAML scalar. The canonical contract is a
+/// length-delimited string that may contain punctuation YAML would otherwise
+/// interpret, so it is escaped rather than emitted bare.
+void writeQuotedScalar(llvm::raw_ostream &os, llvm::StringRef value) {
+  os << '"';
+  for (char character : value) {
+    if (character == '\\' || character == '"')
+      os << '\\';
+    os << character;
+  }
+  os << '"';
+}
+
 void writeIntList(llvm::raw_ostream &os, llvm::StringRef key,
                   llvm::ArrayRef<int64_t> values) {
   os << key << ": [";
@@ -116,6 +129,22 @@ void writeScheduleYaml(llvm::raw_ostream &os, const ScheduleRecord &record) {
   os << "  dram_bytes: " << record.metrics.dramBytes << "\n";
   os << "  sram_bytes: " << record.metrics.sramBytes << "\n";
   os << "  bottleneck: " << record.metrics.bottleneck << "\n";
+
+  if (record.sourceProvenanceVersion) {
+    os << "source_provenance:\n";
+    os << "  schema_version: " << record.sourceProvenanceVersion << "\n";
+    os << "  adapter: " << record.sourceAdapter << "\n";
+    os << "  adapter_version: " << record.sourceAdapterVersion << "\n";
+    os << "  contract_version: " << record.workloadContractVersion << "\n";
+    os << "  contract: ";
+    writeQuotedScalar(os, record.workloadContract);
+    os << "\n";
+    os << "  replay_identity: \"";
+    os << record.replayIdentity;
+    os << "\"\n";
+    writeStringList(os, "  receipt_source", record.sourceReceipt);
+    writeStringList(os, "  receipt_mapping", record.mappingReceipt);
+  }
 
   if (record.mappingProvenanceVersion) {
     os << "mapping_provenance:\n";

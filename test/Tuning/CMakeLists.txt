@@ -28,4 +28,9 @@ if(LLK_BUILD_E2E_TESTS)
   add_test(NAME MappedTuneCLI
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/mapped_tune_cli.py
           $<TARGET_FILE:llk-tune> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR})
+
+  add_test(NAME GenericTuneCLI
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/generic_tune_cli.py
+          $<TARGET_FILE:llk-tune> $<TARGET_FILE:llk-compile>
+          ${CMAKE_SOURCE_DIR})
 endif()

@@ -66,11 +66,15 @@ What you can do today
      - :doc:`Performance analyzer </tools/performance>`
    * - Tune schedule parameters
      - Original-source candidate instantiation, mapped selection/analysis/compilation, static ranking, candidate artifacts, frozen replay and optional verified measurement
-     - Requires explicit mapping target/source mode for original-source tuning; production measurement persistence/calibration remain separate
+     - ``--source-adapter`` selects or infers the source contract; contraction M/N/K options remain supported only for the contraction adapter; production measurement persistence/calibration remain separate
      - :doc:`Tuner </tools/tuning>`, :doc:`tuning tutorial </tutorials/04-tuning>`
+   * - Search a non-contraction source
+     - Versioned workload contract, source adapter registry, bounded rank-two f32 elementwise add/multiply with tiled spatial schedules
+     - The bounded elementwise adapter is the first delivered non-contraction family; arbitrary Linalg import, broadcasting, reductions, dynamic shapes and approximation modes are rejected
+     - :doc:`Tuner </tools/tuning>`, :doc:`Compiler </tools/compiler>`
    * - Run supported mapped kernels
-     - Shared mapped compilation, typed descriptor invocation, caller-buffer ownership and per-call scratch release; selected AVX2 numeric fixtures
-     - Selected-target execution requires x86_64 AVX2; rank-two supported dtypes/strides/bounds are checked by typed invocation; deprecated untagged descriptors cannot check dtype/allocation size
+     - Shared mapped compilation, typed descriptor invocation, caller-buffer ownership and per-call scratch release; reference and selected AVX2 numeric fixtures including generic elementwise add/multiply
+     - Selected-target execution requires x86_64 AVX2; rank-two supported dtypes/strides/bounds are checked by typed invocation; analysis/lowering are rank-neutral but executable ABI v1 rejects other ranks with ``runtime_capability:`` diagnostics; deprecated untagged descriptors cannot check dtype/allocation size
      - :doc:`Compiler </tools/compiler>`
    * - Exercise the benchmark harness
      - ``llk-bench`` runs a synthetic host loop and reports timing
@@ -81,9 +85,12 @@ What you can do today
      - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered
      - :doc:`Mapping tutorial </tutorials/02-mapping>`
 
-The broader goal does not imply arbitrary DNN support today. Semantic export and
-source-search templates remain contraction-shaped, and typed mapped invocation
-is rank-two. The :source:`framework design spec <docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md>`
+The broader goal does not imply arbitrary DNN support today. The LLK-to-Micro
+export and contraction source family remain contraction-shaped, while source
+search also admits the bounded rank-two elementwise family. Typed mapped
+invocation is still rank-two: contracts may describe other ranks, and analysis
+and lowering remain rank-neutral, but executable preparation refuses them. The
+:source:`framework design spec <docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md>`
 records these genericity gaps and capability-based acceptance requirements.
 
 The implemented operation inventory is

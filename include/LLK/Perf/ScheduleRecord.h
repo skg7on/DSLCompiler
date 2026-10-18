@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace mlir::llk::perf {
 
@@ -79,6 +80,21 @@ struct ScheduleRecord {
   std::string mappingBindingHash;
   std::string mappingSourceArtifact;
   std::string mappingPlanReport;
+
+  /// Source provenance, present when the selected candidate came through the
+  /// workload-contract adapter boundary. The canonical contract content and
+  /// the realization receipt travel with the record so a replay can compare
+  /// semantics rather than trust a workload label.
+  uint32_t sourceProvenanceVersion = 0;
+  std::string sourceAdapter;
+  uint32_t sourceAdapterVersion = 1;
+  uint32_t workloadContractVersion = 0;
+  std::string workloadContract;
+  std::vector<std::string> sourceReceipt;
+  std::vector<std::string> mappingReceipt;
+  /// The length-delimited source/binding/plan identity a frozen replay must
+  /// reproduce. Empty for legacy shapes, which carry no source contract.
+  std::string replayIdentity;
 };
 
 /// Writes one record as a YAML document.

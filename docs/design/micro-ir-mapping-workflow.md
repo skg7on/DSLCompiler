@@ -106,6 +106,29 @@ llk-compile --mapping-target x86-avx2 --mapping-root . \
   tune-candidates/candidate_.../source.mlir --emit mlir
 ```
 
+A non-contraction source names its adapter instead of supplying M/N/K. The
+adapter describes the contract, so the search space's source-owned axes are the
+tile choices it can actually realize:
+
+```bash
+llk-tune --input test/Tuning/Inputs/framework/elementwise_search.mlir \
+  --machine machines/x86-avx2-v2.yaml --mapping-target x86-avx2 \
+  --mapping-root . --mapping-mode exact --mapping-backend reference \
+  --candidate-source semantic --source-symbol elementwise \
+  --source-adapter linalg-elementwise-v1 \
+  --mapping-report tune.json --candidate-artifacts tune-candidates \
+  --output tune.yaml
+```
+
+The report and the schedule YAML add the adapter key/version, canonical contract
+content, the realization receipt and a `replay_identity` of the form
+`graph=<hash>|binding=<hash>|plan=<id>`. `llk-compile` prints the same identity
+during replay, along with `source-adapter=` and `source-contract-version=`.
+Explicit M/N/K or dtype options are rejected for this family because its contract
+defines the ports and axes. Execution still requires the mapped rank-two ABI v1:
+a rank-three contract or rank-one reduction reaches static/lowered evidence, but
+`--mapping-stop executable` fails with a `runtime_capability:` diagnostic.
+
 Optional runtime measurement uses a version-1 JSON fixture with ordered input
 and output ports. Each port declares `dtype`, rank-two `shape`, and `data`; data
 can be a scalar to fill the tensor or an element array. Output ports can also

@@ -20,6 +20,9 @@
 
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
 #include "LLK/Conversion/MicroMapping/MappedTuningSession.h"
+#include "LLK/Conversion/Workload/ContractionSourceAdapter.h"
+#include "LLK/Conversion/Workload/SourceAdapter.h"
+#include "LLK/Conversion/Workload/WorkloadContract.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Machine/MachineModelLoader.h"
@@ -133,6 +136,11 @@ static cl::opt<std::string>
     tuneSourceSymbol("source-symbol",
                      cl::desc("Semantic source function to instantiate"),
                      cl::init(""));
+static cl::opt<std::string>
+    tuneSourceAdapter("source-adapter",
+                      cl::desc("Source adapter key to dispatch to (default: "
+                               "infer from the selected source root)"),
+                      cl::init(""));
 static cl::opt<unsigned>
     tuneSourceRoot("source-root",
                    cl::desc("Zero-based semantic contraction root ordinal"),
@@ -677,6 +685,15 @@ makeFixtureBuffers(const MeasurementFixture &fixture,
   return buffers;
 }
 
+/// The source graph, binding and plan identity in one stable, printable field.
+/// A frozen replay must reproduce it exactly; a changed source, port or plan
+/// cannot present itself under the previous value.
+std::string replayIdentity(const mlir::llk::mapping::CoveringPlan &plan) {
+  return "graph=" + llvm::formatv("{0:x}", plan.graphHash).str() +
+         "|binding=" + llvm::formatv("{0:x}", plan.sourceBindingHash).str() +
+         "|plan=" + llvm::formatv("{0:x}", plan.id).str();
+}
+
 int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
                     const mlir::llk::perf::WorkloadShape &shape) {
   namespace perf = mlir::llk::perf;
@@ -702,6 +719,50 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
       tuneCandidateSource != "concrete-micro" &&
       tuneCandidateSource != "synthetic")
     return reportError("unsupported --candidate-source=" + tuneCandidateSource);
+  if (!tuneSourceAdapter.empty() && tuneCandidateSource != "semantic")
+    return reportError("--source-adapter applies only to "
+                       "--candidate-source=semantic");
+
+  // The selected source supplies its own contract. Inference is explicit: the
+  // root is chosen first, then its adapter describes what it implements, so a
+  // label can never stand in for the port/axis semantics.
+  std::optional<mlir::llk::workload::WorkloadContract> sourceContract;
+  std::string sourceAdapterKey = tuneSourceAdapter;
+  if (tuneCandidateSource == "semantic") {
+    mlir::llk::workload::SourceAdapterRegistry registry =
+        mlir::llk::workload::makeDefaultSourceAdapters();
+    auto root = mlir::llk::workload::selectSourceRoot(
+        source, {tuneSourceSymbol, tuneSourceRoot}, registry,
+        tuneSourceAdapter);
+    if (!root)
+      return reportError(llvm::toString(root.takeError()));
+    auto adapter = registry.resolve(*root, tuneSourceAdapter);
+    if (!adapter)
+      return reportError(llvm::toString(adapter.takeError()));
+    sourceAdapterKey = (*adapter)->key().str();
+    auto described = (*adapter)->describe(*root);
+    if (!described)
+      return reportError(llvm::toString(described.takeError()));
+    sourceContract = std::move(*described);
+  }
+  // The contraction adapter's explicit M/N/K and dtype facts remain supported
+  // legacy inputs. Every other family describes its own ports and axes, so
+  // supplying contraction shape options for it would silently answer a
+  // question the contract already answered differently.
+  const bool explicitShapeOptions =
+      tuneM.getNumOccurrences() || tuneN.getNumOccurrences() ||
+      tuneK.getNumOccurrences() || tuneInputDType.getNumOccurrences() ||
+      tuneWeightDType.getNumOccurrences() ||
+      tuneAccumulatorDType.getNumOccurrences() ||
+      tuneOutputDType.getNumOccurrences();
+  const bool contractionSource =
+      sourceAdapterKey.empty() ||
+      sourceAdapterKey == mlir::llk::workload::contractionSourceAdapterKey();
+  if (!contractionSource && explicitShapeOptions)
+    return reportError("--M/--N/--K and dtype options apply only to the "
+                       "contraction adapter; '" +
+                       sourceAdapterKey + "' defines its own contract");
+
   mlir::llk::target::registerAllMappingTargets();
   const bool explicitMachine = tuneMachine.getNumOccurrences() != 0;
   auto target = mapping::createRegisteredMappingTarget(
@@ -752,6 +813,7 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
   options.source.machine = &(*target)->machine();
   options.source.sourceSymbol = tuneSourceSymbol;
   options.source.sourceRootOrdinal = tuneSourceRoot;
+  options.source.adapterKey = sourceAdapterKey;
   options.source.sourceMode = tuneCandidateSource == "semantic"
                                   ? tuning::SourceMode::SemanticSource
                               : tuneCandidateSource == "concrete-micro"
@@ -819,8 +881,11 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
       return llvm::Error::success();
     };
   }
-  auto report =
-      tuning::runMappedTuningSession(source, space, shape, **target, options);
+  auto report = !contractionSource && sourceContract
+                    ? tuning::runMappedTuningSession(
+                          source, space, *sourceContract, **target, options)
+                    : tuning::runMappedTuningSession(source, space, shape,
+                                                     **target, options);
   if (!report)
     return reportError(llvm::toString(report.takeError()));
   if (report->ranked.empty()) {
@@ -848,6 +913,20 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
       bindings[v.first] = v.second;
     row["bindings"] = std::move(bindings);
     row["source_mode"] = tuneCandidateSource;
+    if (!sourceAdapterKey.empty()) {
+      row["source_adapter"] = sourceAdapterKey;
+      llvm::json::Object receipt;
+      llvm::json::Array sourceParameters;
+      for (const std::string &parameter : candidate.receipt.source)
+        sourceParameters.push_back(parameter);
+      llvm::json::Array mappingParameters;
+      for (const std::string &parameter : candidate.receipt.mapping)
+        mappingParameters.push_back(parameter);
+      receipt["source"] = std::move(sourceParameters);
+      receipt["mapping"] = std::move(mappingParameters);
+      row["source_receipt"] = std::move(receipt);
+      row["replay_identity"] = replayIdentity(candidate.plan);
+    }
     row["plan_id"] = llvm::formatv("{0:x}", candidate.plan.id).str();
     row["binding_hash"] = llvm::formatv("{0:x}", candidate.bindingHash).str();
     row["plan_report"] = candidate.planReport;
@@ -910,6 +989,18 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
     record.mappingPlanId = llvm::formatv("{0:x}", candidate.plan.id).str();
     record.mappingBindingHash =
         llvm::formatv("{0:x}", candidate.bindingHash).str();
+    if (!sourceAdapterKey.empty()) {
+      record.sourceProvenanceVersion = 1;
+      record.sourceAdapter = sourceAdapterKey;
+      if (sourceContract) {
+        record.workloadContractVersion = sourceContract->version;
+        record.workloadContract =
+            mlir::llk::workload::canonicalWorkloadContract(*sourceContract);
+      }
+      record.sourceReceipt = candidate.receipt.source;
+      record.mappingReceipt = candidate.receipt.mapping;
+      record.replayIdentity = replayIdentity(candidate.plan);
+    }
     if (candidate.ranking.metrics.measuredNs) {
       record.measured = true;
       record.warmup = fixture ? static_cast<unsigned>(fixture->warmup) : 0;
@@ -927,8 +1018,12 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
                   planPath = dir + "/plan.json";
       tuning::CandidateInstantiationOptions sourceOptions = options.source;
       sourceOptions.machine = &(*target)->machine();
-      auto instance = tuning::instantiateCandidate(
-          source, space, record.candidate, shape, sourceOptions);
+      auto instance =
+          !contractionSource && sourceContract
+              ? tuning::instantiateCandidate(source, space, record.candidate,
+                                             *sourceContract, sourceOptions)
+              : tuning::instantiateCandidate(source, space, record.candidate,
+                                             shape, sourceOptions);
       if (!instance)
         return reportError(llvm::toString(instance.takeError()));
       std::error_code ec;
@@ -961,6 +1056,17 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
     out["objective"] = space.objective.primaryMetric;
     out["objective_direction"] =
         perf::stringifyObjectiveDirection(space.objective.direction).str();
+    if (!sourceAdapterKey.empty()) {
+      out["source_adapter"] = sourceAdapterKey;
+      out["source_adapter_version"] = 1;
+      if (sourceContract) {
+        llvm::json::Object contract;
+        contract["version"] = sourceContract->version;
+        contract["canonical"] =
+            mlir::llk::workload::canonicalWorkloadContract(*sourceContract);
+        out["source_contract"] = std::move(contract);
+      }
+    }
     out["generated"] = report->generated;
     out["mapping_truncated"] = report->mappingTruncated;
     out["generator_truncated"] = report->generatorTruncated;
@@ -1014,8 +1120,8 @@ int runMicroSearch() {
       (tuneMappingBackend != "reference" && !tuneMappingBackend.empty()) ||
       !tuneMappingReport.empty() || !tuneCandidateArtifacts.empty() ||
       tuneCandidateSource != "semantic" || !tuneSourceSymbol.empty() ||
-      tuneSourceRoot != 0 || tuneMeasureTop != 0 ||
-      !tuneMeasurementInputs.empty();
+      tuneSourceRoot != 0 || !tuneSourceAdapter.empty() ||
+      tuneMeasureTop != 0 || !tuneMeasurementInputs.empty();
   if (tuneMappingTarget.empty() && mappedOptionsUsed)
     return reportError("target-aware options require --mapping-target");
 

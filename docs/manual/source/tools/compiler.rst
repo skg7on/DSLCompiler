@@ -91,6 +91,9 @@ Driver options
    * - ``--plan-report=<path>``
      - Empty
      - Read a frozen JSON selection instead of searching. Requires the mapping path.
+   * - ``--source-adapter=<key>``
+     - Empty
+     - Assert the source adapter that produced the artifact. Empty accepts the adapter recorded in the frozen source. Requires the mapping path.
 
 The ``--M``, ``--N``, and ``--K`` options affect only the legacy JIT cache key. Shapes in the MLIR types drive export and compilation. They do not affect Micro export, mapped search, or mapped compilation. The corresponding shape options on :doc:`llk-tune </tools/tuning>` and :doc:`llk-bench </tools/benchmark>` have different contracts.
 
@@ -272,6 +275,44 @@ This reuses the report's frozen ``selectedState`` instead of re-running search; 
 
 ``llk-opt --micro-bind-plan`` is a different interface: it reads a plan **id**, re-runs the same search, and finds that id among the retained plans. It does not load a report file.
 
+Generic source replay
+---------------------
+
+The compiler does not instantiate a semantic source by itself. Produce the
+instantiated source with ``llk-tune --candidate-artifacts`` (see the
+:doc:`tuner manual </tools/tuning>`), then replay it exactly like a contraction
+candidate: the frozen ``source.mlir`` already holds the realized ``micro.kernel``
+and its retained ``micro.workload_contract`` and ``source_adapter`` attributes,
+and ``plan.json`` holds the selected mapping state.
+
+.. code-block:: sh
+
+   build/bin/llk-compile --mapping-target=x86-avx2 --mapping-root=. \
+     --machine=machines/x86-avx2-v2.yaml --mapping-backend=reference \
+     --mapping-stop=lowered --source-adapter=linalg-elementwise-v1 \
+     --plan-report=build/tutorial/elementwise-candidates/<candidate>/plan.json \
+     build/tutorial/elementwise-candidates/<candidate>/source.mlir --emit=mlir
+
+The status line reports ``source-adapter=``, ``source-contract-version=`` and
+``replay-identity=`` next to the backend identity. The replay identity is the
+same ``graph=<hash>|binding=<hash>|plan=<id>`` value the tuner retained, so a
+matching value is evidence that source, binding and plan are the frozen ones.
+A changed source attribute or port extent changes the workload graph and is
+rejected by the plan report's graph hash; changed layout/rule content changes the
+target hash; changed machine content changes the machine/target hash; and a
+different execution mode (``reference`` versus ``selected-target``) produces a
+different ``identity=``. None of those cases silently reuse the previous
+artifact.
+
+The mapped ABI v1 is a rank-two, compact, offset-zero descriptor envelope with
+at most 12 ports and read-only inputs. Analysis, reporting and lowering are
+rank-neutral; only executable preparation applies that envelope. A rank-three
+contract or a rank-one reduction can therefore reach lowered IR, while
+``--mapping-stop=executable`` fails explicitly with a ``runtime_capability:``
+diagnostic naming the rank, dtype, descriptor count or port effect it cannot
+express. Ports whose contract declares unknown or dynamic extents are rejected
+earlier as contract errors, not as execution-capability errors.
+
 .. _tools-compiler-runtime-boundary:
 
 Runtime boundary
@@ -321,6 +362,8 @@ Troubleshooting
      - Check operation/dtype support and inspect an optimizer mapping report. Beam/candidate caps can limit the search; exact mode still has finite internal caps and reports truncation.
    * - No selected vector width / fused emitter failure
      - Inspect the selected rule and bundle. The shipped fused ``convert → silu → mul`` chain is verified. Inspect unsupported emitter/effect/region diagnostics and use the intended backend policy.
+   * - ``runtime_capability:`` rank/dtype/effect diagnostic
+     - The selected workload or reference program is valid, but the mapped ABI v1 cannot call it: it requires rank-two static ports, a supported dtype, at most 12 descriptors, read-only inputs and write-only outputs. Use a supported shape for execution, or stop at ``--mapping-stop=lowered`` for analysis/lowering evidence.
    * - Report hash/version mismatch
      - Use the original pre-mapping Micro input and the exact target configuration that produced the report; regenerate after intentional changes.
    * - Saved mapped output does not parse

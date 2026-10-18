@@ -46,6 +46,50 @@ KernelAbi::Port describe(mlir::MemRefType type) {
   return port;
 }
 
+bool isSupportedAbiElementType(llvm::StringRef type) {
+  return type == "f32" || type == "bf16" || type == "f16" || type == "i32" ||
+         type == "i8";
+}
+
+/// The mapped ABI v1 envelope, stated as an execution capability rather than a
+/// malformed-ABI error. Analysis and lowering are rank-neutral; only preparing
+/// callable code has to fit these compact descriptors, so the rejection names
+/// the limit it hit.
+llvm::Error validateMappedAbiEnvelope(const KernelAbi &abi) {
+  if (abi.version != kMappedAbiVersion)
+    return abiError("runtime_capability: unsupported mapped ABI version " +
+                    std::to_string(abi.version));
+  if (abi.inputs.size() > kMappedMaxDescriptors ||
+      abi.outputs.size() > kMappedMaxDescriptors - abi.inputs.size())
+    return abiError("runtime_capability: mapped ABI v1 supports at most 12 "
+                    "descriptors");
+  auto validatePorts = [](const std::vector<KernelAbi::Port> &ports,
+                          llvm::StringRef kind) -> llvm::Error {
+    for (size_t i = 0; i < ports.size(); ++i) {
+      const auto &port = ports[i];
+      if (port.shape.size() != 2)
+        return abiError("runtime_capability: mapped ABI v1 requires rank-two "
+                        "ports; " +
+                        (kind + " " + llvm::Twine(i) + " has rank " +
+                         llvm::Twine(port.shape.size()))
+                            .str());
+      if (port.shape[0] <= 0 || port.shape[1] <= 0)
+        return abiError("runtime_capability: mapped ABI v1 requires positive "
+                        "static extents; " +
+                        (kind + " " + llvm::Twine(i)).str());
+      if (!isSupportedAbiElementType(port.elementType))
+        return abiError("runtime_capability: mapped ABI v1 does not support "
+                        "element type '" +
+                        port.elementType + "' on " +
+                        (kind + " " + llvm::Twine(i)).str());
+    }
+    return llvm::Error::success();
+  };
+  if (llvm::Error error = validatePorts(abi.inputs, "input"))
+    return error;
+  return validatePorts(abi.outputs, "output");
+}
+
 llvm::Error validatePortType(mlir::Type type, const KernelAbi::Port &port,
                              llvm::StringRef kind, size_t index) {
   auto memref = mlir::dyn_cast<mlir::MemRefType>(type);
@@ -77,7 +121,7 @@ llvm::Error makeResultsBorrowedOutputs(mlir::func::FuncOp function,
       return error;
     abi.outputs.push_back(std::move(port));
   }
-  if (llvm::Error error = validateKernelAbi(abi))
+  if (llvm::Error error = validateMappedAbiEnvelope(abi))
     return error;
   if (resultTypes.empty())
     return llvm::Error::success();
