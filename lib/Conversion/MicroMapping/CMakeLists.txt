@@ -25,7 +25,8 @@ add_llk_library(LLKMappedCompilation
 
 add_llk_library(LLKMappedTuning
     MappedTuningSession.cpp
-    LINK_LIBRARIES LLKMicroMapping LLKMappedCompilation
+    MeasurementStore.cpp
+    LINK_LIBRARIES LLKMicroMapping LLKMappedCompilation LLKPerf
 )
 
 target_include_directories(LLKMappedCompilation PRIVATE
