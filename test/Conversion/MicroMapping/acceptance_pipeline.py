@@ -97,7 +97,8 @@ AVX2_EMITTERS = ("avx2_vector_add,avx2_vector_convert,avx2_vector_silu,"
                  "avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,"
                  "avx2_tile_copy,avx2_tile_store,"
                  "avx2_fused_convert_silu_mul")
-ACCEL_EMITTERS = "accel_vector_add,accel_mxu,accel_copy"
+ACCEL_EMITTERS = ("accel_vector_add,accel_vector_mul,accel_reduce_sum,"
+                  "accel_mxu,accel_copy")
 
 
 def chains():

@@ -30,6 +30,7 @@
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingRules.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
@@ -67,6 +68,20 @@ public:
   /// handles, or when a bundle parameter is not the integer/string shape the
   /// plugin contract permits.
   virtual llvm::Error verify(const TargetBundle &bundle) const = 0;
+
+  /// Verifies the operations this emitter's bundle covers.
+  ///
+  /// `verify` sees only the opaque bundle, which cannot state what the covered
+  /// operation's variant or operand/result types are. A target whose contract
+  /// depends on those facts overrides this hook; the default preserves every
+  /// existing plugin by falling back to `verify`. It is read-only: a coverage
+  /// check must never rewrite the IR it inspects.
+  virtual llvm::Error
+  verifyOperations(llvm::ArrayRef<mlir::Operation *> coveredOps,
+                   const TargetBundle &bundle) const {
+    (void)coveredOps;
+    return verify(bundle);
+  }
 
   /// True when this emitter lowers the bundles it verifies.
   ///
