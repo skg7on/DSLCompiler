@@ -51,8 +51,11 @@ Micro export plus mapped compilation. RoPE and attention use the established
 CPU path and are not current ``LLKToMicro`` export roots.
 
 Target-aware search instantiates the original source, maps and analyzes candidates,
-and saves selected-plan artifacts for replay. Compatibility mode remains synthetic.
-Optional verified measurement uses the shared mapped compiler and typed inputs.
+and saves selected-plan artifacts for replay. The source supplies a versioned
+workload contract through a registered adapter; contraction keeps its explicit
+M/N/K and dtype inputs, while the bounded elementwise family describes its own
+ordered ports and axes. Compatibility mode remains synthetic. Optional verified
+measurement uses the shared mapped compiler and typed inputs.
 
 .. _architecture-generic-contracts-and-current-limits:
 
@@ -62,11 +65,19 @@ Generic contracts and current limits
 New workloads contribute semantic decomposition into supported MicroIR primitives.
 New targets contribute machine profiles, layouts/rules and emitters. Shared mapping
 and analysis consume operation/dataflow facts rather than operator-name switches.
-The current exporter and source-search templates are contraction-shaped; M/N/K,
-BM/BN/BK and two contraction arms are adapter limits, not generic workload fields.
-Typed mapped invocation currently accepts rank-two buffers. General structured
-import, non-contraction source-search contracts and wider invocation remain
-capability work.
+The LLK exporter and contraction source family keep M/N/K, BM/BN/BK and two arms
+as adapter limits rather than generic workload fields. Source realization is
+dispatched through an immutable adapter registry: the adapter describes the
+versioned contract (ordered ports, axes, numerical semantics and required
+primitives), declares parameter ownership and reports what it realized, so a
+frozen record carries the canonical contract and receipt next to the selected
+plan. The delivered non-contraction family is bounded rank-two f32 add/multiply.
+
+Typed mapped invocation still accepts rank-two buffers. That is an execution
+envelope, not an analysis limit: rank-three contracts and rank-one reductions
+reach static reporting and lowered IR, while executable preparation fails with an
+explicit ``runtime_capability:`` diagnostic. General structured import, wider
+invocation and additional non-contraction families remain capability work.
 
 Framework validation covers tile semantics, non-contraction computation, fusion,
 movement/layout, resource capacity, search/replay, analysis parity and extension.
@@ -96,6 +107,9 @@ Components and ownership
    * - LLK conversions
      - Semantic-to-Linalg lowering and supported Micro export
      - :source:`LLKToLinalg.cpp <lib/Conversion/LLKToLinalg/LLKToLinalg.cpp>`, :source:`LLKToMicro.cpp <lib/Conversion/LLKToMicro/LLKToMicro.cpp>`
+   * - Workload contracts and source adapters
+     - Rank-neutral port/axis contract, adapter registry, contraction compatibility wrapper, bounded elementwise family and binding receipts
+     - :source:`WorkloadContract.h <include/LLK/Conversion/Workload/WorkloadContract.h>`, :source:`SourceAdapter.h <include/LLK/Conversion/Workload/SourceAdapter.h>`, :source:`implementation <lib/Conversion/Workload>`
    * - CPU transforms
      - Scheduling, tiling, fusion, vectorization, packing and dispatch
      - :source:`transforms <lib/Transforms>`, :source:`schedule loader <lib/Transforms/Common/ScheduleLoader.cpp>`

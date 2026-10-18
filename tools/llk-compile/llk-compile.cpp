@@ -18,9 +18,12 @@
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/TritonToLLK/GridToForall.h"
 #include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
+#include "LLK/Conversion/Workload/SourceAdapter.h"
+#include "LLK/Conversion/Workload/WorkloadContract.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/WorkloadGraph.h"
@@ -78,6 +81,7 @@
 #include "llvm/Config/llvm-config.h"
 
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -152,6 +156,12 @@ static cl::opt<std::string> mappingEntry(
     "mapping-entry",
     cl::desc("Kernel symbol to compile. Empty uses the module's single "
              "micro.kernel."),
+    cl::init(""));
+
+static cl::opt<std::string> mappingSourceAdapter(
+    "source-adapter",
+    cl::desc("Source adapter key this artifact must have come from. Empty "
+             "accepts the adapter recorded by the frozen source."),
     cl::init(""));
 
 static cl::opt<std::string> mappingPlanReport(
@@ -428,6 +438,41 @@ static int runMappedCompilation(mlir::ModuleOp module,
     return 1;
   }
 
+  // Source provenance is read from the artifact, not guessed from a workload
+  // label. A caller that names an adapter is asserting which family produced
+  // the source; a mismatch means the artifact and the request disagree.
+  std::string sourceAdapter;
+  std::optional<mlir::llk::workload::WorkloadContract> sourceContract;
+  if (!mappingSourceAdapter.empty()) {
+    mlir::llk::workload::SourceAdapterRegistry registry =
+        mlir::llk::workload::makeDefaultSourceAdapters();
+    if (!registry.findByKey(mappingSourceAdapter)) {
+      llvm::errs() << "unknown_source_adapter: " << mappingSourceAdapter
+                   << "\n";
+      return 1;
+    }
+  }
+  if (auto attr = kernel->getAttrOfType<mlir::StringAttr>("source_adapter"))
+    sourceAdapter = attr.getValue().str();
+  if (auto attr = kernel->getAttrOfType<mlir::DictionaryAttr>(
+          "micro.workload_contract")) {
+    auto decoded = mlir::llk::workload::decodeWorkloadContract(attr);
+    if (!decoded) {
+      llvm::errs() << llvm::toString(decoded.takeError()) << "\n";
+      return 1;
+    }
+    sourceContract = std::move(*decoded);
+  }
+  if (!mappingSourceAdapter.empty() && !sourceAdapter.empty() &&
+      mappingSourceAdapter != sourceAdapter) {
+    llvm::errs() << "source_adapter_mismatch: artifact records '"
+                 << sourceAdapter << "', requested '" << mappingSourceAdapter
+                 << "'\n";
+    return 1;
+  }
+  if (sourceAdapter.empty())
+    sourceAdapter = mappingSourceAdapter;
+
   llvm::Expected<mlir::llk::mapping::WorkloadGraph> graph =
       mlir::llk::mapping::extractWorkloadGraph(kernel);
   if (!graph) {
@@ -494,6 +539,16 @@ static int runMappedCompilation(mlir::ModuleOp module,
     selected = result->plans.front();
   }
 
+  // One printable identity for the source graph, binding and selected plan.
+  // Frozen replay reproduces it exactly; a changed source or plan cannot reuse
+  // the previous artifact under this value.
+  const uint64_t sourceGraphHash =
+      mlir::llk::mapping::computeSourceGraphHash(*graph);
+  const std::string replayIdentity =
+      "graph=" + llvm::formatv("{0:x}", sourceGraphHash).str() +
+      "|binding=" + llvm::formatv("{0:x}", selected->sourceBindingHash).str() +
+      "|plan=" + llvm::formatv("{0:x}", selected->id).str();
+
   llk::MappedCompileOptions options;
   options.stop = *stop;
   options.backend = *backend;
@@ -516,7 +571,12 @@ static int runMappedCompilation(mlir::ModuleOp module,
   // generation, and saying so is the difference between the two claims.
   llvm::outs() << "mapping: target=" << mappingTargetName
                << " backend=" << mappingBackend
-               << " stop=" << mappingStop.getValue() << " executable="
+               << " stop=" << mappingStop.getValue();
+  if (!sourceAdapter.empty())
+    llvm::outs() << " source-adapter=" << sourceAdapter;
+  if (sourceContract)
+    llvm::outs() << " source-contract-version=" << sourceContract->version;
+  llvm::outs() << " replay-identity=" << replayIdentity << " executable="
                << (compiled->stopped == llk::MappedStop::Executable
                        ? "ready"
                        : "not-built")
@@ -616,6 +676,11 @@ int main(int argc, char **argv) {
       emit != "micro-search") {
     llvm::errs() << "Unsupported --emit=" << emit
                  << "; expected llvm, mlir, micro, or micro-search\n";
+    return 1;
+  }
+  if (!mappingSourceAdapter.empty() && mappingTargetName.empty()) {
+    llvm::errs() << "--source-adapter applies only to the mapped compilation "
+                    "path; pass --mapping-target\n";
     return 1;
   }
 

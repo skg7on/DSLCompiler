@@ -111,8 +111,7 @@ if(LLK_BUILD_E2E_TESTS)
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME GenericElementwiseTest COMMAND GenericElementwiseTest)
   set_tests_properties(GenericElementwiseTest PROPERTIES
-      LABELS "mapped-reference"
-      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
+      LABELS "mapped-reference")
 
   # The required-selected-target binary makes a missing AVX2 lane a failure,
   # not a skip, so CI evidence cannot silently pass on the wrong host.
