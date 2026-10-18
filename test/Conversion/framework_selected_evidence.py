@@ -6,15 +6,15 @@ fixtures, requires vector-reduction/vector IR evidence and zero reference
 fallback, records the strict static analysis produced by micro-perf, and
 writes a versioned manifest keyed by source/plan/target/compiler/mode.
 
-The reduction is rank-one, so its invocation row is explicitly *unsupported*
-with the mapped ABI v1 reason; no callable is claimed for it.
+Both reduction results are rank-one, so their invocation rows are explicitly
+unsupported with the mapped ABI v1 reason. This script performs no numerical
+execution or reference lowering; those stages remain not checked.
 """
 
 import argparse
 import json
 import os
 import platform
-import re
 import subprocess
 import sys
 
@@ -121,7 +121,7 @@ def main():
                 "mapping": "supported",
                 "physical_plan": "supported",
                 "selected_lowering": "supported",
-                "reference_lowering": "supported",
+                "reference_lowering": "not_checked",
                 "invocation": "not_checked",
             },
             "analysis": {
@@ -157,16 +157,25 @@ def main():
         "micro_reduce_remaining": False,
     }
 
-    refused = compile_selected(args.llk_compile, root, reduce_fixture,
-                               "executable", check=False)
-    refusal = refused.stdout + refused.stderr
-    require(refused.returncode != 0,
-            "the rank-one reduction must not prepare an executable")
-    require("runtime_capability:" in refusal and "rank-two" in refusal,
-            "the reduction refusal did not name the rank-two ABI:\n" + refusal)
-    reduce_row["stages"]["invocation"] = {
-        "status": "unsupported",
-        "reason": "runtime_capability: mapped ABI v1 requires rank-two ports",
+    def rank_one_invocation(fixture):
+        refused = compile_selected(args.llk_compile, root, fixture,
+                                   "executable", check=False)
+        refusal = refused.stdout + refused.stderr
+        require(refused.returncode != 0,
+                "the rank-one reduction must not prepare an executable")
+        require("runtime_capability:" in refusal and "rank-two" in refusal,
+                "the reduction refusal did not name the rank-two ABI:\n" + refusal)
+        return {
+            "status": "unsupported",
+            "reason": "runtime_capability: mapped ABI v1 requires rank-two ports",
+        }
+
+    reduce_row["stages"]["invocation"] = rank_one_invocation(reduce_fixture)
+    reduce_row["output_shape"] = [8]
+    reduce_row["numeric"] = {
+        "status": "not_checked",
+        "formula": "sum_j(input[i,j])",
+        "elements": 8,
     }
     rows.append(reduce_row)
 
@@ -201,10 +210,17 @@ def main():
                                 "vector.reduction" in ir,
         }
         row["numeric"] = {
+            "status": "not_checked",
             "formula": "(left[i] + right[i]) * left[i]",
             "elements": 64,
-            "verified_by": "FrameworkPrimitivesTest/SelectedAvx2AddMul",
         }
+        row["output_shape"] = [8, 8]
+        if symbol == "add_mul_reduce":
+            row["stages"]["invocation"] = rank_one_invocation(fixture)
+            row["output_shape"] = [8]
+            row["numeric"]["elements"] = 8
+            row["numeric"]["formula"] = \
+                "sum_j((left[i,j] + right[i,j]) * left[i,j])"
         rows.append(row)
 
     manifest = {
