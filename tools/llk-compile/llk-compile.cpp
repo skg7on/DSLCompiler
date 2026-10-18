@@ -571,12 +571,7 @@ static int runMappedCompilation(mlir::ModuleOp module,
   // generation, and saying so is the difference between the two claims.
   llvm::outs() << "mapping: target=" << mappingTargetName
                << " backend=" << mappingBackend
-               << " stop=" << mappingStop.getValue();
-  if (!sourceAdapter.empty())
-    llvm::outs() << " source-adapter=" << sourceAdapter;
-  if (sourceContract)
-    llvm::outs() << " source-contract-version=" << sourceContract->version;
-  llvm::outs() << " replay-identity=" << replayIdentity << " executable="
+               << " stop=" << mappingStop.getValue() << " executable="
                << (compiled->stopped == llk::MappedStop::Executable
                        ? "ready"
                        : "not-built")
@@ -612,7 +607,12 @@ static int runMappedCompilation(mlir::ModuleOp module,
                << " reference-lowered-ops=" << compiled->referenceLowered
                << " backend-groups-realized=" << compiled->backendGroupsRealized
                << " reference-groups-lowered="
-               << compiled->referenceGroupsLowered << "\n";
+               << compiled->referenceGroupsLowered;
+  if (!sourceAdapter.empty())
+    llvm::outs() << " source-adapter=" << sourceAdapter;
+  if (sourceContract)
+    llvm::outs() << " source-contract-version=" << sourceContract->version;
+  llvm::outs() << " replay-identity=" << replayIdentity << "\n";
 
   if (compiled->stopped != llk::MappedStop::Executable) {
     compiled->module->print(llvm::outs());
