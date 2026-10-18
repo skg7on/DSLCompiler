@@ -677,7 +677,7 @@ CaseSpec paddedLayoutSpec() {
 }
 
 //===----------------------------------------------------------------------===//
-// C2: `transform-view` and `transform-layout`
+// C2: `transform-direct`, `transform-view` and `transform-layout`
 //===----------------------------------------------------------------------===//
 
 /// One worker with a vector engine, an SRAM the vector result lives in, and an
@@ -754,6 +754,21 @@ module {
 }
 )mlir";
 
+/// The same producer/store with an explicit logical view inserted on their
+/// edge. Unlike a physical layout transform, this aliases the produced tile.
+constexpr llvm::StringLiteral kTransformViewSource = R"mlir(
+module {
+  micro.kernel @transform_store {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %view = micro.tile_view %r {shape = array<i64: 8, 8>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.tile_store %view {dst_memory = #micro.memory<l2>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
 /// Two concrete 8x8 f32 layouts: the identity row-major image and a transposed
 /// image. Both describe the same logical tile; the second is a different
 /// physical representation, so a value produced in one and read in the other
@@ -823,13 +838,19 @@ rule issue129.transform_store_convert {
 }
 )llkmap";
 
-CaseSpec transformViewSpec() {
+CaseSpec transformDirectSpec() {
   CaseSpec spec;
   spec.source = kTransformSource;
   spec.rules = kTransformRulesAgree;
   spec.layouts = kTransformLayouts;
   spec.machine = transformMachine();
   spec.emitters = {"issue129_transform_vector", "issue129_transform_store"};
+  return spec;
+}
+
+CaseSpec transformViewSpec() {
+  CaseSpec spec = transformDirectSpec();
+  spec.source = kTransformViewSource;
   return spec;
 }
 
@@ -1167,6 +1188,11 @@ buildPaddedLayout(const LatencyProvider *provider) {
 }
 
 llvm::Expected<ResourceCase>
+buildTransformDirect(const LatencyProvider *provider) {
+  return buildCase(transformDirectSpec(), provider);
+}
+
+llvm::Expected<ResourceCase>
 buildTransformView(const LatencyProvider *provider) {
   return buildCase(transformViewSpec(), provider);
 }
@@ -1200,6 +1226,7 @@ llvm::ArrayRef<CaseEntry> caseTable() {
       {"pipeline-four", &buildPipelineFour},
       {"parallel-overlap", &buildParallelOverlap},
       {"padded-layout", &buildPaddedLayout},
+      {"transform-direct", &buildTransformDirect},
       {"transform-view", &buildTransformView},
       {"transform-layout", &buildTransformLayout},
       {"capacity-topk", &buildCapacityTopK},

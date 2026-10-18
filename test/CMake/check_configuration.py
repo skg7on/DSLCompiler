@@ -34,6 +34,13 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("LLVM_PROJECT_BUILD_DIR", result.stdout)
         self.assertIn("LLVMConfig.cmake", result.stdout)
 
+    def test_testing_without_tools_or_e2e_configures(self):
+        result = self.configure(
+            f"-DLLVM_PROJECT_BUILD_DIR={LLVM_BUILD}", "-DBUILD_TESTING=ON",
+            "-DLLK_BUILD_TOOLS=OFF", "-DLLK_BUILD_E2E_TESTS=OFF",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_explicit_build_directory_overrides_foreign_cached_packages(self):
         foreign = self.root / "foreign"
         foreign.mkdir()

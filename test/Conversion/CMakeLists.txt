@@ -58,3 +58,8 @@ add_test(NAME FrameworkBoundaryScanRegression
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/framework_boundary_scan_test.py)
 add_test(NAME FrameworkEvidenceManifestRegression
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/framework_manifest_validator_test.py)
+if(TARGET llk-compile AND TARGET llk-opt)
+  add_test(NAME FrameworkCoverageCli
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/framework_coverage_cli.py
+          $<TARGET_FILE:llk-compile> $<TARGET_FILE:llk-opt> ${CMAKE_SOURCE_DIR})
+endif()
