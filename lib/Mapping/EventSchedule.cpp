@@ -12,6 +12,8 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CostModel.h"
 
+#include "llvm/ADT/STLExtras.h" // IWYU pragma: keep
+
 #include <algorithm>
 #include <cmath>
 #include <map>

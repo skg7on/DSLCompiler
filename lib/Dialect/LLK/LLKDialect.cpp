@@ -12,9 +12,12 @@
 
 #include "LLK/Dialect/LLKEnums.h" // IWYU pragma: keep
 
+#include "mlir/Bytecode/BytecodeOpInterface.h" // IWYU pragma: keep
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h" // IWYU pragma: keep
 #include "mlir/Interfaces/TilingInterface.h"             // IWYU pragma: keep
+#include "llvm/ADT/StringExtras.h"                       // IWYU pragma: keep
+#include "llvm/ADT/TypeSwitch.h"                         // IWYU pragma: keep
 
 //===----------------------------------------------------------------------===//
 // Generated headers: class declarations

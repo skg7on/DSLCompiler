@@ -46,7 +46,8 @@
 #include "LLK/Conversion/MicroToLinalg.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
-#include "LLK/Dialect/Micro/MicroEnums.h" // IWYU pragma: keep
+#include "LLK/Dialect/Micro/MicroEnums.h"   // IWYU pragma: keep
+#include "LLK/Dialect/Micro/MicroHelpers.h" // IWYU pragma: keep
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"

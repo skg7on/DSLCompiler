@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits> // IWYU pragma: keep
 #include <string>
 
 using namespace mlir::llk::mapping;

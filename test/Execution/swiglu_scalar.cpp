@@ -28,6 +28,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h" // IWYU pragma: keep
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -61,6 +62,7 @@ using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream> // IWYU pragma: keep
 #include <random>
 #include <sstream>
 #include <string>

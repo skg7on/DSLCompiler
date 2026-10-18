@@ -19,6 +19,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/MemoryBuffer.h"
 
+#include <array> // IWYU pragma: keep
 #include <cstdlib>
 #include <map>
 #include <mutex>

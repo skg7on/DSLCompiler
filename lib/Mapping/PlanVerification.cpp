@@ -38,6 +38,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h" // IWYU pragma: keep
 #include "llvm/Support/Error.h"
 
 #include <memory>

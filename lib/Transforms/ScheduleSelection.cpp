@@ -18,6 +18,7 @@
 #include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/Support/raw_ostream.h" // IWYU pragma: keep
 
 using namespace mlir;
 

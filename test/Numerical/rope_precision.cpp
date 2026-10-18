@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <gtest/gtest.h>
+#include <vector> // IWYU pragma: keep
 
 namespace {
 

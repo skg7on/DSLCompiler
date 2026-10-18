@@ -14,7 +14,9 @@
 
 #include "llvm/Support/CommandLine.h"
 
+#include <algorithm> // IWYU pragma: keep
 #include <chrono>
+#include <cmath> // IWYU pragma: keep
 #include <cstdint>
 #include <iostream>
 #include <vector>

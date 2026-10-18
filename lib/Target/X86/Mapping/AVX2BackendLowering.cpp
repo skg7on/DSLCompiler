@@ -22,6 +22,8 @@
 #include "mlir/Pass/PassManager.h"
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/Error.h"      // IWYU pragma: keep
+#include "llvm/Support/MathExtras.h" // IWYU pragma: keep
 
 #include <cstdint>
 #include <map>

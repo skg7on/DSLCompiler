@@ -30,6 +30,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 
+#include <algorithm> // IWYU pragma: keep
 #include <cstdio>
 #include <limits>
 #include <map>

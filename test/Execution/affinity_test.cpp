@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <vector> // IWYU pragma: keep
 
 using namespace llk;
 

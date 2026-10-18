@@ -39,12 +39,17 @@
 // spellings are equivalent.
 
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
+#include "LLK/Conversion/MicroMapping/TileExtent.h" // IWYU pragma: keep
 #include "MicroKernelDriver.h"
 
+#include "LLK/Dialect/LLKEnums.h" // IWYU pragma: keep
 #include "LLK/Dialect/Micro/MicroDialect.h"
+#include "LLK/Dialect/Micro/MicroEnums.h"   // IWYU pragma: keep
+#include "LLK/Dialect/Micro/MicroHelpers.h" // IWYU pragma: keep
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h" // IWYU pragma: keep
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -53,7 +58,12 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h" // IWYU pragma: keep
 #include "llvm/ADT/Twine.h"
+
+#include <algorithm> // IWYU pragma: keep
+#include <iterator>  // IWYU pragma: keep
+#include <limits>    // IWYU pragma: keep
 
 // Micro attribute, type, and op declarations.
 #define GET_ATTRDEF_CLASSES

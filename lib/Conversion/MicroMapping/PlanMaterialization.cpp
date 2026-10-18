@@ -45,6 +45,7 @@
 
 #include "LLK/Mapping/PlanBinder.h"
 
+#include "LLK/Dialect/Micro/MicroDialect.h" // IWYU pragma: keep
 #include "LLK/Dialect/Micro/MicroEnums.h"
 #include "LLK/Dialect/Micro/MicroHelpers.h"
 

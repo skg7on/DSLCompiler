@@ -46,6 +46,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstring>
+#include <sstream> // IWYU pragma: keep
 
 using namespace mlir;
 

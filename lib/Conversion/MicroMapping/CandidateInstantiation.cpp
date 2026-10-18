@@ -25,6 +25,7 @@
 #include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
+#include <map> // IWYU pragma: keep
 #include <optional>
 #include <string>
 

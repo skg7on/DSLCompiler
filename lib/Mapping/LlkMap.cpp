@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <limits> // IWYU pragma: keep
 #include <optional>
 #include <string>
 #include <variant>

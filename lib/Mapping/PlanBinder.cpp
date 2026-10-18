@@ -24,6 +24,7 @@
 
 #include "llvm/Support/Error.h"
 
+#include <memory> // IWYU pragma: keep
 #include <optional>
 #include <string>
 #include <utility>

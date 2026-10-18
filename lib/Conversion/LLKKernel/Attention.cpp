@@ -7,17 +7,24 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "LLK/Dialect/LLKDialect.h" // IWYU pragma: keep
 #include "LLK/Dialect/LLKEnums.h"
 #include "LLK/Transforms/Common/MathApproximation.h"
 
+#include "mlir/Bytecode/BytecodeOpInterface.h" // IWYU pragma: keep
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Math/IR/Math.h" // IWYU pragma: keep
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h" // IWYU pragma: keep
+#include "mlir/Interfaces/TilingInterface.h"             // IWYU pragma: keep
+#include "mlir/Pass/Pass.h"                              // IWYU pragma: keep
 #include "mlir/Support/LLVM.h"
 
+#include <cmath> // IWYU pragma: keep
 #include <limits>
 
 // Generated attribute and op class declarations.

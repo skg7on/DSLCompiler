@@ -48,7 +48,9 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 
+#include "llvm/Config/llvm-config.h" // IWYU pragma: keep
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h" // IWYU pragma: keep
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/TargetParser/Host.h"

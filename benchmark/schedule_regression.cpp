@@ -12,7 +12,9 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath> // IWYU pragma: keep
 #include <cstdint>
+#include <vector> // IWYU pragma: keep
 
 // Baseline GFLOPS thresholds per M-bucket.
 //

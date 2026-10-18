@@ -22,6 +22,7 @@
 #include "LLK/Transforms/TileAndVectorize.h"
 
 // Dependencies required by the generated op/attribute headers.
+#include "mlir/Bytecode/BytecodeOpInterface.h"           // IWYU pragma: keep
 #include "mlir/Interfaces/DestinationStyleOpInterface.h" // IWYU pragma: keep
 #include "mlir/Interfaces/TilingInterface.h"             // IWYU pragma: keep
 
@@ -36,6 +37,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h" // IWYU pragma: keep
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -66,6 +68,7 @@ using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
 #include <cmath>
 #include <cstring>
 #include <random>
+#include <sstream> // IWYU pragma: keep
 #include <string>
 #include <vector>
 

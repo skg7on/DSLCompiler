@@ -42,6 +42,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set> // IWYU pragma: keep
 #include <string>
 #include <vector>
 
