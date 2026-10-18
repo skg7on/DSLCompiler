@@ -6,6 +6,7 @@ add_llk_test_category(Conversion
         MicroMapping/search_binding_loader.cpp
         MicroMapping/complete_plan_evaluation.cpp
         framework_capabilities.cpp
+        framework_conformance.cpp
         ../Mapping/resource_regression_fixture.cpp
     LIBRARIES
         LLKKernel
