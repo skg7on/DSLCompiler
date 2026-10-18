@@ -299,7 +299,9 @@ and `micro-perf` charges it **hop by hop** rather than endpoint to endpoint.
 `describeCapabilities` (`LLK/Conversion/FrameworkCapabilities.h`) reports one
 verdict per stage for a concrete source/contract/target/plan artifact:
 structure, interpretation, mapping, physical plan, reference lowering, selected
-lowering and invocation. `supported` means the stage was established for this
+lowering, ABI eligibility, preparation, host compatibility and invocation.
+Preparation does not establish invocation; a successful call does not establish
+numerical correctness. `supported` means the stage was established for this
 artifact, `unsupported` means a concrete blocker was found, and `not_checked`
 means it was never attempted. A static receipt performs structural verification
 and pure bundle validation only — it never runs a backend lowering or JIT.

@@ -81,7 +81,8 @@ invocation and additional non-contraction families remain capability work.
 
 Conformance is reported per compiler stage. ``CapabilityReceipt`` records
 structure, interpretation, mapping, physical plan, reference lowering, selected
-lowering and invocation as supported, unsupported or not checked for one
+lowering, ABI eligibility, preparation, host compatibility and invocation as
+supported, unsupported or not checked for one
 concrete source/contract/target/plan artifact. The receipt layer sits above
 mapping, performance and runtime, runs no lowering or JIT to produce a static
 report, and is keyed by existing complete identities. Before analysis and

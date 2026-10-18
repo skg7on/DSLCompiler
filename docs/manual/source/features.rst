@@ -76,7 +76,7 @@ What you can do today
      - The bounded elementwise adapter is the first delivered non-contraction family; arbitrary Linalg import, broadcasting, reductions, dynamic shapes and approximation modes are rejected
      - :doc:`Tuner </tools/tuning>`, :doc:`Compiler </tools/compiler>`
    * - Report stage-specific capabilities
-     - Capability receipts for structure, interpretation, mapping, physical plan, reference lowering, selected lowering and invocation, keyed by source/contract/target/plan identity
+     - Capability receipts for structure, interpretation, mapping, physical plan, reference lowering, selected lowering, ABI eligibility, preparation, host compatibility and invocation, keyed by source/contract/target/plan identity
      - ``supported``, ``unsupported`` and ``not_checked`` are distinct; printing a static receipt never runs lowering or JIT; a reference-backend run leaves selected lowering ``not_checked``
      - :doc:`Architecture </architecture>`, :source:`conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
    * - Validate composed primitives and reduction
@@ -177,12 +177,17 @@ Capability receipts and stage evidence
 --------------------------------------
 
 A known emitter key and a complete static mapping do not prove that a target
-lowers or runs a kernel. ``CapabilityReceipt`` v1 reports one verdict per stage:
+lowers or runs a kernel. ``CapabilityReceipt`` v2 reports one verdict per stage:
 structure, interpretation, mapping, physical plan, reference lowering, selected
-lowering and invocation. Each is ``supported`` (established for this artifact),
+lowering, ABI eligibility, preparation, host compatibility and invocation.
+Each is ``supported`` (established for this artifact),
 ``unsupported`` (a concrete blocker was found) or ``not_checked`` (the stage was
 never attempted). A receipt is keyed by the source graph content, canonical
 workload contract, target content and plan id.
+
+Preparation and host compatibility require an actual executable; invocation
+requires a call that returned successfully. Neither preparation nor a successful
+call establishes numerical correctness.
 
 Receipts never run a backend lowering or JIT merely to print. A target without a
 codegen contract reports selected lowering unsupported; a selected-backend

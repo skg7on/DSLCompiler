@@ -6,7 +6,7 @@ analysis, workload/source-search and primitive/target conformance increments.
 It does not claim arbitrary DNN import, arbitrary-rank invocation or hardware
 execution for the analysis-only accelerator.
 
-- **Tested tree:** `feat/framework-acceptance` at `c5aba8f`
+- **Original tested tree:** `feat/framework-acceptance` at `c5aba8f`
   (C1+C2+C3 integrated; see the stacked-PR note below).
 - **Local toolchain:** LLVM/MLIR 24.0.0git, `darwin arm64`.
 - **Required selected-execution gate:** Linux `x86_64` CI with LLVM/MLIR 22.1.8.
@@ -19,7 +19,7 @@ execution for the analysis-only accelerator.
 |---|---|---|---|---|
 | A | Analysis coverage | **Passed** | A1–A4 (#165–#168); `CompletePlanEvaluationTest`; incomplete plans rejected before top-K | Extraction must model an operation; unmodelled leaves reject ranking |
 | B | Workload contracts and source search | **Passed** | B1–B7 (#170–#202); `FrameworkSourceTest`, `GenericTuneCLI`, `GenericElementwiseTest` | Bounded rank-two f32 elementwise family; contraction options remain adapter-specific |
-| C1 | Stage-specific capability receipts | **Passed** | `FrameworkCapabilitiesTest` 7/7; `llk-tune` per-candidate receipts; `llk-compile` stderr receipt | A receipt states only stages the caller supplied evidence for |
+| C1 | Stage-specific capability receipts | **Passed** | `FrameworkCapabilitiesTest`; `llk-tune` per-candidate receipts; `llk-compile` stderr receipt | Evidence must match the source/target/plan/contract it credits |
 | C2 | Movement, storage and resource conformance | **Passed** | `FrameworkConformance` chains over two-compute / named-ports / two-hop / padded-layout / capacity-topk | Fixture scope; no new planner or second evaluator |
 | C3 | Composed vectors and reduction | **Passed (static + selected lowering)** | `FrameworkPrimitivesTest`, `FrameworkConformance`, `FrameworkSelectedEvidence` manifest | Selected AVX2 **execution** requires `x86_64`; rank-one invocation is unsupported |
 | C4 | Target extension boundaries | **Passed** | `FrameworkTargetPortability` 3/3; `FrameworkBoundaryScan`; `FrameworkEvidenceManifest` | Test-only wrapper; no new physical target |
@@ -49,13 +49,15 @@ requires selected execution without reference fallback.
 
 ### C1 — Stage-specific capability receipts
 
-`CapabilityReceipt` v1 reports `supported`, `unsupported` or `not_checked` for
+`CapabilityReceipt` v2 reports `supported`, `unsupported` or `not_checked` for
 structure, interpretation, mapping, physical plan, reference lowering, selected
-lowering and invocation. Identities cover the source graph, canonical contract,
-target content and plan id. A reference-backend compilation carries no codegen
-contract, so selected lowering stays `not_checked` rather than claiming a
-failure. Evidence: `FrameworkCapabilitiesTest` 7/7 and PR #205 CI
-(`build-and-test`, `analyze`, `coverage`, CodeQL and license headers green).
+lowering, ABI eligibility, preparation, host compatibility and invocation.
+Identities cover the source graph, canonical contract, target content and plan
+id; stale analysis or compilation cannot establish support. A reference-only
+compilation leaves selected lowering `not_checked`; selected-only compilation
+does the same for reference lowering. Executable preparation does not establish
+invocation, and a returned call does not establish numerical correctness.
+Evidence: `FrameworkCapabilitiesTest` and the integrated checks recorded below.
 
 ### C2 — Movement, storage and resource conformance
 
@@ -67,12 +69,14 @@ One strict `search -> finalized plan -> bind -> shared analysis` chain checks:
 - the `sram.0 -> l2.0 -> dram.0` route, `dma.a`/`dma.b`, shared intermediate
   storage and literal traffic `sram=256 / l2=768 / dram=512`;
 - the padded physical image (480 bytes) and the capacity-before-top-K result;
-- a logical-view control with no transform work and a physical transform with
+- a direct baseline and an added logical view preserving producer alias and
+  dependency, 256-byte SRAM/L2 traffic, a 512-byte SRAM peak and no additional
+  allocation; and a physical transform with
   64 work items, 256 bytes, 8 cycles on `vpu.0`, plus one extra 256-byte SRAM
   allocation.
 
 Search and materialized costs agree without a second planner call. Evidence:
-`FrameworkConformance` 7/7 plus `Routing.*`, `StorageLiveness.*`,
+`FrameworkConformance` plus `Routing.*`, `StorageLiveness.*`,
 `ExactResourceOracleTest.*` and `CoveringSearch.*` 155/155.
 
 ### C3 — Composed vectors and reduction
