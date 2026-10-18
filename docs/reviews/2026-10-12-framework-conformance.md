@@ -6,7 +6,7 @@ analysis, workload/source-search and primitive/target conformance increments.
 It does not claim arbitrary DNN import, arbitrary-rank invocation or hardware
 execution for the analysis-only accelerator.
 
-- **Tested tree:** `feat/framework-acceptance` at `TESTED_REVISION`
+- **Tested tree:** `feat/framework-acceptance` at `c5aba8f`
   (C1+C2+C3 integrated; see the stacked-PR note below).
 - **Local toolchain:** LLVM/MLIR 24.0.0git, `darwin arm64`.
 - **Required selected-execution gate:** Linux `x86_64` CI with LLVM/MLIR 22.1.8.
