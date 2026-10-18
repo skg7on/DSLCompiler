@@ -224,6 +224,32 @@ micro.search_space @dup attributes {workload = "matmul"} {
   EXPECT_NE(error.find("repeats a choice"), std::string::npos) << error;
 }
 
+TEST(SearchSpaceLoader, ExplicitSingletonLoadsWithNoParameters) {
+  auto parsed = parse(R"MLIR(
+micro.search_space @elementwise attributes {singleton = true, workload = "elementwise"} {
+  micro.candidate @only {bindings = {}}
+  micro.objective {direction = "minimize", metric = "latency_cycles"}
+}
+)MLIR");
+  ASSERT_TRUE(parsed);
+  ASSERT_TRUE(succeeded(verify(parsed->module.get())));
+
+  auto space = loadSearchSpace(parsed->module.get(), "elementwise");
+  ASSERT_TRUE(static_cast<bool>(space)) << llvm::toString(space.takeError());
+  EXPECT_TRUE(space->singleton);
+  EXPECT_TRUE(space->params.empty());
+  EXPECT_EQ(space->objective.primaryMetric, "latency_cycles");
+}
+
+TEST(SearchSpaceLoader, SingletonDefaultsToFalse) {
+  auto parsed = parse(kFixture);
+  ASSERT_TRUE(parsed);
+  auto space = loadSearchSpace(parsed->module.get(), "matmul_M16_N64_K64");
+  ASSERT_TRUE(static_cast<bool>(space)) << llvm::toString(space.takeError());
+  EXPECT_FALSE(space->singleton);
+  EXPECT_FALSE(space->params.empty());
+}
+
 TEST(SearchSpaceLoader, ConstraintKindRoundTripsThroughItsSpelling) {
   for (ConstraintKind kind :
        {ConstraintKind::SramCapacity, ConstraintKind::AccCapacity,

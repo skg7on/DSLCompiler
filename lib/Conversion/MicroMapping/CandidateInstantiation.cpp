@@ -350,6 +350,7 @@ instantiateAdapterSource(ModuleOp source, const perf::SearchSpace &space,
   instance.kernel = realization->kernel;
   instance.sourceMode = options.sourceMode;
   instance.workloadContract = contract;
+  instance.schema = *schema;
   instance.receipt = realization->receipt;
   instance.bindingFacts = mapping::extractBindingFacts(instance.kernel);
   instance.bindingHash = candidateBindingHash(candidate);

@@ -157,6 +157,61 @@ TEST(CandidateGenerator, RandomSearchCannotExceedTheSpace) {
   EXPECT_EQ(sample.size(), 4u);
 }
 
+TEST(CandidateGenerator, ExplicitSingletonYieldsOneEmptyCandidate) {
+  SearchSpace space;
+  space.name = "singleton";
+  space.workload = "elementwise";
+  space.singleton = true;
+
+  for (SearchMode mode : {SearchMode::Grid, SearchMode::Random}) {
+    CandidateGeneratorOptions options;
+    options.mode = mode;
+    auto candidates = generateCandidates(space, options);
+    ASSERT_EQ(candidates.size(), 1u);
+    EXPECT_TRUE(candidates.front().values.empty());
+    EXPECT_TRUE(candidates.front().symbolicValues.empty());
+    EXPECT_EQ(candidates.front().id, computeCandidateId({}, {}));
+  }
+
+  CandidateGeneratorOptions capped;
+  capped.maxCandidates = 0;
+  EXPECT_TRUE(generateCandidates(space, capped).empty());
+}
+
+TEST(CandidateGenerator, OrdinaryEmptySpaceHasNoCandidates) {
+  SearchSpace space;
+  space.name = "empty";
+  space.workload = "elementwise";
+  EXPECT_TRUE(generateCandidates(space, {}).empty());
+  EXPECT_TRUE(generateGridCandidates(space).empty());
+  EXPECT_TRUE(generateRandomCandidates(space, 42, 1).empty());
+}
+
+TEST(CandidateGenerator, GridEnumeratesExplicitSingleton) {
+  SearchSpace space;
+  space.singleton = true;
+  auto candidates = generateGridCandidates(space);
+  ASSERT_EQ(candidates.size(), 1u);
+  EXPECT_TRUE(candidates.front().values.empty());
+  EXPECT_TRUE(candidates.front().symbolicValues.empty());
+  EXPECT_EQ(candidates.front().id, generateCandidates(space).front().id);
+  EXPECT_EQ(generateGridCandidates(space, 1).size(), 1u);
+  EXPECT_EQ(generateGridCandidates(space, 100).size(), 1u);
+  EXPECT_TRUE(generateGridCandidates(space, 0).empty());
+}
+
+TEST(CandidateGenerator, RandomEnumeratesExplicitSingleton) {
+  SearchSpace space;
+  space.singleton = true;
+  auto candidates = generateRandomCandidates(space, 42, 100);
+  ASSERT_EQ(candidates.size(), 1u);
+  EXPECT_TRUE(candidates.front().values.empty());
+  EXPECT_TRUE(candidates.front().symbolicValues.empty());
+  EXPECT_EQ(candidates.front().id, generateCandidates(space).front().id);
+  EXPECT_EQ(generateRandomCandidates(space, 7, 1).size(), 1u);
+  EXPECT_TRUE(generateRandomCandidates(space, 42, 0).empty());
+}
+
 TEST(CandidateGenerator, DispatcherSelectsTheMode) {
   CandidateGeneratorOptions options;
   options.mode = SearchMode::Grid;

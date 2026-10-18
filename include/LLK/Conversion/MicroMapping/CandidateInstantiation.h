@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace mlir::llk::tuning {
 
@@ -49,6 +50,9 @@ struct CandidateInstance {
   perf::BindingFacts bindingFacts;
   /// Populated by the contract-based source path; no contraction facts needed.
   workload::WorkloadContract workloadContract;
+  /// The ownership schema the adapter declared for these bindings, so a later
+  /// stage can complete the receipt without re-resolving the source root.
+  std::vector<workload::ParameterBinding> schema;
   /// What the source stage realized. Mapping-owned choices stay pending here;
   /// the mapping stage completes the receipt before retention and reporting.
   workload::BindingReceipt receipt;

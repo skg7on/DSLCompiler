@@ -17,12 +17,14 @@
 #include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Version.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Error.h"
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <map>
 
@@ -101,6 +103,10 @@ projectAxes(const perf::SearchSpace &space, const perf::Candidate &candidate,
 }
 
 uint64_t candidateDomainSize(const perf::SearchSpace &space) {
+  // An explicitly declared singleton has one empty binding; an ordinary empty
+  // space has none.
+  if (space.params.empty())
+    return space.singleton ? 1 : 0;
   uint64_t result = 1;
   for (const perf::SearchParam &param : space.params) {
     if (param.choices.empty())
@@ -318,11 +324,237 @@ makeMeasurementIdentity(const MappedTuningCandidate &candidate,
   return identity;
 }
 
+/// How one candidate is realized: through the legacy shape translation or
+/// through a source contract. The rest of the session is shared, so the two
+/// paths cannot drift in legality, search, retention or measurement.
+using InstantiateCandidateFn = std::function<llvm::Expected<CandidateInstance>(
+    const perf::Candidate &, const CandidateInstantiationOptions &)>;
+
+/// The target layout id a bound symbolic value resolves to. `projectAxes` uses
+/// the same resolution, so the receipt is checked against the value the search
+/// actually consumed.
+std::string resolvedLayoutId(const mapping::MappingTarget &target,
+                             llvm::StringRef value) {
+  std::vector<const mapping::LayoutDef *> implementing =
+      target.layouts().implementing(value);
+  return implementing.empty() ? value.str() : implementing.front()->id;
+}
+
+/// True when the plan's own solved layouts show the bound value in use. A
+/// role-less parameter governs the axis as a whole, so any solved layout
+/// counts; a parameter with a role is realized only by a solution on that
+/// occurrence.
+bool layoutConsumed(const perf::SearchSpace &space, llvm::StringRef parameter,
+                    const perf::Candidate &candidate,
+                    const mapping::CoveringPlan &plan,
+                    const mapping::MappingTarget &target) {
+  std::optional<llvm::StringRef> value = candidate.symbol(parameter);
+  if (!value)
+    return false;
+  const perf::SearchParam *param = space.findParam(parameter);
+  if (!param)
+    return false;
+  const std::string resolved = resolvedLayoutId(target, *value);
+  // The selected plan shows the value in use when a placement's rule declares
+  // the requirement for this role (or, role-less, anywhere) and the plan
+  // carries the solved layout for it. A value no selected rule consumes stays
+  // out of the receipt.
+  for (const mapping::PlanPlacement &placement : plan.placements) {
+    const mapping::RuleDef *rule = target.rules().find(placement.rule);
+    if (!rule)
+      continue;
+    const bool declared = llvm::any_of(
+        rule->layoutRequirements,
+        [&](const mapping::RuleLayoutRequirement &requirement) {
+          if (!param->role.empty() && requirement.port != param->role)
+            return false;
+          return requirement.layoutId == resolved;
+        });
+    if (!declared)
+      continue;
+    const bool solved =
+        llvm::any_of(placement.layoutSolutions, [&](const auto &entry) {
+          return entry.second.layoutClass == resolved;
+        });
+    if (solved)
+      return true;
+  }
+  return false;
+}
+
+bool executorNestedUnder(const machine::MachineModel &machine,
+                         llvm::StringRef inner, llvm::StringRef outer) {
+  const machine::ExecutorNode *current = machine.findExecutor(inner);
+  llvm::StringSet<> visited;
+  while (current && current->parent && visited.insert(current->id).second) {
+    if (*current->parent == outer)
+      return true;
+    current = machine.findExecutor(*current->parent);
+  }
+  return false;
+}
+
+/// Resolve the path under one selected executor. Intermediate owners belong to
+/// machine containment; they need not each run a separate selected operation.
+/// A final compute-only kind is realized by its selected attached capability.
+bool ownerMappingConsumed(llvm::StringRef value,
+                          const mapping::CoveringPlan &plan,
+                          const machine::MachineModel &machine) {
+  llvm::SmallVector<llvm::StringRef, 4> owners;
+  value.split(owners, '/');
+  if (owners.empty() ||
+      llvm::any_of(owners, [](llvm::StringRef owner) { return owner.empty(); }))
+    return false;
+  for (const mapping::PlanPlacement &placement : plan.placements) {
+    if (!machine.ownerMatches(owners.front(), placement.executor))
+      continue;
+    llvm::SmallVector<const machine::ExecutorNode *, 4> scopes{
+        machine.findExecutor(placement.executor)};
+    for (size_t index = 1; index < owners.size(); ++index) {
+      llvm::SmallVector<const machine::ExecutorNode *, 4> nested;
+      for (const machine::ExecutorNode &executor : machine.executors)
+        if (machine.ownerMatches(owners[index], executor.id) &&
+            llvm::any_of(scopes, [&](const machine::ExecutorNode *scope) {
+              return executorNestedUnder(machine, executor.id, scope->id);
+            }))
+          nested.push_back(&executor);
+
+      if (index + 1 == owners.size())
+        for (const auto &binding : placement.computeBindings) {
+          const machine::ComputeNode *compute =
+              machine.findCompute(binding.second);
+          if (compute &&
+              (compute->kind == owners[index] ||
+               llvm::is_contained(compute->refines, owners[index])) &&
+              llvm::any_of(scopes, [&](const machine::ExecutorNode *scope) {
+                return compute->attachedTo == scope->id ||
+                       executorNestedUnder(machine, compute->attachedTo,
+                                           scope->id);
+              }))
+            return true;
+        }
+      scopes = std::move(nested);
+      if (scopes.empty())
+        break;
+    }
+    if (!scopes.empty())
+      return true;
+  }
+  return false;
+}
+
+/// True when the selected plan's resolved memories are constrained by the bound
+/// path. The path *restricts* which memory kinds a rule may require, so a plan
+/// consumes it when it made at least one memory decision and every kind it used
+/// is on the path. Requiring every path level to appear would reject a legal
+/// plan that stays in a subset of the allowed levels.
+bool memoryPathConsumed(llvm::StringRef value,
+                        const mapping::CoveringPlan &plan,
+                        const machine::MachineModel &machine) {
+  llvm::StringSet<> used;
+  auto add = [&](llvm::StringRef id) {
+    if (const machine::MemoryNode *memory = machine.findMemory(id))
+      used.insert(memory->kind);
+  };
+  for (const mapping::PlanPlacement &placement : plan.placements)
+    for (const auto &entry : placement.memories)
+      add(entry.second);
+  for (const mapping::PlanConnection &connection : plan.connectionPlans)
+    for (llvm::StringRef id : connection.route)
+      add(id);
+  if (used.empty())
+    return false;
+
+  llvm::SmallVector<llvm::StringRef, 4> levels;
+  value.split(levels, ':');
+  if (levels.empty())
+    return false;
+  for (llvm::StringRef level : levels)
+    if (!machine.findMemoryOfKind(level))
+      return false;
+  for (const auto &entry : used)
+    if (!llvm::is_contained(levels, llvm::StringRef(entry.getKey())))
+      return false;
+  return true;
+}
+
+/// Completes `receipt` with the mapping-owned choices the selected plan
+/// realizes and validates the result at the complete stage. A choice no
+/// resolved decision consumes stays out of the receipt, which the shared
+/// validator reports as `axis_not_realized`.
+llvm::Error completeMappingReceipt(
+    const perf::SearchSpace &space, const perf::Candidate &candidate,
+    llvm::ArrayRef<workload::ParameterBinding> schema,
+    const mapping::CoveringPlan &plan, const mapping::MappingTarget &target,
+    workload::BindingReceipt &receipt) {
+  for (const workload::ParameterBinding &binding : schema) {
+    if (binding.owner != workload::BindingOwner::Mapping)
+      continue;
+    const perf::SearchParam *param = space.findParam(binding.parameter);
+    if (!param)
+      continue; // The shared validator names the unknown parameter.
+    bool consumed = false;
+    if (param->kind == "layout")
+      consumed =
+          layoutConsumed(space, binding.parameter, candidate, plan, target);
+    else if (param->kind == "owner_mapping")
+      consumed = ownerMappingConsumed(
+          candidate.symbol(binding.parameter).value_or(llvm::StringRef()), plan,
+          target.machine());
+    else if (param->kind == "memory_path")
+      consumed = memoryPathConsumed(
+          candidate.symbol(binding.parameter).value_or(llvm::StringRef()), plan,
+          target.machine());
+    if (consumed)
+      receipt.mapping.push_back(binding.parameter);
+  }
+  return workload::validateBindingReceipt(space, candidate, schema, receipt,
+                                          workload::ReceiptStage::Complete);
+}
+
+using PlanReceipts = std::map<uint64_t, workload::BindingReceipt>;
+
+/// Initial selection and measurement replay must retain the same receipt-valid
+/// domain. Check realization before top-K in both searches; only the initial
+/// search needs to keep the accepted receipt for reporting.
+auto makeCompletePlanEvaluator(const CandidateInstance &instance,
+                               const perf::SearchSpace &space,
+                               const perf::Candidate &candidate,
+                               const mapping::MappingTarget &target,
+                               mapping::BindContract contract,
+                               uint64_t memoryBudget,
+                               PlanReceipts *acceptedReceipts = nullptr) {
+  return [&instance, &space, &candidate, &target, contract, memoryBudget,
+          acceptedReceipts](const mapping::CoveringPlan &proposal)
+             -> llvm::Expected<mapping::CompletePlanEvaluation> {
+    auto evaluation = mapping::evaluateCompletePlan(
+        instance.module.get(), instance.workloadGraph, target, proposal,
+        contract, memoryBudget, mapping::AnalysisRequirement::Complete);
+    if (!evaluation)
+      return evaluation.takeError();
+    if (!evaluation->plan || instance.schema.empty())
+      return evaluation;
+    workload::BindingReceipt receipt = instance.receipt;
+    if (llvm::Error invalid =
+            completeMappingReceipt(space, candidate, instance.schema,
+                                   *evaluation->plan, target, receipt)) {
+      evaluation->rejection = mapping::Diagnostic{
+          mapping::DiagnosticCode::GlobalConstraintFailed,
+          "mapping_receipt: " + llvm::toString(std::move(invalid))};
+      evaluation->plan.reset();
+      return evaluation;
+    }
+    if (acceptedReceipts)
+      (*acceptedReceipts)[evaluation->plan->id] = std::move(receipt);
+    return evaluation;
+  };
+}
+
 llvm::Error measureSelectedCandidates(ModuleOp source,
                                       const perf::SearchSpace &space,
-                                      const perf::WorkloadShape &shape,
                                       const mapping::MappingTarget &target,
                                       const MappedTuningOptions &options,
+                                      const InstantiateCandidateFn &instantiate,
                                       MappedTuningReport &report) {
   const auto &measurement = options.measurement;
   if (!measurement.measure)
@@ -349,8 +581,7 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
     MappedTuningCandidate &candidate = report.ranked[index];
     CandidateInstantiationOptions sourceOptions = options.source;
     sourceOptions.machine = &target.machine();
-    auto instance = instantiateCandidate(
-        source, space, candidate.ranking.candidate, shape, sourceOptions);
+    auto instance = instantiate(candidate.ranking.candidate, sourceOptions);
     if (!instance) {
       candidate.ranking.rejectionReason =
           "measurement source: " + llvm::toString(instance.takeError());
@@ -382,15 +613,9 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
     auto binding = toBinding(candidate.ranking.candidate);
     mapping::MappingSearchOptions searchOptions = options.mapping;
     searchOptions.requireCompleteEvaluation = true;
-    searchOptions.evaluateCompletePlan =
-        [module = instance->module.get(), graph = &instance->workloadGraph,
-         &target, memoryBudget = searchOptions.memoryBudgetBytes](
-            const mapping::CoveringPlan &proposal)
-        -> llvm::Expected<mapping::CompletePlanEvaluation> {
-      return mapping::evaluateCompletePlan(
-          module, *graph, target, proposal, mapping::BindContract::Executable,
-          memoryBudget, mapping::AnalysisRequirement::Complete);
-    };
+    searchOptions.evaluateCompletePlan = makeCompletePlanEvaluator(
+        *instance, space, candidate.ranking.candidate, target,
+        mapping::BindContract::Executable, searchOptions.memoryBudgetBytes);
     mapping::CoveringSearch search(
         instance->workloadGraph, target, *instance->module->getContext(),
         layoutContext(instance->workloadGraph), searchOptions, binding,
@@ -520,13 +745,14 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
   return llvm::Error::success();
 }
 
-} // namespace
-
+/// The shared search sequence. The only path-specific step is candidate
+/// realization, so the legacy shape translation and the contract path cannot
+/// diverge in legality, complete-plan evaluation, retention or measurement.
 llvm::Expected<MappedTuningReport>
-runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
-                       const perf::WorkloadShape &shape,
-                       const mapping::MappingTarget &target,
-                       const MappedTuningOptions &options) {
+runMappedTuningSessionImpl(ModuleOp source, const perf::SearchSpace &space,
+                           const mapping::MappingTarget &target,
+                           const MappedTuningOptions &options,
+                           const InstantiateCandidateFn &instantiate) {
   if (!source)
     return fail("mapped tuning requires a source module");
   if (llvm::Error error = perf::validateObjective(space.objective))
@@ -554,8 +780,7 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
     }
     CandidateInstantiationOptions sourceOptions = options.source;
     sourceOptions.machine = &target.machine();
-    auto instance =
-        instantiateCandidate(source, space, candidate, shape, sourceOptions);
+    auto instance = instantiate(candidate, sourceOptions);
     if (!instance) {
       std::string reason = llvm::toString(instance.takeError());
       if (StringRef(reason).starts_with("candidate is illegal:")) {
@@ -588,14 +813,14 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
         options.executable ? mapping::BindContract::Executable
                            : mapping::BindContract::Partial;
     const uint64_t memoryBudget = searchOptions.memoryBudgetBytes;
+    // The completion evaluator is the last point before a proposal can be
+    // retained, so the plan-specific mapping receipt is completed and checked
+    // here. A failed receipt rejects that proposal and the search keeps
+    // enumerating; it is never a post-top-K filter.
+    PlanReceipts acceptedReceipts;
     searchOptions.evaluateCompletePlan =
-        [module = instance->module.get(), graph = &instance->workloadGraph,
-         &target, contract, memoryBudget](const mapping::CoveringPlan &proposal)
-        -> llvm::Expected<mapping::CompletePlanEvaluation> {
-      return mapping::evaluateCompletePlan(
-          module, *graph, target, proposal, contract, memoryBudget,
-          mapping::AnalysisRequirement::Complete);
-    };
+        makeCompletePlanEvaluator(*instance, space, candidate, target, contract,
+                                  memoryBudget, &acceptedReceipts);
     searchOptions.requireCompleteEvaluation = true;
     mapping::CoveringSearch search(
         instance->workloadGraph, target, *instance->module->getContext(),
@@ -628,8 +853,12 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
           capacity ? "capacity_failure: no feasible covering"
                    : (route ? "no_route: no feasible covering"
                             : "mapping_failure: no feasible covering");
-      if (!found->frontier.diagnostics.empty())
-        reason += ": " + found->frontier.diagnostics.front().message;
+      if (!found->frontier.diagnostics.empty()) {
+        const mapping::Diagnostic &primary =
+            found->frontier.diagnostics.front();
+        reason += ": " + mapping::stringifyDiagnosticCode(primary.code).str() +
+                  ": " + primary.message;
+      }
       report.rejected.push_back({candidate, {}, false, std::move(reason)});
       continue;
     }
@@ -686,6 +915,11 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
       selected.planReport = mapping::writePlanReport(
           onePlan, target.machine(), target, searchOptions,
           mapping::computeSourceGraphHash(instance->workloadGraph));
+      // Persist the receipt the completion evaluator accepted for this exact
+      // plan alongside the selected candidate.
+      if (auto accepted = acceptedReceipts.find(selected.plan.id);
+          accepted != acceptedReceipts.end())
+        selected.receipt = std::move(accepted->second);
       compiled = true;
       break;
     }
@@ -712,8 +946,8 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
       [&](const MappedTuningCandidate &a, const MappedTuningCandidate &b) {
         return ranksBefore(a, b, space.objective);
       });
-  if (llvm::Error error = measureSelectedCandidates(source, space, shape,
-                                                    target, options, report))
+  if (llvm::Error error = measureSelectedCandidates(
+          source, space, target, options, instantiate, report))
     return std::move(error);
   if (measuredObjective) {
     report.measuredCohortOnly = true;
@@ -745,6 +979,43 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
   if (options.topK && report.ranked.size() > options.topK)
     report.ranked.resize(options.topK);
   return report;
+}
+
+} // namespace
+
+llvm::Expected<MappedTuningReport>
+runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
+                       const perf::WorkloadShape &shape,
+                       const mapping::MappingTarget &target,
+                       const MappedTuningOptions &options) {
+  // The legacy entry point is a translation: its contraction facts become the
+  // source selection the adapter path realizes, and everything after candidate
+  // realization is the shared sequence.
+  InstantiateCandidateFn instantiate =
+      [source, space, shape](const perf::Candidate &candidate,
+                             const CandidateInstantiationOptions &sourceOptions)
+      -> llvm::Expected<CandidateInstance> {
+    return instantiateCandidate(source, space, candidate, shape, sourceOptions);
+  };
+  return runMappedTuningSessionImpl(source, space, target, options,
+                                    instantiate);
+}
+
+llvm::Expected<MappedTuningReport>
+runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
+                       const workload::WorkloadContract &contract,
+                       const mapping::MappingTarget &target,
+                       const MappedTuningOptions &options) {
+  InstantiateCandidateFn instantiate =
+      [source, space,
+       contract](const perf::Candidate &candidate,
+                 const CandidateInstantiationOptions &sourceOptions)
+      -> llvm::Expected<CandidateInstance> {
+    return instantiateCandidate(source, space, candidate, contract,
+                                sourceOptions);
+  };
+  return runMappedTuningSessionImpl(source, space, target, options,
+                                    instantiate);
 }
 
 } // namespace mlir::llk::tuning

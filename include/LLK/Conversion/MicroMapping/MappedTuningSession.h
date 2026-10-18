@@ -98,6 +98,11 @@ struct MappedTuningCandidate {
   bool materializationReady = false;
   std::string planReport;
   bool executable = false;
+  /// What the source and the selected plan realized. The source entries come
+  /// from realization; the mapping entries are filled only after the selected
+  /// plan's own resolved layout/owner/path proves the choice was consumed.
+  /// Empty for the legacy shape path, which has no adapter schema.
+  workload::BindingReceipt receipt;
   std::optional<MappedMeasurementIdentity> measurementIdentity;
 };
 
@@ -127,6 +132,20 @@ struct MappedTuningReport {
 llvm::Expected<MappedTuningReport>
 runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
                        const perf::WorkloadShape &shape,
+                       const mapping::MappingTarget &target,
+                       const MappedTuningOptions &options = {});
+
+/// The same search over a source *contract* instead of contraction extents.
+/// Candidates are instantiated through the source adapters selected by
+/// `options.source`, so a non-contraction family enters the existing complete
+/// evaluator, search, compiler and measurement sequence without fabricated
+/// M/N/K facts. Every offered source choice must be realized by the adapter,
+/// and a mapping-owned choice must be consumed by the selected plan's resolved
+/// layout/owner/path; a mapping receipt that fails is a candidate rejection
+/// inside the completion evaluator, never a post-top-K filter.
+llvm::Expected<MappedTuningReport>
+runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
+                       const workload::WorkloadContract &contract,
                        const mapping::MappingTarget &target,
                        const MappedTuningOptions &options = {});
 

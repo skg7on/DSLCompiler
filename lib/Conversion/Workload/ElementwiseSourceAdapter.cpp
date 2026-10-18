@@ -41,6 +41,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -265,6 +266,46 @@ elementwiseSchema(const perf::SearchSpace &space) {
   return schema;
 }
 
+/// The tile each source axis is realized at. The default is the full extent:
+/// a source that offers no tile choice is realized as one tile, not refused.
+struct ElementwiseTiles {
+  int64_t t0 = 0;
+  int64_t t1 = 0;
+};
+
+/// Resolves the source-owned tile choices by the axis each one names. A
+/// source-owned choice with no matching axis has no realization in this
+/// increment and is reported rather than ignored; a tile that does not divide
+/// its extent cannot be realized without inventing padding or masking.
+llvm::Expected<ElementwiseTiles>
+resolveTiles(const ElementwiseProgram &program, const perf::SearchSpace &space,
+             const perf::Candidate &candidate) {
+  ElementwiseTiles tiles{program.d0, program.d1};
+  for (const ParameterBinding &binding : elementwiseSchema(space)) {
+    if (binding.owner != BindingOwner::Source)
+      continue;
+    const perf::SearchParam *param = space.findParam(binding.parameter);
+    // A source-owned choice this family does not implement -- a fragment
+    // shape, a tail policy, an unrelated integer -- has no realization here.
+    if (!param || param->kind != "integer")
+      return error("axis_not_realized: " + binding.parameter);
+    std::optional<int64_t> value = candidate.integer(binding.parameter);
+    if (!value)
+      return error("source_binding: " + binding.parameter +
+                   " is not an integer binding");
+    if (binding.role == "axis:d0")
+      tiles.t0 = *value;
+    else if (binding.role == "axis:d1")
+      tiles.t1 = *value;
+    else
+      return error("axis_not_realized: " + binding.parameter);
+  }
+  if (tiles.t0 <= 0 || tiles.t1 <= 0 || program.d0 % tiles.t0 ||
+      program.d1 % tiles.t1)
+    return error("source_legality: tile_divisibility: T0/T1 must divide d0/d1");
+  return tiles;
+}
+
 /// The one structured family this increment supports.
 class ElementwiseSourceAdapter final : public SourceAdapter {
 public:
@@ -297,10 +338,11 @@ public:
     // The first supported numerical mode. Approximation stays an explicit
     // source fact, so this adapter never invents one.
     described.numericalContract = "strict-f32";
-    // The primitives realization actually emits: staged operand movement and
-    // the vector operation. A required primitive the emitter does not produce
-    // would be a false contract.
-    described.requiredPrimitives = {"micro.tile_async_copy", "micro.vector"};
+    // The primitives realization actually emits: staged operand movement, the
+    // vector operation, and the tile store into the carried output. A required
+    // primitive the emitter does not produce would be a false contract.
+    described.requiredPrimitives = {"micro.tile_async_copy", "micro.vector",
+                                    "micro.tile_store"};
     return described;
   }
 
@@ -312,7 +354,7 @@ public:
   llvm::Expected<SourceRealization>
   realize(ModuleOp clone, Operation *selectedRoot,
           const WorkloadContract &contract, const perf::SearchSpace &space,
-          const perf::Candidate &) const override {
+          const perf::Candidate &candidate) const override {
     auto program = analyze(selectedRoot);
     if (!program)
       return program.takeError();
@@ -327,12 +369,12 @@ public:
       return error("source_contract_mismatch: elementwise source describes a "
                    "different contract");
 
-    // Only the full-tile program exists in this increment. A source-owned
-    // choice has no realization yet, and saying so is the point of the
-    // ownership declaration.
-    for (const ParameterBinding &binding : elementwiseSchema(space))
-      if (binding.owner == BindingOwner::Source)
-        return error("axis_not_realized: " + binding.parameter);
+    // Resolve the source-owned choices before emitting anything: an axis this
+    // increment cannot realize, or a tile that does not divide its extent, is
+    // reported instead of being silently ignored or padded.
+    auto tiles = resolveTiles(*program, space, candidate);
+    if (!tiles)
+      return tiles.takeError();
 
     MLIRContext *context = clone.getContext();
     // Parsing a Linalg-only source does not load the output dialect.
@@ -367,20 +409,56 @@ public:
       body->addArgument(input, loc);
     builder.setInsertionPointToStart(body);
 
-    // Target-independent full-tile placement: external tensors are viewed in
-    // dram, staged through sram, and computed into acc. No layout or owner is
-    // invented -- those are mapping choices.
+    // Target-independent placement: external tensors are viewed in dram,
+    // staged through sram, and computed into acc. No layout or owner is
+    // invented -- those are mapping choices. A source that offers no tile
+    // choice is realized as one tile covering the full extent.
     micro::LayoutAttr layout;
     micro::OwnerAttr owner;
     auto dram = micro::MemorySpaceAttr::get(context, micro::MemorySpace::dram);
     auto sram = micro::MemorySpaceAttr::get(context, micro::MemorySpace::sram);
     auto acc = micro::MemorySpaceAttr::get(context, micro::MemorySpace::acc);
-    auto tile = [&](micro::MemorySpaceAttr memory) {
-      return micro::TileType::get(context, {program->d0, program->d1},
-                                  program->elementType, layout, memory, owner);
+    auto tile = [&](ArrayRef<int64_t> shape, micro::MemorySpaceAttr memory) {
+      return micro::TileType::get(context, shape, program->elementType, layout,
+                                  memory, owner);
     };
     Type tokenType = micro::AsyncTokenType::get(context);
-    const SmallVector<int64_t, 2> shape{program->d0, program->d1};
+    const SmallVector<int64_t, 2> outputShape{program->d0, program->d1};
+    const SmallVector<int64_t, 2> tileShape{tiles->t0, tiles->t1};
+    Type outputTileType = tile(outputShape, sram);
+
+    // Tile-by-tile output is SSA-carried: the store updates the destination
+    // the inner loop hands on, and each loop yields what its body produced.
+    Value output =
+        micro::TileAllocOp::create(builder, loc, outputTileType).getResult();
+    auto openSpatialLoop = [&](int64_t extent, int64_t step, StringRef axis,
+                               ValueRange carried) -> micro::SpatialForOp {
+      Value lower = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
+      Value upper =
+          arith::ConstantIndexOp::create(builder, loc, extent).getResult();
+      Value by = arith::ConstantIndexOp::create(builder, loc, step).getResult();
+      auto loop = micro::SpatialForOp::create(
+          builder, loc, carried.getTypes(), lower, upper, by,
+          micro::MappingTargetAttr::get(context, axis), carried);
+      llvm::SmallVector<Type> bodyTypes{IndexType::get(context)};
+      bodyTypes.append(carried.getTypes().begin(), carried.getTypes().end());
+      Block *loopBody = builder.createBlock(
+          &loop.getBody(), {}, bodyTypes,
+          llvm::SmallVector<Location>(bodyTypes.size(), loc));
+      builder.setInsertionPointToEnd(loopBody);
+      micro::YieldOp::create(builder, loc);
+      builder.setInsertionPoint(loopBody->getTerminator());
+      return loop;
+    };
+
+    micro::SpatialForOp d0Loop =
+        openSpatialLoop(program->d0, tiles->t0, "worker", ValueRange{output});
+    BlockArgument d0 = d0Loop.getBody().front().getArgument(0);
+    Value d0Carried = d0Loop.getBody().front().getArgument(1);
+    micro::SpatialForOp d1Loop =
+        openSpatialLoop(program->d1, tiles->t1, "lane", ValueRange{d0Carried});
+    BlockArgument d1 = d1Loop.getBody().front().getArgument(0);
+    Value d1Carried = d1Loop.getBody().front().getArgument(1);
 
     llvm::SmallVector<Value, 2> staged;
     llvm::SmallVector<Value, 2> tokens;
@@ -388,12 +466,13 @@ public:
       // The kernel is IsolatedFromAbove, so the operands it reads are its own
       // entry block arguments -- the source-local values are not in scope.
       Value input = body->getArgument(i);
-      Value view = micro::TileViewOp::create(builder, loc, tile(dram), input,
-                                             /*offsets=*/ValueRange(), shape,
-                                             /*layout=*/micro::LayoutAttr());
-      auto copy = micro::TileAsyncCopyOp::create(builder, loc, tile(sram),
-                                                 tokenType, view, sram,
-                                                 /*owner=*/micro::OwnerAttr());
+      Value view = micro::TileViewOp::create(
+          builder, loc, tile(tileShape, dram), input, ValueRange{d0, d1},
+          DenseI64ArrayAttr::get(context, tileShape),
+          /*layout=*/micro::LayoutAttr());
+      auto copy = micro::TileAsyncCopyOp::create(
+          builder, loc, tile(tileShape, sram), tokenType, view, sram,
+          /*owner=*/micro::OwnerAttr());
       staged.push_back(copy.getResult());
       tokens.push_back(copy.getToken());
     }
@@ -402,10 +481,30 @@ public:
     // The validated scalar operation decides the primitive key inside this
     // adapter only.
     Value result = micro::VectorOp::create(
-        builder, loc, tile(acc),
+        builder, loc, tile(tileShape, acc),
         StringAttr::get(context, program->multiply ? "mul" : "add"),
         ValueRange{staged[0], staged[1]}, /*math_mode=*/StringAttr());
-    micro::YieldOp::create(builder, loc, result);
+    Value written =
+        micro::TileStoreOp::create(builder, loc, outputTileType, result,
+                                   d1Carried, ValueRange{d0, d1}, sram)
+            .getResult();
+
+    if (auto terminator = dyn_cast<micro::YieldOp>(
+            d1Loop.getBody().front().getTerminator())) {
+      builder.setInsertionPoint(terminator);
+      micro::YieldOp::create(builder, loc, ValueRange{written});
+      terminator.erase();
+    }
+    if (auto terminator = dyn_cast<micro::YieldOp>(
+            d0Loop.getBody().front().getTerminator())) {
+      builder.setInsertionPoint(terminator);
+      micro::YieldOp::create(builder, loc, d1Loop.getResults());
+      terminator.erase();
+    }
+    // The kernel body has no terminator yet: the loops were emitted into it in
+    // order, so the yielded value is what the outer loop left.
+    builder.setInsertionPointToEnd(body);
+    micro::YieldOp::create(builder, loc, d0Loop.getResults());
 
     // Carry the canonical numerical semantics as an explicit IR fact.
     if (!contract.numericalContract.empty())
@@ -414,9 +513,12 @@ public:
 
     SourceRealization realization;
     realization.kernel = kernel.getOperation();
-    // The receipt names what realization actually produced. This increment
-    // realizes no source-owned parameter: the loop above rejected any offered
-    // one, so there is nothing to append.
+    // The receipt names what realization actually produced: every source-owned
+    // choice that reached this point was emitted as a tile loop. Mapping-owned
+    // choices stay pending for the later stage.
+    for (const ParameterBinding &binding : elementwiseSchema(space))
+      if (binding.owner == BindingOwner::Source)
+        realization.receipt.source.push_back(binding.parameter);
     return realization;
   }
 };
