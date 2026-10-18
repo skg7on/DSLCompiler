@@ -10,6 +10,7 @@
 #ifndef LLK_CONVERSION_MICROMAPPING_MAPPEDTUNINGSESSION_H
 #define LLK_CONVERSION_MICROMAPPING_MAPPEDTUNINGSESSION_H
 
+#include "LLK/Conversion/FrameworkCapabilities.h"
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
 #include "LLK/Mapping/PlanReport.h"
@@ -103,6 +104,10 @@ struct MappedTuningCandidate {
   /// plan's own resolved layout/owner/path proves the choice was consumed.
   /// Empty for the legacy shape path, which has no adapter schema.
   workload::BindingReceipt receipt;
+  /// What the retained plan and its compilation established, stage by stage.
+  /// Filled from the concrete instantiated kernel and compilation; stages the
+  /// session never runs (such as invocation) stay `not_checked`.
+  framework::CapabilityReceipt capability;
   std::optional<MappedMeasurementIdentity> measurementIdentity;
 };
 

@@ -5,10 +5,13 @@ add_llk_test_category(Conversion
         LLKKernel/fragments.cpp
         MicroMapping/search_binding_loader.cpp
         MicroMapping/complete_plan_evaluation.cpp
+        framework_capabilities.cpp
         ../Mapping/resource_regression_fixture.cpp
     LIBRARIES
         LLKKernel
+        LLKMappedCompilation
         LLKMicroMapping
+        LLKTargetMapping
         MicroDialect
         LLK::MLIR
     DEFINITIONS

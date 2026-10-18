@@ -16,6 +16,7 @@ add_llk_library(LLKMicroMapping
 
 add_llk_library(LLKMappedCompilation
     MappedCompilation.cpp
+    FrameworkCapabilities.cpp
     LINK_LIBRARIES LLKMicroMapping LLKMicroToLinalg LLKMappedKernelAbi
                    LLKWorkloadContracts LLKRuntime LLKMapping LLKTargetMapping
                    LLK::MLIR

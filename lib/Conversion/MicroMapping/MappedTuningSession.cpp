@@ -752,7 +752,8 @@ llvm::Expected<MappedTuningReport>
 runMappedTuningSessionImpl(ModuleOp source, const perf::SearchSpace &space,
                            const mapping::MappingTarget &target,
                            const MappedTuningOptions &options,
-                           const InstantiateCandidateFn &instantiate) {
+                           const InstantiateCandidateFn &instantiate,
+                           const workload::WorkloadContract *workloadContract) {
   if (!source)
     return fail("mapped tuning requires a source module");
   if (llvm::Error error = perf::validateObjective(space.objective))
@@ -888,6 +889,14 @@ runMappedTuningSessionImpl(ModuleOp source, const perf::SearchSpace &space,
       selected.plan = found->plans[i];
       selected.sourceGraphHash = instance->sourceGraphHash;
       selected.bindingHash = instance->bindingHash;
+      // Record what this exact kernel, plan and compilation established. The
+      // stage statuses stay honest: the session does not run a callable
+      // invocation, so that stage remains not_checked even when compilation
+      // reached a lowered form.
+      selected.capability = framework::describeCapabilities(
+          instance->kernel,
+          workloadContract ? *workloadContract : workload::WorkloadContract{},
+          target, /*analysis=*/nullptr, &selected.plan, &*compilation);
       selected.materializationReady = selected.plan.materialized;
       selected.ranking = {candidate, {}, true, {}};
       selected.ranking.metrics.predictedCycles = static_cast<uint64_t>(
@@ -997,8 +1006,8 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
       -> llvm::Expected<CandidateInstance> {
     return instantiateCandidate(source, space, candidate, shape, sourceOptions);
   };
-  return runMappedTuningSessionImpl(source, space, target, options,
-                                    instantiate);
+  return runMappedTuningSessionImpl(source, space, target, options, instantiate,
+                                    /*workloadContract=*/nullptr);
 }
 
 llvm::Expected<MappedTuningReport>
@@ -1014,8 +1023,8 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
     return instantiateCandidate(source, space, candidate, contract,
                                 sourceOptions);
   };
-  return runMappedTuningSessionImpl(source, space, target, options,
-                                    instantiate);
+  return runMappedTuningSessionImpl(source, space, target, options, instantiate,
+                                    &contract);
 }
 
 } // namespace mlir::llk::tuning
