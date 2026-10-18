@@ -311,6 +311,78 @@ TEST(FrameworkConformance, LogicalViewControlAddsNoTransformOrMovement) {
   EXPECT_EQ(eventsOfKind(*chain, CostEventKind::TransferHop).size(), 1u);
 }
 
+TEST(FrameworkConformance, AddedLogicalViewPreservesAliasTrafficAndStorage) {
+  auto viewed = buildChain("transform-view", 1);
+  ASSERT_TRUE(static_cast<bool>(viewed)) << llvm::toString(viewed.takeError());
+  unsigned viewCount = 0;
+  mlir::Operation *producer = nullptr;
+  mlir::Operation *view = nullptr;
+  mlir::Operation *store = nullptr;
+  viewed->fixture.source->walk([&](mlir::Operation *op) {
+    const auto name = op->getName().getStringRef();
+    if (name == "micro.vector")
+      producer = op;
+    if (name == "micro.tile_view") {
+      ++viewCount;
+      if (op->getOperand(0).getDefiningOp() == producer)
+        view = op;
+    }
+    if (name == "micro.tile_store")
+      store = op;
+  });
+  ASSERT_EQ(viewCount, 2u) << "the control needs a real producer-result view";
+  ASSERT_NE(view, nullptr);
+  ASSERT_NE(store, nullptr);
+  EXPECT_EQ(store->getOperand(0), view->getResult(0));
+
+  auto direct = buildChain("transform-direct", 1);
+  ASSERT_TRUE(static_cast<bool>(direct)) << llvm::toString(direct.takeError());
+  expectStrictParity(*viewed);
+  expectStrictParity(*direct);
+
+  // A view adds neither a workload node nor another value/storage version:
+  // the store still reads the vector's result, so its data dependency survives.
+  const auto &graph = viewed->fixture.graph;
+  ASSERT_EQ(graph.getNodes().size(), 2u);
+  const mlir::llk::mapping::WorkloadNode *vectorNode = nullptr;
+  const mlir::llk::mapping::WorkloadNode *storeNode = nullptr;
+  for (const auto &node : graph.getNodes()) {
+    if (node.opName == "micro.vector")
+      vectorNode = &node;
+    if (node.opName == "micro.tile_store")
+      storeNode = &node;
+  }
+  ASSERT_NE(vectorNode, nullptr);
+  ASSERT_NE(storeNode, nullptr);
+  ASSERT_EQ(vectorNode->outputs.size(), 1u);
+  ASSERT_EQ(storeNode->inputs.size(), 1u);
+  EXPECT_EQ(storeNode->inputs.front().value, vectorNode->outputs.front().value);
+  EXPECT_EQ(graph.getValues().size(), direct->fixture.graph.getValues().size());
+
+  // Only the store moves the 8x8xf32 result: 256 bytes read from SRAM and
+  // written to L2. The 256-byte input and result share a 512-byte live peak.
+  EXPECT_EQ(memoryValue(viewed->analysis.trafficBytes, "sram"), 256u);
+  EXPECT_EQ(memoryValue(viewed->analysis.trafficBytes, "l2"), 256u);
+  EXPECT_EQ(memoryValue(viewed->analysis.peakBytes, "sram.0"), 512u);
+  EXPECT_EQ(viewed->analysis.trafficBytes, direct->analysis.trafficBytes);
+  EXPECT_EQ(viewed->analysis.peakBytes, direct->analysis.peakBytes);
+  EXPECT_EQ(viewed->plan.allocations.size(), direct->plan.allocations.size());
+  EXPECT_EQ(allocationsOf(viewed->plan, "sram.0", 256),
+            allocationsOf(direct->plan, "sram.0", 256));
+  EXPECT_EQ(viewed->analysis.events.events.size(),
+            direct->analysis.events.events.size());
+  EXPECT_TRUE(eventsOfKind(*viewed, CostEventKind::Transform).empty());
+  const auto computes = eventsOfKind(*viewed, CostEventKind::Compute);
+  const auto transfers = eventsOfKind(*viewed, CostEventKind::TransferHop);
+  ASSERT_EQ(computes.size(), 1u);
+  ASSERT_EQ(transfers.size(), 1u);
+  const auto computeIndex = static_cast<uint32_t>(
+      computes.front() - viewed->analysis.events.events.data());
+  EXPECT_TRUE(llvm::is_contained(transfers.front()->deps, computeIndex));
+  EXPECT_DOUBLE_EQ(viewed->analysis.cost.latencyCycles,
+                   direct->analysis.cost.latencyCycles);
+}
+
 TEST(FrameworkConformance, PhysicalTransformAddsCalculatedWorkAndStorage) {
   auto control = buildChain("transform-view", 1);
   ASSERT_TRUE(static_cast<bool>(control))
