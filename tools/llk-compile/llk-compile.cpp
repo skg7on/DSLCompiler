@@ -13,6 +13,7 @@
 //
 // Usage: llk-compile <input.mlir> [--M=<dim>] [--N=<dim>] [--K=<dim>]
 
+#include "LLK/Conversion/FrameworkCapabilities.h"
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/MappedCompilation.h"
@@ -79,6 +80,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/Support/JSON.h"
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -613,6 +615,24 @@ static int runMappedCompilation(mlir::ModuleOp module,
   if (sourceContract)
     llvm::outs() << " source-contract-version=" << sourceContract->version;
   llvm::outs() << " replay-identity=" << replayIdentity << "\n";
+
+  // What this run established, stage by stage. The compilation is real
+  // evidence for the lowering stages; this tool runs no selected static
+  // analysis and no invocation, so those stages stay `not_checked`.
+  mlir::llk::workload::WorkloadContract capabilityContract;
+  if (sourceContract)
+    capabilityContract = *sourceContract;
+  mlir::llk::framework::CapabilityReceipt capabilities =
+      mlir::llk::framework::describeCapabilities(kernel, capabilityContract,
+                                                 **target, /*analysis=*/nullptr,
+                                                 &*selected, &*compiled);
+  // Diagnostics go to stderr so the tool's stdout stays "mapping line + MLIR"
+  // and can be re-parsed as an artifact, as the tutorials do.
+  llvm::errs() << "capabilities: "
+               << llvm::json::Value(
+                      mlir::llk::framework::capabilityReceiptToJson(
+                          capabilities))
+               << "\n";
 
   if (compiled->stopped != llk::MappedStop::Executable) {
     compiled->module->print(llvm::outs());

@@ -34,6 +34,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -90,6 +91,11 @@ public:
   const KernelAbi &abi() const { return abi_; }
   uint64_t abiHash() const { return computeKernelAbiHash(abi_); }
   llvm::StringRef executionIdentity() const { return executionIdentity_; }
+  /// Calls that passed descriptor checks and returned from the generated code.
+  /// This is execution evidence, not a numerical-correctness verdict.
+  uint64_t successfulInvocations() const {
+    return successfulInvocations_.load(std::memory_order_relaxed);
+  }
 
   llvm::Error invoke(llvm::ArrayRef<InvocationBuffer2D> inputs,
                      llvm::ArrayRef<InvocationBuffer2D> outputs);
@@ -132,6 +138,7 @@ private:
   void *entry_ = nullptr;
   KernelAbi abi_;
   std::string executionIdentity_;
+  std::atomic<uint64_t> successfulInvocations_{0};
 };
 
 } // namespace llk

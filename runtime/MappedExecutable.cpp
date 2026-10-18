@@ -218,6 +218,7 @@ MappedExecutable::invoke(llvm::ArrayRef<InvocationBuffer2D> inputs,
     callAtArity(entry_, args, std::make_index_sequence<12>{});
     break;
   }
+  successfulInvocations_.fetch_add(1, std::memory_order_relaxed);
   return llvm::Error::success();
 }
 
@@ -291,6 +292,7 @@ MappedExecutable::invokeUncheckedLegacy(llvm::ArrayRef<MemRef2D *> inputs,
     callAtArity(entry_, args, std::make_index_sequence<12>{});
     break;
   }
+  successfulInvocations_.fetch_add(1, std::memory_order_relaxed);
   return llvm::Error::success();
 }
 
