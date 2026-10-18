@@ -278,7 +278,9 @@ This reuses the report's frozen ``selectedState`` instead of re-running search; 
 Generic source replay
 ---------------------
 
-An instantiated non-contraction source is replayed exactly like a contraction
+The compiler does not instantiate a semantic source by itself. Produce the
+instantiated source with ``llk-tune --candidate-artifacts`` (see the
+:doc:`tuner manual </tools/tuning>`), then replay it exactly like a contraction
 candidate: the frozen ``source.mlir`` already holds the realized ``micro.kernel``
 and its retained ``micro.workload_contract`` and ``source_adapter`` attributes,
 and ``plan.json`` holds the selected mapping state.
