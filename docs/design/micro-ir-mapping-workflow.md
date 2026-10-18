@@ -288,7 +288,38 @@ and `micro-perf` charges it **hop by hop** rather than endpoint to endpoint.
 1. the ordinary Micro verifier checks structure;
 2. `verifyMappedMicroIR` resolves every id the metadata names — rules, executors,
    memories (and that the executor can see them), layouts, route hops, emitters;
-3. the target emitter validates its own bundle before lowering.
+3. `verifyTargetOperationCoverage` groups the bound IR by selected instance and
+   each emitter validates the covered operation's variant and operand/result
+   types without rewriting the IR; this runs before complete-plan analysis and
+   scoring, so an unsupported variant is a candidate rejection;
+4. the target emitter validates its own bundle before lowering.
+
+### Capability conformance
+
+`describeCapabilities` (`LLK/Conversion/FrameworkCapabilities.h`) reports one
+verdict per stage for a concrete source/contract/target/plan artifact:
+structure, interpretation, mapping, physical plan, reference lowering, selected
+lowering, ABI eligibility, preparation, host compatibility and invocation.
+Preparation does not establish invocation; a successful call does not establish
+numerical correctness. `supported` means the stage was established for this
+artifact, `unsupported` means a concrete blocker was found, and `not_checked`
+means it was never attempted. A static receipt performs structural verification
+and pure bundle validation only — it never runs a backend lowering or JIT.
+
+The distinction matters in both directions. A target with no codegen contract
+reports selected lowering unsupported even after a complete static mapping; a
+reference-backend compilation carries no codegen contract, so its selected
+lowering stays `not_checked` rather than reporting a failure. `llk-tune` writes
+the receipt per candidate in its mapping report, and `llk-compile` prints a
+`capabilities:` JSON line on stderr so stdout remains parseable.
+
+Target names are provenance, not policy. A renamed target preserves the plan id,
+legal decisions and its base backend capability while changing `targetIdentity`;
+changing machine capacities, resources or links changes legal coverings and
+rejection reasons through the same generic code. The boundary scan
+(`test/Conversion/framework_boundary_scan.py`) keeps target names and semantic
+operator labels out of generic `lib/Mapping`/`lib/Machine` code and keeps
+`LLKPerf`/runtime/JIT links out of those libraries.
 
 ## Acceptance chains
 

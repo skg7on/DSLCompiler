@@ -930,6 +930,8 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
     row["plan_id"] = llvm::formatv("{0:x}", candidate.plan.id).str();
     row["binding_hash"] = llvm::formatv("{0:x}", candidate.bindingHash).str();
     row["plan_report"] = candidate.planReport;
+    row["capabilities"] =
+        mlir::llk::framework::capabilityReceiptToJson(candidate.capability);
     row["predicted_cycles"] = candidate.ranking.metrics.predictedCycles;
     row["predicted_ns"] = candidate.ranking.metrics.predictedNs;
     row["matrix_utilization"] = candidate.ranking.metrics.matrixUtilization;

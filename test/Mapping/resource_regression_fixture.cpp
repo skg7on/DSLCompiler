@@ -677,6 +677,194 @@ CaseSpec paddedLayoutSpec() {
 }
 
 //===----------------------------------------------------------------------===//
+// C2: `transform-direct`, `transform-view` and `transform-layout`
+//===----------------------------------------------------------------------===//
+
+/// One worker with a vector engine, an SRAM the vector result lives in, and an
+/// L2 the store writes to over one real link. Both compute nodes stay in SRAM,
+/// so the transform pair isolates a *layout* conversion from the store's own
+/// boundary write.
+machine::MachineModel transformMachine() {
+  machine::MachineModel model;
+  model.target = "issue129.transform";
+  model.description = "one worker, sram result and l2 store";
+  model.executors = {{"worker.0", "worker", std::nullopt, {}, 1, {}}};
+  machine::ComputeNode vpu;
+  vpu.id = "vpu.0";
+  vpu.kind = "vector_engine";
+  vpu.attachedTo = "worker.0";
+  vpu.concurrency = 1;
+  vpu.elementTypes = {"f32"};
+  vpu.lanes = {{"f32", 8}};
+  vpu.issueCycles = 1;
+  model.computes = {vpu};
+  machine::MemoryNode sram;
+  sram.id = "sram.0";
+  sram.kind = "sram";
+  sram.visibleFrom = "worker.0";
+  sram.capacityBytes = 4096;
+  sram.alignmentBytes = 64;
+  sram.supportedLayouts = {"issue129.row_major_layout",
+                           "issue129.transposed_layout"};
+  machine::MemoryNode l2;
+  l2.id = "l2.0";
+  l2.kind = "l2";
+  l2.visibleFrom = "worker.0";
+  l2.capacityBytes = 4096;
+  l2.alignmentBytes = 64;
+  l2.supportedLayouts = {"issue129.row_major_layout",
+                         "issue129.transposed_layout"};
+  model.memories = {sram, l2};
+  // The store writes its operand across the SRAM/L2 boundary itself. A real
+  // link names the engine that carries it, so the analysis is complete; the
+  // transform pair still isolates a layout conversion from that boundary
+  // write, because both nodes stay in SRAM.
+  machine::TransferEngineNode dma;
+  dma.id = "dma.0";
+  dma.kind = "dma";
+  dma.refines = {"transfer"};
+  dma.attachedTo = "worker.0";
+  dma.count = 1;
+  dma.maxOutstanding = 1;
+  model.transferEngines = {dma};
+  machine::LinkEdge toL2;
+  toL2.id = "sram_to_l2.0";
+  toL2.source = "sram.0";
+  toL2.destination = "l2.0";
+  toL2.bandwidthBytesPerCycle = 64;
+  toL2.latencyCycles = 0;
+  toL2.transactionBytes = 64;
+  toL2.transferEngines = {"dma.0"};
+  model.links = {toL2};
+  return model;
+}
+
+/// A vector add produced in SRAM and consumed in-place by a store that writes
+/// to L2. The store's operand is the vector's result, so the connection between
+/// the two nodes is the one place a layout conversion can happen.
+constexpr llvm::StringLiteral kTransformSource = R"mlir(
+module {
+  micro.kernel @transform_store {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.tile_store %r {dst_memory = #micro.memory<l2>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// The same producer/store with an explicit logical view inserted on their
+/// edge. Unlike a physical layout transform, this aliases the produced tile.
+constexpr llvm::StringLiteral kTransformViewSource = R"mlir(
+module {
+  micro.kernel @transform_store {
+    %a = tensor.empty() : tensor<8x8xf32>
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %ta, %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>, !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %view = micro.tile_view %r {shape = array<i64: 8, 8>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.tile_store %view {dst_memory = #micro.memory<l2>} : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+
+/// Two concrete 8x8 f32 layouts: the identity row-major image and a transposed
+/// image. Both describe the same logical tile; the second is a different
+/// physical representation, so a value produced in one and read in the other
+/// needs a real conversion, not a free view.
+constexpr llvm::StringLiteral kTransformLayouts = R"llkmap(
+layout issue129.row_major_layout() {
+  require rank == 2;
+  implements row_major;
+  map (m, n) -> (m, n);
+}
+layout issue129.transposed_layout() {
+  require rank == 2;
+  implements col_major;
+  map (m, n) -> (n, m);
+}
+)llkmap";
+
+/// Producer and consumer ask for the *same* layout, so the connection is direct
+/// and the value moves nothing. This is the logical-view control.
+constexpr llvm::StringLiteral kTransformRulesAgree = R"llkmap(
+rule issue129.transform_vector {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout result satisfies issue129.row_major_layout;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.transform.vector";
+  emit "issue129_transform_vector";
+  cost 4;
+}
+rule issue129.transform_store_agree {
+  match micro.tile_store();
+  require executor kind worker;
+  require layout source satisfies issue129.row_major_layout;
+  input "source";
+  bundle "issue129.transform.store.agree";
+  emit "issue129_transform_store";
+  cost 4;
+}
+)llkmap";
+
+/// The consumer asks for the transposed image, so the same value must be
+/// converted physically before the store reads it.
+constexpr llvm::StringLiteral kTransformRulesConvert = R"llkmap(
+rule issue129.transform_vector {
+  match micro.vector(op = "add");
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout result satisfies issue129.row_major_layout;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "issue129.transform.vector";
+  emit "issue129_transform_vector";
+  cost 4;
+}
+rule issue129.transform_store_convert {
+  match micro.tile_store();
+  require executor kind worker;
+  require layout source satisfies issue129.transposed_layout;
+  input "source";
+  bundle "issue129.transform.store.convert";
+  emit "issue129_transform_store";
+  cost 4;
+}
+)llkmap";
+
+CaseSpec transformDirectSpec() {
+  CaseSpec spec;
+  spec.source = kTransformSource;
+  spec.rules = kTransformRulesAgree;
+  spec.layouts = kTransformLayouts;
+  spec.machine = transformMachine();
+  spec.emitters = {"issue129_transform_vector", "issue129_transform_store"};
+  return spec;
+}
+
+CaseSpec transformViewSpec() {
+  CaseSpec spec = transformDirectSpec();
+  spec.source = kTransformViewSource;
+  return spec;
+}
+
+CaseSpec transformLayoutSpec() {
+  CaseSpec spec;
+  spec.source = kTransformSource;
+  spec.rules = kTransformRulesConvert;
+  spec.layouts = kTransformLayouts;
+  spec.machine = transformMachine();
+  spec.emitters = {"issue129_transform_vector", "issue129_transform_store"};
+  return spec;
+}
+
+//===----------------------------------------------------------------------===//
 // R7: `capacity-topk`
 //===----------------------------------------------------------------------===//
 
@@ -1000,6 +1188,21 @@ buildPaddedLayout(const LatencyProvider *provider) {
 }
 
 llvm::Expected<ResourceCase>
+buildTransformDirect(const LatencyProvider *provider) {
+  return buildCase(transformDirectSpec(), provider);
+}
+
+llvm::Expected<ResourceCase>
+buildTransformView(const LatencyProvider *provider) {
+  return buildCase(transformViewSpec(), provider);
+}
+
+llvm::Expected<ResourceCase>
+buildTransformLayout(const LatencyProvider *provider) {
+  return buildCase(transformLayoutSpec(), provider);
+}
+
+llvm::Expected<ResourceCase>
 buildCapacityTopK(const LatencyProvider *provider) {
   return buildCase(capacityTopKSpec(), provider);
 }
@@ -1023,6 +1226,9 @@ llvm::ArrayRef<CaseEntry> caseTable() {
       {"pipeline-four", &buildPipelineFour},
       {"parallel-overlap", &buildParallelOverlap},
       {"padded-layout", &buildPaddedLayout},
+      {"transform-direct", &buildTransformDirect},
+      {"transform-view", &buildTransformView},
+      {"transform-layout", &buildTransformLayout},
       {"capacity-topk", &buildCapacityTopK},
       {"joint-oracle", &buildJointOracle},
       {"joint-oracle-reversed", &buildJointOracleReversed},

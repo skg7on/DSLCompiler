@@ -15,6 +15,7 @@
 #include "LLK/Perf/OpDAGBuilder.h"
 
 #include "LLK/Mapping/EventSchedule.h"
+#include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/StorageLiveness.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 
@@ -35,6 +36,14 @@ namespace {
 llvm::Error analysisError(const llvm::Twine &message) {
   return llvm::make_error<llvm::StringError>(message.str(),
                                              llvm::inconvertibleErrorCode());
+}
+
+void recordSource(SelectedKernelAnalysis &analysis, mlir::Operation *kernel) {
+  auto hash = mapping::computeModuleSourceGraphHash(kernel);
+  if (hash)
+    analysis.sourceGraphHash = *hash;
+  else
+    llvm::consumeError(hash.takeError());
 }
 
 /// A checked accumulate: it adds `amount` to `value` and reports overflow. The
@@ -78,6 +87,7 @@ llvm::Expected<SelectedKernelAnalysis>
 analyzeSelectedDag(const MicroDAG &dag, const machine::MachineModel &machine,
                    bool requireComplete) {
   SelectedKernelAnalysis analysis;
+  analysis.machineHash = machine::computeContentHash(machine);
 
   // --- normalize every event through the one shared construction point ------
   //
@@ -191,7 +201,10 @@ analyzeSelectedKernel(mlir::Operation *kernel,
                     DAGBuildOptions{CoverageMode::Audit});
   if (!dag)
     return dag.takeError();
-  return analyzeSelectedDag(*dag, machine, requireComplete);
+  auto analysis = analyzeSelectedDag(*dag, machine, requireComplete);
+  if (analysis)
+    recordSource(*analysis, kernel);
+  return analysis;
 }
 
 llvm::Error
@@ -234,6 +247,7 @@ attachPlanStorageLiveness(SelectedKernelAnalysis &analysis,
   analysis.peakBytes = live->peakBytes;
   analysis.requiredReuseEdges = live->requiredReuseEdges;
   analysis.storageLivenessFromPlan = true;
+  analysis.planId = finalizedPlan.id;
   return llvm::Error::success();
 }
 
@@ -266,6 +280,7 @@ llvm::Expected<SelectedKernelAnalysis> analyzeSelectedKernel(
       analyzeSelectedDag(*dag, machine, requireComplete);
   if (!analysis)
     return analysis.takeError();
+  recordSource(*analysis, kernel);
   // R5 liveness for the strict analysis: the plan's own occupancy replaces the
   // extraction's allocation accounting, so a strict caller reads the same peak
   // the plan's capacity verdict did.

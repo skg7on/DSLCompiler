@@ -75,6 +75,12 @@ struct MappedCompileOptions {
 
 /// What a mapped compilation produced.
 struct MappedCompilation {
+  /// Actual input/target identities captured by compilation, rather than
+  /// copied from the caller's plan. Used to associate later receipts with the
+  /// artifact whose lowering/executable they credit.
+  uint64_t sourceGraphHash = 0;
+  uint64_t targetHash = 0;
+  MappedBackend backend = MappedBackend::Reference;
   /// The compiled module. Present for every stop before `Executable`; a
   /// successful `Executable` compilation hands the module to the JIT, so this
   /// is empty there.
