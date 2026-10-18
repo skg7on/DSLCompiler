@@ -16,6 +16,7 @@
 #include "LLK/Runtime/KernelAbi.h"
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 
 #include "llvm/ADT/Twine.h"
@@ -46,6 +47,59 @@ bool reached(::llk::MappedStop stop, ::llk::MappedStop stage) {
 
 std::string describePort(const workload::WorkloadPort &port) {
   return "port '" + port.name + "'";
+}
+
+/// Read the declared tensor/memref boundary without running ABI preparation.
+/// The source and its bound kernel retain the same logical signature.
+std::optional<::llk::KernelAbi> sourceSignature(mlir::Operation *kernel) {
+  if (!kernel)
+    return std::nullopt;
+  auto attr = kernel->getAttrOfType<mlir::TypeAttr>("function_type");
+  auto type = attr ? mlir::dyn_cast<mlir::FunctionType>(attr.getValue())
+                   : mlir::FunctionType{};
+  if (!type)
+    return std::nullopt;
+  ::llk::KernelAbi signature;
+  auto append = [](mlir::TypeRange types,
+                   std::vector<::llk::KernelAbi::Port> &ports) {
+    for (mlir::Type type : types) {
+      auto shaped = mlir::dyn_cast<mlir::ShapedType>(type);
+      if (!shaped || !shaped.hasRank())
+        return false;
+      std::string element;
+      llvm::raw_string_ostream stream(element);
+      shaped.getElementType().print(stream);
+      ports.push_back({std::vector<int64_t>(shaped.getShape().begin(),
+                                            shaped.getShape().end()),
+                       stream.str()});
+    }
+    return true;
+  };
+  if (!append(type.getInputs(), signature.inputs) ||
+      !append(type.getResults(), signature.outputs))
+    return std::nullopt;
+  return signature;
+}
+
+/// Names/effects belong to the workload contract; the runtime ABI records the
+/// ordered shapes and element types separately for input and output ports.
+std::optional<std::string>
+contractMismatch(const workload::WorkloadContract &contract,
+                 const ::llk::KernelAbi &abi, llvm::StringRef boundary) {
+  size_t input = 0, output = 0;
+  for (const workload::WorkloadPort &port : contract.ports) {
+    bool isInput = port.direction == workload::PortDirection::Input;
+    const auto &actual = isInput ? abi.inputs : abi.outputs;
+    size_t index = isInput ? input++ : output++;
+    if (index >= actual.size() || port.shape != actual[index].shape ||
+        port.elementType != actual[index].elementType)
+      return "the declared contract " + describePort(port) +
+             " does not match the " + boundary.str();
+  }
+  if (input != abi.inputs.size() || output != abi.outputs.size())
+    return "the declared contract input/output counts do not match the " +
+           boundary.str();
+  return std::nullopt;
 }
 
 } // namespace
@@ -303,6 +357,12 @@ describeCapabilities(mlir::Operation *kernel,
           rejectAbi(llvm::Twine("mapped ABI v1 requires rank-two ports; ") +
                     describePort(port) + " has rank " +
                     llvm::Twine(port.shape.size()));
+        for (int64_t extent : port.shape)
+          if (extent <= 0) {
+            rejectAbi("mapped ABI v1 requires positive static extents; " +
+                      describePort(port) + " has a nonpositive/dynamic extent");
+            break;
+          }
         if (!isSupportedAbiDtype(port.elementType))
           rejectAbi("mapped ABI v1 does not support element type '" +
                     port.elementType + "' on " + describePort(port));
@@ -332,6 +392,23 @@ describeCapabilities(mlir::Operation *kernel,
           receipt.invocation = CapabilityStatus::Supported;
       }
     }
+  }
+
+  // A declaration can fit the ABI envelope while describing a different
+  // artifact. Never credit this artifact's preparation or calls to it. The
+  // executable ABI is authoritative even if no source signature is available.
+  if (!contract.ports.empty()) {
+    auto checkAssociation = [&](const ::llk::KernelAbi &abi,
+                                llvm::StringRef boundary) {
+      if (auto reason = contractMismatch(contract, abi, boundary)) {
+        reject(receipt.abiPreparation, "abi_preparation", *reason);
+        reject(receipt.invocation, "invocation", *reason);
+      }
+    };
+    if (auto signature = sourceSignature(kernel))
+      checkAssociation(*signature, "source signature");
+    if (compilation && compilation->executable)
+      checkAssociation(compilation->executable->abi(), "executable ABI");
   }
 
   // Evidence is credited only to the artifact it actually validated. Keep a

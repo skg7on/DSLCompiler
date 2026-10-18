@@ -472,6 +472,113 @@ TEST(FrameworkCapabilitiesTest, PreparationAndHostChecksDoNotCreditInvocation) {
   EXPECT_EQ(stale.invocation, CapabilityStatus::Unsupported);
 }
 
+std::vector<WorkloadContract> differentPortContracts() {
+  std::vector<WorkloadContract> contracts(4, addContract());
+  contracts[0].ports[0].shape = {4, 16}; // Same byte count, different shape.
+  contracts[1].ports[0].elementType = "bf16";
+  contracts[2].ports[1].direction = PortDirection::Output;
+  contracts[2].ports[1].effect = PortEffect::Write;
+  contracts[3].ports.pop_back();
+  return contracts;
+}
+
+TEST(FrameworkCapabilitiesTest,
+     ChangedContractCannotBorrowSuccessfulInvocation) {
+  auto fixture = buildFixture(TargetKind::AVX2);
+  ASSERT_TRUE(bool(fixture)) << llvm::toString(fixture.takeError());
+  auto compiled = compileAt(*fixture, llk::MappedStop::Executable,
+                            llk::MappedBackend::Reference);
+  ASSERT_TRUE(bool(compiled)) << llvm::toString(compiled.takeError());
+  std::array<float, 64> left, right, output{};
+  left.fill(1.0f);
+  right.fill(2.0f);
+  auto buffer = [](std::array<float, 64> &data) -> llk::InvocationBuffer2D {
+    return {{data.data(), data.data(), 0, 8, 8, 8, 1},
+            llk::InvocationElementType::F32,
+            sizeof(data)};
+  };
+  std::array<llk::InvocationBuffer2D, 2> inputs{buffer(left), buffer(right)};
+  std::array<llk::InvocationBuffer2D, 1> outputs{buffer(output)};
+  llvm::Error error = compiled->executable->invoke(inputs, outputs);
+  ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
+  for (float actual : output)
+    EXPECT_FLOAT_EQ(actual, 3.0f);
+
+  for (const WorkloadContract &different : differentPortContracts()) {
+    auto receipt = mlir::llk::framework::describeCapabilities(
+        fixture->kernel, different, *fixture->target, &fixture->analysis,
+        &fixture->plan, &*compiled);
+    // Each declaration fits the ABI envelope, but none is this executable's
+    // ordered boundary contract. An old successful call cannot validate it.
+    EXPECT_EQ(receipt.abiEligibility, CapabilityStatus::Supported);
+    EXPECT_EQ(receipt.abiPreparation, CapabilityStatus::Unsupported);
+    EXPECT_EQ(receipt.invocation, CapabilityStatus::Unsupported);
+    EXPECT_NE(joinedReasons(receipt).find("executable ABI"), std::string::npos);
+  }
+}
+
+TEST(FrameworkCapabilitiesTest,
+     ContractAssociationUsesOriginalAndBoundSignature) {
+  auto fixture = buildFixture(TargetKind::AVX2);
+  ASSERT_TRUE(bool(fixture)) << llvm::toString(fixture.takeError());
+  auto sourceKernel = mlir::llk::perf::findMicroKernel(*fixture->source, "add");
+  ASSERT_TRUE(bool(sourceKernel)) << llvm::toString(sourceKernel.takeError());
+  for (mlir::Operation *kernel : {*sourceKernel, fixture->kernel}) {
+    auto matching = mlir::llk::framework::describeCapabilities(
+        kernel, fixture->contract, *fixture->target);
+    EXPECT_EQ(matching.abiEligibility, CapabilityStatus::Supported);
+    EXPECT_EQ(matching.abiPreparation, CapabilityStatus::NotChecked);
+    EXPECT_EQ(matching.invocation, CapabilityStatus::NotChecked);
+    for (const WorkloadContract &different : differentPortContracts()) {
+      auto receipt = mlir::llk::framework::describeCapabilities(
+          kernel, different, *fixture->target);
+      EXPECT_EQ(receipt.abiEligibility, CapabilityStatus::Supported);
+      EXPECT_EQ(receipt.abiPreparation, CapabilityStatus::Unsupported);
+      EXPECT_EQ(receipt.invocation, CapabilityStatus::Unsupported);
+      EXPECT_NE(joinedReasons(receipt).find("source signature"),
+                std::string::npos);
+    }
+  }
+}
+
+TEST(FrameworkCapabilitiesTest, NonpositiveExtentsAreNotAbiEligible) {
+  auto fixture = buildFixture(TargetKind::AVX2);
+  ASSERT_TRUE(bool(fixture)) << llvm::toString(fixture.takeError());
+  for (int64_t extent : {-1, 0, -3}) {
+    auto invalid = fixture->contract;
+    invalid.ports[0].shape[0] = extent;
+    auto receipt = mlir::llk::framework::describeCapabilities(
+        fixture->kernel, invalid, *fixture->target);
+    EXPECT_EQ(receipt.abiEligibility, CapabilityStatus::Unsupported);
+    EXPECT_EQ(receipt.abiPreparation, CapabilityStatus::Unsupported);
+    EXPECT_EQ(receipt.invocation, CapabilityStatus::Unsupported);
+    EXPECT_NE(joinedReasons(receipt).find("positive static extents"),
+              std::string::npos);
+  }
+}
+
+TEST(FrameworkCapabilitiesTest, SignatureAssociationPreservesInputPortOrder) {
+  std::string source = kAddSource.str();
+  llvm::StringRef lastInput = "%b: tensor<8x8xf32>)";
+  source.replace(source.find(lastInput.str()), lastInput.size(),
+                 "%b: tensor<8x8xf32>, %unused: tensor<4x16xbf16>)");
+  auto fixture = buildFixture(TargetKind::AVX2, source);
+  ASSERT_TRUE(bool(fixture)) << llvm::toString(fixture.takeError());
+  auto contract = addContract();
+  contract.ports.insert(
+      contract.ports.begin() + 2,
+      {"input2", PortDirection::Input, PortEffect::Read, {4, 16}, "bf16"});
+  auto matching = mlir::llk::framework::describeCapabilities(
+      fixture->kernel, contract, *fixture->target);
+  EXPECT_EQ(matching.abiPreparation, CapabilityStatus::NotChecked);
+  std::swap(contract.ports[0], contract.ports[2]);
+  auto reordered = mlir::llk::framework::describeCapabilities(
+      fixture->kernel, contract, *fixture->target);
+  EXPECT_EQ(reordered.abiEligibility, CapabilityStatus::Supported);
+  EXPECT_EQ(reordered.abiPreparation, CapabilityStatus::Unsupported);
+  EXPECT_EQ(reordered.invocation, CapabilityStatus::Unsupported);
+}
+
 TEST(FrameworkCapabilitiesTest, MalformedBundleCarriesAConcreteReason) {
   auto fixture = buildFixture(TargetKind::AVX2);
   ASSERT_TRUE(static_cast<bool>(fixture))

@@ -35,6 +35,9 @@ host, and ``invocation`` requires a call that returned successfully. This driver
 does not invoke kernels, so successful executable compilation leaves
 ``invocation`` as ``not_checked``. A successful call alone does not establish
 numerical correctness.
+Eligibility requires positive static extents. A supplied contract that fits the
+ABI envelope must also match the source signature and the executable's ordered
+input/output shapes and dtypes before preparation or invocation is credited.
 
 Without ``--mapping-target``, ``--emit`` chooses the path:
 
