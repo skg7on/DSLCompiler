@@ -15,6 +15,7 @@
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/WorkloadGraph.h"
+#include "LLK/Perf/MeasurementRecord.h"
 #include "LLK/Version.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -149,15 +150,6 @@ void appendField(std::string &out, llvm::StringRef value) {
   out += std::to_string(value.size());
   out += ':';
   out += value.str();
-}
-
-std::string stableContentHash(llvm::StringRef value) {
-  uint64_t hash = 14695981039346656037ull;
-  for (unsigned char byte : value.bytes()) {
-    hash ^= byte;
-    hash *= 1099511628211ull;
-  }
-  return std::to_string(hash);
 }
 
 std::string renderSearchValue(const mapping::SearchValue &value) {
@@ -320,7 +312,7 @@ makeMeasurementIdentity(const MappedTuningCandidate &candidate,
   for (const std::string &key : identity.connectionKeys)
     appendField(canonical, key);
   identity.canonical = std::move(canonical);
-  identity.contentHash = stableContentHash(identity.canonical);
+  identity.contentHash = perf::measurementContentHash(identity.canonical);
   return identity;
 }
 
