@@ -13,7 +13,7 @@
 // only what was actually established for one concrete source/contract/target/
 // plan artifact.
 //
-// Four status classes are deliberately distinguished:
+// Three status classes are deliberately distinguished:
 //
 //   * Supported   -- the stage ran or was proven for this artifact;
 //   * Unsupported -- a concrete blocker was found (no backend contract,
@@ -63,7 +63,9 @@ llvm::StringRef stringifyCapabilityStatus(CapabilityStatus status);
 /// The report schema version. A reader keys its parser on it; a compatible
 /// addition of a field does not change the version, but a change to an
 /// existing field's meaning does.
-inline constexpr uint32_t kCapabilityReceiptVersion = 1;
+/// Version 2 separates ABI eligibility, preparation, host compatibility and
+/// invocation. In v1 `invocation` ambiguously credited executable preparation.
+inline constexpr uint32_t kCapabilityReceiptVersion = 2;
 
 /// One stage-by-stage capability receipt for a concrete artifact.
 ///
@@ -72,7 +74,10 @@ inline constexpr uint32_t kCapabilityReceiptVersion = 1;
 /// selected covering and its rule/machine resolution, `physicalPlan` the
 /// finalized storage/occupancy decisions, `referenceLowering` the portable
 /// bridge that reached backend form, `selectedLowering` the target's own
-/// emitters, and `invocation` the mapped ABI plus an actual executable.
+/// emitters. `abiEligibility` checks the declared workload contract's ABI fit;
+/// `abiPreparation` and `hostCompatibility` require successful executable
+/// creation; `invocation` requires a call that returned successfully. Invocation
+/// alone does not prove numerical correctness.
 ///
 /// Identities reuse the existing complete renderings: the source graph content
 /// hash, the canonical workload contract, the target content hash and the
@@ -86,12 +91,15 @@ struct CapabilityReceipt {
   CapabilityStatus physicalPlan = CapabilityStatus::NotChecked;
   CapabilityStatus referenceLowering = CapabilityStatus::NotChecked;
   CapabilityStatus selectedLowering = CapabilityStatus::NotChecked;
+  CapabilityStatus abiEligibility = CapabilityStatus::NotChecked;
+  CapabilityStatus abiPreparation = CapabilityStatus::NotChecked;
+  CapabilityStatus hostCompatibility = CapabilityStatus::NotChecked;
   CapabilityStatus invocation = CapabilityStatus::NotChecked;
   /// Ordered, stage-prefixed blockers. Only stages whose verdict is
   /// `Unsupported` contribute; an empty list therefore means no stage recorded
   /// a blocker, not that every stage succeeded.
   std::vector<std::string> reasons;
-  /// `graph=<hex>` for the exact source graph (or the plan's recorded graph).
+  /// `graph=<hex>` for the actual kernel's projected source graph.
   std::string sourceIdentity;
   /// The canonical contract rendering, empty when no contract was supplied.
   std::string contractIdentity;
@@ -105,11 +113,14 @@ struct CapabilityReceipt {
 ///
 /// `kernel` is the source or bound `micro.kernel` the receipt describes.
 /// `contract` is the versioned workload contract of that source; an empty
-/// contract (no ports) means the caller had none, so ABI eligibility is left
+/// contract (no ports) means the caller had none, so `abiEligibility` is left
 /// `NotChecked` rather than guessed. `analysis`, `plan` and `compilation` are
 /// evidence the caller already holds; a null one leaves its stages `NotChecked`
 /// unless a concrete blocker can be established without it.
 ///
+/// Identities are recomputed from the supplied kernel/target and compared with
+/// the provenance captured by the plan, analysis and compilation. Bound kernels
+/// use the pre-materialization source projection, not the expanded graph.
 /// This performs structural verification and pure bundle validation only. It
 /// never runs a target lowering, prepares a callable or starts a JIT.
 CapabilityReceipt

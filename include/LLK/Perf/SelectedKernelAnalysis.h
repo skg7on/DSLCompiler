@@ -73,6 +73,12 @@ namespace mlir::llk::perf {
 /// analysis; a lenient one receives it *with* its reasons and its cost, never
 /// as a silent approximation.
 struct SelectedKernelAnalysis {
+  /// Provenance captured by the analysis entry points, independently of any
+  /// later report's plan. Zero source identity means a DAG-only analysis has
+  /// no kernel association and cannot establish a kernel capability receipt.
+  uint64_t sourceGraphHash = 0;
+  uint64_t machineHash = 0;
+  uint64_t planId = 0;
   /// The normalized event stream, in extraction (dependency) order. Each event
   /// carries the extended execution facts the plan path records too -- owner,
   /// source/destination memory -- so a planner event and its materialized

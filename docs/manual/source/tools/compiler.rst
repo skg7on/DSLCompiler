@@ -20,6 +20,22 @@ Invocation and outputs
 
 The input filename is required. Textual output goes to stdout and diagnostics go to stderr. Use shell redirection to save an artifact; this driver has no ``-o`` output option. Errors return a nonzero exit status.
 
+Mapped compilation also writes a ``capabilities:`` JSON receipt to stderr.
+Receipt version 2 validates source, target and plan provenance before crediting
+analysis or compilation evidence. Bound kernels use the original-source
+projection, so inserted movement does not change that source identity.
+Selected lowering establishes ``selected_lowering`` only; a separate reference
+compilation establishes ``reference_lowering``.
+
+The runtime fields distinguish four facts: ``abi_eligibility`` checks a supplied
+workload contract against ABI v1 (an absent contract stays ``not_checked``),
+``abi_preparation`` records successful callable preparation,
+``host_compatibility`` records successful executable creation on the current
+host, and ``invocation`` requires a call that returned successfully. This driver
+does not invoke kernels, so successful executable compilation leaves
+``invocation`` as ``not_checked``. A successful call alone does not establish
+numerical correctness.
+
 Without ``--mapping-target``, ``--emit`` chooses the path:
 
 .. list-table::

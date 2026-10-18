@@ -54,6 +54,15 @@ rejection counts and search truncation. Candidate directories contain
 ``source.mlir`` and ``plan.json``. The current fixture's deterministic candidate
 ID is ``candidate_e4c6c3f6abcfbc65``; derive IDs from the report for other spaces.
 
+Each candidate's ``capabilities`` object uses receipt schema version 2 and
+describes its retained static/compilation evidence. Reference and selected
+lowering are credited separately. ``abi_eligibility`` reports the declared
+contract's ABI fit; ``abi_preparation``, ``host_compatibility`` and ``invocation``
+remain ``not_checked`` at the tuner's lowering stop. Optional measurement results
+are kept in the separate measurement sidecar and do not rewrite this static
+receipt. See :doc:`the compiler receipt fields </tools/compiler>` for their
+runtime meanings.
+
 Replay against the exact instantiated source and machine files:
 
 .. code-block:: bash

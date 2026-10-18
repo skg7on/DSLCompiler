@@ -21,7 +21,9 @@
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/CoveringSearch.h"
+#include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/PlanBinder.h"
+#include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Perf/MicroDAG.h"
 #include "LLK/Perf/SelectedKernelAnalysis.h"
@@ -43,6 +45,7 @@
 
 #include "gtest/gtest.h"
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -122,7 +125,8 @@ llvm::Expected<std::unique_ptr<MappingTarget>> createTarget(TargetKind kind) {
   return mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
 }
 
-llvm::Expected<Fixture> buildFixture(TargetKind kind) {
+llvm::Expected<Fixture> buildFixture(TargetKind kind,
+                                     llvm::StringRef source = kAddSource) {
   Fixture fixture;
   mlir::DialectRegistry registry;
   registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
@@ -131,8 +135,8 @@ llvm::Expected<Fixture> buildFixture(TargetKind kind) {
                   mlir::arith::ArithDialect, mlir::memref::MemRefDialect>();
   fixture.context = std::make_unique<mlir::MLIRContext>(registry);
   fixture.context->loadAllAvailableDialects();
-  fixture.source = mlir::parseSourceString<mlir::ModuleOp>(
-      kAddSource, fixture.context.get());
+  fixture.source =
+      mlir::parseSourceString<mlir::ModuleOp>(source, fixture.context.get());
   if (!fixture.source)
     return fixtureError("cannot parse the direct elementwise fixture");
 
@@ -277,8 +281,195 @@ TEST(FrameworkCapabilitiesTest,
       fixture->kernel, fixture->contract, *fixture->target, &fixture->analysis,
       &fixture->plan, &*lowered);
   EXPECT_EQ(atLowered.selectedLowering, CapabilityStatus::Supported);
-  EXPECT_EQ(atLowered.referenceLowering, CapabilityStatus::Supported);
+  EXPECT_EQ(atLowered.referenceLowering, CapabilityStatus::NotChecked);
   EXPECT_EQ(atLowered.invocation, CapabilityStatus::NotChecked);
+}
+
+TEST(FrameworkCapabilitiesTest,
+     ReferenceLoweringDoesNotCreditSelectedLowering) {
+  auto fixture = buildFixture(TargetKind::AVX2);
+  ASSERT_TRUE(bool(fixture)) << llvm::toString(fixture.takeError());
+  auto lowered = compileAt(*fixture, llk::MappedStop::Lowered,
+                           llk::MappedBackend::Reference);
+  ASSERT_TRUE(bool(lowered)) << llvm::toString(lowered.takeError());
+  auto receipt = mlir::llk::framework::describeCapabilities(
+      fixture->kernel, fixture->contract, *fixture->target, &fixture->analysis,
+      &fixture->plan, &*lowered);
+  EXPECT_EQ(receipt.referenceLowering, CapabilityStatus::Supported);
+  EXPECT_EQ(receipt.selectedLowering, CapabilityStatus::NotChecked);
+}
+
+// A valid alternate topology retains the same rule vocabulary but changes the
+// concrete engines. Old successful evidence must not describe these engines.
+class ReplacedEnginesTarget : public MappingTarget {
+public:
+  explicit ReplacedEnginesTarget(const MappingTarget &base)
+      : base(base), model(base.machine()) {
+    for (auto &compute : model.computes)
+      compute.id += ".replacement";
+    model.contentHash = mlir::llk::machine::computeContentHash(model);
+  }
+  llvm::StringRef name() const override { return base.name(); }
+  const mlir::llk::machine::MachineModel &machine() const override {
+    return model;
+  }
+  const mlir::llk::mapping::LayoutRegistry &layouts() const override {
+    return base.layouts();
+  }
+  const mlir::llk::mapping::RuleRegistry &rules() const override {
+    return base.rules();
+  }
+  bool isKnownEmitter(llvm::StringRef key) const override {
+    return base.isKnownEmitter(key);
+  }
+  std::unique_ptr<mlir::llk::mapping::TargetEmitter>
+  createEmitter(llvm::StringRef key) const override {
+    return base.createEmitter(key);
+  }
+  std::optional<mlir::llk::mapping::TargetCodegenRequirements>
+  codegenRequirements() const override {
+    return base.codegenRequirements();
+  }
+
+private:
+  const MappingTarget &base;
+  mlir::llk::machine::MachineModel model;
+};
+
+TEST(FrameworkCapabilitiesTest, ChangedTargetRejectsOldSuccessfulEvidence) {
+  auto fixture = buildFixture(TargetKind::AVX2);
+  ASSERT_TRUE(bool(fixture)) << llvm::toString(fixture.takeError());
+  auto lowered = compileAt(*fixture, llk::MappedStop::Lowered,
+                           llk::MappedBackend::SelectedTarget);
+  ASSERT_TRUE(bool(lowered)) << llvm::toString(lowered.takeError());
+  ReplacedEnginesTarget changed(*fixture->target);
+  llvm::Error invalid = mlir::llk::mapping::verifyMappingTarget(changed);
+  ASSERT_FALSE(bool(invalid)) << llvm::toString(std::move(invalid));
+  auto receipt = mlir::llk::framework::describeCapabilities(
+      fixture->kernel, fixture->contract, changed, &fixture->analysis,
+      &fixture->plan, &*lowered);
+  auto original = mlir::llk::framework::describeCapabilities(
+      fixture->kernel, fixture->contract, *fixture->target, &fixture->analysis,
+      &fixture->plan, &*lowered);
+  EXPECT_NE(receipt.targetIdentity, original.targetIdentity);
+  EXPECT_EQ(receipt.interpretation, CapabilityStatus::Unsupported);
+  EXPECT_EQ(receipt.mapping, CapabilityStatus::Unsupported);
+  EXPECT_EQ(receipt.physicalPlan, CapabilityStatus::Unsupported);
+  EXPECT_EQ(receipt.selectedLowering, CapabilityStatus::Unsupported);
+  EXPECT_NE(joinedReasons(receipt).find("target"), std::string::npos);
+}
+
+TEST(FrameworkCapabilitiesTest, ChangedSourceRejectsOldSuccessfulEvidence) {
+  auto original = buildFixture(TargetKind::AVX2);
+  ASSERT_TRUE(bool(original)) << llvm::toString(original.takeError());
+  auto lowered = compileAt(*original, llk::MappedStop::Lowered,
+                           llk::MappedBackend::SelectedTarget);
+  ASSERT_TRUE(bool(lowered)) << llvm::toString(lowered.takeError());
+  std::string mul = kAddSource.str();
+  mul.replace(mul.find("micro.vector \"add\""), 18, "micro.vector \"mul\"");
+  auto changed = buildFixture(TargetKind::AVX2, mul);
+  ASSERT_TRUE(bool(changed)) << llvm::toString(changed.takeError());
+
+  auto stale = mlir::llk::framework::describeCapabilities(
+      changed->kernel, changed->contract, *changed->target, &original->analysis,
+      &original->plan, &*lowered);
+  auto current = mlir::llk::framework::describeCapabilities(
+      changed->kernel, changed->contract, *changed->target, &changed->analysis,
+      &changed->plan);
+  EXPECT_EQ(stale.sourceIdentity, current.sourceIdentity);
+  EXPECT_EQ(stale.interpretation, CapabilityStatus::Unsupported);
+  EXPECT_EQ(stale.mapping, CapabilityStatus::Unsupported);
+  EXPECT_EQ(stale.physicalPlan, CapabilityStatus::Unsupported);
+  EXPECT_EQ(stale.selectedLowering, CapabilityStatus::Unsupported);
+
+  // Even a current plan cannot lend its identity to old analysis/compilation.
+  auto mixed = mlir::llk::framework::describeCapabilities(
+      changed->kernel, changed->contract, *changed->target, &original->analysis,
+      &changed->plan, &*lowered);
+  EXPECT_EQ(mixed.mapping, CapabilityStatus::Supported);
+  EXPECT_EQ(mixed.interpretation, CapabilityStatus::Unsupported);
+  EXPECT_EQ(mixed.selectedLowering, CapabilityStatus::Unsupported);
+}
+
+TEST(FrameworkCapabilitiesTest, FrozenPlanRetainsVerifiedSourceProvenance) {
+  auto fixture = buildFixture(TargetKind::AVX2);
+  ASSERT_TRUE(bool(fixture)) << llvm::toString(fixture.takeError());
+  mlir::llk::mapping::MappingSearchResult result;
+  result.plans.push_back(fixture->plan);
+  result.workloadHash = fixture->plan.graphHash;
+  std::string report = mlir::llk::mapping::writePlanReport(
+      result, fixture->target->machine(), *fixture->target,
+      MappingSearchOptions{}, fixture->plan.graphHash);
+  auto replay = mlir::llk::mapping::readPlanReport(report, *fixture->target,
+                                                   fixture->graph);
+  ASSERT_TRUE(bool(replay)) << llvm::toString(replay.takeError());
+  auto receipt = mlir::llk::framework::describeCapabilities(
+      fixture->kernel, fixture->contract, *fixture->target, &fixture->analysis,
+      &*replay);
+  EXPECT_EQ(receipt.mapping, CapabilityStatus::Supported)
+      << joinedReasons(receipt);
+  EXPECT_EQ(receipt.physicalPlan, CapabilityStatus::Supported);
+}
+
+TEST(FrameworkCapabilitiesTest, PreparationAndHostChecksDoNotCreditInvocation) {
+  auto fixture = buildFixture(TargetKind::AVX2);
+  ASSERT_TRUE(bool(fixture)) << llvm::toString(fixture.takeError());
+  auto compiled = compileAt(*fixture, llk::MappedStop::Executable,
+                            llk::MappedBackend::Reference);
+  ASSERT_TRUE(bool(compiled)) << llvm::toString(compiled.takeError());
+  ASSERT_TRUE(compiled->executable);
+  auto describe = [&](const WorkloadContract &contract) {
+    return mlir::llk::framework::describeCapabilities(
+        fixture->kernel, contract, *fixture->target, &fixture->analysis,
+        &fixture->plan, &*compiled);
+  };
+  auto expectJsonStage = [](const CapabilityReceipt &receipt,
+                            llvm::StringRef key, llvm::StringRef expected) {
+    auto json = mlir::llk::framework::capabilityReceiptToJson(receipt);
+    ASSERT_TRUE(json.getString(key).has_value()) << key.str();
+    EXPECT_EQ(*json.getString(key), expected) << key.str();
+  };
+  auto prepared = describe(fixture->contract);
+  EXPECT_EQ(prepared.invocation, CapabilityStatus::NotChecked);
+  expectJsonStage(prepared, "abi_eligibility", "supported");
+  expectJsonStage(prepared, "abi_preparation", "supported");
+  expectJsonStage(prepared, "host_compatibility", "supported");
+  auto absentContract = describe({});
+  EXPECT_EQ(absentContract.invocation, CapabilityStatus::NotChecked);
+  expectJsonStage(absentContract, "abi_eligibility", "not_checked");
+  expectJsonStage(absentContract, "abi_preparation", "supported");
+
+  std::array<float, 64> left, right, output{};
+  left.fill(1.0f);
+  right.fill(2.0f);
+  auto buffer = [](std::array<float, 64> &data) -> llk::InvocationBuffer2D {
+    return {{data.data(), data.data(), 0, 8, 8, 8, 1},
+            llk::InvocationElementType::F32,
+            sizeof(data)};
+  };
+  std::array<llk::InvocationBuffer2D, 2> inputs{buffer(left), buffer(right)};
+  std::array<llk::InvocationBuffer2D, 1> outputs{buffer(output)};
+  llvm::Error invalid = compiled->executable->invoke(
+      llvm::ArrayRef<llk::InvocationBuffer2D>{}, outputs);
+  ASSERT_TRUE(bool(invalid));
+  llvm::consumeError(std::move(invalid));
+  EXPECT_EQ(describe(fixture->contract).invocation,
+            CapabilityStatus::NotChecked);
+  llvm::Error error = compiled->executable->invoke(inputs, outputs);
+  ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
+  EXPECT_EQ(describe(fixture->contract).invocation,
+            CapabilityStatus::Supported);
+  for (float actual : output)
+    EXPECT_FLOAT_EQ(actual, 3.0f);
+
+  ReplacedEnginesTarget changed(*fixture->target);
+  auto stale = mlir::llk::framework::describeCapabilities(
+      fixture->kernel, fixture->contract, changed, &fixture->analysis,
+      &fixture->plan, &*compiled);
+  EXPECT_EQ(stale.referenceLowering, CapabilityStatus::Unsupported);
+  EXPECT_EQ(stale.abiPreparation, CapabilityStatus::Unsupported);
+  EXPECT_EQ(stale.hostCompatibility, CapabilityStatus::Unsupported);
+  EXPECT_EQ(stale.invocation, CapabilityStatus::Unsupported);
 }
 
 TEST(FrameworkCapabilitiesTest, MalformedBundleCarriesAConcreteReason) {
@@ -313,6 +504,9 @@ TEST(FrameworkCapabilitiesTest, UnsupportedAbiCarriesAConcreteReason) {
   EXPECT_EQ(receipt.interpretation, CapabilityStatus::Supported);
   EXPECT_EQ(receipt.mapping, CapabilityStatus::Supported);
   EXPECT_EQ(receipt.invocation, CapabilityStatus::Unsupported);
+  EXPECT_EQ(receipt.abiEligibility, CapabilityStatus::Unsupported);
+  EXPECT_EQ(receipt.abiPreparation, CapabilityStatus::Unsupported);
+  EXPECT_EQ(receipt.hostCompatibility, CapabilityStatus::NotChecked);
   EXPECT_NE(joinedReasons(receipt).find("rank-two"), std::string::npos)
       << joinedReasons(receipt);
 }
@@ -347,6 +541,9 @@ TEST(FrameworkCapabilitiesTest, AbsentStagesAreNeverChecked) {
   EXPECT_EQ(receipt.physicalPlan, CapabilityStatus::NotChecked);
   EXPECT_EQ(receipt.referenceLowering, CapabilityStatus::NotChecked);
   EXPECT_EQ(receipt.selectedLowering, CapabilityStatus::NotChecked);
+  EXPECT_EQ(receipt.abiEligibility, CapabilityStatus::Supported);
+  EXPECT_EQ(receipt.abiPreparation, CapabilityStatus::NotChecked);
+  EXPECT_EQ(receipt.hostCompatibility, CapabilityStatus::NotChecked);
   EXPECT_EQ(receipt.invocation, CapabilityStatus::NotChecked);
 }
 
@@ -361,10 +558,11 @@ TEST(FrameworkCapabilitiesTest, JsonSchemaCarriesEveryStatusAndIdentity) {
   llvm::json::Object json =
       mlir::llk::framework::capabilityReceiptToJson(receipt);
 
-  EXPECT_EQ(json.getInteger("version"), 1u);
+  EXPECT_EQ(json.getInteger("version"), 2u);
   for (const char *key :
        {"structural", "interpretation", "mapping", "physical_plan",
-        "reference_lowering", "selected_lowering", "invocation"})
+        "reference_lowering", "selected_lowering", "abi_eligibility",
+        "abi_preparation", "host_compatibility", "invocation"})
     EXPECT_NE(json.get(key), nullptr) << key;
   EXPECT_NE(json.get("reasons"), nullptr);
   EXPECT_NE(json.get("source_identity"), nullptr);
