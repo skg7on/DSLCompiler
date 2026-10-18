@@ -641,8 +641,11 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
                     const mlir::llk::mapping::CoveringPlan &plan,
                     const MappedCompileOptions &options) {
   MappedCompilation compilation;
+  compilation.backend = options.backend;
+  compilation.targetHash = mlir::llk::mapping::computeTargetContentHash(target);
   compilation.planId = plan.id;
-  compilation.machineHash = target.machine().contentHash;
+  compilation.machineHash =
+      mlir::llk::machine::computeContentHash(target.machine());
   compilation.targetName = target.name().str();
   compilation.executionIdentity =
       std::string("compiler=") + LLK_COMPILER_VERSION + "|backend=" +
@@ -688,6 +691,18 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
           *bound->module, plan, target))
     return compileError("target_coverage: " + llvm::toString(std::move(error)));
   compilation.module = std::move(bound->module);
+  llvm::Error sourceIdentityError = llvm::Error::success();
+  compilation.module->walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef() != "micro.kernel")
+      return;
+    auto hash = mlir::llk::mapping::computeModuleSourceGraphHash(op);
+    if (hash)
+      compilation.sourceGraphHash = *hash;
+    else
+      sourceIdentityError = hash.takeError();
+  });
+  if (sourceIdentityError)
+    return std::move(sourceIdentityError);
   compilation.stopped = MappedStop::MappedMicro;
   if (options.stop == MappedStop::MappedMicro)
     return compilation;

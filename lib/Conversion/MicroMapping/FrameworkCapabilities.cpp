@@ -78,31 +78,51 @@ describeCapabilities(mlir::Operation *kernel,
 
   // --- identity -----------------------------------------------------------
   //
-  // Prefer the plan's recorded provenance: for an instantiated source that is
-  // the exact graph the plan was selected over, which is not necessarily the
-  // graph a fresh extraction of the original source would produce.
-  if (plan && plan->graphHash) {
-    receipt.sourceIdentity = "graph=" + hexId(plan->graphHash);
-  } else if (kernel) {
-    llvm::Expected<mapping::WorkloadGraph> graph =
-        mapping::extractWorkloadGraph(kernel);
-    if (graph)
-      receipt.sourceIdentity =
-          "graph=" + hexId(mapping::computeSourceGraphHash(*graph));
-    else
-      llvm::consumeError(graph.takeError());
+  // Resolve the actual artifact. The projection handles binder-inserted
+  // movement and transforms; trusting the plan's recorded hash would instead
+  // lend stale evidence to an unrelated source.
+  uint64_t sourceHash = 0;
+  if (kernel) {
+    auto hash = mapping::computeModuleSourceGraphHash(kernel);
+    if (hash) {
+      sourceHash = *hash;
+      receipt.sourceIdentity = "graph=" + hexId(sourceHash);
+    } else
+      llvm::consumeError(hash.takeError());
   }
 
   if (!contract.ports.empty())
     receipt.contractIdentity = workload::canonicalWorkloadContract(contract);
 
-  // The receipt describes the target it was handed, so its identity is that
-  // target's content. A plan's recorded target hash is provenance (and may
-  // name a differently named but policy-identical wrapper); it must not make
-  // the receipt claim the wrong target identity.
-  receipt.targetIdentity = "target=" + target.name().str() + "|content=" +
-                           hexId(mapping::computeTargetContentHash(target));
+  const uint64_t targetHash = mapping::computeTargetContentHash(target);
+  const uint64_t machineHash = machine::computeContentHash(target.machine());
+  receipt.targetIdentity =
+      "target=" + target.name().str() + "|content=" + hexId(targetHash);
   receipt.planId = plan ? plan->id : 0;
+
+  std::vector<std::string> planErrors;
+  if (plan) {
+    if (!sourceHash || plan->graphHash != sourceHash)
+      planErrors.push_back(
+          "the plan source identity does not match the kernel");
+    if (plan->targetHash != targetHash)
+      planErrors.push_back(
+          "the plan target identity does not match the target");
+  }
+  std::vector<std::string> compilationErrors;
+  if (compilation) {
+    if (!sourceHash || compilation->sourceGraphHash != sourceHash)
+      compilationErrors.push_back(
+          "the compilation source identity does not match the kernel");
+    if (compilation->targetHash != targetHash ||
+        compilation->machineHash != machineHash ||
+        compilation->targetName != target.name())
+      compilationErrors.push_back(
+          "the compilation target identity does not match the target");
+    if (plan && compilation->planId != plan->id)
+      compilationErrors.push_back(
+          "the compilation plan identity does not match the plan");
+  }
 
   // --- structural ---------------------------------------------------------
   if (!kernel) {
@@ -236,7 +256,8 @@ describeCapabilities(mlir::Operation *kernel,
     // actually asked for the selected backend can establish or refute the
     // stage.
     const bool selectedBackendAttempted =
-        compilation && compilation->codegenRequirements.has_value();
+        compilation &&
+        compilation->backend == ::llk::MappedBackend::SelectedTarget;
     if (selectedBackendAttempted &&
         reached(compilation->stopped, ::llk::MappedStop::Lowered)) {
       if (compilation->backendGroupsRealized == 0)
@@ -255,16 +276,17 @@ describeCapabilities(mlir::Operation *kernel,
   }
 
   // --- reference lowering -------------------------------------------------
-  if (compilation && reached(compilation->stopped, ::llk::MappedStop::Lowered))
+  if (compilation && compilation->backend == ::llk::MappedBackend::Reference &&
+      reached(compilation->stopped, ::llk::MappedStop::Lowered))
     receipt.referenceLowering = CapabilityStatus::Supported;
   else
     receipt.referenceLowering = CapabilityStatus::NotChecked;
 
   // --- invocation ---------------------------------------------------------
   //
-  // Eligibility is the declared contract's fit with mapped ABI v1, which can
-  // be decided statically. A successful invocation additionally needs an
-  // actually compiled executable; preparation alone is not execution.
+  // Eligibility is static. Descriptor preparation and host compatibility are
+  // evidenced by successful executable creation; a returned invocation is
+  // recorded by that executable itself, never inferred from a stopping point.
   {
     bool abiOkay = true;
     auto rejectAbi = [&](const llvm::Twine &detail) {
@@ -297,14 +319,45 @@ describeCapabilities(mlir::Operation *kernel,
       }
     }
     if (!abiOkay)
-      receipt.invocation = CapabilityStatus::Unsupported;
-    else if (compilation &&
-             compilation->stopped == ::llk::MappedStop::Executable)
-      receipt.invocation = CapabilityStatus::Supported;
-    else
-      receipt.invocation = CapabilityStatus::NotChecked;
+      receipt.abiEligibility = receipt.abiPreparation = receipt.invocation =
+          CapabilityStatus::Unsupported;
+    else {
+      if (!contract.ports.empty())
+        receipt.abiEligibility = CapabilityStatus::Supported;
+      if (compilation && compilation->executable &&
+          compilation->stopped == ::llk::MappedStop::Executable) {
+        receipt.abiPreparation = CapabilityStatus::Supported;
+        receipt.hostCompatibility = CapabilityStatus::Supported;
+        if (compilation->executable->successfulInvocations() > 0)
+          receipt.invocation = CapabilityStatus::Supported;
+      }
+    }
   }
 
+  // Evidence is credited only to the artifact it actually validated. Keep a
+  // structurally valid changed source visible while refusing the stale stages.
+  for (const std::string &reason : planErrors) {
+    reject(receipt.mapping, "mapping", reason);
+    reject(receipt.physicalPlan, "physical_plan", reason);
+    reject(receipt.selectedLowering, "selected_lowering", reason);
+  }
+  if (analysis && (!sourceHash || analysis->sourceGraphHash != sourceHash ||
+                   analysis->machineHash != machineHash ||
+                   (plan && analysis->planId && analysis->planId != plan->id)))
+    reject(
+        receipt.interpretation, "interpretation",
+        "the analysis source/target/plan identity does not match the artifact");
+  for (const std::string &reason : compilationErrors) {
+    if (compilation->backend == ::llk::MappedBackend::SelectedTarget)
+      reject(receipt.selectedLowering, "selected_lowering", reason);
+    else if (reached(compilation->stopped, ::llk::MappedStop::Lowered))
+      reject(receipt.referenceLowering, "reference_lowering", reason);
+    if (compilation->stopped == ::llk::MappedStop::Executable) {
+      reject(receipt.abiPreparation, "abi_preparation", reason);
+      reject(receipt.hostCompatibility, "host_compatibility", reason);
+      reject(receipt.invocation, "invocation", reason);
+    }
+  }
   return receipt;
 }
 
@@ -321,6 +374,12 @@ llvm::json::Object capabilityReceiptToJson(const CapabilityReceipt &receipt) {
       stringifyCapabilityStatus(receipt.referenceLowering).str();
   object["selected_lowering"] =
       stringifyCapabilityStatus(receipt.selectedLowering).str();
+  object["abi_eligibility"] =
+      stringifyCapabilityStatus(receipt.abiEligibility).str();
+  object["abi_preparation"] =
+      stringifyCapabilityStatus(receipt.abiPreparation).str();
+  object["host_compatibility"] =
+      stringifyCapabilityStatus(receipt.hostCompatibility).str();
   object["invocation"] = stringifyCapabilityStatus(receipt.invocation).str();
 
   llvm::json::Array reasons;
