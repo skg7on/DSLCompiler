@@ -147,12 +147,12 @@ portable failures, and they are **not** counted as selected execution evidence.
 The required selected-AVX2 numerical gate is the Linux `x86_64` CI job with
 zero selected-path skips.
 
-**Stacked-PR note.** C1 (#205) is green. C2 (#206) and C3 (#207) were opened as
-a stack because CI runs only for pull requests targeting `main`; this C4 review
-records the integrated local evidence first. After #205–#207 merge, this
-revision must be retargeted and the CI run id plus exact registered/skip counts
-filled in before the C4 pull request is merged. No CI run is claimed here that
-has not completed.
+**Stacked-PR note.** C1 (#205) and C2 (#206) target `main`; C3 (#207) targets
+C2, and C4 (#208) targets C3 while integrating C1. CI runs only for pull requests
+targeting `main`, so C3/C4 require retargeting after their dependencies merge.
+The selected CI run id plus exact registered/skip counts must be filled in
+before C4 is merged. Earlier green runs do not establish support for repaired
+heads, and no unfinished CI run is credited here.
 
 ## Reproduction
 
@@ -173,8 +173,31 @@ The selected execution gate is
 `ctest --test-dir build -L selected-avx2 --no-tests=error --output-on-failure`
 on a Linux `x86_64` host with AVX2.
 
-The test counts and tested-tree revision above are the original C4 snapshot.
-The review fixes add producer/validator/boundary regression tests and enforce
-fresh producer evidence through a CTest fixture. Their integrated counts and
-revision must be recorded after the updated stack is verified; the original
-snapshot is not evidence for the changed tree.
+## Review-repair verification
+
+The original snapshot above is retained as history. The repaired integrated
+implementation was tested at `132f66b` with compiler identity
+`0.1.0+132f66b`, LLVM/MLIR 24.0.0git on `darwin aarch64`:
+
+- Full build: passed.
+- Full serial `check-llk`: 1,321 registered; 1,311 passed, six skipped, one
+  disabled and three failed. The only failures were the same three required
+  selected-AVX2 binaries listed above, because this host is not `x86_64`.
+- All 92 conversion and 695 mapping tests passed. Capability regressions
+  include 16 cases, real successful typed invocation, changed source/target
+  evidence, changed contract/ABI ports, and dynamic/nonpositive extent refusal.
+- The real-view/no-view pair preserves alias and event dependency with no
+  added allocation, and operation-coverage regressions exercise CLI, explicit
+  plans and frozen replay. Tools-disabled configuration passed.
+- Producer, manifest and boundary regressions passed. The manifest requires
+  exactly three unique cases, verified/realized groups with zero fallback,
+  associated source/plan/compiler identities and parsed complete analysis.
+  A CTest fixture regenerates evidence when the validator is selected alone.
+- Strict Sphinx 9.1.0 (`-n -W --keep-going`): passed with the pinned manual
+  dependencies. Independent review confirmed the original findings and the
+  two additional ABI receipt issues were addressed.
+
+This is portable/static/lowering and reference-runtime evidence. Selected
+AVX2 numerical execution remains a required Linux CI gate; the ARM run and its
+skips do not establish it. Later documentation-only commits retain this code
+revision pin.
