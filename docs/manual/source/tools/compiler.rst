@@ -20,6 +20,25 @@ Invocation and outputs
 
 The input filename is required. Textual output goes to stdout and diagnostics go to stderr. Use shell redirection to save an artifact; this driver has no ``-o`` output option. Errors return a nonzero exit status.
 
+Mapped compilation also writes a ``capabilities:`` JSON receipt to stderr.
+Receipt version 2 validates source, target and plan provenance before crediting
+analysis or compilation evidence. Bound kernels use the original-source
+projection, so inserted movement does not change that source identity.
+Selected lowering establishes ``selected_lowering`` only; a separate reference
+compilation establishes ``reference_lowering``.
+
+The runtime fields distinguish four facts: ``abi_eligibility`` checks a supplied
+workload contract against ABI v1 (an absent contract stays ``not_checked``),
+``abi_preparation`` records successful callable preparation,
+``host_compatibility`` records successful executable creation on the current
+host, and ``invocation`` requires a call that returned successfully. This driver
+does not invoke kernels, so successful executable compilation leaves
+``invocation`` as ``not_checked``. A successful call alone does not establish
+numerical correctness.
+Eligibility requires positive static extents. A supplied contract that fits the
+ABI envelope must also match the source signature and the executable's ordered
+input/output shapes and dtypes before preparation or invocation is credited.
+
 Without ``--mapping-target``, ``--emit`` chooses the path:
 
 .. list-table::
@@ -303,6 +322,15 @@ target hash; changed machine content changes the machine/target hash; and a
 different execution mode (``reference`` versus ``selected-target``) produces a
 different ``identity=``. None of those cases silently reuse the previous
 artifact.
+
+A ``capabilities:`` JSON object is printed on stderr after the status line. It
+reports structure, interpretation, mapping, physical plan, reference lowering,
+selected lowering and invocation as ``supported``, ``unsupported`` or
+``not_checked`` for this exact run, keyed by source/contract/target/plan
+identity. Diagnostics go to stderr so stdout remains "mapping line + MLIR" and
+can be re-parsed as an artifact. A reference-backend run leaves selected
+lowering ``not_checked``: the absence of a codegen contract means the stage was
+not attempted, not that it failed.
 
 The mapped ABI v1 is a rank-two, compact, offset-zero descriptor envelope with
 at most 12 ports and read-only inputs. Analysis, reporting and lowering are

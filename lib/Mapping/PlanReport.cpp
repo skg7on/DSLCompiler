@@ -796,6 +796,10 @@ llvm::Expected<CoveringPlan> readPlanReport(llvm::StringRef json,
     }
   }
   plan.targetHash = computeTargetContentHash(target);
+  // Preserve the source identity verified above, just as the target identity
+  // is preserved. Downstream receipts must distinguish verified replay from a
+  // plan with no source provenance.
+  plan.graphHash = computeSourceGraphHash(graph);
   plan.machineHash = machine::computeContentHash(target.machine());
   plan.layoutHash = target.layouts().computeContentHash();
   plan.ruleHash = target.rules().computeContentHash();

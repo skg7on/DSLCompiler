@@ -66,6 +66,23 @@ with tempfile.TemporaryDirectory(prefix="llk-generic-tune-") as temp:
     selected_identity = selected["replay_identity"]
     assert selected_identity, selected
 
+    # Every stage is present, and the reference-backend run claims only what it
+    # established: selected lowering was never attempted.
+    capabilities = selected["capabilities"]
+    assert capabilities["version"] == 2, capabilities
+    for stage in ("structural", "interpretation", "mapping", "physical_plan",
+                  "reference_lowering", "selected_lowering", "abi_eligibility",
+                  "abi_preparation", "host_compatibility", "invocation"):
+        assert stage in capabilities, capabilities
+    assert capabilities["mapping"] == "supported", capabilities
+    assert capabilities["physical_plan"] == "supported", capabilities
+    assert capabilities["reference_lowering"] == "supported", capabilities
+    assert capabilities["selected_lowering"] == "not_checked", capabilities
+    assert capabilities["abi_eligibility"] == "supported", capabilities
+    assert capabilities["abi_preparation"] == "not_checked", capabilities
+    assert capabilities["host_compatibility"] == "not_checked", capabilities
+    assert capabilities["invocation"] == "not_checked", capabilities
+
     # The frozen record keeps the source, contract and selected plan identity
     # together, so the artifact does not need the reporting tool to interpret.
     frozen_yaml = schedule.read_text()
@@ -98,6 +115,23 @@ with tempfile.TemporaryDirectory(prefix="llk-generic-tune-") as temp:
                                                   selected_identity)
     assert field(replay.stdout, "source-adapter") == adapter, replay.stdout
     assert field(replay.stdout, "source-contract-version") == "1", replay.stdout
+
+    # The compile sidecar carries the same stage vocabulary and leaves the
+    # stages this run did not attempt not_checked.
+    capability_line = next(
+        (line for line in replay.stderr.splitlines()
+         if line.startswith("capabilities: ")), None)
+    assert capability_line, replay.stderr
+    replay_capabilities = json.loads(capability_line.split(":", 1)[1].strip())
+    assert replay_capabilities["mapping"] == "supported", replay_capabilities
+    assert replay_capabilities["selected_lowering"] == "not_checked", (
+        replay_capabilities)
+    assert replay_capabilities["invocation"] == "not_checked", (
+        replay_capabilities)
+    assert replay_capabilities["abi_preparation"] == "not_checked", (
+        replay_capabilities)
+    assert replay_capabilities["host_compatibility"] == "not_checked", (
+        replay_capabilities)
 
     # A changed source attribute is a different semantics, not a different
     # spelling of the same plan.
@@ -155,6 +189,14 @@ with tempfile.TemporaryDirectory(prefix="llk-generic-tune-") as temp:
     assert selected_mode_identity, selected_mode.stdout
     assert selected_mode_identity != reference_identity, (
         reference_identity, selected_mode_identity)
+    selected_capabilities = json.loads(next(
+        line.split(":", 1)[1].strip()
+        for line in selected_mode.stderr.splitlines()
+        if line.startswith("capabilities: ")))
+    assert selected_capabilities["selected_lowering"] == "supported", (
+        selected_capabilities)
+    assert selected_capabilities["reference_lowering"] == "not_checked", (
+        selected_capabilities)
 
     # Explicit M/N/K belong to the contraction adapter; a source family that
     # describes its own contract must not receive them.

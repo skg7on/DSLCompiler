@@ -16,18 +16,35 @@
 
 #include "resource_regression_fixture.h"
 
+#include "CompletePlanEvaluation.h"
+
 #include "LLK/Conversion/MappedCompilation.h"
+#include "LLK/Dialect/LLKDialect.h"
+#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/MappingPlan.h"
+#include "LLK/Mapping/PlanReport.h"
 #include "LLK/Perf/MicroDAG.h"
 #include "LLK/Perf/SelectedKernelAnalysis.h"
+#include "LLK/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.h"
+#include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include "gtest/gtest.h"
 
@@ -43,6 +60,7 @@ using mlir::llk::mapping::CostEventKind;
 using mlir::llk::mapping::CoveringPlan;
 using mlir::llk::mapping::MappingSearchOptions;
 using mlir::llk::mapping::MappingSearchResult;
+using mlir::llk::mapping::MappingTarget;
 using mlir::llk::mapping::PlanConnection;
 using mlir::llk::mapping::PlanCostEvent;
 using mlir::llk::mapping::SearchMode;
@@ -408,6 +426,344 @@ TEST(FrameworkConformance, PhysicalTransformAddsCalculatedWorkAndStorage) {
                    control->analysis.cost.latencyCycles + 8.0);
   EXPECT_EQ(physical->analysis.cost.localBytes,
             control->analysis.cost.localBytes + 256u);
+}
+
+//===----------------------------------------------------------------------===//
+// C3: composed vectors and reduction on both target profiles
+//===----------------------------------------------------------------------===//
+
+enum class Profile { AVX2, GenericAccelerator };
+
+llvm::StringRef profileName(Profile profile) {
+  return profile == Profile::AVX2 ? "x86-avx2" : "generic-ai-accel";
+}
+
+mlir::DialectRegistry frameworkRegistry() {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::scf::SCFDialect,
+                  mlir::arith::ArithDialect, mlir::memref::MemRefDialect>();
+  return registry;
+}
+
+std::unique_ptr<MappingTarget> createProfile(Profile profile) {
+  llvm::Expected<std::unique_ptr<MappingTarget>> target =
+      profile == Profile::AVX2
+          ? mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR)
+          : mlir::llk::target::generic_accel::createMappingTarget(
+                LLK_SOURCE_DIR);
+  if (!target) {
+    ADD_FAILURE() << llvm::toString(target.takeError());
+    return nullptr;
+  }
+  return std::move(*target);
+}
+
+mlir::OwningOpRef<mlir::ModuleOp> parseFramework(mlir::MLIRContext &context,
+                                                 llvm::StringRef name) {
+  std::string path = std::string(LLK_SOURCE_DIR) +
+                     "/test/Execution/Inputs/framework/" + name.str();
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> input =
+      llvm::MemoryBuffer::getFile(path);
+  if (!input)
+    return {};
+  return mlir::parseSourceString<mlir::ModuleOp>((*input)->getBuffer(),
+                                                 &context);
+}
+
+std::string printModule(mlir::ModuleOp module) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  module.print(stream);
+  stream.flush();
+  return text;
+}
+
+llvm::Expected<MappingSearchResult>
+searchWithEvaluator(mlir::ModuleOp module,
+                    const mlir::llk::mapping::WorkloadGraph &graph,
+                    MappingTarget &target) {
+  MappingSearchOptions options;
+  options.mode = SearchMode::Exact;
+  options.topK = 1;
+  options.requireCompleteEvaluation = true;
+  options.evaluateCompletePlan = [&](const CoveringPlan &proposal) {
+    return mlir::llk::mapping::evaluateCompletePlan(
+        module, graph, target, proposal,
+        mlir::llk::mapping::BindContract::Partial, std::nullopt,
+        mlir::llk::mapping::AnalysisRequirement::Complete);
+  };
+  mlir::llk::mapping::LayoutContext layoutContext;
+  layoutContext.rank = 2;
+  layoutContext.elementType = "f32";
+  mlir::llk::mapping::CoveringSearch search(graph, target, *module.getContext(),
+                                            layoutContext, options);
+  return search.search();
+}
+
+/// One strict chain over a framework primitive fixture and a *real* target
+/// package: the searched plan, the kernel it bound, and the shared analysis.
+struct PackageChain {
+  mlir::llk::mapping::WorkloadGraph graph;
+  MappingSearchResult search;
+  CoveringPlan plan;
+  mlir::OwningOpRef<mlir::ModuleOp> boundModule;
+  mlir::Operation *kernel = nullptr;
+  mlir::llk::perf::SelectedKernelAnalysis analysis;
+};
+
+llvm::Expected<PackageChain> buildPackageChain(mlir::ModuleOp module,
+                                               MappingTarget &target,
+                                               llvm::StringRef symbol) {
+  llvm::Expected<mlir::Operation *> kernel =
+      mlir::llk::perf::findMicroKernel(module, symbol);
+  if (!kernel)
+    return kernel.takeError();
+  llvm::Expected<mlir::llk::mapping::WorkloadGraph> graph =
+      mlir::llk::mapping::extractWorkloadGraph(*kernel);
+  if (!graph)
+    return graph.takeError();
+  auto search = searchWithEvaluator(module, *graph, target);
+  if (!search)
+    return search.takeError();
+  if (search->plans.empty()) {
+    std::string reason = "no complete plan for '" + symbol.str() + "'";
+    if (!search->frontier.diagnostics.empty())
+      reason += ": " + search->frontier.diagnostics.front().message;
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), reason);
+  }
+
+  PackageChain chain;
+  chain.graph = std::move(*graph);
+  chain.search = std::move(*search);
+  chain.plan = chain.search.plans.front();
+
+  llk::MappedCompileOptions compile;
+  compile.stop = llk::MappedStop::MappedMicro;
+  compile.requireExecutable = false;
+  auto bound = llk::compileMappedKernel(module, target, chain.plan, compile);
+  if (!bound)
+    return bound.takeError();
+  chain.boundModule = std::move(bound->module);
+  auto boundKernel =
+      mlir::llk::perf::findMicroKernel(chain.boundModule.get(), symbol);
+  if (!boundKernel)
+    return boundKernel.takeError();
+  chain.kernel = *boundKernel;
+  auto analysis = mlir::llk::perf::analyzeSelectedKernel(
+      chain.kernel, target.machine(), /*requireComplete=*/true, chain.plan,
+      chain.graph);
+  if (!analysis)
+    return analysis.takeError();
+  chain.analysis = std::move(*analysis);
+  return chain;
+}
+
+TEST(FrameworkConformance, FrameworkPrimitivesMapStaticallyOnBothProfiles) {
+  struct FixtureCase {
+    const char *file;
+    const char *symbol;
+    size_t nodes;
+  };
+  const FixtureCase fixtures[] = {{"reduce.mlir", "reduce_sum", 1},
+                                  {"add_mul.mlir", "add_mul", 2},
+                                  {"add_mul_reduce.mlir", "add_mul_reduce", 3}};
+
+  for (Profile profile : {Profile::AVX2, Profile::GenericAccelerator})
+    for (const FixtureCase &fixture : fixtures) {
+      SCOPED_TRACE(profileName(profile).str() + "/" + fixture.file);
+      mlir::MLIRContext context(frameworkRegistry());
+      context.loadAllAvailableDialects();
+      auto module = parseFramework(context, fixture.file);
+      ASSERT_TRUE(module);
+      ASSERT_TRUE(mlir::succeeded(mlir::verify(*module)));
+      auto target = createProfile(profile);
+      ASSERT_NE(target, nullptr);
+
+      auto chain = buildPackageChain(*module, *target, fixture.symbol);
+      ASSERT_TRUE(static_cast<bool>(chain))
+          << llvm::toString(chain.takeError());
+      EXPECT_EQ(chain->graph.getNodes().size(), fixture.nodes);
+      ASSERT_EQ(chain->plan.placements.size(), fixture.nodes);
+      for (const auto &placement : chain->plan.placements) {
+        EXPECT_FALSE(placement.rule.empty());
+        EXPECT_GT(placement.workItems, 0u);
+      }
+      EXPECT_TRUE(chain->analysis.complete);
+      EXPECT_DOUBLE_EQ(chain->analysis.cost.latencyCycles,
+                       chain->plan.totalCost.latencyCycles);
+      EXPECT_TRUE(chain->plan.diagnostics.physicalComplete);
+    }
+}
+
+TEST(FrameworkConformance, UnsupportedReductionVariantIsExplicitlyRejected) {
+  constexpr llvm::StringLiteral kMaxReduce = R"mlir(
+module {
+  micro.kernel @reduce_max(%input: tensor<8x8xf32>) -> tensor<8xf32> {
+    %tile = micro.tile_view %input {shape = array<i64: 8, 8>}
+        : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    %max = micro.reduce "max" %tile {axis = 1 : i64}
+        : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+       -> !micro.tile<8xf32, memory = #micro.memory<acc>>
+    micro.yield %max : !micro.tile<8xf32, memory = #micro.memory<acc>>
+  }
+}
+)mlir";
+
+  for (Profile profile : {Profile::AVX2, Profile::GenericAccelerator})
+    for (llvm::StringRef variant : {"max", "product"}) {
+      SCOPED_TRACE(profileName(profile).str() + "/" + variant.str());
+      std::string source = kMaxReduce.str();
+      source.replace(source.find("\"max\""), 5, "\"" + variant.str() + "\"");
+      mlir::MLIRContext context(frameworkRegistry());
+      context.loadAllAvailableDialects();
+      auto module = mlir::parseSourceString<mlir::ModuleOp>(source, &context);
+      ASSERT_TRUE(module);
+      ASSERT_TRUE(mlir::succeeded(mlir::verify(*module)));
+      auto target = createProfile(profile);
+      ASSERT_NE(target, nullptr);
+      auto kernel = mlir::llk::perf::findMicroKernel(*module, "reduce_max");
+      ASSERT_TRUE(static_cast<bool>(kernel))
+          << llvm::toString(kernel.takeError());
+      auto graph = mlir::llk::mapping::extractWorkloadGraph(*kernel);
+      ASSERT_TRUE(static_cast<bool>(graph))
+          << llvm::toString(graph.takeError());
+      auto search = searchWithEvaluator(*module, *graph, *target);
+      ASSERT_TRUE(static_cast<bool>(search))
+          << llvm::toString(search.takeError());
+      EXPECT_TRUE(search->plans.empty());
+      EXPECT_TRUE(search->frontier.has(
+          mlir::llk::mapping::DiagnosticCode::NoMatchingRule));
+    }
+}
+
+TEST(FrameworkConformance, AcceleratorRejectsNonF32CoverageBeforeRanking) {
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> input =
+      llvm::MemoryBuffer::getFile(
+          std::string(LLK_SOURCE_DIR) +
+          "/test/Execution/Inputs/framework/add_mul.mlir");
+  ASSERT_TRUE(static_cast<bool>(input)) << input.getError().message();
+  const std::string source = (*input)->getBuffer().str();
+
+  std::string bf16 = source;
+  for (size_t at = bf16.find("f32"); at != std::string::npos;
+       at = bf16.find("f32")) {
+    bf16.replace(at, 3, "bf16");
+  }
+
+  mlir::MLIRContext context(frameworkRegistry());
+  context.loadAllAvailableDialects();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(bf16, &context);
+  ASSERT_TRUE(module);
+  ASSERT_TRUE(mlir::succeeded(mlir::verify(*module)));
+  const std::string before = printModule(*module);
+
+  auto target = createProfile(Profile::GenericAccelerator);
+  ASSERT_NE(target, nullptr);
+  auto kernel = mlir::llk::perf::findMicroKernel(*module, "add_mul");
+  ASSERT_TRUE(static_cast<bool>(kernel)) << llvm::toString(kernel.takeError());
+  auto graph = mlir::llk::mapping::extractWorkloadGraph(*kernel);
+  ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+  auto search = searchWithEvaluator(*module, *graph, *target);
+  ASSERT_TRUE(static_cast<bool>(search)) << llvm::toString(search.takeError());
+
+  EXPECT_TRUE(search->plans.empty());
+  bool coverageFailure = false;
+  for (const auto &diagnostic : search->frontier.diagnostics)
+    coverageFailure |=
+        diagnostic.code ==
+            mlir::llk::mapping::DiagnosticCode::UnsupportedMaterialization &&
+        (diagnostic.message.find("target_coverage") != std::string::npos ||
+         diagnostic.message.find("f32") != std::string::npos);
+  EXPECT_TRUE(coverageFailure)
+      << (search->frontier.diagnostics.empty()
+              ? "no diagnostic"
+              : search->frontier.diagnostics.front().message);
+  EXPECT_EQ(printModule(*module), before)
+      << "coverage validation must not mutate the source IR";
+
+  // f64 is outside the Micro tile type system: the dialect refuses it before
+  // any target can consider coverage.
+  std::string f64 = source;
+  for (size_t at = f64.find("f32"); at != std::string::npos;
+       at = f64.find("f32")) {
+    f64.replace(at, 3, "f64");
+  }
+  auto f64Module = mlir::parseSourceString<mlir::ModuleOp>(f64, &context);
+  if (f64Module)
+    EXPECT_TRUE(mlir::failed(mlir::verify(*f64Module)))
+        << "f64 tiles must never become a rankable plan";
+}
+
+TEST(FrameworkConformance,
+     CompilationRejectsUnsupportedExplicitAndReplayedOperations) {
+  for (llvm::StringRef fixture : {"reduce.mlir", "add_mul.mlir"}) {
+    SCOPED_TRACE(fixture.str());
+    auto input = llvm::MemoryBuffer::getFile(
+        std::string(LLK_SOURCE_DIR) + "/test/Execution/Inputs/framework/" +
+        fixture.str());
+    ASSERT_TRUE(static_cast<bool>(input)) << input.getError().message();
+    std::string source = (*input)->getBuffer().str();
+    for (size_t at = source.find("f32"); at != std::string::npos;
+         at = source.find("f32"))
+      source.replace(at, 3, "bf16");
+
+    mlir::MLIRContext context(frameworkRegistry());
+    context.loadAllAvailableDialects();
+    auto module = mlir::parseSourceString<mlir::ModuleOp>(source, &context);
+    ASSERT_TRUE(module);
+    ASSERT_TRUE(mlir::succeeded(mlir::verify(*module)));
+    const std::string before = printModule(*module);
+    auto target = createProfile(Profile::GenericAccelerator);
+    ASSERT_NE(target, nullptr);
+    auto kernel = mlir::llk::perf::findMicroKernel(*module, "");
+    ASSERT_TRUE(static_cast<bool>(kernel))
+        << llvm::toString(kernel.takeError());
+    auto graph = mlir::llk::mapping::extractWorkloadGraph(*kernel);
+    ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
+
+    // A caller can supply a plan without having run complete evaluation. The
+    // compilation boundary must still enforce the target's f32-only contract.
+    MappingSearchOptions searchOptions;
+    searchOptions.mode = SearchMode::Exact;
+    searchOptions.topK = 1;
+    mlir::llk::mapping::LayoutContext layoutContext;
+    layoutContext.rank = 2;
+    layoutContext.elementType = "bf16";
+    mlir::llk::mapping::CoveringSearch search(*graph, *target, context,
+                                              layoutContext, searchOptions);
+    auto searched = search.search();
+    ASSERT_TRUE(static_cast<bool>(searched))
+        << llvm::toString(searched.takeError());
+    ASSERT_EQ(searched->plans.size(), 1u);
+    const std::string report = mlir::llk::mapping::writePlanReport(
+        *searched, target->machine(), *target, searchOptions, 0);
+    auto replayed = mlir::llk::mapping::readPlanReport(report, *target, *graph);
+    ASSERT_TRUE(static_cast<bool>(replayed))
+        << llvm::toString(replayed.takeError());
+
+    for (const auto *plan : {&searched->plans.front(), &*replayed})
+      for (llk::MappedStop stop :
+           {llk::MappedStop::MappedMicro, llk::MappedStop::Lowered}) {
+        SCOPED_TRACE(plan == &*replayed ? "replayed" : "explicit");
+        SCOPED_TRACE(static_cast<int>(stop));
+        llk::MappedCompileOptions options;
+        options.backend = llk::MappedBackend::Reference;
+        options.stop = stop;
+        options.requireExecutable = false;
+        auto compiled =
+            llk::compileMappedKernel(*module, *target, *plan, options);
+        EXPECT_FALSE(static_cast<bool>(compiled));
+        if (!compiled) {
+          const std::string error = llvm::toString(compiled.takeError());
+          EXPECT_NE(error.find("target_coverage:"), std::string::npos) << error;
+          EXPECT_NE(error.find("f32"), std::string::npos) << error;
+        }
+        EXPECT_EQ(printModule(*module), before)
+            << "rejected compilation must leave the caller's source unchanged";
+      }
+  }
 }
 
 } // namespace

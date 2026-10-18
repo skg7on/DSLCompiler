@@ -15,6 +15,8 @@
 
 #include "CompletePlanEvaluation.h"
 
+#include "TargetCoverageValidation.h"
+
 #include "MicroMappingCommon.h"
 
 #include "LLK/Mapping/CostEvent.h"
@@ -238,6 +240,17 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
       plan.diagnostics.warnings.push_back(
           "plan evaluation: selected decision was not materialized: " + reason);
   }
+
+  // --- 3b. target operation coverage -------------------------------------
+  //
+  // A well-formed bundle does not prove the target implements the operation it
+  // covers. Validate the covered variants/types now, before analysis or
+  // scoring, so an unsupported case is a candidate rejection rather than a
+  // late lowering failure. The check is read-only.
+  if (llvm::Error error =
+          verifyTargetOperationCoverage(*bound->module, plan, target))
+    return rejected(DiagnosticCode::UnsupportedMaterialization,
+                    "target_coverage: " + llvm::toString(std::move(error)));
 
   // --- 4. selected static analysis ----------------------------------------
   //

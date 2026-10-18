@@ -61,6 +61,7 @@
 // The canonical plan materializer lives beside this file, in the one library
 // that owns the Micro dialect on the mapping path.
 #include "MicroMappingCommon.h"
+#include "TargetCoverageValidation.h"
 #include "selected_group_lowering_test_hooks.h"
 
 #if LLVM_VERSION_MAJOR >= 21
@@ -640,8 +641,11 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
                     const mlir::llk::mapping::CoveringPlan &plan,
                     const MappedCompileOptions &options) {
   MappedCompilation compilation;
+  compilation.backend = options.backend;
+  compilation.targetHash = mlir::llk::mapping::computeTargetContentHash(target);
   compilation.planId = plan.id;
-  compilation.machineHash = target.machine().contentHash;
+  compilation.machineHash =
+      mlir::llk::machine::computeContentHash(target.machine());
   compilation.targetName = target.name().str();
   compilation.executionIdentity =
       std::string("compiler=") + LLK_COMPILER_VERSION + "|backend=" +
@@ -680,7 +684,25 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
                                    materializer.get());
   if (!bound)
     return bound.takeError();
+  // Explicit plans and frozen replay need the same operation-aware admission
+  // as complete-plan search. Check the bound clone before any early return or
+  // rewrite; a reference backend does not relax the selected target contract.
+  if (llvm::Error error = mlir::llk::mapping::verifyTargetOperationCoverage(
+          *bound->module, plan, target))
+    return compileError("target_coverage: " + llvm::toString(std::move(error)));
   compilation.module = std::move(bound->module);
+  llvm::Error sourceIdentityError = llvm::Error::success();
+  compilation.module->walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef() != "micro.kernel")
+      return;
+    auto hash = mlir::llk::mapping::computeModuleSourceGraphHash(op);
+    if (hash)
+      compilation.sourceGraphHash = *hash;
+    else
+      sourceIdentityError = hash.takeError();
+  });
+  if (sourceIdentityError)
+    return std::move(sourceIdentityError);
   compilation.stopped = MappedStop::MappedMicro;
   if (options.stop == MappedStop::MappedMicro)
     return compilation;

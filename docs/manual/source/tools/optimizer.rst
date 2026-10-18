@@ -377,7 +377,7 @@ The generic accelerator's shipped policy can also be inspected with a workload i
 
 .. code-block:: sh
 
-   build/bin/llk-opt --micro-map="target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_mxu,accel_copy mode=exact" \
+   build/bin/llk-opt --micro-map="target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_vector_mul,accel_reduce_sum,accel_mxu,accel_copy mode=exact" \
      test/Conversion/MicroMapping/micro_map.mlir \
      -o build/tutorial/add.accelerator.mlir
 
