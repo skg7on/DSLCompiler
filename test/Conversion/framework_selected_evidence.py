@@ -18,6 +18,8 @@ import platform
 import subprocess
 import sys
 
+from framework_perf_report import validate_analysis
+
 MACHINE = "machines/x86-avx2-v2.yaml"
 
 
@@ -86,16 +88,13 @@ def main():
             "--format=yaml",
             bound_path,
         ])
-        require("complete: true" in analysis.stdout,
-                "strict analysis is incomplete:\n" + analysis.stdout)
-        require("bytes:" in analysis.stdout and
-                "live_bytes:" in analysis.stdout,
-                "analysis did not report traffic/storage:\n" +
-                analysis.stdout)
-        return mapped, analysis.stdout
+        validate_analysis(analysis.stdout, symbol, "x86-avx2")
+        identity = artifact_identity(mapped)
+        return {"format": "micro-perf-yaml", "yaml": analysis.stdout,
+                **identity}
 
-    def base_row(fixture, symbol, lowered, analysis_yaml):
-        mapping_line = lowered.stdout.splitlines()[0]
+    def artifact_identity(compilation):
+        mapping_line = compilation.stdout.splitlines()[0]
         require(mapping_line.startswith("mapping: "),
                 "missing mapping line: " + mapping_line)
         replay_identity = token(mapping_line, "replay-identity")
@@ -103,6 +102,20 @@ def main():
                 "mapping line records no replay identity: " + mapping_line)
         plan_id = replay_identity.split("|plan=", 1)[1]
         require(plan_id, "mapping line records no plan id")
+        return {"compiler": token(mapping_line, "identity"),
+                "replay_identity": replay_identity, "plan_id": plan_id}
+
+    def base_row(fixture, symbol, lowered, analysis):
+        mapping_line = lowered.stdout.splitlines()[0]
+        identity = artifact_identity(lowered)
+        # The lowered identity additionally records the numerical contract.
+        # Mapped-micro precedes lowering, so compare its common identity fields
+        # while retaining both original strings in the artifact.
+        require(all(analysis[key] == identity[key]
+                    for key in ("replay_identity", "plan_id")) and
+                analysis["compiler"].split("|math-mode=")[0] ==
+                identity["compiler"].split("|math-mode=")[0],
+                "analyzed and lowered artifacts have different identities")
         counters = {}
         for counter in ("selected-groups-verified", "target-lowered-ops",
                         "reference-lowered-ops", "backend-groups-realized",
@@ -122,9 +135,7 @@ def main():
                 "backend": "selected-target",
                 "stop": "lowered",
             },
-            "compiler": token(mapping_line, "identity"),
-            "replay_identity": replay_identity,
-            "plan_id": plan_id,
+            **identity,
             "counters": counters,
             "stages": {
                 "mapping": "supported",
@@ -133,10 +144,7 @@ def main():
                 "reference_lowering": "not_checked",
                 "invocation": "not_checked",
             },
-            "analysis": {
-                "format": "micro-perf-yaml",
-                "yaml": analysis_yaml,
-            },
+            "analysis": analysis,
         }
 
     # --- direct reduction --------------------------------------------------
@@ -157,7 +165,7 @@ def main():
             "the selected reduce fell back to reference lowering")
     require("reference-groups-lowered=0" in reduce_lowered.stdout,
             "a selected group fell back to the reference bridge")
-    _, reduce_analysis = analyzed_bound_ir(reduce_fixture, "reduce_sum")
+    reduce_analysis = analyzed_bound_ir(reduce_fixture, "reduce_sum")
     reduce_row = base_row(reduce_fixture, "reduce_sum", reduce_lowered,
                           reduce_analysis)
     reduce_row["ir_evidence"] = {
@@ -211,8 +219,8 @@ def main():
             require("vector.multi_reduction" in ir or
                     "vector.reduction" in ir,
                     "the composed reduction did not reach Vector IR")
-        _, analysis_yaml = analyzed_bound_ir(fixture, symbol)
-        row = base_row(fixture, symbol, lowered, analysis_yaml)
+        analysis = analyzed_bound_ir(fixture, symbol)
+        row = base_row(fixture, symbol, lowered, analysis)
         row["ir_evidence"] = {
             "selected_width": "vector<8xf32>",
             "vector_reduction": "vector.multi_reduction" in ir or

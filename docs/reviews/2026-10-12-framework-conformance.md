@@ -98,7 +98,10 @@ host), `FrameworkConformance.FrameworkPrimitivesMapStaticallyOnBothProfiles`,
 `FrameworkSelectedEvidence`, and the validated manifest
 `framework_selected_evidence.manifest.json` (3 rows; source, replay identity,
 plan id, target, compiler, mode, strict `micro-perf` traffic/storage and
-counters).
+counters). These rows record selected lowering only: reference lowering and
+numerical validation remain `not_checked`. The two rank-one reduction results
+contain eight elements and report the checked ABI preparation refusal. Numeric
+add → multiply execution is established by the separate runtime tests above.
 
 ### C4 — Target extension boundaries
 
@@ -114,9 +117,14 @@ counters).
 - `FrameworkBoundaryScan` finds no target-name or semantic-operator policy in
   generic `LLKMapping`/`LLKMachine` code and no `LLKPerf`/`LLKRuntime`/JIT link.
   `LLKMapping` links `LLKMachine LLVM LLK::MLIR`; `LLKMachine` links `LLVM`.
-- `FrameworkEvidenceManifest` requires every selected-evidence row to name its
-  source/plan/target/compiler/mode/counters, carry complete strict analysis, and
-  state every stage as supported, not checked, or unsupported with a reason.
+- `FrameworkEvidenceManifest` requires the three selected primitive cases
+  exactly once, matching source/symbol/target/mode and analyzed/lowered
+  plan/replay/compiler identities. All selected groups must be verified and
+  realized with zero reference fallback. The dependency-free reader checks
+  actual `micro-perf` completeness, reason lists and unsigned traffic/storage
+  maps; comments and duplicate keys cannot establish support. Unsupported
+  stages require reasons. Resource and portability rows are checked by their
+  separate CTests rather than this selected-lowering manifest.
 
 ## Host, skip and CI limits
 
@@ -157,5 +165,12 @@ ctest --test-dir build -R 'FrameworkSelectedEvidence|FrameworkEvidenceManifest'
 ctest --test-dir build --output-on-failure
 ```
 
-The selected execution gate is `ctest --test-dir build -R selected-avx2` on a
-Linux `x86_64` host with AVX2.
+The selected execution gate is
+`ctest --test-dir build -L selected-avx2 --no-tests=error --output-on-failure`
+on a Linux `x86_64` host with AVX2.
+
+The test counts and tested-tree revision above are the original C4 snapshot.
+The review fixes add producer/validator/boundary regression tests and enforce
+fresh producer evidence through a CTest fixture. Their integrated counts and
+revision must be recorded after the updated stack is verified; the original
+snapshot is not evidence for the changed tree.

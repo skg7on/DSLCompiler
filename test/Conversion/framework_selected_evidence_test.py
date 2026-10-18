@@ -48,6 +48,16 @@ class SelectedEvidenceTest(unittest.TestCase):
         self.assertEqual(row["stages"]["invocation"]["status"], "unsupported")
         self.assertIn("rank-two", row["stages"]["invocation"]["reason"])
 
+    def test_analysis_and_lowering_record_the_same_artifact(self):
+        for symbol, row in self.rows.items():
+            with self.subTest(symbol=symbol):
+                for field in ("replay_identity", "plan_id"):
+                    self.assertEqual(row["analysis"].get(field), row[field])
+                # Lowering adds the math contract to the compiler identity;
+                # the mapped-micro artifact precedes that stage.
+                self.assertEqual(row["analysis"]["compiler"].split("|math-mode=")[0],
+                                 row["compiler"].split("|math-mode=")[0])
+
 
 if __name__ == "__main__":
     TOOL_ARGUMENTS = sys.argv[1:4]

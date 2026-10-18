@@ -32,10 +32,12 @@ def strip_comments(text: str) -> str:
 
 
 TARGET_TOKEN = re.compile(
-    r"\b(avx2|aarch64|sve|sme|x86|generic-ai-accel)\b|accel_[a-z]",
+    r"(?<![a-z0-9])(avx2|aarch64|sve|sme|x86|generic-ai-accel)"
+    r"(?![a-z0-9])|accel_[a-z]",
     re.IGNORECASE)
 SEMANTIC_TOKEN = re.compile(
-    r"\b(swiglu|matmul|attention|rope)\b", re.IGNORECASE)
+    r"(?<![a-z0-9])(swiglu|matmul|attention|rope)(?![a-z0-9])",
+    re.IGNORECASE)
 FORBIDDEN_LINK = re.compile(
     r"\b(LLKPerf|LLKRuntime|LLKJit|LLKMappedCompilation|LLKMappedTuning)\b")
 
