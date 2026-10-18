@@ -117,6 +117,10 @@ struct CapabilityReceipt {
 /// `NotChecked` rather than guessed. `analysis`, `plan` and `compilation` are
 /// evidence the caller already holds; a null one leaves its stages `NotChecked`
 /// unless a concrete blocker can be established without it.
+/// ABI eligibility requires positive static extents and describes the ABI
+/// envelope only. A supplied contract must also match the source signature and
+/// executable's ordered input/output shapes and dtypes before preparation or
+/// invocation can be credited; an ABI-valid different contract is rejected.
 ///
 /// Identities are recomputed from the supplied kernel/target and compared with
 /// the provenance captured by the plan, analysis and compilation. Bound kernels
