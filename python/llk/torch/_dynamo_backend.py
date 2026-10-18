@@ -1,53 +1,59 @@
-"""Registers 'llk' as a torch.compile backend.
-
-The backend detects ATen patterns that map to llk.* ops:
-
-- SiLU(mm(X, Wg)) * mm(X, Wu) -> llk.fused_swiglu
-- RoPE pattern -> llk.rope
-- scaled_dot_product_attention -> llk.attention
-
-The torch import is optional so that ``import llk.torch`` works in
-environments without PyTorch installed; backend registration only happens
-when torch is available.
-"""
+"""Optional, idempotent registration of LLK's unavailable native backend."""
 
 from __future__ import annotations
 
+import threading
+
+from .._errors import UnsupportedFeatureError
+
 try:
     import torch
-    _TORCH_AVAILABLE = True
-except ImportError:  # pragma: no cover - exercised only without torch
-    torch = None  # type: ignore[assignment]
-    _TORCH_AVAILABLE = False
+except ModuleNotFoundError as error:
+    # Missing dependencies inside an installed Torch indicate a broken install.
+    if error.name != "torch":
+        raise
+    torch = None
 
 
 class LLKBackend:
-    """torch.compile backend that lowers to LLK dialect."""
+    """Dynamo entry point; native compilation is a later frontend milestone."""
 
-    def __init__(self) -> None:
-        self._compiled = 0
+    def __call__(self, gm, example_inputs, **kwargs):
+        raise UnsupportedFeatureError(
+            "LLK native frontend compilation is not available in this package.",
+            code="native_backend_unavailable",
+        )
 
-    def __call__(self, gm: "torch.fx.GraphModule",
-                 example_inputs: "list[torch.Tensor]"):
-        """Entry point for torch.compile.
 
-        For now, return the graph unchanged (no lowering). M8e+ full
-        integration will add ATen pattern matching here.
-        """
-        self._compiled += 1
-        return gm.forward
+# reload retains the module dictionary. Preserve the lock and callable: a
+# redefined class is not an identity check for an already registered instance.
+if "_registration_lock" not in globals():
+    _registration_lock = threading.RLock()
+if "_llk_backend" not in globals():
+    _llk_backend = LLKBackend()
+
+
+def get_backend() -> LLKBackend:
+    """Return the exact singleton used for public reporting and registration."""
+    return _llk_backend
 
 
 def register() -> None:
-    """Register the LLK backend with PyTorch Dynamo.
-
-    No-op when PyTorch is not importable. After this call,
-    ``torch.compile(model, backend="llk")`` is available.
-    """
-    if not _TORCH_AVAILABLE:
+    """Register once without resetting Dynamo or replacing another owner."""
+    if torch is None:
         return
-    torch._dynamo.reset()
-    torch._dynamo.register_backend("llk", LLKBackend(), eager=False)
 
+    from torch._dynamo.backends.registry import lookup_backend, register_backend
+    from torch._dynamo.exc import InvalidBackend
 
-_llk_backend = LLKBackend()
+    with _registration_lock:
+        try:
+            registered = lookup_backend("llk")
+        except InvalidBackend:
+            register_backend(compiler_fn=_llk_backend, name="llk")
+            return
+        if registered is not _llk_backend:
+            raise UnsupportedFeatureError(
+                "The Torch backend name 'llk' is already registered by another owner.",
+                code="backend_registration_conflict",
+            )

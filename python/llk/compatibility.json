@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "validation_baseline": {
+    "python": ["3.11", "3.12"],
+    "torch": "2.9.0"
+  },
+  "native_execution": "unavailable",
+  "upstream_triton": "unimplemented"
+}
