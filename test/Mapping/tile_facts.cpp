@@ -21,7 +21,6 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <limits>
 #include <string>
 
 using namespace mlir::llk::mapping;

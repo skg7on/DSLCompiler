@@ -15,7 +15,6 @@
 #include "LLK/Transforms/Common/TilingUtils.h"
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 
-#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 
 using namespace mlir;

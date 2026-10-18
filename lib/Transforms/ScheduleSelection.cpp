@@ -16,15 +16,8 @@
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 
 #include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/Interfaces/DestinationStyleOpInterface.h"
-#include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/Support/JSON.h"
-#include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/Path.h"
-#include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 

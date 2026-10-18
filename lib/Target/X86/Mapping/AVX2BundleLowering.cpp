@@ -23,7 +23,6 @@
 
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
-#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Dialect/Micro/MicroEnums.h"
 
 #include "mlir/IR/Builders.h"

@@ -12,9 +12,7 @@
 
 #include <gtest/gtest.h>
 
-#include <cmath>
 #include <cstdint>
-#include <vector>
 
 // Baseline GFLOPS thresholds per M-bucket.
 //

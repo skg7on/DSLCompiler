@@ -42,7 +42,6 @@
 #include <gtest/gtest.h>
 
 #include <memory>
-#include <set>
 #include <string>
 #include <vector>
 

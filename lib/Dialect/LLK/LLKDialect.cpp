@@ -10,14 +10,11 @@
 // Implements the LLK dialect: registration, attribute parsing/printing,
 // and operation initialization.
 
-#include "LLK/Dialect/LLKEnums.h"
+#include "LLK/Dialect/LLKEnums.h" // IWYU pragma: keep
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/DialectImplementation.h"
-#include "mlir/Interfaces/DestinationStyleOpInterface.h"
-#include "mlir/Interfaces/TilingInterface.h"
-#include "llvm/ADT/StringExtras.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h" // IWYU pragma: keep
+#include "mlir/Interfaces/TilingInterface.h"             // IWYU pragma: keep
 
 //===----------------------------------------------------------------------===//
 // Generated headers: class declarations

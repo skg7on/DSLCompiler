@@ -7,11 +7,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/LLKEnums.h"
 #include "LLK/Transforms/Common/MathApproximation.h"
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -19,13 +17,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Interfaces/DestinationStyleOpInterface.h"
-#include "mlir/Interfaces/TilingInterface.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
-
-#include <cmath>
-#include <limits>
 
 // Generated attribute and op class declarations.
 #define GET_ATTRDEF_CLASSES

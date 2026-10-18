@@ -10,7 +10,6 @@
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
 
 #include "LLK/Conversion/MicroMapping/SearchBindingLoader.h"
-#include "LLK/Conversion/MicroMapping/TileExtent.h"
 #include "LLK/Conversion/Workload/ContractionSourceAdapter.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/SearchBinding.h"
@@ -23,12 +22,9 @@
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Support/Errc.h"
 
 #include <algorithm>
-#include <map>
 #include <optional>
 #include <string>
 

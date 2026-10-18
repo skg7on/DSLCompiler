@@ -21,11 +21,9 @@
 
 #include "MicroTileInfo.h"
 
-#include "LLK/Dialect/Micro/MicroEnums.h"
 #include "LLK/Mapping/CostModel.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"

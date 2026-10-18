@@ -12,8 +12,6 @@
 #include "LLK/Machine/MachineModel.h"
 #include "LLK/Mapping/CostModel.h"
 
-#include "llvm/ADT/STLExtras.h"
-
 #include <algorithm>
 #include <cmath>
 #include <map>

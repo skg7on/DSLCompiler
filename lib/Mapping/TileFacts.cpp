@@ -12,7 +12,6 @@
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/BuiltinTypes.h"
 
-#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <string>

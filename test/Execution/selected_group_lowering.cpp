@@ -17,7 +17,6 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/MLIRContext.h"
 
-#include <map>
 #include <memory>
 #include <string>
 #include <vector>

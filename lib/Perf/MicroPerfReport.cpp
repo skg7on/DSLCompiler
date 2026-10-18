@@ -30,7 +30,6 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
 
-#include <algorithm>
 #include <cstdio>
 #include <limits>
 #include <map>

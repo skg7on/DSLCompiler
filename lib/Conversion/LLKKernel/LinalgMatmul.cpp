@@ -7,25 +7,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "LLK/Dialect/LLKDialect.h"
-#include "LLK/Dialect/LLKEnums.h"
-#include "LLK/Transforms/Common/MathApproximation.h"
+#include "LLK/Dialect/LLKEnums.h" // IWYU pragma: keep
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Math/IR/Math.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h" // IWYU pragma: keep
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Interfaces/DestinationStyleOpInterface.h"
-#include "mlir/Interfaces/TilingInterface.h"
-#include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
-
-#include <cmath>
-#include <limits>
 
 // Generated attribute and op class declarations.
 #define GET_ATTRDEF_CLASSES
@@ -36,9 +23,7 @@
 using namespace mlir;
 
 #include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"
-#include "LLK/Dialect/Micro/MicroDialect.h"
-#include "LLK/Dialect/Micro/MicroEnums.h"
-#include "mlir/IR/BuiltinTypes.h"
+#include "LLK/Dialect/Micro/MicroEnums.h" // IWYU pragma: keep
 #define GET_ATTRDEF_CLASSES
 #include "LLK/Dialect/Micro/MicroAttributes.h.inc"
 #define GET_TYPEDEF_CLASSES

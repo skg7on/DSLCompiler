@@ -24,7 +24,6 @@
 
 #include "llvm/Support/Error.h"
 
-#include <memory>
 #include <optional>
 #include <string>
 #include <utility>

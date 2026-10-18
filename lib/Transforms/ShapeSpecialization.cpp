@@ -20,10 +20,7 @@
 #include "LLK/Transforms/ShapeSpecialization.h"
 
 #include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/Interfaces/DestinationStyleOpInterface.h"
-#include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Pass/Pass.h"
 
 using namespace mlir;

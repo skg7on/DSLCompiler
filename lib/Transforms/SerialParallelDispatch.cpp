@@ -16,7 +16,6 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OpDefinition.h"
-#include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include <thread>

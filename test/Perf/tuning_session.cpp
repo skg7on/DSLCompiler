@@ -46,8 +46,6 @@
 namespace mlir::llk::perf {
 namespace {
 
-using llvm::StringRef;
-
 TuningResult resultWith(std::string id, uint64_t cycles, double matrixUtil,
                         uint64_t dramBytes) {
   TuningResult result;

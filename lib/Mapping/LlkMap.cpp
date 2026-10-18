@@ -14,8 +14,6 @@
 
 #include "LLK/Mapping/LlkMap.h"
 
-#include "LLK/Dialect/Micro/MicroEnums.h"
-
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -23,7 +21,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <limits>
 #include <optional>
 #include <string>
 #include <variant>

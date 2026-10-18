@@ -10,7 +10,6 @@
 #include "FrameworkTestSupport.h"
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
 #include "LLK/Conversion/Workload/WorkloadContract.h"
-#include "LLK/Perf/CandidateGenerator.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/Support/Error.h"

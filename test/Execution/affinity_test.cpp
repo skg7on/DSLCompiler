@@ -15,7 +15,6 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
-#include <vector>
 
 using namespace llk;
 

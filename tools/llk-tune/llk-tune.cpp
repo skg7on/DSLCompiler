@@ -28,7 +28,6 @@
 #include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingTarget.h"
-#include "LLK/Mapping/PlanReport.h"
 #include "LLK/Perf/ScheduleRecord.h"
 #include "LLK/Perf/TuningSession.h"
 #include "LLK/Target/MappingTargets.h"

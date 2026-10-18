@@ -9,15 +9,12 @@
 
 // Implements the LLK dialect operations.
 
-#include "LLK/Dialect/LLKEnums.h"
+#include "LLK/Dialect/LLKEnums.h" // IWYU pragma: keep
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/OpImplementation.h"
-#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Interfaces/TilingInterface.h"
 
 // Attribute class declarations.

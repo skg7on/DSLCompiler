@@ -27,7 +27,6 @@
 #include "LLK/Mapping/EventSchedule.h"
 #include "LLK/Perf/SelectedKernelAnalysis.h"
 
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/MathExtras.h"
 

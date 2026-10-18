@@ -48,9 +48,7 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 
-#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Error.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/TargetParser/Host.h"
@@ -79,7 +77,6 @@
 
 namespace {
 
-using mlir::llk::mapping::CoveringPlan;
 using mlir::llk::mapping::MappingSearchOptions;
 using mlir::llk::mapping::MappingSearchResult;
 using mlir::llk::mapping::MappingTarget;

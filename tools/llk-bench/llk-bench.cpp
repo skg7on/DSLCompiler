@@ -14,9 +14,7 @@
 
 #include "llvm/Support/CommandLine.h"
 
-#include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <vector>

@@ -22,8 +22,6 @@
 #include "mlir/Pass/PassManager.h"
 
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/Support/Error.h"
-#include "llvm/Support/MathExtras.h"
 
 #include <cstdint>
 #include <map>
