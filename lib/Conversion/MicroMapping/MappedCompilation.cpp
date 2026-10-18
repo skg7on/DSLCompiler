@@ -23,6 +23,8 @@
 
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/MappedKernelAbi.h"
+#include "LLK/Conversion/Workload/WorkloadContract.h"
+#include "LLK/Runtime/KernelAbi.h"
 #include "LLK/Version.h"
 
 #include "LLK/Conversion/MicroToLinalg.h"
@@ -431,6 +433,75 @@ lowerSelectedOperationsForTest(mlir::ModuleOp module,
 }
 } // namespace testing
 
+namespace {
+
+/// Enforces the mapped ABI v1 envelope against the source contract before any
+/// code is prepared. Analysis and lowering stay rank-neutral; only the last
+/// step of a compilation has to fit the compact descriptors, so this runs when
+/// the caller asked for an executable and never merely because the binding
+/// contract was `Executable`. A kernel with no retained contract is checked
+/// from its signature at invocation preparation instead.
+llvm::Error validateExecutableContract(mlir::ModuleOp module,
+                                       llvm::StringRef entrySymbol) {
+  mlir::DictionaryAttr retained;
+  llvm::StringRef retainedSymbol;
+  module->walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef() != "micro.kernel")
+      return;
+    auto value =
+        op->getAttrOfType<mlir::DictionaryAttr>("micro.workload_contract");
+    if (!value)
+      return;
+    auto symbol = op->getAttrOfType<mlir::StringAttr>("sym_name");
+    if (retained && (!symbol || symbol.getValue() != entrySymbol))
+      return;
+    retained = value;
+    retainedSymbol = symbol ? symbol.getValue() : llvm::StringRef();
+  });
+  if (!retained)
+    return llvm::Error::success();
+
+  llvm::Expected<mlir::llk::workload::WorkloadContract> decoded =
+      mlir::llk::workload::decodeWorkloadContract(retained);
+  if (!decoded)
+    return decoded.takeError();
+  const mlir::llk::workload::WorkloadContract &contract = *decoded;
+  auto prefix = [&](const llvm::Twine &detail) {
+    return compileError(
+        "runtime_capability: " +
+        (retainedSymbol.empty()
+             ? detail
+             : llvm::Twine("kernel '") + retainedSymbol + "': " + detail)
+            .str());
+  };
+  if (contract.ports.size() > kMappedMaxDescriptors)
+    return prefix("mapped ABI v1 supports at most 12 descriptors");
+  for (const mlir::llk::workload::WorkloadPort &port : contract.ports) {
+    if (port.shape.size() != 2)
+      return prefix("mapped ABI v1 requires rank-two ports; port '" +
+                    port.name + "' has rank " + llvm::Twine(port.shape.size()));
+    bool supported = port.elementType == "f32" || port.elementType == "bf16" ||
+                     port.elementType == "f16" || port.elementType == "i32" ||
+                     port.elementType == "i8";
+    if (!supported)
+      return prefix("mapped ABI v1 does not support element type '" +
+                    port.elementType + "' on port '" + port.name + "'");
+    using mlir::llk::workload::PortDirection;
+    using mlir::llk::workload::PortEffect;
+    if (port.direction == PortDirection::Input &&
+        port.effect == PortEffect::ReadWrite)
+      return prefix("mapped ABI v1 requires read-only inputs; port '" +
+                    port.name + "' is read-write");
+    if (port.direction == PortDirection::Output &&
+        port.effect != PortEffect::Write)
+      return prefix("mapped ABI v1 requires write-only outputs; port '" +
+                    port.name + "' is not write-only");
+  }
+  return llvm::Error::success();
+}
+
+} // namespace
+
 /// The tail every compilation shares: Linalg and loops, then the calling
 /// convention, then the code.
 llvm::Expected<MappedCompilation>
@@ -496,6 +567,15 @@ finishCompilation(MappedCompilation compilation, const MappingTarget *target,
   });
   if (!hasMathMode)
     compilation.executionIdentity += "default";
+
+  // Rank-neutral analysis and lowering are settled policy; the mapped ABI v1
+  // envelope is an execution limit, so it is applied only when code is about
+  // to be prepared. `requireExecutable` alone asks the binder for a complete
+  // plan and does not imply a callable descriptor.
+  if (options.stop == MappedStop::Executable)
+    if (llvm::Error error = validateExecutableContract(*compilation.module,
+                                                       options.entrySymbol))
+      return std::move(error);
 
   if (llvm::Error error =
           lowerToBackendForm(*compilation.module, target, options.backend))
