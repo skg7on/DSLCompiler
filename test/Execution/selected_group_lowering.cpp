@@ -17,7 +17,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/MLIRContext.h"
 
-#include <map>
+#include <map> // IWYU pragma: keep
 #include <memory>
 #include <string>
 #include <vector>

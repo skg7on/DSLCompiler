@@ -20,7 +20,7 @@
 
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/Error.h"
-#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/MathExtras.h" // IWYU pragma: keep
 
 #include <limits>
 

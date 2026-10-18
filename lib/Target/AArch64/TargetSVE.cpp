@@ -11,7 +11,7 @@
 
 #include "LLK/Target/AArch64/TargetSVE.h"
 
-#include <fstream>
+#include <fstream> // IWYU pragma: keep
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif

@@ -22,7 +22,6 @@
 
 #include "LLK/Mapping/MappingMetadata.h"
 
-#include "LLK/Mapping/MappingHelpers.h"
 #include "LLK/Mapping/StableHash.h"
 
 #include "LLK/Machine/MachineModel.h"

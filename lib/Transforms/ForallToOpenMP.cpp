@@ -16,15 +16,15 @@
 #include "LLK/Transforms/ForallToOpenMP.h"
 
 #include "mlir/Conversion/SCFToOpenMP/SCFToOpenMP.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"      // IWYU pragma: keep
+#include "mlir/Dialect/OpenMP/OpenMPDialect.h" // IWYU pragma: keep
+#include "mlir/Dialect/SCF/IR/SCF.h"           // IWYU pragma: keep
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/DialectConversion.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/Transforms/DialectConversion.h"          // IWYU pragma: keep
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h" // IWYU pragma: keep
 
 #include "llvm/Config/llvm-config.h"
 

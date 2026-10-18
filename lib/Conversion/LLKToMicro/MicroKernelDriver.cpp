@@ -41,20 +41,20 @@
 #include "MicroKernelDriver.h"
 #include "LLK/Conversion/MicroMapping/TileExtent.h"
 
-#include "LLK/Dialect/LLKEnums.h"
-#include "LLK/Dialect/Micro/MicroDialect.h"
+#include "LLK/Dialect/LLKEnums.h"           // IWYU pragma: keep
+#include "LLK/Dialect/Micro/MicroDialect.h" // IWYU pragma: keep
 #include "LLK/Dialect/Micro/MicroEnums.h"
 #include "LLK/Dialect/Micro/MicroHelpers.h"
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h" // IWYU pragma: keep
+#include "mlir/Dialect/Tensor/IR/Tensor.h" // IWYU pragma: keep
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/SymbolTable.h"
-#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/Pass.h" // IWYU pragma: keep
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
@@ -62,7 +62,7 @@
 
 #include <algorithm>
 #include <iterator>
-#include <limits>
+#include <limits> // IWYU pragma: keep
 
 // Micro attribute, type, and op declarations.
 #define GET_ATTRDEF_CLASSES

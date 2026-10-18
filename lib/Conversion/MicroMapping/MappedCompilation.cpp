@@ -28,7 +28,6 @@
 #include "LLK/Version.h"
 
 #include "LLK/Conversion/MicroToLinalg.h"
-#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/PlanBinder.h"
 

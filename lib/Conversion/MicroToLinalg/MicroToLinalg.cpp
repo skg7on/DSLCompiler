@@ -46,8 +46,8 @@
 #include "LLK/Conversion/MicroToLinalg.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
-#include "LLK/Dialect/Micro/MicroEnums.h"
-#include "LLK/Dialect/Micro/MicroHelpers.h"
+#include "LLK/Dialect/Micro/MicroEnums.h"   // IWYU pragma: keep
+#include "LLK/Dialect/Micro/MicroHelpers.h" // IWYU pragma: keep
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -123,8 +123,13 @@ private:
 /// A pure movement, and a layout conversion once the layouts themselves are
 /// dropped, both lower to a `linalg.generic` copy: a fresh tensor of the same
 /// shape carrying the same elements.
-Value buildTensorCopy(OpBuilder &builder, Location loc, Value source,
-                      RankedTensorType resultType) {
+///
+/// The only caller is `AsyncCopyOpLowering`, a template whose virtual
+/// `matchAndRewrite` Clang does not always instantiate here even though the
+/// pattern is registered, so the call is not visible to -Wunused-function.
+[[maybe_unused]] Value buildTensorCopy(OpBuilder &builder, Location loc,
+                                       Value source,
+                                       RankedTensorType resultType) {
   auto empty = tensor::EmptyOp::create(builder, loc, resultType.getShape(),
                                        resultType.getElementType());
   SmallVector<AffineMap> maps{

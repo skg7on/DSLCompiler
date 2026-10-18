@@ -17,7 +17,6 @@
 
 #include "CompletePlanEvaluation.h"
 
-#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/StoragePlan.h"
 #include "LLK/Perf/SelectedKernelAnalysis.h"

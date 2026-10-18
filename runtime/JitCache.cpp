@@ -23,7 +23,7 @@
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
 #include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
-#include "mlir/Conversion/Passes.h"
+#include "mlir/Conversion/Passes.h" // IWYU pragma: keep
 #include "mlir/Conversion/UBToLLVM/UBToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
@@ -46,7 +46,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstring>
-#include <sstream>
+#include <sstream> // IWYU pragma: keep
 
 using namespace mlir;
 

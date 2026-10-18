@@ -11,25 +11,22 @@
 
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Conversion/LLKKernel/LLKKernelLowering.h"
-#include "LLK/Dialect/LLKDialect.h"
-#include "LLK/Dialect/LLKEnums.h"
-#include "LLK/Transforms/Common/MathApproximation.h"
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/Bytecode/BytecodeOpInterface.h" // IWYU pragma: keep
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinTypes.h"
-#include "mlir/Interfaces/DestinationStyleOpInterface.h"
-#include "mlir/Interfaces/TilingInterface.h"
+#include "mlir/IR/BuiltinTypes.h"                        // IWYU pragma: keep
+#include "mlir/Interfaces/DestinationStyleOpInterface.h" // IWYU pragma: keep
+#include "mlir/Interfaces/TilingInterface.h"             // IWYU pragma: keep
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 
-#include <cmath>
-#include <limits>
+#include <cmath>  // IWYU pragma: keep
+#include <limits> // IWYU pragma: keep
 
 using namespace mlir;
 

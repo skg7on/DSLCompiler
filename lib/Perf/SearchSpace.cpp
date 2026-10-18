@@ -19,9 +19,9 @@
 
 // MicroDialect/MicroEnums/MicroHelpers are prerequisites for the generated
 // attribute, type, and op declarations below, not direct uses here.
-#include "LLK/Dialect/Micro/MicroDialect.h"
-#include "LLK/Dialect/Micro/MicroEnums.h"
-#include "LLK/Dialect/Micro/MicroHelpers.h"
+#include "LLK/Dialect/Micro/MicroDialect.h" // IWYU pragma: keep
+#include "LLK/Dialect/Micro/MicroEnums.h"   // IWYU pragma: keep
+#include "LLK/Dialect/Micro/MicroHelpers.h" // IWYU pragma: keep
 
 #include "mlir/IR/BuiltinOps.h"
 
