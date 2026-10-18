@@ -43,6 +43,30 @@
     "stopOnEntry": false
   },
   {
+    "label": "Debug llk-compile (LLK → Micro → search → LLVM IR)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "build": "Build LLK tools (Debug)",
+    "program": "$ZED_WORKTREE_ROOT/build/bin/llk-compile",
+    "args": [
+      "--mapping-target=x86-avx2",
+      "--mapping-root=$ZED_WORKTREE_ROOT",
+      "--mapping-stop=executable",
+      "--mapping-backend=reference",
+      "$ZED_WORKTREE_ROOT/docs/manual/source/examples/matmul.mlir"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "preRunCommands": [
+      "breakpoint set --name 'runMicroExport'",
+      "breakpoint set --name 'mlir::llk::mapping::CoveringSearch::search()'",
+      "breakpoint set --name 'llk::compileMappedKernel'",
+      "breakpoint set --name 'llk::prepareMappedKernelForInvocation'",
+      "breakpoint set --name 'llk::addKernelToLLVMPasses'",
+      "breakpoint set --name 'mlir::translateModuleToLLVMIR'"
+    ],
+    "stopOnEntry": false
+  },
+  {
     "label": "Debug llk-tune (predicted Micro search)",
     "adapter": "CodeLLDB",
     "request": "launch",

@@ -22,14 +22,14 @@
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/LLKEnums.h"
-#include "LLK/Runtime/JitCache.h"
+#include "LLK/Runtime/JitCache.h" // IWYU pragma: keep
 #include "LLK/Transforms/FuseDoubleContraction.h"
 #include "LLK/Transforms/TileAndVectorize.h"
 
 // Dependencies required by the generated op/attribute headers.
-#include "mlir/Bytecode/BytecodeOpInterface.h"
-#include "mlir/Interfaces/DestinationStyleOpInterface.h"
-#include "mlir/Interfaces/TilingInterface.h"
+#include "mlir/Bytecode/BytecodeOpInterface.h"           // IWYU pragma: keep
+#include "mlir/Interfaces/DestinationStyleOpInterface.h" // IWYU pragma: keep
+#include "mlir/Interfaces/TilingInterface.h"             // IWYU pragma: keep
 
 // Generated attribute classes (ActivationAttr, MathModeAttr).
 #define GET_ATTRDEF_CLASSES
@@ -42,7 +42,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
-#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
+#include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h" // IWYU pragma: keep
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -69,8 +69,8 @@ using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
 
 #include <gtest/gtest.h>
 
-#include <string>
-#include <vector>
+#include <string> // IWYU pragma: keep
+#include <vector> // IWYU pragma: keep
 
 // ---------------------------------------------------------------------------
 // Helpers: MLIR module construction and pipeline

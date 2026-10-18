@@ -113,7 +113,7 @@ The :source:`generic accelerator package <mapping/generic-ai-accel>` is for mapp
 
 .. code-block:: bash
 
-   build/bin/llk-opt --micro-map="target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_mxu,accel_copy mode=deterministic report=build/tutorial/accelerator.plan.json" \
+   build/bin/llk-opt --micro-map="target=generic-ai-accel machine=machines/generic-ai-accel-v2.yaml layouts=mapping/generic-ai-accel/layouts.llkmap rules=mapping/generic-ai-accel/rules.llkmap emitters=accel_vector_add,accel_vector_mul,accel_reduce_sum,accel_mxu,accel_copy mode=deterministic report=build/tutorial/accelerator.plan.json" \
      test/Conversion/MicroMapping/micro_map.mlir > build/tutorial/accelerator.mapped.mlir
 
 If emitter names or supported rules change, consult the package and :doc:`optimizer manual </tools/optimizer>`. Compare selected placements and routes with AVX2 rather than assuming the same cost model has been calibrated for both machines.

@@ -12,7 +12,7 @@
 #include "LLK/Dialect/Micro/MicroEnums.h"
 #include "LLK/Dialect/Micro/MicroHelpers.h"
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/Bytecode/BytecodeOpInterface.h" // IWYU pragma: keep
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"

@@ -106,6 +106,11 @@ schedules:
 
 The report records ``source_adapter``, ``source_adapter_version`` and a
 ``source_contract`` object with the contract ``version`` and canonical content.
+Each retained candidate also carries a ``capabilities`` object reporting the
+compiler stages established for that candidate (structure, interpretation,
+mapping, physical plan, reference lowering, selected lowering and invocation) as
+``supported``, ``unsupported`` or ``not_checked``. A static tuning run does not
+invoke the candidate, so its invocation stage remains ``not_checked``.
 Each retained candidate carries its ``source_receipt`` (which source-owned
 choices were realized, here ``T0`` and ``T1``) and a ``replay_identity`` folding
 the source graph hash, binding hash and plan id. The schedule YAML's

@@ -323,6 +323,15 @@ different execution mode (``reference`` versus ``selected-target``) produces a
 different ``identity=``. None of those cases silently reuse the previous
 artifact.
 
+A ``capabilities:`` JSON object is printed on stderr after the status line. It
+reports structure, interpretation, mapping, physical plan, reference lowering,
+selected lowering and invocation as ``supported``, ``unsupported`` or
+``not_checked`` for this exact run, keyed by source/contract/target/plan
+identity. Diagnostics go to stderr so stdout remains "mapping line + MLIR" and
+can be re-parsed as an artifact. A reference-backend run leaves selected
+lowering ``not_checked``: the absence of a codegen contract means the stage was
+not attempted, not that it failed.
+
 The mapped ABI v1 is a rank-two, compact, offset-zero descriptor envelope with
 at most 12 ports and read-only inputs. Analysis, reporting and lowering are
 rank-neutral; only executable preparation applies that envelope. A rank-three

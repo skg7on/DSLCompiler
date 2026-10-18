@@ -185,9 +185,9 @@ TEST(OpDAGBuilders, HandlerErrorsPropagateAndDoNotPoisonLaterBuilds) {
 } // namespace mlir::llk::perf
 
 // Generated operation classes are confined to these integration tests.
-#include "LLK/Dialect/Micro/MicroEnums.h"
-#include "mlir/Bytecode/BytecodeOpInterface.h"
-#include "mlir/IR/OpImplementation.h"
+#include "LLK/Dialect/Micro/MicroEnums.h"      // IWYU pragma: keep
+#include "mlir/Bytecode/BytecodeOpInterface.h" // IWYU pragma: keep
+#include "mlir/IR/OpImplementation.h"          // IWYU pragma: keep
 #define GET_ATTRDEF_CLASSES
 #include "LLK/Dialect/Micro/MicroAttributes.h.inc"
 #define GET_TYPEDEF_CLASSES

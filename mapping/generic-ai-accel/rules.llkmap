@@ -21,6 +21,36 @@ rule accel.vector_add {
   cost 2;
 }
 
+// The multiply variant is the same vector-engine contract as add. The emitter
+// validates the variant and f32 operand/result tiles; the bundle key alone
+// cannot state either fact.
+rule accel.vector_mul {
+  match micro.vector(op = "mul");
+  require executor kind pe;
+  require compute kind vector_engine;
+  require layout operand0 satisfies accel.row_major;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "accel.vector.mul";
+  emit "accel_vector_mul";
+  cost 2;
+}
+
+// A reduction removes an axis, so this profile advertises the f32 sum fragment
+// only as an analysis/lowering capability. The emitter validates the sum
+// variant and f32 operand/result tiles; there is no hardware claim.
+rule accel.reduce_sum_f32 {
+  match micro.reduce(op = "sum");
+  require executor kind pe;
+  require compute kind vector_engine;
+  input "operand0";
+  output "result";
+  bundle "accel.reduce.sum.f32";
+  emit "accel_reduce_sum";
+  cost 3;
+}
+
 rule accel.mma_bf16 {
   match micro.mma(input = bf16);
   require executor kind pe;

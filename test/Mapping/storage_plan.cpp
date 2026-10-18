@@ -13,7 +13,6 @@
 // checks per-memory capacity against real occupancy.
 
 #include "LLK/Mapping/CostEvent.h"
-#include "LLK/Mapping/StorageLiveness.h"
 #include "LLK/Mapping/StoragePlan.h"
 
 #include "resource_regression_fixture.h"
@@ -24,7 +23,6 @@
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanReport.h"
-#include "LLK/Mapping/TileFacts.h"
 
 #include "LLK/Dialect/Micro/MicroDialect.h"
 

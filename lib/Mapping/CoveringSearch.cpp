@@ -709,10 +709,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
                          stringifyDiagnosticCode(code).str() + ")");
       }
       for (CandidateInstance &instance : *instances) {
-        InstanceEntry entry{std::move(instance), rule, {}, {}};
+        InstanceEntry entry{
+            std::move(instance),           rule,      {}, std::nullopt,
+            candidate->resolvedParameters, {node->id}};
         entry.cost = entry.instance.localCost;
-        entry.resolvedParameters = candidate->resolvedParameters;
-        entry.coveredNodes = {node->id};
         if (options_.enableLatencyCache) {
           if (const LatencyProvider *provider = target_.latencyProvider()) {
             OperationSignature signature;
@@ -811,9 +811,10 @@ llvm::Expected<MappingSearchResult> CoveringSearch::search() {
           continue;
         ++result.candidateCount;
         for (CandidateInstance &instance : *instances) {
-          InstanceEntry entry{std::move(instance), ruleDef, {}, {}};
+          InstanceEntry entry{
+              std::move(instance),          ruleDef, {}, std::nullopt,
+              candidate.resolvedParameters, {}};
           entry.cost = entry.instance.localCost;
-          entry.resolvedParameters = candidate.resolvedParameters;
           entry.coveredNodes.assign(candidate.coveredNodes.begin(),
                                     candidate.coveredNodes.end());
           table.instances.push_back(std::move(entry));

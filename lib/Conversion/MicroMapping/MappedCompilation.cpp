@@ -28,7 +28,6 @@
 #include "LLK/Version.h"
 
 #include "LLK/Conversion/MicroToLinalg.h"
-#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/PlanBinder.h"
 
@@ -61,6 +60,7 @@
 // The canonical plan materializer lives beside this file, in the one library
 // that owns the Micro dialect on the mapping path.
 #include "MicroMappingCommon.h"
+#include "TargetCoverageValidation.h"
 #include "selected_group_lowering_test_hooks.h"
 
 #if LLVM_VERSION_MAJOR >= 21
@@ -683,6 +683,12 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
                                    materializer.get());
   if (!bound)
     return bound.takeError();
+  // Explicit plans and frozen replay need the same operation-aware admission
+  // as complete-plan search. Check the bound clone before any early return or
+  // rewrite; a reference backend does not relax the selected target contract.
+  if (llvm::Error error = mlir::llk::mapping::verifyTargetOperationCoverage(
+          *bound->module, plan, target))
+    return compileError("target_coverage: " + llvm::toString(std::move(error)));
   compilation.module = std::move(bound->module);
   llvm::Error sourceIdentityError = llvm::Error::success();
   compilation.module->walk([&](mlir::Operation *op) {

@@ -19,10 +19,10 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/PatternMatch.h" // IWYU pragma: keep
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/Debug.h"
+#include "llvm/Support/Debug.h" // IWYU pragma: keep
 
 using namespace mlir;
 

@@ -13,13 +13,13 @@
 #include "LLK/Dialect/Micro/MicroEnums.h"
 #include "LLK/Dialect/Micro/MicroHelpers.h"
 
-#include "mlir/Bytecode/BytecodeOpInterface.h"
+#include "mlir/Bytecode/BytecodeOpInterface.h" // IWYU pragma: keep
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
-#include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/DialectImplementation.h" // IWYU pragma: keep
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include "llvm/ADT/TypeSwitch.h" // IWYU pragma: keep
 #include "llvm/Support/MathExtras.h"
 
 //===----------------------------------------------------------------------===//

@@ -19,7 +19,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
-#include <memory>
+#include <memory> // IWYU pragma: keep
 #include <optional>
 #include <string>
 #include <utility>

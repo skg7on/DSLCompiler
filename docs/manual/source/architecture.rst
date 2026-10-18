@@ -79,9 +79,26 @@ reach static reporting and lowered IR, while executable preparation fails with a
 explicit ``runtime_capability:`` diagnostic. General structured import, wider
 invocation and additional non-contraction families remain capability work.
 
+Conformance is reported per compiler stage. ``CapabilityReceipt`` records
+structure, interpretation, mapping, physical plan, reference lowering, selected
+lowering, ABI eligibility, preparation, host compatibility and invocation as
+supported, unsupported or not checked for one
+concrete source/contract/target/plan artifact. The receipt layer sits above
+mapping, performance and runtime, runs no lowering or JIT to produce a static
+report, and is keyed by existing complete identities. Before analysis and
+scoring, ``verifyTargetOperationCoverage`` groups the bound IR by selected
+instance and asks each emitter to validate its covered variant and types, so an
+unsupported operation is a candidate rejection rather than a late backend error.
+Target policy remains declarative: generic mapping/machine code never branches on
+a target name, and a boundary scan enforces that these libraries do not acquire
+performance, runtime or JIT links.
+
 Framework validation covers tile semantics, non-contraction computation, fusion,
-movement/layout, resource capacity, search/replay, analysis parity and extension.
-Matmul/SwiGLU tests prove only the contracts and fixtures they exercise. The
+movement/layout, resource capacity, search/replay, analysis parity, composed
+vector/reduction behavior and extension portability. Matmul/SwiGLU tests prove
+only the contracts and fixtures they exercise. The
+:source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
+records the current capability matrix. The
 :source:`operator registration proposal <docs/superpowers/specs/2026-10-11-conversion-kernel-lowering-framework-design.md>`
 and merged :source:`MicroDAG event-builder seam <docs/superpowers/specs/2026-10-04-micro-dag-ioc-design.md>`
 advance extensibility without establishing arbitrary DNN coverage.
