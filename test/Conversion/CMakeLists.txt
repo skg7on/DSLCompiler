@@ -7,6 +7,7 @@ add_llk_test_category(Conversion
         MicroMapping/complete_plan_evaluation.cpp
         framework_capabilities.cpp
         framework_conformance.cpp
+        framework_target_portability.cpp
         ../Mapping/resource_regression_fixture.cpp
     LIBRARIES
         LLKKernel
@@ -30,3 +31,17 @@ add_test(NAME FrameworkSelectedEvidence
         $<TARGET_FILE:llk-compile> $<TARGET_FILE:micro-perf>
         ${CMAKE_SOURCE_DIR}
         ${CMAKE_CURRENT_BINARY_DIR}/framework_selected_evidence)
+
+# C4: generic mapping/machine libraries stay target-neutral and do not link the
+# performance model, runtime or JIT.
+add_test(NAME FrameworkBoundaryScan
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/framework_boundary_scan.py
+        ${CMAKE_SOURCE_DIR})
+
+# C4: every selected-evidence row is passed with identity/analysis evidence or
+# unsupported with a reason. It depends on the C3 evidence producer.
+add_test(NAME FrameworkEvidenceManifest
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/framework_manifest_validator.py
+        ${CMAKE_CURRENT_BINARY_DIR}/framework_selected_evidence)
+set_tests_properties(FrameworkEvidenceManifest PROPERTIES
+    DEPENDS FrameworkSelectedEvidence)

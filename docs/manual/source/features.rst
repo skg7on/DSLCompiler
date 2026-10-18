@@ -10,10 +10,13 @@ declarative target mapping and performance exploration. The established CPU comp
 available while the newer mapped path is being strengthened. Use this page to
 choose a workflow and understand what a successful run proves.
 
-This summary reflects merged PR #133 (2026-10-11, merge ``5ee61b1``).
-The :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>` records
-revision-pinned tests, execution artifacts and retained limitations. The October 7
-gap assessment is historical; its resource/runtime/tuner repairs are implemented.
+This summary reflects merged PR #133 (2026-10-11, merge ``5ee61b1``) plus the
+generic framework increments A–C. The revision-pinned
+:source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
+records capability-based acceptance, exact test counts and retained limits.
+The :source:`PR #133 acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
+records the earlier resource/runtime/tuner repairs. The October 7 gap assessment
+is historical.
 
 .. _features-what-you-can-do-today:
 
@@ -72,6 +75,18 @@ What you can do today
      - Versioned workload contract, source adapter registry, bounded rank-two f32 elementwise add/multiply with tiled spatial schedules
      - The bounded elementwise adapter is the first delivered non-contraction family; arbitrary Linalg import, broadcasting, reductions, dynamic shapes and approximation modes are rejected
      - :doc:`Tuner </tools/tuning>`, :doc:`Compiler </tools/compiler>`
+   * - Report stage-specific capabilities
+     - Capability receipts for structure, interpretation, mapping, physical plan, reference lowering, selected lowering and invocation, keyed by source/contract/target/plan identity
+     - ``supported``, ``unsupported`` and ``not_checked`` are distinct; printing a static receipt never runs lowering or JIT; a reference-backend run leaves selected lowering ``not_checked``
+     - :doc:`Architecture </architecture>`, :source:`conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
+   * - Validate composed primitives and reduction
+     - Direct 8x8→8 sum and add→multiply; selected AVX2 Vector reduction/vector IR; operation-aware target coverage before ranking
+     - Rank-one invocation is outside mapped ABI v1; generic-accelerator mul/sum are analysis-only; Linalg reduction import is not implemented
+     - :doc:`Performance analyzer </tools/performance>`, conformance review
+   * - Extend a target without generic dispatch
+     - Renamed-target portability, literal topology variants and a generic-library boundary scan
+     - A target still needs its own machine/layout/rule/emitter package; no physical accelerator backend is delivered
+     - :source:`conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
    * - Run supported mapped kernels
      - Shared mapped compilation, typed descriptor invocation, caller-buffer ownership and per-call scratch release; reference and selected AVX2 numeric fixtures including generic elementwise add/multiply
      - Selected-target execution requires x86_64 AVX2; rank-two supported dtypes/strides/bounds are checked by typed invocation; analysis/lowering are rank-neutral but executable ABI v1 rejects other ranks with ``runtime_capability:`` diagnostics; deprecated untagged descriptors cannot check dtype/allocation size
@@ -81,8 +96,8 @@ What you can do today
      - It does not parse MLIR, load weights, invoke a compiled kernel or use the JIT; thread-pool setup occurs per invocation
      - :doc:`Benchmark </tools/benchmark>`
    * - Explore a second target
-     - Generic accelerator topology, layouts, rules and mapping through the same canonical IR
-     - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered
+     - Generic accelerator topology, layouts, rules and mapping through the same canonical IR; static f32 add/mul/sum coverage with operation-aware validation
+     - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered; accelerator mul/sum emitters verify only
      - :doc:`Mapping tutorial </tutorials/02-mapping>`
 
 The broader goal does not imply arbitrary DNN support today. The LLK-to-Micro
@@ -158,6 +173,38 @@ an unknown effect-free arithmetic operation is not automatically zero cost.
 See the :source:`mapping workflow <docs/design/micro-ir-mapping-workflow.md>`
 for the integration boundary and supported modes.
 
+Capability receipts and stage evidence
+--------------------------------------
+
+A known emitter key and a complete static mapping do not prove that a target
+lowers or runs a kernel. ``CapabilityReceipt`` v1 reports one verdict per stage:
+structure, interpretation, mapping, physical plan, reference lowering, selected
+lowering and invocation. Each is ``supported`` (established for this artifact),
+``unsupported`` (a concrete blocker was found) or ``not_checked`` (the stage was
+never attempted). A receipt is keyed by the source graph content, canonical
+workload contract, target content and plan id.
+
+Receipts never run a backend lowering or JIT merely to print. A target without a
+codegen contract reports selected lowering unsupported; a selected-backend
+``Lowered`` result is supported only with realized groups and zero reference
+fallback; a reference-backend run leaves selected lowering ``not_checked``
+rather than misreporting the deliberate mode as a failure. ``llk-tune`` mapping
+reports carry a per-candidate ``capabilities`` object, and ``llk-compile`` prints
+a ``capabilities:`` JSON line on stderr so stdout remains a re-parsable
+artifact.
+
+Operation coverage complements the receipt: before complete-plan analysis and
+scoring, the bound IR is grouped by selected instance and each emitter validates
+the covered operation's variant and operand/result types without rewriting the
+IR. A mismatch is a candidate rejection, not a late lowering error. This is how
+the analysis-only accelerator accepts f32 add/multiply/sum while refusing bf16.
+
+Target names are provenance, not policy. Renaming a target preserves legal
+plans, analysis verdicts and its base backend capability while changing the
+receipt's ``targetIdentity``; changing machine resource or capacity data changes
+the legal covering set and rejection reasons through the same generic code. The
+conformance review records these checks and the library link boundary.
+
 .. _features-work-planned-separately:
 
 Work planned separately
@@ -166,14 +213,19 @@ Work planned separately
 PR #133 completes the #129 resource, runtime, mapped tuning and acceptance
 repair series within the supported bounded contract. Production measured-record
 persistence, calibration fitting and prediction-error validation remain #51/#52.
-The generic accelerator package has static two-hop conformance, not hardware
-execution. A direct MicroIR emulator and broad Python/model frontend remain deferred.
+The generic accelerator package has static topology, movement and f32
+add/mul/sum conformance, not hardware execution. A direct MicroIR emulator and a
+broad Python/model frontend remain deferred.
 
-Selected AVX2 acceptance passed 13/13 without required skips. The implementation
-CI suite recorded 1,215 entries, 1,211 passed, three legacy JIT skips and one
-pre-existing disabled test. The legacy skips do not establish numerical legacy
-JIT execution and are not host AVX2 capability skips. See the acceptance matrix
-for their diagnostics and exact revision.
+Selected AVX2 acceptance for PR #133 passed 13/13 without required skips. The
+current framework review records the later increments and their exact local and
+CI counts; required selected execution remains a Linux ``x86_64`` AVX2 gate.
+Legacy JIT skips do not establish numerical legacy execution and are not host
+AVX2 capability skips. See the
+:source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
+for current evidence and the older
+:source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>` for the
+#133 diagnostics and revision.
 
 .. _features-reading-status-evidence:
 

@@ -103,6 +103,14 @@ def main():
                 "mapping line records no replay identity: " + mapping_line)
         plan_id = replay_identity.split("|plan=", 1)[1]
         require(plan_id, "mapping line records no plan id")
+        counters = {}
+        for counter in ("selected-groups-verified", "target-lowered-ops",
+                        "reference-lowered-ops", "backend-groups-realized",
+                        "reference-groups-lowered"):
+            value = token(mapping_line, counter)
+            require(value is not None and value.isdigit(),
+                    "mapping line omits counter " + counter)
+            counters[counter.replace("-", "_")] = int(value)
         return {
             "source": os.path.relpath(fixture, root),
             "symbol": symbol,
@@ -117,6 +125,7 @@ def main():
             "compiler": token(mapping_line, "identity"),
             "replay_identity": replay_identity,
             "plan_id": plan_id,
+            "counters": counters,
             "stages": {
                 "mapping": "supported",
                 "physical_plan": "supported",

@@ -96,12 +96,12 @@ describeCapabilities(mlir::Operation *kernel,
   if (!contract.ports.empty())
     receipt.contractIdentity = workload::canonicalWorkloadContract(contract);
 
-  if (plan && plan->targetHash)
-    receipt.targetIdentity =
-        "target=" + target.name().str() + "|content=" + hexId(plan->targetHash);
-  else
-    receipt.targetIdentity = "target=" + target.name().str() + "|content=" +
-                             hexId(mapping::computeTargetContentHash(target));
+  // The receipt describes the target it was handed, so its identity is that
+  // target's content. A plan's recorded target hash is provenance (and may
+  // name a differently named but policy-identical wrapper); it must not make
+  // the receipt claim the wrong target identity.
+  receipt.targetIdentity = "target=" + target.name().str() + "|content=" +
+                           hexId(mapping::computeTargetContentHash(target));
   receipt.planId = plan ? plan->id : 0;
 
   // --- structural ---------------------------------------------------------
