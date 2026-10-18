@@ -55,13 +55,11 @@
 
 #include "gtest/gtest.h"
 
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -71,15 +69,12 @@
 
 namespace {
 
-using mlir::llk::mapping::CoveringPlan;
 using mlir::llk::mapping::MappingSearchOptions;
 using mlir::llk::mapping::MappingSearchResult;
-using mlir::llk::mapping::MappingTarget;
 using mlir::llk::mapping::SearchMode;
 using mlir::llk::workload::PortDirection;
 using mlir::llk::workload::PortEffect;
 using mlir::llk::workload::WorkloadContract;
-using mlir::llk::workload::WorkloadPort;
 
 mlir::DialectRegistry buildRegistry() {
   mlir::DialectRegistry registry;
