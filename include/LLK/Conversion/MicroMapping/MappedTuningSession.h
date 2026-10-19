@@ -13,6 +13,7 @@
 #include "LLK/Conversion/FrameworkCapabilities.h"
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
+#include "LLK/Conversion/MicroMapping/MeasurementStore.h"
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Perf/CandidateGenerator.h"
 #include "LLK/Perf/TuningSession.h"
@@ -29,8 +30,7 @@
 namespace mlir::llk::tuning {
 
 /// The complete, length-delimited identity of one mapped executable. The
-/// canonical string is suitable for external measurement records; no such
-/// records are stored by the tuning session.
+/// canonical string is suitable for exact persistent measurement records.
 struct MappedMeasurementIdentity {
   std::string canonical;
   std::string contentHash;
@@ -73,10 +73,27 @@ using MappedMeasurementVerifier = std::function<llvm::Error(
     const MappedTuningCandidate &, llvm::ArrayRef<::llk::InvocationBuffer2D>,
     llvm::ArrayRef<::llk::InvocationBuffer2D>)>;
 
+struct MappedMeasurementSamples {
+  perf::CandidateMetrics metrics;
+  std::vector<double> samplesNs;
+};
+using MappedDetailedMeasurementProvider =
+    std::function<llvm::Expected<std::optional<MappedMeasurementSamples>>(
+        const MappedMeasurementRequest &)>;
+
 struct MappedMeasurementOptions {
   MappedInputProvider inputs;
   MappedMeasurementProvider measure;
   MappedMeasurementVerifier verify;
+  /// Mutually exclusive with the aggregate provider above.
+  MappedDetailedMeasurementProvider measureDetailed;
+  MeasurementStore *store = nullptr; // Borrowed for the synchronous session.
+  bool reuseExact = false;
+  perf::MeasurementProtocol protocol;
+  perf::MeasurementEnvironment environment;
+  perf::VerificationIdentity verification;
+  /// Observer called only after successful validated persistence.
+  std::function<llvm::Error(const perf::MeasurementRecord &)> recordSink;
 };
 
 struct MappedTuningOptions {
@@ -109,6 +126,7 @@ struct MappedTuningCandidate {
   /// session never runs (such as invocation) stay `not_checked`.
   framework::CapabilityReceipt capability;
   std::optional<MappedMeasurementIdentity> measurementIdentity;
+  std::string measurementOrigin = "predicted_static";
 };
 
 struct MappedTuningReport {
@@ -129,6 +147,9 @@ struct MappedTuningReport {
   bool hasMeasuredResult = false;
   uint64_t measuredCohortSize = 0;
   uint64_t measurementAttempts = 0;
+  uint64_t measurementRecordHits = 0;
+  uint64_t measurementRecordMisses = 0;
+  uint64_t measurementRecordsWritten = 0;
   std::vector<MappedTuningCandidate> ranked;
   std::vector<MappedTuningCandidate> unrankable;
   std::vector<perf::TuningResult> rejected;

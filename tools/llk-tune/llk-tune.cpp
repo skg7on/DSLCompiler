@@ -47,6 +47,13 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
+
+#if defined(__linux__)
+#include <sched.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -153,6 +160,14 @@ static cl::opt<std::string>
     tuneMeasurementInputs("measurement-inputs",
                           cl::desc("Versioned JSON typed input/output fixture"),
                           cl::init(""));
+
+static cl::opt<std::string> tuneMeasurementStore(
+    "measurement-store",
+    cl::desc("Optional local verified measurement directory"), cl::init(""));
+static cl::opt<std::string>
+    tuneMeasurementReuse("measurement-reuse",
+                         cl::desc("Verified measurement reuse: off or exact"),
+                         cl::init("off"));
 
 static cl::opt<std::string> tuneInputDType("input-dtype",
                                            cl::desc("Input element dtype"),
@@ -418,6 +433,7 @@ struct FixturePort {
 struct MeasurementFixture {
   uint64_t warmup = 0;
   uint64_t repeat = 1;
+  std::string content;
   std::vector<FixturePort> inputs;
   std::vector<FixturePort> outputs;
 };
@@ -527,6 +543,7 @@ loadMeasurementFixture(llvm::StringRef path) {
   if (!object || object->getInteger("version") != 1)
     return fixtureError("measurement fixture must be a version 1 JSON object");
   MeasurementFixture fixture;
+  fixture.content = (*buffer)->getBuffer().str();
   auto warmup = object->getInteger("warmup");
   auto repeat = object->getInteger("repeat");
   auto inputs = object->getArray("inputs");
@@ -694,6 +711,62 @@ std::string replayIdentity(const mlir::llk::mapping::CoveringPlan &plan) {
          "|plan=" + llvm::formatv("{0:x}", plan.id).str();
 }
 
+// Capture observable host facts; neither clock nor affinity is controlled by
+// the tuner. The record states that policy explicitly instead of claiming pinning.
+mlir::llk::perf::MeasurementEnvironment measurementEnvironment() {
+  mlir::llk::perf::MeasurementEnvironment environment;
+  environment.architecture = llvm::sys::getProcessTriple();
+  environment.cpuIdentity = llvm::sys::getHostCPUName().str();
+  std::vector<std::string> features;
+  for (const auto &feature : llvm::sys::getHostCPUFeatures())
+    if (feature.second)
+      features.push_back(feature.first().str());
+  llvm::sort(features);
+  for (const auto &feature : features)
+    environment.isa += feature + ";";
+  if (environment.isa.empty())
+    environment.isa = "no-detected-features";
+  environment.threads = 1; // Mapped invocation's default worker count.
+  environment.affinity = "uncontrolled";
+  environment.clockPolicy = "uncontrolled-observed-default";
+#if defined(__linux__)
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+    environment.affinity = "allowed-cpus:";
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+      if (CPU_ISSET(cpu, &mask))
+        environment.affinity += std::to_string(cpu) + ",";
+  }
+  std::ifstream cpuinfo("/proc/cpuinfo");
+  std::string line;
+  while (std::getline(cpuinfo, line)) {
+    if (line.empty())
+      break; // One logical CPU; topology is in the affinity mask.
+    auto key = llvm::StringRef(line).split(':').first.trim();
+    if (key == "vendor_id" || key == "cpu family" || key == "model" ||
+        key == "model name" || key == "stepping" || key == "microcode")
+      environment.cpuIdentity += "|" + line;
+  }
+  std::ifstream governor(
+      "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
+  if (std::getline(governor, line))
+    environment.clockPolicy += ";governor=" + line;
+#elif defined(__APPLE__)
+  for (const char *key : {"hw.model", "machdep.cpu.brand_string"}) {
+    size_t size = 0;
+    if (sysctlbyname(key, nullptr, &size, nullptr, 0) == 0 && size) {
+      std::string value(size, '\0');
+      if (sysctlbyname(key, value.data(), &size, nullptr, 0) == 0) {
+        value.resize(size && value[size - 1] == '\0' ? size - 1 : size);
+        environment.cpuIdentity += "|" + std::string(key) + "=" + value;
+      }
+    }
+  }
+#endif
+  return environment;
+}
+
 int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
                     const mlir::llk::perf::WorkloadShape &shape) {
   namespace perf = mlir::llk::perf;
@@ -705,6 +778,14 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
     return reportError("--measure-top requires --measurement-inputs");
   if (!tuneMeasureTop && !tuneMeasurementInputs.empty())
     return reportError("--measurement-inputs requires --measure-top > 0");
+  if (tuneMeasurementReuse != "off" && tuneMeasurementReuse != "exact")
+    return reportError("--measurement-reuse must be off or exact");
+  if (tuneMeasurementReuse == "exact" && tuneMeasurementStore.empty())
+    return reportError(
+        "--measurement-reuse=exact requires --measurement-store");
+  if (!tuneMeasurementStore.empty() && !tuneMeasureTop)
+    return reportError(
+        "--measurement-store requires --measure-top > 0 and a fixture");
   std::optional<MeasurementFixture> fixture;
   if (!tuneMeasurementInputs.empty()) {
     auto loadedFixture = loadMeasurementFixture(tuneMeasurementInputs);
@@ -820,16 +901,27 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
                                   ? tuning::SourceMode::ConcreteMicro
                                   : tuning::SourceMode::Synthetic;
   options.executable = true;
+  std::optional<tuning::MeasurementStore> measurementStore;
+  if (!tuneMeasurementStore.empty()) {
+    measurementStore.emplace(tuneMeasurementStore);
+    options.measurement.store = &*measurementStore;
+    options.measurement.reuseExact = tuneMeasurementReuse == "exact";
+  }
   if (fixture) {
+    options.measurement.protocol = {1, fixture->warmup, fixture->repeat};
+    options.measurement.environment = measurementEnvironment();
+    options.measurement.verification = {
+        fixture->content, "typed-fixture-verifier-v1",
+        sourceContract ? sourceContract->numericalContract : fixture->content};
     options.measurement.inputs = [fixture =
                                       *fixture](const ::llk::KernelAbi &abi)
         -> llvm::Expected<tuning::OwnedInvocationBuffers> {
       return makeFixtureBuffers(fixture, abi);
     };
-    options.measurement.measure =
+    options.measurement.measureDetailed =
         [warmup = fixture->warmup, repeat = fixture->repeat](
             const tuning::MappedMeasurementRequest &request)
-        -> llvm::Expected<std::optional<perf::CandidateMetrics>> {
+        -> llvm::Expected<std::optional<tuning::MappedMeasurementSamples>> {
       for (uint64_t i = 0; i < warmup; ++i)
         if (llvm::Error error =
                 request.executable.invoke(request.inputs, request.outputs))
@@ -845,13 +937,16 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
         samples.push_back(
             std::chrono::duration<double, std::nano>(end - begin).count());
       }
-      llvm::sort(samples);
-      double median = samples[samples.size() / 2];
-      if (samples.size() % 2 == 0)
-        median = (samples[samples.size() / 2 - 1] + median) / 2.0;
+      auto sorted = samples;
+      llvm::sort(sorted);
+      double median = sorted[sorted.size() / 2];
+      if (sorted.size() % 2 == 0)
+        median = sorted[sorted.size() / 2 - 1] / 2.0 + median / 2.0;
       perf::CandidateMetrics metrics;
       metrics.measuredNs = median;
-      return std::optional<perf::CandidateMetrics>(std::move(metrics));
+      return std::optional<tuning::MappedMeasurementSamples>(
+          tuning::MappedMeasurementSamples{std::move(metrics),
+                                           std::move(samples)});
     };
     options.measurement.verify =
         [fixture = *fixture](
@@ -974,7 +1069,7 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
       llvm::json::Object measured;
       measured["candidate_id"] = candidate.ranking.candidate.id;
       measured["measured_ns"] = *candidate.ranking.metrics.measuredNs;
-      measured["measured_ns_origin"] = "runtime-observation";
+      measured["measured_ns_origin"] = candidate.measurementOrigin;
       measured["warmup"] = fixture->warmup;
       measured["repeat"] = fixture->repeat;
       measured["identity"] = std::move(id);
@@ -1079,6 +1174,12 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
     out["rejected_by_legality"] = report->rejectedByLegality;
     out["rejected_by_mapping"] = report->rejectedByMapping;
     out["rejected_by_compile"] = report->rejectedByCompile;
+    if (measurementStore) {
+      out["measurement_record_hits"] = report->measurementRecordHits;
+      out["measurement_record_misses"] = report->measurementRecordMisses;
+      out["measurement_records_written"] = report->measurementRecordsWritten;
+      out["measurement_attempts"] = report->measurementAttempts;
+    }
     out["candidates"] = std::move(rows);
     std::error_code ec;
     llvm::raw_fd_ostream os(tuneMappingReport, ec);
@@ -1099,6 +1200,10 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
     observed["setup_policy"] = "fixture-values-before-timing";
     observed["timing_policy"] =
         "steady_clock-per-invocation; median of repeat samples";
+    observed["measurement_record_hits"] = report->measurementRecordHits;
+    observed["measurement_record_misses"] = report->measurementRecordMisses;
+    observed["measurement_records_written"] = report->measurementRecordsWritten;
+    observed["measurement_attempts"] = report->measurementAttempts;
     observed["records"] = std::move(measurements);
     std::error_code ec;
     llvm::raw_fd_ostream os(measurementPath, ec);

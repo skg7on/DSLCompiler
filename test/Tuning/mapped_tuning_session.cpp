@@ -15,18 +15,22 @@
 #include "LLK/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
+#include "LLK/Conversion/MicroMapping/MeasurementStore.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Parser/Parser.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 
 #include "gtest/gtest.h"
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <string>
 
@@ -938,6 +942,250 @@ TEST(MappedTuningSessionTest, GenericAcceleratorReportsPrimitiveBoundary) {
   }
   EXPECT_TRUE(sawNoRule) << report->rejected.front().rejectionReason;
   EXPECT_TRUE(sawPrimitive) << report->rejected.front().rejectionReason;
+}
+
+TEST(MappedTuningSessionTest,
+     PersistsOnlyVerifiedSamplesAndReusesExactRecords) {
+  mlir::DialectRegistry registry;
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect,
+                  mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                  mlir::tensor::TensorDialect, mlir::arith::ArithDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+  auto source = parseSource(context);
+  ASSERT_TRUE(source);
+  auto target = mlir::llk::target::avx2::createMappingTarget(LLK_SOURCE_DIR);
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+
+  using namespace mlir::llk::tuning;
+  MappedTuningOptions options;
+  options.source.sourceSymbol = "matmul";
+  options.source.sourceRootOrdinal = 0;
+  options.mapping.mode = mlir::llk::mapping::SearchMode::Exact;
+  options.mapping.topK = 4;
+  // The ARM test host can exercise the exact mapped executable contract with
+  // the reference backend. x86 exercises the target's selected AVX2 backend.
+#if defined(__x86_64__) || defined(_M_X64)
+  options.backend = ::llk::MappedBackend::SelectedTarget;
+#else
+  options.backend = ::llk::MappedBackend::Reference;
+#endif
+  std::vector<std::string> calls;
+  options.measurement.inputs = [&](const ::llk::KernelAbi &abi)
+      -> llvm::Expected<OwnedInvocationBuffers> {
+    calls.push_back("inputs");
+    OwnedInvocationBuffers owned;
+    auto allocate = [&](const ::llk::KernelAbi::Port &port,
+                        bool initialize) -> ::llk::InvocationBuffer2D {
+      const size_t count = static_cast<size_t>(port.shape[0] * port.shape[1]);
+      owned.storage.emplace_back(count * sizeof(float));
+      auto *data = reinterpret_cast<float *>(owned.storage.back().data());
+      for (size_t i = 0; i < count; ++i)
+        data[i] = initialize ? 3.0f : 0.0f;
+      return {{data, data, 0, port.shape[0], port.shape[1], port.shape[1], 1},
+              ::llk::InvocationElementType::F32,
+              count * sizeof(float)};
+    };
+    for (size_t i = 0; i < abi.inputs.size(); ++i) {
+      auto buffer = allocate(abi.inputs[i], i == 2);
+      if (i == 0)
+        std::fill_n(static_cast<float *>(buffer.descriptor.aligned),
+                    buffer.descriptor.size0 * buffer.descriptor.size1, 1.0f);
+      if (i == 1)
+        std::fill_n(static_cast<float *>(buffer.descriptor.aligned),
+                    buffer.descriptor.size0 * buffer.descriptor.size1, 2.0f);
+      owned.inputs.push_back(buffer);
+    }
+    for (const auto &port : abi.outputs)
+      owned.outputs.push_back(allocate(port, false));
+    return owned;
+  };
+
+  llvm::SmallString<128> directory;
+  ASSERT_FALSE(llvm::sys::fs::createUniqueDirectory("llk-d3", directory));
+  struct Cleanup {
+    llvm::StringRef directory;
+    ~Cleanup() { llvm::sys::fs::remove_directories(directory); }
+  } cleanup{directory};
+  MeasurementStore store(directory.str().str());
+  options.measurement.store = &store;
+  options.measurement.reuseExact = true;
+  options.measurement.protocol = {1, 1, 3};
+  options.measurement.environment = {
+      "test-host", "test-cpu", "test-isa", 1, "unpinned", "observed-default"};
+  options.measurement.verification = {"inputs=1,2,3;outputs=67;tol=0",
+                                      "scalar-f32-v1", "strict-f32"};
+  options.measurement.measureDetailed = [&](const MappedMeasurementRequest &r)
+      -> llvm::Expected<std::optional<MappedMeasurementSamples>> {
+    calls.push_back("measure");
+    EXPECT_NE(
+        r.identity.targetIdentity.find(
+            mlir::llk::machine::canonicalMachineString((*target)->machine())),
+        std::string::npos);
+    for (const auto &layout : (*target)->layouts().all())
+      EXPECT_NE(r.identity.targetIdentity.find(
+                    mlir::llk::mapping::printLayout(layout)),
+                std::string::npos);
+    for (const auto &rule : (*target)->rules().all())
+      EXPECT_NE(
+          r.identity.targetIdentity.find(mlir::llk::mapping::printRule(rule)),
+          std::string::npos);
+
+    if (auto error = r.executable.invoke(r.inputs, r.outputs))
+      return std::move(error);
+    MappedMeasurementSamples samples;
+    samples.metrics.measuredNs = 90.0;
+    samples.samplesNs = {80.0, 100.0, 90.0};
+    return std::optional<MappedMeasurementSamples>(samples);
+  };
+  options.measurement.verify =
+      [&](const MappedTuningCandidate &,
+          llvm::ArrayRef<::llk::InvocationBuffer2D>,
+          llvm::ArrayRef<::llk::InvocationBuffer2D> outputs) -> llvm::Error {
+    calls.push_back("verify");
+    for (int64_t i = 0; i < outputs.front().descriptor.size0 *
+                                outputs.front().descriptor.size1;
+         ++i)
+      if (static_cast<float *>(outputs.front().descriptor.aligned)[i] != 67.0f)
+        return llvm::createStringError("wrong output");
+    return llvm::Error::success();
+  };
+  options.measurement.recordSink =
+      [&](const mlir::llk::perf::MeasurementRecord &r) -> llvm::Error {
+    calls.push_back("persist");
+    EXPECT_TRUE(r.verified);
+    EXPECT_EQ(r.samplesNs, (std::vector<double>{80.0, 100.0, 90.0}));
+    EXPECT_EQ(r.medianNs, 90.0);
+    EXPECT_FALSE(r.prediction.measuredNs);
+    MeasurementLookup key{r.executableIdentity, r.environment, r.protocol,
+                          r.verification};
+    auto hit = store.lookup(key);
+    EXPECT_TRUE(bool(hit));
+    if (!hit)
+      return hit.takeError();
+    EXPECT_TRUE(hit->has_value()); // Observer runs after the durable write.
+    return llvm::Error::success();
+  };
+  auto space = oneCandidateSpace();
+  space.objective.primaryMetric = "measured_ns";
+  auto run = [&] {
+    return runMappedTuningSession(*source, space, testShape(), **target,
+                                  options);
+  };
+  auto fresh = run();
+  ASSERT_TRUE(bool(fresh)) << llvm::toString(fresh.takeError());
+  ASSERT_EQ(fresh->ranked.size(), 1u);
+  EXPECT_EQ(calls, (std::vector<std::string>{"inputs", "measure", "verify",
+                                             "persist"}));
+  EXPECT_EQ(fresh->measurementRecordsWritten, 1u);
+  EXPECT_EQ(fresh->measurementRecordMisses, 1u);
+  EXPECT_EQ(fresh->measurementAttempts, 1u);
+  EXPECT_EQ(fresh->ranked.front().measurementOrigin, "measured_runtime");
+  // Detailed providers must carry valid samples even with persistence disabled.
+  const auto persistentOptions = options.measurement;
+  options.measurement.store = nullptr;
+  options.measurement.reuseExact = false;
+  options.measurement.recordSink = {};
+  for (const auto &invalidSamples : std::vector<std::vector<double>>{
+           {},
+           {80.0, 100.0},
+           {-1.0, 100.0, 90.0},
+           {std::numeric_limits<double>::quiet_NaN(), 100.0, 90.0},
+           {std::numeric_limits<double>::infinity(), 100.0, 90.0},
+           {1.0, 2.0, 3.0}}) {
+    options.measurement.measureDetailed = [&](const MappedMeasurementRequest &r)
+        -> llvm::Expected<std::optional<MappedMeasurementSamples>> {
+      if (auto error = r.executable.invoke(r.inputs, r.outputs))
+        return std::move(error);
+      MappedMeasurementSamples samples;
+      samples.metrics.measuredNs = 90.0;
+      samples.samplesNs = invalidSamples;
+      return std::optional<MappedMeasurementSamples>(samples);
+    };
+    auto invalid = run();
+    ASSERT_TRUE(bool(invalid)) << llvm::toString(invalid.takeError());
+    EXPECT_TRUE(invalid->ranked.empty());
+    EXPECT_EQ(invalid->measurementRecordsWritten, 0u);
+  }
+  options.measurement = persistentOptions;
+  // Aggregate providers remain usable, but cannot persist reusable samples.
+  options.measurement.measureDetailed = {};
+  options.measurement.reuseExact = false;
+  options.measurement.measure = [&](const MappedMeasurementRequest &r)
+      -> llvm::Expected<std::optional<mlir::llk::perf::CandidateMetrics>> {
+    if (auto error = r.executable.invoke(r.inputs, r.outputs))
+      return std::move(error);
+    mlir::llk::perf::CandidateMetrics metrics;
+    metrics.measuredNs = 90.0;
+    return std::optional<mlir::llk::perf::CandidateMetrics>(metrics);
+  };
+  auto aggregate = run();
+  ASSERT_TRUE(bool(aggregate)) << llvm::toString(aggregate.takeError());
+  ASSERT_EQ(aggregate->ranked.size(), 1u);
+  EXPECT_EQ(aggregate->measurementRecordsWritten, 0u);
+  options.measurement.measureDetailed = persistentOptions.measureDetailed;
+  auto conflicting = run();
+  ASSERT_FALSE(bool(conflicting));
+  EXPECT_NE(llvm::toString(conflicting.takeError()).find("mutually exclusive"),
+            std::string::npos);
+  options.measurement = persistentOptions;
+  options.measurement.verification.verifierVersion.clear();
+  auto incomplete = run();
+  ASSERT_FALSE(bool(incomplete));
+  EXPECT_NE(llvm::toString(incomplete.takeError()).find("verifier_version"),
+            std::string::npos);
+  options.measurement = persistentOptions;
+
+  calls.clear();
+  auto reused = run();
+  ASSERT_TRUE(bool(reused)) << llvm::toString(reused.takeError());
+  ASSERT_EQ(reused->ranked.size(), 1u);
+  EXPECT_EQ(calls, (std::vector<std::string>{"inputs", "verify"}));
+  EXPECT_EQ(reused->measurementRecordHits, 1u);
+  EXPECT_EQ(reused->measurementAttempts, 0u);
+  EXPECT_EQ(reused->measurementRecordsWritten, 0u);
+  EXPECT_EQ(reused->ranked.front().measurementOrigin, "measured_record");
+  EXPECT_EQ(reused->ranked.front().ranking.metrics.measuredNs, 90.0);
+  for (const auto &placement : reused->ranked.front().plan.placements)
+    EXPECT_FALSE(placement.measuredCycles);
+
+  // A whole-kernel latency record cannot fabricate a missing secondary metric.
+  space.objective.secondaryMetrics = {"measured_gflops"};
+  auto missing = run();
+  ASSERT_TRUE(bool(missing)) << llvm::toString(missing.takeError());
+  EXPECT_TRUE(missing->ranked.empty());
+  EXPECT_EQ(missing->unrankable.size(), 1u);
+  space.objective.secondaryMetrics.clear();
+
+  calls.clear();
+  options.measurement.environment.threads = 2;
+  auto changed = run();
+  ASSERT_TRUE(bool(changed)) << llvm::toString(changed.takeError());
+  EXPECT_EQ(changed->measurementRecordHits, 0u);
+  EXPECT_EQ(changed->measurementRecordMisses, 1u);
+  EXPECT_EQ(changed->measurementRecordsWritten, 1u);
+
+  options.measurement.verify =
+      [&](const MappedTuningCandidate &,
+          llvm::ArrayRef<::llk::InvocationBuffer2D>,
+          llvm::ArrayRef<::llk::InvocationBuffer2D>) -> llvm::Error {
+    calls.push_back("verify");
+    return llvm::createStringError("bad numerical output");
+  };
+  calls.clear();
+  auto badHit = run();
+  ASSERT_TRUE(bool(badHit)) << llvm::toString(badHit.takeError());
+  EXPECT_TRUE(badHit->ranked.empty());
+  EXPECT_EQ(badHit->measurementRecordHits, 0u);
+  EXPECT_EQ(badHit->measurementRecordsWritten, 0u);
+  EXPECT_EQ(calls, (std::vector<std::string>{"inputs", "verify"}));
+  options.measurement.verification.fixtureContent += ";changed";
+  calls.clear();
+  auto failed = run();
+  ASSERT_TRUE(bool(failed)) << llvm::toString(failed.takeError());
+  EXPECT_TRUE(failed->ranked.empty());
+  EXPECT_EQ(failed->measurementRecordsWritten, 0u);
+  EXPECT_EQ(calls, (std::vector<std::string>{"inputs", "measure", "verify"}));
 }
 
 } // namespace

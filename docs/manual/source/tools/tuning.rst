@@ -148,9 +148,41 @@ the candidate; its shape/ports must match that particular instantiated source.
 Observations are written to ``<mapping-report>.measurements.json`` (or beside
 schedule output when no report is requested). They carry source/binding/plan,
 target/machine, ABI and execution identities. The static JSON report remains
-byte-identical to the same static-only run. This verified timing path is not a
-production measurement store, calibration fitter or prediction validator;
-those remain #51/#52.
+byte-identical to the same static-only run unless persistence is requested.
+
+To persist verified raw samples and allow exact reuse, also append:
+
+.. code-block:: bash
+
+   --measurement-store=measurements --measurement-reuse=exact
+
+Both options are opt-in: the default creates no store and reuse defaults to
+``off``. A store requires ``--measure-top > 0`` and a valid fixture. Only an
+exact match of the full source, bindings, plan, target, compiler, backend, ABI,
+host environment, protocol and fixture/verifier identity can reuse a record.
+The current executable must still compile, pass host/ABI checks, invoke once
+and verify its outputs. That verification invocation is not timed. Changes to
+fixture data, expected values or tolerances invalidate reuse. The CLI records
+observed CPU/features, allowed CPU affinity where available, and uncontrolled
+clock policy; it does not pin threads or control CPU frequency.
+
+The report and measurement sidecar expose ``measurement_record_hits``,
+``measurement_record_misses``, ``measurement_records_written`` and
+``measurement_attempts`` separately. Attempts count timing-provider calls;
+hits do not consume that count. Candidate traversal and ``measure-top`` bounds
+still apply. Sidecar latency origins are ``measured_runtime`` or
+``measured_record``; static candidate metrics retain their existing static
+origins (the session origin is ``predicted_static``). A record supplies only
+whole-kernel latency; it cannot supply missing throughput or event-level cycles.
+
+For API users, ``measureDetailed`` returns raw samples and aggregate metrics;
+it is mutually exclusive with the existing aggregate ``measure`` callback.
+Persistence requires explicit protocol, environment and verification metadata.
+Aggregate providers remain supported but cannot write reusable sample records.
+The borrowed store must outlive the synchronous session; ``recordSink`` observes
+only successful durable writes. Corrupt records and store I/O failures are
+errors. Calibration, automatic fitting and prediction validation remain separate
+work.
 
 Options and ranking
 -------------------
