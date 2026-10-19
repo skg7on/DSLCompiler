@@ -224,8 +224,10 @@ Work planned separately
 -----------------------
 
 PR #133 completes the #129 resource, runtime, mapped tuning and acceptance
-repair series within the supported bounded contract. Production measured-record
-persistence, calibration fitting and prediction-error validation remain #51/#52.
+repair series within the supported bounded contract. Phase D adds opt-in verified
+measurement persistence and exact reuse, plus held-out prediction-error reports;
+see :doc:`tools/tuning` and :doc:`tools/validation`. Calibration fitting and
+independently measured event attribution remain separate work.
 The generic accelerator package has static topology, movement and f32
 add/mul/sum conformance, not hardware execution. A direct MicroIR emulator and a
 broad Python/model execution frontend remain deferred. PF01's Python package and
