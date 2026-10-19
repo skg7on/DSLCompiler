@@ -91,6 +91,29 @@ input and output. See :source:`CI <.github/workflows/ci.yml>` and
 :source:`CMakeLists.txt <CMakeLists.txt>` for configuration and
 :source:`test/CMakeLists.txt <test/CMakeLists.txt>` for test registration.
 
+.. _contributing-python-frontend-tests:
+
+Run Python frontend checks
+--------------------------
+
+Use the project ``.venv`` interpreter by absolute path while working in an isolated
+worktree. The :doc:`Python frontend guide </python-frontend>` records setup and
+the current Python 3.14.8 / Torch 2.14.1 environment alongside the separately
+verified Python 3.11/3.12 + Torch 2.9.0 reference matrix.
+
+.. code-block:: sh
+
+   export LLK_PYTHON=/absolute/path/to/DSLCompiler/.venv/bin/python
+   "$LLK_PYTHON" -m pip install -e './python[test]'
+   "$LLK_PYTHON" -m pytest
+
+Default discovery selects ``test/python``. The real-Torch tests must execute;
+missing Torch or wheel-build dependencies are setup failures. Wheel tests also
+exercise a clean Torch-absent environment outside the checkout. PF01 has 21
+passing Python tests; native frontend execution and required CMake/CI execution
+lanes remain later milestones. Keep native compiler checks separate and report
+their skips and target identities as above.
+
 .. _contributing-source-file-headers:
 
 Match the source file header convention

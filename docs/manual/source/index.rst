@@ -20,6 +20,7 @@ the options, output contracts, and failure modes in detail.
    architecture
    features
    getting-started
+   python-frontend
 
 .. toctree::
    :hidden:
@@ -66,6 +67,9 @@ Choose a starting point
    * - Explore schedule choices
      - :doc:`Tuning tutorial </tutorials/04-tuning>`
      - :doc:`Tuner manual </tools/tuning>`
+   * - Develop the Python frontend
+     - :doc:`Python frontend </python-frontend>`
+     - Project ``.venv`` setup, PF01 tests and current capability boundaries
    * - Extend a compiler component or target
      - :doc:`Architecture </architecture>`
      - :doc:`Contributor guide </contributing>`

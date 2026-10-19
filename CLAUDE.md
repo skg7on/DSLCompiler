@@ -38,6 +38,49 @@ The compiler is the `clang` on `PATH` — on macOS that is Homebrew's clang, not
 
 CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned LLVM source, so the full registered suite runs. Local LLVM builds must use `-DLLVM_BUILD_UTILS=ON`; configuration fails when `LLK_BUILD_TOOLS=ON` and a matching `FileCheck` is unavailable. `check-llk` is a thin wrapper over CTest, so it runs exactly the registered suite — run it locally before trusting a change.
 
+## Python frontend environment and tests
+
+Use the project-level `.venv` for Python frontend work, rather than an ambient
+Python or a pipx application environment. When working in an isolated worktree,
+point `LLK_PYTHON` at the existing project `.venv/bin/python` with an absolute
+path; keep source edits and generated artifacts in that worktree. An environment
+at the root checkout can be shared for these Python checks; each compiler build
+still belongs to its own worktree.
+
+```bash
+# Run from the isolated worktree root; adjust this interpreter path.
+export LLK_PYTHON=/absolute/path/to/DSLCompiler/.venv/bin/python
+"$LLK_PYTHON" -m pip install -e './python[test]'
+"$LLK_PYTHON" -m pytest
+"$LLK_PYTHON" -m pytest test/python/test_torch_registration.py test/python/test_package_install.py -q
+```
+
+The current local snapshot (2026-10-19) is Python 3.14.8, Torch 2.14.1,
+NumPy 2.5.4, pytest 9.1.1, build 1.6.1, setuptools 84.0.0 and wheel 0.48.0.
+Torchvision 0.29.1 and torchaudio 2.11.0 also import successfully but are optional
+for PF01. The full PF01 suite passes 21/21 in this project `.venv`. Preserve the
+separate Python 3.11/3.12 + Torch 2.9.0 reference matrix; use `[test]` with the
+current environment and `[torch-test]` only when selecting that reference Torch
+version. The checked-in compatibility manifest records the reference matrix,
+not every installed environment.
+
+PF01 delivers packaging, optional imports, stable registration, ownership checks,
+structured errors and truthful capability reporting. `llk.torch.get_backend()`
+is the registered singleton; importing/reloading must not reset global Dynamo
+state or replace another owner's backend. Native execution raises
+`UnsupportedFeatureError(code="native_backend_unavailable")`; actual
+`torch.compile` wraps it in `BackendCompilerFailed.inner_exception`. Do not count
+registration or eager execution as LLK compilation. Typed capture/native JIT,
+Inductor, training and real upstream Triton remain later tasks under #203.
+
+`pytest.ini` restricts default discovery to `test/python` and adds the local
+`python/` package path. Do not run vendored GoogleTest Python tests as project
+frontend acceptance. The package tests build/install a real wheel in a clean
+Torch-absent environment; registration tests require real Torch and must not
+skip. Python frontend tests are separate from `check-llk`; required native/CI
+integration remains PF20. See the [frontend guide](docs/manual/source/python-frontend.rst)
+and [PF01 environment evidence](docs/reviews/2026-10-19-pf01-python-environment.md).
+
 ## Architecture
 
 **Primary framework path:** semantic/structured input or directly authored MicroIR → source/schedule candidates → workload graph → mapping/covering search → complete-plan materialization and shared feasibility/analysis → selected bound MicroIR → target lowering/execution or performance reports. Current LLK semantic export covers matmul and fused SwiGLU; general structured/Linalg import remains future work.
@@ -90,7 +133,7 @@ CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned
 
 Historical milestone numbers record delivery order. Future goals are framework capabilities: broader workload/import and search contracts, explicit modeling coverage, primitive/target extension, analysis parity, measured feedback/calibration and wider runtime integration as required. Choose example operators to test those capabilities.
 
-M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, specialization/tuning, RoPE + Attention). M7 (Python frontend) deferred.
+M1–M6 complete (CPU pipeline, AVX2 vector, fused memory, parallel dispatch, specialization/tuning, RoPE + Attention). Python frontend PF01 packaging/registration is implemented in PR #233; executable frontend milestones remain tracked by #203.
 
 **M9–M12 and mapped acceptance:** PR #133 merged on 2026-10-11 at `5ee61b193d85b873497e9a7aecbd07f1fea73c55`. It implements the #129 resource, execution and tuning repair series: concrete selected resource identity, feasibility before top-K, per-hop storage/lifetimes, per-engine DMA scheduling, selected-plan/materialized static parity, typed invocation and scratch ownership, explicit selected-width/fused lowering, and original-source mapped tuning with frozen replay.
 

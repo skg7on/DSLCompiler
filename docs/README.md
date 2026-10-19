@@ -18,4 +18,16 @@ The proposed [dynamic-shape design](superpowers/specs/2026-10-17-dynamic-shape-l
 
 The framework specification governs project-level goal/scope statements in earlier specs. Detailed subsystem contracts remain applicable where consistent with it. Milestone plans and revision-pinned reviews preserve history and evidence; the [historical CPU architecture](design/legacy-cpu-architecture.md) records the original validation design.
 
-The proposed [Python frontend refinement design](superpowers/specs/2026-10-18-python-frontend-refinement-design.md) and [20-task implementation plan](superpowers/plans/2026-10-18-python-frontend-refinement.md) address the [revision-pinned frontend review](reviews/2026-10-18-python-triton-inductor-gap-assessment.md). They separate executable LLK decorators, strict Dynamo compilation, Inductor external kernels and genuine upstream Triton integration; these documents do not deliver those capabilities.
+The [Python frontend guide](manual/source/python-frontend.rst) records PF01's
+installable package, safe Dynamo registration, structured errors, project-level
+`.venv` setup and current capability limits. The
+[PF01 environment evidence](reviews/2026-10-19-pf01-python-environment.md) records
+21 passing tests with Python 3.14.8 / Torch 2.14.1 and the separately tested
+Python 3.11/3.12 + Torch 2.9.0 reference matrix.
+
+The [Python frontend refinement design](superpowers/specs/2026-10-18-python-frontend-refinement-design.md)
+and [20-task implementation plan](superpowers/plans/2026-10-18-python-frontend-refinement.md)
+address the [revision-pinned frontend review](reviews/2026-10-18-python-triton-inductor-gap-assessment.md).
+PF01 is implemented in PR #233; the remaining executable decorator, strict Dynamo,
+Inductor external-kernel and genuine upstream Triton milestones remain proposals
+under #203. Their design text is not execution evidence.

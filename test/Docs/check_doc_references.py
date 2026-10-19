@@ -30,10 +30,13 @@ import sys
 # follow literally.
 DOCS = [
     "README.md",
+    "CLAUDE.md",
+    "python/README.md",
     "docs/README.md",
     "docs/manual/README.md",
     "docs/manual/source/index.rst",
     "docs/manual/source/getting-started.rst",
+    "docs/manual/source/python-frontend.rst",
     "docs/manual/source/concepts.rst",
     "docs/manual/source/architecture.rst",
     "docs/manual/source/features.rst",
@@ -53,6 +56,7 @@ DOCS = [
     "docs/manual/source/tutorials/04-tuning.rst",
     "docs/design/micro-ir-mapping-workflow.md",
     "docs/reviews/issue67-final-acceptance.md",
+    "docs/reviews/2026-10-19-pf01-python-environment.md",
 ]
 
 # The tools whose documented flags are checked, keyed by the basename a command

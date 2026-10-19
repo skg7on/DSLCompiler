@@ -1,17 +1,12 @@
-"""PyTorch Dynamo backend for the LLK compiler.
+"""Optional Dynamo registration; native LLK compilation remains unavailable.
 
-Usage:
-    import torch
-    import llk.torch  # registers backend="llk"
-    model = torch.compile(model, backend="llk")
-
-Importing this package also calls ``register()`` so the backend is available
-without an explicit call. If PyTorch is not installed the import still
-succeeds and registration is a no-op.
+Import registers ``backend="llk"`` idempotently when Torch is installed.
+Calling it raises ``UnsupportedFeatureError`` with ``native_backend_unavailable``.
+Without Torch, import succeeds and registration is a no-op.
 """
 
-from ._dynamo_backend import LLKBackend, register
+from ._dynamo_backend import LLKBackend, get_backend, register
 
 register()
 
-__all__ = ["LLKBackend", "register"]
+__all__ = ["LLKBackend", "get_backend", "register"]

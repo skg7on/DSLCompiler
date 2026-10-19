@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llk-compiler"
+version = "0.1.0"
+description = "Python frontend prototype for the LLK MicroIR compiler"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0 WITH LLVM-exception"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "build>=1.2", "setuptools>=77", "wheel"]
+torch-test = ["torch==2.9.0", "pytest>=8,<10"]
+
+[project.urls]
+Repository = "https://github.com/skg7on/DSLCompiler"
+Documentation = "https://skg7on.github.io/DSLCompiler/"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["llk", "llk.*"]
+
+[tool.setuptools.package-data]
+llk = ["compatibility.json"]
