@@ -11,6 +11,7 @@ add_llk_library(LLKPerf
     CandidateGenerator.cpp
     Legality.cpp
     MeasurementRecord.cpp
+    PredictionValidation.cpp
     CandidateBinding.cpp
     ScheduleRecord.cpp
     TuningSession.cpp

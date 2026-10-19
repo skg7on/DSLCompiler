@@ -287,7 +287,10 @@ the unified LLVM conversion pipeline after structural/vector lowering.
 
 The :source:`PR #133 acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
 records selected x86_64 AVX2 execution, static parity and retained legacy skips.
-Production measurement persistence and calibrated prediction remain #51/#52.
+Phase D adds opt-in verified whole-kernel records and exact reuse through
+:doc:`tools/tuning`, with held-out prediction-error reports through
+:doc:`tools/validation`. These reports retain the uncalibrated static model;
+model fitting and independently measured event attribution remain separate work.
 
 For the established CPU pipeline's detailed scheduling and runtime design, see
 :source:`historical CPU architecture <docs/design/legacy-cpu-architecture.md>`.

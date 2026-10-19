@@ -440,9 +440,9 @@ State these plainly so no reader infers a capability from a neighbouring one:
   semantics; the versioned report names the machine, layout, rule, target and
   graph hashes it searched.
 
-## #51 / #52 handoff
+## #51 / #52 handoff (PR #133 snapshot)
 
-This epic provides the *executable candidate and key/event hooks*; it does not
+At PR #133 this epic provided the *executable candidate and key/event hooks*; it did not
 claim production measurement, calibration or prediction validation, which remain
 #51/#52's work:
 
@@ -456,6 +456,12 @@ claim production measurement, calibration or prediction validation, which remain
 What is *not* done: persisting measured records, fitting calibration, and
 validating predictions against measured hardware. A measured number that
 disagrees with the static model is #51/#52's to reconcile, not a defect here.
+
+The later Phase D record/report increment is documented in
+[the D4 acceptance review](issue164-prediction-validation.md): verified records,
+explicit exact reuse and held-out prediction-error reporting are delivered by
+D1–D4. Model fitting and independently measured event attribution remain separate;
+the historical snapshot above does not describe current persistence support.
 
 ## Reproducing
 

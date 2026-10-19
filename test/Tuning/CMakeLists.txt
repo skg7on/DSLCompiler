@@ -38,3 +38,16 @@ if(LLK_BUILD_E2E_TESTS)
           $<TARGET_FILE:llk-tune> $<TARGET_FILE:llk-compile>
           ${CMAKE_SOURCE_DIR})
 endif()
+
+if(LLK_BUILD_TOOLS)
+  add_test(NAME PredictionValidationCLI
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/prediction_validation_cli.py
+          $<TARGET_FILE:llk-validate>)
+endif()
+
+if(LLK_BUILD_TOOLS AND LLK_BUILD_E2E_TESTS)
+  add_test(NAME PredictionValidationMappedCLI
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/prediction_validation_mapped_cli.py
+          $<TARGET_FILE:llk-tune> $<TARGET_FILE:llk-validate> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_BINARY_DIR}/prediction-validation-evidence)
+endif()

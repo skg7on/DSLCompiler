@@ -1,0 +1,87 @@
+{
+  "calibrated": false,
+  "compared_record_count": 2,
+  "excluded_record_count": 1,
+  "groups": [
+    {
+      "calibrated": false,
+      "compared_record_count": 2,
+      "excluded": [
+        "complete-fixture-identity-unknown-clock: no_prediction_time_basis"
+      ],
+      "excluded_record_count": 1,
+      "measurement_origin": "verified_measurement_record",
+      "median_absolute_relative_error": 0.375,
+      "p90_absolute_relative_error": 0.5,
+      "prediction_origin": "predicted_static",
+      "record_count": 3,
+      "regime": {
+        "backend_identity": "synthetic-selected-backend-complete-content-v1",
+        "bottleneck": "fixture-compute",
+        "candidate_bindings": "T0=4,T1=8",
+        "compiler_version": "fixture-compiler-v1",
+        "environment": {
+          "affinity": "fixture",
+          "architecture": "synthetic",
+          "clock_policy": "deterministic-fixture",
+          "cpu_identity": "fixture-cpu",
+          "isa": "fixture-isa",
+          "threads": 1
+        },
+        "protocol": {
+          "repeat": 3,
+          "scope": "per_invocation",
+          "statistic": "median",
+          "timer": "steady_clock",
+          "version": 1,
+          "warmup": 2
+        },
+        "source_adapter": "synthetic-statistics-fixture-v1",
+        "target_identity": "synthetic-target-complete-content-v1",
+        "verification": {
+          "fixture_content": "complete-arithmetic-test-fixture",
+          "numerical_contract": "strict-f32",
+          "verifier_version": "fixture-v1"
+        },
+        "workload_contract": "fixture-contract:f32:shape=[8,16]"
+      },
+      "rows": [
+        {
+          "absolute_error_ns": 20,
+          "absolute_relative_error": 0.25,
+          "identity": "complete-fixture-identity-a",
+          "measured_ns": 80,
+          "predicted_ns": 100,
+          "signed_relative_error": 0.25
+        },
+        {
+          "absolute_error_ns": 100,
+          "absolute_relative_error": 0.5,
+          "identity": "complete-fixture-identity-b",
+          "measured_ns": 200,
+          "predicted_ns": 100,
+          "signed_relative_error": -0.5
+        }
+      ],
+      "sample_count": 9,
+      "status": "ok",
+      "version": 1
+    }
+  ],
+  "held_out": true,
+  "holdout_identity_count": 3,
+  "input_files": [
+    "test/Tuning/Inputs/prediction_validation/a.json",
+    "test/Tuning/Inputs/prediction_validation/b.json",
+    "test/Tuning/Inputs/prediction_validation/unknown-clock.json"
+  ],
+  "input_record_count": 3,
+  "not_in_holdout_count": 0,
+  "record_count": 3,
+  "sample_count": 9,
+  "status": "ok",
+  "training_calibration_identity_count": 0,
+  "version": 1,
+  "fixture_only": true,
+  "note": "Synthetic arithmetic baseline, not measured hardware accuracy; input paths normalized relative to the repository."
+}

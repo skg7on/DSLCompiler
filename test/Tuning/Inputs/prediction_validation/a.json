@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "executable_identity": "complete-fixture-identity-a",
+  "executable_hash": "11496843150160985193",
+  "target_identity": "synthetic-target-complete-content-v1",
+  "backend_identity": "synthetic-selected-backend-complete-content-v1",
+  "environment": {
+    "architecture": "synthetic",
+    "cpu_identity": "fixture-cpu",
+    "isa": "fixture-isa",
+    "threads": 1,
+    "affinity": "fixture",
+    "clock_policy": "deterministic-fixture"
+  },
+  "protocol": {
+    "version": 1,
+    "warmup": 2,
+    "repeat": 3,
+    "timer": "steady_clock",
+    "statistic": "median",
+    "scope": "per_invocation"
+  },
+  "verification": {
+    "fixture_content": "complete-arithmetic-test-fixture",
+    "verifier_version": "fixture-v1",
+    "numerical_contract": "strict-f32"
+  },
+  "verified": true,
+  "samples_ns": [
+    80,
+    80,
+    80
+  ],
+  "median_ns": 80,
+  "prediction": {
+    "predicted_cycles": 300,
+    "predicted_ns": 100
+  },
+  "source_adapter": "synthetic-statistics-fixture-v1",
+  "workload_contract": "fixture-contract:f32:shape=[8,16]",
+  "candidate_bindings": "T0=4,T1=8",
+  "bottleneck": "fixture-compute",
+  "timestamp_utc": "2026-10-19T00:00:00Z",
+  "compiler_version": "fixture-compiler-v1"
+}

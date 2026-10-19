@@ -64,3 +64,7 @@ target_link_libraries(micro-perf PRIVATE LLKBuildOptions
     LLKDialect
     LLK::MLIR
 )
+
+# Tool: llk-validate (verified-record statistics; no runtime/JIT integration)
+add_executable(llk-validate llk-validate/llk-validate.cpp)
+target_link_libraries(llk-validate PRIVATE LLKBuildOptions LLKPerf)

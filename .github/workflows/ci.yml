@@ -132,3 +132,4 @@ jobs:
             build/test/SelectedVectorWidth/selected-width-*.mlir
             build/test/SelectedVectorWidth/selected-fused.mlir
             build/selected-execution-evidence/*
+            build/prediction-validation-evidence/
