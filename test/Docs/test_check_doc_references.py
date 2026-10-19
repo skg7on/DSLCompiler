@@ -162,7 +162,9 @@ class DocReferencesTest(unittest.TestCase):
 
     def test_cli_checks_rst_corpus_and_infers_sibling_benchmark(self):
         docs = [
-            "README.md", "docs/README.md", "docs/manual/README.md", "docs/manual/source/index.rst", "docs/manual/source/getting-started.rst",
+            "README.md", "CLAUDE.md", "python/README.md", "docs/README.md",
+            "docs/manual/README.md", "docs/manual/source/index.rst", "docs/manual/source/getting-started.rst",
+            "docs/manual/source/python-frontend.rst",
             "docs/manual/source/concepts.rst", "docs/manual/source/architecture.rst", "docs/manual/source/features.rst",
             "docs/manual/source/contributing.rst", "docs/manual/source/building-docs.rst",
             "docs/manual/source/examples/index.rst", "docs/manual/source/tools/index.rst",
@@ -173,6 +175,7 @@ class DocReferencesTest(unittest.TestCase):
             "docs/manual/source/tutorials/03-performance.rst", "docs/manual/source/tutorials/04-tuning.rst",
             "docs/design/micro-ir-mapping-workflow.md",
             "docs/reviews/issue67-final-acceptance.md",
+            "docs/reviews/2026-10-19-pf01-python-environment.md",
         ]
         for doc in docs:
             self.write(doc, "")

@@ -95,6 +95,10 @@ What you can do today
      - ``llk-bench`` runs a synthetic host loop and reports timing
      - It does not parse MLIR, load weights, invoke a compiled kernel or use the JIT; thread-pool setup occurs per invocation
      - :doc:`Benchmark </tools/benchmark>`
+   * - Install and inspect the Python frontend
+     - ``llk-compiler`` packaging, optional Torch imports, stable Dynamo registration, structured errors and explicit capability reporting (PF01)
+     - Backend calls report ``native_backend_unavailable``; native Python JIT, Inductor and upstream Triton execution remain later milestones
+     - :doc:`Python frontend </python-frontend>`
    * - Explore a second target
      - Generic accelerator topology, layouts, rules and mapping through the same canonical IR; static f32 add/mul/sum coverage with operation-aware validation
      - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered; accelerator mul/sum emitters verify only
@@ -220,7 +224,9 @@ repair series within the supported bounded contract. Production measured-record
 persistence, calibration fitting and prediction-error validation remain #51/#52.
 The generic accelerator package has static topology, movement and f32
 add/mul/sum conformance, not hardware execution. A direct MicroIR emulator and a
-broad Python/model frontend remain deferred.
+broad Python/model execution frontend remain deferred. PF01's Python package and
+registration foundation is available separately; see :doc:`python-frontend` for
+its tested environment and explicit execution boundary.
 
 Selected AVX2 acceptance for PR #133 passed 13/13 without required skips. The
 current framework review records the later increments and their exact local and

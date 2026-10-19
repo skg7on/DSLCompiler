@@ -12,7 +12,17 @@
 
 **Review:** [Revision-pinned gap assessment](../../reviews/2026-10-18-python-triton-inductor-gap-assessment.md).
 
-**Baseline/status:** `13cef9c`; proposed work, all task boxes unchecked. Paths below describe future files unless marked Modify. Implementation has not started.
+**Baseline/status (2026-10-19):** Original planning baseline `13cef9c`. PF01 is
+implemented at `ffc55f5` in [PR #233](https://github.com/skg7on/DSLCompiler/pull/233),
+independently reviewed and pending merge; its checked steps record branch
+implementation and verification. PF02–PF20 remain proposed and unchecked. Paths
+in those later tasks describe future files unless marked Modify.
+
+**Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
+2.14.1 / NumPy 2.5.4). PF01 passes 21 tests with that interpreter as well as
+21 per original Python 3.11/3.12 + Torch 2.9.0 reference configuration. See the
+[current frontend guide](../../manual/source/python-frontend.rst) and
+[verification record](../../reviews/2026-10-19-pf01-python-environment.md).
 
 ## Global constraints
 
@@ -96,7 +106,16 @@ Inspection stages: `frontend`, `llk`, `micro`; unavailable `asm` returns `inspec
 
 ## Implementation build setup
 
-At implementation time, configure a fresh worktree build against the approved LLVM tree, then build only the targets named by the current task. PF07 introduces `LLK_BUILD_PYTHON_CAPI`; from PF07 onward configure with `-DLLK_BUILD_PYTHON_CAPI=ON`. Use an isolated Python 3.11 or 3.12 environment, `python -m pip install -e ./python`, and the task's optional integration dependencies. Export `LLK_FRONTEND_LIBRARY` to that worktree's actual shared-library output before native pytest commands. PF20 registers these settings in CMake/CI. None of this setup runs as part of the present documentation-only change.
+For Python frontend development, use the project `.venv` interpreter by absolute
+path from the isolated worktree and install `./python[test]` there as described in
+the current guide. Preserve separate Python 3.11/3.12 + Torch 2.9.0 environments
+for the reference matrix; `[torch-test]` selects that reference Torch version.
+PF01 needs no native build. For later native tasks, configure a fresh worktree
+build against the approved LLVM tree and build only the named targets. PF07
+introduces `LLK_BUILD_PYTHON_CAPI`; from PF07 onward configure with
+`-DLLK_BUILD_PYTHON_CAPI=ON` and export `LLK_FRONTEND_LIBRARY` to that worktree's
+actual shared-library output. PF20 registers those native settings in CMake/CI.
+The current `.venv` qualification does not establish those future native lanes.
 
 ## Milestone A — repair boundaries and establish the shared contract
 
@@ -106,7 +125,7 @@ At implementation time, configure a fresh worktree build against the approved LL
 
 **Interfaces:** Produce named exception classes above and `register() -> None`. Until native compilation lands, backend execution raises `UnsupportedFeatureError(code="native_backend_unavailable")` rather than returning `gm.forward`. Registration uses the same singleton instance for public reporting and the registry.
 
-- [ ] Write real-Torch subprocess tests for import, repeated `register()` and reload; spy on `torch._dynamo.reset` and assert zero calls. Assert lookup returns the LLK callable. With Torch absent, `import llk` and `import llk.torch` succeed without registration. Add the package install test in a clean venv.
+- [x] Write real-Torch subprocess tests for import, repeated `register()` and reload; spy on `torch._dynamo.reset` and assert zero calls. Assert lookup returns the LLK callable. With Torch absent, `import llk` and `import llk.torch` succeed without registration. Add the package install test in a clean venv.
 
 Pinned regression assertions (local test fixture names):
 
@@ -115,10 +134,10 @@ assert callable(torch._dynamo.lookup_backend("llk"))
 assert reset_spy.call_count == 0
 ```
 
-- [ ] Run `python -m pytest test/python/test_torch_registration.py test/python/test_package_install.py -q`; confirm failures include the existing `eager` keyword/API behavior, not missing Torch in the required Torch lane.
-- [ ] Add setuptools packaging from `python/`, optional Torch test dependencies and the explicit initial compatibility manifest. Use `register_backend(compiler_fn=instance, name="llk")`, an idempotent ownership check and no global reset. Do not overwrite an unrelated registered backend with the same name.
-- [ ] Run the tests in Torch-present and Torch-absent environments; wheel import and named lookup must pass; invoking the prototype must explicitly report its unavailable native capability.
-- [ ] Stage this task's files and commit `fix: package frontend and repair Dynamo registration`.
+- [x] Run `python -m pytest test/python/test_torch_registration.py test/python/test_package_install.py -q`; confirm failures include the existing `eager` keyword/API behavior, not missing Torch in the required Torch lane.
+- [x] Add setuptools packaging from `python/`, optional Torch test dependencies and the explicit initial compatibility manifest. Use `register_backend(compiler_fn=instance, name="llk")`, an idempotent ownership check and no global reset. Do not overwrite an unrelated registered backend with the same name.
+- [x] Run the tests in Torch-present and Torch-absent environments; wheel import and named lookup must pass; invoking the prototype must explicitly report its unavailable native capability.
+- [x] Stage this task's files and commit `fix: package frontend and repair Dynamo registration`.
 
 ### PF02: Repair unsafe legacy Triton pass behavior
 

@@ -131,6 +131,35 @@ Exporting IR does not execute a kernel. Target-aware tuning instantiates the sel
 | `llk-tune` | [Search and persist schedule candidates](docs/manual/source/tools/tuning.rst) |
 | `llk-bench` | [Exercise a synthetic host timing harness](docs/manual/source/tools/benchmark.rst) |
 
+## Python frontend
+
+PF01 provides the installable `llk-compiler` package, optional Torch imports,
+idempotent `llk` Dynamo registration, structured errors and `llk.capabilities()`.
+Calling the backend raises `native_backend_unavailable`; executable Python JIT,
+Inductor composition and upstream Triton launches remain tracked by
+[#203](https://github.com/skg7on/DSLCompiler/issues/203).
+
+Use the project-level `.venv` for Python frontend work. The local environment
+verified on 2026-10-19 uses **Python 3.14.8, Torch 2.14.1 and NumPy 2.5.4**;
+all **21 PF01 Python tests pass**. Python 3.11/3.12 with Torch 2.9.0 remains the
+separately tested reference matrix. See the
+[Python frontend guide](docs/manual/source/python-frontend.rst) for setup,
+capabilities and the exact environment snapshot.
+
+Run from your isolated worktree, setting `LLK_PYTHON` to the existing project
+environment's absolute interpreter path:
+
+```bash
+export LLK_PYTHON=/absolute/path/to/DSLCompiler/.venv/bin/python
+"$LLK_PYTHON" -m pip install -e './python[test]'
+"$LLK_PYTHON" -m pytest
+```
+
+The `[test]` extra installs test/build tools while preserving the environment's
+Torch version. `[torch-test]` selects Torch 2.9.0 for the Python 3.11/3.12 reference
+matrix. Root pytest discovery selects `test/python`; compiler tests still use
+`check-llk`. Package details are in [python/README.md](python/README.md).
+
 ## Contribute
 
 Read [CLAUDE.md](CLAUDE.md) and the [contributor guide](docs/manual/source/contributing.rst). Create a worktree under `.claude/worktrees/` with a branch such as **feat/tile-operation**, **fix/mapping-route**, or **docs/tutorial-update**.
@@ -144,7 +173,7 @@ Read [CLAUDE.md](CLAUDE.md) and the [contributor guide](docs/manual/source/contr
 - **Generalize workload and search contracts:** extend structured import and source-candidate schemas beyond the current M/N/K contraction template; use non-contraction fixtures to prove the extension.
 - **Extend framework conformance:** broaden primitive, dtype, layout, movement/topology and target-emitter coverage while preserving the [PR #133 acceptance contract](docs/reviews/issue67-final-acceptance.md). Select operators to test reusable capabilities.
 - **Add measured feedback and calibration:** persist measurements, fit cost models, and validate prediction error ([#51](https://github.com/skg7on/DSLCompiler/issues/51), [#52](https://github.com/skg7on/DSLCompiler/issues/52)).
-- **Broaden frontend and target coverage:** expand semantic import and GPU/NPU/systolic/custom accelerator backends. A general Python frontend and direct Micro-IR emulator remain deferred.
+- **Broaden frontend and target coverage:** build on PF01's Python packaging/registration foundation toward executable LLK decorators, Dynamo/Inductor and upstream Triton integration ([#203](https://github.com/skg7on/DSLCompiler/issues/203)); expand semantic import and GPU/NPU/systolic/custom accelerator backends. A general Python execution frontend and direct Micro-IR emulator remain deferred.
 
 Follow the [project tracker](https://github.com/skg7on/DSLCompiler/issues/41) for sequencing and status.
 

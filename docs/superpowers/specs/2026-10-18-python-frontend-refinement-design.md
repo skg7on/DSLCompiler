@@ -2,7 +2,12 @@
 
 **Date:** 2026-10-18
 
-**Status:** Proposed for implementation review; no functionality delivered by this document.
+**Status (2026-10-19):** PF01 packaging/registration is implemented in
+[PR #233](https://github.com/skg7on/DSLCompiler/pull/233), pending merge. Remaining
+capabilities are proposed. The [current frontend guide](../../manual/source/python-frontend.rst)
+and [environment evidence](../../reviews/2026-10-19-pf01-python-environment.md)
+describe the project `.venv` and verified PF01 behavior; this design does not
+establish native execution support.
 
 **Baseline:** `13cef9c` (main, after #200).
 
@@ -35,6 +40,12 @@ The first Inductor integration uses `torch.library.custom_op` CPU implementation
 Review closure means every advertised capability either executes correctly or is rejected at a documented boundary. It does not mean all operations in the old proposal become supported. Atomics, asynchronous/shared-memory programs, arbitrary reduction/control-flow patterns, arbitrary ranks/strides, CUDA execution and model-wide dynamic shapes remain unsupported until separately implemented. The upstream integration milestone remains open until a real upstream kernel runs; importing a wrapper or reusing its Python source does not close it.
 
 ## 3. Supported initial envelope
+
+The planned reference envelope below retains Python 3.11/3.12 + Torch 2.9.0.
+Current local development uses the project `.venv` with Python 3.14.8, Torch
+2.14.1 and NumPy 2.5.4, separately verified for PF01's 21 tests. This additional
+package/registration evidence does not qualify the proposed native, Inductor or
+upstream Triton milestones on that environment.
 
 - Python 3.11 and 3.12; C++20. CI LLVM/MLIR 22.1.8 and the repository's local LLVM 24+ lane. Use version guards where APIs differ.
 - Initial real-framework compatibility baseline: Torch 2.9.0; optional upstream Triton 3.5.0 on Linux x86_64. These are deliberately pinned initial validation versions, not a claim about the newest releases. Their pairing is recorded by [PyTorch's version file](https://github.com/pytorch/pytorch/blob/v2.9.0/.ci/docker/triton_version.txt). Qualify additional releases independently.

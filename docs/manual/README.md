@@ -8,6 +8,7 @@ HTML copy to keep in sync, and none to open from a plain checkout.
 |---|---|
 | [`source/index.rst`](source/index.rst) | Manual entry point and table of contents |
 | [`source/`](source/) | RST guides, tool references, and tutorials |
+| [`source/python-frontend.rst`](source/python-frontend.rst) | PF01 scope, project `.venv`, verified versions and Python tests |
 | [`source/examples/`](source/examples/) | Checked-in MLIR tutorial inputs |
 | [`source/conf.py`](source/conf.py) | Sphinx configuration |
 | [`requirements.txt`](requirements.txt) | Pinned documentation dependencies; Python 3.12+ |
