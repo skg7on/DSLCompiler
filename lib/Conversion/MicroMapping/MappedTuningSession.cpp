@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <ctime>
 #include <functional>
 #include <limits>
 #include <map>
@@ -173,7 +174,7 @@ bool buffersAreOwned(const OwnedInvocationBuffers &buffers) {
 }
 
 MappedMeasurementIdentity
-makeMeasurementIdentity(const MappedTuningCandidate &candidate,
+makeMeasurementIdentity(ModuleOp source, const MappedTuningCandidate &candidate,
                         const CandidateInstance &instance,
                         const ::llk::MappedCompilation &compiled,
                         const mapping::MappingTarget &target) {
@@ -311,6 +312,11 @@ makeMeasurementIdentity(const MappedTuningCandidate &candidate,
     appendField(canonical, key);
   for (const std::string &key : identity.connectionKeys)
     appendField(canonical, key);
+  // Full source and instantiated content guard against short-hash collisions.
+  appendField(canonical, render(source));
+  appendField(canonical, render(instance.module.get()));
+  appendField(canonical,
+              workload::canonicalWorkloadContract(instance.workloadContract));
   identity.canonical = std::move(canonical);
   identity.contentHash = perf::measurementContentHash(identity.canonical);
   return identity;
@@ -549,7 +555,7 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
                                       const InstantiateCandidateFn &instantiate,
                                       MappedTuningReport &report) {
   const auto &measurement = options.measurement;
-  if (!measurement.measure)
+  if (!measurement.measure && !measurement.measureDetailed)
     return llvm::Error::success();
   if (!measurement.inputs || !measurement.verify)
     return fail("mapped measurement requires input-buffer and output-verifier "
@@ -569,7 +575,6 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
          (measuredObjective ? measuredCount < options.measureTop
                             : completedCount < options.measureTop);
        ++index) {
-    report.measurementAttempts++;
     MappedTuningCandidate &candidate = report.ranked[index];
     CandidateInstantiationOptions sourceOptions = options.source;
     sourceOptions.machine = &target.machine();
@@ -681,43 +686,142 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
       rejected.push_back(index);
       continue;
     }
-    MappedMeasurementIdentity identity =
-        makeMeasurementIdentity(candidate, *instance, *compiled, target);
+    MappedMeasurementIdentity identity = makeMeasurementIdentity(
+        source, candidate, *instance, *compiled, target);
     MappedMeasurementRequest request{candidate, *compiled->executable, identity,
                                      buffers->inputs, buffers->outputs};
-    auto observed = measurement.measure(request);
-    if (!observed) {
+    perf::MeasurementRecord record;
+    record.executableIdentity = identity.canonical;
+    record.executableHash = identity.contentHash;
+    record.targetIdentity = identity.targetIdentity;
+    record.backendIdentity = identity.backendIdentity;
+    record.environment = measurement.environment;
+    record.protocol = measurement.protocol;
+    record.verification = measurement.verification;
+    record.compilerVersion = LLK_COMPILER_VERSION;
+    if (auto adapter =
+            instance->kernel->getAttrOfType<StringAttr>("source_adapter"))
+      record.sourceAdapter = adapter.getValue().str();
+    else
+      record.sourceAdapter = options.source.adapterKey.empty()
+                                 ? "direct-or-legacy-source-v1"
+                                 : options.source.adapterKey;
+    record.workloadContract =
+        workload::canonicalWorkloadContract(instance->workloadContract);
+    if (instance->workloadContract.ports.empty()) {
+      // The legacy adapter encodes its actual contract in the concrete module.
+      llvm::raw_string_ostream out(record.workloadContract);
+      instance->module->print(out);
+    }
+    for (const auto &entry : candidate.ranking.candidate.values) {
+      appendField(record.candidateBindings, entry.first);
+      appendField(record.candidateBindings, std::to_string(entry.second));
+    }
+    for (const auto &entry : candidate.ranking.candidate.symbolicValues) {
+      appendField(record.candidateBindings, entry.first);
+      appendField(record.candidateBindings, entry.second);
+    }
+    if (record.candidateBindings.empty())
+      appendField(record.candidateBindings, "no-bindings");
+    record.prediction = candidate.ranking.metrics;
+    record.prediction.measuredNs.reset();
+    record.prediction.measuredGflops.reset();
+    record.bottleneck = candidate.ranking.metrics.bottleneck;
+
+    auto reject = [&](llvm::StringRef stage, llvm::Error error) {
       candidate.ranking.rejectionReason =
-          "measurement provider: " + llvm::toString(observed.takeError());
+          (stage + llvm::toString(std::move(error))).str();
       report.rejected.push_back(candidate.ranking);
       rejected.push_back(index);
-      continue;
+    };
+    std::optional<perf::MeasurementRecord> cached;
+    if (measurement.reuseExact) {
+      auto found = measurement.store->lookup(
+          {identity.canonical, measurement.environment, measurement.protocol,
+           measurement.verification});
+      if (!found)
+        return found.takeError();
+      cached = std::move(*found);
+      if (!cached)
+        report.measurementRecordMisses++;
     }
-    if (!*observed) {
-      if (!measuredObjective)
-        completedCount++;
-      continue; // A miss leaves the legal static candidate untouched.
+    perf::CandidateMetrics metrics;
+    std::vector<double> samples;
+    if (cached) {
+      // Recheck this fixture with the current executable before accepting the
+      // old verified timing. This invocation is never timed or attributed to
+      // the provider-attempt budget.
+      if (auto error =
+              request.executable.invoke(request.inputs, request.outputs)) {
+        reject("measurement invocation: ", std::move(error));
+        continue;
+      }
+      metrics.measuredNs = cached->medianNs;
+    } else {
+      report.measurementAttempts++;
+      llvm::Expected<std::optional<MappedMeasurementSamples>> observed =
+          std::optional<MappedMeasurementSamples>();
+      if (measurement.measureDetailed) {
+        observed = measurement.measureDetailed(request);
+      } else {
+        auto aggregate = measurement.measure(request);
+        if (!aggregate)
+          observed = aggregate.takeError();
+        else if (*aggregate)
+          observed = std::optional<MappedMeasurementSamples>(
+              MappedMeasurementSamples{**aggregate, {}});
+      }
+      if (!observed) {
+        reject("measurement provider: ", observed.takeError());
+        continue;
+      }
+      if (!*observed) {
+        if (!measuredObjective)
+          completedCount++;
+        continue;
+      }
+      metrics = (**observed).metrics;
+      samples = std::move((**observed).samplesNs);
     }
-    if (llvm::Error error =
+    if (auto error =
             measurement.verify(candidate, buffers->inputs, buffers->outputs)) {
-      candidate.ranking.rejectionReason =
-          "measurement verification: " + llvm::toString(std::move(error));
-      report.rejected.push_back(candidate.ranking);
-      rejected.push_back(index);
+      reject("measurement verification: ", std::move(error));
       continue;
     }
-    perf::CandidateMetrics metrics = **observed;
     if (!metrics.measuredNs || !std::isfinite(*metrics.measuredNs) ||
         *metrics.measuredNs <= 0.0 ||
         (metrics.measuredGflops && (!std::isfinite(*metrics.measuredGflops) ||
                                     *metrics.measuredGflops < 0.0))) {
-      candidate.ranking.rejectionReason =
-          "measurement metric: duration must be finite and positive; "
-          "throughput must be finite and nonnegative";
-      report.rejected.push_back(candidate.ranking);
-      rejected.push_back(index);
+      reject("measurement metric: ",
+             fail("duration must be finite and positive; "
+                  "throughput must be finite and nonnegative"));
       continue;
     }
+    if (!cached && measurement.measureDetailed && measurement.store) {
+      record.verified = true;
+      record.samplesNs = std::move(samples);
+      record.medianNs = *metrics.measuredNs;
+      std::time_t now = std::time(nullptr);
+      char timestamp[32];
+      if (auto *utc = std::gmtime(&now))
+        if (std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ",
+                          utc))
+          record.timestampUtc = timestamp;
+      if (auto error = perf::validateMeasurementRecord(record)) {
+        reject("measurement record: ", std::move(error));
+        continue;
+      }
+      if (auto error = measurement.store->write(record))
+        return error;
+      report.measurementRecordsWritten++;
+      if (measurement.recordSink)
+        if (auto error = measurement.recordSink(record))
+          return error;
+    }
+    if (cached)
+      report.measurementRecordHits++;
+    candidate.measurementOrigin =
+        cached ? "measured_record" : "measured_runtime";
     candidate.ranking.metrics.measuredNs = metrics.measuredNs;
     candidate.ranking.metrics.measuredGflops = metrics.measuredGflops;
     candidate.measurementIdentity = std::move(identity);
@@ -751,7 +855,43 @@ runMappedTuningSessionImpl(ModuleOp source, const perf::SearchSpace &space,
   if (llvm::Error error = perf::validateObjective(space.objective))
     return std::move(error);
   const bool measuredObjective = objectiveUsesMeasuredMetric(space.objective);
-  if (measuredObjective && !options.measurement.measure)
+  const auto &measurement = options.measurement;
+  if (measurement.measure && measurement.measureDetailed)
+    return fail(
+        "aggregate and detailed measurement providers are mutually exclusive");
+  const bool hasProvider = measurement.measure || measurement.measureDetailed;
+  if ((measurement.store || measurement.reuseExact || measurement.recordSink) &&
+      (!hasProvider || !measurement.inputs || !measurement.verify ||
+       !options.measureTop))
+    return fail("measurement persistence requires a provider, fixture and "
+                "measureTop > 0");
+  if (measurement.reuseExact && !measurement.store)
+    return fail("exact measurement reuse requires a store");
+  if (measurement.recordSink && !measurement.store)
+    return fail("measurement record observer requires a store");
+  if (measurement.store) {
+    // Validate the reusable metadata before even consulting durable records.
+    // A one-sample probe reuses D1 validation without allocating repeat samples.
+    perf::MeasurementRecord probe;
+    probe.executableIdentity = "metadata-validation";
+    probe.executableHash =
+        perf::measurementContentHash(probe.executableIdentity);
+    probe.targetIdentity = probe.backendIdentity = probe.sourceAdapter =
+        probe.workloadContract = probe.candidateBindings =
+            probe.compilerVersion = "probe";
+    probe.environment = measurement.environment;
+    probe.protocol = measurement.protocol;
+    if (!probe.protocol.repeat)
+      return fail("measurement protocol requires repeat > 0");
+    probe.protocol.repeat = 1;
+    probe.verification = measurement.verification;
+    probe.verified = true;
+    probe.samplesNs = {1.0};
+    probe.medianNs = 1.0;
+    if (auto error = perf::validateMeasurementRecord(probe))
+      return std::move(error);
+  }
+  if (measuredObjective && !hasProvider)
     return fail("a measured objective requires a mapped measurement provider");
   MappedTuningReport report;
   std::vector<perf::Candidate> candidates =
