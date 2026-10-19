@@ -236,6 +236,37 @@ llvm::json::Object predictionToJson(const CandidateMetrics &prediction) {
 
 } // namespace
 
+llvm::Error validateMeasurementSamples(const MeasurementProtocol &protocol,
+                                       llvm::ArrayRef<double> samplesNs,
+                                       double medianNs) {
+  if (protocol.version != kMeasurementProtocolVersion)
+    return invalidField("protocol.version", "must be 1");
+  if (protocol.timer != "steady_clock")
+    return invalidField("protocol.timer", "must be \"steady_clock\"");
+  if (protocol.statistic != "median")
+    return invalidField("protocol.statistic", "must be \"median\"");
+  if (protocol.scope != "per_invocation")
+    return invalidField("protocol.scope", "must be \"per_invocation\"");
+  if (samplesNs.empty())
+    return invalidField("samples_ns", "must not be empty");
+  for (size_t index = 0; index < samplesNs.size(); ++index) {
+    if (!isPositiveFinite(samplesNs[index]))
+      return invalidField(llvm::Twine("samples_ns[") + llvm::Twine(index) + "]",
+                          "must be finite and positive");
+  }
+  if (protocol.repeat != samplesNs.size())
+    return invalidField("protocol.repeat",
+                        "must equal the number of samples_ns");
+  if (!isPositiveFinite(medianNs))
+    return invalidField("median_ns", "must be finite and positive");
+  const double expectedMedian = sampleMedian(samplesNs);
+  const double scale = std::max(1.0, std::abs(expectedMedian));
+  if (std::abs(medianNs - expectedMedian) > 1e-9 * scale)
+    return invalidField("median_ns", "does not match the sample median");
+
+  return llvm::Error::success();
+}
+
 llvm::Error validateMeasurementRecord(const MeasurementRecord &record) {
   if (record.version != kMeasurementRecordVersion)
     return invalidField("version", "must be 1");
@@ -275,15 +306,6 @@ llvm::Error validateMeasurementRecord(const MeasurementRecord &record) {
                                           "environment.clock_policy"))
     return error;
 
-  if (record.protocol.version != kMeasurementProtocolVersion)
-    return invalidField("protocol.version", "must be 1");
-  if (record.protocol.timer != "steady_clock")
-    return invalidField("protocol.timer", "must be \"steady_clock\"");
-  if (record.protocol.statistic != "median")
-    return invalidField("protocol.statistic", "must be \"median\"");
-  if (record.protocol.scope != "per_invocation")
-    return invalidField("protocol.scope", "must be \"per_invocation\"");
-
   if (llvm::Error error = requireNonEmpty(record.verification.fixtureContent,
                                           "verification.fixture_content"))
     return error;
@@ -310,22 +332,9 @@ llvm::Error validateMeasurementRecord(const MeasurementRecord &record) {
   if (!record.verified)
     return invalidField("verified", "must be true");
 
-  if (record.samplesNs.empty())
-    return invalidField("samples_ns", "must not be empty");
-  for (size_t index = 0; index < record.samplesNs.size(); ++index) {
-    if (!isPositiveFinite(record.samplesNs[index]))
-      return invalidField(llvm::Twine("samples_ns[") + llvm::Twine(index) + "]",
-                          "must be finite and positive");
-  }
-  if (record.protocol.repeat != record.samplesNs.size())
-    return invalidField("protocol.repeat",
-                        "must equal the number of samples_ns");
-  if (!isPositiveFinite(record.medianNs))
-    return invalidField("median_ns", "must be finite and positive");
-  const double expectedMedian = sampleMedian(record.samplesNs);
-  const double scale = std::max(1.0, std::abs(expectedMedian));
-  if (std::abs(record.medianNs - expectedMedian) > 1e-9 * scale)
-    return invalidField("median_ns", "does not match the sample median");
+  if (auto error = validateMeasurementSamples(record.protocol, record.samplesNs,
+                                              record.medianNs))
+    return error;
 
   if (!std::isfinite(record.prediction.predictedNs) ||
       record.prediction.predictedNs < 0.0)

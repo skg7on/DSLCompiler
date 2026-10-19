@@ -185,10 +185,18 @@ makeMeasurementIdentity(ModuleOp source, const MappedTuningCandidate &candidate,
       mapping::computeSourceGraphHash(instance.workloadGraph);
   identity.bindingHash = instance.bindingHash;
   identity.abiHash = compiled.executable->abiHash();
-  identity.targetIdentity = std::to_string(candidate.plan.targetHash) + ":" +
-                            std::to_string(candidate.plan.machineHash) + ":" +
-                            std::to_string(candidate.plan.layoutHash) + ":" +
-                            std::to_string(candidate.plan.ruleHash);
+  appendField(identity.targetIdentity, "mapped-target-v1");
+  appendField(identity.targetIdentity, target.name());
+  appendField(identity.targetIdentity,
+              machine::canonicalMachineString(target.machine()));
+  std::vector<std::string> layoutContent;
+  for (const auto &layout : target.layouts().all())
+    layoutContent.push_back(mapping::printLayout(layout));
+  llvm::sort(layoutContent);
+  for (const auto &layout : layoutContent)
+    appendField(identity.targetIdentity, layout);
+  for (const auto &rule : target.rules().all())
+    appendField(identity.targetIdentity, mapping::printRule(rule));
   identity.backendIdentity = compiled.executable->executionIdentity().str();
   auto render = [](auto value) {
     std::string text;
@@ -796,6 +804,18 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
              fail("duration must be finite and positive; "
                   "throughput must be finite and nonnegative"));
       continue;
+    }
+    if (!cached && measurement.measureDetailed) {
+      auto protocol = measurement.protocol;
+      // Without persistence, callers may omit protocol metadata. The sample
+      // distribution and reported median must still be valid evidence.
+      if (!measurement.store && !protocol.repeat)
+        protocol.repeat = samples.size();
+      if (auto error = perf::validateMeasurementSamples(protocol, samples,
+                                                        *metrics.measuredNs)) {
+        reject("measurement samples: ", std::move(error));
+        continue;
+      }
     }
     if (!cached && measurement.measureDetailed && measurement.store) {
       record.verified = true;

@@ -30,6 +30,7 @@
 #include "gtest/gtest.h"
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <string>
 
@@ -1017,6 +1018,19 @@ TEST(MappedTuningSessionTest,
   options.measurement.measureDetailed = [&](const MappedMeasurementRequest &r)
       -> llvm::Expected<std::optional<MappedMeasurementSamples>> {
     calls.push_back("measure");
+    EXPECT_NE(
+        r.identity.targetIdentity.find(
+            mlir::llk::machine::canonicalMachineString((*target)->machine())),
+        std::string::npos);
+    for (const auto &layout : (*target)->layouts().all())
+      EXPECT_NE(r.identity.targetIdentity.find(
+                    mlir::llk::mapping::printLayout(layout)),
+                std::string::npos);
+    for (const auto &rule : (*target)->rules().all())
+      EXPECT_NE(
+          r.identity.targetIdentity.find(mlir::llk::mapping::printRule(rule)),
+          std::string::npos);
+
     if (auto error = r.executable.invoke(r.inputs, r.outputs))
       return std::move(error);
     MappedMeasurementSamples samples;
@@ -1067,6 +1081,61 @@ TEST(MappedTuningSessionTest,
   EXPECT_EQ(fresh->measurementRecordMisses, 1u);
   EXPECT_EQ(fresh->measurementAttempts, 1u);
   EXPECT_EQ(fresh->ranked.front().measurementOrigin, "measured_runtime");
+  // Detailed providers must carry valid samples even with persistence disabled.
+  const auto persistentOptions = options.measurement;
+  options.measurement.store = nullptr;
+  options.measurement.reuseExact = false;
+  options.measurement.recordSink = {};
+  for (const auto &invalidSamples : std::vector<std::vector<double>>{
+           {},
+           {80.0, 100.0},
+           {-1.0, 100.0, 90.0},
+           {std::numeric_limits<double>::quiet_NaN(), 100.0, 90.0},
+           {std::numeric_limits<double>::infinity(), 100.0, 90.0},
+           {1.0, 2.0, 3.0}}) {
+    options.measurement.measureDetailed = [&](const MappedMeasurementRequest &r)
+        -> llvm::Expected<std::optional<MappedMeasurementSamples>> {
+      if (auto error = r.executable.invoke(r.inputs, r.outputs))
+        return std::move(error);
+      MappedMeasurementSamples samples;
+      samples.metrics.measuredNs = 90.0;
+      samples.samplesNs = invalidSamples;
+      return std::optional<MappedMeasurementSamples>(samples);
+    };
+    auto invalid = run();
+    ASSERT_TRUE(bool(invalid)) << llvm::toString(invalid.takeError());
+    EXPECT_TRUE(invalid->ranked.empty());
+    EXPECT_EQ(invalid->measurementRecordsWritten, 0u);
+  }
+  options.measurement = persistentOptions;
+  // Aggregate providers remain usable, but cannot persist reusable samples.
+  options.measurement.measureDetailed = {};
+  options.measurement.reuseExact = false;
+  options.measurement.measure = [&](const MappedMeasurementRequest &r)
+      -> llvm::Expected<std::optional<mlir::llk::perf::CandidateMetrics>> {
+    if (auto error = r.executable.invoke(r.inputs, r.outputs))
+      return std::move(error);
+    mlir::llk::perf::CandidateMetrics metrics;
+    metrics.measuredNs = 90.0;
+    return std::optional<mlir::llk::perf::CandidateMetrics>(metrics);
+  };
+  auto aggregate = run();
+  ASSERT_TRUE(bool(aggregate)) << llvm::toString(aggregate.takeError());
+  ASSERT_EQ(aggregate->ranked.size(), 1u);
+  EXPECT_EQ(aggregate->measurementRecordsWritten, 0u);
+  options.measurement.measureDetailed = persistentOptions.measureDetailed;
+  auto conflicting = run();
+  ASSERT_FALSE(bool(conflicting));
+  EXPECT_NE(llvm::toString(conflicting.takeError()).find("mutually exclusive"),
+            std::string::npos);
+  options.measurement = persistentOptions;
+  options.measurement.verification.verifierVersion.clear();
+  auto incomplete = run();
+  ASSERT_FALSE(bool(incomplete));
+  EXPECT_NE(llvm::toString(incomplete.takeError()).find("verifier_version"),
+            std::string::npos);
+  options.measurement = persistentOptions;
+
   calls.clear();
   auto reused = run();
   ASSERT_TRUE(bool(reused)) << llvm::toString(reused.takeError());

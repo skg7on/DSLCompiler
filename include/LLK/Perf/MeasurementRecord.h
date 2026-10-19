@@ -22,6 +22,7 @@
 
 #include "LLK/Perf/Candidate.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
@@ -82,6 +83,11 @@ struct MeasurementRecord {
   std::string timestampUtc;
   std::string compilerVersion;
 };
+
+/// Validates raw timing evidence independently of persistent identity metadata.
+llvm::Error validateMeasurementSamples(const MeasurementProtocol &protocol,
+                                       llvm::ArrayRef<double> samplesNs,
+                                       double medianNs);
 
 /// Rejects unverified, incomplete, nonpositive, nonfinite or inconsistent
 /// records with a `measurement_record:` error naming the offending field.
