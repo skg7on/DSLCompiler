@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "identities": [
+    "complete-fixture-identity-a",
+    "complete-fixture-identity-b",
+    "complete-fixture-identity-unknown-clock"
+  ]
+}

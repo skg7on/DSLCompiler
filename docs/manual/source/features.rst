@@ -11,7 +11,7 @@ available while the newer mapped path is being strengthened. Use this page to
 choose a workflow and understand what a successful run proves.
 
 This summary reflects merged PR #133 (2026-10-11, merge ``5ee61b1``) plus the
-generic framework increments A–C. The revision-pinned
+generic framework increments A–D. The revision-pinned
 :source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
 records capability-based acceptance, exact test counts and retained limits.
 The :source:`PR #133 acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
@@ -69,8 +69,12 @@ What you can do today
      - :doc:`Performance analyzer </tools/performance>`
    * - Tune schedule parameters
      - Original-source candidate instantiation, mapped selection/analysis/compilation, static ranking, candidate artifacts, frozen replay and optional verified measurement
-     - ``--source-adapter`` selects or infers the source contract; contraction M/N/K options remain supported only for the contraction adapter; production measurement persistence/calibration remain separate
+     - ``--source-adapter`` selects or infers the source contract; contraction M/N/K options remain supported only for the contraction adapter; record persistence and exact reuse are opt-in; calibration remains separate
      - :doc:`Tuner </tools/tuning>`, :doc:`tuning tutorial </tutorials/04-tuning>`
+   * - Validate measured predictions
+     - Verified raw-sample records, exact reproducible reuse, comparable-regime JSON/text error reports and disjoint full-identity holdout manifests
+     - Whole-kernel timing remains separate from event costs; unknown time bases are excluded; no automatic fitting or calibrated accuracy threshold
+     - :doc:`Validation </tools/validation>`, :doc:`Tuner </tools/tuning>`
    * - Search a non-contraction source
      - Versioned workload contract, source adapter registry, bounded rank-two f32 elementwise add/multiply with tiled spatial schedules
      - The bounded elementwise adapter is the first delivered non-contraction family; arbitrary Linalg import, broadcasting, reductions, dynamic shapes and approximation modes are rejected

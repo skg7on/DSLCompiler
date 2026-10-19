@@ -181,8 +181,8 @@ Persistence requires explicit protocol, environment and verification metadata.
 Aggregate providers remain supported but cannot write reusable sample records.
 The borrowed store must outlive the synchronous session; ``recordSink`` observes
 only successful durable writes. Corrupt records and store I/O failures are
-errors. Calibration, automatic fitting and prediction validation remain separate
-work.
+errors. Use :doc:`validation` to compare held-out predictions by regime. Calibration
+and automatic fitting remain separate work.
 
 Options and ranking
 -------------------
