@@ -21,7 +21,9 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Chrono.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #include <algorithm>
 #include <cmath>
@@ -204,6 +206,8 @@ makeMeasurementIdentity(ModuleOp source, const MappedTuningCandidate &candidate,
     value.print(stream);
     return stream.str();
   };
+  // Preserve the selected implementation and its concrete resources for each
+  // operation. These signatures are identity evidence, never measured costs.
   for (const mapping::PlanPlacement &placement : candidate.plan.placements) {
     mapping::OperationSignature signature;
     if (const mapping::WorkloadNode *node =
@@ -254,6 +258,8 @@ makeMeasurementIdentity(ModuleOp source, const MappedTuningCandidate &candidate,
     signature.compute = llvm::join(computes, ",");
     identity.operationKeys.push_back(signature.canonicalString());
   }
+  // Keep every realized route and endpoint in the identity, including access
+  // maps. Equal aggregate cost does not imply equivalent data movement.
   for (const mapping::PlanConnection &planned :
        candidate.plan.connectionPlans) {
     mapping::ConnectionPlan connection;
@@ -303,6 +309,8 @@ makeMeasurementIdentity(ModuleOp source, const MappedTuningCandidate &candidate,
     identity.operationKeys.push_back(candidate.planReport);
   if (identity.connectionKeys.empty())
     identity.connectionKeys.push_back(candidate.planReport);
+  // The durable key includes full content as well as the compact graph/ABI
+  // indices. Length-delimited fields prevent ambiguous concatenations.
   std::string canonical;
   appendField(canonical, "mapped-measurement-v1");
   appendField(canonical, std::to_string(identity.planId));
@@ -821,12 +829,10 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
       record.verified = true;
       record.samplesNs = std::move(samples);
       record.medianNs = *metrics.measuredNs;
-      std::time_t now = std::time(nullptr);
-      char timestamp[32];
-      if (auto *utc = std::gmtime(&now))
-        if (std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ",
-                          utc))
-          record.timestampUtc = timestamp;
+      record.timestampUtc =
+          llvm::formatv("{0:%Y-%m-%dT%H:%M:%SZ}",
+                        llvm::sys::toUtcTime(std::time(nullptr)))
+              .str();
       if (auto error = perf::validateMeasurementRecord(record)) {
         reject("measurement record: ", std::move(error));
         continue;
