@@ -137,4 +137,22 @@ TEST(PredictionValidation, RejectsInvalidRecordsAndNonfiniteErrorArithmetic) {
   EXPECT_NE(llvm::toString(overflow.takeError()).find("nonfinite"),
             std::string::npos);
 }
+TEST(PredictionValidation,
+     RejectsFalseMedianEvenWhenLargeSamplesWouldOverflow) {
+  auto large = record("large-samples", 80);
+  large.protocol.repeat = 2;
+  large.samplesNs = {std::numeric_limits<double>::max(),
+                     std::numeric_limits<double>::max()};
+  auto result = validatePredictions({large});
+  EXPECT_FALSE(bool(result));
+  if (!result)
+    EXPECT_NE(llvm::toString(result.takeError()).find("median_ns"),
+              std::string::npos);
+  large.medianNs = std::numeric_limits<double>::max();
+  large.prediction.predictedNs = std::numeric_limits<double>::max();
+  auto valid = validatePredictions({large});
+  ASSERT_TRUE(bool(valid)) << llvm::toString(valid.takeError());
+  EXPECT_DOUBLE_EQ(valid->rows.front().absoluteRelativeError, 0.0);
+}
+
 } // namespace

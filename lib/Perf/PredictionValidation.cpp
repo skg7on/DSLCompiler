@@ -10,6 +10,7 @@
 #include "LLK/Perf/PredictionValidation.h"
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <set>
 
 namespace mlir::llk::perf {
@@ -76,7 +77,7 @@ validatePredictions(llvm::ArrayRef<MeasurementRecord> records) {
   size_t size = errors.size();
   result.medianAbsoluteRelativeError =
       size % 2 ? errors[size / 2]
-               : errors[size / 2 - 1] / 2.0 + errors[size / 2] / 2.0;
+               : std::midpoint(errors[size / 2 - 1], errors[size / 2]);
   result.p90AbsoluteRelativeError =
       errors[static_cast<size_t>(std::ceil(0.9 * size)) - 1];
   return result;

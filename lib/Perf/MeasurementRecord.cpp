@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <utility>
@@ -58,7 +59,7 @@ double sampleMedian(llvm::ArrayRef<double> samples) {
   const size_t count = sorted.size();
   if (count % 2 == 1)
     return sorted[count / 2];
-  return (sorted[count / 2 - 1] + sorted[count / 2]) / 2.0;
+  return std::midpoint(sorted[count / 2 - 1], sorted[count / 2]);
 }
 
 bool isPositiveFinite(double value) {

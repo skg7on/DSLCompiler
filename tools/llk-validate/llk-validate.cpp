@@ -205,16 +205,19 @@ void printText(const llvm::json::Object &report, llvm::raw_ostream &out) {
   out << "uncalibrated prediction validation; held_out="
       << (*report.getBoolean("held_out") ? "true" : "false")
       << " status=" << *report.getString("status") << '\n';
-  out << "record_count=" << *report.getInteger("record_count")
-      << " compared_record_count="
-      << *report.getInteger("compared_record_count")
-      << " excluded_record_count="
-      << *report.getInteger("excluded_record_count") << '\n';
+  for (const char *counter :
+       {"input_record_count", "record_count", "compared_record_count",
+        "excluded_record_count", "not_in_holdout_count", "sample_count",
+        "holdout_identity_count", "training_calibration_identity_count"})
+    out << counter << '=' << *report.getInteger(counter) << '\n';
   size_t index = 0;
   for (const auto &value : *report.getArray("groups")) {
     const auto &group = *value.getAsObject();
     out << "group " << index++ << " status=" << *group.getString("status")
         << '\n';
+    for (const char *counter : {"record_count", "compared_record_count",
+                                "excluded_record_count", "sample_count"})
+      out << counter << '=' << *group.getInteger(counter) << '\n';
     out << "regime=" << *group.get("regime") << '\n';
     for (const char *metric :
          {"median_absolute_relative_error", "p90_absolute_relative_error"})

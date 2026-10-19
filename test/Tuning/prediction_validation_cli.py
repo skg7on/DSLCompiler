@@ -132,6 +132,11 @@ def main():
         assert selected["record_count"] == 1
         assert selected["not_in_holdout_count"] == 1
         assert selected["groups"][0]["median_absolute_relative_error"] == 0.5
+        text = run(records, f"--holdout-manifest={holdout}",
+                   f"--training-manifest={training}", "--format=text").stdout
+        for counter in ("input_record_count=2", "not_in_holdout_count=1", "sample_count=3",
+                        "holdout_identity_count=1", "training_calibration_identity_count=1"):
+            assert counter in text, (counter, text)
         # Reporting never changes source records.
         assert json.loads(a_path.read_text()) == a
         assert json.loads(b_path.read_text()) == b
