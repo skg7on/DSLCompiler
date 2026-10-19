@@ -14,6 +14,7 @@
 #include "LLK/Perf/TileInfo.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/ValueRange.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 #include <functional>
@@ -62,6 +63,13 @@ public:
   pickMatrixEngine(llvm::StringRef requested, std::string &reason) const = 0;
   virtual const machine::ComputeNode *
   pickVectorEngine(std::string &reason) const = 0;
+  /// Select the capability a contraction actually runs on. This is not a
+  /// synonym for the matrix engine: a mapped contraction names its concrete
+  /// vector or matrix selection, and the core context honors it. The default
+  /// preserves the pre-existing matrix behavior for injected/reference
+  /// contexts.
+  virtual const machine::ComputeNode *
+  pickContractionEngine(llvm::StringRef requested, std::string &reason) const;
   /// Select the conversion capability from the current transform executor.
   virtual const machine::ComputeNode *
   pickTransformEngine(std::string &reason) const = 0;
@@ -71,6 +79,13 @@ public:
   virtual uint64_t mmaCycles(const machine::ComputeNode &engine,
                              llvm::ArrayRef<int64_t> shape,
                              uint64_t flops) const = 0;
+  /// Cost a contraction, reporting incomplete or overflowing cost facts as
+  /// errors instead of encoding them as a sentinel cycle count. The default
+  /// returns `mmaCycles`, preserving injected/reference contexts.
+  virtual llvm::Expected<uint64_t>
+  contractionCycles(const machine::ComputeNode &engine,
+                    llvm::ArrayRef<int64_t> shape, uint64_t flops,
+                    llvm::StringRef accumulatorDtype) const;
 
 protected:
   OpDAGBuildContext() = default;

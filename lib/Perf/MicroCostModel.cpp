@@ -104,7 +104,12 @@ L0Report computeL0StaticBound(const MicroDAG &dag,
     switch (event.kind) {
     case EventKind::Mma:
       report.totalFlops += 2 * event.workItems;
-      matrixWork += event.minCycles;
+      // A contraction is matrix work or vector work according to the resource
+      // it actually occupies, not according to its opcode.
+      if (event.resource == ResourceKind::VectorEngine)
+        vectorWork += event.minCycles;
+      else
+        matrixWork += event.minCycles;
       break;
     case EventKind::Vector:
     case EventKind::Reduce:

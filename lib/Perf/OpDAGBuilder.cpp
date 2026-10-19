@@ -65,4 +65,19 @@ OpDAGBuilderRegistry::classification(llvm::StringRef name) const {
     return std::nullopt;
   return found->second.kind;
 }
+
+const machine::ComputeNode *
+OpDAGBuildContext::pickContractionEngine(llvm::StringRef requested,
+                                         std::string &reason) const {
+  // Injected and reference contexts predate selected contraction resources, so
+  // their contract stays the matrix one.
+  return pickMatrixEngine(requested, reason);
+}
+
+llvm::Expected<uint64_t> OpDAGBuildContext::contractionCycles(
+    const machine::ComputeNode &engine, llvm::ArrayRef<int64_t> shape,
+    uint64_t flops, llvm::StringRef accumulatorDtype) const {
+  (void)accumulatorDtype;
+  return mmaCycles(engine, shape, flops);
+}
 } // namespace mlir::llk::perf

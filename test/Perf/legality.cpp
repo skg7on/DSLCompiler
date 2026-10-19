@@ -183,6 +183,87 @@ compute:
   return *model;
 }
 
+/// A machine with no matrix engine: one vector capability that supports
+/// contraction dtype pairs through `accumulator_dtypes` and declares the
+/// accumulator lane width a vector tail is checked against. `withLanes`
+/// removes the f32 width so an incomplete cost fact is observable.
+machine::MachineModel vectorContractionMachine(bool withLanes = true) {
+  std::string yaml = R"yaml(
+schema: llk.machine.v2
+target: vector_probe
+executors:
+  - id: w0
+    kind: worker
+memories:
+  - id: acc.0
+    kind: acc
+    visible_from: w0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+compute:
+  - id: v0
+    kind: vector_engine
+    refines: [vector]
+    attached_to: w0
+    element_types: [f32, bf16]
+    accumulator_dtypes: [f32]
+    shapes: [[16]]
+    issue_cycles: 1
+)yaml";
+  if (withLanes)
+    yaml += "    lanes: {f32: 16, bf16: 32}\n";
+  auto loaded = machine::parseMachineModel(yaml, "<legality-vector>");
+  if (!loaded) {
+    ADD_FAILURE() << llvm::toString(loaded.takeError());
+    return machine::MachineModel();
+  }
+  return *loaded;
+}
+
+/// A mixed machine whose first contraction-capable-looking node rejects the
+/// dtype pair, so acceptance must come from a *later* engine.
+machine::MachineModel mixedContractionMachine() {
+  static constexpr llvm::StringLiteral kYaml = R"yaml(
+schema: llk.machine.v2
+target: mixed_probe
+executors:
+  - id: w0
+    kind: worker
+memories:
+  - id: acc.0
+    kind: acc
+    visible_from: w0
+    capacity_bytes: 1048576
+    alignment_bytes: 64
+    supported_layouts: [row_major]
+compute:
+  - id: v0
+    kind: vector_engine
+    refines: [vector]
+    attached_to: w0
+    element_types: [i8]
+    accumulator_dtypes: [i32]
+    shapes: [[64]]
+    lanes: {i8: 64}
+    issue_cycles: 1
+  - id: mxu
+    kind: matrix_engine
+    refines: [matrix]
+    attached_to: w0
+    element_types: [f32, bf16]
+    accumulator_dtypes: [f32]
+    shapes: [[4, 8, 8]]
+    issue_cycles: 1
+)yaml";
+  auto loaded = machine::parseMachineModel(kYaml, "<legality-mixed>");
+  if (!loaded) {
+    ADD_FAILURE() << llvm::toString(loaded.takeError());
+    return machine::MachineModel();
+  }
+  return *loaded;
+}
+
 std::vector<SearchConstraint> exporterConstraints();
 
 /// A space shaped like the M11 export's output: the tuner grid for the numeric
@@ -364,6 +445,109 @@ TEST(Legality, TileNotAMultipleOfTheMmaFragmentIsRejected) {
 
   expectRejected(checkLegality(space, candidate, swigluShape(), avx2()),
                  "mma_compatible:", "4x8x8");
+}
+
+// A machine with no matrix engine must still accept a contraction its vector
+// capability supports: the accumulator dtype pair and the lane width decide.
+TEST(Legality, VectorOnlyMachineAcceptsADivisibleContraction) {
+  SearchSpace space =
+      spaceWith(ConstraintKind::MmaCompatible, {"BM", "BN", "BK"},
+                fullParams(/*withTail=*/false));
+  Candidate candidate = preferred();
+  candidate.values["BN"] = 16;
+  WorkloadShape shape = swigluShape();
+  shape.inputDType = "f32";
+  shape.accumulatorDType = "f32";
+
+  EXPECT_TRUE(
+      checkLegality(space, candidate, shape, vectorContractionMachine()).legal);
+}
+
+TEST(Legality, VectorOnlyMachineRejectsAnUnmaskedTail) {
+  SearchSpace space =
+      spaceWith(ConstraintKind::MmaCompatible, {"BM", "BN", "BK"},
+                fullParams(/*withTail=*/false));
+  Candidate candidate = preferred();
+  candidate.values["BN"] = 15;
+  WorkloadShape shape = swigluShape();
+  shape.inputDType = "f32";
+  shape.accumulatorDType = "f32";
+
+  expectRejected(
+      checkLegality(space, candidate, shape, vectorContractionMachine()),
+      "mma_compatible:", "15");
+}
+
+TEST(Legality, VectorOnlyMachineAcceptsAMaskedTail) {
+  SearchSpace space = spaceWith(ConstraintKind::MmaCompatible,
+                                {"BM", "BN", "BK"}, fullParams());
+  Candidate candidate = preferred();
+  candidate.values["BN"] = 15;
+  candidate.symbolicValues["tail_policy"] = "mask";
+  WorkloadShape shape = swigluShape();
+  shape.inputDType = "f32";
+  shape.accumulatorDType = "f32";
+
+  EXPECT_TRUE(
+      checkLegality(space, candidate, shape, vectorContractionMachine()).legal);
+}
+
+TEST(Legality, VectorOnlyMachineRejectsAnUnsupportedDtypePair) {
+  SearchSpace space =
+      spaceWith(ConstraintKind::MmaCompatible, {"BM", "BN", "BK"},
+                fullParams(/*withTail=*/false));
+  Candidate candidate = preferred();
+  candidate.values["BN"] = 16;
+  WorkloadShape shape = swigluShape();
+  shape.inputDType = "f32";
+  shape.accumulatorDType = "bf16"; // the vector probe accumulates f32 only.
+
+  expectRejected(
+      checkLegality(space, candidate, shape, vectorContractionMachine()),
+      "mma_compatible:", "bf16");
+}
+
+// An absent accumulator lane width is an incomplete cost fact, not a pass and
+// not a one-cycle fallback.
+TEST(Legality, VectorTailRequiresAnAccumulatorLaneWidth) {
+  SearchSpace space =
+      spaceWith(ConstraintKind::MmaCompatible, {"BM", "BN", "BK"},
+                fullParams(/*withTail=*/false));
+  Candidate candidate = preferred();
+  candidate.values["BN"] = 16;
+  WorkloadShape shape = swigluShape();
+  shape.inputDType = "f32";
+  shape.accumulatorDType = "f32";
+
+  expectRejected(checkLegality(space, candidate, shape,
+                               vectorContractionMachine(/*withLanes=*/false)),
+                 "mma_compatible:", "lane");
+}
+
+// A machine is not rejected because its first capability cannot run the work:
+// a later matrix alternative that fits is enough.
+TEST(Legality, MixedMachineAcceptsALaterCompatibleEngine) {
+  SearchSpace space =
+      spaceWith(ConstraintKind::MmaCompatible, {"BM", "BN", "BK"},
+                fullParams(/*withTail=*/false));
+  Candidate candidate = preferred();
+
+  EXPECT_TRUE(
+      checkLegality(space, candidate, swigluShape(), mixedContractionMachine())
+          .legal);
+}
+
+TEST(Legality, MmaCompatibleRejectsAMissingReferencedBinding) {
+  std::vector<SearchParam> params = fullParams(/*withTail=*/false);
+  params.erase(std::remove_if(
+                   params.begin(), params.end(),
+                   [](const SearchParam &param) { return param.name == "BN"; }),
+               params.end());
+  SearchSpace space =
+      spaceWith(ConstraintKind::MmaCompatible, {"BM", "BN", "BK"}, params);
+
+  expectRejected(checkLegality(space, preferred(), swigluShape(), avx2()),
+                 "mma_compatible:", "BN");
 }
 
 //===----------------------------------------------------------------------===//

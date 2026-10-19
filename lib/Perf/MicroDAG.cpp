@@ -32,6 +32,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/Error.h"
 
 #include <algorithm>
@@ -244,6 +245,11 @@ private:
                                       reason, mappedExecutor(op));
     }
     const machine::ComputeNode *
+    pickContractionEngine(llvm::StringRef requested,
+                          std::string &reason) const override {
+      return builder.pickContractionEngine(op, requested, reason);
+    }
+    const machine::ComputeNode *
     pickTransformEngine(std::string &reason) const override {
       return builder.pickVectorEngine("", reason, transformExecutor(op));
     }
@@ -256,6 +262,12 @@ private:
                        llvm::ArrayRef<int64_t> shape,
                        uint64_t flops) const override {
       return builder.mmaCycles(engine, shape, flops);
+    }
+    llvm::Expected<uint64_t>
+    contractionCycles(const machine::ComputeNode &engine,
+                      llvm::ArrayRef<int64_t> shape, uint64_t flops,
+                      llvm::StringRef accumulatorDtype) const override {
+      return builder.contractionCycles(engine, shape, flops, accumulatorDtype);
     }
 
   private:
@@ -320,6 +332,18 @@ private:
   const machine::ComputeNode *
   pickVectorEngine(llvm::StringRef requested, std::string &reason,
                    llvm::StringRef executor = "") const;
+  /// The selected concrete engine a mapped contraction runs on. An unmapped
+  /// contraction keeps the matrix default; a mapped one must name exactly one
+  /// vector or matrix selection that resolves on its selected executor.
+  const machine::ComputeNode *pickContractionEngine(mlir::Operation &op,
+                                                    llvm::StringRef requested,
+                                                    std::string &reason) const;
+  /// Checked contraction cost: positive extents, checked MAC/FLOP products,
+  /// and no one-cycle fallback for a missing lane or throughput fact.
+  llvm::Expected<uint64_t>
+  contractionCycles(const machine::ComputeNode &engine,
+                    llvm::ArrayRef<int64_t> shape, uint64_t flops,
+                    llvm::StringRef accumulatorDtype) const;
 
   llvm::SmallVector<uint32_t, 4> producerDeps(mlir::ValueRange values) const;
   void inheritProducer(mlir::Value result, mlir::Value source);
@@ -823,6 +847,138 @@ DAGBuilder::pickVectorEngine(llvm::StringRef requested, std::string &reason,
     return nullptr;
   }
   return engines.front();
+}
+
+const machine::ComputeNode *DAGBuilder::pickContractionEngine(
+    mlir::Operation &op, llvm::StringRef requested, std::string &reason) const {
+  // An unmapped contraction is the reference/hand-written case: there is no
+  // selected identity, so the documented matrix default still applies.
+  auto mapping = op.getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
+  if (!mapping)
+    return pickMatrixEngine(requested, reason);
+
+  llvm::StringRef selectedKind;
+  llvm::StringRef selectedId;
+  if (auto bindings = mapping.getAs<mlir::DictionaryAttr>("compute_bindings")) {
+    auto vector = bindings.getAs<mlir::StringAttr>("vector_engine");
+    auto matrix = bindings.getAs<mlir::StringAttr>("matrix_engine");
+    if (vector && matrix) {
+      reason = "micro.mapping selects both vector_engine '" +
+               vector.getValue().str() + "' and matrix_engine '" +
+               matrix.getValue().str() + "' as its compute engine";
+      return nullptr;
+    }
+    if (vector) {
+      selectedId = vector.getValue();
+      selectedKind = "vector_engine";
+    } else if (matrix) {
+      selectedId = matrix.getValue();
+      selectedKind = "matrix_engine";
+    }
+  }
+  if (selectedId.empty()) {
+    reason = "micro.mapping records no selected compute engine "
+             "(compute_bindings names no vector_engine or matrix_engine)";
+    return nullptr;
+  }
+
+  const machine::ComputeNode *engine = machine.findCompute(selectedId);
+  if (!engine) {
+    reason = "selected engine '" + selectedId.str() +
+             "' is not declared by machine '" + machine.target + "'";
+    return nullptr;
+  }
+  if (llvm::StringRef(engine->kind) != selectedKind) {
+    reason = "selected node '" + selectedId.str() + "' has kind '" +
+             engine->kind + "', not " + selectedKind.str();
+    return nullptr;
+  }
+
+  // The selected executor is part of the identity: an engine attached to a
+  // different executor describes work the plan did not place here.
+  llvm::StringRef executor = mappedExecutor(op);
+  if (executor.empty()) {
+    reason = "micro.mapping records no selected executor for the contraction";
+    return nullptr;
+  }
+  if (llvm::StringRef(engine->attachedTo) != executor) {
+    reason = "selected engine '" + selectedId.str() + "' is attached to '" +
+             engine->attachedTo + "', not selected executor '" +
+             executor.str() + "'";
+    return nullptr;
+  }
+
+  // An op-level engine is a redundant spelling of the same decision; it may
+  // agree, but it may never override or contradict the recorded selection.
+  if (!requested.empty() && requested != selectedId) {
+    reason = "explicit engine '" + requested.str() +
+             "' disagrees with selected engine '" + selectedId.str() + "'";
+    return nullptr;
+  }
+  return engine;
+}
+
+llvm::Expected<uint64_t>
+DAGBuilder::contractionCycles(const machine::ComputeNode &engine,
+                              llvm::ArrayRef<int64_t> shape, uint64_t flops,
+                              llvm::StringRef accumulatorDtype) const {
+  if (shape.size() != 3)
+    return invalid("micro.mma shape must have three dimensions");
+  for (int64_t extent : shape)
+    if (extent <= 0)
+      return invalid("micro.mma shape extents must be positive");
+
+  // Validate the MAC and FLOP products before either cost formula runs, so an
+  // overflowing shape cannot become a wrapped or one-cycle estimate.
+  uint64_t macs = 1;
+  for (int64_t extent : shape) {
+    std::optional<uint64_t> product =
+        llvm::checkedMulUnsigned<uint64_t>(macs, static_cast<uint64_t>(extent));
+    if (!product)
+      return invalid("micro.mma MAC count overflows 64 bits");
+    macs = *product;
+  }
+  std::optional<uint64_t> checkedFlops =
+      llvm::checkedMulUnsigned<uint64_t>(macs, 2);
+  if (!checkedFlops)
+    return invalid("micro.mma FLOP count overflows 64 bits");
+  if (flops != *checkedFlops)
+    return invalid("micro.mma cycle request does not match its shape");
+
+  if (engine.throughputPerCycle && *engine.throughputPerCycle > 0)
+    return static_cast<uint64_t>(
+        std::ceil(static_cast<double>(flops) / *engine.throughputPerCycle));
+
+  // Matrix capabilities keep the established fragment-based cost.
+  if (engine.kind == "matrix_engine")
+    return mmaCycles(engine, shape, flops);
+
+  if (engine.kind != "vector_engine")
+    return invalid("engine '" + engine.id + "' of kind '" + engine.kind +
+                   "' cannot cost a contraction");
+
+  auto lanes = engine.lanes.find(accumulatorDtype.str());
+  if (lanes == engine.lanes.end() || lanes->second <= 0)
+    return invalid("engine '" + engine.id +
+                   "' declares no accumulator lane width for dtype '" +
+                   accumulatorDtype.str() + "'");
+
+  // M * K issues of ceil(N / lanes) vector MACs each. Missing facts are an
+  // incomplete analysis, never a one-cycle event.
+  uint64_t issues = llvm::divideCeil(static_cast<uint64_t>(shape[1]),
+                                     static_cast<uint64_t>(lanes->second));
+  std::optional<uint64_t> product = llvm::checkedMulUnsigned<uint64_t>(
+      static_cast<uint64_t>(shape[0]), static_cast<uint64_t>(shape[2]));
+  if (!product)
+    return invalid("micro.mma vector issue count overflows 64 bits");
+  product = llvm::checkedMulUnsigned<uint64_t>(*product, issues);
+  if (!product)
+    return invalid("micro.mma vector issue count overflows 64 bits");
+  product = llvm::checkedMulUnsigned<uint64_t>(
+      *product, std::max<uint64_t>(1, engine.issueCycles));
+  if (!product)
+    return invalid("micro.mma vector issue count overflows 64 bits");
+  return *product;
 }
 
 //===----------------------------------------------------------------------===//
