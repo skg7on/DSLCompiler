@@ -1,18 +1,20 @@
-# DSLCompiler logo
+# LLK / MicroIR logo
 
-![DSLCompiler logo](dslcompiler-logo-white.png)
+![LLK / MicroIR logo](llk-microir-logo-white.png)
 
 ## Meaning
 
 - **Code brackets:** custom LLK kernel semantics and a compiler-defined dialect.
-- **Modular tile core:** MicroIR expresses tile dataflow and execution independently of any particular machine. Its tiled structure also echoes the project's Tile model.
-- **Three branching routes:** the same intermediate representation can map to different target resources and implementation choices.
+- **Small teal primitive blocks:** composable atomic micro operators are the building blocks of MicroIR execution. Their modular structure also echoes the project's Tile model.
+- **Three branching routes from one core:** the same architecture-independent representation can map to different NPU architectures, target resources and implementation choices.
 - **Highlighted amber route:** search selects a plan using performance evaluation and feasibility checks. The rising route suggests optimization; it does not claim measured speedups.
-- **LLK / MicroIR descriptor:** connects the semantic kernel dialect to the shared execution representation.
+- **LLK / MicroIR wordmark:** places the low-level kernel language and its shared micro-operator execution IR at the center of the identity. The two explanatory lines expand this as `Low-Level Kernel Language` and `Architecture-Independent Micro Operators`.
 
 ## Asset
 
-`dslcompiler-logo-white.png` is the preferred revision: a 2069 × 760 PNG with a solid white background. It keeps the original horizontal design and refined `LLK / MicroIR` subtitle typography.
+`llk-microir-logo-white.png` is the preferred revision: a 2069 × 760 opaque PNG with a solid white background. It preserves the original horizontal emblem and emphasizes LLK and MicroIR in the main wordmark, with consistent explanatory typography.
+
+`dslcompiler-logo-white.png` is the earlier 2069 × 760 revision with a solid white background and the original project-name headline.
 
 `dslcompiler-logo-v2.png` is the corresponding 2069 × 760 version with a transparent alpha background. The `LLK / MicroIR` subtitle uses a geometric sans-serif treatment consistent with the main wordmark, with matching weight and tighter, balanced spacing. The original emblem and horizontal design are retained.
 
@@ -23,6 +25,8 @@ The logo was created with the built-in image-generation tool. It is saved here f
 The typography revision was created with the built-in image-generation edit tool using the original logo as its reference. Its exact prompt is in [font-revision-prompt.txt](font-revision-prompt.txt).
 
 The white-background revision uses the same built-in image editor; its exact prompt is in [white-background-prompt.txt](white-background-prompt.txt).
+
+The LLK / MicroIR identity revision uses the white-background logo as its reference. Its exact built-in image edit prompt is in [llk-microir-identity-prompt.txt](llk-microir-identity-prompt.txt).
 
 ## Original generation prompt
 
