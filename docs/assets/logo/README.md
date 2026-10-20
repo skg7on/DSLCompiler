@@ -1,6 +1,6 @@
 # LLK / MicroIR logo
 
-![LLK / MicroIR logo](llk-microir-logo-white.png)
+![LLK · MicroIR logo](llk-microir-logo-simple.png)
 
 ## Meaning
 
@@ -8,11 +8,13 @@
 - **Small teal primitive blocks:** composable atomic micro operators are the building blocks of MicroIR execution. Their modular structure also echoes the project's Tile model.
 - **Three branching routes from one core:** the same architecture-independent representation can map to different NPU architectures, target resources and implementation choices.
 - **Highlighted amber route:** search selects a plan using performance evaluation and feasibility checks. The rising route suggests optimization; it does not claim measured speedups.
-- **LLK / MicroIR wordmark:** places the low-level kernel language and its shared micro-operator execution IR at the center of the identity. The two explanatory lines expand this as `Low-Level Kernel Language` and `Architecture-Independent Micro Operators`.
+- **LLK · MicroIR wordmark:** places the low-level kernel language and its shared micro-operator execution IR at the center of the identity in one short line. The logo has no subtitle or descriptive text.
 
 ## Asset
 
-`llk-microir-logo-white.png` is the preferred revision: a 2069 × 760 opaque PNG with a solid white background. It preserves the original horizontal emblem and emphasizes LLK and MicroIR in the main wordmark, with consistent explanatory typography.
+`llk-microir-logo-simple.png` is the preferred revision: a 2069 × 760 opaque PNG with a solid white background. It keeps the original emblem and a single `LLK · MicroIR` wordmark, removing both explanatory lines for a simpler composition.
+
+`llk-microir-logo-white.png` is the previous revision with a headline and two explanatory lines.
 
 `dslcompiler-logo-white.png` is the earlier 2069 × 760 revision with a solid white background and the original project-name headline.
 
@@ -27,6 +29,8 @@ The typography revision was created with the built-in image-generation edit tool
 The white-background revision uses the same built-in image editor; its exact prompt is in [white-background-prompt.txt](white-background-prompt.txt).
 
 The LLK / MicroIR identity revision uses the white-background logo as its reference. Its exact built-in image edit prompt is in [llk-microir-identity-prompt.txt](llk-microir-identity-prompt.txt).
+
+The simplified revision uses the identity revision as its reference. Its exact built-in image edit prompt is in [simplification-prompt.txt](simplification-prompt.txt).
 
 ## Original generation prompt
 
