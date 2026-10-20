@@ -1,3 +1,5 @@
+![LLK · MicroIR](docs/assets/logo/llk-microir-logo-simple.png)
+
 # DSLCompiler
 
 [![CI](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml/badge.svg)](https://github.com/skg7on/DSLCompiler/actions/workflows/ci.yml)
