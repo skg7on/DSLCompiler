@@ -1,0 +1,307 @@
+// Arm SME mapping rules.
+//
+// The same typed rule families as arm-sve, under the SME prefix. Vector work
+// uses the shared 512-bit vector engine; contraction is the one difference --
+// it requires the `matrix_engine` capability (`za` in machines/arm-sme-v2.yaml)
+// and names the `sme_mma_za` emitter. Contraction cost is the modeled lower
+// bound seed 8; it is not a claim that SME is universally faster, and
+// complete-plan analysis decides ranking.
+//
+// Every vector rule is typed on the ports it reads, and each layout requirement
+// names one port, so a mixed-dtype program solves each operand against its own
+// element type. Layout ids refer to layouts.llkmap.
+
+//===----------------------------------------------------------------------===//
+// Elementwise add and multiply
+//===----------------------------------------------------------------------===//
+
+rule sme.vector_add_f32 v1 {
+  match micro.vector(op = "add", input[0].element_type = f32,
+                     input[1].element_type = f32,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sme.vector.add.f32";
+  emit "sme_vector_add";
+  cost 4;
+}
+
+rule sme.vector_add_bf16 v1 {
+  match micro.vector(op = "add", input[0].element_type = bf16,
+                     input[1].element_type = bf16,
+                     output[0].element_type = bf16);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sme.vector.add.bf16";
+  emit "sme_vector_add";
+  cost 4;
+}
+
+rule sme.vector_add_i8 v1 {
+  match micro.vector(op = "add", input[0].element_type = i8,
+                     input[1].element_type = i8,
+                     output[0].element_type = i8);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sme.vector.add.i8";
+  emit "sme_vector_add";
+  cost 4;
+}
+
+rule sme.vector_mul_f32 v1 {
+  match micro.vector(op = "mul", input[0].element_type = f32,
+                     input[1].element_type = f32,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sme.vector.mul.f32";
+  emit "sme_vector_mul";
+  cost 4;
+}
+
+rule sme.vector_mul_bf16 v1 {
+  match micro.vector(op = "mul", input[0].element_type = bf16,
+                     input[1].element_type = bf16,
+                     output[0].element_type = bf16);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sme.vector.mul.bf16";
+  emit "sme_vector_mul";
+  cost 4;
+}
+
+rule sme.vector_mul_i8 v1 {
+  match micro.vector(op = "mul", input[0].element_type = i8,
+                     input[1].element_type = i8,
+                     output[0].element_type = i8);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sme.vector.mul.i8";
+  emit "sme_vector_mul";
+  cost 4;
+}
+
+//===----------------------------------------------------------------------===//
+// Conversion
+//===----------------------------------------------------------------------===//
+
+rule sme.vector_convert_bf16_f32 v1 {
+  match micro.vector(op = "convert", input[0].element_type = bf16,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "sme.vector.convert.bf16_f32";
+  emit "sme_vector_convert";
+  cost 2;
+}
+
+rule sme.vector_convert_bf16_f32_row_major v1 {
+  match micro.vector(op = "convert", input[0].element_type = bf16,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.row_major;
+  input "operand0";
+  output "result";
+  bundle "sme.vector.convert.bf16_f32";
+  emit "sme_vector_convert";
+  cost 2;
+}
+
+rule sme.vector_convert_f32_bf16 v1 {
+  match micro.vector(op = "convert", input[0].element_type = f32,
+                     output[0].element_type = bf16);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "sme.vector.convert.f32_bf16";
+  emit "sme_vector_convert";
+  cost 2;
+}
+
+rule sme.vector_convert_f32_bf16_row_major v1 {
+  match micro.vector(op = "convert", input[0].element_type = f32,
+                     output[0].element_type = bf16);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.row_major;
+  input "operand0";
+  output "result";
+  bundle "sme.vector.convert.f32_bf16";
+  emit "sme_vector_convert";
+  cost 2;
+}
+
+//===----------------------------------------------------------------------===//
+// Activation and reduction (f32 only)
+//===----------------------------------------------------------------------===//
+
+rule sme.vector_silu_f32 v1 {
+  match micro.vector(op = "silu", input[0].element_type = f32,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sme.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "sme.vector.silu.f32";
+  emit "sme_vector_silu";
+  cost 4;
+}
+
+rule sme.reduce_sum_f32 v1 {
+  match micro.reduce(op = "sum", input[0].element_type = f32,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  input "operand0";
+  output "result";
+  bundle "sme.reduce.sum.f32";
+  emit "sme_reduce";
+  cost 3;
+}
+
+//===----------------------------------------------------------------------===//
+// Contraction
+//===----------------------------------------------------------------------===//
+
+// f32 and bf16 input pairs accumulate into f32 on the modeled 16x16x16 matrix
+// engine. Both rules check the two operands plus the accumulator and result,
+// require the logical accumulator storage on the `acc` input and `result`
+// output, and keep every contraction operand row-major. An i8 contraction
+// matches nothing here.
+
+rule sme.mma_f32 v1 {
+  match micro.mma(input[0].element_type = f32, input[1].element_type = f32,
+                  input[2].element_type = f32, output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind matrix_engine;
+  require layout lhs satisfies sme.row_major;
+  require layout rhs satisfies sme.row_major;
+  require layout acc satisfies sme.row_major;
+  require memory input "acc" kind acc;
+  require memory output "result" kind acc;
+  input "lhs";
+  input "rhs";
+  input "acc";
+  output "result";
+  bundle "sme.mma.f32";
+  emit "sme_mma_za";
+  cost 8;
+}
+
+rule sme.mma_bf16 v1 {
+  match micro.mma(input[0].element_type = bf16, input[1].element_type = bf16,
+                  input[2].element_type = f32, output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind matrix_engine;
+  require layout lhs satisfies sme.row_major;
+  require layout rhs satisfies sme.row_major;
+  require layout acc satisfies sme.row_major;
+  require memory input "acc" kind acc;
+  require memory output "result" kind acc;
+  input "lhs";
+  input "rhs";
+  input "acc";
+  output "result";
+  bundle "sme.mma.bf16";
+  emit "sme_mma_za";
+  cost 8;
+}
+
+//===----------------------------------------------------------------------===//
+// Movement
+//===----------------------------------------------------------------------===//
+
+rule sme.async_copy v1 {
+  match micro.async_copy();
+  require executor kind worker;
+  require memory input "source" kind dram;
+  require memory output "result" kind sram;
+  input "source";
+  output "result";
+  bundle "sme.copy";
+  emit "sme_copy";
+  cost 2;
+}
+
+rule sme.tile_async_copy v1 {
+  match micro.tile_async_copy();
+  require executor kind worker;
+  input "source";
+  output "result";
+  bundle "sme.tile.copy";
+  emit "sme_tile_copy";
+  cost 2;
+}
+
+rule sme.tile_store v1 {
+  match micro.tile_store();
+  require executor kind worker;
+  input "source";
+  bundle "sme.tile.store";
+  emit "sme_tile_store";
+  cost 2;
+}
+
+//===----------------------------------------------------------------------===//
+// Fused convert -> SiLU -> multiply
+//===----------------------------------------------------------------------===//
+
+// The fused epilogue again uses vector resources: conversion, activation and
+// gating are vector work even on a machine that also has a matrix engine. The
+// per-port layout requirements keep cv.operand0 at bf16 width 32 and the f32
+// gate ports at width 16.
+rule sme.fused_convert_silu_mul v1 {
+  match graph {
+    node cv: micro.vector(op = "convert", input[0].element_type = bf16,
+                          output[0].element_type = f32);
+    node act: micro.vector(op = "silu", input[0].element_type = f32,
+                           output[0].element_type = f32);
+    node gate: micro.vector(op = "mul", input[0].element_type = f32,
+                            input[1].element_type = f32,
+                            output[0].element_type = f32);
+    edge cv.result -> act.operand0;
+    edge act.result -> gate.operand0;
+  }
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout cv.operand0 satisfies sme.blocked_2d;
+  require layout gate.operand1 satisfies sme.blocked_2d;
+  require layout gate.result satisfies sme.blocked_2d;
+  input "cv.operand0";
+  input "gate.operand1";
+  output "gate.result";
+  bundle "sme.fused.convert_silu_mul";
+  emit "sme_fused_convert_silu_mul";
+  cost 3;
+}
