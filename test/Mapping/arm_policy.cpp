@@ -71,6 +71,13 @@ loadArmTarget(llvm::StringRef prefix) {
       emitterKeys(prefix));
 }
 
+/// The rank-two tile type these fixtures put on every port. It is built here
+/// and returned as the general `mlir::Type` a workload port stores, so the port
+/// assignment is a base-to-base copy rather than a derived-handle slice.
+mlir::Type rankTwoTile(mlir::Type elementType) {
+  return mlir::RankedTensorType::get({8, 16}, elementType);
+}
+
 /// A `micro.vector` / `micro.reduce` node with a rank-two tile on every port.
 /// Attribute predicates read `attributes`, port predicates read the port types.
 WorkloadNode elementwiseNode(mlir::MLIRContext &context, llvm::StringRef opName,
@@ -88,12 +95,12 @@ WorkloadNode elementwiseNode(mlir::MLIRContext &context, llvm::StringRef opName,
   for (mlir::Type type : operandTypes) {
     WorkloadPort port;
     port.value = value++;
-    port.type = mlir::RankedTensorType::get({8, 16}, type);
+    port.type = rankTwoTile(type);
     node.inputs.push_back(port);
   }
   WorkloadPort result;
   result.value = value;
-  result.type = mlir::RankedTensorType::get({8, 16}, resultType);
+  result.type = rankTwoTile(resultType);
   node.outputs.push_back(result);
   return node;
 }
@@ -416,21 +423,18 @@ namespace {
 WorkloadGraph fusedConvertSiluMul(mlir::MLIRContext &context) {
   mlir::Type f32 = mlir::Float32Type::get(&context);
   mlir::Type bf16 = mlir::BFloat16Type::get(&context);
-  auto tile = [&](mlir::Type element) {
-    return mlir::RankedTensorType::get({8, 16}, element);
-  };
 
   WorkloadGraph graph;
-  WorkloadValueId input =
-      graph.addValue(WorkloadValue{0, tile(bf16), "in", /*external=*/true});
+  WorkloadValueId input = graph.addValue(
+      WorkloadValue{0, rankTwoTile(bf16), "in", /*external=*/true});
   WorkloadValueId converted =
-      graph.addValue(WorkloadValue{0, tile(f32), "converted", false});
+      graph.addValue(WorkloadValue{0, rankTwoTile(f32), "converted", false});
   WorkloadValueId activated =
-      graph.addValue(WorkloadValue{0, tile(f32), "activated", false});
-  WorkloadValueId other =
-      graph.addValue(WorkloadValue{0, tile(f32), "other", /*external=*/true});
+      graph.addValue(WorkloadValue{0, rankTwoTile(f32), "activated", false});
+  WorkloadValueId other = graph.addValue(
+      WorkloadValue{0, rankTwoTile(f32), "other", /*external=*/true});
   WorkloadValueId result =
-      graph.addValue(WorkloadValue{0, tile(f32), "result", false});
+      graph.addValue(WorkloadValue{0, rankTwoTile(f32), "result", false});
 
   auto addVector =
       [&](llvm::StringRef op,
@@ -455,10 +459,12 @@ WorkloadGraph fusedConvertSiluMul(mlir::MLIRContext &context) {
         graph.addNode(std::move(node));
       };
 
-  addVector("convert", {{input, tile(bf16)}}, converted, tile(f32));
-  addVector("silu", {{converted, tile(f32)}}, activated, tile(f32));
-  addVector("mul", {{activated, tile(f32)}, {other, tile(f32)}}, result,
-            tile(f32));
+  addVector("convert", {{input, rankTwoTile(bf16)}}, converted,
+            rankTwoTile(f32));
+  addVector("silu", {{converted, rankTwoTile(f32)}}, activated,
+            rankTwoTile(f32));
+  addVector("mul", {{activated, rankTwoTile(f32)}, {other, rankTwoTile(f32)}},
+            result, rankTwoTile(f32));
   graph.finalize();
   return graph;
 }
