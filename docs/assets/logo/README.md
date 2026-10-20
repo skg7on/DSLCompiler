@@ -1,6 +1,6 @@
 # DSLCompiler logo
 
-![DSLCompiler logo](dslcompiler-logo-v2.png)
+![DSLCompiler logo](dslcompiler-logo-white.png)
 
 ## Meaning
 
@@ -12,13 +12,17 @@
 
 ## Asset
 
-`dslcompiler-logo-v2.png` is the preferred revision: a 2069 × 760 PNG with a transparent alpha background. The `LLK / MicroIR` subtitle uses a geometric sans-serif treatment consistent with the main wordmark, with matching weight and tighter, balanced spacing. The original emblem and horizontal design are retained.
+`dslcompiler-logo-white.png` is the preferred revision: a 2069 × 760 PNG with a solid white background. It keeps the original horizontal design and refined `LLK / MicroIR` subtitle typography.
+
+`dslcompiler-logo-v2.png` is the corresponding 2069 × 760 version with a transparent alpha background. The `LLK / MicroIR` subtitle uses a geometric sans-serif treatment consistent with the main wordmark, with matching weight and tighter, balanced spacing. The original emblem and horizontal design are retained.
 
 `dslcompiler-logo.png` preserves the original 2070 × 760 design from commit `fd2ad03`. Both files are raster logos with geometric styling, not SVGs. The dark lettering is intended for a light background. Keep their aspect ratios and clear space; do not stretch them.
 
 The logo was created with the built-in image-generation tool. It is saved here for project use; the root README and documentation theme have not been changed.
 
 The typography revision was created with the built-in image-generation edit tool using the original logo as its reference. Its exact prompt is in [font-revision-prompt.txt](font-revision-prompt.txt).
+
+The white-background revision uses the same built-in image editor; its exact prompt is in [white-background-prompt.txt](white-background-prompt.txt).
 
 ## Original generation prompt
 
