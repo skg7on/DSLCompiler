@@ -404,6 +404,201 @@ TEST(MachineModelLoader, LoadsShippedGenericProfile) {
 }
 
 //===----------------------------------------------------------------------===//
+// ARM SVE and SME profiles (issue #177)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+llvm::Expected<MachineModel> loadShipped(llvm::StringRef name) {
+  return loadMachineModel(std::string(LLK_MACHINE_DIR) + name.str());
+}
+
+/// Every link endpoint and transfer resource must name a node in the profile,
+/// and every hop moves whole 64-byte transactions. A dangling reference would
+/// only surface later as a routing failure, so the profiles are checked here.
+void expectLinksResolve(const MachineModel &model) {
+  ASSERT_FALSE(model.links.empty());
+  for (const LinkEdge &link : model.links) {
+    EXPECT_NE(model.findMemory(link.source), nullptr) << link.id;
+    EXPECT_NE(model.findMemory(link.destination), nullptr) << link.id;
+    EXPECT_EQ(link.transactionBytes, 64u) << link.id;
+    EXPECT_FALSE(link.transferEngines.empty()) << link.id;
+    for (const std::string &engine : link.transferEngines)
+      EXPECT_NE(model.findTransferEngine(engine), nullptr) << link.id;
+  }
+}
+
+} // namespace
+
+TEST(MachineModelLoader, LoadsArmSve) {
+  llvm::Expected<MachineModel> model = loadShipped("/arm-sve-v2.yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  EXPECT_EQ(model->target, "arm-sve");
+
+  // A cluster group contains eight workers, each offering a 512-bit SVE scope.
+  const ExecutorNode *cluster = model->findExecutor("cluster.0");
+  ASSERT_NE(cluster, nullptr);
+  EXPECT_EQ(cluster->kind, "cluster");
+  EXPECT_TRUE(model->ownerMatches("group", "cluster.0"));
+  EXPECT_EQ(cluster->concurrency, 1u);
+  const ExecutorNode *worker = model->findExecutor("worker.0");
+  ASSERT_NE(worker, nullptr);
+  EXPECT_EQ(worker->parent, std::optional<std::string>("cluster.0"));
+  EXPECT_EQ(worker->concurrency, 8u);
+  const ExecutorNode *sve = model->findExecutor("sve_eng.0");
+  ASSERT_NE(sve, nullptr);
+  EXPECT_EQ(sve->kind, "sve_engine");
+  EXPECT_EQ(sve->parent, std::optional<std::string>("worker.0"));
+  EXPECT_EQ(sve->concurrency, 8u);
+  // The target's own label resolves to an abstract class through `refines`.
+  EXPECT_TRUE(model->ownerMatches("vector", "sve_eng.0"));
+
+  // VL=512 makes 16 f32 / 32 bf16 / 64 i8 lanes.
+  EXPECT_EQ(model->lanesFor("vector_engine", "f32"),
+            std::optional<int64_t>(16));
+  EXPECT_EQ(model->lanesFor("vector_engine", "bf16"),
+            std::optional<int64_t>(32));
+  EXPECT_EQ(model->lanesFor("vector_engine", "i8"), std::optional<int64_t>(64));
+
+  const ComputeNode *svp = model->findCompute("svp");
+  ASSERT_NE(svp, nullptr);
+  EXPECT_EQ(svp->kind, "vector_engine");
+  EXPECT_EQ(svp->attachedTo, "worker.0");
+  EXPECT_EQ(svp->elementTypes, (std::vector<std::string>{"f32", "bf16", "i8"}));
+  EXPECT_EQ(svp->accumulatorDTypes, (std::vector<std::string>{"f32"}));
+  ASSERT_TRUE(svp->throughputPerCycle.has_value());
+  EXPECT_DOUBLE_EQ(*svp->throughputPerCycle, 32.0);
+  EXPECT_EQ(svp->issueCycles, 1u);
+  EXPECT_EQ(svp->latencyCycles, 4u);
+  EXPECT_EQ(svp->concurrency, 8u);
+
+  // SVE is vector-only here, and the accumulator budget *is* the register
+  // storage: a second `rf` pool would double-count it.
+  EXPECT_TRUE(model->computesOfKind("matrix_engine").empty());
+  EXPECT_EQ(model->findMemoryOfKind("rf"), nullptr);
+
+  const MemoryNode *dram = model->findMemory("dram.0");
+  ASSERT_NE(dram, nullptr);
+  EXPECT_EQ(dram->capacityBytes, 68719476736u);
+  EXPECT_DOUBLE_EQ(dram->bandwidthBytesPerCycle, 32.0);
+  EXPECT_EQ(dram->latencyCycles, 220u);
+  const MemoryNode *l2 = model->findMemory("l2.0");
+  ASSERT_NE(l2, nullptr);
+  EXPECT_EQ(l2->capacityBytes, 1048576u);
+  EXPECT_DOUBLE_EQ(l2->bandwidthBytesPerCycle, 64.0);
+  EXPECT_EQ(l2->latencyCycles, 12u);
+  const MemoryNode *sram = model->findMemory("sram.0");
+  ASSERT_NE(sram, nullptr);
+  EXPECT_EQ(sram->capacityBytes, 65536u);
+  EXPECT_DOUBLE_EQ(sram->bandwidthBytesPerCycle, 64.0);
+  EXPECT_EQ(sram->latencyCycles, 4u);
+  ASSERT_TRUE(sram->banks.has_value());
+  EXPECT_EQ(*sram->banks, 1u);
+
+  // 32 Z registers x 64 bytes, a modeled budget rather than a physical claim.
+  const MemoryNode *acc = model->findMemory("acc.0");
+  ASSERT_NE(acc, nullptr);
+  EXPECT_EQ(acc->kind, "acc");
+  EXPECT_EQ(acc->capacityBytes, 2048u);
+  EXPECT_EQ(acc->alignmentBytes, 64u);
+  ASSERT_TRUE(acc->banks.has_value());
+  EXPECT_EQ(*acc->banks, 32u);
+  EXPECT_DOUBLE_EQ(acc->bandwidthBytesPerCycle, 256.0);
+  EXPECT_EQ(acc->latencyCycles, 1u);
+  EXPECT_EQ(acc->supportedLayouts,
+            (std::vector<std::string>{"row_major", "blocked"}));
+
+  // Visibility declared on the worker is inherited by its descendants, and the
+  // cluster-scoped memories remain reachable from the worker.
+  EXPECT_TRUE(model->isVisible("dram.0", "worker.0"));
+  EXPECT_TRUE(model->isVisible("l2.0", "worker.0"));
+  EXPECT_TRUE(model->isVisible("sram.0", "worker.0"));
+  EXPECT_TRUE(model->isVisible("acc.0", "worker.0"));
+
+  const TransferEngineNode *dma = model->findTransferEngine("dma.0");
+  ASSERT_NE(dma, nullptr);
+  EXPECT_EQ(dma->attachedTo, "worker.0");
+  EXPECT_EQ(dma->count, 1u);
+  EXPECT_EQ(dma->maxOutstanding, 8u);
+  EXPECT_EQ(dma->setupCycles, 0u);
+
+  expectLinksResolve(*model);
+  for (const char *id : {"dram_to_l2.0", "l2_to_sram.0", "dram_to_sram.0",
+                         "sram_to_acc.0", "acc_to_sram.0", "sram_to_dram.0"})
+    EXPECT_NE(model->findLink(id), nullptr) << id;
+  EXPECT_EQ(model->findLink("sram_to_za.0"), nullptr);
+  EXPECT_NE(computeContentHash(*model), 0u);
+}
+
+TEST(MachineModelLoader, LoadsArmSme) {
+  llvm::Expected<MachineModel> model = loadShipped("/arm-sme-v2.yaml");
+  ASSERT_TRUE(static_cast<bool>(model)) << llvm::toString(model.takeError());
+  EXPECT_EQ(model->target, "arm-sme");
+
+  // The common vector facts are unchanged: streaming mode does not widen the
+  // ordinary vector lanes in this profile.
+  EXPECT_EQ(model->lanesFor("vector_engine", "f32"),
+            std::optional<int64_t>(16));
+  EXPECT_EQ(model->lanesFor("vector_engine", "bf16"),
+            std::optional<int64_t>(32));
+  EXPECT_EQ(model->lanesFor("vector_engine", "i8"), std::optional<int64_t>(64));
+
+  // Both refinements must resolve: the kernel can pick a vector or a matrix
+  // owner, and neither path is hard-coded in the generic mapping code.
+  const ExecutorNode *sve = model->findExecutor("sve_eng.0");
+  ASSERT_NE(sve, nullptr);
+  EXPECT_TRUE(model->ownerMatches("vector", "sve_eng.0"));
+  const ExecutorNode *zaEng = model->findExecutor("za_eng.0");
+  ASSERT_NE(zaEng, nullptr);
+  EXPECT_EQ(zaEng->kind, "za_engine");
+  EXPECT_EQ(zaEng->parent, std::optional<std::string>("worker.0"));
+  EXPECT_TRUE(model->ownerMatches("matrix", "za_eng.0"));
+
+  // One modeled 16x16x16 macro-work fragment, not one FMOPA instruction.
+  std::vector<const ComputeNode *> matrices =
+      model->computesOfKind("matrix_engine");
+  ASSERT_EQ(matrices.size(), 1u);
+  const ComputeNode *za = matrices[0];
+  EXPECT_EQ(za->id, "za");
+  EXPECT_EQ(za->attachedTo, "worker.0");
+  EXPECT_EQ(za->elementTypes, (std::vector<std::string>{"f32", "bf16"}));
+  EXPECT_EQ(za->accumulatorDTypes, (std::vector<std::string>{"f32"}));
+  ASSERT_EQ(za->shapes.size(), 1u);
+  EXPECT_EQ(za->shapes[0], (std::vector<int64_t>{16, 16, 16}));
+  EXPECT_EQ(za->supportedLayouts,
+            (std::vector<std::string>{"row_major", "blocked"}));
+  ASSERT_TRUE(za->throughputPerCycle.has_value());
+  EXPECT_DOUBLE_EQ(*za->throughputPerCycle, 512.0);
+  EXPECT_EQ(za->issueCycles, 1u);
+  EXPECT_EQ(za->latencyCycles, 5u);
+  EXPECT_EQ(za->concurrency, 8u);
+
+  // ZA capacity is (SVL/8)^2 = 4096 bytes; the bank count is an independent
+  // declared seed, not a derivation from the four logical ZA.S tiles.
+  EXPECT_EQ(model->findMemory("acc.0"), nullptr);
+  const MemoryNode *zaMem = model->findMemory("za.0");
+  ASSERT_NE(zaMem, nullptr);
+  EXPECT_EQ(zaMem->kind, "acc");
+  EXPECT_EQ(zaMem->capacityBytes, 4096u);
+  EXPECT_EQ(zaMem->alignmentBytes, 64u);
+  ASSERT_TRUE(zaMem->banks.has_value());
+  EXPECT_EQ(*zaMem->banks, 4u);
+  EXPECT_DOUBLE_EQ(zaMem->bandwidthBytesPerCycle, 256.0);
+  EXPECT_EQ(zaMem->latencyCycles, 1u);
+  EXPECT_EQ(zaMem->supportedLayouts,
+            (std::vector<std::string>{"row_major", "blocked"}));
+  EXPECT_TRUE(model->isVisible("za.0", "worker.0"));
+  EXPECT_EQ(model->findMemoryOfKind("rf"), nullptr);
+
+  expectLinksResolve(*model);
+  EXPECT_NE(model->findLink("sram_to_za.0"), nullptr);
+  EXPECT_NE(model->findLink("za_to_sram.0"), nullptr);
+  EXPECT_EQ(model->findLink("sram_to_acc.0"), nullptr);
+  EXPECT_EQ(model->findLink("acc_to_sram.0"), nullptr);
+  EXPECT_NE(computeContentHash(*model), 0u);
+}
+
+//===----------------------------------------------------------------------===//
 // Performance facts
 //===----------------------------------------------------------------------===//
 
