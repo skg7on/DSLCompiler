@@ -1,6 +1,6 @@
 # DSLCompiler logo
 
-![DSLCompiler logo](dslcompiler-logo.png)
+![DSLCompiler logo](dslcompiler-logo-v2.png)
 
 ## Meaning
 
@@ -12,11 +12,15 @@
 
 ## Asset
 
-`dslcompiler-logo.png` is a 2070 × 760 PNG with a transparent alpha background. It is a raster logo with geometric styling, not an SVG. The dark lettering is intended for a light background. Keep its aspect ratio and clear space; do not stretch it.
+`dslcompiler-logo-v2.png` is the preferred revision: a 2069 × 760 PNG with a transparent alpha background. The `LLK / MicroIR` subtitle uses a geometric sans-serif treatment consistent with the main wordmark, with matching weight and tighter, balanced spacing. The original emblem and horizontal design are retained.
+
+`dslcompiler-logo.png` preserves the original 2070 × 760 design from commit `fd2ad03`. Both files are raster logos with geometric styling, not SVGs. The dark lettering is intended for a light background. Keep their aspect ratios and clear space; do not stretch them.
 
 The logo was created with the built-in image-generation tool. It is saved here for project use; the root README and documentation theme have not been changed.
 
-## Generation prompt
+The typography revision was created with the built-in image-generation edit tool using the original logo as its reference. Its exact prompt is in [font-revision-prompt.txt](font-revision-prompt.txt).
+
+## Original generation prompt
 
 Use case: logo-brand.
 Asset type: final horizontal project logo with emblem and wordmark, for the README and documentation of the open-source DNN compiler project DSLCompiler.
