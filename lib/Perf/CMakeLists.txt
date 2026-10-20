@@ -1,5 +1,6 @@
 add_llk_library(LLKPerf
     MicroOpDAGBuilders.cpp
+    ContractionSupport.cpp
     OpDAGBuilder.cpp
     TileInfo.cpp
     MicroDAG.cpp

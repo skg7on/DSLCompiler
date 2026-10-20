@@ -28,6 +28,7 @@
 #include "LLK/Mapping/MappingPlan.h"
 #include "LLK/Mapping/StorageLiveness.h"
 #include "LLK/Mapping/StoragePlan.h"
+#include "LLK/Perf/ContractionSupport.h"
 #include "LLK/Perf/MicroCostModel.h"
 #include "LLK/Perf/MicroDAG.h"
 #include "LLK/Perf/MicroPerfReport.h"
@@ -1543,8 +1544,8 @@ module {
     %b = micro.tile_alloc : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>
     %c0 = micro.tile_alloc : !micro.tile<1x1xf32, memory = #micro.memory<acc>>
     %c1 = micro.tile_alloc : !micro.tile<1x1xf32, memory = #micro.memory<acc>>
-    %r0 = micro.mma %a, %b, %c0 {shape = array<i64: 1, 1, 1>, input = #micro.dtype<bf16>, accumulator = #micro.dtype<f32>, engine = "mxu.a", micro.mapping = {executor = "worker.0"}} : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xf32, memory = #micro.memory<acc>> -> !micro.tile<1x1xf32, memory = #micro.memory<acc>>
-    %r1 = micro.mma %a, %b, %c1 {shape = array<i64: 1, 1, 1>, input = #micro.dtype<bf16>, accumulator = #micro.dtype<f32>, engine = "mxu.b", micro.mapping = {executor = "worker.0"}} : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xf32, memory = #micro.memory<acc>> -> !micro.tile<1x1xf32, memory = #micro.memory<acc>>
+    %r0 = micro.mma %a, %b, %c0 {shape = array<i64: 1, 1, 1>, input = #micro.dtype<bf16>, accumulator = #micro.dtype<f32>, engine = "mxu.a", micro.mapping = {executor = "worker.0", compute_bindings = {matrix_engine = "mxu.a"}}} : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xf32, memory = #micro.memory<acc>> -> !micro.tile<1x1xf32, memory = #micro.memory<acc>>
+    %r1 = micro.mma %a, %b, %c1 {shape = array<i64: 1, 1, 1>, input = #micro.dtype<bf16>, accumulator = #micro.dtype<f32>, engine = "mxu.b", micro.mapping = {executor = "worker.0", compute_bindings = {matrix_engine = "mxu.b"}}} : !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xbf16, memory = #micro.memory<sram>>, !micro.tile<1x1xf32, memory = #micro.memory<acc>> -> !micro.tile<1x1xf32, memory = #micro.memory<acc>>
     micro.yield
   }
 }
@@ -1937,4 +1938,441 @@ module { micro.kernel @dependent_partition {
   EXPECT_EQ(dag->events[1].kind, EventKind::TilePartition);
   EXPECT_EQ(dag->events[1].deps, (std::vector<uint32_t>{0}));
 }
+
+//===----------------------------------------------------------------------===//
+// Selected contraction resources (issue #176, task E1)
+//===----------------------------------------------------------------------===//
+
+TEST(ContractionSupport, AcceptsSupportedVectorAndMatrixPairs) {
+  machine::ComputeNode engine;
+  engine.kind = "vector_engine";
+  engine.elementTypes = {"f32", "bf16"};
+  engine.accumulatorDTypes = {"f32"};
+  EXPECT_TRUE(supportsContractionTypes(engine, "f32", "f32"));
+  EXPECT_TRUE(supportsContractionTypes(engine, "bf16", "f32"));
+
+  engine.kind = "matrix_engine";
+  EXPECT_TRUE(supportsContractionTypes(engine, "f32", "f32"));
+  EXPECT_TRUE(supportsContractionTypes(engine, "bf16", "f32"));
+}
+
+TEST(ContractionSupport, RejectsUnsupportedKindsAndDtypePairs) {
+  machine::ComputeNode engine;
+  engine.kind = "vector_engine";
+  engine.elementTypes = {"f32", "bf16"};
+  engine.accumulatorDTypes = {"f32"};
+
+  // An unsupported kind is never a contraction engine, even with the pair.
+  engine.kind = "dma";
+  EXPECT_FALSE(supportsContractionTypes(engine, "f32", "f32"));
+
+  engine.kind = "vector_engine";
+  EXPECT_FALSE(supportsContractionTypes(engine, "i8", "f32"));
+  EXPECT_FALSE(supportsContractionTypes(engine, "f32", "bf16"));
+  engine.accumulatorDTypes.clear();
+  EXPECT_FALSE(supportsContractionTypes(engine, "f32", "f32"));
+}
+
+namespace {
+
+/// A synthetic contraction probe with no target name: vector engines `v0` and
+/// `v1` and an optional matrix unit `mxu`, all attached to `w0`. Neither engine
+/// declares a `throughput_per_cycle`, so a vector contraction exercises the
+/// accumulator-lane fallback unless the caller asks for throughput costing.
+std::string contractionProbeMachine(bool withVector, bool withMatrix,
+                                    bool withThroughput = false,
+                                    bool withF32Lanes = true,
+                                    unsigned workerConcurrency = 1) {
+  std::string yaml =
+      "schema: llk.machine.v2\n"
+      "target: contraction-probe\n"
+      "clock_hz: 1000000000\n"
+      "worker_threads: 1\n"
+      "sync:\n  barrier_cycles: 1\n  wait_cycles: 0\n"
+      "executors:\n"
+      "  - id: cluster.0\n    kind: cluster\n    refines: [group]\n"
+      "  - id: w0\n    kind: worker\n    parent: cluster.0\n"
+      "    concurrency: " +
+      std::to_string(workerConcurrency) +
+      "\n"
+      "  - id: w1\n    kind: worker\n    parent: cluster.0\n"
+      "memories:\n"
+      "  - id: sram.0\n    kind: sram\n    visible_from: w0\n"
+      "    capacity_bytes: 1048576\n    alignment_bytes: 64\n"
+      "    supported_layouts: [row_major]\n"
+      "    bandwidth_bytes_per_cycle: 64\n    latency_cycles: 1\n"
+      "  - id: acc.0\n    kind: acc\n    visible_from: w0\n"
+      "    capacity_bytes: 65536\n    alignment_bytes: 64\n"
+      "    supported_layouts: [row_major]\n"
+      "    bandwidth_bytes_per_cycle: 64\n    latency_cycles: 1\n"
+      "compute:\n";
+  if (withVector)
+    for (llvm::StringRef id : {"v0", "v1"}) {
+      yaml += "  - id: " + id.str() +
+              "\n    kind: vector_engine\n    refines: [vector]\n"
+              "    attached_to: w0\n"
+              "    element_types: [f32, bf16, i8]\n"
+              "    accumulator_dtypes: [f32]\n"
+              "    shapes: [[16], [32]]\n"
+              "    issue_cycles: 1\n    latency_cycles: 1\n"
+              "    concurrency: 1\n    supported_layouts: [row_major]\n";
+      yaml += withF32Lanes ? "    lanes: {f32: 16, bf16: 32, i8: 64}\n"
+                           : "    lanes: {bf16: 32, i8: 64}\n";
+      if (withThroughput)
+        yaml += "    throughput_per_cycle: 32\n";
+    }
+  if (withMatrix) {
+    yaml += "  - id: mxu\n    kind: matrix_engine\n    refines: [matrix]\n"
+            "    attached_to: w0\n"
+            "    element_types: [f32, bf16]\n"
+            "    accumulator_dtypes: [f32]\n"
+            "    shapes: [[16, 16, 16]]\n"
+            "    issue_cycles: 1\n    latency_cycles: 1\n"
+            "    concurrency: 1\n    supported_layouts: [row_major]\n";
+    if (withThroughput)
+      yaml += "    throughput_per_cycle: 32\n";
+  }
+  return yaml;
+}
+
+/// One mapped 16x16x16 contraction. `bindings` is the body of the
+/// `micro.mapping` dictionary, so a test writes only the identity it exercises.
+std::string selectedContractionKernel(llvm::StringRef bindings,
+                                      llvm::StringRef input = "f32",
+                                      llvm::StringRef accumulator = "f32",
+                                      llvm::StringRef engine = "") {
+  std::string attrs = "shape = array<i64: 16, 16, 16>, input = #micro.dtype<";
+  attrs += input.str();
+  attrs += ">, accumulator = #micro.dtype<";
+  attrs += accumulator.str();
+  attrs += ">";
+  if (!engine.empty()) {
+    attrs += ", engine = \"";
+    attrs += engine.str();
+    attrs += "\"";
+  }
+  if (!bindings.empty()) {
+    attrs += ", micro.mapping = {";
+    attrs += bindings.str();
+    attrs += "}";
+  }
+
+  std::string source = "module {\n  micro.kernel @selected_contraction {\n"
+                       "    %a = micro.tile_alloc : !micro.tile<16x16x";
+  source += input.str();
+  source += ", memory = #micro.memory<sram>>\n"
+            "    %b = micro.tile_alloc : !micro.tile<16x16x";
+  source += input.str();
+  source += ", memory = #micro.memory<sram>>\n"
+            "    %c = micro.tile_alloc : !micro.tile<16x16x";
+  source += accumulator.str();
+  source += ", memory = #micro.memory<acc>>\n"
+            "    %r = micro.mma %a, %b, %c {";
+  source += attrs;
+  source += "} : !micro.tile<16x16x";
+  source += input.str();
+  source += ", memory = #micro.memory<sram>>, !micro.tile<16x16x";
+  source += input.str();
+  source += ", memory = #micro.memory<sram>>, !micro.tile<16x16x";
+  source += accumulator.str();
+  source += ", memory = #micro.memory<acc>> -> !micro.tile<16x16x";
+  source += accumulator.str();
+  source += ", memory = #micro.memory<acc>>\n"
+            "    micro.yield\n  }\n}\n";
+  return source;
+}
+
+/// An independent vector op and a vector contraction, both placed on `w0`.
+/// `vectorEngine` is the engine the epilogue-like vector op selected.
+std::string sharedVectorPoolKernel(llvm::StringRef vectorEngine) {
+  std::string source = R"mlir(module {
+  micro.kernel @shared_vector_pool {
+    %a = micro.tile_alloc : !micro.tile<16x16xf32, memory = #micro.memory<sram>>
+    %b = micro.tile_alloc : !micro.tile<16x16xf32, memory = #micro.memory<sram>>
+    %c = micro.tile_alloc : !micro.tile<16x16xf32, memory = #micro.memory<acc>>
+    %r = micro.mma %a, %b, %c {shape = array<i64: 16, 16, 16>, input = #micro.dtype<f32>, accumulator = #micro.dtype<f32>, micro.mapping = {executor = "w0", compute_bindings = {vector_engine = "v0"}}} : !micro.tile<16x16xf32, memory = #micro.memory<sram>>, !micro.tile<16x16xf32, memory = #micro.memory<sram>>, !micro.tile<16x16xf32, memory = #micro.memory<acc>> -> !micro.tile<16x16xf32, memory = #micro.memory<acc>>
+    %x = micro.tile_alloc : !micro.tile<16xf32, memory = #micro.memory<sram>>
+    %y = micro.vector "silu" %x {micro.mapping = {executor = "w0", compute_bindings = {vector_engine = ")mlir";
+  source += vectorEngine.str();
+  source +=
+      R"mlir("}}} : !micro.tile<16xf32, memory = #micro.memory<sram>> -> !micro.tile<16xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir";
+  return source;
+}
+
+const MicroEvent *mmaEvent(const MicroDAG &dag) {
+  for (const MicroEvent &event : dag.events)
+    if (event.kind == EventKind::Mma)
+      return &event;
+  return nullptr;
+}
+
+void expectBuildError(llvm::StringRef source, llvm::StringRef machineYaml,
+                      llvm::StringRef fragment) {
+  auto parsed = parseKernel(source);
+  ASSERT_NE(parsed, nullptr);
+  machine::MachineModel model = parseMachine(machineYaml);
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_FALSE(static_cast<bool>(dag));
+  const std::string text = llvm::toString(dag.takeError());
+  EXPECT_NE(text.find(fragment.str()), std::string::npos) << text;
+}
+
+} // namespace
+
+// A vector-only machine has no matrix engine at all. The mapped contraction's
+// selected engine -- not declaration order -- decides its event identity, cost
+// and owner, and the accumulator-lane fallback charges 16x16x16 at lanes 16.
+TEST(SelectedContraction, VectorOnlyMachineChargesTheSelectedEngine) {
+  auto parsed = parseKernel(selectedContractionKernel(
+      R"(executor = "w0", compute_bindings = {vector_engine = "v1"})"));
+  ASSERT_NE(parsed, nullptr);
+  machine::MachineModel model = parseMachine(
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/false));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  const MicroEvent *mma = mmaEvent(*dag);
+  ASSERT_NE(mma, nullptr);
+  EXPECT_EQ(mma->kind, EventKind::Mma);
+  EXPECT_EQ(mma->resource, ResourceKind::VectorEngine);
+  EXPECT_EQ(mma->resourceName, "v1");
+  EXPECT_EQ(mma->ownerPool, "w0");
+  EXPECT_EQ(mma->workItems, 4096u); // M=N=K=16 MACs.
+  EXPECT_EQ(mma->minCycles, 256u);  // 16*16*ceil(16/16)*issue 1.
+
+  // The report classifies the work by the selected resource, not by the op.
+  L0Report bound = computeL0StaticBound(*dag, model);
+  EXPECT_EQ(bound.totalFlops, 8192u);
+  EXPECT_EQ(bound.bottleneck, "vector_engine");
+  L1Report report = scheduleL1(*dag, model);
+  EXPECT_GT(report.vectorUtilization, 0.0);
+  EXPECT_EQ(report.matrixUtilization, 0.0);
+  EXPECT_EQ(report.bottleneck, "vector_engine");
+}
+
+// A declared throughput is the one cost fact: 8192 flops at 32 per cycle.
+TEST(SelectedContraction, ThroughputCostWinsOverTheLaneFallback) {
+  auto parsed = parseKernel(selectedContractionKernel(
+      R"(executor = "w0", compute_bindings = {vector_engine = "v0"})"));
+  ASSERT_NE(parsed, nullptr);
+  machine::MachineModel model = parseMachine(contractionProbeMachine(
+      /*withVector=*/true, /*withMatrix=*/false, /*withThroughput=*/true));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  const MicroEvent *mma = mmaEvent(*dag);
+  ASSERT_NE(mma, nullptr);
+  EXPECT_EQ(mma->resource, ResourceKind::VectorEngine);
+  EXPECT_EQ(mma->minCycles, 256u); // 8192 / 32.
+}
+
+// A matrix-only machine keeps the existing matrix path, including the
+// fragment-based fallback and the matrix resource kind.
+TEST(SelectedContraction, MatrixOnlyMachineKeepsMatrixIdentity) {
+  auto parsed = parseKernel(selectedContractionKernel(
+      R"(executor = "w0", compute_bindings = {matrix_engine = "mxu"})"));
+  ASSERT_NE(parsed, nullptr);
+  machine::MachineModel model = parseMachine(
+      contractionProbeMachine(/*withVector=*/false, /*withMatrix=*/true));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  const MicroEvent *mma = mmaEvent(*dag);
+  ASSERT_NE(mma, nullptr);
+  EXPECT_EQ(mma->resource, ResourceKind::MatrixEngine);
+  EXPECT_EQ(mma->resourceName, "mxu");
+  EXPECT_EQ(mma->minCycles, 1u); // one 16x16x16 fragment, issue 1.
+  L0Report bound = computeL0StaticBound(*dag, model);
+  EXPECT_EQ(bound.bottleneck, "matrix_engine");
+}
+
+// On a mixed machine the selected identity still wins over declaration order:
+// `v0` is declared first and `mxu` exists, but the plan chose `v1`.
+TEST(SelectedContraction, MixedMachineHonorsTheSelectedNode) {
+  auto parsed = parseKernel(selectedContractionKernel(
+      R"(executor = "w0", compute_bindings = {vector_engine = "v1"})"));
+  ASSERT_NE(parsed, nullptr);
+  machine::MachineModel model = parseMachine(
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/true));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  const MicroEvent *mma = mmaEvent(*dag);
+  ASSERT_NE(mma, nullptr);
+  EXPECT_EQ(mma->resource, ResourceKind::VectorEngine);
+  EXPECT_EQ(mma->resourceName, "v1");
+  EXPECT_EQ(mma->minCycles, 256u);
+}
+
+// An unmapped kernel keeps the documented reference default: the machine's
+// first matrix engine, with no selected identity to honor.
+TEST(SelectedContraction, UnmappedContractionKeepsTheMatrixDefault) {
+  auto parsed = parseKernel(selectedContractionKernel(/*bindings=*/""));
+  ASSERT_NE(parsed, nullptr);
+  machine::MachineModel model = parseMachine(
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/true));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  const MicroEvent *mma = mmaEvent(*dag);
+  ASSERT_NE(mma, nullptr);
+  EXPECT_EQ(mma->resource, ResourceKind::MatrixEngine);
+  EXPECT_EQ(mma->resourceName, "mxu");
+  EXPECT_TRUE(mma->ownerPool.empty());
+}
+
+TEST(SelectedContraction, MissingSelectedComputeEngineIsRejected) {
+  expectBuildError(
+      selectedContractionKernel(R"(executor = "w0")"),
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/false),
+      "compute engine");
+}
+
+TEST(SelectedContraction, ConflictingSelectedComputeEnginesAreRejected) {
+  expectBuildError(
+      selectedContractionKernel(
+          R"(executor = "w0", compute_bindings = {vector_engine = "v0", matrix_engine = "mxu"})"),
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/true),
+      "both");
+}
+
+TEST(SelectedContraction, UnknownSelectedComputeEngineIsRejected) {
+  expectBuildError(
+      selectedContractionKernel(
+          R"(executor = "w0", compute_bindings = {vector_engine = "ghost"})"),
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/false),
+      "ghost");
+}
+
+TEST(SelectedContraction, EngineOnAnotherExecutorIsRejected) {
+  expectBuildError(
+      selectedContractionKernel(
+          R"(executor = "w1", compute_bindings = {vector_engine = "v0"})"),
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/false),
+      "attached");
+}
+
+TEST(SelectedContraction, ExplicitEngineMustAgreeWithTheSelection) {
+  expectBuildError(
+      selectedContractionKernel(
+          R"(executor = "w0", compute_bindings = {vector_engine = "v1"})",
+          "f32", "f32", /*engine=*/"v0"),
+      contractionProbeMachine(/*withVector=*/true,
+                              /*withMatrix=*/false),
+      "disagrees");
+}
+
+TEST(SelectedContraction, UnsupportedSelectedDtypePairIsRejected) {
+  expectBuildError(
+      selectedContractionKernel(
+          R"(executor = "w0", compute_bindings = {vector_engine = "v0"})",
+          "f32", "bf16"),
+      contractionProbeMachine(/*withVector=*/true,
+                              /*withMatrix=*/false),
+      "not supported");
+}
+
+TEST(SelectedContraction, MissingAccumulatorLanesIsRejected) {
+  expectBuildError(
+      selectedContractionKernel(
+          R"(executor = "w0", compute_bindings = {vector_engine = "v0"})"),
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/false,
+                              /*withThroughput=*/false,
+                              /*withF32Lanes=*/false),
+      "lane");
+}
+
+TEST(SelectedContraction, OverflowingShapeIsRejected) {
+  // 2^40 in each extent overflows the 64-bit MAC product before any cost is
+  // computed. The tile types are dynamic so the op itself still verifies.
+  const std::string source = R"mlir(module {
+  micro.kernel @overflow {
+    %c0 = arith.constant 0 : index
+    %ae = tensor.empty(%c0, %c0) : tensor<?x?xf32>
+    %be = tensor.empty(%c0, %c0) : tensor<?x?xf32>
+    %ce = tensor.empty(%c0, %c0) : tensor<?x?xf32>
+    %a = micro.tile_view %ae {shape = array<i64: -9223372036854775808, -9223372036854775808>} : tensor<?x?xf32> -> !micro.tile<?x?xf32, memory = #micro.memory<sram>>
+    %b = micro.tile_view %be {shape = array<i64: -9223372036854775808, -9223372036854775808>} : tensor<?x?xf32> -> !micro.tile<?x?xf32, memory = #micro.memory<sram>>
+    %c = micro.tile_view %ce {shape = array<i64: -9223372036854775808, -9223372036854775808>} : tensor<?x?xf32> -> !micro.tile<?x?xf32, memory = #micro.memory<acc>>
+    %r = micro.mma %a, %b, %c {shape = array<i64: 1099511627776, 1099511627776, 1099511627776>, input = #micro.dtype<f32>, accumulator = #micro.dtype<f32>, micro.mapping = {executor = "w0", compute_bindings = {vector_engine = "v0"}}} : !micro.tile<?x?xf32, memory = #micro.memory<sram>>, !micro.tile<?x?xf32, memory = #micro.memory<sram>>, !micro.tile<?x?xf32, memory = #micro.memory<acc>> -> !micro.tile<?x?xf32, memory = #micro.memory<acc>>
+    micro.yield
+  }
+}
+)mlir";
+  expectBuildError(source,
+                   contractionProbeMachine(/*withVector=*/true,
+                                           /*withMatrix=*/false),
+                   "overflow");
+}
+
+// A vector contraction and an independent vector op are both vector work. On
+// one concurrency-1 engine they must serialize; on two selected engines the
+// owner pool allows them to overlap.
+TEST(SelectedContraction, VectorContractionSharesTheSelectedEnginePool) {
+  machine::MachineModel model = parseMachine(
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/false,
+                              /*withThroughput=*/false,
+                              /*withF32Lanes=*/true,
+                              /*workerConcurrency=*/2));
+
+  auto same = parseKernel(sharedVectorPoolKernel("v0"));
+  ASSERT_NE(same, nullptr);
+  auto sameDag = buildMicroDAG(same->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(sameDag))
+      << llvm::toString(sameDag.takeError());
+  ASSERT_EQ(sameDag->events.size(), 2u);
+  EXPECT_EQ(sameDag->events[0].resourceName, "v0");
+  EXPECT_EQ(sameDag->events[1].resourceName, "v0");
+  L1Report serial = scheduleL1(*sameDag, model);
+  EXPECT_EQ(serial.schedule[1].start, serial.schedule[0].finish);
+  EXPECT_EQ(serial.predictedCycles, serial.schedule[0].finish +
+                                        serial.schedule[1].finish -
+                                        serial.schedule[1].start);
+
+  auto distinct = parseKernel(sharedVectorPoolKernel("v1"));
+  ASSERT_NE(distinct, nullptr);
+  auto distinctDag = buildMicroDAG(distinct->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(distinctDag))
+      << llvm::toString(distinctDag.takeError());
+  ASSERT_EQ(distinctDag->events.size(), 2u);
+  EXPECT_EQ(distinctDag->events[0].resourceName, "v0");
+  EXPECT_EQ(distinctDag->events[1].resourceName, "v1");
+  L1Report parallel = scheduleL1(*distinctDag, model);
+  EXPECT_EQ(parallel.schedule[0].start, 0u);
+  EXPECT_EQ(parallel.schedule[1].start, 0u);
+  EXPECT_LT(parallel.predictedCycles, serial.predictedCycles);
+}
+
+// The materialized kernel's own event and the selected analysis must agree on
+// the identity, owner and cost of a vector contraction.
+TEST(SelectedContraction, SelectedAndMaterializedFactsAgree) {
+  auto parsed = parseKernel(selectedContractionKernel(
+      R"(executor = "w0", compute_bindings = {vector_engine = "v1"})"));
+  ASSERT_NE(parsed, nullptr);
+  machine::MachineModel model = parseMachine(
+      contractionProbeMachine(/*withVector=*/true, /*withMatrix=*/false));
+
+  auto dag = buildMicroDAG(parsed->kernel, model);
+  ASSERT_TRUE(static_cast<bool>(dag)) << llvm::toString(dag.takeError());
+  llvm::Expected<SelectedKernelAnalysis> analysis =
+      analyzeSelectedKernel(parsed->kernel, model, /*requireComplete=*/true);
+  ASSERT_TRUE(static_cast<bool>(analysis))
+      << llvm::toString(analysis.takeError());
+  ASSERT_EQ(analysis->events.events.size(), 1u);
+  const mapping::PlanCostEvent &normalized = analysis->events.events[0];
+  EXPECT_EQ(normalized.event.resource, "v1");
+  EXPECT_EQ(normalized.owner, "w0");
+  EXPECT_DOUBLE_EQ(normalized.event.cost.latencyCycles, 256.0);
+  const MicroEvent *mma = mmaEvent(*dag);
+  ASSERT_NE(mma, nullptr);
+  EXPECT_EQ(mma->resourceName, normalized.event.resource);
+  EXPECT_EQ(mma->ownerPool, normalized.owner);
+  EXPECT_DOUBLE_EQ(static_cast<double>(mma->minCycles),
+                   normalized.event.cost.latencyCycles);
+}
+
 } // namespace mlir::llk::perf

@@ -25,6 +25,7 @@
 #include "LLK/Perf/Legality.h"
 
 #include "LLK/Dialect/Micro/MicroEnums.h"
+#include "LLK/Perf/ContractionSupport.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLExtras.h"
@@ -367,20 +368,61 @@ LegalityResult checkAccCapacity(const SearchSpace &space,
   return legal();
 }
 
-/// Reports that `engine` cannot run `shape`; shared by each contraction so the
-/// diagnostic names the *first* offending dtype pair.
-LegalityResult mmaUnsupported(const machine::ComputeNode &engine,
-                              const WorkloadShape &shape) {
+/// Reports that no capability can run `shape`; shared by each contraction so
+/// the diagnostic names the *first* offending dtype fact.
+LegalityResult
+mmaUnsupported(llvm::ArrayRef<const machine::ComputeNode *> engines,
+               const WorkloadShape &shape) {
   ConstraintKind kind = ConstraintKind::MmaCompatible;
-  if (!llvm::is_contained(engine.elementTypes, shape.inputDType))
-    return illegal(kind, "engine '" + engine.id +
-                             "' does not support input dtype '" +
-                             shape.inputDType + "' (supported: " +
-                             llvm::join(engine.elementTypes, ", ") + ")");
-  return illegal(kind, "no matrix engine supports accumulator dtype '" +
-                           shape.accumulatorDType + "' (engine '" + engine.id +
-                           "' supports: " +
-                           llvm::join(engine.accumulatorDTypes, ", ") + ")");
+  for (const machine::ComputeNode *engine : engines)
+    if (!llvm::is_contained(engine->elementTypes, shape.inputDType))
+      return illegal(kind, "engine '" + engine->id +
+                               "' does not support input dtype '" +
+                               shape.inputDType + "' (supported: " +
+                               llvm::join(engine->elementTypes, ", ") + ")");
+  return illegal(kind, "no contraction engine supports accumulator dtype '" +
+                           shape.accumulatorDType + "'");
+}
+
+/// True when `engine` can issue the execution tile without masking. Matrix
+/// capabilities keep their fragment divisibility; a vector capability needs a
+/// positive accumulator lane width and a tile width divisible by it.
+bool contractionTileFits(const machine::ComputeNode &engine,
+                         const WorkloadShape &shape, int64_t BM, int64_t BN,
+                         int64_t BK, std::string &reason) {
+  if (engine.kind == "matrix_engine") {
+    if (engine.shapes.empty()) {
+      reason = "matrix engine '" + engine.id + "' declares no fragment";
+      return false;
+    }
+    const std::vector<int64_t> &fragment = largestTileShape(engine);
+    if (fragment.size() != 3) {
+      reason = "matrix engine '" + engine.id + "' declares no rank-3 fragment";
+      return false;
+    }
+    if (BM % fragment[0] == 0 && BN % fragment[1] == 0 && BK % fragment[2] == 0)
+      return true;
+    reason = "tile " + tripleText({BM, BN, BK}) +
+             " is not a multiple of engine '" + engine.id + "' fragment " +
+             tripleText(fragment) + " and tail_policy is not 'mask'";
+    return false;
+  }
+
+  auto lanes = engine.lanes.find(shape.accumulatorDType);
+  if (lanes == engine.lanes.end() || lanes->second <= 0) {
+    reason = "engine '" + engine.id +
+             "' declares no accumulator lane width for dtype '" +
+             shape.accumulatorDType + "'";
+    return false;
+  }
+  if (BN % lanes->second == 0)
+    return true;
+  reason =
+      ("tile " + tripleText({BM, BN, BK}) + " is not a multiple of engine '" +
+       engine.id + "' accumulator lane width " + llvm::Twine(lanes->second) +
+       " and tail_policy is not 'mask'")
+          .str();
+  return false;
 }
 
 LegalityResult checkMmaCompatible(const SearchSpace &space,
@@ -388,9 +430,16 @@ LegalityResult checkMmaCompatible(const SearchSpace &space,
                                   const BindingFacts &facts,
                                   const machine::MachineModel &machine) {
   ConstraintKind kind = ConstraintKind::MmaCompatible;
-  if (machine.computesOfKind("matrix_engine").empty())
+
+  // Contraction-capable capabilities, in declaration order. A machine with no
+  // matrix engine is still a machine that can accumulate on a vector engine.
+  llvm::SmallVector<const machine::ComputeNode *> engines;
+  for (const machine::ComputeNode &node : machine.computes)
+    if (node.kind == "vector_engine" || node.kind == "matrix_engine")
+      engines.push_back(&node);
+  if (engines.empty())
     return illegal(kind, "machine '" + machine.target +
-                             "' declares no matrix engine");
+                             "' declares no vector or matrix engine");
 
   // Every contraction the kernel performs must be runnable, not merely the
   // first: a second `micro.mma` with an unsupported dtype pair is a rejection.
@@ -410,35 +459,41 @@ LegalityResult checkMmaCompatible(const SearchSpace &space,
     BK = resolver.get("BK");
     if (!resolver.error.empty())
       return illegal(kind, resolver.error);
+    if (*BM <= 0 || *BN <= 0 || *BK <= 0)
+      return illegal(kind, "tile " + tripleText({*BM, *BN, *BK}) +
+                               " has a non-positive extent");
   }
 
   for (const WorkloadShape *shape : shapes) {
-    // Any engine that accepts the dtype pair can run this contraction; the
-    // first matching one is used, so a machine is not rejected because its
-    // *first* engine happens to have a different dtype mix.
-    const machine::ComputeNode *engine = nullptr;
-    for (const machine::ComputeNode *candidateEngine :
-         machine.computesOfKind("matrix_engine"))
-      if (llvm::is_contained(candidateEngine->elementTypes,
-                             shape->inputDType) &&
-          llvm::is_contained(candidateEngine->accumulatorDTypes,
-                             shape->accumulatorDType)) {
-        engine = candidateEngine;
-        break;
-      }
-    if (!engine)
-      return mmaUnsupported(*machine.computesOfKind("matrix_engine").front(),
-                            *shape);
+    // Any capability that accepts the dtype pair is a candidate; the plan may
+    // select either the vector or the matrix implementation.
+    llvm::SmallVector<const machine::ComputeNode *> compatible;
+    for (const machine::ComputeNode *engine : engines)
+      if (supportsContractionTypes(*engine, shape->inputDType,
+                                   shape->accumulatorDType))
+        compatible.push_back(engine);
+    if (compatible.empty())
+      return mmaUnsupported(engines, *shape);
     if (masked)
       continue;
 
-    const std::vector<int64_t> &fragment = largestTileShape(*engine);
-    if (*BM % fragment[0] != 0 || *BN % fragment[1] != 0 ||
-        *BK % fragment[2] != 0)
-      return illegal(kind, "tile " + tripleText({*BM, *BN, *BK}) +
-                               " is not a multiple of engine '" + engine->id +
-                               "' fragment " + tripleText(fragment) +
-                               " and tail_policy is not 'mask'");
+    // One compatible implementation that meets its own constraints is enough;
+    // the concrete selection happens later and is authoritative there.
+    std::string firstFailure;
+    bool fits = false;
+    for (const machine::ComputeNode *engine : compatible) {
+      std::string failure;
+      if (contractionTileFits(*engine, *shape, *BM, *BN, *BK, failure)) {
+        fits = true;
+        break;
+      }
+      if (firstFailure.empty())
+        firstFailure = std::move(failure);
+    }
+    if (!fits)
+      return illegal(kind, firstFailure.empty()
+                               ? "no contraction engine can issue the tile"
+                               : firstFailure);
   }
   return legal();
 }

@@ -8,11 +8,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/CostModel.h"
+#include "LLK/Perf/ContractionSupport.h"
 #include "LLK/Perf/OpDAGBuilder.h"
 #include "MicroTileInfo.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/CheckedArithmetic.h"
 #include <cmath>
+#include <optional>
 namespace mlir::llk::perf {
 namespace {
 llvm::Error invalid(const llvm::Twine &message) {
@@ -122,7 +125,7 @@ llvm::Error buildMma(micro::MmaOp mma, OpDAGBuildContext &context) {
     requested = *engineAttr;
   std::string reason;
   const machine::ComputeNode *engine =
-      context.pickMatrixEngine(requested, reason);
+      context.pickContractionEngine(requested, reason);
   if (!engine)
     return invalid("kernel '" + context.kernelName().str() +
                    "' uses micro.mma: " + reason);
@@ -131,37 +134,65 @@ llvm::Error buildMma(micro::MmaOp mma, OpDAGBuildContext &context) {
   if (shape.size() != 3)
     return invalid("micro.mma shape must have three dimensions");
 
-  uint64_t macs = static_cast<uint64_t>(shape[0]) *
-                  static_cast<uint64_t>(shape[1]) *
-                  static_cast<uint64_t>(shape[2]);
+  uint64_t macs = 1;
+  for (int64_t extent : shape) {
+    std::optional<uint64_t> product =
+        llvm::checkedMulUnsigned<uint64_t>(macs, static_cast<uint64_t>(extent));
+    if (!product)
+      return invalid("micro.mma MAC count overflows 64 bits");
+    macs = *product;
+  }
+  std::optional<uint64_t> flops = llvm::checkedMulUnsigned<uint64_t>(macs, 2);
+  if (!flops)
+    return invalid("micro.mma FLOP count overflows 64 bits");
+
   std::string inputDtype = micro::stringifyDType(mma.getInput()).str();
   std::string accumulatorDtype =
       micro::stringifyDType(mma.getAccumulator()).str();
-  if (!llvm::is_contained(engine->elementTypes, inputDtype))
-    context.noteWarning(
-        "micro.mma input dtype '" + inputDtype +
-        "' is not supported by engine '" + engine->id +
-        "' (supported: " + llvm::join(engine->elementTypes, ", ") + ")");
-  if (!llvm::is_contained(engine->accumulatorDTypes, accumulatorDtype))
-    context.noteWarning(
-        "micro.mma accumulator dtype '" + accumulatorDtype +
-        "' is not supported by engine '" + engine->id +
-        "' (supported: " + llvm::join(engine->accumulatorDTypes, ", ") + ")");
+  const bool mapped =
+      op.getAttrOfType<mlir::DictionaryAttr>("micro.mapping") != nullptr;
+  if (!supportsContractionTypes(*engine, inputDtype, accumulatorDtype)) {
+    // A selected plan may not be described as complete when its engine cannot
+    // run the dtype pair; only hand-written/reference analysis keeps the
+    // historical warning.
+    if (mapped)
+      return invalid("micro.mma dtype pair ('" + inputDtype + "', '" +
+                     accumulatorDtype +
+                     "') is not supported by selected "
+                     "engine '" +
+                     engine->id + "'");
+    if (!llvm::is_contained(engine->elementTypes, inputDtype))
+      context.noteWarning(
+          "micro.mma input dtype '" + inputDtype +
+          "' is not supported by engine '" + engine->id +
+          "' (supported: " + llvm::join(engine->elementTypes, ", ") + ")");
+    if (!llvm::is_contained(engine->accumulatorDTypes, accumulatorDtype))
+      context.noteWarning(
+          "micro.mma accumulator dtype '" + accumulatorDtype +
+          "' is not supported by engine '" + engine->id +
+          "' (supported: " + llvm::join(engine->accumulatorDTypes, ", ") + ")");
+  }
 
   TileInfo lhsInfo = describeType(mma.getLhs().getType());
   TileInfo accInfo = describeType(mma.getAcc().getType());
 
   MicroEvent event;
   event.kind = EventKind::Mma;
-  event.resource = ResourceKind::MatrixEngine;
-  // An op that names no engine runs on the first engine of its class; one
-  // that names an engine runs there. Either way the event names a single
-  // pool, so two events naming the same engine share its slots instead of
-  // each being handed the whole machine.
+  // The selected engine's actual kind is the resource the work occupies: a
+  // vector contraction contends with vector epilogues on the same pool.
+  event.resource = engine->kind == "matrix_engine" ? ResourceKind::MatrixEngine
+                                                   : ResourceKind::VectorEngine;
+  // The event names the one concrete pool the selected engine owns, so two
+  // events selecting the same engine share its slots instead of each being
+  // handed the whole machine.
   event.resourceName = engine->id;
   event.ownerPool = mappedExecutor(op).str();
   event.workItems = macs;
-  event.minCycles = context.mmaCycles(*engine, shape, 2 * macs);
+  llvm::Expected<uint64_t> cycles =
+      context.contractionCycles(*engine, shape, *flops, accumulatorDtype);
+  if (!cycles)
+    return cycles.takeError();
+  event.minCycles = *cycles;
   event.sourceOpName = op.getName().getStringRef().str();
   event.tileShape = shapeString(shape);
   event.tileLayout = lhsInfo.layout.empty() ? accInfo.layout : lhsInfo.layout;
