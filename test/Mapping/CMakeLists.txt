@@ -14,6 +14,7 @@ add_llk_test_category(Mapping
         storage_plan.cpp
         avx2_target.cpp
         arm_policy.cpp
+        arm_targets.cpp
         generic_accelerator_target.cpp
         plan_binder.cpp
         e2e_workflow.cpp
@@ -35,6 +36,7 @@ add_llk_test_category(Mapping
         LLK_MAPPING_DIR="${CMAKE_SOURCE_DIR}/mapping"
         LLK_MACHINE_DIR="${CMAKE_SOURCE_DIR}/machines"
         LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        LLK_TEST_BINARY_DIR="${CMAKE_CURRENT_BINARY_DIR}"
     INCLUDE_DIRECTORIES
         ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
 )
