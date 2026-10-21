@@ -13,6 +13,7 @@ add_llk_test_category(Mapping
         covering_search.cpp
         storage_plan.cpp
         avx2_target.cpp
+        arm_policy.cpp
         generic_accelerator_target.cpp
         plan_binder.cpp
         e2e_workflow.cpp
