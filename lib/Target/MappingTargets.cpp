@@ -13,6 +13,8 @@
 
 #include "LLK/Target/MappingTargets.h"
 
+#include "LLK/Target/AArch64/Mapping/SMEMappingTarget.h"
+#include "LLK/Target/AArch64/Mapping/SVEMappingTarget.h"
 #include "LLK/Target/GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.h"
 #include "LLK/Target/X86/Mapping/AVX2MappingTarget.h"
 
@@ -22,6 +24,8 @@ void registerAllMappingTargets() {
   mapping::registerMappingTarget("x86-avx2", &avx2::createMappingTarget);
   mapping::registerMappingTarget("generic-ai-accel",
                                  &generic_accel::createMappingTarget);
+  mapping::registerMappingTarget("arm-sve", &sve::createMappingTarget);
+  mapping::registerMappingTarget("arm-sme", &sme::createMappingTarget);
 }
 
 } // namespace mlir::llk::target
