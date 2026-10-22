@@ -1,14 +1,14 @@
 // RUN: llk-opt --allow-unregistered-dialect \
 // RUN:   --triton-to-structured --canonicalize --triton-cpu-verify \
 // RUN:   --triton-block-ptr-to-vector --triton-shared-mem-to-scratch \
-// RUN:   --triton-atomic-to-llrt --triton-grid-to-forall %s \
+// RUN:   --triton-atomic-to-llrt --triton-grid-to-forall \
+// RUN:   --triton-cpu-verify=reject-residual=true %s \
 // RUN:   | FileCheck %s
 
-// Full Triton -> LLK lowering pipeline integration test. Each function in this
-// module carries representative IR for one stage of the 5-stage Triton
-// frontend (compute, block pointers, shared memory, atomics, grid dispatch).
-// Running the whole module through every stage in a single llk-opt invocation
-// must fully lower the tt.* operations.
+// Experimental generic-op pipeline: compute, block pointers and void grids.
+// Unsupported scratch/atomic programs live in expected-diagnostic fixtures.
+// The final verifier rejects every residual tt.* operation. This fixture
+// demonstrates native pass integration, not Python or upstream Triton execution.
 
 // ----- Stage 1: tt.dot -> linalg.matmul
 // CHECK-LABEL: func @stage1_dot
@@ -41,26 +41,7 @@ func.func @stage2_block_ptr(%base: memref<128x64xbf16>, %off_m: index, %off_k: i
   func.return
 }
 
-// ----- Stage 3: shared memory -> per-worker scratch
-// CHECK-LABEL: func @stage3_shared_mem
-func.func @stage3_shared_mem(%global: memref<32x64xbf16>) {
-  %smem = "tt.alloc"() : () -> memref<32x64xbf16, 3>
-  "tt.async_copy"(%global, %smem) : (memref<32x64xbf16>, memref<32x64xbf16, 3>) -> ()
-  // CHECK: memref.alloc
-  // CHECK: memref.copy
-  // CHECK-NOT: tt.alloc
-  // CHECK-NOT: tt.async_copy
-  func.return
-}
-
-// ----- Stage 4: atomics -> llrt runtime calls
-// CHECK-LABEL: func @stage4_atomic
-func.func @stage4_atomic(%ptr: !llvm.ptr, %val: f32) {
-  %old = "tt.atomic_add"(%ptr, %val) : (!llvm.ptr, f32) -> f32
-  // CHECK: call @llrt.atomic_add_f32
-  // CHECK-NOT: tt.atomic_add
-  func.return
-}
+// Unsupported scratch/atomic programs have separate diagnostic fixtures.
 
 // ----- Stage 5: grid dispatch -> scf.forall
 // CHECK-LABEL: func @stage5_grid

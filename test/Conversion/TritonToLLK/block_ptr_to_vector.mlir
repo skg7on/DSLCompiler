@@ -4,7 +4,7 @@
 func.func @two_d_block_ptr_load(%base: memref<128x64xbf16>,
                                 %off_m: index, %off_k: index)
     -> vector<32x64xbf16> {
-  // CHECK: memref.subview
+  // CHECK: memref.subview {{.*}}strided<[64, 1]
   %ptr = "tt.make_block_ptr"(%base, %off_m, %off_k) {
     shape = array<i64: 128, 64>,
     strides = array<i64: 64, 1>,

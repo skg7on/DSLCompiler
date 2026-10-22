@@ -31,6 +31,7 @@ add_subdirectory(Tuning)
 add_subdirectory(Machine)
 add_subdirectory(Mapping)
 add_subdirectory(Conversion)
+add_subdirectory(Frontend)
 add_subdirectory(Benchmark)
 
 include(FileCheck.cmake)
