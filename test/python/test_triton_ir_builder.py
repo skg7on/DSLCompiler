@@ -1,23 +1,17 @@
 import pytest
+from llk import UnsupportedFeatureError
+from llk.frontend import Value
 
 
-def test_arange_emits_make_range():
-    """tl.arange should produce a Triton IR make_range op."""
+def test_compatibility_value_is_a_typed_frontend_value():
+    from llk.language._triton_ir import IRValue
+
+    assert IRValue("index", "index", (4,)) == Value("index", "index", (4,))
+
+
+def test_legacy_string_builder_is_explicitly_unavailable():
     from llk.language._triton_ir import TritonIRBuilder
 
-    builder = TritonIRBuilder()
-    result = builder.make_range(0, 32)
-
-    assert result is not None
-    assert "tt.make_range" in str(builder.module)
-
-
-def test_program_id_emits_get_program_id():
-    """tl.program_id should produce tt.get_program_id."""
-    from llk.language._triton_ir import TritonIRBuilder
-
-    builder = TritonIRBuilder()
-    result = builder.get_program_id(axis=0)
-
-    assert result is not None
-    assert "tt.get_program_id" in str(builder.module)
+    with pytest.raises(UnsupportedFeatureError) as caught:
+        TritonIRBuilder()
+    assert caught.value.code == "legacy_ir_builder_unavailable"

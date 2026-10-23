@@ -15,9 +15,10 @@
 **Baseline/status (2026-10-23):** Original planning baseline `13cef9c`. PF01
 ([PR #233](https://github.com/skg7on/DSLCompiler/pull/233)) and PF02
 ([PR #241](https://github.com/skg7on/DSLCompiler/pull/241)) are merged; PF03 starts
-from main `29b00eb`. PF03's checked steps record branch implementation and
-verification in the [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
-PF04–PF20 remain proposed and unchecked. Paths in those later tasks describe
+from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
+at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
+PF04's checked steps record branch implementation and verification in the
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -189,7 +190,7 @@ assert grid_call_count == 1
 
 **Interfaces:** Produce `compile_kernel(fn, binding: KernelBinding) -> FrontendProgram`. `_triton_ir.py` becomes a compatibility facade; private JSON is named frontend IR and cannot be returned as TTIR. Public language stubs exist for accepted syntax and raise outside capture.
 
-- [ ] Add exact operation/value assertions for canonical masked add and multiply, offsets, comparison, `[:, None]`, constexpr branches and positional/keyword masks. Assert unknown math/calls/runtime branches/while loops, source-unavailable functions and mutable captured globals raise with line/column. Add `test_keyword_mask_and_other_survive_capture` and `test_unknown_call_cannot_equal_empty_kernel`.
+- [x] Add exact operation/value assertions for canonical masked add and multiply, offsets, comparison, `[:, None]`, constexpr branches and positional/keyword masks. Assert unknown math/calls/runtime branches/while loops, source-unavailable functions and mutable captured globals raise with line/column. Add `test_keyword_mask_and_other_survive_capture` and `test_unknown_call_cannot_equal_empty_kernel`.
 
 Pinned regression assertions (local test fixture names):
 
@@ -198,10 +199,10 @@ assert load_op.operands == (pointer_value.id, mask_value.id, other_value.id)
 assert unsupported_error.code == "unsupported_frontend_call"
 ```
 
-- [ ] Run `python -m pytest test/python/test_ast_semantics.py test/python/test_frontend_diagnostics.py -q`; verify old stringification/silent dropping fails.
-- [ ] Implement a typed environment and explicit visitor methods; resolve operands recursively and bind assignment results. Type-check broadcast/indexing and mask/other rules. Only constexpr branches are evaluated here; canonical counted K loops are represented as typed regions, not unrolled or walked once. Other runtime control flow fails. Capture explicit conversions/rounding and ordered numerical-policy metadata. Validate the resulting program before returning it.
-- [ ] Run the new suites and updated original tests. No assertion may count `tt.load` substrings as valid IR; compare canonical typed operations and meaningful negative diagnostics.
-- [ ] Commit `feat: capture typed SSA and preserve frontend semantics`.
+- [x] Run `python -m pytest test/python/test_ast_semantics.py test/python/test_frontend_diagnostics.py -q`; verify old stringification/silent dropping fails.
+- [x] Implement a typed environment and explicit visitor methods; resolve operands recursively and bind assignment results. Type-check broadcast/indexing and mask/other rules. Only constexpr branches are evaluated here; canonical counted K loops are represented as typed regions, not unrolled or walked once. Other runtime control flow fails. Capture explicit conversions/rounding and ordered numerical-policy metadata. Validate the resulting program before returning it.
+- [x] Run the new suites and updated original tests. No assertion may count `tt.load` substrings as valid IR; compare canonical typed operations and meaningful negative diagnostics.
+- [x] Commit `feat: capture typed SSA and preserve frontend semantics` (`dab28b3`; review fixes `0c65068`).
 
 ### PF05: Import checked frontend programs into registered structured IR
 

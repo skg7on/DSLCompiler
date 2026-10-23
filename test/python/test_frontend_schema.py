@@ -243,3 +243,10 @@ def test_wire_config_snapshot_is_required_without_filesystem_reads(monkeypatch):
 def test_config_snapshot_rejects_empty_paths():
     with pytest.raises(LLKError):
         CompileOptions(config_root=".", config_files={"": "content"})
+
+
+def test_float_negation_rejects_pointer_operands():
+    p = make_add_program()
+    bad = replace(p.operations[0], opcode="neg", operands=("a",), attributes={})
+    with pytest.raises(LLKError):
+        replace(p, operations=(bad,) + p.operations[1:])

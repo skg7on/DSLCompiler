@@ -31,6 +31,10 @@ bytes. Its [verification record](reviews/2026-10-23-pf03-typed-frontend.md) cove
 compiler-independent schema/binding tests and the boundary for later AST capture,
 native import and checked invocation tasks.
 
+PF04's [typed AST capture evidence](reviews/2026-10-23-pf04-typed-ast.md) records
+SSA dataflow, masks, counted-loop/cast metadata, source diagnostics and explicit
+rejection of the former pseudo-TTIR interface. Native execution remains separate.
+
 The [Python frontend refinement design](superpowers/specs/2026-10-18-python-frontend-refinement-design.md)
 and [20-task implementation plan](superpowers/plans/2026-10-18-python-frontend-refinement.md)
 address the [revision-pinned frontend review](reviews/2026-10-18-python-triton-inductor-gap-assessment.md).

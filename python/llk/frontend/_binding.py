@@ -118,7 +118,8 @@ def source_of(fn):
             code="source_unavailable",
             error=UnsupportedFeatureError,
         )
-    return textwrap.dedent("".join(lines)), SourceSpan(span.file, line, 0)
+    indentation = len(lines[0]) - len(lines[0].lstrip())
+    return textwrap.dedent("".join(lines)), SourceSpan(span.file, line, indentation)
 
 
 def kernel_signature(fn, source):
@@ -260,9 +261,43 @@ def bind_kernel(
                 try:
                     captured.update(constants({name: value}))
                 except LLKError:
+                    tree = ast.parse(source)
+                    references = [
+                        node
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.Name)
+                        and node.id == name
+                        and isinstance(node.ctx, ast.Load)
+                    ]
+                    calls = []
+                    for call in (
+                        node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                    ):
+                        root = call.func
+                        while isinstance(root, ast.Attribute):
+                            root = root.value
+                        if isinstance(root, ast.Name) and root.id == name:
+                            calls.append(call)
+                    reference = min(
+                        calls or references,
+                        key=lambda n: (n.lineno, n.col_offset),
+                        default=None,
+                    )
+                    location = (
+                        span
+                        if reference is None
+                        else SourceSpan(
+                            span.file,
+                            span.line + reference.lineno - 1,
+                            span.column + reference.col_offset,
+                        )
+                    )
                     fail(
                         f"unsupported mutable or dynamic capture: {name}",
-                        code="unsupported_frontend_constant",
+                        location,
+                        code="unsupported_frontend_call"
+                        if calls
+                        else "unsupported_frontend_constant",
                         error=UnsupportedFeatureError,
                     )
         if callable(grid):

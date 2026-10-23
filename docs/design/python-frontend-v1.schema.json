@@ -789,6 +789,58 @@
           "type": "object",
           "properties": {
             "opcode": {
+              "const": "neg"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false,
+          "description": "Exact floating-point sign negation, preserving signed zero and NaN payload/sign without arithmetic rounding."
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
               "const": "mul"
             },
             "operands": {
