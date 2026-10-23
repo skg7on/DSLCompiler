@@ -193,3 +193,41 @@ def test_where_cdiv_mask_or_and_explicit_cast_call_preserve_operands():
     assert [
         (c.source_dtype, c.target_dtype) for c in p.numerical_contract.cast_sites
     ] == [("f32", "bf16"), ("bf16", "f32")]
+
+
+def test_unary_negation_uses_exact_operation_and_preserves_literal_signed_zero():
+    import json
+    import math
+    from pathlib import Path
+
+    import jsonschema
+
+    def kernel(a, b, out, N: lang.constexpr):
+        offsets = lang.arange(0, N)
+        x = lang.load(a + offsets, True, -0.0)
+        lang.store(out + offsets, -x, True)
+
+    p = capture(kernel)
+    load = next(o for o in p.operations if o.opcode == "load")
+    padding = next(
+        o for o in p.operations if o.results and o.results[0].id == load.operands[2]
+    )
+    assert math.copysign(1.0, padding.attributes["value"]) == -1.0
+    neg = next(o for o in p.operations if o.opcode == "neg")
+    assert neg.operands == (load.results[0].id,)
+    assert neg.results[0].dtype == "f32"
+    store = next(o for o in p.operations if o.opcode == "store")
+    assert store.operands[1] == neg.results[0].id
+    opts = replace(binding(kernel).options, numerical_contract=p.numerical_contract)
+    request = CompileRequest(p, opts)
+    assert serialize_request(
+        deserialize_request(serialize_request(request))
+    ) == serialize_request(request)
+    schema = json.loads(
+        (
+            Path(__file__).parents[2] / "docs/design/python-frontend-v1.schema.json"
+        ).read_text()
+    )
+    jsonschema.Draft202012Validator(schema).validate(
+        json.loads(serialize_request(request))
+    )

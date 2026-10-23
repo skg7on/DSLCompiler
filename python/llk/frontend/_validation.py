@@ -12,6 +12,7 @@ SCHEMAS = {
     "store": (3, 0, ()),
     "add": (2, 1, ()),
     "sub": (2, 1, ()),
+    "neg": (1, 1, ()),
     "mul": (2, 1, ()),
     "div": (2, 1, ()),
     "rem": (2, 1, ()),
@@ -131,6 +132,11 @@ def validate_program(program):
                 if end <= start or end - start > 2**63 - 1:
                     fail("range requires a positive signed-index extent", span)
                 same(result, "index", (end - start,), span)
+            elif code == "neg":
+                a = operands[0]
+                if a.dtype not in ("f32", "bf16", "f16"):
+                    fail("neg requires a floating-point operand", span)
+                same(result, a.dtype, a.shape, span)
             elif code in ("add", "sub", "mul", "div", "rem", "ceildiv", "compare"):
                 a, b = operands
                 if a.dtype != b.dtype or a.dtype.startswith("ptr<") or a.dtype == "i1":

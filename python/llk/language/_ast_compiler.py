@@ -451,8 +451,20 @@ class Capture:
                     node, type(node.op), self.expr(node.left), self.expr(node.right)
                 )
             elif isinstance(node, ast.UnaryOp):
+                if (
+                    isinstance(node.op, ast.USub)
+                    and isinstance(node.operand, ast.Constant)
+                    and type(node.operand.value) in (int, float)
+                ):
+                    # Negate before range checking so the signed minimum is a
+                    # valid literal, and retain the sign bit of floating zero.
+                    return freeze(operator.neg(node.operand.value))
                 item = self.expr(node.operand)
                 if isinstance(node.op, ast.USub):
+                    if type(item) in (int, float):
+                        return freeze(operator.neg(item))
+                    if isinstance(item, Value) and item.dtype in ("f32", "bf16", "f16"):
+                        return self.emit(node, "neg", (item,), item.dtype, item.shape)
                     return self.binary(node, ast.Sub, 0, item)
                 if isinstance(node.op, ast.UAdd) and type(item) in (int, float):
                     return +item
@@ -587,6 +599,12 @@ class Capture:
         if lower.shape or upper.shape:
             self.error(node, "loop bounds must be scalar indices")
         outer = dict(self.env)
+        if node.target.id in outer:
+            self.error(
+                node,
+                "loop induction variable must have a fresh binding",
+                "unsupported_frontend_control_flow",
+            )
         assigned = sorted(
             (
                 target

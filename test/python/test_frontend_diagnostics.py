@@ -127,3 +127,37 @@ def test_not_on_runtime_tiles_is_not_a_constexpr_condition():
 
     with pytest.raises(LLKError):
         compile_kernel(kernel, binding(kernel))
+
+
+def test_loop_induction_cannot_restore_a_preexisting_binding():
+    def kernel(a, b, out, N: lang.constexpr):
+        r = lang.arange(0, 8)
+        offsets = r[:, None] * 8 + r[None, :]
+        acc = lang.zeros((8, 8), lang.float32)
+        k = 99
+        for k in range(0, N, 2):
+            x = lang.load(a + offsets, True, 0.0)
+            y = lang.load(b + offsets, True, 0.0)
+            acc = lang.dot(x, y, acc)
+        lang.store(out + offsets, acc + k, True)
+
+    with pytest.raises(LLKError) as caught:
+        compile_kernel(kernel, binding(kernel))
+    assert caught.value.code == "unsupported_frontend_control_flow"
+
+
+def test_nested_loops_cannot_reuse_the_outer_induction_binding():
+    def kernel(a, b, out, N: lang.constexpr):
+        r = lang.arange(0, 8)
+        offsets = r[:, None] * 8 + r[None, :]
+        acc = lang.zeros((8, 8), lang.float32)
+        for k in range(0, N, 4):
+            for k in range(0, 4, 2):
+                x = lang.load(a + offsets, True, 0.0)
+                y = lang.load(b + offsets, True, 0.0)
+                acc = lang.dot(x, y, acc)
+        lang.store(out + offsets, acc, True)
+
+    with pytest.raises(LLKError) as caught:
+        compile_kernel(kernel, binding(kernel))
+    assert caught.value.code == "unsupported_frontend_control_flow"
