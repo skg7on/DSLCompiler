@@ -18,7 +18,7 @@
 from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
 at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
 PF04's checked steps record branch implementation and verification in the
-[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05–PF20 remain proposed and unchecked. Paths in those later tasks describe
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -206,11 +206,11 @@ assert unsupported_error.code == "unsupported_frontend_call"
 
 ### PF05: Import checked frontend programs into registered structured IR
 
-**Files:** Create `include/LLK/Frontend/{Program,Importer}.h`, `lib/Frontend/{Program,Importer}.cpp`, `lib/Frontend/CMakeLists.txt`, `test/Frontend/{program,importer}.cpp`; modify root `CMakeLists.txt`, `test/Frontend/CMakeLists.txt`.
+**Files:** Create `include/LLK/Frontend/{Program,Importer}.h`, `lib/Frontend/{Program,Importer}.cpp`, `lib/Frontend/CMakeLists.txt`, `test/Frontend/{program,importer}.cpp`; modify `lib/CMakeLists.txt`, `test/Frontend/CMakeLists.txt`.
 
 **Interfaces:** Produce `FrontendRequest`, `ImportedProgram`, `parseRequest`, `importProgram`. Parser supports only schema version 1 and uses LLVM JSON with strict field/type/range checks. Imported modules contain registered `func`, `arith`, `tensor`, `linalg` or `llk` operations only.
 
-- [ ] Add GTests importing PF03's canonical fixture: verify the module, root port effects and `linalg.generic` scalar add/mul. Reject undefined/duplicate ids, wrong mask shape, extra effects, multiple writes per element, incomplete/duplicate grid coverage and arbitrary pointer expressions. Assert no operation's name starts with `tt.`.
+- [x] Add GTests importing PF03's canonical fixture: verify the module, root port effects and `linalg.generic` scalar add/mul. Reject undefined/duplicate ids, wrong mask shape, extra effects, multiple writes per element, incomplete/duplicate grid coverage and arbitrary pointer expressions. Assert no operation's name starts with `tt.`.
 
 Pinned regression assertions (local test fixture names):
 
@@ -219,10 +219,10 @@ EXPECT_TRUE(succeeded(mlir::verify(*imported.module)));
 EXPECT_EQ(unsupportedGridError.code, "invalid_launch_coverage");
 ```
 
-- [ ] Build/run `LLKFrontendTests --gtest_filter='FrontendProgram.*:FrontendImporter.*'`; record expected red assertions.
-- [ ] Implement typed validation and affine access/coverage proof before structured recovery. Recover only full-domain rank-two add/mul accepted by `ElementwiseSourceAdapter`. Carry BLOCK choices into source-owned parameter roles and preserve the numerical contract. Unsupported programs fail before MLIR construction or with verified diagnostics.
-- [ ] Rerun GTests plus parse/print/parse/verify of the emitted registered module. Prove each source choice has a declared source or mapping owner; inspect root port order.
-- [ ] Commit `feat: import frontend programs into structured workload sources`.
+- [x] Build/run `LLKFrontendTests --gtest_filter='FrontendProgram.*:FrontendImporter.*'`; record expected red assertions (missing native headers; `build/pf05-red.log`).
+- [x] Implement typed validation and affine access/coverage proof before structured recovery. Recover only full-domain rank-two add/mul accepted by `ElementwiseSourceAdapter`. Carry BLOCK choices into source-owned parameter roles and preserve the numerical contract. Unsupported programs fail before MLIR construction or with verified diagnostics.
+- [x] Rerun GTests plus parse/print/parse/verify of the emitted registered module. Prove each source choice has a declared source or mapping owner; inspect root port order.
+- [x] Commit `feat: import frontend programs into structured workload sources` (`bd6ddb9`).
 
 ### PF06: Share candidate selection and native mapped compilation
 
