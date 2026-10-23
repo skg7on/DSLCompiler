@@ -482,13 +482,11 @@ if(LLK_BUILD_TOOLS)
         ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall.mlir"
   )
-  # GridToForallReturnOperands: regression for func.return referencing a cloned
-  # op -- the pass must remap the return operand instead of crashing on erase.
+  # Result-returning grid blocks must fail with verification enabled.
   add_test(NAME GridToForallReturnOperands
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --verify-each=false --triton-grid-to-forall \
-        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall_return.mlir \
-        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall_return.mlir"
-  )
+      COMMAND $<TARGET_FILE:llk-opt> --allow-unregistered-dialect
+        --verify-diagnostics --triton-grid-to-forall
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/grid_to_forall_return.mlir)
   # TritonToStructured: verify tt.dot -> linalg.matmul lowering
   add_test(NAME TritonToStructured
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --triton-to-structured --allow-unregistered-dialect \
@@ -513,19 +511,19 @@ if(LLK_BUILD_TOOLS)
         ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_masked.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/block_ptr_masked.mlir"
   )
-  # SharedMemToScratch: verify tt.alloc -> memref.alloc, tt.async_copy -> memref.copy
+  # SharedMemToScratch: reject unsupported ownership/asynchronous semantics
   add_test(NAME SharedMemToScratch
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-shared-mem-to-scratch \
-        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/shared_mem_to_scratch.mlir \
-        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/shared_mem_to_scratch.mlir"
+      COMMAND $<TARGET_FILE:llk-opt> --allow-unregistered-dialect
+        --verify-diagnostics --split-input-file --triton-shared-mem-to-scratch
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/shared_mem_to_scratch.mlir
   )
-  # AtomicToLLRT: verify tt.atomic_* -> llrt.atomic_* runtime calls
+  # AtomicToLLRT: reject atomics without runtime implementations
   add_test(NAME AtomicToLLRT
-      COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-atomic-to-llrt \
-        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/atomic_to_llrt.mlir \
-        | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/atomic_to_llrt.mlir"
+      COMMAND $<TARGET_FILE:llk-opt> --allow-unregistered-dialect
+        --verify-diagnostics --split-input-file --triton-atomic-to-llrt
+        ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/atomic_to_llrt.mlir
   )
-  # TritonCPUVerifierPass: whitelisted ops pass through with no diagnostics
+  # TritonCPUVerifierPass: typed experimental ops pass schema validation
   add_test(NAME TritonCPUVerifierPass
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect --triton-cpu-verify \
         ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_pass.mlir \
@@ -537,12 +535,13 @@ if(LLK_BUILD_TOOLS)
         ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_reject.mlir \
         2>&1 | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/cpu_verifier_reject.mlir"
   )
-  # TritonFullPipeline: all 5 Triton->LLK stages in one invocation
+  # TritonFullPipeline: supported stages plus final residual-op rejection
   add_test(NAME TritonFullPipeline
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --allow-unregistered-dialect \
         --triton-to-structured --canonicalize --triton-cpu-verify \
         --triton-block-ptr-to-vector --triton-shared-mem-to-scratch \
         --triton-atomic-to-llrt --triton-grid-to-forall \
+        --triton-cpu-verify=reject-residual=true \
         ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_full_pipeline.mlir \
         | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/TritonToLLK/triton_full_pipeline.mlir"
   )

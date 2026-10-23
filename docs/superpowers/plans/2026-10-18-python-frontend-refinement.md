@@ -145,7 +145,7 @@ assert reset_spy.call_count == 0
 
 **Interfaces:** Legacy input remains an explicitly experimental generic-op format. Unsupported ops fail with `triton_unsupported_op`; malformed schemas use `triton_invalid_schema`; result-returning grid functions use `triton_grid_result_unsupported`. No new executable support is claimed for atomics/await.
 
-- [ ] Add stride assertions (`strided<[64, 1]>`, never `[4096, 1]`), typed operand/attribute arity failures, nonzero/negative offsets, supported masks and invalid mask types. Replace the return fixture's verifier-disabled success with expected diagnostic. Add a guarded-buffer numerical load/store case at zero offsets.
+- [x] Add stride assertions (`strided<[64, 1]>`, never `[4096, 1]`), typed operand/attribute arity failures, nonzero/negative offsets, supported masks and invalid mask types. Replace the return fixture's verifier-disabled success with expected diagnostic. Add a guarded-buffer numerical load/store case at zero offsets.
 
 Pinned regression assertions (local test fixture names):
 
@@ -154,10 +154,12 @@ assert "strided<[64, 1]" in lowered_ir
 assert "strided<[4096, 1]" not in lowered_ir
 ```
 
-- [ ] Run `cmake --build build --target LLKFrontendTests llk-opt` and `ctest --test-dir build -R 'FrontendLegacy|BlockPointer|GridToForall|TritonCPU' --output-on-failure`; show the old stride/return failures.
-- [ ] Distinguish physical base layout from logical subview steps: compact memref input uses unit logical steps, validates declared physical strides against the base, and rejects unsupported layouts. Validate exact array lengths, rank, operands/results and mask element types before indexing/casting. Reject unsupported atomic/runtime and await/reduction/broadcast/transpose forms; require residual-op rejection at an executable boundary. Reject escaping grid results before mutation.
-- [ ] Rerun the targeted tests with verification enabled. The legacy full-pipeline fixture must now separate executable-supported cases from expected unsupported cases. Verify canaries and expected row values, not just operation names.
-- [ ] Commit `fix: validate legacy Triton lowering and repair block addressing`.
+- [x] Run `cmake --build build --target LLKFrontendTests llk-opt` and `ctest --test-dir build -R 'FrontendLegacy|BlockPointer|GridToForall|TritonCPU' --output-on-failure`; show the old stride/return failures.
+- [x] Distinguish physical base layout from logical subview steps: compact memref input uses unit logical steps, validates declared physical strides against the base, and rejects unsupported layouts. Validate exact array lengths, rank, operands/results and mask element types before indexing/casting. Reject unsupported atomic/runtime and await/reduction/broadcast/transpose forms; require residual-op rejection at an executable boundary. Reject escaping grid results before mutation.
+- [x] Rerun the targeted tests with verification enabled. The legacy full-pipeline fixture must now separate executable-supported cases from expected unsupported cases. Verify canaries and expected row values, not just operation names.
+- [x] Commit `fix: validate legacy Triton lowering and repair block addressing`.
+
+**Implementation evidence:** [PF02 safety verification](../../reviews/2026-10-22-pf02-legacy-triton-safety.md).
 
 ### PF03: Define typed program, deterministic serialization and argument binding
 

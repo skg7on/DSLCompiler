@@ -20,6 +20,32 @@ Typed capture, executable decorators, Inductor composition, training and genuine
 upstream Triton launches remain later tasks under
 `#203 <https://github.com/skg7on/DSLCompiler/issues/203>`__.
 
+Legacy Triton safety boundary
+-----------------------------
+
+PF02 (`#213 <https://github.com/skg7on/DSLCompiler/issues/213>`__) repairs the
+experimental quoted ``tt.*`` format consumed by the native passes. It is not
+upstream TTIR or a Python compilation path. Each pass validates the complete
+legacy input before rewriting. Malformed schemas report
+``triton_invalid_schema``; unsupported operations report ``triton_unsupported_op``;
+grid functions returning values report ``triton_grid_result_unsupported``.
+
+Block pointers accept static positive rank-one/two compact host memrefs with
+zero storage offset. Declared physical strides must match the base layout.
+Logical subview steps are one; view sizes are clipped to the remaining base
+extent. Offsets must be nonnegative and strictly below the base extent; constant
+violations fail compilation and dynamic violations abort through ``cf.assert``
+before memory access. Transfer boundary masks are combined with explicit i1
+vector masks. Loads pad masked lanes with zero.
+
+Atomics and their old ``llrt.atomic_*`` declarations/calls, scratch allocation,
+asynchronous copy/await, advance, reductions, broadcasts and transposes remain
+unsupported. The final experimental executable boundary must run
+``--triton-cpu-verify=reject-residual=true`` after supported lowering to reject
+any remaining ``tt.*`` operations. ``TritonFullPipeline`` tests that sequence
+with MLIR verification enabled; native load/store tests validate numerical rows
+and guard buffers. They do not establish Python or upstream Triton execution.
+
 .. _python-frontend-environment:
 
 Use the project environment

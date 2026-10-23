@@ -4,7 +4,7 @@
 // before any lowering runs. tt.inline_asm has no CPU lowering.
 
 func.func @unsupported_inline_asm(%str: !tt.ptr) {
-  // CHECK: error: Triton op 'tt.inline_asm' is unsupported on CPU
+  // CHECK: error: triton_unsupported_op: Triton op 'tt.inline_asm' is unsupported on CPU
   // CHECK: See the CPU compatibility guide for supported operations
   "tt.inline_asm"(%str) : (!tt.ptr) -> ()
   func.return

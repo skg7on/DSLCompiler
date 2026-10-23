@@ -12,6 +12,8 @@
 // M4 parallel infrastructure.
 
 #include "LLK/Conversion/TritonToLLK/GridToForall.h"
+#include "LegacyValidation.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -43,7 +45,7 @@ struct TritonGridToForallPass
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect>();
-    registry.insert<scf::SCFDialect>();
+    registry.insert<scf::SCFDialect, cf::ControlFlowDialect>();
   }
 
   void runOnOperation() override;
@@ -52,6 +54,31 @@ struct TritonGridToForallPass
 void TritonGridToForallPass::runOnOperation() {
   ModuleOp module = getOperation();
 
+  if (failed(mlir::llk::validateLegacyTriton(module))) {
+    signalPassFailure();
+    return;
+  }
+  // Preflight all grid functions before changing any function.
+  auto checked = module.walk([&](func::FuncOp fn) -> WalkResult {
+    int gridDims = 0;
+    fn.walk([&](Operation *op) {
+      if (op->getName().getStringRef() == "tt.get_program_id")
+        gridDims = std::max(
+            gridDims, int(op->getAttrOfType<IntegerAttr>("axis").getInt()) + 1);
+    });
+    int indices = llvm::count_if(fn.getArgumentTypes(),
+                                 [](Type t) { return t.isIndex(); });
+    if (gridDims && indices != 2 * gridDims) {
+      fn.emitError("triton_invalid_schema: expected exactly dimension/block "
+                   "index arguments for each grid axis");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (checked.wasInterrupted()) {
+    signalPassFailure();
+    return;
+  }
   module.walk([&](func::FuncOp funcOp) {
     // Collect all tt.get_program_id ops in this function.
     SmallVector<Operation *> pidOps;
@@ -86,19 +113,20 @@ void TritonGridToForallPass::runOnOperation() {
       if (isa<IndexType>(arg.getType()))
         indexArgs.push_back(arg);
     }
-    if ((int)indexArgs.size() < 2 * gridDims) {
-      funcOp.emitWarning(
-          "triton-grid-to-forall: not enough index-typed arguments for "
-          "a ")
-          << gridDims << "D grid";
-      return WalkResult::advance();
-    }
-
     // Compute num_tiles for each axis: ceilDiv(dim, block).
     SmallVector<Value> numTilesPerAxis;
     for (int i = 0; i < gridDims; ++i) {
       Value dim = indexArgs[i];
       Value block = indexArgs[gridDims + i];
+      Value zero = arith::ConstantIndexOp::create(builder, loc, 0);
+      Value dimValid = arith::CmpIOp::create(
+          builder, loc, arith::CmpIPredicate::sgt, dim, zero);
+      Value blockValid = arith::CmpIOp::create(
+          builder, loc, arith::CmpIPredicate::sgt, block, zero);
+      Value valid = arith::AndIOp::create(builder, loc, dimValid, blockValid);
+      cf::AssertOp::create(
+          builder, loc, valid,
+          "triton_invalid_schema: grid dimensions and blocks must be positive");
       Value numTiles = arith::CeilDivSIOp::create(builder, loc, dim, block);
       numTilesPerAxis.push_back(numTiles);
     }
@@ -172,16 +200,6 @@ void TritonGridToForallPass::runOnOperation() {
     builder.setInsertionPoint(forallOp.getBody()->getTerminator());
     for (auto *op : opsToClone) {
       builder.clone(*op, mapper);
-    }
-
-    // Remap return operands so they don't reference erased ops.  A
-    // func.return that consumes a value produced by a cloned op would
-    // otherwise dangle once the original op is erased below.
-    auto returnOp = funcOp.getBody().back().getTerminator();
-    for (unsigned i = 0; i < returnOp->getNumOperands(); ++i) {
-      if (mapper.contains(returnOp->getOperand(i))) {
-        returnOp->setOperand(i, mapper.lookup(returnOp->getOperand(i)));
-      }
     }
 
     // Erase original ops from the function body.  Order matters:

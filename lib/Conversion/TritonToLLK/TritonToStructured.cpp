@@ -23,6 +23,8 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/Config/llvm-config.h"
 
+#include "LegacyValidation.h"
+
 using namespace mlir;
 
 namespace {
@@ -73,6 +75,10 @@ struct TritonToStructuredPass
   }
 
   void runOnOperation() override {
+    if (failed(mlir::llk::validateLegacyTriton(getOperation()))) {
+      signalPassFailure();
+      return;
+    }
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
     patterns.add<DotToMatmulPattern>(ctx);
