@@ -16,8 +16,9 @@ Native frontend compilation and invocation remain unavailable. Calling the
 ``native_backend_unavailable``. Real ``torch.compile`` wraps this in
 ``BackendCompilerFailed.inner_exception``. The registration tests verify this
 diagnostic; their passing result does not establish native kernel execution.
-Typed capture, executable decorators, Inductor composition, training and genuine
-upstream Triton launches remain later tasks under
+PF04 provides typed AST capture for the subset described below. Executable
+decorators, Inductor composition, training and genuine upstream Triton launches
+remain later tasks under
 `#203 <https://github.com/skg7on/DSLCompiler/issues/203>`__.
 
 Typed program and binding contract
@@ -28,8 +29,9 @@ PF03 (`#214 <https://github.com/skg7on/DSLCompiler/issues/214>`__) adds the
 ``SourceSpan``, ``Value``, ``Operation``, ``Region``, ``FrontendProgram``,
 ``NumericalContract``, ``CompileOptions``, ``CompileRequest`` and
 ``CompilationReport`` records. Mappings and sequences are copied into immutable
-snapshots. This API validates authored programs and binds arguments; AST capture
-and native compilation remain later milestones.
+snapshots. This API validates authored programs and binds arguments; PF04 captures
+supported Python source into those records. Native compilation remains a later
+milestone.
 
 ``bind_kernel(fn, args, kwargs, grid, options)`` returns a ``KernelBinding`` with
 ports in signature order, bound constexprs, accepted immutable closure/global
@@ -104,6 +106,79 @@ Run the compiler-independent contract checks with:
 
 The :source:`PF03 verification record <docs/reviews/2026-10-23-pf03-typed-frontend.md>`
 records versions, nonzero test counts and the reviewed boundary.
+
+Typed AST capture
+------------------
+
+PF04 (`#215 <https://github.com/skg7on/DSLCompiler/issues/215>`__) provides
+``llk.language._ast_compiler.compile_kernel(fn, binding) -> FrontendProgram``.
+The explicit ``KernelBinding`` supplies the source and frozen argument/capture
+values. Capture never executes the function body or arbitrary Python calls.
+Renamed module and directly imported language symbols resolve by identity.
+Calling a language operation eagerly raises ``outside_frontend_capture``.
+
+Supported source includes name assignments and aliases, recursive numeric
+arithmetic, exact floating negation, comparisons, full slices with ``None`` axes, mask ``&``/``|``/``~``,
+``where``, static ``arange``, ``program_id``, ``cdiv``, explicit memory operations,
+zero tiles, dot products and explicit conversions. Memory calls preserve
+positional/keyword operands; duplicate, unpacked and unknown keywords fail.
+Loads require explicit ``other`` padding. Masks must be i1 and broadcast to the
+memory tile; stores require the exact value shape/type. No implicit conversion
+between SSA value dtypes or storage providers occurs.
+
+Only literal/constexpr conditions choose a branch during capture. Runtime
+branches, ``while``, arbitrary calls, arbitrary loop-carried state and value
+returns fail explicitly. Counted ``range`` loops retain typed induction and
+accumulator arguments, a region body and matching yields; the body is not
+unrolled. Accepted carried values are rank-two f32 dot accumulators, including
+nested loops and explicit intermediate rounding casts. Other control flow
+requires a separate extension.
+
+Induction names must be fresh within their enclosing environment; reusing a
+preexisting value or an enclosing loop's induction name fails explicitly.
+Floating unary minus uses the checked ``neg`` opcode, preserving signed zero
+and sign/payload semantics without substituting arithmetic subtraction.
+
+Tensor-pointer arithmetic retains its declared tensor base and element offsets.
+Capture expresses a flat offset as row ``offset div width`` and column
+``offset rem width`` using the declared compact physical shape; it never invents
+a rank-one runtime ABI. Bounds, affine bijection and full-domain single-writer
+coverage remain checks for the PF05 importer. A captured program alone is not
+evidence that such a proof or an execution succeeded.
+
+Every emitted operation has an original file/line/column, including indentation
+removed to parse nested functions. Unknown source, calls and mutable captures
+produce structured diagnostics. The exact recognized expression
+``x / (1 + tl.exp(-x))`` and ``tl.silu(x)`` capture explicit exact SiLU metadata;
+general ``exp`` is unsupported. A relaxed activation requires matching explicit
+numerical permissions. Cast result ids and rounding sites remain ordered, even
+inside loops. Source-specific facts extend the program's numerical contract;
+construct a request using that full contract:
+
+.. code-block:: python
+
+   from dataclasses import replace
+   from llk.frontend import CompileRequest
+   from llk.language._ast_compiler import compile_kernel
+
+   program = compile_kernel(fn, binding)
+   options = replace(binding.options,
+                     numerical_contract=program.numerical_contract)
+   request = CompileRequest(program, options)
+
+``@llk.jit`` definitions expose ``frontend_ir(binding)`` for the same metadata.
+The former ``ttir()`` method raises ``upstream_toolchain_unqualified``; private
+frontend records are never labeled upstream TTIR. The old string builder raises
+``legacy_ir_builder_unavailable``. Invocation still raises
+``native_backend_unavailable`` until the native service/runtime milestones land.
+
+.. code-block:: sh
+
+   "$LLK_PYTHON" -m pytest test/python/test_ast_semantics.py \
+     test/python/test_frontend_diagnostics.py -q
+
+See the :source:`PF04 verification record <docs/reviews/2026-10-23-pf04-typed-ast.md>`
+for the tested source/diagnostic contract and its capability limits.
 
 Legacy Triton safety boundary
 -----------------------------
@@ -246,5 +321,6 @@ After installing the package into the chosen environment:
 ``get_backend()`` returns the exact registered callable. Repeated registration
 and module reload preserve it without clearing Dynamo's global state. A foreign
 owner of the ``llk`` backend name is preserved and produces
-``backend_registration_conflict``. The experimental decorator's captured strings
-do not establish verified MLIR, real upstream TTIR or a native JIT invocation.
+``backend_registration_conflict``. Decorator inspection returns checked frontend
+metadata; it does not establish verified MLIR, real upstream TTIR or a native
+JIT invocation.

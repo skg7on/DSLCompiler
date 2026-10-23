@@ -43,5 +43,12 @@ raises `UnsupportedFeatureError` with code `native_backend_unavailable`;
 `torch.compile` wraps that diagnostic in `BackendCompilerFailed.inner_exception`.
 It does not return the captured graph for eager execution. Inspect
 `llk.capabilities()` for the package's explicit capability report and packaged
-compatibility baseline. The existing decorator/AST prototype remains experimental;
-its captured strings are not proof of native compilation or execution.
+compatibility baseline.
+
+PF03/PF04 provide immutable schema-v1 records, deterministic argument binding and
+checked typed AST capture. Use `compile_kernel(fn, binding)` or a decorator's
+`frontend_ir(binding)` for a `FrontendProgram`; `ttir()` rejects private metadata
+with `upstream_toolchain_unqualified`. The finite source subset preserves SSA,
+masks, explicit casts and counted dot-accumulator loops, with source-located
+errors for unsupported semantics. These records do not establish native
+compilation or execution. See the manual for source syntax and request options.
