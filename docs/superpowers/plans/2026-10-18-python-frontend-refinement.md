@@ -12,11 +12,13 @@
 
 **Review:** [Revision-pinned gap assessment](../../reviews/2026-10-18-python-triton-inductor-gap-assessment.md).
 
-**Baseline/status (2026-10-19):** Original planning baseline `13cef9c`. PF01 is
-implemented at `ffc55f5` in [PR #233](https://github.com/skg7on/DSLCompiler/pull/233),
-independently reviewed and pending merge; its checked steps record branch
-implementation and verification. PF02–PF20 remain proposed and unchecked. Paths
-in those later tasks describe future files unless marked Modify.
+**Baseline/status (2026-10-23):** Original planning baseline `13cef9c`. PF01
+([PR #233](https://github.com/skg7on/DSLCompiler/pull/233)) and PF02
+([PR #241](https://github.com/skg7on/DSLCompiler/pull/241)) are merged; PF03 starts
+from main `29b00eb`. PF03's checked steps record branch implementation and
+verification in the [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
+PF04–PF20 remain proposed and unchecked. Paths in those later tasks describe
+future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
 2.14.1 / NumPy 2.5.4). PF01 passes 21 tests with that interpreter as well as
@@ -167,7 +169,7 @@ assert "strided<[4096, 1]" not in lowered_ir
 
 **Interfaces:** Produce the frozen records, `KernelBinding`, `bind_kernel` and `serialize_request`. `frontend_cases.py` defines `make_add_program(shape=(32,64), block=(8,16))` with two read inputs, one write output, f32 and exact coverage, plus malformed-request variants.
 
-- [ ] Test positional/keyword/default binding, postponed constexpr annotations, renamed `llk.language`, closure constants and duplicate/unknown args. Include a nested counted-K-loop fixture with typed init/yield and cast sites; reject escaping region values, yield-type mismatch and erased cast metadata. Pin canonical bytes against a literal fixture; permuted dict order is identical, permuted port order differs. Assert grid callable runs once and its result is a normalized three-tuple. Reject bool grid extents, zero/negative shape, axes >2, unknown schema fields/versions and non-finite constexpr floats.
+- [x] Test positional/keyword/default binding, postponed constexpr annotations, renamed `llk.language`, closure constants and duplicate/unknown args. Include a nested counted-K-loop fixture with typed init/yield and cast sites; reject escaping region values, yield-type mismatch and erased cast metadata. Pin canonical bytes against a literal fixture; permuted dict order is identical, permuted port order differs. Assert grid callable runs once and its result is a normalized three-tuple. Reject bool grid extents, zero/negative shape, axes >2, unknown schema fields/versions and non-finite constexpr floats.
 
 Pinned regression assertions (local test fixture names):
 
@@ -176,10 +178,10 @@ assert serialize_request(request_a) == serialize_request(same_request_reordered_
 assert grid_call_count == 1
 ```
 
-- [ ] Run `python -m pytest test/python/test_frontend_binding.py test/python/test_frontend_schema.py -q`; verify the intended missing records/functions fail.
-- [ ] Implement records and validation. Use signed 64-bit ranges for serialized indices/extents and checked products for allocation sizes. Bind values by sentinel/symbol identity, preserve port order and never serialize runtime addresses/providers. Emit source-span diagnostics for binding failures.
-- [ ] Rerun both suites and round-trip the canonical fixture; assert source/constant/launch/numerical changes alter identity, while pointer relocation does not.
-- [ ] Commit `feat: define typed frontend program and binding contract`.
+- [x] Run `python -m pytest test/python/test_frontend_binding.py test/python/test_frontend_schema.py -q`; verify the intended missing records/functions fail.
+- [x] Implement records and validation. Use signed 64-bit ranges for serialized indices/extents and checked products for allocation sizes. Bind values by sentinel/symbol identity, preserve port order and never serialize runtime addresses/providers. Emit source-span diagnostics for binding failures.
+- [x] Rerun both suites and round-trip the canonical fixture; assert source/constant/launch/numerical changes alter identity, while pointer relocation does not.
+- [x] Commit `feat: define typed frontend program and binding contract` (`b78ee15`).
 
 ### PF04: Replace lossy AST walking with typed SSA capture
 
