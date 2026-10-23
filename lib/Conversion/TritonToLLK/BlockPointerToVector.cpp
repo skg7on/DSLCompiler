@@ -28,8 +28,12 @@ struct BlockAccessPattern : RewritePattern {
   LogicalResult matchAndRewrite(Operation *op,
                                 PatternRewriter &rewriter) const override {
     bool load = op->getName().getStringRef() == "tt.load";
-    // The whole module was validated before the rewrite driver started.
+    // The module preflight checks the schema. Keep the pattern's defining-op
+    // requirement local as well, since block arguments have no defining op.
     auto *ptr = op->getOperand(0).getDefiningOp();
+    if (!ptr || ptr->getName().getStringRef() != "tt.make_block_ptr")
+      return rewriter.notifyMatchFailure(op,
+                                         "expected a block pointer definition");
     Value base = ptr->getOperand(0);
     auto type = cast<MemRefType>(base.getType());
     auto block =
