@@ -25,6 +25,12 @@ installable package, safe Dynamo registration, structured errors, project-level
 21 passing tests with Python 3.14.8 / Torch 2.14.1 and the separately tested
 Python 3.11/3.12 + Torch 2.9.0 reference matrix.
 
+PF03 adds the [typed frontend JSON schema](design/python-frontend-v1.schema.json),
+immutable program records, deterministic metadata binding and canonical request
+bytes. Its [verification record](reviews/2026-10-23-pf03-typed-frontend.md) covers
+compiler-independent schema/binding tests and the boundary for later AST capture,
+native import and checked invocation tasks.
+
 The [Python frontend refinement design](superpowers/specs/2026-10-18-python-frontend-refinement-design.md)
 and [20-task implementation plan](superpowers/plans/2026-10-18-python-frontend-refinement.md)
 address the [revision-pinned frontend review](reviews/2026-10-18-python-triton-inductor-gap-assessment.md).

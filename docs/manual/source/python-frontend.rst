@@ -20,6 +20,91 @@ Typed capture, executable decorators, Inductor composition, training and genuine
 upstream Triton launches remain later tasks under
 `#203 <https://github.com/skg7on/DSLCompiler/issues/203>`__.
 
+Typed program and binding contract
+----------------------------------
+
+PF03 (`#214 <https://github.com/skg7on/DSLCompiler/issues/214>`__) adds the
+``llk.frontend`` metadata API. It provides frozen ``TensorSpec``, ``LaunchSpec``,
+``SourceSpan``, ``Value``, ``Operation``, ``Region``, ``FrontendProgram``,
+``NumericalContract``, ``CompileOptions``, ``CompileRequest`` and
+``CompilationReport`` records. Mappings and sequences are copied into immutable
+snapshots. This API validates authored programs and binds arguments; AST capture
+and native compilation remain later milestones.
+
+``bind_kernel(fn, args, kwargs, grid, options)`` returns a ``KernelBinding`` with
+ports in signature order, bound constexprs, accepted immutable closure/global
+constants, source text/location, launch metadata and options. Parameters annotated
+with the actual ``llk.language.constexpr`` sentinel are compile-time values.
+Renamed imports, module attributes and resolvable postponed annotations work by
+symbol identity. Annotation call expressions are rejected without evaluation,
+including Python 3.14 deferred annotations. An annotation-only local alias lost
+by postponed annotation storage on older Python versions fails explicitly.
+Binding errors carry ``file``, ``line`` and ``column`` attributes.
+
+Tensor arguments require an explicit ``TensorSpec`` or
+``TensorArgument(spec, provider)``. Tensor metadata describes positive static
+rank-two compact row-major storage and an explicit input/read or output/write
+effect. Binding retains providers strongly and never inspects their addresses,
+converts their data or infers output effects from argument names. Actual provider
+layout, allocation, storage offset and alias validation belongs to PF08 before
+invocation. A bare ``TensorSpec`` supports metadata-only binding with no provider.
+
+Tuple grids have one to three positive integer axes, padded with ones to a
+three-tuple. A callable grid receives immutable constexpr metadata and runs
+exactly once after argument validation. Such grids use block ``(1, 1, 1)``;
+pass an explicit ``LaunchSpec`` to carry other block dimensions. Boolean extents,
+nonpositive dimensions and signed 64-bit overflow fail. Affine access and
+whole-domain coverage proofs belong to the PF05 native importer.
+
+Schema v1 and canonical bytes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The :source:`JSON schema <docs/design/python-frontend-v1.schema.json>` fixes the
+wire fields, supported opcodes and per-op attribute/arity grammar. The
+:source:`literal add request <test/python/frontend_add_v1.json>` pins a complete
+32-by-64 f32 add program with two read inputs, one write output, masks and explicit
+load padding. ``serialize_request`` returns compact UTF-8 JSON bytes with sorted
+object keys; ordered ports, operations and region arguments retain their order.
+It never includes providers or runtime addresses. ``deserialize_request`` rejects
+unknown/missing fields, duplicate keys, unknown versions and non-finite numbers.
+
+Python validation additionally checks SSA definition/use, region scope, exact
+mask types/shapes, read/write effects, checked allocation products and dependent
+operation types. Integer indices and extents must be actual signed 64-bit
+integers; booleans and floating values such as ``1.0`` fail even where JSON
+Schema's mathematical integer definition accepts them.
+
+A ``counted_loop`` has operands ``(lower, upper, init...)``, scalar index bounds,
+a positive constant ``step`` attribute, and one result per init value. Its one
+``Region`` has arguments ``(iv, iter...)`` and a terminal ``yield`` matching the
+carried result types and order. Nested loop values stay local. Top-level programs
+end with a void ``return``; other region kinds are rejected.
+
+``NumericalContract`` records storage, compute and accumulator dtypes, ordered
+``CastSite`` records keyed by cast result id, rounding, activation policy,
+reduction order, reassociation, FMA and subnormal policy. Program and compile
+options must agree on this contract. Explicit cast sites must match the program
+exactly, including casts inside nested loops.
+
+``CompileOptions`` defaults to ``x86-avx2``, ``reference``, deterministic search,
+64 candidates and top-1 retention. Its default ``config_root`` is the installed
+package resource directory. Construction snapshots YAML and LLKMap file contents
+under that root; an explicit ``config_files`` mapping supplies an existing
+snapshot. Canonical identity includes source, accepted constants, launch,
+numerical policy, options and configuration contents. Wire decoding requires an
+explicit snapshot object and does not read local files. PF03 does not bundle a
+native target package or establish executable support for an options value.
+
+Run the compiler-independent contract checks with:
+
+.. code-block:: sh
+
+   "$LLK_PYTHON" -m pytest test/python/test_frontend_binding.py \
+     test/python/test_frontend_schema.py -q
+
+The :source:`PF03 verification record <docs/reviews/2026-10-23-pf03-typed-frontend.md>`
+records versions, nonzero test counts and the reviewed boundary.
+
 Legacy Triton safety boundary
 -----------------------------
 

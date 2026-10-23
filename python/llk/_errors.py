@@ -4,10 +4,23 @@
 class LLKError(Exception):
     """A diagnostic with a stable machine-readable code."""
 
-    def __init__(self, message: str, *, code: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        file: str | None = None,
+        line: int | None = None,
+        column: int | None = None,
+        stage: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.code = code
+        self.file = file
+        self.line = line
+        self.column = column
+        self.stage = stage
 
 
 class FrontendSyntaxError(LLKError):
