@@ -1,28 +1,65 @@
-from ._triton_ir import TritonIRBuilder, IRValue
+"""Symbols recognized by typed AST capture; never an eager tensor interpreter."""
 
-_builder: TritonIRBuilder | None = None
+from llk._errors import UnsupportedFeatureError
 
-# Sentinel-type objects recognized by the AST compiler
+
 class constexpr:
     """Annotation sentinel for compile-time constant parameters."""
-    pass
 
 
 float32 = "float32"
+bfloat16 = "bfloat16"
 float16 = "float16"
 int32 = "int32"
+int8 = "int8"
 
 
-def _get_builder() -> TritonIRBuilder:
-    global _builder
-    if _builder is None:
-        _builder = TritonIRBuilder()
-    return _builder
+def _outside():
+    raise UnsupportedFeatureError(
+        "language operations require frontend capture", code="outside_frontend_capture"
+    )
 
 
-def arange(start: int, end: int) -> IRValue:
-    return _get_builder().make_range(start, end)
+def program_id(axis):
+    _outside()
 
 
-def program_id(axis: int) -> IRValue:
-    return _get_builder().get_program_id(axis)
+def arange(start, end):
+    _outside()
+
+
+def load(pointer, mask=True, other=None):
+    _outside()
+
+
+def store(pointer, value, mask=True):
+    _outside()
+
+
+def zeros(shape, dtype=float32):
+    _outside()
+
+
+def dot(a, b, acc=None):
+    _outside()
+
+
+def where(condition, x, y):
+    _outside()
+
+
+def cast(value, dtype, rounding="rtne"):
+    _outside()
+
+
+def cdiv(a, b):
+    _outside()
+
+
+def silu(value, approximation="exact"):
+    _outside()
+
+
+def exp(value):
+    """Accepted only inside the recognized exact SiLU expression."""
+    _outside()
