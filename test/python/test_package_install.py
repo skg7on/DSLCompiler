@@ -57,7 +57,11 @@ def test_clean_wheel_import_without_torch(installed_python):
 import importlib.util, json, sys
 assert importlib.util.find_spec('torch') is None
 import llk
+import llk.frontend
 import llk.torch
+assert importlib.util.find_spec('jsonschema') is None
+assert llk.frontend.CompileOptions(config_files={}).backend == 'reference'
+assert llk.frontend.TensorSpec('a', (2, 3), 'f32', (3, 1)).shape == (2, 3)
 assert llk.torch.register() is None
 assert 'torch' not in sys.modules
 assert callable(llk.jit)

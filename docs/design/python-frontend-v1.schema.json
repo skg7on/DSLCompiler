@@ -1,0 +1,1688 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skg7on.github.io/DSLCompiler/schemas/python-frontend-v1.json",
+  "title": "LLK frontend compile request v1",
+  "description": "Strict structural transport grammar. Consumers additionally check exact integer representations, signed allocation products, SSA/types/effects, region scope/yields, numerical cast sites and affine coverage before execution.",
+  "$defs": {
+    "Literal": {
+      "anyOf": [
+        {
+          "type": [
+            "null",
+            "boolean",
+            "string",
+            "number"
+          ]
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Literal"
+          },
+          "minItems": 0
+        }
+      ]
+    },
+    "Constants": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/Literal"
+      }
+    },
+    "SourceSpan": {
+      "type": "object",
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "column": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        }
+      },
+      "required": [
+        "file",
+        "line",
+        "column"
+      ],
+      "additionalProperties": false
+    },
+    "TensorSpec": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+        },
+        "shape": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "dtype": {
+          "enum": [
+            "f32",
+            "bf16",
+            "f16",
+            "i32",
+            "i8"
+          ]
+        },
+        "strides": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "direction": {
+          "enum": [
+            "input",
+            "output"
+          ]
+        },
+        "effect": {
+          "enum": [
+            "read",
+            "write"
+          ]
+        }
+      },
+      "required": [
+        "name",
+        "shape",
+        "dtype",
+        "strides",
+        "direction",
+        "effect"
+      ],
+      "additionalProperties": false
+    },
+    "LaunchSpec": {
+      "type": "object",
+      "properties": {
+        "grid": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "block": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "minItems": 3,
+          "maxItems": 3
+        }
+      },
+      "required": [
+        "grid",
+        "block"
+      ],
+      "additionalProperties": false
+    },
+    "Value": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+        },
+        "dtype": {
+          "enum": [
+            "f32",
+            "bf16",
+            "f16",
+            "i32",
+            "i8",
+            "i1",
+            "index",
+            "ptr<f32>",
+            "ptr<bf16>",
+            "ptr<f16>",
+            "ptr<i32>",
+            "ptr<i8>"
+          ]
+        },
+        "shape": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "minItems": 0,
+          "maxItems": 2
+        }
+      },
+      "required": [
+        "id",
+        "dtype",
+        "shape"
+      ],
+      "additionalProperties": false
+    },
+    "CastSite": {
+      "type": "object",
+      "properties": {
+        "value_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+        },
+        "source_dtype": {
+          "enum": [
+            "f32",
+            "bf16",
+            "f16",
+            "i32",
+            "i8",
+            "i1",
+            "index"
+          ]
+        },
+        "target_dtype": {
+          "enum": [
+            "f32",
+            "bf16",
+            "f16",
+            "i32",
+            "i8",
+            "i1",
+            "index"
+          ]
+        },
+        "rounding": {
+          "enum": [
+            "rtne"
+          ]
+        }
+      },
+      "required": [
+        "value_id",
+        "source_dtype",
+        "target_dtype",
+        "rounding"
+      ],
+      "additionalProperties": false
+    },
+    "Region": {
+      "type": "object",
+      "properties": {
+        "arguments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Value"
+          },
+          "minItems": 1
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Operation"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "arguments",
+        "operations"
+      ],
+      "additionalProperties": false
+    },
+    "NumericalContract": {
+      "type": "object",
+      "properties": {
+        "storage_dtype": {
+          "enum": [
+            "f32",
+            "bf16",
+            "f16",
+            "i32",
+            "i8"
+          ]
+        },
+        "compute_dtype": {
+          "enum": [
+            "f32",
+            "bf16",
+            "f16",
+            "i32",
+            "i8"
+          ]
+        },
+        "accumulator_dtype": {
+          "enum": [
+            "f32",
+            "bf16",
+            "f16",
+            "i32",
+            "i8"
+          ]
+        },
+        "cast_sites": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CastSite"
+          },
+          "minItems": 0
+        },
+        "rounding": {
+          "enum": [
+            "rtne"
+          ]
+        },
+        "activation_expression": {
+          "enum": [
+            "none",
+            "x/(1+exp(-x))"
+          ]
+        },
+        "activation_approximation": {
+          "enum": [
+            "none",
+            "exact",
+            "native"
+          ]
+        },
+        "reduction_order": {
+          "enum": [
+            "source",
+            "unspecified"
+          ]
+        },
+        "reassociation": {
+          "type": "boolean"
+        },
+        "fma": {
+          "type": "boolean"
+        },
+        "subnormal": {
+          "enum": [
+            "preserve",
+            "flush-to-zero"
+          ]
+        }
+      },
+      "required": [
+        "storage_dtype",
+        "compute_dtype",
+        "accumulator_dtype",
+        "cast_sites",
+        "rounding",
+        "activation_expression",
+        "activation_approximation",
+        "reduction_order",
+        "reassociation",
+        "fma",
+        "subnormal"
+      ],
+      "additionalProperties": false
+    },
+    "Operation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "constant"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": [
+                    "number",
+                    "boolean"
+                  ]
+                }
+              },
+              "required": [
+                "value"
+              ],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "program_id"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {
+                "axis": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 2
+                }
+              },
+              "required": [
+                "axis"
+              ],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "range"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {
+                "start": {
+                  "type": "integer",
+                  "minimum": -9223372036854775808,
+                  "maximum": 9223372036854775807
+                },
+                "end": {
+                  "type": "integer",
+                  "minimum": -9223372036854775808,
+                  "maximum": 9223372036854775807
+                }
+              },
+              "required": [
+                "start",
+                "end"
+              ],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "address"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "load"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "store"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "add"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "sub"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "mul"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "div"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "rem"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "ceildiv"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "compare"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {
+                "predicate": {
+                  "enum": [
+                    "eq",
+                    "ne",
+                    "lt",
+                    "le",
+                    "gt",
+                    "ge"
+                  ]
+                }
+              },
+              "required": [
+                "predicate"
+              ],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "select"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "broadcast"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {
+                "dimensions": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1
+                  },
+                  "minItems": 0,
+                  "maxItems": 2
+                }
+              },
+              "required": [
+                "dimensions"
+              ],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "expand_dims"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {
+                "axis": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              },
+              "required": [
+                "axis"
+              ],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "cast"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {
+                "rounding": {
+                  "enum": [
+                    "rtne"
+                  ]
+                }
+              },
+              "required": [
+                "rounding"
+              ],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "dot"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 3,
+              "maxItems": 3
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "silu"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {
+                "approximation": {
+                  "enum": [
+                    "none",
+                    "exact",
+                    "native"
+                  ]
+                }
+              },
+              "required": [
+                "approximation"
+              ],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "return"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "yield"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 0
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {},
+              "required": [],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 0,
+              "maxItems": 0
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "opcode": {
+              "const": "counted_loop"
+            },
+            "operands": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+              },
+              "minItems": 0
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Value"
+              },
+              "minItems": 0
+            },
+            "attributes": {
+              "type": "object",
+              "properties": {
+                "step": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9223372036854775807
+                }
+              },
+              "required": [
+                "step"
+              ],
+              "additionalProperties": false
+            },
+            "regions": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/Region"
+              },
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "span": {
+              "$ref": "#/$defs/SourceSpan"
+            }
+          },
+          "required": [
+            "opcode",
+            "operands",
+            "results",
+            "attributes",
+            "regions",
+            "span"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "FrontendProgram": {
+      "type": "object",
+      "properties": {
+        "entry": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z_0-9]*$"
+        },
+        "tensors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TensorSpec"
+          },
+          "minItems": 0
+        },
+        "constexprs": {
+          "$ref": "#/$defs/Constants"
+        },
+        "launch": {
+          "$ref": "#/$defs/LaunchSpec"
+        },
+        "operations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Operation"
+          },
+          "minItems": 1
+        },
+        "numerical_contract": {
+          "$ref": "#/$defs/NumericalContract"
+        },
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "source": {
+          "type": "string"
+        },
+        "captured_constants": {
+          "$ref": "#/$defs/Constants"
+        }
+      },
+      "required": [
+        "entry",
+        "tensors",
+        "constexprs",
+        "launch",
+        "operations",
+        "numerical_contract",
+        "version",
+        "source",
+        "captured_constants"
+      ],
+      "additionalProperties": false
+    },
+    "CompileOptions": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "minLength": 1
+        },
+        "backend": {
+          "enum": [
+            "reference",
+            "selected-target"
+          ]
+        },
+        "search_mode": {
+          "enum": [
+            "deterministic"
+          ]
+        },
+        "max_candidates": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "top_k": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "numerical_contract": {
+          "$ref": "#/$defs/NumericalContract"
+        },
+        "config_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "config_files": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "target",
+        "backend",
+        "search_mode",
+        "max_candidates",
+        "top_k",
+        "numerical_contract",
+        "config_root",
+        "config_files"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "properties": {
+    "program": {
+      "$ref": "#/$defs/FrontendProgram"
+    },
+    "options": {
+      "$ref": "#/$defs/CompileOptions"
+    }
+  },
+  "required": [
+    "program",
+    "options"
+  ],
+  "additionalProperties": false
+}

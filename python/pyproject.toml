@@ -12,7 +12,7 @@ license = "Apache-2.0 WITH LLVM-exception"
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "build>=1.2", "setuptools>=77", "wheel"]
+test = ["pytest>=8,<10", "build>=1.2", "setuptools>=77", "wheel", "jsonschema>=4,<5"]
 torch-test = ["torch==2.9.0", "pytest>=8,<10"]
 
 [project.urls]
