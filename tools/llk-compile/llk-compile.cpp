@@ -694,6 +694,9 @@ static int runMappedCompilation(mlir::ModuleOp module,
     llk::MappedObjectOptions objectOptions;
     objectOptions.triple = emitTargetTriple;
     objectOptions.features = std::move(features);
+    if (compiled->codegenRequirements)
+      objectOptions.invocationAttributes =
+          compiled->codegenRequirements->invocationAttributes;
     std::error_code error;
     llvm::raw_fd_ostream objectFile(emitOutput, error);
     if (error) {
@@ -733,6 +736,11 @@ static int runMappedCompilation(mlir::ModuleOp module,
     record.selectedGroupsVerified = compiled->selectedGroupsVerified;
     record.backendGroupsRealized = compiled->backendGroupsRealized;
     record.referenceGroupsLowered = compiled->referenceGroupsLowered;
+    record.streamingVectorLengthBits =
+        compiled->codegenRequirements
+            ? compiled->codegenRequirements->streamingVectorLengthBits
+            : std::nullopt;
+    record.invocationAttributes = objectOptions.invocationAttributes;
     record.executionIdentity = compiled->executionIdentity;
     llvm::raw_fd_ostream identityFile(emitIdentity, error);
     if (error) {

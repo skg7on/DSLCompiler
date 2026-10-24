@@ -29,6 +29,7 @@
 #include "LLK/Runtime/MappedExecutable.h"
 #include "LLK/Conversion/MappedKernelAbi.h"
 #include "LLK/Mapping/CodegenRequirements.h"
+#include "LLK/Runtime/MappedObject.h"
 #include "mapped_jit_test_factory.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -67,10 +68,15 @@
 #ifndef HWCAP_SVE
 #define HWCAP_SVE (1 << 22)
 #endif
+#ifndef HWCAP2_SME
+#define HWCAP2_SME (1UL << 23)
+#endif
 
 namespace {
 /// prctl() request code for PR_SVE_GET_VL.
 constexpr int kPrSveGetVl = 51;
+/// prctl() request code for PR_SME_GET_VL.
+constexpr int kPrSmeGetVl = 64;
 } // namespace
 #endif
 
@@ -95,6 +101,23 @@ std::optional<int64_t> detectHostVectorLengthBits() {
   if (!(hwcap & HWCAP_SVE))
     return std::nullopt;
   long value = prctl(kPrSveGetVl, 0, 0, 0, 0);
+  if (value < 0)
+    return std::nullopt;
+  return mlir::llk::mapping::vectorLengthBitsFromPrctl(value);
+#else
+  return std::nullopt;
+#endif
+}
+
+/// The host's implemented streaming vector length, when the platform can report
+/// one. Nullopt means the host did not report it, which is not evidence of a
+/// match.
+std::optional<int64_t> detectHostStreamingVectorLengthBits() {
+#if defined(__linux__) && defined(__aarch64__)
+  unsigned long hwcap2 = getauxval(AT_HWCAP2);
+  if (!(hwcap2 & HWCAP2_SME))
+    return std::nullopt;
+  long value = prctl(kPrSmeGetVl, 0, 0, 0, 0);
   if (value < 0)
     return std::nullopt;
   return mlir::llk::mapping::vectorLengthBitsFromPrctl(value);
@@ -408,7 +431,8 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
       hostArchitecture = "x86_64";
     if (llvm::Error error = mlir::llk::mapping::checkHostRequirements(
             *options.selectedTarget, hostArchitecture, hostFeatures,
-            detectHostVectorLengthBits()))
+            detectHostVectorLengthBits(),
+            detectHostStreamingVectorLengthBits()))
       return error;
     if (hostFeatures.empty())
       return abiError("cannot detect host CPU features for selected-target "
@@ -460,6 +484,13 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
     if (!unresolvedCasts.empty())
       message += "; remaining conversion casts: " + unresolvedCasts;
     return abiError(message);
+  }
+
+  if (options.selectedTarget) {
+    std::string wrapper = "_mlir_ciface_" + prepared.entrySymbol;
+    if (llvm::Error error = applyInvocationAttributes(
+            *llvmModule, wrapper, options.selectedTarget->invocationAttributes))
+      return std::move(error);
   }
 
   if (options.evidenceSink) {

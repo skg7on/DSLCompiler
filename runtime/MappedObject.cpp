@@ -19,6 +19,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CodeGen.h"
@@ -40,6 +41,22 @@ std::string hexHash(uint64_t value) {
 }
 
 } // namespace
+
+llvm::Error applyInvocationAttributes(llvm::Module &module,
+                                      llvm::StringRef wrapperSymbol,
+                                      llvm::ArrayRef<std::string> attributes) {
+  if (attributes.empty())
+    return llvm::Error::success();
+  llvm::Function *wrapper = module.getFunction(wrapperSymbol);
+  if (!wrapper)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "invocation wrapper '" +
+                                       wrapperSymbol.str() +
+                                       "' is missing from the LLVM module");
+  for (const std::string &attribute : attributes)
+    wrapper->addFnAttr(attribute);
+  return llvm::Error::success();
+}
 
 llvm::Expected<std::string> emitMappedObject(PreparedMappedKernel &prepared,
                                              const MappedObjectOptions &options,
@@ -76,6 +93,10 @@ llvm::Expected<std::string> emitMappedObject(PreparedMappedKernel &prepared,
   if (!llvmModule->getFunction(wrapper))
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "no C-interface wrapper '" + wrapper + "'");
+
+  if (llvm::Error error = applyInvocationAttributes(
+          *llvmModule, wrapper, options.invocationAttributes))
+    return std::move(error);
 
   llvm::InitializeAllTargetInfos();
   llvm::InitializeAllTargets();
@@ -161,6 +182,14 @@ llvm::Error writeMappedObjectIdentity(const MappedObjectIdentity &identity,
   record["selectedGroupsVerified"] = identity.selectedGroupsVerified;
   record["backendGroupsRealized"] = identity.backendGroupsRealized;
   record["referenceGroupsLowered"] = identity.referenceGroupsLowered;
+  if (identity.streamingVectorLengthBits)
+    record["streamingVectorLengthBits"] = *identity.streamingVectorLengthBits;
+  else
+    record["streamingVectorLengthBits"] = nullptr;
+  llvm::json::Array invocationAttributes;
+  for (const std::string &attribute : identity.invocationAttributes)
+    invocationAttributes.push_back(attribute);
+  record["invocationAttributes"] = std::move(invocationAttributes);
   record["executionIdentity"] = identity.executionIdentity;
   jsonStream << llvm::json::Value(std::move(record)) << "\n";
   jsonStream.flush();

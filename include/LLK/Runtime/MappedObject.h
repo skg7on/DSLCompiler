@@ -12,10 +12,13 @@
 
 #include "LLK/Runtime/PreparedMappedKernel.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,10 +28,14 @@ struct MappedObjectOptions {
   std::string triple;
   std::string cpu;
   std::vector<std::string> features;
+  /// LLVM function attributes to attach to the exported `_mlir_ciface_*`
+  /// wrapper. Supplied by the target's codegen contract; empty for targets
+  /// whose entry needs no ABI annotation.
+  std::vector<std::string> invocationAttributes;
 };
 
 struct MappedObjectIdentity {
-  uint32_t schemaVersion = 1;
+  uint32_t schemaVersion = 2;
   std::string compilerVersion;
   std::string llvmVersion;
   std::string targetTriple;
@@ -45,8 +52,20 @@ struct MappedObjectIdentity {
   unsigned selectedGroupsVerified = 0;
   unsigned backendGroupsRealized = 0;
   unsigned referenceGroupsLowered = 0;
+  std::optional<int64_t> streamingVectorLengthBits;
+  std::vector<std::string> invocationAttributes;
   std::string executionIdentity;
 };
+
+/// Attach `attributes` to `wrapperSymbol` in `module`.
+///
+/// An empty attribute list is a no-op and does not require the wrapper to
+/// exist. A nonempty list naming a missing wrapper is an error: silently
+/// dropping a required ABI attribute would emit an object whose entry runs in
+/// the wrong streaming state.
+llvm::Error applyInvocationAttributes(llvm::Module &module,
+                                      llvm::StringRef wrapperSymbol,
+                                      llvm::ArrayRef<std::string> attributes);
 
 /// Lowers `prepared` through the same LLVM pipeline the JIT uses and writes an
 /// object for `options.triple`. Returns the C-interface wrapper symbol.

@@ -8,8 +8,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "LLK/Mapping/CodegenRequirements.h"
+#include "LLK/Runtime/MappedObject.h"
 
 #include "llvm/ADT/StringMap.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 
 #include "gtest/gtest.h"
@@ -60,4 +64,29 @@ TEST(MappedCodegenRequirements, ChecksOptionalFmaOnlyWhenRequired) {
   features["fma"] = true;
   EXPECT_FALSE(
       static_cast<bool>(checkHostRequirements(avx2AndFma, "x86_64", features)));
+}
+
+TEST(MappedCodegenRequirements, AppliesInvocationAttributesToTheWrapper) {
+  llvm::LLVMContext context;
+  llvm::Module module("m", context);
+  auto *wrapper = llvm::Function::Create(
+      llvm::FunctionType::get(llvm::Type::getVoidTy(context), false),
+      llvm::GlobalValue::ExternalLinkage, "_mlir_ciface_k", module);
+  ASSERT_FALSE(wrapper->hasFnAttribute("aarch64_pstate_sm_enabled"));
+
+  llvm::Error error = llk::applyInvocationAttributes(
+      module, "_mlir_ciface_k", {"aarch64_pstate_sm_enabled"});
+  ASSERT_FALSE(static_cast<bool>(error));
+  EXPECT_TRUE(wrapper->hasFnAttribute("aarch64_pstate_sm_enabled"));
+
+  // An empty attribute list is a no-op even when the wrapper is absent.
+  EXPECT_FALSE(static_cast<bool>(
+      llk::applyInvocationAttributes(module, "_mlir_ciface_missing", {})));
+
+  // Naming a missing wrapper with attributes is an error, not a silent skip.
+  llvm::Error missing = llk::applyInvocationAttributes(
+      module, "_mlir_ciface_missing", {"aarch64_pstate_sm_enabled"});
+  ASSERT_TRUE(static_cast<bool>(missing));
+  EXPECT_NE(llvm::toString(std::move(missing)).find("_mlir_ciface_missing"),
+            std::string::npos);
 }
