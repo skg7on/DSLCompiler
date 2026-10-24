@@ -33,6 +33,9 @@ add_subdirectory(Mapping)
 add_subdirectory(Conversion)
 add_subdirectory(Frontend)
 add_subdirectory(Benchmark)
+if(LLK_BUILD_PYTHON_CAPI)
+  add_subdirectory(CAPI)
+endif()
 
 include(FileCheck.cmake)
 
@@ -49,7 +52,7 @@ foreach(_llk_tool llk-opt micro-perf llk-tune llk-compile llk-bench llk-validate
     MappedAcceptance MappedAVX2Acceptance MappedInvocationTest
     MappedAllocationLifetimeTest MappedCodegenRequirementsTest
     SelectedGroupLoweringTest MappedTuningSessionTest CandidateInstantiationTest
-    FrameworkSourceTest)
+    FrameworkSourceTest LLKCAPIFrontendTests)
   if(TARGET ${_llk_tool})
     list(APPEND _llk_check_deps ${_llk_tool})
   endif()

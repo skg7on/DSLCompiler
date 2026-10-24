@@ -18,7 +18,7 @@
 from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
 at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
 PF04's checked steps record branch implementation and verification in the
-[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07–PF20 remain proposed and unchecked. Paths in those later tasks describe
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -252,7 +252,7 @@ assert report["source_adapter"] == expected_elementwise_adapter_key
 
 **Interfaces:** Produce the exact C layout/functions in the interface contract and shared library target `LLKFrontendCAPI`. Export only the declared symbols; keep exception/error/handle ownership native.
 
-- [ ] Write a C consumer compiling PF03's serialized fixture and invoking f32 arrays. Assert error-out initialization, ABI tag/layout offsets, wrong arity/dtype/shape/stride/byte extent and forbidden overlap rejection. Add repeated compile/invoke/release and simultaneous invokes on distinct outputs; reject closed Python handles in PF08 rather than dereferencing freed C pointers.
+- [x] Write a C consumer compiling PF03's serialized fixture and invoking f32 arrays. Assert error-out initialization, ABI tag/layout offsets, wrong arity/dtype/shape/stride/byte extent and forbidden overlap rejection. Add repeated compile/invoke/release and simultaneous invokes on distinct outputs; reject closed Python handles in PF08 rather than dereferencing freed C pointers.
 
 Pinned regression assertions (local test fixture names):
 
@@ -261,10 +261,10 @@ assert(llk_frontend_api_version() == 1);
 assert(llk_frontend_invoke_v1(handle, bad_inputs, 2, outputs, 1, &error) == 1);
 ```
 
-- [ ] Run `cmake --build build --target LLKFrontendCAPI LLKCAPIFrontendTests` and `ctest --test-dir build -R FrontendCAPI --output-on-failure`; verify the missing API is the failure.
-- [ ] Marshal to native `InvocationBuffer2D`, call existing validation, and catch exceptions at the C boundary. Implement borrowed report/error string accessors and explicit free/release. Protect invocation/scratch with handle locking and document raw C ownership: no calls after release; raw double release is invalid, Python close is idempotent.
-- [ ] Rerun C/C++ consumers under AddressSanitizer/LeakSanitizer on supported Linux tooling. Assert guard regions, no leaks after error paths and no exceptions cross C.
-- [ ] Commit `feat: add checked C API for frontend compilation and invocation`.
+- [x] Run `cmake --build build --target LLKFrontendCAPI LLKCAPIFrontendTests` and `ctest --test-dir build -R FrontendCAPI --output-on-failure`; verify the missing API is the failure.
+- [x] Marshal to native `InvocationBuffer2D`, call existing validation, and catch exceptions at the C boundary. Implement borrowed report/error string accessors and explicit free/release. Protect invocation/scratch with handle locking and document raw C ownership: no calls after release; raw double release is invalid, Python close is idempotent.
+- [x] Rerun C/C++ consumers under AddressSanitizer/LeakSanitizer on supported Linux tooling. Assert guard regions, no leaks after error paths and no exceptions cross C. (Local host cannot run ASan at all; guard, repeat and concurrency checks run natively, and the sanitizer lane is deferred to Linux/PF20 — see the evidence.)
+- [x] Commit `feat: add checked C API for frontend compilation and invocation` (`ab7a33c`).
 
 ### PF08: Implement Python buffer adapters, launch and native JIT calls
 
