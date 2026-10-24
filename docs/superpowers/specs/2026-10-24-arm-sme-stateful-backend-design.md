@@ -212,11 +212,14 @@ depend on compiler-generated transitions.
   the ABI's ZA save/restore rules apply; that is out of scope here.
 - **ABI runtime**: `new_za` code consults `TPIDR2_EL0` and calls
   `__arm_tpidr2_save` only when it is nonzero. At the exported boundary it is
-  zero (measured by the native probe). The native runner links the platform
+  zero on the native runner (measured by the probe). QEMU/Linux does not leave
+  it zero, so the entry shim writes zero to `TPIDR2_EL0` after `smstart sm`
+  and before the kernel call, making the no-incoming-ZA precondition explicit
+  and identical on both runners. The native runner links the platform
   compiler-rt implementation. The freestanding QEMU runner supplies explicit
-  trap stubs for `__arm_tpidr2_save`/`__arm_tpidr2_restore` and documents that
-  the single-threaded, top-level call flow never enters them; a stub firing is
-  a test failure, not a silent continuation.
+  trap stubs for `__arm_tpidr2_save`/`__arm_tpidr2_restore`; the shim's clear
+  means the single-threaded, top-level call flow never enters them, and a stub
+  firing is a test failure, not a silent continuation.
 
 ### 5.4 Across-call correctness
 

@@ -1712,6 +1712,11 @@ def render_shim(symbol_prefix, arch_directive=""):
     # The ELF path passes `.arch armv9-a+sme` because GNU as defaults to the
     # base architecture; the Mach-O path passes an empty directive and enables
     # SME with `clang -march=armv9-a+sme`.
+    #
+    # The shim clears TPIDR2_EL0 before the kernel call. A top-level kernel
+    # with `new_za` owns a fresh ZA array and has no incoming ZA save buffer;
+    # macOS starts with TPIDR2_EL0 zero, but QEMU/Linux does not, and the
+    # kernel's prologue would otherwise call `__arm_tpidr2_save`.
     return arch_directive + r"""
 	.text
 	.p2align 2
@@ -1725,6 +1730,7 @@ def render_shim(symbol_prefix, arch_directive=""):
 	mov	x2, x3
 	mov	x3, x4
 	smstart	sm
+	msr	tpidr2_el0, xzr
 	blr	x16
 	smstop	sm
 	ldp	x29, x30, [sp], #16
