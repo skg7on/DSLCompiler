@@ -17,8 +17,12 @@
 //  * a selected add compiles with no reference-lowered group and reaches
 //    scalable SVE Vector IR;
 //  * a selected contraction still refuses to compile, so "executable subset"
-//    does not silently widen to the whole target.
+//    does not silently widen to the whole target;
+//  * an unimplemented dtype and an emitter-only operation are refused by the
+//    backend's own accounting, and a capability receipt reports that boundary
+//    from the artifacts rather than from the rule table.
 
+#include "LLK/Conversion/FrameworkCapabilities.h"
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/MappedKernelAbi.h"
 #include "LLK/Mapping/MappingLowering.h"
@@ -30,6 +34,7 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/PatternMatch.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
@@ -47,6 +52,8 @@ constexpr const char *kVectorBf16Add =
     "test/Conversion/MicroMapping/Inputs/arm/vector_add_bf16.mlir";
 constexpr const char *kVectorI8Mul =
     "test/Conversion/MicroMapping/Inputs/arm/vector_mul_i8.mlir";
+constexpr const char *kVectorSiluF32 =
+    "test/Conversion/MicroMapping/Inputs/arm/vector_silu_f32.mlir";
 constexpr const char *kContraction =
     "test/Conversion/MicroMapping/Inputs/arm/contraction_f32.mlir";
 
@@ -180,6 +187,105 @@ TEST(ArmSVEBackend, SelectedBackendRefusesUnimplementedDtypes) {
   EXPECT_NE(message.find("realized no selected compute groups"),
             std::string::npos)
       << message;
+}
+
+// The executable subset is narrower than the target's rule coverage in two
+// independent directions: a dtype the arithmetic emitters do not implement
+// (bf16 add) and a f32 operation whose rule names an emitter that only
+// verifies its bundle (SiLU). Both are refused by the selected backend's own
+// group accounting -- not by falling back to the portable reference bridge and
+// reporting success, which would call reference code target execution.
+TEST(ArmSVEBackend, UnsupportedDtypeAndOperationAreRefused) {
+  struct Case {
+    const char *path;
+    const char *entry;
+  };
+  for (const Case &testCase : {Case{kVectorBf16Add, "arm_vector_add_bf16"},
+                               Case{kVectorSiluF32, "arm_vector_silu_f32"}}) {
+    SCOPED_TRACE(testCase.path);
+    auto fixture = arm_test::mapFixture("arm-sve", testCase.path);
+    ASSERT_TRUE(static_cast<bool>(fixture))
+        << llvm::toString(fixture.takeError());
+    mlir::OwningOpRef<mlir::ModuleOp> source =
+        mlir::cast<mlir::ModuleOp>(fixture->source->clone());
+    llk::MappedCompileOptions options;
+    options.entrySymbol = testCase.entry;
+    options.backend = llk::MappedBackend::SelectedTarget;
+    options.stop = llk::MappedStop::Lowered;
+    llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
+        *source, *fixture->target, fixture->plan, options);
+    ASSERT_FALSE(static_cast<bool>(compiled));
+    const std::string message = llvm::toString(compiled.takeError());
+    EXPECT_NE(message.find("selected-target backend realized no selected "
+                           "compute groups"),
+              std::string::npos)
+        << message;
+    EXPECT_EQ(message.find("reference"), std::string::npos)
+        << "the refusal is reported as a reference fallback: " << message;
+  }
+}
+
+// A capability receipt states what the artifacts establish, not what the
+// target's rule table promises. Before any selected compilation runs, the f32
+// add plan leaves selected lowering `not_checked` -- even though both of its
+// emitter keys implement a lowering. The SiLU plan is different: its only
+// compute emitter verifies bundles and never lowers, so the receipt can report
+// `unsupported` statically, without running a backend. After the f32 add
+// compilation, selected lowering is credited and the unexercised stages stay
+// `not_checked`.
+TEST(ArmSVEBackend, CapabilityReceiptDrawsTheExecutableBoundary) {
+  using mlir::llk::framework::CapabilityReceipt;
+  using mlir::llk::framework::CapabilityStatus;
+
+  auto fixture = arm_test::mapFixture("arm-sve", kVectorAdd);
+  ASSERT_TRUE(static_cast<bool>(fixture))
+      << llvm::toString(fixture.takeError());
+  mlir::Operation *kernel = nullptr;
+  fixture->source->walk([&](mlir::Operation *op) {
+    if (!kernel && op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+  });
+  ASSERT_NE(kernel, nullptr);
+  // A direct MicroIR fixture carries no workload contract; the ABI stages stay
+  // `not_checked` rather than being guessed from the signature.
+  mlir::llk::workload::WorkloadContract contract;
+  CapabilityReceipt planned = mlir::llk::framework::describeCapabilities(
+      kernel, contract, *fixture->target, &fixture->analysis, &fixture->plan);
+  EXPECT_EQ(planned.selectedLowering, CapabilityStatus::NotChecked);
+  EXPECT_EQ(planned.referenceLowering, CapabilityStatus::NotChecked);
+  EXPECT_EQ(planned.invocation, CapabilityStatus::NotChecked);
+
+  mlir::OwningOpRef<mlir::ModuleOp> source =
+      mlir::cast<mlir::ModuleOp>(fixture->source->clone());
+  llk::MappedCompileOptions options;
+  options.entrySymbol = "arm_vector_add_f32";
+  options.backend = llk::MappedBackend::SelectedTarget;
+  options.stop = llk::MappedStop::Lowered;
+  llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
+      *source, *fixture->target, fixture->plan, options);
+  ASSERT_TRUE(static_cast<bool>(compiled))
+      << llvm::toString(compiled.takeError());
+  CapabilityReceipt realized = mlir::llk::framework::describeCapabilities(
+      kernel, contract, *fixture->target, &fixture->analysis, &fixture->plan,
+      &*compiled);
+  EXPECT_EQ(realized.selectedLowering, CapabilityStatus::Supported);
+  EXPECT_EQ(realized.referenceLowering, CapabilityStatus::NotChecked);
+  EXPECT_EQ(realized.invocation, CapabilityStatus::NotChecked);
+
+  auto silu = arm_test::mapFixture("arm-sve", kVectorSiluF32);
+  ASSERT_TRUE(static_cast<bool>(silu)) << llvm::toString(silu.takeError());
+  mlir::Operation *siluKernel = nullptr;
+  silu->source->walk([&](mlir::Operation *op) {
+    if (!siluKernel && op->getName().getStringRef() == "micro.kernel")
+      siluKernel = op;
+  });
+  ASSERT_NE(siluKernel, nullptr);
+  CapabilityReceipt refused = mlir::llk::framework::describeCapabilities(
+      siluKernel, contract, *silu->target, &silu->analysis, &silu->plan);
+  EXPECT_EQ(refused.selectedLowering, CapabilityStatus::Unsupported);
+  EXPECT_NE(llvm::join(refused.reasons, "\n").find("sve_vector_silu"),
+            std::string::npos)
+      << llvm::join(refused.reasons, "\n");
 }
 
 // The prepared artifact is what the AOT object and the JIT both consume.

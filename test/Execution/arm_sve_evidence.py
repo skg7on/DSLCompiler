@@ -6,6 +6,11 @@ subset computes the fixture's numbers. It is not a measurement, and the harness
 is deliberately libc-free and static so the object under test is the compiler's
 output rather than a runtime's.
 
+Each passing object is also replayed on two CPUs the harness must refuse -- one
+without SVE and one whose vector length is not the modeled 512 bits -- and must
+exit with the harness's distinct rejection codes (70 and 71). That keeps the
+host checks that qualify the executable subset live rather than assumed.
+
 The script fails -- never skips -- when qemu or the cross compiler is missing;
 CTest's `REQUIRED` lookups refuse to configure in that case.
 """
@@ -23,6 +28,17 @@ CASES = [
     ("vector_mul_f32", "arm_vector_mul_f32", "mul", 8, 8),
     ("vector_add_f32_full", "arm_vector_add_f32_full", "add", 16, 16),
     ("vector_mul_f32_full", "arm_vector_mul_f32_full", "mul", 16, 16),
+]
+
+# The harness's own host checks are the executable subset's guardrails: it
+# exits 70 when the CPU does not advertise SVE and 71 when PR_SVE_GET_VL is not
+# the modeled 512 bits. Running every object on emulated CPUs that violate each
+# condition proves those branches are live -- a zero exit would mean the
+# artifact computed numbers on a host the subset is not contracted for.
+# `max,sve-max-vq=8` caps the vector length at 8 x 128 = 1024 bits.
+NEGATIVE_CONTROLS = [
+    ("no-sve", "max,sve=off", 70),
+    ("wrong-vl", "max,sve-max-vq=8", 71),
 ]
 
 HARNESS = r"""
@@ -262,6 +278,38 @@ def resolve_tool(path, description):
     return resolved
 
 
+def run_negative_controls(qemu, binaries, failures):
+    """Run every built object on CPUs the harness must reject.
+
+    `binaries` maps a case name to its linked harness. Each object runs once
+    per entry in NEGATIVE_CONTROLS and must exit with exactly that entry's
+    code. Zero is the failure the control exists to catch: it would mean the
+    harness ran and compared numbers on a CPU without the contracted SVE
+    support. Any other code is also a failure, because it is not the branch
+    being asserted.
+    """
+    for fixture, binary in binaries.items():
+        for label, cpu, expected in NEGATIVE_CONTROLS:
+            try:
+                run = subprocess.run([qemu, "-cpu", cpu, binary],
+                                     capture_output=True, text=True,
+                                     timeout=120)
+            except subprocess.TimeoutExpired:
+                failures.append("%s: %s negative run timed out" %
+                                (fixture, label))
+                continue
+            if run.returncode == 0:
+                failures.append(
+                    "%s: %s negative run exited 0; the harness accepted CPU "
+                    "'%s'\n%s%s" % (fixture, label, cpu, run.stdout,
+                                    run.stderr))
+            elif run.returncode != expected:
+                failures.append(
+                    "%s: %s negative run exited %d, expected %d\n%s%s" %
+                    (fixture, label, run.returncode, expected, run.stdout,
+                     run.stderr))
+
+
 def main():
     if len(sys.argv) != 6:
         print("usage: arm_sve_evidence.py <llk-compile> <source-dir> "
@@ -274,6 +322,7 @@ def main():
     os.makedirs(work_dir, exist_ok=True)
     failures = []
     graph_ids = {}
+    binaries = {}
     for fixture, symbol, name, rows, cols in CASES:
         case_dir = os.path.join(work_dir, fixture)
         os.makedirs(case_dir, exist_ok=True)
@@ -354,6 +403,7 @@ def main():
             failures.append("%s: cross link failed\n%s%s" %
                             (fixture, build.stdout, build.stderr))
             continue
+        binaries[fixture] = binary
         try:
             run = subprocess.run([qemu, "-cpu", "max,sve-max-vq=4", binary],
                                  capture_output=True, text=True, timeout=120)
@@ -364,6 +414,10 @@ def main():
         if run.returncode != 0:
             failures.append("%s: qemu exit %d\n%s%s" %
                             (fixture, run.returncode, run.stdout, run.stderr))
+    # Every object that linked is replayed on CPUs the harness must reject, so
+    # the passing runs above are not the only thing that ever exercises its
+    # host checks.
+    run_negative_controls(qemu, binaries, failures)
     # The 8x8 and 16x16 runs must be distinct bindings, not one artifact
     # reused. A plan id hashes the plan's *decisions* -- binding, placements,
     # routes and parameters -- and is deliberately shape-agnostic, so the same
