@@ -21,10 +21,12 @@ llvm::Error requirementError(const std::string &message) {
 
 } // namespace
 
-llvm::Error checkHostRequirements(const TargetCodegenRequirements &requirements,
-                                  llvm::StringRef hostArchitecture,
-                                  const llvm::StringMap<bool> &hostFeatures,
-                                  std::optional<int64_t> hostVectorLengthBits) {
+llvm::Error
+checkHostRequirements(const TargetCodegenRequirements &requirements,
+                      llvm::StringRef hostArchitecture,
+                      const llvm::StringMap<bool> &hostFeatures,
+                      std::optional<int64_t> hostVectorLengthBits,
+                      std::optional<int64_t> hostStreamingVectorLengthBits) {
   if (!requirements.architecture.empty() &&
       requirements.architecture != hostArchitecture)
     return requirementError(
@@ -47,6 +49,20 @@ llvm::Error checkHostRequirements(const TargetCodegenRequirements &requirements,
           "host vector length is " + std::to_string(*hostVectorLengthBits) +
           " bits but the selected target requires " +
           std::to_string(*requirements.vectorLengthBits) + " bits");
+  }
+  if (requirements.streamingVectorLengthBits) {
+    if (!hostStreamingVectorLengthBits)
+      return requirementError(
+          "host streaming vector length is unknown but '" +
+          requirements.architecture + "' requires " +
+          std::to_string(*requirements.streamingVectorLengthBits) + " bits");
+    if (*hostStreamingVectorLengthBits !=
+        *requirements.streamingVectorLengthBits)
+      return requirementError(
+          "host streaming vector length is " +
+          std::to_string(*hostStreamingVectorLengthBits) +
+          " bits but the selected target requires " +
+          std::to_string(*requirements.streamingVectorLengthBits) + " bits");
   }
   return llvm::Error::success();
 }

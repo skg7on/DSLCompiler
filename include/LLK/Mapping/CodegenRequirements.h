@@ -27,13 +27,21 @@ struct TargetCodegenRequirements {
   /// Exact implemented vector length in bits, when the target's code assumes
   /// one. Nullopt means the target makes no vector-length claim.
   std::optional<int64_t> vectorLengthBits = std::nullopt;
+  /// Exact implemented *streaming* vector length in bits (Arm SME SVL). This is
+  /// independent of vectorLengthBits: a machine can have no non-streaming SVE
+  /// and still implement a streaming length.
+  std::optional<int64_t> streamingVectorLengthBits = std::nullopt;
+  /// LLVM function attributes the exported C-interface wrapper must carry.
+  /// Empty for targets whose invocation entry needs no ABI annotation.
+  std::vector<std::string> invocationAttributes{};
 };
 
 /// Check a selected target's ISA policy against the detected host facts.
-llvm::Error checkHostRequirements(const TargetCodegenRequirements &requirements,
-                                  llvm::StringRef hostArchitecture,
-                                  const llvm::StringMap<bool> &hostFeatures,
-                                  std::optional<int64_t> hostVectorLengthBits);
+llvm::Error checkHostRequirements(
+    const TargetCodegenRequirements &requirements,
+    llvm::StringRef hostArchitecture, const llvm::StringMap<bool> &hostFeatures,
+    std::optional<int64_t> hostVectorLengthBits,
+    std::optional<int64_t> hostStreamingVectorLengthBits = std::nullopt);
 
 /// Check requirements when the caller has no host vector-length information.
 inline llvm::Error
