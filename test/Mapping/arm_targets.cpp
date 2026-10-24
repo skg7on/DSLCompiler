@@ -225,23 +225,53 @@ TEST(ArmTargets, RejectsUnknownCrossKeyAndMalformedBundles) {
   }
 }
 
-// Catches a package inadvertently gaining native lowering or ISA requirements.
-TEST(ArmTargets, NoExecutableBackend) {
+// SME remains a configuration-only package: no code-generation contract, no
+// selected backend, and no emitter with a lowering.
+TEST(ArmTargets, SmeHasNoExecutableBackend) {
   mlir::MLIRContext context;
   mlir::IRRewriter rewriter(&context);
+  auto target = loadRegistered(kConfigurations[1]); // arm-sme
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  EXPECT_FALSE((*target)->codegenRequirements().has_value());
   mlir::OpPassManager pipeline;
-  for (const ArmConfiguration &configuration : kConfigurations) {
-    auto target = loadRegistered(configuration);
-    ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
-    EXPECT_FALSE((*target)->codegenRequirements().has_value());
-    EXPECT_NE(llvm::toString((*target)->buildSelectedBackendPipeline(pipeline))
-                  .find("unsupported"),
+  EXPECT_NE(llvm::toString((*target)->buildSelectedBackendPipeline(pipeline))
+                .find("unsupported"),
+            std::string::npos);
+  TargetLoweringContext lowering{(*target)->machine(), {}, {}};
+  for (const RuleDef &rule : (*target)->rules().all()) {
+    auto emitter = (*target)->createEmitter(rule.emitter);
+    ASSERT_NE(emitter, nullptr);
+    EXPECT_FALSE(emitter->hasLowering());
+    TargetBundle bundle{rule.bundle, {}, rule.emitter};
+    EXPECT_NE(llvm::toString(emitter->lower({}, bundle, lowering, rewriter))
+                  .find("target_lowering_unsupported"),
               std::string::npos);
-    TargetLoweringContext lowering{(*target)->machine(), {}, {}};
-    for (const RuleDef &rule : (*target)->rules().all()) {
-      auto emitter = (*target)->createEmitter(rule.emitter);
-      ASSERT_NE(emitter, nullptr);
-      EXPECT_FALSE(emitter->hasLowering());
+  }
+}
+
+// SVE declares exactly the executable arithmetic subset; every other key keeps
+// the explicit rejection. This is the negative control that stops the target
+// from quietly claiming the contraction, reduction, conversion or movement
+// families.
+TEST(ArmTargets, SveExecutableSubsetIsExplicit) {
+  mlir::MLIRContext context;
+  auto target = loadRegistered(kConfigurations[0]); // arm-sve
+  ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
+  auto requirements = (*target)->codegenRequirements();
+  ASSERT_TRUE(requirements.has_value());
+  EXPECT_EQ(requirements->architecture, "aarch64");
+  mlir::OpPassManager pipeline;
+  EXPECT_FALSE(
+      static_cast<bool>((*target)->buildSelectedBackendPipeline(pipeline)));
+  for (const RuleDef &rule : (*target)->rules().all()) {
+    bool executable =
+        rule.emitter == "sve_vector_add" || rule.emitter == "sve_vector_mul";
+    auto emitter = (*target)->createEmitter(rule.emitter);
+    ASSERT_NE(emitter, nullptr);
+    EXPECT_EQ(emitter->hasLowering(), executable);
+    if (!executable) {
+      mlir::IRRewriter rewriter(&context);
+      TargetLoweringContext lowering{(*target)->machine(), {}, {}};
       TargetBundle bundle{rule.bundle, {}, rule.emitter};
       EXPECT_NE(llvm::toString(emitter->lower({}, bundle, lowering, rewriter))
                     .find("target_lowering_unsupported"),

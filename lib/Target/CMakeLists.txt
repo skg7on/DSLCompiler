@@ -13,6 +13,8 @@ add_llk_library(LLKTargetMapping
     X86/Mapping/AVX2BackendLowering.cpp
     GenericAccelerator/Mapping/GenericAcceleratorMappingTarget.cpp
     AArch64/Mapping/SVEMappingTarget.cpp
+    AArch64/Mapping/SVEBundleLowering.cpp
+    AArch64/Mapping/SVEBackendLowering.cpp
     AArch64/Mapping/SMEMappingTarget.cpp
     LINK_LIBRARIES LLKMapping LLKMachine MicroDialect LLK::MLIR
 )

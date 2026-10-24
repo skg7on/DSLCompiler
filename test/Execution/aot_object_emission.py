@@ -53,7 +53,14 @@ def main():
     assert record["entrySymbol"] == "arm_vector_add_f32"
     assert record["wrapperSymbol"] == "_mlir_ciface_arm_vector_add_f32"
     assert record["wrapperSymbol"].encode() in data, "wrapper symbol not exported"
-    assert record["referenceGroupsLowered"] == 1
+    # `sve_vector_add` implements a lowering (the selected SVE backend pass), so
+    # this reference-backend run verifies the selected group and carries it
+    # through generic lowering: nothing falls back to the reference bridge and
+    # no selected backend group is realized. The identity must record that
+    # split rather than a blanket "reference-lowered" count.
+    assert record["selectedGroupsVerified"] == 1
+    assert record["referenceGroupsLowered"] == 0
+    assert record["backendGroupsRealized"] == 0
 
     missing = run(common[:-1] + ["--output=" + obj, "--emit-identity=" + identity,
                                 source], expect_success=False)
