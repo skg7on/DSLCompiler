@@ -180,6 +180,55 @@ frontend records are never labeled upstream TTIR. The old string builder raises
 See the :source:`PF04 verification record <docs/reviews/2026-10-23-pf04-typed-ast.md>`
 for the tested source/diagnostic contract and its capability limits.
 
+Checked native structured import
+--------------------------------
+
+PF05 (`#216 <https://github.com/skg7on/DSLCompiler/issues/216>`__) adds the C++
+``LLKFrontend`` library. ``llk::frontend::parseRequest(StringRef)`` returns an
+owned, immutable ``FrontendRequest`` after LLVM JSON decoding, strict schema-v1
+checks and typed SSA/effect/region validation. Duplicate keys (including escaped
+aliases), fractional integer tokens, signed-64 overflow, non-finite numbers and
+unknown fields fail with ``invalid_frontend_schema``. Requests are bounded to
+16 MiB and 64 JSON nesting levels. Configuration contents must be an explicit
+snapshot; decoding never reads files or executes Python.
+
+``importProgram(request, context)`` proves accesses before constructing MLIR.
+The initial accepted envelope is two read-only inputs and one write-only output
+of the same positive static rank-two compact f32 shape, computing exactly one
+strict add or multiply per output element. Checked affine expressions over
+program ids and two lane axes establish in-bounds reads, matching input/output
+coordinates, all-active masks and exact single-writer coverage. Constant-divisor
+quotient/remainder expressions from PF04 flat offsets are accepted when the
+residue bounds prove their affine form. Grid times BLOCK must equal each tensor
+axis; the third grid/BLOCK axes must be singleton. Tails, flattened lane tiles,
+axis permutations, non-affine indexing, loops, casts, activations and relaxed
+numerical policies fail explicitly in this initial importer.
+
+The resulting ``ImportedProgram`` owns a verified module with registered
+``func``, ``arith``, ``tensor`` and ``linalg`` operations. Its source selection
+uses the existing ``linalg-elementwise-v1`` adapter and its canonical workload
+contract. The entire canonical request remains a module attribute, preserving
+source, launch, ordered metadata and configuration identity. Source BLOCK sizes
+become singleton search domains with source-owned roles ``axis:d0`` and
+``axis:d1``; realization emits the adapter's receipt and cannot retune them.
+
+The explicit public/native port map preserves signature order. Native adapter
+ports are two read inputs, an internal no-read destination (port 2), and the
+write output (port 3). The destination is not a public buffer. PF06/runtime work
+must allocate separate owned scratch for it. The MLIR context must outlive the
+imported module. This API establishes structured import and source realization;
+Python native compilation/invocation remains unavailable.
+
+.. code-block:: sh
+
+   cmake --build build --target LLKFrontendTests
+   build/bin/LLKFrontendTests --gtest_filter='FrontendProgram.*:FrontendImporter.*'
+
+Native tests consume both the literal PF03 request and live PF04 add, multiply
+and nested-loop capture requests generated with Python 3.11+ during the test
+build. No Torch or upstream Triton is needed for these fixtures. See the
+:source:`PF05 verification record <docs/reviews/2026-10-23-pf05-native-import.md>`.
+
 Legacy Triton safety boundary
 -----------------------------
 
