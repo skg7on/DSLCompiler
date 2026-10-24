@@ -21,6 +21,8 @@ import sys
 CASES = [
     ("vector_add_f32", "arm_vector_add_f32", "add", 8, 8),
     ("vector_mul_f32", "arm_vector_mul_f32", "mul", 8, 8),
+    ("vector_add_f32_full", "arm_vector_add_f32_full", "add", 16, 16),
+    ("vector_mul_f32_full", "arm_vector_mul_f32_full", "mul", 16, 16),
 ]
 
 HARNESS = r"""
@@ -177,22 +179,55 @@ void _start(void) {
 """
 
 
-def float_bits(values):
-    return ", ".join("0x%08xu" % struct.unpack("<I", struct.pack("<f", v))[0]
-                     for v in values)
+# The first four elements of both operands in every case: positive zero,
+# negative zero, positive infinity and a quiet NaN. Signed zero and infinity
+# have one exact bit pattern each, so they pin the arithmetic's sign handling;
+# the NaN is compared by classification instead (the harness accepts any NaN).
+SPECIAL = [0x00000000, 0x80000000, 0x7f800000, 0x7fc00000]  # +0, -0, +inf, NaN
+
+# The correctly rounded result of the SPECIAL operands for each operation,
+# written as bits so signed zero is asserted rather than coerced by a Python
+# float round-trip. `-0 + -0` stays negative; `-0 * -0` is positive.
+SPECIAL_EXPECTED = {
+    "add": [0x00000000, 0x80000000, 0x7f800000, 0x7fc00000],
+    "mul": [0x00000000, 0x00000000, 0x7f800000, 0x7fc00000],
+}
+
+
+def bit_patterns(values):
+    return ", ".join("0x%08xu" % value for value in values)
+
+
+def _float_from_bits(value):
+    return struct.unpack("<f", struct.pack("<I", value))[0]
+
+
+def _bits_from_float(value):
+    return struct.unpack("<I", struct.pack("<f", value))[0]
 
 
 def expected_data(name, rows, cols):
+    """Return the case's operand and expected tables as f32 bit patterns.
+
+    The table is bits, not Python floats, so the harness receives exactly the
+    value the case names -- including -0.0 and the NaN payload class -- and the
+    ordinary elements keep the fixture's deterministic pattern. Python's
+    binary64 arithmetic is exact here: two f32 operands add and multiply into
+    values a double represents exactly, so rounding once to f32 is the
+    correctly rounded f32 result.
+    """
     lhs, rhs = [], []
     for i in range(rows * cols):
-        lhs.append(struct.unpack("<f", struct.pack("<I", 0x3f800000 + i * 7))[0])
-        rhs.append(struct.unpack("<f", struct.pack("<I", 0x40000000 + i * 3))[0])
-    if name == "add":
-        values = [struct.unpack("<f", struct.pack("<f", a + b))[0]
-                  for a, b in zip(lhs, rhs)]
-    else:
-        values = [struct.unpack("<f", struct.pack("<f", a * b))[0]
-                  for a, b in zip(lhs, rhs)]
+        if i < len(SPECIAL):
+            lhs.append(SPECIAL[i])
+            rhs.append(SPECIAL[i])
+        else:
+            lhs.append(0x3f800000 + i * 7)
+            rhs.append(0x40000000 + i * 3)
+    values = list(SPECIAL_EXPECTED[name])
+    for a_bits, b_bits in zip(lhs[len(SPECIAL):], rhs[len(SPECIAL):]):
+        a, b = _float_from_bits(a_bits), _float_from_bits(b_bits)
+        values.append(_bits_from_float(a + b if name == "add" else a * b))
     return lhs, rhs, values
 
 
@@ -208,9 +243,9 @@ def render_harness(wrapper, rows, cols, lhs, rhs, expected):
         "WRAPPER": wrapper,
         "ROWS": str(rows),
         "COLS": str(cols),
-        "LHS_DATA": float_bits(lhs),
-        "RHS_DATA": float_bits(rhs),
-        "EXPECTED_DATA": float_bits(expected),
+        "LHS_DATA": bit_patterns(lhs),
+        "RHS_DATA": bit_patterns(rhs),
+        "EXPECTED_DATA": bit_patterns(expected),
     }
     return _PLACEHOLDER.sub(lambda match: values[match.group(0)], HARNESS)
 
@@ -238,6 +273,7 @@ def main():
     cross_gcc = resolve_tool(cross_gcc, "aarch64 cross compiler")
     os.makedirs(work_dir, exist_ok=True)
     failures = []
+    graph_ids = {}
     for fixture, symbol, name, rows, cols in CASES:
         case_dir = os.path.join(work_dir, fixture)
         os.makedirs(case_dir, exist_ok=True)
@@ -275,10 +311,20 @@ def main():
         # reference bridge would make "executed under qemu" a claim about a
         # different lowering than the one this task validates.
         if record.get("referenceGroupsLowered") != 0 or \
-                not record.get("backendGroupsRealized"):
+                record.get("backendGroupsRealized", 0) <= 0:
             failures.append("%s: selected lowering fell back\n%s" %
                             (fixture, record))
             continue
+        if not record.get("planId"):
+            failures.append("%s: identity record has no planId\n%s" %
+                            (fixture, record))
+            continue
+        graph_id = record.get("sourceGraphHash")
+        if not graph_id:
+            failures.append("%s: identity record has no sourceGraphHash\n%s" %
+                            (fixture, record))
+            continue
+        graph_ids[fixture] = graph_id
         expected_wrapper = "_mlir_ciface_" + symbol
         if record.get("wrapperSymbol") != expected_wrapper:
             failures.append("%s: identity names wrapper %r, expected %r" %
@@ -318,6 +364,18 @@ def main():
         if run.returncode != 0:
             failures.append("%s: qemu exit %d\n%s%s" %
                             (fixture, run.returncode, run.stdout, run.stderr))
+    # The 8x8 and 16x16 runs must be distinct bindings, not one artifact
+    # reused. A plan id hashes the plan's *decisions* -- binding, placements,
+    # routes and parameters -- and is deliberately shape-agnostic, so the same
+    # rule on the same layout solves to the same plan id at either width. The
+    # shape lives in the source-graph identity, which must differ; the equality
+    # below would catch a cached or mis-bound full-width run.
+    for tail, full in (("vector_add_f32", "vector_add_f32_full"),
+                       ("vector_mul_f32", "vector_mul_f32_full")):
+        if tail in graph_ids and full in graph_ids and \
+                graph_ids[tail] == graph_ids[full]:
+            failures.append("%s and %s share the source graph %s" %
+                            (tail, full, graph_ids[tail]))
     if failures:
         print("\n".join(failures), file=sys.stderr)
         return 1

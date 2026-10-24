@@ -41,6 +41,8 @@ namespace {
 
 constexpr const char *kVectorAdd =
     "test/Conversion/MicroMapping/Inputs/arm/vector_add_f32.mlir";
+constexpr const char *kVectorMulFull =
+    "test/Conversion/MicroMapping/Inputs/arm/vector_mul_f32_full.mlir";
 constexpr const char *kVectorBf16Add =
     "test/Conversion/MicroMapping/Inputs/arm/vector_add_bf16.mlir";
 constexpr const char *kVectorI8Mul =
@@ -82,6 +84,32 @@ TEST(ArmSVEBackend, SelectedVectorAddVectorizesToScalableSVE) {
   llvm::raw_string_ostream stream(text);
   compiled->module->print(stream);
   EXPECT_NE(text.find("vector<8x[4]xf32>"), std::string::npos) << text;
+}
+
+// A row of an 8x8 f32 tile is half of the modeled 512-bit vector, so the
+// scalable form needs a mask. A 16x16 row is exactly one 512-bit vector: it is
+// the full-width shape the executable subset must also realize, and it lowers
+// to the same `vector<16x[4]xf32>` form without any fallback group.
+TEST(ArmSVEBackend, SelectedFullWidthVectorMulVectorizesToScalableSVE) {
+  auto fixture = arm_test::mapFixture("arm-sve", kVectorMulFull);
+  ASSERT_TRUE(static_cast<bool>(fixture))
+      << llvm::toString(fixture.takeError());
+  mlir::OwningOpRef<mlir::ModuleOp> source =
+      mlir::cast<mlir::ModuleOp>(fixture->source->clone());
+  llk::MappedCompileOptions options;
+  options.entrySymbol = "arm_vector_mul_f32_full";
+  options.backend = llk::MappedBackend::SelectedTarget;
+  options.stop = llk::MappedStop::Lowered;
+  llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
+      *source, *fixture->target, fixture->plan, options);
+  ASSERT_TRUE(static_cast<bool>(compiled))
+      << llvm::toString(compiled.takeError());
+  EXPECT_GT(compiled->backendGroupsRealized, 0u);
+  EXPECT_EQ(compiled->referenceGroupsLowered, 0u);
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  compiled->module->print(stream);
+  EXPECT_NE(text.find("vector<16x[4]xf32>"), std::string::npos) << text;
 }
 
 TEST(ArmSVEBackend, ContractionStillHasNoSelectedLowering) {
