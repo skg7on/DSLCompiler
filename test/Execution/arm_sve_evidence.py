@@ -12,6 +12,7 @@ CTest's `REQUIRED` lookups refuse to configure in that case.
 
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -36,7 +37,7 @@ typedef struct {
   int64_t stride1;
 } MemRef2D;
 
-extern void WRAPPER(MemRef2D *out, MemRef2D *a, MemRef2D *b);
+extern void WRAPPER(MemRef2D *a, MemRef2D *b, MemRef2D *out);
 
 static unsigned char heap[1 << 20] __attribute__((aligned(64)));
 static size_t used;
@@ -141,9 +142,10 @@ void _start(void) {
 
   static float lhs[ROWS * COLS] __attribute__((aligned(64)));
   static float rhs[ROWS * COLS] __attribute__((aligned(64)));
-  /* The mapped ABI borrows results: the caller owns the output buffer and
-     passes it through the descriptor, which the callee reads and writes. The
-     32-word tail is a canary for a write past the ROWS * COLS result. */
+  /* The mapped ABI appends borrowed results after the inputs, so the output
+     descriptor is the *last* argument. The caller owns that buffer and passes
+     it in; the callee reads its fields and writes through aligned + offset.
+     The 32-word tail is a canary for a write past the ROWS * COLS result. */
   static float out[ROWS * COLS + 32] __attribute__((aligned(64)));
   for (int i = 0; i < ROWS * COLS; ++i) {
     lhs[i] = bits(LHS[i]);
@@ -154,7 +156,7 @@ void _start(void) {
   MemRef2D a = {lhs, lhs, 0, ROWS, COLS, COLS, 1};
   MemRef2D b = {rhs, rhs, 0, ROWS, COLS, COLS, 1};
   MemRef2D result = {out, out, 0, ROWS, COLS, COLS, 1};
-  WRAPPER(&result, &a, &b);
+  WRAPPER(&a, &b, &result);
   const float *values = result.aligned + result.offset;
   for (int i = 0; i < ROWS * COLS; ++i) {
     uint32_t got = as_bits(values[i]);
@@ -194,13 +196,23 @@ def expected_data(name, rows, cols):
     return lhs, rhs, values
 
 
+# Substitute every placeholder in one pass: a sequential str.replace chain
+# would rescan each replacement, so a value that happened to contain a later
+# placeholder name would be corrupted.
+_PLACEHOLDER = re.compile(
+    r"\b(?:WRAPPER|ROWS|COLS|LHS_DATA|RHS_DATA|EXPECTED_DATA)\b")
+
+
 def render_harness(wrapper, rows, cols, lhs, rhs, expected):
-    harness = HARNESS.replace("WRAPPER", wrapper)
-    harness = harness.replace("ROWS", str(rows)).replace("COLS", str(cols))
-    harness = harness.replace("LHS_DATA", float_bits(lhs))
-    harness = harness.replace("RHS_DATA", float_bits(rhs))
-    harness = harness.replace("EXPECTED_DATA", float_bits(expected))
-    return harness
+    values = {
+        "WRAPPER": wrapper,
+        "ROWS": str(rows),
+        "COLS": str(cols),
+        "LHS_DATA": float_bits(lhs),
+        "RHS_DATA": float_bits(rhs),
+        "EXPECTED_DATA": float_bits(expected),
+    }
+    return _PLACEHOLDER.sub(lambda match: values[match.group(0)], HARNESS)
 
 
 def resolve_tool(path, description):
@@ -242,7 +254,12 @@ def main():
             "--target-features=+sve", "--output=" + obj,
             "--emit-identity=" + identity, source,
         ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=300)
+        except subprocess.TimeoutExpired:
+            failures.append("%s: object emission timed out" % fixture)
+            continue
         if result.returncode:
             failures.append("%s: object emission failed\n%s" %
                             (fixture, result.stderr))
@@ -274,14 +291,19 @@ def main():
             handle.write(render_harness(expected_wrapper, rows, cols,
                                         lhs, rhs, expected))
         binary = os.path.join(case_dir, "harness")
-        build = subprocess.run(
-            # -fno-stack-protector: a freestanding -nostdlib link has no
-            # __stack_chk_fail or TLS guard, and _start takes the address of
-            # its descriptors, which a hardening default would instrument.
-            [cross_gcc, "-static", "-O2", "-nostdlib", "-ffreestanding",
-             "-fno-builtin", "-fno-stack-protector", "-Wl,-e,_start",
-             harness_path, obj, "-o", binary],
-            capture_output=True, text=True)
+        try:
+            build = subprocess.run(
+                # -fno-stack-protector: a freestanding -nostdlib link has no
+                # __stack_chk_fail or TLS guard, and _start takes the address
+                # of its descriptors, which a hardening default would
+                # instrument.
+                [cross_gcc, "-static", "-O2", "-nostdlib", "-ffreestanding",
+                 "-fno-builtin", "-fno-stack-protector", "-Wl,-e,_start",
+                 harness_path, obj, "-o", binary],
+                capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            failures.append("%s: cross link timed out" % fixture)
+            continue
         if build.returncode:
             failures.append("%s: cross link failed\n%s%s" %
                             (fixture, build.stdout, build.stderr))
