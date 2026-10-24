@@ -261,13 +261,17 @@ selected-target compilation.
 1. **Pre-bufferization (`SMEVectorLoweringPass`)** runs after `micro-to-linalg`.
    It finds the selected `linalg.matmul` (`emitter == "sme_mma_za"`,
    `micro.op == "mma"`), validates the signature, tiles with scalable
-   `[4]x[4]` sizes, vectorizes to `vector.contract`, and lowers the contract to
-   `vector.outerproduct` while preserving the initialized accumulator
-   `vector.transfer_read` and the result `vector.transfer_write`. It rejects a
-   non-f32 dtype, a shape other than 16x16x16, a missing selection, or a
-   conflicting value, without partial rewrites.
+   `[4]x[4]` sizes, and vectorizes to `vector.contract` while preserving the
+   initialized accumulator `vector.transfer_read` and the result
+   `vector.transfer_write`. It rejects a non-f32 dtype, a shape other than
+   16x16x16, a missing selection, or a conflicting value, without partial
+   rewrites.
 2. **Post-bufferization (`SMEArmLoweringPass`)** runs after One-Shot Bufferize
-   and before `convert-linalg-to-loops`. It runs the production sequence:
+   and before `convert-linalg-to-loops`. The reference ArmSME pipeline applies
+   its Vector patterns after bufferization because the unit-dim transfer
+   patterns operate on memrefs, so this pass first applies the permutation-map,
+   unit-dim, contract-to-outerproduct and mask patterns, then the production
+   sequence:
 
    ```text
    arm-sme-vector-legalization
