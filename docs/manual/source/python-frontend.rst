@@ -231,7 +231,7 @@ build. No Torch or upstream Triton is needed for these fixtures. See the
 :source:`PF05 verification record <docs/reviews/2026-10-23-pf05-native-import.md>`.
 
 Shared native compilation and invocation
----------------------------------------
+----------------------------------------
 
 PF06 (`#217 <https://github.com/skg7on/DSLCompiler/issues/217>`__) adds
 ``llk::frontend::compileFrontend(request) -> Expected<FrontendCompilation>``.
