@@ -260,10 +260,14 @@ its ``vector_engine`` is a ``vector``. The dialect accepts the symbol, while tar
 resolution determines whether execution can use it. An unknown spelling can
 remain analysis data; parse success does not prove a valid target placement.
 
-See the shipped :source:`AVX2 profile <machines/x86-avx2-v2.yaml>` and
-:source:`generic accelerator profile <machines/generic-ai-accel-v2.yaml>`. Both use the
-same topology schema and canonical IR. The latter is an architecture exploration
-target rather than an accelerator hardware backend.
+See the shipped :source:`AVX2 profile <machines/x86-avx2-v2.yaml>`,
+:source:`generic accelerator profile <machines/generic-ai-accel-v2.yaml>` and the
+static :source:`Arm SVE <machines/arm-sve-v2.yaml>` and
+:source:`Arm SME <machines/arm-sme-v2.yaml>` profiles. All use the same topology
+schema and canonical IR. The generic accelerator is an architecture exploration
+target rather than an accelerator hardware backend, and the Arm profiles model
+VL=SVL=512 for static mapping and analysis only — they do not establish
+executable SVE/SME or physical ZA behavior.
 
 .. _concepts-layouts-and-movement-are-separate-decisions:
 

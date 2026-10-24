@@ -94,7 +94,7 @@ Driver options
      - Append a K value to the legacy JIT cache key. Does not change the contraction dimension.
    * - ``--mapping-target=<name>``
      - Empty
-     - Use a registered mapping package instead of the legacy/export path. Registered names are ``x86-avx2`` and ``generic-ai-accel``.
+     - Use a registered mapping package instead of the legacy/export path. Registered names are ``x86-avx2``, ``generic-ai-accel``, ``arm-sve`` and ``arm-sme``. The Arm packages are static mapping/analysis targets: they map, verify and analyze, but selected-target compilation is rejected.
    * - ``--mapping-root=<directory>``
      - ``.``
      - Root containing the package's ``machines/`` and ``mapping/`` directories.
@@ -270,8 +270,14 @@ exact LLVM/plan artifacts are recorded in the
    * - ``generic-ai-accel``
      - ``machines/generic-ai-accel-v2.yaml``
      - :source:`layouts.llkmap <mapping/generic-ai-accel/layouts.llkmap>`, :source:`rules.llkmap <mapping/generic-ai-accel/rules.llkmap>`
+   * - ``arm-sve``
+     - ``machines/arm-sve-v2.yaml``
+     - :source:`layouts.llkmap <mapping/arm-sve/layouts.llkmap>`, :source:`rules.llkmap <mapping/arm-sve/rules.llkmap>`
+   * - ``arm-sme``
+     - ``machines/arm-sme-v2.yaml``
+     - :source:`layouts.llkmap <mapping/arm-sme/layouts.llkmap>`, :source:`rules.llkmap <mapping/arm-sme/rules.llkmap>`
 
-The package supplies its emitter keys in code. The compiler does not accept the optimizer's individual ``machine=``, ``layouts=``, ``rules=``, or ``emitters=`` pass options. Use :doc:`llk-opt </tools/optimizer>` when experimenting with policy files. The accelerator's shipped rules cover a smaller operation set; do not assume it can map the tile-level matmul/SwiGLU export or execute accelerator hardware.
+The package supplies its emitter keys in code. The compiler does not accept the optimizer's individual ``machine=``, ``layouts=``, ``rules=``, or ``emitters=`` pass options. Use :doc:`llk-opt </tools/optimizer>` when experimenting with policy files. The accelerator's shipped rules cover a smaller operation set; do not assume it can map the tile-level matmul/SwiGLU export or execute accelerator hardware. The Arm packages are static mapping and analysis targets: they accept direct-MicroIR fixtures, verify and report complete plans at modeled VL=SVL=512, but their emitters refuse lowering and selected-target compilation fails. See the :source:`Arm acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>` for the exact domain.
 
 Mapped compilation uses an executable binding contract by default. It rejects decisions the binder cannot materialize; the driver has no partial-binding toggle. It preserves concrete selected resources and rejects unresolved storage, scheduling or backend decisions. Use the optimizer's report-only mode for analysis without binding.
 

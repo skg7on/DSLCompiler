@@ -214,10 +214,13 @@ Add or extend a target
 
 Start with a topology profile and LLKMap layouts/rules, then implement only the
 target-owned emitter behavior that is required. Use the shipped
-:source:`AVX2 <mapping/x86-avx2>` and :source:`generic accelerator <mapping/generic-ai-accel>`
+:source:`AVX2 <mapping/x86-avx2>`, :source:`generic accelerator <mapping/generic-ai-accel>`
+and static :source:`Arm SVE <mapping/arm-sve>` / :source:`SME <mapping/arm-sme>`
 packages as examples, and consult :source:`formal syntax <docs/design/llkmap-syntax.md>`.
-Owner refinements belong in target data; layout IDs and bundle names remain
-opaque to canonical IR and generic algorithms.
+The Arm packages show typed per-dtype policy with finite layout domains; their
+emitters verify bundles and intentionally refuse lowering. Owner refinements
+belong in target data; layout IDs and bundle names remain opaque to canonical IR
+and generic algorithms.
 
 Register a new package's factory through
 :source:`MappingTargets.cpp <lib/Target/MappingTargets.cpp>` and add its sources and

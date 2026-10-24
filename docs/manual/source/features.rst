@@ -10,11 +10,14 @@ declarative target mapping and performance exploration. The established CPU comp
 available while the newer mapped path is being strengthened. Use this page to
 choose a workflow and understand what a successful run proves.
 
-This summary reflects merged PR #133 (2026-10-11, merge ``5ee61b1``) plus the
-generic framework increments A–D. The revision-pinned
+This summary reflects merged PR #133 (2026-10-11, merge ``5ee61b1``), the
+generic framework increments A–D, and the bounded Arm SVE/SME static mapping
+increment E1–E7. The revision-pinned
 :source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
 records capability-based acceptance, exact test counts and retained limits.
-The :source:`PR #133 acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
+The :source:`Arm static acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`
+records the target-specific evidence and its exact accepted domain. The
+:source:`PR #133 acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
 records the earlier resource/runtime/tuner repairs. The October 7 gap assessment
 is historical.
 
@@ -107,6 +110,10 @@ What you can do today
      - Generic accelerator topology, layouts, rules and mapping through the same canonical IR; static f32 add/mul/sum coverage with operation-aware validation
      - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered; accelerator mul/sum emitters verify only
      - :doc:`Mapping tutorial </tutorials/02-mapping>`
+   * - Map Arm SVE and SME statically
+     - Both target names load a bounded machine profile and typed LLKMap policy, then map direct-MicroIR fixtures: f32/bf16 M=N=K=16 contraction, typed f32/bf16/i8 add and multiply, both bf16↔f32 conversions, f32 SiLU and reduce sum, and the fused convert→SiLU→multiply graph. Selected plans report concrete vector or matrix engine and accumulator identities, verify, replay from the reported plan id and analyze
+     - Static mapping and analysis only, at modeled VL=SVL=512: no executable SVE/SME, physical ZA realization, calibrated timing or automatic retargeting of CPU schedules. Emitters refuse lowering, and selected-target compilation is rejected
+     - :source:`Acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`, :doc:`Optimizer </tools/optimizer>`
 
 The broader goal does not imply arbitrary DNN support today. The LLK-to-Micro
 export and contraction source family remain contraction-shaped, while source
