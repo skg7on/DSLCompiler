@@ -126,7 +126,7 @@ TEST(CodegenRequirements, KeepsInvocationAttributesAsTargetPolicy) {
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=CodegenRequirements.*
+./build/bin/LLKMappingTests --gtest_filter=CodegenRequirements.*
 ```
 
 Expected: compile failure (`streamingVectorLengthBits` and the 5-argument call do not exist).
@@ -184,7 +184,7 @@ In `lib/Mapping/CodegenRequirements.cpp`, add the SVL check after the existing `
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=CodegenRequirements.*
+./build/bin/LLKMappingTests --gtest_filter=CodegenRequirements.*
 ```
 
 Expected: PASS, including every pre-existing `CodegenRequirements` case (the fifth argument defaults to `std::nullopt`).
@@ -368,6 +368,50 @@ In `writeMappedObjectIdentity`, add after the existing group counters:
   for (const std::string &attribute : identity.invocationAttributes)
     invocationAttributes.push_back(attribute);
   record["invocationAttributes"] = std::move(invocationAttributes);
+```
+
+In `runtime/MappedExecutable.cpp`, add the host streaming-length probe next to
+the existing SVE probe and pass it to the host check. Without this wiring the
+new contract field would be inert and every selected SME JIT run would refuse
+with "host streaming vector length is unknown".
+
+In the existing `#if defined(__linux__) && defined(__aarch64__)` block at the
+top of the file, next to `kPrSveGetVl`:
+
+```cpp
+#ifndef HWCAP2_SME
+#define HWCAP2_SME (1UL << 23)
+#endif
+/// prctl() request code for PR_SME_GET_VL.
+constexpr int kPrSmeGetVl = 64;
+```
+
+After `detectHostVectorLengthBits()`:
+
+```cpp
+std::optional<int64_t> detectHostStreamingVectorLengthBits() {
+#if defined(__linux__) && defined(__aarch64__)
+  unsigned long hwcap2 = getauxval(AT_HWCAP2);
+  if (!(hwcap2 & HWCAP2_SME))
+    return std::nullopt;
+  long value = prctl(kPrSmeGetVl, 0, 0, 0, 0);
+  if (value < 0)
+    return std::nullopt;
+  return mlir::llk::mapping::vectorLengthBitsFromPrctl(value);
+#else
+  return std::nullopt;
+#endif
+}
+```
+
+Replace the four-argument host check call with:
+
+```cpp
+    if (llvm::Error error = mlir::llk::mapping::checkHostRequirements(
+            *options.selectedTarget, hostArchitecture, hostFeatures,
+            detectHostVectorLengthBits(),
+            detectHostStreamingVectorLengthBits()))
+      return error;
 ```
 
 Add `#include "LLK/Runtime/MappedObject.h"` to `runtime/MappedExecutable.cpp`
@@ -585,7 +629,7 @@ Add `backend_pipeline_hooks.cpp` to `test/Mapping/CMakeLists.txt` after `arm_sve
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=BackendPipelineHooks.*
+./build/bin/LLKMappingTests --gtest_filter=BackendPipelineHooks.*
 ```
 
 Expected: compile failure (`buildPostBufferizationBackendPipeline` does not exist and is not virtual).
@@ -620,10 +664,19 @@ In `lib/Conversion/MicroMapping/MappedCompilation.cpp`, between the bufferize pa
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='BackendPipelineHooks.*:ArmSVEBackend.*'
+./build/bin/LLKMappingTests --gtest_filter='BackendPipelineHooks.*:ArmSVEBackend.*'
 ```
 
-Expected: PASS. The probe sees memrefs (bufferization ran) and at least one Linalg op (loops have not been rolled yet).
+Expected: PASS. The probe sees memrefs (bufferization ran) and at least one
+Linalg op (loops have not been rolled yet).
+
+The committed test adds a test-only `MarkerLinalgPass` after the inner target's
+pre-bufferization pipeline. The arm-sve pass consumes its own selected
+`linalg.generic` before bufferization, so without a dead marker
+`convert-linalg-to-loops` would have nothing to act on and the hook's position
+relative to it would be unobservable. The marker is dead code, is not part of
+any selected group, and does not affect the realized count; the reviewer should
+confirm it preserves the ordering claim without weakening the test.
 
 - [ ] **Step 5: Commit**
 
@@ -883,7 +936,7 @@ TEST(ArmPlacement, SelectedBundlesVerifyAndOnlyImplementedKeysLower) {
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*'
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*'
 ```
 
 Expected: compile failure (`createSMEEmitter` missing) and the old
@@ -1212,7 +1265,7 @@ void buildSMEPostBufferizationPipeline(mlir::OpPassManager &) {}
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*'
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*'
 ```
 
 Expected: PASS for the emitter and contract tests. The `SelectedBf16ContractionIsRefused` test passes because no target pass realizes a group yet; the f32 end-to-end test arrives in Task 5.
@@ -1286,7 +1339,7 @@ TEST(ArmSMEBackend, SelectedContractionLowersToArmSME) {
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=ArmSMEBackend.SelectedContractionLowersToArmSME
+./build/bin/LLKMappingTests --gtest_filter=ArmSMEBackend.SelectedContractionLowersToArmSME
 ```
 
 Expected: FAIL with `selected-target backend realized no selected compute groups` (both stub pipelines do nothing).
@@ -1635,7 +1688,7 @@ void buildSMEPostBufferizationPipeline(mlir::OpPassManager &pm) {
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*:BackendPipelineHooks.*'
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*:BackendPipelineHooks.*'
 ```
 
 Expected: PASS. `SelectedContractionLowersToArmSME` sees `llvm.aarch64.sme`
@@ -2654,6 +2707,7 @@ git commit -m "test(execution): run the selected SME contraction under qemu (#25
 - Modify: `docs/reviews/2026-10-24-arm-sve-executable-acceptance.md`
 - Modify: `docs/reviews/arm-mapping-targets-acceptance.md`
 - Modify: `docs/manual/source/concepts.rst`
+- Modify: `docs/manual/source/tools/compiler.rst`
 
 **Interfaces:**
 - Consumes: Task 4's emitters, Task 5's compilation results, Task 6/7's evidence records
@@ -2717,7 +2771,7 @@ TEST(ArmSMEBackend, CapabilityReceiptDrawsTheExecutableBoundary) {
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=ArmSMEBackend.CapabilityReceiptDrawsTheExecutableBoundary
+./build/bin/LLKMappingTests --gtest_filter=ArmSMEBackend.CapabilityReceiptDrawsTheExecutableBoundary
 ```
 
 Expected: FAIL. The receipt currently asks only `hasLowering()` on the key,
@@ -2770,7 +2824,7 @@ Add `#include "llvm/ADT/DenseMap.h"` and
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmSVEBackend.*:ArmTargets.*'
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmSVEBackend.*:ArmTargets.*'
 ```
 
 Expected: PASS. The f32 contraction is `Supported` after its selected compile;
@@ -2841,6 +2895,12 @@ with:
   initialized contraction is executable as of E11; every other signature
   remains static and is rejected rather than emulated.
 ```
+
+In `docs/manual/source/tools/compiler.rst`, update the identity-sidecar prose
+(around lines 321-324) so it lists `schemaVersion`,
+`streamingVectorLengthBits` (null for non-SME targets) and
+`invocationAttributes` (the LLVM function attributes applied to the exported
+wrapper), in addition to the existing fields.
 
 - [ ] **Step 6: Write the revision-pinned acceptance ledger**
 
@@ -2923,8 +2983,11 @@ fails the evidence test; it is not skipped.
 - No bf16/i8 SME execution, no SME2, no multi-tile kernels, no ZA preservation
   across calls, no physical SRAM/L2/DMA realization, no calibrated timing.
 - The JIT path refuses selected `arm-sme` on hosts without an SVL probe
-  (`checkHostRequirements` never assumes SVL=512). The AOT object plus the
-  native/QEMU harness is the executable route.
+  (`checkHostRequirements` never assumes SVL=512). The Python frontend's
+  selected-target check uses the no-vector-length overload, so it also refuses
+  `arm-sve` and `arm-sme` even on capable Linux hardware; that is fail-closed
+  and is left to the later frontend integration increment. The AOT object plus
+  the native/QEMU harness is the executable route.
 - The E10 SVE evidence and the AVX2 baseline are unchanged.
 - #175 closes with this ledger: a non-AVX2 selected-target backend has
   reproducible numerical execution evidence, including initialized
