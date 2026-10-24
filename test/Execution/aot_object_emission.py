@@ -53,14 +53,46 @@ def main():
     assert record["entrySymbol"] == "arm_vector_add_f32"
     assert record["wrapperSymbol"] == "_mlir_ciface_arm_vector_add_f32"
     assert record["wrapperSymbol"].encode() in data, "wrapper symbol not exported"
-    # `sve_vector_add` implements a lowering (the selected SVE backend pass), so
-    # this reference-backend run verifies the selected group and carries it
-    # through generic lowering: nothing falls back to the reference bridge and
-    # no selected backend group is realized. The identity must record that
-    # split rather than a blanket "reference-lowered" count.
+    # `sve_vector_add` implements a lowering, so this reference-backend run
+    # verifies the selected group and hands it to the target emitter; no group
+    # falls back to the bridge and the selected backend pass does not run. The
+    # unimplemented dtypes (bf16, i8) are the ones the bridge carries, and they
+    # are covered by the ArmSVEBackend tests.
     assert record["selectedGroupsVerified"] == 1
     assert record["referenceGroupsLowered"] == 0
     assert record["backendGroupsRealized"] == 0
+
+    # The selected backend is the executable subset this target advertises. Its
+    # artifact is prepared through the same ownership stage as the reference
+    # one, which is what catches a masked-vector form that stage cannot hold.
+    selected_obj = os.path.join(work_dir, "arm_vector_add_f32_selected.o")
+    selected_identity = os.path.join(work_dir, "identity_selected.json")
+    selected = [
+        llk_compile,
+        "--mapping-target=arm-sve",
+        "--mapping-root=" + source_dir,
+        "--mapping-backend=selected-target",
+        "--mapping-stop=lowered",
+        "--emit=object",
+        "--target-features=+sve",
+        "--target-triple=aarch64-unknown-linux-gnu",
+        "--output=" + selected_obj,
+        "--emit-identity=" + selected_identity,
+        source,
+    ]
+    run(selected)
+
+    selected_data = open(selected_obj, "rb").read()
+    assert selected_data[:4] == b"\x7fELF", "selected output is not an ELF object"
+    assert struct.unpack_from("<H", selected_data, 18)[0] == 183, \
+        "selected output is not EM_AARCH64"
+    selected_record = json.load(open(selected_identity))
+    assert selected_record["wrapperSymbol"] == "_mlir_ciface_arm_vector_add_f32"
+    assert selected_record["wrapperSymbol"].encode() in selected_data, \
+        "selected wrapper symbol not exported"
+    assert selected_record["selectedGroupsVerified"] == 1
+    assert selected_record["backendGroupsRealized"] == 1
+    assert selected_record["referenceGroupsLowered"] == 0
 
     missing = run(common[:-1] + ["--output=" + obj, "--emit-identity=" + identity,
                                 source], expect_success=False)

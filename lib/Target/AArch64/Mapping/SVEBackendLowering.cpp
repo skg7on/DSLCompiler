@@ -37,18 +37,21 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace mlir::llk::target::sve {
 namespace {
@@ -61,18 +64,177 @@ constexpr int64_t kSVEF32ScalableElements = 4;
 /// The modeled 512-bit profile: 16 f32 lanes = vscale 4 of the quantum.
 constexpr int64_t kModeledF32VectorWidth = 16;
 
+/// The emitter key a selected operation carries, or null when it carries none.
+StringAttr selectedEmitter(Operation *op) {
+  auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+  return mapping ? mapping.getAs<StringAttr>("emitter") : StringAttr();
+}
+
 /// True when `op` carries the selected provenance of one of the two arithmetic
 /// emitters this target lowers. The emitter key is opaque metadata here; the
 /// pass never infers a target decision from the operation's own spelling.
 bool isSelectedSVEGroup(Operation *op) {
-  auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
-  if (!mapping)
-    return false;
-  auto emitter = mapping.getAs<StringAttr>("emitter");
+  StringAttr emitter = selectedEmitter(op);
   if (!emitter)
     return false;
   return emitter.getValue() == "sve_vector_add" ||
          emitter.getValue() == "sve_vector_mul";
+}
+
+/// True when `op` is the signature this target's emitters implement and this
+/// pass can realize: the emitter's own `micro.vector` add/multiply on a static
+/// rank-two f32 tile.
+///
+/// This mirrors `SVEEmitter::hasLoweringFor`. Keeping the two views of the
+/// executable subset identical matters: a group the emitter declines is
+/// counted by the shared layer as reference-lowered, so the pass must not
+/// silently realize it, and a group the emitter accepts must not be skipped
+/// here or the compilation would report success with unlowered selected work.
+bool isExecutableSignature(Operation *op) {
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  if (!linalgOp)
+    return false;
+  StringAttr emitter = selectedEmitter(op);
+  auto name = op->getAttrOfType<StringAttr>("micro.op");
+  if (!emitter || !name)
+    return false;
+  llvm::StringRef expected =
+      emitter.getValue() == "sve_vector_add" ? "add" : "mul";
+  if (name.getValue() != expected)
+    return false;
+  auto output = dyn_cast<ShapedType>(linalgOp->getResult(0).getType());
+  return output && output.getRank() == 2 && output.hasStaticShape() &&
+         output.getElementType().isF32();
+}
+
+/// True when the transfer's leading vector dimension maps to the source's
+/// leading index, which is what lets the row rewrite advance that index.
+bool leadingVectorDimensionIsRow(AffineMap map) {
+  if (!map.isMinorIdentity() || map.getNumResults() != 2)
+    return false;
+  auto row = dyn_cast<AffineDimExpr>(map.getResult(0));
+  return row && row.getPosition() == 0;
+}
+
+/// The rank-two scalable vector type the vectorizer emits for a whole tile, or
+/// null when `type` is not `vector<rows x [k]xT>` with a static row count and a
+/// scalable trailing dimension.
+std::optional<VectorType> rowScalableVector(Type type) {
+  auto vector = dyn_cast<VectorType>(type);
+  if (!vector || vector.getRank() != 2)
+    return std::nullopt;
+  ArrayRef<bool> scalable = vector.getScalableDims();
+  if (scalable[0] || !scalable[1])
+    return std::nullopt;
+  return vector;
+}
+
+/// Rewrites a rank-two masked transfer into one rank-one transfer per row.
+///
+/// The project's AOT LLVM pipeline lowers a rank-two scalable transfer through
+/// VectorToSCF, which stores the rank-two mask vector into an `alloca` before
+/// rank-reducing it. AArch64 cannot select a store of a scalable predicate
+/// vector, so that form does not compile. A rank-one masked transfer lowers
+/// directly to `llvm.masked.load`/`llvm.masked.store`, which the SVE backend
+/// selects as a predicated load/store.
+///
+/// The rank-two vector value is preserved through `vector.extract` and
+/// `vector.insert`, so the selected artifact keeps its whole-tile scalable
+/// arithmetic; only the transfers become per-row.
+LogicalResult lowerRowScalableTransfers(Operation *root, IRRewriter &rewriter) {
+  SmallVector<vector::TransferReadOp> reads;
+  SmallVector<vector::TransferWriteOp> writes;
+  root->walk([&](Operation *op) {
+    if (auto read = dyn_cast<vector::TransferReadOp>(op))
+      reads.push_back(read);
+    else if (auto write = dyn_cast<vector::TransferWriteOp>(op))
+      writes.push_back(write);
+  });
+
+  for (vector::TransferReadOp read : reads) {
+    VectorType vector = cast<VectorType>(read.getVectorType());
+    std::optional<VectorType> rowVector = rowScalableVector(vector);
+    AffineMap map = read.getPermutationMap();
+    if (!rowVector || !leadingVectorDimensionIsRow(map))
+      continue;
+    Location loc = read.getLoc();
+    VectorType rowType =
+        VectorType::get({vector.getShape()[1]}, vector.getElementType(),
+                        /*scalableDims=*/true);
+    AffineMap rowMap =
+        AffineMap::get(map.getNumDims(), map.getNumSymbols(),
+                       {map.getResult(1)}, rewriter.getContext());
+    ArrayAttr inBounds = read.getInBounds();
+    ArrayAttr rowBounds = ArrayAttr::get(rewriter.getContext(), {inBounds[1]});
+    Value mask = read.getMask();
+    SmallVector<Value> indices(read.getIndices().begin(),
+                               read.getIndices().end());
+    rewriter.setInsertionPoint(read);
+    Value result = ub::PoisonOp::create(rewriter, loc, vector);
+    for (int64_t row = 0; row != vector.getShape()[0]; ++row) {
+      Value rowMask;
+      if (mask)
+        rowMask = vector::ExtractOp::create(rewriter, loc, mask, ValueRange{},
+                                            ArrayRef<int64_t>{row});
+      SmallVector<Value> rowIndices(indices);
+      rowIndices[0] = arith::AddIOp::create(
+                          rewriter, loc, indices[0],
+                          arith::ConstantIndexOp::create(rewriter, loc, row))
+                          .getResult();
+      auto rowRead = vector::TransferReadOp::create(
+          rewriter, loc, rowType, read.getBase(), rowIndices, rowMap,
+          read.getPadding(), rowMask, rowBounds);
+      result = vector::InsertOp::create(rewriter, loc, rowRead, result,
+                                        ValueRange{}, ArrayRef<int64_t>{row});
+    }
+    rewriter.replaceOp(read, result);
+  }
+
+  for (vector::TransferWriteOp write : writes) {
+    auto vector = dyn_cast<VectorType>(write.getValueToStore().getType());
+    if (!vector)
+      continue;
+    std::optional<VectorType> rowVector = rowScalableVector(vector);
+    AffineMap map = write.getPermutationMap();
+    if (!rowVector || !leadingVectorDimensionIsRow(map))
+      continue;
+    Location loc = write.getLoc();
+    AffineMap rowMap =
+        AffineMap::get(map.getNumDims(), map.getNumSymbols(),
+                       {map.getResult(1)}, rewriter.getContext());
+    ArrayAttr inBounds = write.getInBounds();
+    ArrayAttr rowBounds = ArrayAttr::get(rewriter.getContext(), {inBounds[1]});
+    Value mask = write.getMask();
+    SmallVector<Value> indices(write.getIndices().begin(),
+                               write.getIndices().end());
+    Type resultType = write.getResult() ? write.getResult().getType() : Type();
+    Value destination = write.getBase();
+    rewriter.setInsertionPoint(write);
+    for (int64_t row = 0; row != vector.getShape()[0]; ++row) {
+      Value rowValue =
+          vector::ExtractOp::create(rewriter, loc, write.getValueToStore(),
+                                    ValueRange{}, ArrayRef<int64_t>{row});
+      Value rowMask;
+      if (mask)
+        rowMask = vector::ExtractOp::create(rewriter, loc, mask, ValueRange{},
+                                            ArrayRef<int64_t>{row});
+      SmallVector<Value> rowIndices(indices);
+      rowIndices[0] = arith::AddIOp::create(
+                          rewriter, loc, indices[0],
+                          arith::ConstantIndexOp::create(rewriter, loc, row))
+                          .getResult();
+      auto rowWrite = vector::TransferWriteOp::create(
+          rewriter, loc, resultType, rowValue, destination, rowIndices, rowMap,
+          rowMask, rowBounds);
+      if (write.getResult())
+        destination = rowWrite.getResult();
+    }
+    if (write.getResult())
+      rewriter.replaceOp(write, destination);
+    else
+      rewriter.eraseOp(write);
+  }
+  return success();
 }
 
 class SVEBackendLoweringPass
@@ -111,18 +273,50 @@ public:
         covered.push_back(linalgOp);
     });
 
-    // No selected SVE group is not this pass's failure to report. A selected
-    // plan that this target cannot lower is accounted for by the shared
-    // compilation contract -- reference groups and a zero realized count are
-    // what it diagnoses -- and failing here would replace that stable message
-    // with a pipeline failure.
+    // An empty or entirely non-executable selected set leaves the realized
+    // count at zero. That is not this pass's failure to report: the shared
+    // compilation contract turns it into "realized no selected compute
+    // groups", which is the diagnostic a caller needs, instead of a generic
+    // pipeline failure.
     IRRewriter rewriter(&getContext());
     for (Operation *op : covered) {
+      // A group the emitters decline (another dtype or shape) is not this
+      // target's selected code; the shared layer already counted it as
+      // reference-lowered, and the compilation contract reports it. Skipping
+      // it here keeps the reference-bridge accounting honest instead of
+      // realizing work the emitter said it does not implement.
+      if (!isExecutableSignature(op))
+        continue;
       if (failed(lowerSelectedGroup(op, rewriter))) {
         signalPassFailure();
         return;
       }
       ++realized_;
+    }
+
+    // Dissolve `vector.mask` into the mask operands of the side-effecting
+    // vector operations. Preparing a mapped kernel for invocation runs
+    // ownership-based buffer deallocation, which inserts an ownership
+    // constant at the start of every region it traverses; a `vector.mask`
+    // region holds exactly one operation, so that insertion fails the
+    // verifier. Masked transfers model the same predication directly and are
+    // the form the downstream bufferization and LLVM lowering consume.
+    if (realized_ > 0) {
+      RewritePatternSet patterns(&getContext());
+      vector::populateVectorMaskLoweringPatternsForSideEffectingOps(patterns);
+      vector::MaskOp::getCanonicalizationPatterns(patterns, &getContext());
+      if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
+        module.emitError(
+            "SVE backend could not lower the masked vector operations");
+        signalPassFailure();
+        return;
+      }
+      if (failed(lowerRowScalableTransfers(module, rewriter))) {
+        module.emitError(
+            "SVE backend could not rank-reduce the scalable transfers");
+        signalPassFailure();
+        return;
+      }
     }
 
     module->setAttr(

@@ -68,6 +68,20 @@ public:
     return key() == "sve_vector_add" || key() == "sve_vector_mul";
   }
 
+  /// The executable subset is not the whole key: `sve_vector_add` and
+  /// `sve_vector_mul` cover f32, bf16 and i8 rules, but this backend only
+  /// implements the rank-two f32 signature. Reporting the key alone would
+  /// make a portable reference compilation call `lower` and fail on every
+  /// other dtype, so the per-group question is answered per group.
+  bool
+  hasLoweringFor(llvm::ArrayRef<mlir::Operation *> coveredOps) const override {
+    if (!hasLowering())
+      return false;
+    if (coveredOps.empty())
+      return true;
+    return !static_cast<bool>(validateGroup(coveredOps));
+  }
+
   llvm::Error lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
                     const mapping::TargetBundle &bundle,
                     const mapping::TargetLoweringContext &context,
@@ -77,6 +91,23 @@ public:
     if (!hasLowering())
       return DeclaredTargetEmitter::lower(coveredOps, bundle, context,
                                           rewriter);
+    // Validate the whole group before the first write. A group this target
+    // cannot honor must leave `coveredOps` untouched rather than partly
+    // marked as handed off.
+    if (llvm::Error error = validateGroup(coveredOps))
+      return error;
+    for (mlir::Operation *op : coveredOps)
+      op->setAttr("llk.sve.selected_handoff",
+                  mlir::UnitAttr::get(rewriter.getContext()));
+    return llvm::Error::success();
+  }
+
+private:
+  /// Checks that `coveredOps` is exactly the signature this key implements: a
+  /// `micro.vector` add/multiply on a rank-two f32 tile. Pure; it is both the
+  /// capability query and `lower`'s pre-write validation.
+  llvm::Error
+  validateGroup(llvm::ArrayRef<mlir::Operation *> coveredOps) const {
     if (coveredOps.empty())
       return sveError("no covered operations to lower");
     llvm::StringRef expected = key() == "sve_vector_add" ? "add" : "mul";
@@ -89,10 +120,12 @@ public:
                         op->getName().getStringRef() + "'");
       auto result =
           mlir::dyn_cast<micro::TileType>(vector.getResult().getType());
-      if (!result || !result.getElementType().isF32())
+      if (!result)
+        return sveError("emitter '" + key() + "' needs a tile result");
+      if (result.getShape().size() != 2)
+        return sveError("emitter '" + key() + "' supports rank-two tiles only");
+      if (!result.getElementType().isF32())
         return sveError("emitter '" + key() + "' supports f32 tiles only");
-      op->setAttr("llk.sve.selected_handoff",
-                  mlir::UnitAttr::get(rewriter.getContext()));
     }
     return llvm::Error::success();
   }

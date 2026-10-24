@@ -92,6 +92,22 @@ public:
   /// not a capability query.
   virtual bool hasLowering() const { return false; }
 
+  /// True when this emitter lowers the particular operation group it covers.
+  ///
+  /// An emitter key can cover several dtype or shape signatures and implement
+  /// only a subset of them, so "the key has a lowering" and "this group has
+  /// one" are different questions. The default preserves every existing
+  /// plugin: a group is lowered exactly when its key is. A target that
+  /// implements a strict subset overrides this, and the shared compilation
+  /// then carries an unimplemented group through the reference bridge and
+  /// counts it there rather than calling `lower` and failing a portable run.
+  /// Like `hasLowering`, this is a capability query and must not rewrite IR.
+  virtual bool
+  hasLoweringFor(llvm::ArrayRef<mlir::Operation *> coveredOps) const {
+    (void)coveredOps;
+    return hasLowering();
+  }
+
   /// Lowers the covered operation group according to `bundle`.
   ///
   /// `coveredOps` are the operations the selected candidate covers, and the
