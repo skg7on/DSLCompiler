@@ -319,6 +319,24 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
           ${CMAKE_CURRENT_BINARY_DIR}/AOTObjectEmission
   )
+  # Framework E10 (#184): run the selected SVE object under qemu and compare
+  # its numbers. This is functional evidence, not a measurement, and it needs
+  # a real aarch64 runner: both lookups are REQUIRED so configuration fails
+  # naming the missing program rather than registering a test that would skip.
+  option(LLK_BUILD_ARM_EVIDENCE
+      "Build and run the cross-object Arm SVE evidence under qemu" OFF)
+  if(LLK_BUILD_ARM_EVIDENCE)
+    find_program(LLK_QEMU_AARCH64
+        NAMES qemu-aarch64 qemu-aarch64-static REQUIRED)
+    find_program(LLK_AARCH64_GCC
+        NAMES aarch64-linux-gnu-gcc REQUIRED)
+    add_test(NAME ArmSVEExecutionEvidence
+        COMMAND ${LLK_TEST_PYTHON} ${CMAKE_SOURCE_DIR}/test/Execution/arm_sve_evidence.py
+            $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}/ArmSVEExecutionEvidence
+            ${LLK_QEMU_AARCH64} ${LLK_AARCH64_GCC}
+    )
+  endif()
   # A target nobody registered is a diagnostic naming the ones that are, not a
   # silent fallback to a different backend.
   add_test(NAME MicroMappingCompileRejectsUnknownTarget
