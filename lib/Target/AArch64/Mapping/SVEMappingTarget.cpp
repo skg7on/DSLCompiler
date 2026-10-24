@@ -43,6 +43,9 @@ public:
   const mapping::RuleRegistry &rules() const override {
     return configuration_->rules();
   }
+  const mapping::LatencyProvider *latencyProvider() const override {
+    return configuration_->latencyProvider();
+  }
   bool isKnownEmitter(llvm::StringRef key) const override {
     return configuration_->isKnownEmitter(key);
   }

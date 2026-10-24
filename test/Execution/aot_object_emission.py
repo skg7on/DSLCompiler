@@ -98,6 +98,39 @@ def main():
                                 source], expect_success=False)
     assert missing.returncode != 0
     assert "--target-triple" in missing.stderr, missing.stderr
+
+    # An invalid stop is a diagnostic even in object mode, where the driver
+    # forces `lowered`. The override applies only to a valid request.
+    bogus = run([
+        llk_compile, "--mapping-target=arm-sve",
+        "--mapping-root=" + source_dir,
+        "--mapping-backend=selected-target",
+        "--mapping-stop=bogus", "--emit=object",
+        "--target-triple=aarch64-unknown-linux-gnu",
+        "--output=" + obj, "--emit-identity=" + identity, source,
+    ], expect_success=False)
+    assert bogus.returncode != 0
+    assert "Unsupported --mapping-stop=bogus" in bogus.stderr, bogus.stderr
+
+    # The AOT flags describe the object contract only. Naming one on another
+    # path is an error naming the offending flag, not an ignored option.
+    for flag, value in (
+            ("--output", os.path.join(work_dir, "ignored.o")),
+            ("--target-triple", "aarch64-unknown-linux-gnu"),
+            ("--target-features", "+sve"),
+            ("--emit-identity", os.path.join(work_dir, "ignored.json"))):
+        misuse = run([llk_compile, "--emit=mlir", flag + "=" + value, source],
+                     expect_success=False)
+        assert misuse.returncode != 0, (flag, misuse.stderr)
+        assert flag in misuse.stderr, (flag, misuse.stderr)
+
+    # The object must not overwrite its own identity record (or the reverse).
+    same_path = run(
+        common + ["--target-triple=aarch64-unknown-linux-gnu",
+                  "--output=" + obj, "--emit-identity=" + obj, source],
+        expect_success=False)
+    assert same_path.returncode != 0
+    assert "--emit-identity" in same_path.stderr, same_path.stderr
     print("aot object emission: ok")
 
 

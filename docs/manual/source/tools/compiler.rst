@@ -18,7 +18,7 @@ Invocation and outputs
    build/bin/llk-compile --help
    mkdir -p build/tutorial
 
-The input filename is required. Textual output goes to stdout and diagnostics go to stderr. Use shell redirection to save an artifact; this driver has no ``-o`` output option. Errors return a nonzero exit status.
+The input filename is required. Textual output goes to stdout and diagnostics go to stderr. Use shell redirection to save a textual artifact. ``--output`` exists only for ``--emit=object``, which writes a binary object rather than printing IR. Errors return a nonzero exit status.
 
 Mapped compilation also writes a ``capabilities:`` JSON receipt to stderr.
 Receipt version 2 validates source, target and plan provenance before crediting
@@ -65,8 +65,12 @@ Without ``--mapping-target``, ``--emit`` chooses the path:
      - No
      - LLK-to-Micro search-space export only
      - Original source functions plus ``micro.search_space``, parameters, constraints, and objectives
+   * - ``object``
+     - No
+     - Mapped compilation to ``--mapping-stop=lowered`` (forced), then AArch64 object emission
+     - ``aot: object=... wrapper=... triple=... stop=lowered``
 
-``--emit=llvm`` does not print LLVM assembly, emit an object file, or save a standalone executable. ``--emit=mlir`` means the fully lowered MLIR module, not an intermediate Linalg or Vector stage. Use :doc:`llk-opt </tools/optimizer>` to inspect those intermediate stages.
+``--emit=llvm`` does not print LLVM assembly, emit an object file, or save a standalone executable; use ``--emit=object`` for an AOT object. ``--emit=mlir`` means the fully lowered MLIR module, not an intermediate Linalg or Vector stage. Use :doc:`llk-opt </tools/optimizer>` to inspect those intermediate stages.
 
 .. _tools-compiler-driver-options:
 
@@ -80,9 +84,21 @@ Driver options
    * - Option
      - Default
      - Meaning
-   * - ``--emit=llvm\|mlir\|micro\|micro-search``
+   * - ``--emit=llvm\|mlir\|micro\|micro-search\|object``
      - ``llvm``
-     - Select the non-mapped path described above.
+     - Select the non-mapped path described above, or AOT object emission with ``object``.
+   * - ``--output=<path>``
+     - Empty
+     - Write the AOT object here. Required by and valid only with ``--emit=object``.
+   * - ``--target-triple=<triple>``
+     - Empty
+     - Target triple for the AOT object, for example ``aarch64-unknown-linux-gnu``. Required by and valid only with ``--emit=object``.
+   * - ``--target-features=<list>``
+     - Empty
+     - Comma-separated LLVM features for the AOT object, for example ``+sve``. Valid only with ``--emit=object``.
+   * - ``--emit-identity=<path>``
+     - Empty
+     - Write the object's JSON identity sidecar here. Required by and valid only with ``--emit=object``, and must differ from ``--output``.
    * - ``--M=<integer>``
      - ``0``
      - Append an M value to the legacy JIT cache key. Does not resize or specialize input IR.
@@ -103,7 +119,7 @@ Driver options
      - Choose the mapping search mode when searching a new plan.
    * - ``--mapping-stop=mapped-micro\|target-lowered\|lowered\|executable``
      - ``executable``
-     - Choose the mapped compilation stopping point.
+     - Choose the mapped compilation stopping point. ``--emit=object`` forces ``lowered``; an invalid value is still rejected.
    * - ``--mapping-entry=<symbol>``
      - Empty
      - Entry symbol to compile, without ``@``. Normally omit it for a module with one kernel.
@@ -116,7 +132,7 @@ Driver options
 
 The ``--M``, ``--N``, and ``--K`` options affect only the legacy JIT cache key. Shapes in the MLIR types drive export and compilation. They do not affect Micro export, mapped search, or mapped compilation. The corresponding shape options on :doc:`llk-tune </tools/tuning>` and :doc:`llk-bench </tools/benchmark>` have different contracts.
 
-When a nonempty ``--mapping-target`` is supplied, the mapping path takes precedence over every **valid** ``--emit`` value. Use ``--mapping-stop`` to select its output. Invalid ``--emit`` values still fail option validation before mapping starts.
+When a nonempty ``--mapping-target`` is supplied, the mapping path takes precedence over ``--emit=llvm``, ``mlir``, ``micro`` and ``micro-search``. Use ``--mapping-stop`` to select its output. ``--emit=object`` is the exception: it selects AOT emission *through* the mapping path, requires ``--mapping-target``, and forces ``--mapping-stop=lowered``. Invalid ``--emit`` and ``--mapping-stop`` values still fail option validation before mapping starts, and the four AOT flags are rejected when ``--emit`` is not ``object``.
 
 .. _tools-compiler-export-a-concrete-kernel-and-a-search-space:
 
@@ -277,9 +293,38 @@ exact LLVM/plan artifacts are recorded in the
      - ``machines/arm-sme-v2.yaml``
      - :source:`layouts.llkmap <mapping/arm-sme/layouts.llkmap>`, :source:`rules.llkmap <mapping/arm-sme/rules.llkmap>`
 
-The package supplies its emitter keys in code. The compiler does not accept the optimizer's individual ``machine=``, ``layouts=``, ``rules=``, or ``emitters=`` pass options. Use :doc:`llk-opt </tools/optimizer>` when experimenting with policy files. The accelerator's shipped rules cover a smaller operation set; do not assume it can map the tile-level matmul/SwiGLU export or execute accelerator hardware. The Arm packages are static mapping and analysis targets: they accept direct-MicroIR fixtures, verify and report complete plans at modeled VL=SVL=512. Their emitters refuse lowering except for the ``arm-sve`` f32 add/multiply subset, which is executable as of E10 through an emulated AArch64 acceptance path (a cross-compiled static object run under ``qemu-aarch64``). Every other ``arm-sve`` signature and all of ``arm-sme`` still fail selected-target compilation. No native SVE code, SME execution, ZA realization or calibrated timing is delivered. See the :source:`Arm acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>` for the exact domain.
+The package supplies its emitter keys in code. The compiler does not accept the optimizer's individual ``machine=``, ``layouts=``, ``rules=``, or ``emitters=`` pass options. Use :doc:`llk-opt </tools/optimizer>` when experimenting with policy files. The accelerator's shipped rules cover a smaller operation set; do not assume it can map the tile-level matmul/SwiGLU export or execute accelerator hardware. The Arm packages are static mapping and analysis targets: they accept direct-MicroIR fixtures, verify and report complete plans at modeled VL=SVL=512. Their emitters refuse lowering except for the ``arm-sve`` f32 add/multiply subset, which is executable as of E10 through an emulated AArch64 acceptance path (a cross-compiled static object run under ``qemu-aarch64``). Every other ``arm-sve`` signature and all of ``arm-sme`` still fail selected-target compilation. No native SVE execution, SME execution, ZA realization or calibrated timing is delivered. See the :source:`Arm acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>` for the exact domain.
 
 Mapped compilation uses an executable binding contract by default. It rejects decisions the binder cannot materialize; the driver has no partial-binding toggle. It preserves concrete selected resources and rejects unresolved storage, scheduling or backend decisions. Use the optimizer's report-only mode for analysis without binding.
+
+.. _tools-compiler-emit-an-aot-object:
+
+Emit an AOT object
+------------------
+
+``--emit=object`` writes a target object instead of running the host JIT. It
+requires ``--mapping-target`` and the three artifact flags, forces
+``--mapping-stop=lowered`` (an object is translated from the lowered module),
+and writes a JSON identity sidecar beside the object:
+
+.. code-block:: sh
+
+   build/bin/llk-compile --mapping-target=arm-sve --mapping-root=. \
+     --mapping-backend=selected-target --mapping-stop=lowered \
+     --emit=object --target-triple=aarch64-unknown-linux-gnu \
+     --target-features=+sve \
+     --output=build/tutorial/vector_add.o \
+     --emit-identity=build/tutorial/vector_add.identity.json \
+     test/Conversion/MicroMapping/Inputs/arm/vector_add_f32.mlir
+
+The status line reports ``stop=lowered``, and the object line reports the
+wrapper symbol, triple and forced stop. The identity record names the compiler
+and LLVM versions, triple, features, entry and wrapper symbols, ABI hash,
+source-graph and plan hashes, machine and target hashes, the selected and
+reference group counts, and the execution identity. ``--output`` and
+``--emit-identity`` must name different paths, and a write failure is an error
+rather than a successful run. The emission path is target-neutral: it consumes
+the mapped compilation those flags select rather than naming a target itself.
 
 .. _tools-compiler-replay-a-saved-selection:
 

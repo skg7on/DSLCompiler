@@ -102,6 +102,11 @@ bool isExecutableSignature(Operation *op) {
       emitter.getValue() == "sve_vector_add" ? "add" : "mul";
   if (name.getValue() != expected)
     return false;
+  // Exactly one result is part of the executable signature: the emitters
+  // implement a single tile result, and indexing result 0 without this check
+  // would assert on a zero-result (memory-out) Linalg form.
+  if (linalgOp->getNumResults() != 1)
+    return false;
   auto output = dyn_cast<ShapedType>(linalgOp->getResult(0).getType());
   return output && output.getRank() == 2 && output.hasStaticShape() &&
          output.getElementType().isF32();
@@ -333,6 +338,13 @@ private:
     if (!linalgOp || !name ||
         (name.getValue() != "add" && name.getValue() != "mul")) {
       op->emitError("SVE backend only lowers add/multiply vector groups");
+      return failure();
+    }
+    // The signature predicate already requires one result, but this function
+    // is the one that indexes it. Refuse with a diagnostic instead of
+    // asserting if a caller reaches it with a zero-result group.
+    if (linalgOp->getNumResults() != 1) {
+      op->emitError("SVE backend needs exactly one result");
       return failure();
     }
     auto output = dyn_cast<ShapedType>(linalgOp->getResult(0).getType());

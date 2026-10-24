@@ -162,6 +162,12 @@ if(LLK_BUILD_E2E_TESTS)
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_required_execution_test.py)
   set_tests_properties(RequiredExecutionEvidenceParser PROPERTIES
       LABELS "mapped-reference")
+  # The SVE artifact checks are pure text/hash predicates, so their regression
+  # test needs neither qemu nor a cross toolchain and runs on every host.
+  add_test(NAME ArmSVEEvidenceParser
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/arm_sve_evidence_test.py)
+  set_tests_properties(ArmSVEEvidenceParser PROPERTIES
+      LABELS "mapped-reference")
   add_test(NAME SelectedExecutionEvidenceValidator
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_selected_execution_evidence.py
           --self-test)

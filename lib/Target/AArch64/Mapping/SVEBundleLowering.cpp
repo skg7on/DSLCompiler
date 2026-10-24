@@ -77,8 +77,10 @@ public:
   hasLoweringFor(llvm::ArrayRef<mlir::Operation *> coveredOps) const override {
     if (!hasLowering())
       return false;
+    // An empty group is not lowerable: `lower({})` rejects it, and this query
+    // must answer the same question as `lower` rather than the opposite.
     if (coveredOps.empty())
-      return true;
+      return false;
     return !static_cast<bool>(validateGroup(coveredOps));
   }
 
@@ -122,8 +124,12 @@ private:
           mlir::dyn_cast<micro::TileType>(vector.getResult().getType());
       if (!result)
         return sveError("emitter '" + key() + "' needs a tile result");
-      if (result.getShape().size() != 2)
-        return sveError("emitter '" + key() + "' supports rank-two tiles only");
+      // The backend pass requires a static rank-two shape; agreeing here keeps
+      // a group the emitter accepts from being skipped as unrealized later.
+      if (result.getShape().size() != 2 ||
+          mlir::ShapedType::isDynamicShape(result.getShape()))
+        return sveError("emitter '" + key() +
+                        "' supports static rank-two tiles only");
       if (!result.getElementType().isF32())
         return sveError("emitter '" + key() + "' supports f32 tiles only");
     }

@@ -142,3 +142,4 @@ jobs:
             build/selected-execution-evidence/*
             build/prediction-validation-evidence/
             build/arm-sve-evidence.log
+            build/test/ArmSVEExecutionEvidence/

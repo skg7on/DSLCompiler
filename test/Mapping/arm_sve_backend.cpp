@@ -25,14 +25,22 @@
 #include "LLK/Conversion/FrameworkCapabilities.h"
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/MappedKernelAbi.h"
+#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Mapping/MappingLowering.h"
 #include "LLK/Target/AArch64/Mapping/SVEMappingTarget.h"
 
 #include "arm_target_fixture.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
 
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -357,6 +365,9 @@ TEST(ArmSVEBackend, EmitterValidatesTheWholeGroupBeforeMutating) {
 
   EXPECT_TRUE(emitter->hasLoweringFor({vector}));
   EXPECT_FALSE(emitter->hasLoweringFor({vector, other}));
+  // The capability query agrees with `lower`, which rejects an empty group: a
+  // query that said "lowerable" would invite a caller to lower nothing.
+  EXPECT_FALSE(emitter->hasLoweringFor({}));
 
   llvm::Error error =
       emitter->lower({vector, other}, bundle, lowering, rewriter);
@@ -368,6 +379,94 @@ TEST(ArmSVEBackend, EmitterValidatesTheWholeGroupBeforeMutating) {
   EXPECT_FALSE(
       static_cast<bool>(emitter->lower({vector}, bundle, lowering, rewriter)));
   EXPECT_TRUE(vector->hasAttr("llk.sve.selected_handoff"));
+}
+
+// The emitter's static-shape requirement is the pass's too: a dynamic
+// rank-two tile must be declined by both, so a mixed module cannot have one
+// group handed off by the emitter and skipped as unrealizable by the pass.
+TEST(ArmSVEBackend, EmitterDeclinesDynamicGroups) {
+  auto fixture = arm_test::mapFixture("arm-sve", kVectorAdd);
+  ASSERT_TRUE(static_cast<bool>(fixture))
+      << llvm::toString(fixture.takeError());
+
+  mlir::MLIRContext context;
+  context.loadDialect<mlir::micro::MicroDialect>();
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+module {
+  micro.kernel @dynamic(%a: tensor<?x8xf32>, %b: tensor<?x8xf32>)
+      -> tensor<?x8xf32> {
+    %ta = micro.tile_view %a
+        {shape = array<i64: -9223372036854775808, 8>}
+        : tensor<?x8xf32> -> !micro.tile<?x8xf32, memory = #micro.memory<sram>>
+    %tb = micro.tile_view %b
+        {shape = array<i64: -9223372036854775808, 8>}
+        : tensor<?x8xf32> -> !micro.tile<?x8xf32, memory = #micro.memory<sram>>
+    %r = micro.vector "add" %ta, %tb
+        : !micro.tile<?x8xf32, memory = #micro.memory<sram>>,
+          !micro.tile<?x8xf32, memory = #micro.memory<sram>>
+        -> !micro.tile<?x8xf32, memory = #micro.memory<sram>>
+    micro.yield %r : !micro.tile<?x8xf32, memory = #micro.memory<sram>>
+  }
+}
+)mlir",
+                                              &context);
+  ASSERT_TRUE(module) << "dynamic-tile fixture did not parse";
+  mlir::Operation *dynamicVector = nullptr;
+  module->walk([&](mlir::Operation *op) {
+    if (!dynamicVector && op->getName().getStringRef() == "micro.vector")
+      dynamicVector = op;
+  });
+  ASSERT_NE(dynamicVector, nullptr);
+
+  auto emitter = fixture->target->createEmitter("sve_vector_add");
+  ASSERT_NE(emitter, nullptr);
+  EXPECT_FALSE(emitter->hasLoweringFor({dynamicVector}))
+      << "the emitter accepted a dynamic tile the backend pass will skip";
+
+  mlir::IRRewriter rewriter(&context);
+  mlir::llk::mapping::TargetLoweringContext lowering{
+      fixture->target->machine(), {}, {}};
+  mlir::llk::mapping::TargetBundle bundle{
+      "sve.vector_add_f32", {}, "sve_vector_add"};
+  EXPECT_TRUE(static_cast<bool>(
+      emitter->lower({dynamicVector}, bundle, lowering, rewriter)));
+}
+
+// A selected group with no SSA result (the memory-out Linalg form) must be
+// declined before any `getResult(0)`. The pass leaves the realized count at
+// zero instead of asserting on the empty result list.
+TEST(ArmSVEBackend, ZeroResultSelectedGroupIsNotRealized) {
+  mlir::MLIRContext context;
+  context
+      .loadDialect<mlir::func::FuncDialect, mlir::linalg::LinalgDialect,
+                   mlir::tensor::TensorDialect, mlir::memref::MemRefDialect>();
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+#map = affine_map<(d0, d1) -> (d0, d1)>
+func.func @zero_result(%in: memref<2x2xf32>, %out: memref<2x2xf32>) {
+  linalg.generic {indexing_maps = [#map, #map],
+                  iterator_types = ["parallel", "parallel"],
+                  micro.op = "add",
+                  micro.mapping = {emitter = "sve_vector_add"}}
+      ins(%in : memref<2x2xf32>) outs(%out : memref<2x2xf32>) {
+  ^bb0(%value: f32, %yielded: f32):
+    linalg.yield %value : f32
+  }
+  return
+}
+)mlir",
+                                              &context);
+  ASSERT_TRUE(module) << "zero-result fixture did not parse";
+
+  mlir::PassManager pm(&context);
+  mlir::llk::target::sve::buildSVESelectedBackendPipeline(pm, 16);
+  EXPECT_TRUE(mlir::succeeded(pm.run(*module)));
+  auto realized = (*module)->getAttrOfType<mlir::IntegerAttr>(
+      "llk.backend_groups_realized");
+  ASSERT_TRUE(realized != nullptr);
+  EXPECT_EQ(realized.getInt(), 0)
+      << "a zero-result selected group was counted as realized";
 }
 
 } // namespace

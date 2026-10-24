@@ -133,6 +133,8 @@ llvm::Expected<std::string> emitMappedObject(PreparedMappedKernel &prepared,
   codegen.run(*llvmModule);
   objectStream.write(objectBytes.data(), objectBytes.size());
   objectStream.flush();
+  // The concrete stream's write error is checked by the caller that owns it:
+  // this function only promises `raw_ostream`, which has no error query.
   return wrapper;
 }
 
@@ -162,6 +164,8 @@ llvm::Error writeMappedObjectIdentity(const MappedObjectIdentity &identity,
   record["executionIdentity"] = identity.executionIdentity;
   jsonStream << llvm::json::Value(std::move(record)) << "\n";
   jsonStream.flush();
+  // As with the object, the owning caller checks its concrete stream's error
+  // state; a `raw_ostream` reference cannot report one.
   return llvm::Error::success();
 }
 

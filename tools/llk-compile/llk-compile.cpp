@@ -92,6 +92,7 @@
 
 #include <string>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #if LLVM_VERSION_MAJOR >= 21
@@ -408,19 +409,23 @@ static int runMappedCompilation(mlir::ModuleOp module,
                                 mlir::MLIRContext &context) {
   mlir::llk::target::registerAllMappingTargets();
 
-  // An AOT object is translated from the lowered module: it is the same
-  // `--mapping-stop=lowered` artifact the JIT path starts from. Asking for
-  // `executable` would hand the module to the JIT and leave nothing to emit,
-  // so the stop is forced and the report says which one actually ran.
-  if (emitMode == "object")
-    mappingStop = "lowered";
-
+  // Validate the caller's stop before object mode overrides it: an invalid
+  // value must be a diagnostic, not silently replaced by the forced stop.
   std::optional<llk::MappedStop> stop = parseStop(mappingStop);
   if (!stop) {
     llvm::errs() << "Unsupported --mapping-stop=" << mappingStop
                  << "; expected mapped-micro, target-lowered, lowered, or "
                     "executable\n";
     return 1;
+  }
+  // An AOT object is translated from the lowered module: it is the same
+  // `--mapping-stop=lowered` artifact the JIT path starts from. Asking for
+  // `executable` would hand the module to the JIT and leave nothing to emit,
+  // so the stop is forced and the report says which one actually ran. Only a
+  // valid caller request reaches here.
+  if (emitMode == "object") {
+    mappingStop = "lowered";
+    stop = llk::MappedStop::Lowered;
   }
   std::optional<llk::MappedBackend> backend = parseBackend(mappingBackend);
   if (!backend) {
@@ -699,6 +704,17 @@ static int runMappedCompilation(mlir::ModuleOp module,
         llk::emitMappedObject(*prepared, objectOptions, objectFile);
     if (!wrapper) {
       llvm::errs() << llvm::toString(wrapper.takeError()) << "\n";
+      if (objectFile.has_error())
+        objectFile.clear_error();
+      return 1;
+    }
+    // A full disk or a closed descriptor must fail the run: printing the
+    // wrapper symbol after a failed write would claim an artifact that is not
+    // there. Clear the flag so the stream's destructor does not abort.
+    if (objectFile.has_error()) {
+      llvm::errs() << "cannot write AOT object '" << emitOutput
+                   << "': " << objectFile.error().message() << "\n";
+      objectFile.clear_error();
       return 1;
     }
     llk::MappedObjectIdentity record;
@@ -726,10 +742,19 @@ static int runMappedCompilation(mlir::ModuleOp module,
     if (llvm::Error writeError =
             llk::writeMappedObjectIdentity(record, identityFile)) {
       llvm::errs() << llvm::toString(std::move(writeError)) << "\n";
+      if (identityFile.has_error())
+        identityFile.clear_error();
+      return 1;
+    }
+    if (identityFile.has_error()) {
+      llvm::errs() << "cannot write AOT identity '" << emitIdentity
+                   << "': " << identityFile.error().message() << "\n";
+      identityFile.clear_error();
       return 1;
     }
     llvm::outs() << "aot: object=" << emitOutput << " wrapper=" << *wrapper
-                 << " triple=" << emitTargetTriple << "\n";
+                 << " triple=" << emitTargetTriple
+                 << " stop=" << mappingStop.getValue() << "\n";
     return 0;
   }
 
@@ -806,6 +831,29 @@ int main(int argc, char **argv) {
     llvm::errs() << "--emit=object requires --output, --target-triple and "
                     "--emit-identity\n";
     return 1;
+  }
+  if (emit == "object" && emitOutput == emitIdentity) {
+    // The object would overwrite its own identity record (or the reverse), so
+    // neither artifact would survive intact.
+    llvm::errs() << "--output and --emit-identity must name different paths\n";
+    return 1;
+  }
+  if (emit != "object") {
+    // These flags describe the AOT object contract only. Ignoring them on
+    // another path would silently drop what the caller asked for, so name the
+    // offending flag instead.
+    const std::pair<const char *, const std::string *> objectOnlyFlags[] = {
+        {"--output", &emitOutput.getValue()},
+        {"--target-triple", &emitTargetTriple.getValue()},
+        {"--target-features", &emitTargetFeatures.getValue()},
+        {"--emit-identity", &emitIdentity.getValue()},
+    };
+    for (const auto &flag : objectOnlyFlags) {
+      if (!flag.second->empty()) {
+        llvm::errs() << flag.first << " applies only to --emit=object\n";
+        return 1;
+      }
+    }
   }
   if (!mappingSourceAdapter.empty() && mappingTargetName.empty()) {
     llvm::errs() << "--source-adapter applies only to the mapped compilation "

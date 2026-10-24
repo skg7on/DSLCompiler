@@ -237,7 +237,7 @@ ninja -C build check-llk
 - The `arm-sve` f32 add/multiply subset is executable as of E10 through an
   emulated AArch64 acceptance path (a cross-compiled static object run under
   `qemu-aarch64`). That path is functional evidence, not a measurement, and it
-  does not widen this static ledger's delivery: no native SVE code, no SME
+  does not widen this static ledger's delivery: no native SVE execution, no SME
   execution, no physical ZA allocation or addressing, no length-agnostic
   semantics, no calibrated timing and no automatic retargeting of CPU schedules
   is delivered or implied. The SVE profile's vector-contraction selection does
@@ -253,5 +253,5 @@ ninja -C build check-llk
   still governs AVX2 execution, and this ledger neither reclassifies reference
   runs nor revises that historical record.
 - Closing this static increment does not close #175. Its executable-backend
-  workstream (E9, #184) must compare fixed-VL execution, length-agnostic
+  workstream (E10, #184) must compare fixed-VL execution, length-agnostic
   semantics and SME stateful lowering, and must publish its own evidence.

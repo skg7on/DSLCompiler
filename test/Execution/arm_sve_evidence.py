@@ -6,15 +6,26 @@ subset computes the fixture's numbers. It is not a measurement, and the harness
 is deliberately libc-free and static so the object under test is the compiler's
 output rather than a runtime's.
 
+Before any object runs, the cross toolchain's `objdump -d` must show scalable
+SVE instructions in it. An artifact with no SVE code is a case failure, not a
+skip: the claim is about SVE code, and running a scalar/NEON object under qemu
+would not establish it even if the numbers matched.
+
 Every object that links is also replayed on two CPUs the harness must refuse --
 one without SVE and one whose vector length is not the modeled 512 bits -- and
 must exit with the harness's distinct rejection codes (70 and 71). That keeps
 the host checks that qualify the executable subset live rather than assumed.
 
-The script fails -- never skips -- when qemu or the cross compiler is missing;
-CTest's `REQUIRED` lookups refuse to configure in that case.
+Each case prints one compact identity record (qemu version, CPU, wrapper, plan
+and source-graph hashes, ABI hash, group counts and artifact digests) so the
+acceptance ledger can cite the exact artifacts instead of a count.
+
+The script fails -- never skips -- when qemu, the cross compiler, or its
+matching objdump is missing; CTest's `REQUIRED` lookups refuse to configure in
+that case.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -30,16 +41,30 @@ CASES = [
     ("vector_mul_f32_full", "arm_vector_mul_f32_full", "mul", 16, 16),
 ]
 
+# The positive run pins the modeled 512-bit vector length: `sve-max-vq=4` caps
+# the length at 4 x 128 = 512 bits, which QEMU also selects as the default.
+POSITIVE_CPU = "max,sve-max-vq=4"
+
 # The harness's own host checks are the executable subset's guardrails: it
 # exits 70 when the CPU does not advertise SVE and 71 when PR_SVE_GET_VL is not
 # the modeled 512 bits. Running every object on emulated CPUs that violate each
 # condition proves those branches are live -- a zero exit would mean the
 # artifact computed numbers on a host the subset is not contracted for.
-# `max,sve-max-vq=8` caps the vector length at 8 x 128 = 1024 bits.
+# The wrong-length control names the length explicitly: QEMU >= 6.2 reads
+# `sve-default-vector-length` in bits, so 128 states the intent without relying
+# on `sve-max-vq` meaning a particular multiple.
 NEGATIVE_CONTROLS = [
     ("no-sve", "max,sve=off", 70),
-    ("wrong-vl", "max,sve-max-vq=8", 71),
+    ("wrong-vl", "max,sve-default-vector-length=128", 71),
 ]
+
+# A scalable register operand and an SVE-only predicate or load/store mnemonic.
+# Both must appear before qemu runs: scalar AArch64 and NEON spell neither, so
+# an object containing only those cannot support an "SVE code" claim.
+SVE_REGISTER = re.compile(r"\bz[0-9]+\.(?:b|h|s|d)\b")
+SVE_MNEMONIC = re.compile(
+    r"\b(?:ld1w|ld1b|ld1h|ld1d|st1w|st1b|st1h|st1d|"
+    r"ptrue|whilelo|whilelt|incw|incd|decw|decd)\b")
 
 HARNESS = r"""
 #include <stdint.h>
@@ -278,6 +303,103 @@ def resolve_tool(path, description):
     return resolved
 
 
+def resolve_objdump(cross_gcc):
+    """Return the objdump that belongs to `cross_gcc`.
+
+    The disassembler has to match the compiler that produced the object: a host
+    `objdump` may not decode SVE at all. Look beside the compiler (and its
+    resolved location) first, then on PATH. A missing disassembler is a
+    failure with its own diagnostic, never a skipped SVE check.
+    """
+    directories = [os.path.dirname(os.path.abspath(cross_gcc)),
+                   os.path.dirname(os.path.realpath(cross_gcc))]
+    for directory in directories:
+        candidate = os.path.join(directory, "aarch64-linux-gnu-objdump")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    resolved = shutil.which("aarch64-linux-gnu-objdump")
+    if not resolved:
+        raise SystemExit(
+            "arm sve evidence: missing aarch64-linux-gnu-objdump beside '%s'"
+            % cross_gcc)
+    return resolved
+
+
+def qemu_version(qemu):
+    """Return qemu's first `--version` line for the evidence record."""
+    try:
+        result = subprocess.run([qemu, "--version"], capture_output=True,
+                                text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise SystemExit("arm sve evidence: '%s --version' timed out" % qemu)
+    if result.returncode:
+        raise SystemExit("arm sve evidence: '%s --version' failed\n%s%s" %
+                         (qemu, result.stdout, result.stderr))
+    lines = result.stdout.strip().splitlines()
+    return lines[0].strip() if lines else "unknown"
+
+
+def has_sve_instructions(disassembly):
+    """True when disassembly text contains scalable SVE instructions.
+
+    A scalable register operand is the unambiguous marker; the SVE-only
+    mnemonic requirement keeps a stray `zN.s` mention (symbol name, comment)
+    from passing. Both are checked case-insensitively because objdump prints
+    instructions in lowercase.
+    """
+    text = disassembly.lower()
+    return bool(SVE_REGISTER.search(text) and SVE_MNEMONIC.search(text))
+
+
+def parse_hex_identity(value):
+    """Parse a hex identity field, returning None when absent or malformed.
+
+    Identity hashes are written with `formatv("{0:x}")`, so `int(value, 16)`
+    accepts both the bare and `0x`-prefixed forms. Callers must additionally
+    reject zero: a zero hash is not a valid plan or source-graph identity, and
+    a truthiness test would accept the string `"0"`.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return int(value, 16)
+    except ValueError:
+        return None
+
+
+def sha256_file(path):
+    """Return the hex sha256 digest of `path` for the evidence record."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_sve_instructions(objdump, obj, fixture, failures):
+    """Disassemble `obj` and record a case failure when it has no SVE code.
+
+    Returns True when the object passes, so the caller can skip qemu rather
+    than spending a run on an artifact that cannot support the claim.
+    """
+    try:
+        result = subprocess.run([objdump, "-d", obj], capture_output=True,
+                                text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        failures.append("%s: disassembly timed out" % fixture)
+        return False
+    if result.returncode:
+        failures.append("%s: disassembly failed\n%s%s" %
+                        (fixture, result.stdout, result.stderr))
+        return False
+    if not has_sve_instructions(result.stdout):
+        failures.append(
+            "%s: object contains no SVE instructions; it is not an SVE "
+            "artifact\n%s" % (fixture, result.stdout))
+        return False
+    return True
+
+
 def run_negative_controls(qemu, binaries, failures):
     """Run every built object on CPUs the harness must reject.
 
@@ -318,6 +440,8 @@ def main():
     llk_compile = resolve_tool(llk_compile, "llk-compile")
     qemu = resolve_tool(qemu, "qemu-aarch64")
     cross_gcc = resolve_tool(cross_gcc, "aarch64 cross compiler")
+    objdump = resolve_objdump(cross_gcc)
+    qemu_first_line = qemu_version(qemu)
     os.makedirs(work_dir, exist_ok=True)
     failures = []
     graph_ids = {}
@@ -363,13 +487,26 @@ def main():
             failures.append("%s: selected lowering fell back\n%s" %
                             (fixture, record))
             continue
-        if not record.get("planId"):
-            failures.append("%s: identity record has no planId\n%s" %
+        # A present but zero hash is not an identity: `int(value, 16)` plus an
+        # explicit nonzero check rejects `"0"`/`"0x0"`, which truthiness alone
+        # would accept.
+        plan_id = parse_hex_identity(record.get("planId"))
+        if plan_id is None:
+            failures.append("%s: identity planId is not a hex hash: %r\n%s" %
+                            (fixture, record.get("planId"), record))
+            continue
+        if plan_id == 0:
+            failures.append("%s: identity planId is zero\n%s" %
                             (fixture, record))
             continue
-        graph_id = record.get("sourceGraphHash")
-        if not graph_id:
-            failures.append("%s: identity record has no sourceGraphHash\n%s" %
+        graph_id = parse_hex_identity(record.get("sourceGraphHash"))
+        if graph_id is None:
+            failures.append(
+                "%s: identity sourceGraphHash is not a hex hash: %r\n%s" %
+                (fixture, record.get("sourceGraphHash"), record))
+            continue
+        if graph_id == 0:
+            failures.append("%s: identity sourceGraphHash is zero\n%s" %
                             (fixture, record))
             continue
         graph_ids[fixture] = graph_id
@@ -384,6 +521,23 @@ def main():
         with open(harness_path, "w", encoding="utf-8") as handle:
             handle.write(render_harness(expected_wrapper, rows, cols,
                                         lhs, rhs, expected))
+        # One compact record per case: the ledger cites these values and the
+        # artifact digests rather than a passing count. It is printed before
+        # the SVE and qemu checks so a later failure still leaves the identity
+        # of the artifact that failed.
+        print(
+            "arm sve evidence: case=%s qemu=\"%s\" cpu=%s wrapper=%s "
+            "plan=%s graph=%s abi=%s selected-groups=%s reference-groups=%s "
+            "object-sha256=%s harness-sha256=%s" % (
+                fixture, qemu_first_line, POSITIVE_CPU, expected_wrapper,
+                record.get("planId"), record.get("sourceGraphHash"),
+                record.get("abiHash"), record.get("selectedGroupsVerified"),
+                record.get("referenceGroupsLowered"), sha256_file(obj),
+                sha256_file(harness_path)))
+        # Prove the artifact is SVE code before spending a run on it. A
+        # non-SVE object is a case failure, not a skipped test.
+        if not check_sve_instructions(objdump, obj, fixture, failures):
+            continue
         binary = os.path.join(case_dir, "harness")
         try:
             build = subprocess.run(
@@ -404,7 +558,7 @@ def main():
             continue
         binaries[fixture] = binary
         try:
-            run = subprocess.run([qemu, "-cpu", "max,sve-max-vq=4", binary],
+            run = subprocess.run([qemu, "-cpu", POSITIVE_CPU, binary],
                                  capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
             # A wedged emulator is a failure, not a skipped test.
