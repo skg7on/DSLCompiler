@@ -100,9 +100,11 @@ public:
       return;
     }
 
-    // Convert through the point where ArmSME tile operations are live, then
-    // require that the selected contraction actually became SME code before
-    // the final LLVM lowering erases the evidence.
+    // Convert through the point where ArmSME tile operations are live. This
+    // pass deliberately stops before SCF-to-CF: the shared ownership
+    // preparation that turns the module into a callable kernel only accepts
+    // structured loops, while ArmSME tile allocation needs the flattened form.
+    // `SMELateLoweringPass` does that conversion after preparation.
     OpPassManager toArmSME(ModuleOp::getOperationName());
     toArmSME.addPass(arm_sme::createVectorLegalizationPass());
     toArmSME.addPass(createCanonicalizerPass());
@@ -115,17 +117,14 @@ public:
     toArmSME.addNestedPass<func::FuncOp>(arm_sme::createEnableArmStreamingPass(
         arm_sme::ArmStreamingMode::Streaming, arm_sme::ArmZaMode::NewZA,
         /*ifRequiredByOps=*/true));
-#if LLVM_VERSION_MAJOR >= 21
-    toArmSME.addPass(createSCFToControlFlowPass());
-#else
-    toArmSME.addPass(createConvertSCFToCFPass());
-#endif
     if (failed(runPipeline(toArmSME, module))) {
       module.emitError("SME ArmSME conversion pipeline failed");
       signalPassFailure();
       return;
     }
 
+    // The late pass erases the high-level tile operations, so the evidence
+    // that the selected contraction became SME code is checked here.
     unsigned armSMEOps = 0;
     module.walk([&](Operation *op) {
       if (op->getName().getStringRef().starts_with("arm_sme."))
@@ -138,19 +137,63 @@ public:
       return;
     }
 
+    module->setAttr("llk.backend_groups_realized",
+                    IntegerAttr::get(IntegerType::get(&getContext(), 64),
+                                     selected.getInt()));
+  }
+};
+
+/// The late half of the selected Arm SME backend.
+///
+/// The shared ABI/ownership preparation runs between the two halves: it clones
+/// the lowered module, makes results borrowed outputs and runs ownership-based
+/// buffer deallocation, which refuses any function with a backedge ("Only
+/// structured control-flow loops are supported"). ArmSME tile allocation, on
+/// the other hand, is only correct after `convert-scf-to-cf` has flattened the
+/// loops. This pass therefore owns the flattening and the ArmSME-to-LLVM
+/// conversion, and runs after preparation has finished with the structured
+/// form.
+class SMELateLoweringPass
+    : public PassWrapper<SMELateLoweringPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SMELateLoweringPass)
+  StringRef getArgument() const final { return "llk-sme-late-lowering"; }
+  StringRef getDescription() const final {
+    return "Flatten selected SME control flow and convert ArmSME to LLVM";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    // As in the post-bufferization pass, the nested pipeline is run from
+    // inside a pass, so every dialect it can create must be declared here or
+    // the operations are created unregistered.
+    registry
+        .insert<affine::AffineDialect, arm_sme::ArmSMEDialect,
+                arith::ArithDialect, cf::ControlFlowDialect, func::FuncDialect,
+                LLVM::LLVMDialect, memref::MemRefDialect, scf::SCFDialect,
+                tensor::TensorDialect, vector::VectorDialect>();
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    auto selected =
+        module->getAttrOfType<IntegerAttr>("llk.sme.selected_groups");
+    if (!selected || selected.getInt() == 0)
+      return; // nothing selected; the shared contract already reported it
+
     OpPassManager toLLVM(ModuleOp::getOperationName());
+#if LLVM_VERSION_MAJOR >= 21
+    toLLVM.addPass(createSCFToControlFlowPass());
+#else
+    toLLVM.addPass(createConvertSCFToCFPass());
+#endif
     toLLVM.addNestedPass<func::FuncOp>(createConvertArmSMEToLLVMPass());
     toLLVM.addPass(createCanonicalizerPass());
     toLLVM.addPass(createCSEPass());
     if (failed(runPipeline(toLLVM, module))) {
-      module.emitError("SME ArmSME-to-LLVM conversion failed");
+      module.emitError("SME late ArmSME conversion pipeline failed");
       signalPassFailure();
       return;
     }
-
-    module->setAttr("llk.backend_groups_realized",
-                    IntegerAttr::get(IntegerType::get(&getContext(), 64),
-                                     selected.getInt()));
   }
 };
 
@@ -158,6 +201,10 @@ public:
 
 void buildSMEPostBufferizationPipeline(mlir::OpPassManager &pm) {
   pm.addPass(std::make_unique<SMEArmLoweringPass>());
+}
+
+void buildSMELateBackendPipeline(mlir::OpPassManager &pm) {
+  pm.addPass(std::make_unique<SMELateLoweringPass>());
 }
 
 } // namespace mlir::llk::target::sme

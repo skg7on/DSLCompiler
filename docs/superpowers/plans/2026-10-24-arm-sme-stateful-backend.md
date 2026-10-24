@@ -1289,17 +1289,43 @@ git commit -m "feat(target): make arm-sme a selective executable target (#253)"
 ## Task 5: Lower the selected contraction through MLIR ArmSME
 
 **Files:**
+- Modify: `include/LLK/Mapping/MappingTarget.h` (target-neutral late hook)
+- Modify: `include/LLK/Target/AArch64/Mapping/SMEMappingTarget.h` (late builder decl)
+- Modify: `lib/Target/AArch64/Mapping/SMEMappingTarget.cpp` (late hook override)
 - Modify: `lib/Target/AArch64/Mapping/SMEVectorLowering.cpp` (replace the stub)
-- Modify: `lib/Target/AArch64/Mapping/SMEArmLowering.cpp` (replace the stub)
+- Modify: `lib/Target/AArch64/Mapping/SMEArmLowering.cpp` (replace the stub; add the late pass)
+- Modify: `include/LLK/Conversion/MappedCompilation.h`,
+  `lib/Conversion/MicroMapping/MappedCompilation.cpp` (`runLateBackendPipeline`
+  and its call on the executable path)
+- Modify: `tools/llk-compile/llk-compile.cpp` (AOT object path)
 - Modify: `test/Mapping/arm_sme_backend.cpp`
 
 **Interfaces:**
-- Consumes: `createSMEEmitter`, the target's two pipeline hooks, and the selected `linalg.matmul` provenance
-- Produces: module attribute `llk.sme.selected_groups` (i64)
-- Produces: `llk.backend_groups_realized` (i64) after the ArmSME conversion
-- Produces: kernel function attributes `llvm.arm_streaming` and `llvm.arm_new_za` at the MLIR level, which translate to `aarch64_pstate_sm_enabled` and `aarch64_new_za` in LLVM IR
+- Consumes: `createSMEEmitter`, the target's three pipeline hooks, and the
+  selected `linalg.matmul` provenance
+- Produces (post-bufferization): module attribute `llk.sme.selected_groups`
+  (i64) and `llk.backend_groups_realized` (i64)
+- Produces (post-bufferization): kernel function attributes
+  `llvm.arm_streaming` and `llvm.arm_new_za` (translated to LLVM IR
+  `aarch64_pstate_sm_enabled` / `aarch64_new_za`)
+- Produces (late): flattened `cf` control flow and the ArmSME dialect's LLVM
+  intrinsic operations (`arm_sme.intr.*`, translated to `llvm.aarch64.sme.*`)
 
-- [ ] **Step 1: Write the failing end-to-end test**
+**Why three stages.** The shared ABI/ownership preparation
+(`prepareMappedKernelForInvocation`) runs ownership-based buffer deallocation,
+which accepts **only structured control flow**. ArmSME tile allocation inside
+`convert-arm-sme-to-llvm` needs **flattened** `cf` control flow. Both cannot run
+in the same pipeline position: flattening in the post-bufferization pass makes
+every ArmSME artifact fail preparation with "Only structured control-flow loops
+are supported." The lowering is therefore split at the ownership boundary:
+
+1. pre-bufferization — select and vectorize the contraction;
+2. post-bufferization (before ownership) — Vector lowering + the ArmSME sequence
+   through `enable-arm-streaming`, stopping with structured SCF;
+3. late (after ownership) — `convert-scf-to-cf`, `convert-arm-sme-to-llvm`,
+   cleanup.
+
+- [ ] **Step 1: Write the failing end-to-end tests**
 
 Append to `test/Mapping/arm_sme_backend.cpp`:
 
@@ -1324,401 +1350,191 @@ TEST(ArmSMEBackend, SelectedContractionLowersToArmSME) {
   std::string text;
   llvm::raw_string_ostream stream(text);
   compiled->module->print(stream);
-  // At MappedStop::Lowered the module is still MLIR: the ArmSME conversion
-  // leaves `arm_sme.intr.*` intrinsics (translated to `llvm.aarch64.sme.*`
-  // only during MLIR-to-LLVM translation), and enable-arm-streaming records
-  // `llvm.arm_streaming`/`llvm.arm_new_za` on the function. The literal
-  // `aarch64_*` LLVM attribute names are checked on the AOT artifact in Tasks
-  // 6-7, where the LLVM IR exists.
-  EXPECT_NE(text.find("arm_sme.intr"), std::string::npos) << text;
+  // The ArmSME conversion consumes the vector contraction and leaves the
+  // dialect's high-level tile operations; the movement copies are already
+  // loops. The SCF flattening and ArmSME-to-LLVM conversion are a late step,
+  // after the shared ownership preparation.
+  EXPECT_NE(text.find("arm_sme.outerproduct"), std::string::npos) << text;
   EXPECT_EQ(text.find("vector.contract"), std::string::npos) << text;
   EXPECT_EQ(text.find("vector.outerproduct"), std::string::npos) << text;
-  // The kernel owns PSTATE.SM and a fresh ZA array.
+  // enable-arm-streaming records MLIR's streaming/ZA attributes; the LLVM
+  // translation names them aarch64_pstate_sm_enabled / aarch64_new_za.
   EXPECT_NE(text.find("llvm.arm_streaming"), std::string::npos) << text;
   EXPECT_NE(text.find("llvm.arm_new_za"), std::string::npos) << text;
 }
+
+TEST(ArmSMEBackend, SelectedContractionLatePipelineFinishesArmSME) {
+  auto fixture = arm_test::mapFixture("arm-sme", kContraction);
+  ASSERT_TRUE(static_cast<bool>(fixture))
+      << llvm::toString(fixture.takeError());
+  mlir::OwningOpRef<mlir::ModuleOp> source =
+      mlir::cast<mlir::ModuleOp>(fixture->source->clone());
+  llk::MappedCompileOptions options;
+  options.entrySymbol = "arm_contraction";
+  options.backend = llk::MappedBackend::SelectedTarget;
+  options.stop = llk::MappedStop::Lowered;
+  llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
+      *source, *fixture->target, fixture->plan, options);
+  ASSERT_TRUE(static_cast<bool>(compiled))
+      << llvm::toString(compiled.takeError());
+  ASSERT_TRUE(static_cast<bool>(compiled->module));
+
+  // In the executable path this runs on the ownership-prepared clone; the
+  // lowered module is the same structured form.
+  ASSERT_FALSE(static_cast<bool>(
+      llk::runLateBackendPipeline(*fixture->target, *compiled->module)));
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  compiled->module->print(stream);
+  EXPECT_NE(text.find("cf.br"), std::string::npos) << text;
+  EXPECT_EQ(text.find("scf.for"), std::string::npos) << text;
+  EXPECT_NE(text.find("arm_sme.intr.mopa"), std::string::npos) << text;
+  EXPECT_EQ(text.find("arm_sme.outerproduct"), std::string::npos) << text;
+}
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
 ninja -C build LLKMappingTests
-./build/bin/LLKMappingTests --gtest_filter=ArmSMEBackend.SelectedContractionLowersToArmSME
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*'
 ```
 
-Expected: FAIL with `selected-target backend realized no selected compute groups` (both stub pipelines do nothing).
+Expected: FAIL with `selected-target backend realized no selected compute
+groups` (both pipeline hooks are still stubs), and the late test fails to run
+the pipeline.
 
 - [ ] **Step 3: Implement the pre-bufferization vector lowering**
 
-Replace `lib/Target/AArch64/Mapping/SMEVectorLowering.cpp` with:
+Replace `lib/Target/AArch64/Mapping/SMEVectorLowering.cpp` with
+`SMEVectorLoweringPass` (`llk-sme-vector-lowering`, module pass):
+
+- selects only `micro.mapping` with `emitter == "sme_mma_za"` **and**
+  `bundle == "sme.mma.f32"` (the bundle is the discriminator: `MicroToLinalg`
+  casts bf16 inputs to the f32 accumulator type, so operand types cannot
+  distinguish the unsupported bf16 selection);
+- requires `micro.op == "mma"` and a static 16x16 f32 `linalg.matmul` result,
+  failing with `SME selected lowering needs a static 16x16x16 f32 contraction`
+  otherwise;
+- tiles with scalable `[vscale*4, vscale*4, 1]` via `scf::tileUsingSCF` and
+  vectorizes with `linalg::vectorize(..., {4,4,1}, {true,true,false},
+  createNamedContraction=true)`;
+- sets `llk.sme.selected_groups` on the module (0 when nothing matched).
+
+`buildSMESelectedBackendPipeline` = pass + canonicalize + CSE.
+
+- [ ] **Step 4: Implement the post-bufferization pass and the late pass**
+
+`SMEArmLoweringPass` (`llk-sme-arm-lowering`, module pass) in
+`lib/Target/AArch64/Mapping/SMEArmLowering.cpp`:
+
+1. reads `llk.sme.selected_groups`; returns when absent or zero;
+2. applies the Vector patterns (`populateVectorTransferPermutationMapLowering`,
+   `populateVectorTransferDropUnitDims`, contract→outerproduct with
+   `disableOuterProductLowering`, mask lowering);
+3. runs, via `runPipeline` on a fresh module pass manager:
+
+   ```text
+   arm-sme-vector-legalization
+   canonicalize, cse
+   convert-arith-to-arm-sme
+   convert-vector-to-arm-sme
+   convert-arm-sme-to-scf
+   convert-vector-to-scf{full-unroll}
+   func.func(enable-arm-streaming{streaming-mode=streaming za-mode=new-za
+                                  if-required-by-ops})
+   ```
+
+   `enable-arm-streaming` is func-scoped and must be added with
+   `addNestedPass<func::FuncOp>`. Every dialect the nested pipeline creates must
+   also be declared by the enclosing pass (`getDependentDialects`), because a
+   pipeline run from inside a pass does not load its passes' dependencies;
+   otherwise ops such as `cf.br` are created unregistered.
+4. counts `arm_sme.*` ops and fails with `selected SME lowering produced no
+   ArmSME tile operations` when none exist (this check must run before the late
+   pass does the intrinsic conversion);
+5. sets `llk.backend_groups_realized`.
+
+`SMELateLoweringPass` (`llk-sme-late-lowering`, module pass, same file):
+
+1. reads `llk.sme.selected_groups`; returns when absent or zero;
+2. runs, via `runPipeline` on a fresh module pass manager:
+
+   ```text
+   convert-scf-to-cf                      # createSCFToControlFlowPass (LLVM >= 21)
+   func.func(convert-arm-sme-to-llvm)
+   canonicalize, cse
+   ```
+
+   `createSCFToControlFlowPass()` (LLVM >= 21) or `createConvertSCFToCFPass()`
+   picks the SCF-to-CF factory behind the existing version guard. Tile
+   allocation happens inside `convert-arm-sme-to-llvm` and requires the
+   flattened form.
+3. declares CF, LLVM, func, scf, vector, memref, arith and arm_sme as dependent
+   dialects.
+
+- [ ] **Step 5: Add the framework hook and call it after ownership preparation**
+
+In `include/LLK/Mapping/MappingTarget.h`:
 
 ```cpp
-//===- SMEVectorLowering.cpp - Selected SME vector lowering --------------===//
-//
-// Part of the LLK Compiler Project, under the Apache License v2.0 with LLVM
-// Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
-
-// The pre-bufferization half of the selected Arm SME backend. It reads only
-// opaque mapping provenance (`micro.mapping` with the selected emitter key),
-// tiles the selected matmul with scalable [4]x[4] sizes (16x16 at SVL 512) and
-// vectorizes it to `vector.contract`. The post-bufferization pass applies the
-// Vector lowering patterns and converts the result to ArmSME: the reference
-// ArmSME pipeline does the same after bufferization because the unit-dim
-// transfer patterns operate on memrefs.
-
-#include "LLK/Target/AArch64/Mapping/SMEMappingTarget.h"
-
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
-#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/UB/IR/UBOps.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/PatternMatch.h"
-#include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/Error.h"
-
-#include <cstdint>
-#include <memory>
-
-namespace mlir::llk::target::sme {
-namespace {
-
-constexpr int64_t kSMEQuantumF32 = 4;      // vscale * 4 lanes
-constexpr int64_t kModeledContraction = 16; // M = N = K at SVL 512
-
-bool isSelectedContraction(Operation *op) {
-  // `MicroToLinalg` casts narrower inputs to the accumulator type, so a bf16
-  // contraction reaches this pass with f32 operands and an f32 result. The
-  // selected bundle name is the surviving provenance that distinguishes it
-  // from the f32 signature the emitter accepted.
-  auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
-  if (!mapping)
-    return false;
-  auto emitter = mapping.getAs<StringAttr>("emitter");
-  auto bundle = mapping.getAs<StringAttr>("bundle");
-  return emitter && emitter.getValue() == "sme_mma_za" && bundle &&
-         bundle.getValue() == "sme.mma.f32";
+/// Runs after the shared ABI and ownership preparation, before code emission.
+/// The shared preparation owns structured control flow (buffer deallocation
+/// rejects backedges); a target whose instruction selection needs a flattened
+/// form changes it here. Default: no-op.
+virtual llvm::Error
+buildLateBackendPipeline(mlir::OpPassManager &) const {
+  return llvm::Error::success();
 }
-
-bool isExecutableSignature(Operation *op) {
-  auto matmul = dyn_cast<linalg::MatmulOp>(op);
-  if (!matmul || matmul->getNumResults() != 1)
-    return false;
-  auto microOp = op->getAttrOfType<StringAttr>("micro.op");
-  if (!microOp || microOp.getValue() != "mma")
-    return false;
-  auto result = dyn_cast<ShapedType>(matmul->getResult(0).getType());
-  return result && result.getRank() == 2 && result.hasStaticShape() &&
-         result.getShape() == ArrayRef<int64_t>{kModeledContraction,
-                                                kModeledContraction} &&
-         result.getElementType().isF32();
-}
-
-class SMEVectorLoweringPass
-    : public PassWrapper<SMEVectorLoweringPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SMEVectorLoweringPass)
-  StringRef getArgument() const final { return "llk-sme-vector-lowering"; }
-  StringRef getDescription() const final {
-    return "Tile and vectorize the selected SME contraction";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect, arith::ArithDialect,
-                    linalg::LinalgDialect, scf::SCFDialect,
-                    tensor::TensorDialect, ub::UBDialect,
-                    vector::VectorDialect>();
-    linalg::registerTilingInterfaceExternalModels(registry);
-  }
-
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-    SmallVector<Operation *> selected;
-    module.walk([&](linalg::LinalgOp op) {
-      if (isSelectedContraction(op))
-        selected.push_back(op);
-    });
-    if (selected.empty()) {
-      module->setAttr("llk.sme.selected_groups",
-                      IntegerAttr::get(IntegerType::get(&getContext(), 64), 0));
-      return;
-    }
-
-    IRRewriter rewriter(&getContext());
-    unsigned realized = 0;
-    for (Operation *op : selected) {
-      if (!isExecutableSignature(op)) {
-        op->emitError(
-            "SME selected lowering needs a static 16x16x16 f32 contraction");
-        signalPassFailure();
-        return;
-      }
-      if (failed(lowerSelectedMatmul(cast<linalg::MatmulOp>(op), rewriter))) {
-        signalPassFailure();
-        return;
-      }
-      ++realized;
-    }
-    module->setAttr("llk.sme.selected_groups",
-                    IntegerAttr::get(IntegerType::get(&getContext(), 64),
-                                     realized));
-  }
-
-private:
-  LogicalResult lowerSelectedMatmul(linalg::MatmulOp matmul,
-                                    IRRewriter &rewriter) {
-    Location loc = matmul.getLoc();
-    scf::SCFTilingOptions tiling;
-    tiling.setTileSizeComputationFunction(
-        [loc](OpBuilder &builder, Operation *) {
-          Value vscale = vector::VectorScaleOp::create(builder, loc,
-                                                       builder.getIndexType());
-          Value quantum = arith::ConstantIndexOp::create(
-              builder, loc, kSMEQuantumF32);
-          Value tile =
-              arith::MulIOp::create(builder, loc, quantum, vscale).getResult();
-          return SmallVector<OpFoldResult>{tile, tile,
-                                           builder.getIndexAttr(1)};
-        });
-    FailureOr<scf::SCFTilingResult> tiled = scf::tileUsingSCF(
-        rewriter, cast<TilingInterface>(matmul.getOperation()), tiling);
-    if (failed(tiled)) {
-      matmul.emitError("SME scalable tiling failed");
-      return failure();
-    }
-    rewriter.replaceOp(matmul, tiled->replacements);
-
-    SmallVector<int64_t> vectorSizes{kSMEQuantumF32, kSMEQuantumF32, 1};
-    SmallVector<bool> scalableVecDims{true, true, false};
-    for (Operation *tiledOp : tiled->tiledOps) {
-      FailureOr<linalg::VectorizationResult> vectorized = linalg::vectorize(
-          rewriter, tiledOp, vectorSizes, scalableVecDims,
-          /*vectorizeNDExtract=*/false, /*flatten1DDepthwiseConv=*/false,
-          /*assumeDynamicDimsMatchVecSizes=*/false,
-          /*createNamedContraction=*/true);
-      if (failed(vectorized)) {
-        tiledOp->emitError("SME contraction vectorization failed");
-        return failure();
-      }
-      rewriter.replaceOp(tiledOp, vectorized->replacements);
-    }
-    return success();
-  }
-};
-
-} // namespace
-
-void buildSMESelectedBackendPipeline(mlir::OpPassManager &pm) {
-  pm.addPass(std::make_unique<SMEVectorLoweringPass>());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
-}
-
-} // namespace mlir::llk::target::sme
 ```
 
-- [ ] **Step 4: Implement the post-bufferization ArmSME conversion**
-
-Replace `lib/Target/AArch64/Mapping/SMEArmLowering.cpp` with:
+In `include/LLK/Conversion/MappedCompilation.h` / `MappedCompilation.cpp`:
 
 ```cpp
-//===- SMEArmLowering.cpp - Selected ArmSME conversion -------------------===//
-//
-// Part of the LLK Compiler Project, under the Apache License v2.0 with LLVM
-// Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
-
-// The post-bufferization half of the selected Arm SME backend. It applies the
-// Vector lowering patterns (permutation maps, unit-dim transfers,
-// contract-to-outerproduct, masks) now that the transfers are memrefs, then
-// runs the production MLIR ArmSME sequence with caller-managed streaming and a
-// new ZA array per call. The sequence deliberately omits
-// `arm-sme-outer-product-fusion`: fusion emits 2-way/4-way widening operations
-// that are outside this SME1 acceptance.
-
-#include "LLK/Target/AArch64/Mapping/SMEMappingTarget.h"
-
-#include "mlir/Conversion/ArithToArmSME/ArithToArmSME.h"
-#include "mlir/Conversion/ArmSMEToLLVM/ArmSMEToLLVM.h"
-#include "mlir/Conversion/ArmSMEToSCF/ArmSMEToSCF.h"
-#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
-#include "mlir/Conversion/VectorToArmSME/VectorToArmSME.h"
-#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
-#include "mlir/Dialect/ArmSME/IR/ArmSMEDialect.h"
-#include "mlir/Dialect/ArmSME/Transforms/Passes.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/PatternMatch.h"
-#include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Transforms/Passes.h"
-
-#include "llvm/Config/llvm-config.h"
-#include "llvm/Support/Error.h"
-
-#include <memory>
-
-namespace mlir::llk::target::sme {
-namespace {
-
-class SMEArmLoweringPass
-    : public PassWrapper<SMEArmLoweringPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SMEArmLoweringPass)
-  StringRef getArgument() const final { return "llk-sme-arm-lowering"; }
-  StringRef getDescription() const final {
-    return "Convert selected SME vector IR to ArmSME and LLVM intrinsics";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arm_sme::ArmSMEDialect, arith::ArithDialect,
-                    func::FuncDialect, memref::MemRefDialect, scf::SCFDialect,
-                    vector::VectorDialect>();
-  }
-
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-    auto selected =
-        module->getAttrOfType<IntegerAttr>("llk.sme.selected_groups");
-    if (!selected || selected.getInt() == 0)
-      return; // nothing was selected; the shared contract reports that
-
-    // The pre-bufferization pass left `vector.contract` and tensor transfers.
-    // Bufferization has made the transfers memrefs, so the reference ArmSME
-    // pattern order applies here.
-    RewritePatternSet patterns(&getContext());
-    vector::populateVectorTransferPermutationMapLoweringPatterns(patterns);
-    vector::populateVectorTransferDropUnitDimsPatterns(patterns);
-    vector::populateVectorContractLoweringPatterns(
-        patterns, vector::VectorContractLowering::OuterProduct,
-        /*benefit=*/1, /*disableOuterProductLowering=*/true);
-    vector::populateVectorMaskLoweringPatternsForSideEffectingOps(patterns);
-    vector::populateVectorMaskOpLoweringPatterns(patterns);
-    if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
-      module.emitError(
-          "SME backend could not lower the vector contraction to outer "
-          "products");
-      signalPassFailure();
-      return;
-    }
-
-    // Convert through the point where ArmSME tile operations are live, then
-    // require that the selected contraction actually became SME code before
-    // the final LLVM lowering erases the evidence.
-    OpPassManager toArmSME(ModuleOp::getOperationName());
-    toArmSME.addPass(arm_sme::createVectorLegalizationPass());
-    toArmSME.addPass(createCanonicalizerPass());
-    toArmSME.addPass(createCSEPass());
-    toArmSME.addPass(createArithToArmSMEConversionPass());
-    toArmSME.addPass(createConvertVectorToArmSMEPass());
-    toArmSME.addPass(createConvertArmSMEToSCFPass());
-    toArmSME.addPass(createConvertVectorToSCFPass(
-        VectorTransferToSCFOptions().enableFullUnroll()));
-    // The pass is func.func-scoped; inside a nested pipeline the module-level
-    // `addPass` form fatal-errors, so nest it explicitly.
-    toArmSME.addNestedPass<func::FuncOp>(
-        arm_sme::createEnableArmStreamingPass(
-            arm_sme::ArmStreamingMode::Streaming, arm_sme::ArmZaMode::NewZA,
-            /*ifRequiredByOps=*/true));
-#if LLVM_VERSION_MAJOR >= 21
-    toArmSME.addPass(createSCFToControlFlowPass());
-#else
-    toArmSME.addPass(createConvertSCFToCFPass());
-#endif
-    if (failed(runPipeline(toArmSME, module))) {
-      module.emitError("SME ArmSME conversion pipeline failed");
-      signalPassFailure();
-      return;
-    }
-
-    unsigned armSMEOps = 0;
-    module.walk([&](Operation *op) {
-      if (op->getName().getStringRef().starts_with("arm_sme."))
-        ++armSMEOps;
-    });
-    if (armSMEOps == 0) {
-      module.emitError(
-          "selected SME lowering produced no ArmSME tile operations");
-      signalPassFailure();
-      return;
-    }
-
-    OpPassManager toLLVM(ModuleOp::getOperationName());
-    toLLVM.addNestedPass<func::FuncOp>(createConvertArmSMEToLLVMPass());
-    toLLVM.addPass(createCanonicalizerPass());
-    toLLVM.addPass(createCSEPass());
-    if (failed(runPipeline(toLLVM, module))) {
-      module.emitError("SME ArmSME-to-LLVM conversion failed");
-      signalPassFailure();
-      return;
-    }
-
-    module->setAttr(
-        "llk.backend_groups_realized",
-        IntegerAttr::get(IntegerType::get(&getContext(), 64),
-                         selected.getInt()));
-  }
-};
-
-} // namespace
-
-void buildSMEPostBufferizationPipeline(mlir::OpPassManager &pm) {
-  pm.addPass(std::make_unique<SMEArmLoweringPass>());
-}
-
-} // namespace mlir::llk::target::sme
+llvm::Error runLateBackendPipeline(const MappingTarget &target,
+                                   mlir::ModuleOp module);
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+It builds a `PassManager`, calls `target.buildLateBackendPipeline(pm)`, skips an
+empty pipeline, runs it and returns an error on failure.
+
+Call it:
+
+- `finishCompilation`: after `prepareMappedKernelForInvocation` succeeds and
+  before `createMappedExecutable`, only for `MappedBackend::SelectedTarget`, on
+  `*prepared->module`;
+- `tools/llk-compile/llk-compile.cpp`, `emitMode == "object"`: after
+  preparation and before `emitMappedObject`, on `*prepared->module`.
+
+`SMETarget` overrides `buildLateBackendPipeline` to add `SMELateLoweringPass`
+through `buildSMELateBackendPipeline`, declared in `SMEMappingTarget.h`.
+
+- [ ] **Step 6: Run the tests to verify they pass**
 
 ```bash
-ninja -C build LLKMappingTests
-./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*:BackendPipelineHooks.*'
+ninja -C build
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*:ArmPlacement.*'
+./build/bin/LLKMappingTests
+ctest --test-dir build
 ```
 
-Expected: PASS. `SelectedContractionLowersToArmSME` sees `arm_sme.intr.*`
-intrinsics, no `vector.contract`/`vector.outerproduct`, and the MLIR-level
-`llvm.arm_streaming`/`llvm.arm_new_za` attributes (which translate to
-`aarch64_pstate_sm_enabled`/`aarch64_new_za`; Tasks 6-7 verify the LLVM/object
-form). The existing `SelectedBf16ContractionIsRefused` test must also
-still pass: the pre-pass identifies the f32 signature by the selected
-`sme.mma.f32` bundle name, because `MicroToLinalg` casts bf16 inputs to the f32
-accumulator type and the operand type alone cannot distinguish them. If the
-pre-bufferization vectorization produces a form `convert-vector-to-arm-sme`
-cannot consume, the pass fails with a diagnostic naming the stage; fix the
-pattern set rather than weakening the acceptance.
+Expected: the two new tests pass, `SelectedBf16ContractionIsRefused` still
+passes, and the full suite shows no new failure. `llk-compile --emit=object`
+then reaches LLVM translation (the ArmSME translation-interface registration and
+the native harness stubs are Task 6).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add lib/Target/AArch64/Mapping/SMEVectorLowering.cpp \
+git add include/LLK/Mapping/MappingTarget.h \
+        include/LLK/Target/AArch64/Mapping/SMEMappingTarget.h \
+        lib/Target/AArch64/Mapping/SMEMappingTarget.cpp \
+        lib/Target/AArch64/Mapping/SMEVectorLowering.cpp \
         lib/Target/AArch64/Mapping/SMEArmLowering.cpp \
+        include/LLK/Conversion/MappedCompilation.h \
+        lib/Conversion/MicroMapping/MappedCompilation.cpp \
+        tools/llk-compile/llk-compile.cpp \
         test/Mapping/arm_sme_backend.cpp
 git commit -m "feat(target): lower the selected SME contraction through ArmSME (#253)"
 ```

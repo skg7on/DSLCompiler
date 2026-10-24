@@ -61,6 +61,10 @@ public:
     buildSMEPostBufferizationPipeline(pm);
     return llvm::Error::success();
   }
+  llvm::Error buildLateBackendPipeline(mlir::OpPassManager &pm) const override {
+    buildSMELateBackendPipeline(pm);
+    return llvm::Error::success();
+  }
   std::unique_ptr<mapping::TargetEmitter>
   createEmitter(llvm::StringRef key) const override {
     if (!configuration_->isKnownEmitter(key))

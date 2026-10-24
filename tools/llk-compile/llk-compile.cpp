@@ -685,6 +685,14 @@ static int runMappedCompilation(mlir::ModuleOp module,
       llvm::errs() << llvm::toString(prepared.takeError()) << "\n";
       return 1;
     }
+    // Ownership preparation requires structured control flow. A target whose
+    // instruction selection needs a flattened form registers it as a late
+    // backend pass, which runs here on the prepared module.
+    if (llvm::Error error =
+            llk::runLateBackendPipeline(**target, *prepared->module)) {
+      llvm::errs() << llvm::toString(std::move(error)) << "\n";
+      return 1;
+    }
     std::vector<std::string> features;
     llvm::SmallVector<llvm::StringRef> split;
     llvm::StringRef(emitTargetFeatures).split(split, ',');

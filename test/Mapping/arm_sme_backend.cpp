@@ -124,11 +124,12 @@ TEST(ArmSMEBackend, SelectedContractionLowersToArmSME) {
   llvm::raw_string_ostream stream(text);
   compiled->module->print(stream);
   // The ArmSME conversion consumes the vector contraction and leaves the
-  // dialect's SME intrinsic operations; the movement copies are already loops.
-  // Those operations become `llvm.aarch64.sme.*` calls only when the module is
-  // translated to LLVM IR, which is the executable step after this artifact,
-  // so the artifact is checked in its own dialect here.
-  EXPECT_NE(text.find("arm_sme.intr.mopa"), std::string::npos) << text;
+  // dialect's high-level tile operations (`arm_sme.outerproduct` carries the
+  // contraction); the movement copies are already loops. `convert-arm-sme-to-llvm`
+  // and the SCF flattening are a late backend step -- they need owned,
+  // structured control flow first -- so the intrinsics appear only after
+  // `runLateBackendPipeline` (see the late test below).
+  EXPECT_NE(text.find("arm_sme.outerproduct"), std::string::npos) << text;
   EXPECT_EQ(text.find("vector.contract"), std::string::npos) << text;
   EXPECT_EQ(text.find("vector.outerproduct"), std::string::npos) << text;
   // The kernel owns PSTATE.SM and a fresh ZA array. `enable-arm-streaming`
@@ -136,6 +137,43 @@ TEST(ArmSMEBackend, SelectedContractionLowersToArmSME) {
   // facts `aarch64_pstate_sm_enabled` and `aarch64_new_za`.
   EXPECT_NE(text.find("llvm.arm_streaming"), std::string::npos) << text;
   EXPECT_NE(text.find("llvm.arm_new_za"), std::string::npos) << text;
+}
+
+// The late backend step is what the executable path runs after shared ownership
+// preparation: it flattens the structured loops (tile allocation needs CF) and
+// converts the ArmSME tile operations to the dialect's LLVM intrinsic
+// operations.
+TEST(ArmSMEBackend, SelectedContractionLatePipelineFinishesArmSME) {
+  auto fixture = arm_test::mapFixture("arm-sme", kContraction);
+  ASSERT_TRUE(static_cast<bool>(fixture))
+      << llvm::toString(fixture.takeError());
+  mlir::OwningOpRef<mlir::ModuleOp> source =
+      mlir::cast<mlir::ModuleOp>(fixture->source->clone());
+  llk::MappedCompileOptions options;
+  options.entrySymbol = "arm_contraction";
+  options.backend = llk::MappedBackend::SelectedTarget;
+  options.stop = llk::MappedStop::Lowered;
+  llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
+      *source, *fixture->target, fixture->plan, options);
+  ASSERT_TRUE(static_cast<bool>(compiled))
+      << llvm::toString(compiled.takeError());
+  ASSERT_TRUE(static_cast<bool>(compiled->module));
+
+  // In the executable path this runs on the ownership-prepared clone; the
+  // lowered module is the same structured form, so running it directly
+  // exercises the same passes.
+  ASSERT_FALSE(static_cast<bool>(
+      llk::runLateBackendPipeline(*fixture->target, *compiled->module)));
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  compiled->module->print(stream);
+  // Tile allocation needed the flattened form, and the contraction is now the
+  // dialect's LLVM MOPA intrinsic operation.
+  EXPECT_NE(text.find("cf.br"), std::string::npos) << text;
+  EXPECT_EQ(text.find("scf.for"), std::string::npos) << text;
+  EXPECT_NE(text.find("arm_sme.intr.mopa"), std::string::npos) << text;
+  EXPECT_EQ(text.find("arm_sme.outerproduct"), std::string::npos) << text;
 }
 
 } // namespace

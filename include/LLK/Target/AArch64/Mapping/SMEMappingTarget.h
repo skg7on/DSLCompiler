@@ -38,6 +38,11 @@ void buildSMESelectedBackendPipeline(mlir::OpPassManager &pm);
 /// Defined in SMEArmLowering.cpp.
 void buildSMEPostBufferizationPipeline(mlir::OpPassManager &pm);
 
+/// Adds the late ArmSME passes: SCF to CF, then ArmSME to LLVM. They run after
+/// the shared ownership preparation, which needs structured loops, because tile
+/// allocation needs flattened control flow. Defined in SMEArmLowering.cpp.
+void buildSMELateBackendPipeline(mlir::OpPassManager &pm);
+
 /// Loads machines/arm-sme-v2.yaml and mapping/arm-sme/{layouts,rules}.llkmap
 /// below configurationRoot. Returns the target with the f32 contraction
 /// executable subset and the AArch64/SME streaming contract.

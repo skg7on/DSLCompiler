@@ -253,9 +253,9 @@ before any mutation and never half-rewrites. It does not rely on a
 target-specific handoff attribute surviving `MicroToLinalg`; the target passes
 key off `micro.mapping` as the SVE backend does.
 
-### 6.2 Two-stage lowering
+### 6.2 Three-stage lowering
 
-Both stages are owned by the `arm-sme` target package and run only for a
+All three stages are owned by the `arm-sme` target package and run only for a
 selected-target compilation.
 
 1. **Pre-bufferization (`SMEVectorLoweringPass`)** runs after `micro-to-linalg`.
@@ -274,7 +274,7 @@ selected-target compilation.
    its Vector patterns after bufferization because the unit-dim transfer
    patterns operate on memrefs, so this pass first applies the permutation-map,
    unit-dim, contract-to-outerproduct and mask patterns, then the production
-   sequence:
+   sequence up to streaming enablement:
 
    ```text
    arm-sme-vector-legalization
@@ -283,20 +283,38 @@ selected-target compilation.
    convert-arm-sme-to-scf
    convert-vector-to-scf
    enable-arm-streaming{streaming-mode=streaming za-mode=new-za if-required-by-ops}
+   ```
+
+   It does **not** run `arm-sme-outer-product-fusion`: fusion creates
+   2-way/4-way widening operations that are not part of the SME1 acceptance
+   surface. It stops before `convert-scf-to-cf`. The module still carries
+   `arm_sme.outerproduct`/tile operations, so the required evidence is checked
+   here, before the late stage erases it: on success it sets
+   `llk.backend_groups_realized`, and if the selected contraction did not become
+   an SME tile computation it emits a diagnostic and leaves the group
+   unrealized. The result is still structured SCF.
+3. **Late (`SMELateLoweringPass`)** runs *after* the shared ABI/ownership
+   preparation (`prepareMappedKernelForInvocation`) and before code emission:
+
+   ```text
    convert-scf-to-cf
    convert-arm-sme-to-llvm
    canonicalize, cse
    ```
 
-   It does **not** run `arm-sme-outer-product-fusion`: fusion creates
-   2-way/4-way widening operations that are not part of the SME1 acceptance
-   surface. Tile allocation is performed inside `convert-arm-sme-to-llvm`.
-   On success it increments/sets `llk.backend_groups_realized`; if the selected
-   contraction did not become an SME tile computation it emits a diagnostic and
-   leaves the group unrealized.
+   Tile allocation, performed inside `convert-arm-sme-to-llvm`, needs the
+   flattened control flow this stage produces. Ownership-based buffer
+   deallocation, which preparation runs, accepts only structured loops and
+   refuses any function with a backedge. Running the flattening in stage 2 made
+   every ArmSME artifact uncompilable ("Only structured control-flow loops are
+   supported"); splitting it keeps the shared ownership contract and the
+   target-owned control-flow change apart. Stage 3 leaves the ArmSME dialect's
+   LLVM intrinsic operations (`arm_sme.intr.*`), which the runtime's LLVM
+   translation converts to `llvm.aarch64.sme.*` calls.
 
 The runtime LLVM stage (`addKernelToLLVMPasses`) is unchanged and target-neutral.
-It sees LLVM dialect intrinsics after `convert-arm-sme-to-llvm`.
+It sees ArmSME intrinsic operations after `convert-arm-sme-to-llvm`; the runtime
+registers the ArmSME translation interface (Task 6).
 
 ### 6.3 Framework hooks
 
@@ -309,6 +327,20 @@ It sees LLVM dialect intrinsics after `convert-arm-sme-to-llvm`.
 
   It is invoked after One-Shot Bufferize and before `convert-linalg-to-loops`.
   The existing pre-bufferization hook and all other targets are unchanged.
+- A third target-neutral hook covers passes that must follow the shared
+  ownership preparation:
+
+  ```cpp
+  virtual llvm::Error MappingTarget::buildLateBackendPipeline(
+      mlir::OpPassManager &pm) const;  // default: no-op
+  ```
+
+  `llk::runLateBackendPipeline(target, module)` builds and runs it. The shared
+  `finishCompilation` calls it for a selected-target executable after
+  `prepareMappedKernelForInvocation` and before `createMappedExecutable`, and
+  `llk-compile --emit=object` calls it before `emitMappedObject`. The split is
+  the ownership/control-flow contract: preparation owns structured loops, the
+  target owns any later flattening. It is inert for every other target.
 - No generic mapping, machine or perf code branches on `sme` or `arm-sme`.
 
 ### 6.4 Codegen contract and invocation attributes
@@ -469,11 +501,13 @@ The implementation plan is written separately and owns exact files, tests and
 order. Its required shape, test-first per task:
 
 1. Framework: `streamingVectorLengthBits`, `invocationAttributes`, their generic
-   application and identity recording, and the post-bufferization target hook.
+   application and identity recording, the post-bufferization target hook, and
+   the late backend hook that runs after ownership preparation.
 2. `arm-sme` package: target wrapper, codegen contract, `SMEEmitter` for
    `sme_mma_za`, and the static-only tests narrowed to the unimplemented subset.
-3. SME lowering: `SMEVectorLoweringPass` and `SMEArmLoweringPass`, including
-   initialized-accumulator handling, rejections and group accounting.
+3. SME lowering: `SMEVectorLoweringPass`, `SMEArmLoweringPass` and
+   `SMELateLoweringPass`, including initialized-accumulator handling,
+   rejections, group accounting and the ownership/control-flow split.
 4. Native evidence: Mach-O AOT, wrapper attributes, assembly shim, macOS
    harness and driver, disassembly gate, negative controls, ledger identity.
 5. QEMU evidence: linux object, freestanding harness with ABI stubs, CI job,
