@@ -311,6 +311,14 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:micro-perf> ${CMAKE_SOURCE_DIR}
           ${CMAKE_CURRENT_BINARY_DIR}/ArmTargetPipeline
   )
+  # Framework E10 (#184): the AOT object contract is target-neutral. A
+  # reference-lowered kernel cross-emits to an AArch64 ELF object, and the
+  # sidecar records the identity the harness will check the artifact against.
+  add_test(NAME AOTObjectEmission
+      COMMAND ${LLK_TEST_PYTHON} ${CMAKE_SOURCE_DIR}/test/Execution/aot_object_emission.py
+          $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/AOTObjectEmission
+  )
   # A target nobody registered is a diagnostic naming the ones that are, not a
   # silent fallback to a different backend.
   add_test(NAME MicroMappingCompileRejectsUnknownTarget

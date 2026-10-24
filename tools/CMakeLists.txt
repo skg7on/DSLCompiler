@@ -36,6 +36,7 @@ target_link_libraries(llk-compile PRIVATE LLKBuildOptions
     LLKScheduleSelection
     LLKToMicro
     LLKMappedCompilation
+    LLKMappedKernelAbi
     LLKTargetMapping
     LLKMapping
     LLKRuntime
