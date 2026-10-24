@@ -48,7 +48,7 @@ public:
   }
   std::optional<mapping::TargetCodegenRequirements>
   codegenRequirements() const override {
-    return mapping::TargetCodegenRequirements{"aarch64", "", {"sve"}};
+    return mapping::TargetCodegenRequirements{"aarch64", "", {"sve"}, 512};
   }
   llvm::Error
   buildSelectedBackendPipeline(mlir::OpPassManager &pm) const override {

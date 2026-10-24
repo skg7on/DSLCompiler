@@ -1,6 +1,7 @@
 add_llk_test_category(Mapping
     SOURCES
         stable_hash.cpp
+        codegen_requirements.cpp
         cost_model.cpp
         search_binding.cpp
         workload_graph.cpp

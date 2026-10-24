@@ -260,6 +260,9 @@ TEST(ArmTargets, SveExecutableSubsetIsExplicit) {
   auto requirements = (*target)->codegenRequirements();
   ASSERT_TRUE(requirements.has_value());
   EXPECT_EQ(requirements->architecture, "aarch64");
+  // The executable subset assumes the modeled 512-bit length, so the host
+  // check must compare the real length rather than only "SVE present".
+  EXPECT_EQ(requirements->vectorLengthBits, 512);
   mlir::OpPassManager pipeline;
   EXPECT_FALSE(
       static_cast<bool>((*target)->buildSelectedBackendPipeline(pipeline)));

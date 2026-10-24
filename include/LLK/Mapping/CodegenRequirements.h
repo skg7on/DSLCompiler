@@ -14,6 +14,8 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,12 +24,25 @@ struct TargetCodegenRequirements {
   std::string architecture;
   std::string cpu;
   std::vector<std::string> requiredFeatures;
+  /// Exact implemented vector length in bits, when the target's code assumes
+  /// one. Nullopt means the target makes no vector-length claim.
+  std::optional<int64_t> vectorLengthBits = std::nullopt;
 };
 
 /// Check a selected target's ISA policy against the detected host facts.
 llvm::Error checkHostRequirements(const TargetCodegenRequirements &requirements,
                                   llvm::StringRef hostArchitecture,
-                                  const llvm::StringMap<bool> &hostFeatures);
+                                  const llvm::StringMap<bool> &hostFeatures,
+                                  std::optional<int64_t> hostVectorLengthBits);
+
+/// Check requirements when the caller has no host vector-length information.
+inline llvm::Error
+checkHostRequirements(const TargetCodegenRequirements &requirements,
+                      llvm::StringRef hostArchitecture,
+                      const llvm::StringMap<bool> &hostFeatures) {
+  return checkHostRequirements(requirements, hostArchitecture, hostFeatures,
+                               std::nullopt);
+}
 
 } // namespace mlir::llk::mapping
 #endif
