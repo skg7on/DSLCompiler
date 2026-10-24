@@ -17,6 +17,9 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/TargetParser/Host.h"
 #include <array>
+#include <bit>
+#include <cmath>
+#include <limits>
 
 #if LLK_FRONTEND_ENABLE_EXECUTION
 using namespace frontend_test;
@@ -85,22 +88,43 @@ struct Buffer {
 };
 void execute(FrontendCompilation &compilation, bool multiply) {
   Buffer a, b, out;
-  constexpr float expectedAdd[] = {6, 8, 10, 12};
-  constexpr float expectedMul[] = {5, 12, 21, 32};
+  constexpr float expectedAdd[] = {
+      258, 261, 264, 267, 270, 273, 276, 279, 282, 285, 288, 291, 294, 297, 300,
+      303, 306, 309, 312, 315, 318, 321, 324, 327, 330, 333, 336, 339, 342, 345,
+      348, 351, 354, 357, 360, 363, 366, 369, 372, 375, 378, 381, 384, 387, 390,
+      393, 396, 399, 402, 405, 408, 411, 414, 417, 420, 423, 426, 429, 432, 435,
+      438, 441, 444, 447, 450, 453, 456, 459, 462, 465, 468, 471, 474, 477, 480,
+      483, 486, 489, 492, 495, 498, 501, 504, 507, 510, 513, 516, 519, 522, 525,
+      528, 531, 534, 537, 540, 543, 546, 549, 552, 555, 558, 561, 564, 567, 570,
+      573, 576, 579, 582, 585, 588, 591, 594, 597, 600, 603, 606, 609, 612, 615,
+      618, 621, 624, 627, 630, 633, 636, 639};
+  constexpr float expectedMul[] = {
+      257,   518,   783,   1052,  1325,  1602,  1883,  2168,  2457,  2750,
+      3047,  3348,  3653,  3962,  4275,  4592,  4913,  5238,  5567,  5900,
+      6237,  6578,  6923,  7272,  7625,  7982,  8343,  8708,  9077,  9450,
+      9827,  10208, 10593, 10982, 11375, 11772, 12173, 12578, 12987, 13400,
+      13817, 14238, 14663, 15092, 15525, 15962, 16403, 16848, 17297, 17750,
+      18207, 18668, 19133, 19602, 20075, 20552, 21033, 21518, 22007, 22500,
+      22997, 23498, 24003, 24512, 25025, 25542, 26063, 26588, 27117, 27650,
+      28187, 28728, 29273, 29822, 30375, 30932, 31493, 32058, 32627, 33200,
+      33777, 34358, 34943, 35532, 36125, 36722, 37323, 37928, 38537, 39150,
+      39767, 40388, 41013, 41642, 42275, 42912, 43553, 44198, 44847, 45500,
+      46157, 46818, 47483, 48152, 48825, 49502, 50183, 50868, 51557, 52250,
+      52947, 53648, 54353, 55062, 55775, 56492, 57213, 57938, 58667, 59400,
+      60137, 60878, 61623, 62372, 63125, 63882, 64643, 65408};
   for (size_t i = 0; i != 128; ++i) {
-    a.storage[i + 1] = float(i % 4 + 1);
-    b.storage[i + 1] = float(i % 4 + 5);
+    a.storage[i + 1] = float(i + 1);
+    b.storage[i + 1] = float(257 + 2 * i);
   }
   auto error = compilation.invoke({a.checked(), b.checked()}, {out.checked()});
   ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
   for (size_t i = 0; i != 128; ++i)
-    EXPECT_EQ(out.storage[i + 1],
-              multiply ? expectedMul[i % 4] : expectedAdd[i % 4]);
+    EXPECT_EQ(out.storage[i + 1], multiply ? expectedMul[i] : expectedAdd[i]);
   EXPECT_EQ(out.storage.front(), -777);
   EXPECT_EQ(out.storage.back(), -777);
   for (size_t i = 0; i != 128; ++i) {
-    EXPECT_EQ(a.storage[i + 1], float(i % 4 + 1));
-    EXPECT_EQ(b.storage[i + 1], float(i % 4 + 5));
+    EXPECT_EQ(a.storage[i + 1], float(i + 1));
+    EXPECT_EQ(b.storage[i + 1], float(257 + 2 * i));
   }
 }
 } // namespace
@@ -263,6 +287,63 @@ TEST(FrontendCompiler, PublicOutputFirstPreservesCheckedPortOrder) {
   EXPECT_EQ((*portsMap)[0].getAsObject()->getInteger("native"), 3);
   EXPECT_EQ((*portsMap)[1].getAsObject()->getInteger("native"), 0);
   EXPECT_EQ((*portsMap)[2].getAsObject()->getInteger("native"), 1);
+}
+
+TEST(FrontendCompiler, StrictF32SignedZerosNonfinitePrecisionAndSubnormals) {
+  constexpr float inf = std::numeric_limits<float>::infinity();
+  constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+  const std::array<float, 8> lhs = {-0.f, 0.f, inf,           -inf,
+                                    inf,  nan, 1.0009765625f, 0x1p-149f};
+  const std::array<float, 8> rhs = {-0.f, -1.f, 2.f,         2.f,
+                                    -inf, 1.f,  2.00390625f, 0x1p-149f};
+  // Independently specified IEEE-f32 outcomes. NaN payload/sign is unspecified;
+  // finite values (including both zero signs and subnormals) compare by bits.
+  const std::array<float, 8> expectedAdd = {
+      -0.f, -1.f, inf, -inf, nan, nan, 3.0048828125f, 0x1p-148f};
+  const std::array<float, 8> expectedMul = {
+      0.f, -0.f, inf, -inf, -inf, nan, 2.005863189697265625f, 0.f};
+  const auto features = llvm::sys::getHostCPUFeatures();
+  const bool selectedAvailable =
+      llvm::sys::getDefaultTargetTriple().starts_with("x86_64-") &&
+      features.lookup("avx2");
+  for (auto backend : {"reference", "selected-target"})
+    for (bool tiled : {false, true})
+      for (bool multiply : {false, true}) {
+        auto value = compileData(multiply, tiled);
+        (*value.getAsObject()->getObject("options"))["backend"] = backend;
+        auto request = parseRequest(render(value));
+        ASSERT_TRUE(bool(request));
+        auto compiled = compileFrontend(*request);
+        if (llvm::StringRef(backend) == "selected-target" &&
+            !selectedAvailable) {
+          ASSERT_FALSE(bool(compiled));
+          EXPECT_EQ(errorCode(compiled.takeError()),
+                    "native_backend_unavailable");
+          continue;
+        }
+        if (!compiled)
+          FAIL() << llvm::toString(compiled.takeError());
+        Buffer a, b, out;
+        for (size_t i = 0; i != 128; ++i) {
+          a.storage[i + 1] = lhs[i % lhs.size()];
+          b.storage[i + 1] = rhs[i % rhs.size()];
+        }
+        auto error =
+            compiled->invoke({a.checked(), b.checked()}, {out.checked()});
+        ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
+        const auto &expected = multiply ? expectedMul : expectedAdd;
+        for (size_t i = 0; i != 128; ++i) {
+          const float want = expected[i % expected.size()];
+          const float got = out.storage[i + 1];
+          if (std::isnan(want))
+            EXPECT_TRUE(std::isnan(got));
+          else
+            EXPECT_EQ(std::bit_cast<uint32_t>(got),
+                      std::bit_cast<uint32_t>(want));
+        }
+        EXPECT_EQ(out.storage.front(), -777.f);
+        EXPECT_EQ(out.storage.back(), -777.f);
+      }
 }
 
 TEST(FrontendCompiler,
