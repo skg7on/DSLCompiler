@@ -419,6 +419,9 @@ llvm::Error lowerToBackendForm(mlir::ModuleOp module,
   options.functionBoundaryTypeConversion =
       mlir::bufferization::LayoutMapOption::IdentityLayoutMap;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(options));
+  if (backend == MappedBackend::SelectedTarget && target)
+    if (llvm::Error error = target->buildPostBufferizationBackendPipeline(pm))
+      return error;
   pm.addPass(mlir::createConvertLinalgToLoopsPass());
   if (mlir::failed(pm.run(module)))
     return compileError("selected/reference backend pass pipeline failed");

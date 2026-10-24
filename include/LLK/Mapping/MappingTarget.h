@@ -206,6 +206,16 @@ public:
         llvm::inconvertibleErrorCode(),
         "selected backend is unsupported by target '" + name().str() + "'");
   }
+
+  /// Add this target's passes that must run after One-Shot Bufferize and
+  /// before `convert-linalg-to-loops`. Targets that lower before bufferization
+  /// leave this as the default no-op. A target that needs memrefs (Arm SME tile
+  /// operations) overrides it rather than making a target pass own the generic
+  /// pipeline's bufferization.
+  virtual llvm::Error
+  buildPostBufferizationBackendPipeline(mlir::OpPassManager &) const {
+    return llvm::Error::success();
+  }
 };
 
 /// A target built from already-loaded registries. `loadMappingTarget` is the
