@@ -276,15 +276,19 @@ TEST(ArmPlacement, SameTypedContractionSelectsDifferentEngines) {
   }
 }
 
-// A physically complete static plan is still not executable code. SME declares
-// no ISA requirements at all, so selected-target compilation refuses before any
-// lowering. SVE declares a contract for its f32 vector subset only: this
-// contraction selects `sve_mma`, which has no lowering, so the shared contract
-// reports that no selected compute group was realized rather than falling back
-// to reference lowering and calling the result target execution.
+// arm-sve still rejects the contraction (`sve_mma` has no lowering); arm-sme
+// executes the f32 contraction but rejects bf16. Every refusal comes from the
+// shared group accounting, not from a missing code-generation contract.
 TEST(ArmPlacement, SelectedTargetCompilationRefusesUnimplementedSignatures) {
-  for (const ArmContractionCase &testCase : kCases) {
-    SCOPED_TRACE(std::string(testCase.targetName) + "/" + testCase.dtype);
+  struct RefusalCase {
+    const char *targetName;
+    const char *inputPath;
+  };
+  const RefusalCase cases[] = {{"arm-sve", kF32Path.data()},
+                               {"arm-sve", kBf16Path.data()},
+                               {"arm-sme", kBf16Path.data()}};
+  for (const RefusalCase &testCase : cases) {
+    SCOPED_TRACE(std::string(testCase.targetName) + "/" + testCase.inputPath);
     llvm::Expected<arm_test::MappedFixture> mapped =
         arm_test::mapFixture(testCase.targetName, testCase.inputPath);
     ASSERT_TRUE(bool(mapped)) << llvm::toString(mapped.takeError());
@@ -292,9 +296,6 @@ TEST(ArmPlacement, SelectedTargetCompilationRefusesUnimplementedSignatures) {
     ::llk::MappedCompileOptions options;
     options.backend = ::llk::MappedBackend::SelectedTarget;
     options.stop = ::llk::MappedStop::Lowered;
-    // The binding contract is not what is under test here; the target's
-    // declared capability is. The plan is fully materialized, so the partial
-    // contract still binds the same IR.
     options.requireExecutable = false;
 
     llvm::Expected<::llk::MappedCompilation> compiled =
@@ -304,11 +305,9 @@ TEST(ArmPlacement, SelectedTargetCompilationRefusesUnimplementedSignatures) {
         << "a target accepted selected-target compilation for an unimplemented "
            "signature";
     const std::string message = llvm::toString(compiled.takeError());
-    const llvm::StringRef expected =
-        llvm::StringRef(testCase.targetName) == "arm-sve"
-            ? "realized no selected compute groups"
-            : "ISA requirements";
-    EXPECT_NE(message.find(expected), std::string::npos) << message;
+    EXPECT_NE(message.find("realized no selected compute groups"),
+              std::string::npos)
+        << message;
   }
 }
 
@@ -328,23 +327,17 @@ TEST(ArmPlacement, FailedFixturePropagatesError) {
             std::string::npos);
 }
 
-// Every bundle the map actually selected is a well-formed opaque bundle the
-// target's emitter verifies -- and the contraction emitter still refuses to
-// lower it. Verifying a bundle is not implementing it, and this is the boundary
-// that keeps the executable subset honest.
-TEST(ArmPlacement, SelectedBundlesVerifyButCannotLower) {
+// Every bundle the map selected verifies, and every key this target does not
+// implement keeps the explicit `target_lowering_unsupported` refusal. Keys
+// that do implement a lowering are proven end to end in ArmSMEBackend.
+TEST(ArmPlacement, SelectedBundlesVerifyAndOnlyImplementedKeysLower) {
   for (const ArmContractionCase &testCase : kCases) {
     SCOPED_TRACE(std::string(testCase.targetName) + "/" + testCase.dtype);
     llvm::Expected<arm_test::MappedFixture> mapped =
         arm_test::mapFixture(testCase.targetName, testCase.inputPath);
     ASSERT_TRUE(bool(mapped)) << llvm::toString(mapped.takeError());
-    // `arm-sve` publishes a code-generation contract for its vector subset, so
-    // only SME is contract-free now. The contraction case below still proves
-    // that a declared emitter is not an implementation.
-    if (llvm::StringRef(testCase.targetName) == "arm-sve")
-      EXPECT_TRUE(mapped->target->codegenRequirements().has_value());
-    else
-      EXPECT_FALSE(mapped->target->codegenRequirements().has_value());
+    // Both Arm targets now publish a code-generation contract.
+    EXPECT_TRUE(mapped->target->codegenRequirements().has_value());
 
     IRRewriter rewriter(mapped->context.get());
     ASSERT_FALSE(mapped->plan.placements.empty());
@@ -354,7 +347,8 @@ TEST(ArmPlacement, SelectedBundlesVerifyButCannotLower) {
           mapped->target->createEmitter(placement.bundle.emitterKey);
       ASSERT_NE(emitter, nullptr) << placement.bundle.emitterKey;
       EXPECT_EQ(llvm::toString(emitter->verify(placement.bundle)), "");
-      EXPECT_FALSE(emitter->hasLowering());
+      if (emitter->hasLowering())
+        continue;
       TargetLoweringContext lowering{
           mapped->target->machine(), mapped->plan.placements,
           mapped->plan.connectionPlans, placement.instance};
