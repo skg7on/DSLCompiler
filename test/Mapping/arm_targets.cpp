@@ -7,6 +7,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "arm_target_fixture.h"
+
 #include "LLK/Mapping/MappingLowering.h"
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Target/AArch64/Mapping/SMEMappingTarget.h"
@@ -18,11 +20,8 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/PassManager.h"
 
-#include "llvm/ADT/SmallString.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FileUtilities.h"
 #include "llvm/Support/MemoryBuffer.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
 
@@ -59,26 +58,6 @@ loadRegistered(const ArmConfiguration &configuration,
                llvm::StringRef machine = {}) {
   mlir::llk::target::registerAllMappingTargets();
   return createRegisteredMappingTarget(configuration.name, root, machine);
-}
-
-/// Keep generated files in this worktree; FileRemover handles early assertions.
-llvm::Expected<std::string> writeMachineOverride(llvm::StringRef text) {
-  int descriptor;
-  llvm::SmallString<256> path;
-  if (std::error_code error = llvm::sys::fs::createUniqueFile(
-          LLK_TEST_BINARY_DIR "/arm-target-%%%%%%.yaml", descriptor, path))
-    return llvm::errorCodeToError(error);
-  llvm::FileRemover cleanup(path);
-  llvm::raw_fd_ostream stream(descriptor, /*shouldClose=*/true);
-  stream << text;
-  stream.close();
-  if (stream.has_error()) {
-    std::error_code error = stream.error();
-    stream.clear_error();
-    return llvm::errorCodeToError(error);
-  }
-  cleanup.releaseFile();
-  return path.str().str();
 }
 
 } // namespace
@@ -121,7 +100,7 @@ TEST(ArmTargets, RegistryUsesMachineOverride) {
     text.replace(offset, capacity.size(),
                  "capacity_bytes: " +
                      std::to_string(configuration.capacity / 2));
-    auto path = writeMachineOverride(text);
+    auto path = arm_test::writeMachineVariant(text);
     ASSERT_TRUE(bool(path)) << llvm::toString(path.takeError());
     llvm::FileRemover cleanup(*path);
     auto overridden = loadRegistered(configuration, LLK_SOURCE_DIR, *path);
