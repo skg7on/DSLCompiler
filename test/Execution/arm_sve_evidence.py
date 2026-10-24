@@ -156,12 +156,29 @@ static int is_nan32(uint32_t value) {
   return (value & 0x7f800000u) == 0x7f800000u && (value & 0x7fffffu);
 }
 
-void _start(void) {
+/* The process entry must read the kernel-provided argv/envp/auxv array before
+   any C prologue moves sp. `_start` is therefore a tiny assembly stub that
+   captures the initial stack pointer and hands it to the C body; a C function
+   cannot do that itself, because the compiler allocates its frame before an
+   inline-asm `mov sp` runs and the parsed argc would then come from the frame
+   rather than from the kernel. */
+__attribute__((noreturn)) void harness_main(unsigned long *initial_stack);
+__asm__(
+    ".text\n"
+    ".global _start\n"
+    ".type _start, %function\n"
+    "_start:\n"
+    "mov x0, sp\n"
+    "bl harness_main\n"
+    ".size _start, .-_start\n");
+
+__attribute__((noreturn)) void harness_main(unsigned long *initial_stack) {
   unsigned long hwcap = 0;
   /* getauxval is unavailable without libc; qemu sets HWCAP in the auxv the
-     kernel passes on the stack. Parsing it here keeps the harness libc-free. */
-  unsigned long *stack;
-  __asm__("mov %0, sp" : "=r"(stack));
+     kernel passes on the stack. `initial_stack` is the sp the entry stub
+     captured before any prologue, so stack[0] is argc. Parsing it here keeps
+     the harness libc-free and avoids /proc, whose auxv is the host's. */
+  unsigned long *stack = initial_stack;
   unsigned long argc = stack[0];
   unsigned long *aux = stack + 1 + argc + 1;  // envp[0]
   while (*aux)
@@ -216,6 +233,10 @@ void _start(void) {
   }
   WRITE_LITERAL("pass\n");
   syscall3(93, 0, 0, 0);
+  /* syscall3 is an opaque svc wrapper, so the compiler cannot see that the
+     exit above never returns; without this, a noreturn function that falls
+     off its end draws -Winvalid-noreturn. */
+  __builtin_unreachable();
 }
 """
 
@@ -542,8 +563,8 @@ def main():
         try:
             build = subprocess.run(
                 # -fno-stack-protector: a freestanding -nostdlib link has no
-                # __stack_chk_fail or TLS guard, and _start takes the address
-                # of its descriptors, which a hardening default would
+                # __stack_chk_fail or TLS guard, and harness_main takes the
+                # address of its descriptors, which a hardening default would
                 # instrument.
                 [cross_gcc, "-static", "-O2", "-nostdlib", "-ffreestanding",
                  "-fno-builtin", "-fno-stack-protector", "-Wl,-e,_start",
