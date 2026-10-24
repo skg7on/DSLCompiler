@@ -294,6 +294,23 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-opt> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
           ${CMAKE_CURRENT_BINARY_DIR}/TailPadExport
   )
+  # Framework E7 (#182): both ARM target names through the public CLI --
+  # search, bind, fresh-process replay and shared analysis parity -- for both
+  # contraction dtypes. This is static mapping only: no ARM host is needed and
+  # no instruction-execution claim is made. Prefer the interpreter CMake
+  # already found, falling back to the PATH's python3 exactly as the pipeline
+  # tests above spell it.
+  find_package(Python3 COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    set(LLK_TEST_PYTHON "${Python3_EXECUTABLE}")
+  else()
+    set(LLK_TEST_PYTHON python3)
+  endif()
+  add_test(NAME ArmTargetPipeline
+      COMMAND ${LLK_TEST_PYTHON} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/arm_target_pipeline.py
+          $<TARGET_FILE:llk-opt> $<TARGET_FILE:micro-perf> ${CMAKE_SOURCE_DIR}
+          ${CMAKE_CURRENT_BINARY_DIR}/ArmTargetPipeline
+  )
   # A target nobody registered is a diagnostic naming the ones that are, not a
   # silent fallback to a different backend.
   add_test(NAME MicroMappingCompileRejectsUnknownTarget
