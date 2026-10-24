@@ -34,7 +34,7 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/PatternMatch.h"
 
-#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <gtest/gtest.h>
@@ -283,9 +283,8 @@ TEST(ArmSVEBackend, CapabilityReceiptDrawsTheExecutableBoundary) {
   CapabilityReceipt refused = mlir::llk::framework::describeCapabilities(
       siluKernel, contract, *silu->target, &silu->analysis, &silu->plan);
   EXPECT_EQ(refused.selectedLowering, CapabilityStatus::Unsupported);
-  EXPECT_NE(llvm::join(refused.reasons, "\n").find("sve_vector_silu"),
-            std::string::npos)
-      << llvm::join(refused.reasons, "\n");
+  const std::string reasons = llvm::join(refused.reasons, "\n");
+  EXPECT_NE(reasons.find("sve_vector_silu"), std::string::npos) << reasons;
 }
 
 // The prepared artifact is what the AOT object and the JIT both consume.

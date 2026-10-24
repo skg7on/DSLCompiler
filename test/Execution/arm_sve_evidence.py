@@ -6,10 +6,10 @@ subset computes the fixture's numbers. It is not a measurement, and the harness
 is deliberately libc-free and static so the object under test is the compiler's
 output rather than a runtime's.
 
-Each passing object is also replayed on two CPUs the harness must refuse -- one
-without SVE and one whose vector length is not the modeled 512 bits -- and must
-exit with the harness's distinct rejection codes (70 and 71). That keeps the
-host checks that qualify the executable subset live rather than assumed.
+Every object that links is also replayed on two CPUs the harness must refuse --
+one without SVE and one whose vector length is not the modeled 512 bits -- and
+must exit with the harness's distinct rejection codes (70 and 71). That keeps
+the host checks that qualify the executable subset live rather than assumed.
 
 The script fails -- never skips -- when qemu or the cross compiler is missing;
 CTest's `REQUIRED` lookups refuse to configure in that case.
@@ -298,16 +298,15 @@ def run_negative_controls(qemu, binaries, failures):
                 failures.append("%s: %s negative run timed out" %
                                 (fixture, label))
                 continue
+            detail = "%s%s" % (run.stdout, run.stderr)
             if run.returncode == 0:
                 failures.append(
                     "%s: %s negative run exited 0; the harness accepted CPU "
-                    "'%s'\n%s%s" % (fixture, label, cpu, run.stdout,
-                                    run.stderr))
+                    "'%s'\n%s" % (fixture, label, cpu, detail))
             elif run.returncode != expected:
                 failures.append(
-                    "%s: %s negative run exited %d, expected %d\n%s%s" %
-                    (fixture, label, run.returncode, expected, run.stdout,
-                     run.stderr))
+                    "%s: %s negative run exited %d, expected %d\n%s" %
+                    (fixture, label, run.returncode, expected, detail))
 
 
 def main():

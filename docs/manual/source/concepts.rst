@@ -266,8 +266,9 @@ static :source:`Arm SVE <machines/arm-sve-v2.yaml>` and
 :source:`Arm SME <machines/arm-sme-v2.yaml>` profiles. All use the same topology
 schema and canonical IR. The generic accelerator is an architecture exploration
 target rather than an accelerator hardware backend, and the Arm profiles model
-VL=SVL=512 for static mapping and analysis only — they do not establish
-executable SVE/SME or physical ZA behavior.
+VL=SVL=512 for static mapping and analysis, plus the executable ``arm-sve`` f32
+add/multiply subset with an emulated (not native) acceptance path; SME, ZA,
+other signatures and timing remain non-executable.
 
 .. _concepts-layouts-and-movement-are-separate-decisions:
 

@@ -110,7 +110,7 @@ What you can do today
      - Generic accelerator topology, layouts, rules and mapping through the same canonical IR; static f32 add/mul/sum coverage with operation-aware validation
      - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered; accelerator mul/sum emitters verify only
      - :doc:`Mapping tutorial </tutorials/02-mapping>`
-   * - Map Arm SVE and SME statically
+   * - Map Arm SVE and SME statically, and run the SVE f32 subset
      - Both target names load a bounded machine profile and typed LLKMap policy, then map direct-MicroIR fixtures: f32/bf16 M=N=K=16 contraction, typed f32/bf16/i8 add and multiply, both bf16↔f32 conversions, f32 SiLU and reduce sum, and the fused convert→SiLU→multiply graph. Selected plans report concrete vector or matrix engine and accumulator identities, verify, replay from the reported plan id and analyze
      - Static mapping and analysis at modeled VL=SVL=512, plus an executable ``arm-sve`` f32 add/multiply subset with an emulated AArch64 acceptance path: a cross-compiled static object run under ``qemu-aarch64``. No native SVE code, SME execution, physical ZA realization, calibrated timing or automatic retargeting of CPU schedules. Other signatures and all ``arm-sme`` lowering remain unimplemented, and selected-target compilation is rejected for them
      - :source:`Acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`, :doc:`Optimizer </tools/optimizer>`
