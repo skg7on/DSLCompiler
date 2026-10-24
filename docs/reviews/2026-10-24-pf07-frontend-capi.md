@@ -51,12 +51,15 @@ rather than discovering a missing binary.
 
 Only the declared symbols are exported. The project archives are built with
 default visibility, so the target uses a linker export list: an
-`-exported_symbols_list` for Mach-O and a `--version-script` for ELF. `nm -gU
-build/lib/libLLKFrontendCAPI.dylib` reports exactly the eight `llk_frontend_*`
-symbols. Hiding the rest matters because the library is loaded into a Python
-process where another MLIR copy may already be resident. The JIT is unaffected:
-`MappedExecutable` hands `memrefCopy` to LLJIT by address rather than by dynamic
-lookup, and the full test suite still executes.
+`-exported_symbols_list` for Mach-O and a `--version-script` for ELF. The export
+set is a property of the build rather than of the code, so
+`test/CAPI/check_exports.cmake` asserts it with `nm` on whichever platform runs
+the tests; pointing the same script at a library without an export list fails,
+so the check is not vacuous. `nm -gU build/lib/libLLKFrontendCAPI.dylib` reports
+exactly the eight `llk_frontend_*` symbols. Hiding the rest matters because the
+library is loaded into a Python process where another MLIR copy may already be
+resident. The JIT is unaffected: `MappedExecutable` hands `memrefCopy` to LLJIT
+by address rather than by dynamic lookup, and the full test suite still executes.
 
 The C boundary reports every failure as `llvm::Error`. With the project's
 `-fno-exceptions` setting no throw site exists; for builds that enable exceptions
@@ -84,11 +87,18 @@ python3 scripts/check-license-headers.py
 
 | Lane | Actual result |
 | --- | --- |
-| `ctest -R FrontendCAPI` | 5 passed, 0 failed, 0 skipped |
-| Full `ctest` in this worktree | 1,463 registered; 1,462 run; 3 failed, 6 skipped, 1 disabled |
+| `ctest -R FrontendCAPI` (local) | 6 passed, 0 failed, 0 skipped |
+| Full `ctest` in this worktree (local) | 1,463 registered; 1,462 run; 3 failed, 6 skipped, 1 disabled |
 | Frontend category (`LLKFrontendTests`) | 56 passed, 0 failed |
+| Linux CI, LLVM/MLIR 22.1.8, `LLK_BUILD_PYTHON_CAPI=ON` | 1,463 of 1,463 passed, including all six `FrontendCAPI` cases |
 | Default configuration (`LLK_BUILD_PYTHON_CAPI=OFF`) | Configures and generates without CAPI targets |
 | License-header and deprecated-API audits | Clean |
+
+The Linux lane is the load-bearing one for this task: it is the only place the
+ELF `--version-script` export list and the position-independent archive build
+run. `build-and-test` configures the project with `-DLLK_BUILD_PYTHON_CAPI=ON`,
+so `FrontendCAPI.Consumer`, `FrontendCAPI.Exports` and the four C++ cases execute
+there rather than only locally.
 
 The full-suite failures are `MappedAVX2Acceptance`, `GenericElementwiseAVX2Test`
 and `FrameworkPrimitivesAVX2Test`, which require x86_64 AVX2 and fail on this

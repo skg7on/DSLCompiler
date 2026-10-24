@@ -22,6 +22,15 @@ add_test(NAME FrontendCAPI.Consumer COMMAND LLKCAPIFrontendTests)
 set_tests_properties(FrontendCAPI.Consumer PROPERTIES
     LABELS "CAPI" TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 
+# The export set is a build property (linker export list), so it is asserted on
+# each platform instead of being assumed from the source annotations.
+add_test(NAME FrontendCAPI.Exports
+    COMMAND ${CMAKE_COMMAND}
+            -DLIBRARY=$<TARGET_FILE:LLKFrontendCAPI>
+            -DNM=${CMAKE_NM}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/check_exports.cmake")
+set_tests_properties(FrontendCAPI.Exports PROPERTIES LABELS "CAPI" TIMEOUT 60)
+
 # C++ consumers cover the error, ownership and concurrency contract; the suite
 # names start with FrontendCAPI so -R FrontendCAPI selects every case.
 add_llk_test_category(CAPI
