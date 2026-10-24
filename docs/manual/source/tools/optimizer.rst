@@ -140,7 +140,7 @@ Legacy scheduling and runtime passes
 
 ``tile-and-vectorize`` exposes ``schedule-file`` (default empty) and ``target-isa`` (default ``avx2``, help lists ``avx512``/``sve``). **Those options are currently inert:** the implementation does not read the file or ISA value and uses the fixed constants above. Do not use their names as evidence that a Transform file ran or that another ISA was selected. The Micro export's ``schedule-db`` is an active option with a different implementation.
 
-The shared schedule selector currently matches operation and M bucket, then chooses the first entry; exact N/K, target, dtype, and math-mode fields do not participate in selection. Buckets are ``{1}``, ``[2,4]``, ``[5,16]``, ``[17,64]``, and ``≥65``. With no match, the export uses a conservative ``BM=8``, ``BN=32``, ``BK=32``, ``VM=1``, ``VN=4`` schedule (vector width 8, four threads, grain 1), with tiles resolved against the actual extents.
+The shared schedule selector currently matches operation and M bucket, then chooses the first entry; exact N/K, target, dtype, and math-mode fields do not participate in selection. Buckets are ``{1}``, ``[2,4]``, ``[5,16]``, ``[17,64]``, and ``≥65``. With no match, the export uses a conservative ``BM=8``, ``BN=32``, ``BK=32``, ``VM=1``, ``VN=4`` schedule (vector width 8, four threads, grain 1), with tiles resolved against the actual extents. The entry schema, every field's effect, and the selection algorithm are documented in :doc:`/models/schedules`.
 
 .. _tools-optimizer-staged-triton-passes:
 

@@ -248,7 +248,10 @@ opaque bundles and refuse lowering, so none of these three executes its modeled
 hardware. The :source:`Arm acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`
 records their exact static domain and limits.
 See the :source:`formal LLKMap syntax <docs/design/llkmap-syntax.md>` and its
-:source:`EBNF <docs/design/llkmap.ebnf>` when authoring policy.
+:source:`EBNF <docs/design/llkmap.ebnf>` when authoring policy. The
+:doc:`machine-model </models/machine-model>` and
+:doc:`mapping-policy </models/mapping-policy>` guides document the file schemas
+and the parser's current grammar, including forms the design EBNF predates.
 
 .. _architecture-library-boundaries-to-preserve:
 
