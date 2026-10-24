@@ -161,23 +161,9 @@ class DocReferencesTest(unittest.TestCase):
         self.assertEqual(1, len(self.path_problems("[missing](missing.md)", "README.md")))
 
     def test_cli_checks_rst_corpus_and_infers_sibling_benchmark(self):
-        docs = [
-            "README.md", "CLAUDE.md", "python/README.md", "docs/README.md",
-            "docs/manual/README.md", "docs/manual/source/index.rst", "docs/manual/source/getting-started.rst",
-            "docs/manual/source/python-frontend.rst",
-            "docs/manual/source/concepts.rst", "docs/manual/source/architecture.rst", "docs/manual/source/features.rst",
-            "docs/manual/source/contributing.rst", "docs/manual/source/building-docs.rst",
-            "docs/manual/source/examples/index.rst", "docs/manual/source/tools/index.rst",
-            "docs/manual/source/tools/compiler.rst", "docs/manual/source/tools/optimizer.rst",
-            "docs/manual/source/tools/performance.rst", "docs/manual/source/tools/tuning.rst",
-            "docs/manual/source/tools/benchmark.rst", "docs/manual/source/tutorials/index.rst",
-            "docs/manual/source/tutorials/01-first-kernel.rst", "docs/manual/source/tutorials/02-mapping.rst",
-            "docs/manual/source/tutorials/03-performance.rst", "docs/manual/source/tutorials/04-tuning.rst",
-            "docs/design/micro-ir-mapping-workflow.md",
-            "docs/reviews/issue67-final-acceptance.md",
-            "docs/reviews/2026-10-19-pf01-python-environment.md",
-        ]
-        for doc in docs:
+        # Mirror the checker's corpus rather than restating it, so adding a
+        # manual page cannot make this fixture stale.
+        for doc in checker.DOCS:
             self.write(doc, "")
         command = [sys.executable, str(CHECKER_PATH), str(self.root)] + [
             self.tool_paths[name] for name in

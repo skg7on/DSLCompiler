@@ -25,6 +25,13 @@ the options, output contracts, and failure modes in detail.
 .. toctree::
    :hidden:
    :maxdepth: 2
+   :caption: Target models and data
+
+   models/index
+
+.. toctree::
+   :hidden:
+   :maxdepth: 2
    :caption: Use the tools
 
    tools/index
@@ -70,6 +77,10 @@ Choose a starting point
    * - Develop the Python frontend
      - :doc:`Python frontend </python-frontend>`
      - Project ``.venv`` setup, PF01 tests and current capability boundaries
+   * - Describe a machine or write target policy
+     - :doc:`Machine models </models/machine-model>`
+     - :doc:`Mapping policy </models/mapping-policy>` and
+       :doc:`Schedules </models/schedules>`
    * - Extend a compiler component or target
      - :doc:`Architecture </architecture>`
      - :doc:`Contributor guide </contributing>`
