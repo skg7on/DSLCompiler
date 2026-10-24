@@ -196,4 +196,4 @@ rather than skips when either is missing.
   and is unchanged.
 - #175 closes with E11's ledger
   (`docs/reviews/2026-10-24-arm-sme-stateful-backend-acceptance.md`), which
-  records the native T3 run and the QEMU T2 run.
+  records the native T3 run and registers the QEMU T2 CI run (pending).
