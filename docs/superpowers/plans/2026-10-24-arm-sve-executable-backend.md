@@ -384,7 +384,13 @@ In `runMappedCompilation`, force `options.stop = llk::MappedStop::Lowered` when 
   }
 ```
 
-Add `#include "LLK/Runtime/MappedObject.h"`, `#include "LLK/Version.h"`, and `#include "llvm/Config/llvm-config.h"` as needed.
+Add `#include "LLK/Runtime/MappedObject.h"`,
+`#include "LLK/Conversion/MappedKernelAbi.h"` (for
+`prepareMappedKernelForInvocation` and `computeKernelAbiHash`),
+`#include "LLK/Version.h"`, and `#include "llvm/Config/llvm-config.h"` as
+needed. Add `LLKMappedKernelAbi` to `llk-compile`'s link libraries in
+`tools/CMakeLists.txt` so the preparation symbols are linked directly rather
+than relying on a transitive static-library order.
 
 - [ ] **Step 6: Build and run the test to verify it passes**
 
@@ -1044,7 +1050,11 @@ void *memcpy(void *dst, const void *src, size_t n) {
     out[i] = in[i];
   return dst;
 }
-void memrefCopy(int64_t, void *, void *) { for (;;) { } }
+static long syscall3(long, long, long, long);
+void memrefCopy(int64_t, void *, void *) {
+  syscall3(93, 75, 0, 0);  // this subset must not reach a generic copy
+  for (;;) { }
+}
 
 static const uint32_t LHS[ROWS * COLS] = { LHS_DATA };
 static const uint32_t RHS[ROWS * COLS] = { RHS_DATA };
@@ -1062,6 +1072,7 @@ static long syscall3(long n, long a, long b, long c) {
 static void write_all(const char *text, long length) {
   syscall3(64, 1, (long)text, length);
 }
+#define WRITE_LITERAL(text) write_all((text), (long)(sizeof(text) - 1))
 
 static float bits(uint32_t value) {
   union { uint32_t u; float f; } cast;
@@ -1096,13 +1107,13 @@ void _start(void) {
     aux += 2;
   }
   if (!(hwcap & (1UL << 22))) {
-    write_all("unsupported: no sve hwcap\n", 26);
+    WRITE_LITERAL("unsupported: no sve hwcap\n");
     syscall3(93, 70, 0, 0);
   }
   /* PR_SVE_GET_VL = 51; VL = (low 16 bits) * 16 bits. */
   long vl = syscall3(167, 51, 0, 0);
   if (vl < 0 || (vl & 0xffff) * 16 != 512) {
-    write_all("unsupported: vector length is not 512\n", 39);
+    WRITE_LITERAL("unsupported: vector length is not 512\n");
     syscall3(93, 71, 0, 0);
   }
 
@@ -1120,24 +1131,24 @@ void _start(void) {
   MemRef2D result = {0, 0, 0, 0, 0, 0, 0};
   WRAPPER(&result, &a, &b);
   if (!result.aligned) {
-    write_all("failed: no result descriptor\n", 29);
+    WRITE_LITERAL("failed: no result descriptor\n");
     syscall3(93, 72, 0, 0);
   }
   float *values = result.aligned + result.offset;
   for (int i = 0; i < ROWS * COLS; ++i) {
     uint32_t got = as_bits(values[i]);
     if (is_nan32(EXPECTED[i]) ? !is_nan32(got) : got != EXPECTED[i]) {
-      write_all("failed: numeric mismatch\n", 24);
+      WRITE_LITERAL("failed: numeric mismatch\n");
       syscall3(93, 73, 0, 0);
     }
   }
   for (int i = 0; i < 128; ++i) {
     if (out[i] != 0x5a) {
-      write_all("failed: canary written\n", 21);
+      WRITE_LITERAL("failed: canary written\n");
       syscall3(93, 74, 0, 0);
     }
   }
-  write_all("pass\n", 5);
+  WRITE_LITERAL("pass\n");
   syscall3(93, 0, 0, 0);
 }
 """
