@@ -15,6 +15,8 @@ add_llk_test_category(Mapping
         avx2_target.cpp
         arm_policy.cpp
         arm_targets.cpp
+        arm_target_fixture.cpp
+        arm_placement.cpp
         generic_accelerator_target.cpp
         plan_binder.cpp
         e2e_workflow.cpp
@@ -29,6 +31,7 @@ add_llk_test_category(Mapping
         LLKTargetMapping
         LLKMicroMapping
         LLKMappedCompilation
+        LLKPerf
         LLKMicroToLinalg
         MicroDialect
         LLK::MLIR
