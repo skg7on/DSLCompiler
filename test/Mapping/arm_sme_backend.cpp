@@ -133,10 +133,12 @@ TEST(ArmSMEBackend, SelectedContractionLowersToArmSME) {
   EXPECT_EQ(text.find("vector.contract"), std::string::npos) << text;
   EXPECT_EQ(text.find("vector.outerproduct"), std::string::npos) << text;
   // The kernel owns PSTATE.SM and a fresh ZA array. `enable-arm-streaming`
-  // records them as MLIR attributes; the LLVM translation names the same two
-  // facts `aarch64_pstate_sm_enabled` and `aarch64_new_za`.
-  EXPECT_NE(text.find("llvm.arm_streaming"), std::string::npos) << text;
-  EXPECT_NE(text.find("llvm.arm_new_za"), std::string::npos) << text;
+  // records them as MLIR attributes; depending on the MLIR version they print
+  // as `llvm.arm_streaming`/`llvm.arm_new_za` or `arm_streaming`/`arm_new_za`.
+  // The stable suffix is the attribute name; the LLVM translation names the
+  // same two facts `aarch64_pstate_sm_enabled` and `aarch64_new_za`.
+  EXPECT_NE(text.find("arm_streaming"), std::string::npos) << text;
+  EXPECT_NE(text.find("arm_new_za"), std::string::npos) << text;
 }
 
 // The late backend step is what the executable path runs after shared ownership
