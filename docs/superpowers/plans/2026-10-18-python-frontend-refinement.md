@@ -18,7 +18,7 @@
 from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
 at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
 PF04's checked steps record branch implementation and verification in the
-[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06–PF20 remain proposed and unchecked. Paths in those later tasks describe
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -230,7 +230,7 @@ EXPECT_EQ(unsupportedGridError.code, "invalid_launch_coverage");
 
 **Interfaces:** Produce `compileFrontend` and `FrontendCompilation`. Add `compileMappedTuningSelection(ModuleOp, const perf::SearchSpace &, const workload::WorkloadContract &, const mapping::MappingTarget &, const MappedTuningCandidate &, const MappedTuningOptions &) -> Expected<llk::MappedCompilation>` to the mapped-tuning header. It realizes the ranked source candidate with `instantiateCandidate`, checks source/binding/plan identities, then calls `compileMappedKernel`; CLI/replay consumers can reuse it.
 
-- [ ] Add full/tiled add/mul native compile tests with a literal expected output and report assertions. A changed source/binding/target content must reject stale selection. Assert no synthetic M/N/K contract enters the elementwise route. Verify selected mode fails on unavailable ISA and reference mode identifies itself.
+- [x] Add full/tiled add/mul native compile tests with a literal expected output and report assertions. A changed source/binding/target content must reject stale selection. Assert no synthetic M/N/K contract enters the elementwise route. Verify selected mode fails on unavailable ISA and reference mode identifies itself.
 
 Pinned regression assertions (local test fixture names):
 
@@ -239,10 +239,10 @@ assert report["backend"] == "reference"
 assert report["source_adapter"] == expected_elementwise_adapter_key
 ```
 
-- [ ] Run `LLKFrontendTests --gtest_filter='FrontendCompiler.*'` and existing candidate/mapped-tuning tests; establish failures for the missing service.
-- [ ] Call the contract overload of `runMappedTuningSession`, retain top_k=1 under explicit search limits, and use the shared selection helper. Preserve native counters/hashes. Implement the internal no-read destination descriptor adaptation specified above with owned storage and an explicit port map. Keep `LLKMapping` free of Python/runtime orchestration dependencies.
-- [ ] Rerun frontend compile/invoke and existing source-candidate/tuning tests. Native outputs must agree exactly for add/mul and no stale selected state may pass. Confirm internal destination scratch does not alias public buffers.
-- [ ] Commit `feat: expose shared frontend compilation through mapped selection`.
+- [x] Run `LLKFrontendTests --gtest_filter='FrontendCompiler.*'` and existing candidate/mapped-tuning tests; establish failures for the missing service.
+- [x] Call the contract overload of `runMappedTuningSession`, retain top_k=1 under explicit search limits, and use the shared selection helper. Preserve native counters/hashes. Implement the internal no-read destination descriptor adaptation specified above with owned storage and an explicit port map. Keep `LLKMapping` free of Python/runtime orchestration dependencies.
+- [x] Rerun frontend compile/invoke and existing source-candidate/tuning tests. Native outputs must agree exactly for add/mul and no stale selected state may pass. Confirm internal destination scratch does not alias public buffers.
+- [x] Commit `feat: expose shared frontend compilation through mapped selection` (`b050a61`; validation fixes `33c1791`).
 
 ## Milestone B — execute and specialize the LLK decorator
 
