@@ -44,5 +44,11 @@ checkHostRequirements(const TargetCodegenRequirements &requirements,
                                std::nullopt);
 }
 
+/// Convert a `prctl(PR_SVE_GET_VL)` result to a vector length in bits.
+///
+/// The kernel reports the implemented length in bytes in the low 16 bits
+/// (`PR_SVE_VL_LEN_MASK`), so the bits value is that field times eight.
+int64_t vectorLengthBitsFromPrctl(long value);
+
 } // namespace mlir::llk::mapping
 #endif

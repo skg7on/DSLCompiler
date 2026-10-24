@@ -12,8 +12,11 @@
 #include "llvm/Support/Error.h"
 #include <gtest/gtest.h>
 
+#include <string>
+
 using mlir::llk::mapping::checkHostRequirements;
 using mlir::llk::mapping::TargetCodegenRequirements;
+using mlir::llk::mapping::vectorLengthBitsFromPrctl;
 
 TEST(CodegenRequirements, AcceptsMatchingVectorLength) {
   TargetCodegenRequirements requirements{"aarch64", "", {"sve"}, 512};
@@ -32,4 +35,48 @@ TEST(CodegenRequirements, RejectsMissingOrDifferentVectorLength) {
   features["sve"] = false;
   EXPECT_TRUE(static_cast<bool>(
       checkHostRequirements(requirements, "aarch64", features, 512)));
+}
+
+TEST(CodegenRequirements, IgnoresHostVectorLengthWithoutRequirement) {
+  TargetCodegenRequirements requirements{"aarch64", "", {"sve"}};
+  llvm::StringMap<bool> features{{"sve", true}};
+  // A target that names no vector length makes no claim about the host's.
+  EXPECT_FALSE(static_cast<bool>(
+      checkHostRequirements(requirements, "aarch64", features, 256)));
+  EXPECT_FALSE(static_cast<bool>(
+      checkHostRequirements(requirements, "aarch64", features, std::nullopt)));
+}
+
+TEST(CodegenRequirements, ReportsVectorLengthRefusals) {
+  TargetCodegenRequirements requirements{"aarch64", "", {"sve"}, 512};
+  llvm::StringMap<bool> features{{"sve", true}};
+
+  llvm::Error unknown =
+      checkHostRequirements(requirements, "aarch64", features, std::nullopt);
+  ASSERT_TRUE(static_cast<bool>(unknown));
+  std::string unknownText = llvm::toString(std::move(unknown));
+  EXPECT_NE(unknownText.find("host vector length is unknown"),
+            std::string::npos)
+      << unknownText;
+  EXPECT_NE(unknownText.find("requires 512 bits"), std::string::npos)
+      << unknownText;
+
+  llvm::Error mismatch =
+      checkHostRequirements(requirements, "aarch64", features, 256);
+  ASSERT_TRUE(static_cast<bool>(mismatch));
+  std::string mismatchText = llvm::toString(std::move(mismatch));
+  EXPECT_NE(mismatchText.find("host vector length is 256 bits"),
+            std::string::npos)
+      << mismatchText;
+  EXPECT_NE(mismatchText.find("requires 512 bits"), std::string::npos)
+      << mismatchText;
+}
+
+TEST(CodegenRequirements, ConvertsSvePrctlLengthFromBytesToBits) {
+  // PR_SVE_GET_VL reports bytes: 64 bytes is the modeled 512-bit length and
+  // 32 bytes a 256-bit one.
+  EXPECT_EQ(vectorLengthBitsFromPrctl(64), 512);
+  EXPECT_EQ(vectorLengthBitsFromPrctl(32), 256);
+  // Only the low 16 bits carry the length; higher bits are status flags.
+  EXPECT_EQ(vectorLengthBitsFromPrctl((512L << 16) | 64), 512);
 }

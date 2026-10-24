@@ -51,4 +51,9 @@ llvm::Error checkHostRequirements(const TargetCodegenRequirements &requirements,
   return llvm::Error::success();
 }
 
+int64_t vectorLengthBitsFromPrctl(long value) {
+  constexpr long kLengthMask = 0xffff; // PR_SVE_VL_LEN_MASK, in bytes
+  return static_cast<int64_t>((value & kLengthMask) * 8);
+}
+
 } // namespace mlir::llk::mapping

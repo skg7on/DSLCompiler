@@ -62,6 +62,16 @@
 #if defined(__linux__) && defined(__aarch64__)
 #include <sys/auxv.h>
 #include <sys/prctl.h>
+
+// Not every libc's <sys/auxv.h> declares the AArch64 SVE capability bit.
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1 << 22)
+#endif
+
+namespace {
+/// prctl() request code for PR_SVE_GET_VL.
+constexpr int kPrSveGetVl = 51;
+} // namespace
 #endif
 
 namespace llk {
@@ -84,11 +94,10 @@ std::optional<int64_t> detectHostVectorLengthBits() {
   unsigned long hwcap = getauxval(AT_HWCAP);
   if (!(hwcap & HWCAP_SVE))
     return std::nullopt;
-  // PR_SVE_GET_VL = 51; the low 16 bits are VL/16.
-  long value = prctl(51, 0, 0, 0, 0);
+  long value = prctl(kPrSveGetVl, 0, 0, 0, 0);
   if (value < 0)
     return std::nullopt;
-  return static_cast<int64_t>((value & 0xffff) * 16);
+  return mlir::llk::mapping::vectorLengthBitsFromPrctl(value);
 #else
   return std::nullopt;
 #endif
