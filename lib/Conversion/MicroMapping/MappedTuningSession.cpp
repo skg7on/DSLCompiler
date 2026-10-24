@@ -1150,6 +1150,54 @@ runMappedTuningSessionImpl(ModuleOp source, const perf::SearchSpace &space,
 
 } // namespace
 
+llvm::Expected<::llk::MappedCompilation>
+compileMappedTuningSelection(ModuleOp source, const perf::SearchSpace &space,
+                             const workload::WorkloadContract &contract,
+                             const mapping::MappingTarget &target,
+                             const MappedTuningCandidate &selected,
+                             const MappedTuningOptions &options) {
+  auto invalid = [](llvm::Twine message) {
+    return fail("stale_selection: " + message);
+  };
+  if (!options.executable || !selected.executable || !selected.ranking.legal ||
+      !selected.materializationReady || !selected.plan.materialized)
+    return invalid("selection is not a retained executable plan");
+  CandidateInstantiationOptions sourceOptions = options.source;
+  sourceOptions.machine = &target.machine();
+  auto instance = instantiateCandidate(
+      source, space, selected.ranking.candidate, contract, sourceOptions);
+  if (!instance)
+    return invalid(llvm::toString(instance.takeError()));
+  if (instance->sourceGraphHash != selected.sourceGraphHash ||
+      instance->bindingHash != selected.bindingHash ||
+      selected.plan.sourceBindingHash != selected.bindingHash)
+    return invalid("source or binding identity changed");
+  if (selected.plan.graphHash !=
+          mapping::computeSourceGraphHash(instance->workloadGraph) ||
+      selected.plan.targetHash != mapping::computeTargetContentHash(target) ||
+      selected.plan.id != mapping::computePlanId(selected.plan))
+    return invalid("graph, target or plan content identity changed");
+  auto receipt = instance->receipt;
+  if (auto error = completeMappingReceipt(space, selected.ranking.candidate,
+                                          instance->schema, selected.plan,
+                                          target, receipt))
+    return invalid(llvm::toString(std::move(error)));
+  if (receipt.source != selected.receipt.source ||
+      receipt.mapping != selected.receipt.mapping)
+    return invalid("ownership receipt changed");
+  auto symbol = instance->kernel->getAttrOfType<StringAttr>("sym_name");
+  if (!symbol)
+    return invalid("instantiated kernel has no symbol");
+  ::llk::MappedCompileOptions compileOptions;
+  compileOptions.entrySymbol = symbol.getValue().str();
+  compileOptions.backend = options.backend;
+  compileOptions.requireExecutable = true;
+  compileOptions.stop = ::llk::MappedStop::Executable;
+  compileOptions.captureMappedMicroIR = true;
+  return ::llk::compileMappedKernel(*instance->module, target, selected.plan,
+                                    compileOptions);
+}
+
 llvm::Expected<MappedTuningReport>
 runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
                        const perf::WorkloadShape &shape,

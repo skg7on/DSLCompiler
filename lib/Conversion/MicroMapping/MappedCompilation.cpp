@@ -703,6 +703,10 @@ compileMappedKernel(mlir::ModuleOp source, const MappingTarget &target,
   if (sourceIdentityError)
     return std::move(sourceIdentityError);
   compilation.stopped = MappedStop::MappedMicro;
+  if (options.captureMappedMicroIR) {
+    llvm::raw_string_ostream inspection(compilation.mappedMicroIR);
+    compilation.module->print(inspection);
+  }
   if (options.stop == MappedStop::MappedMicro)
     return compilation;
 
