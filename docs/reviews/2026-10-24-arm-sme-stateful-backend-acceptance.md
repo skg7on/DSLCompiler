@@ -29,7 +29,7 @@ digest is recorded here because the T2 run has not executed.
 |---|---|
 | Target | `arm-sme` |
 | Operation | `micro.mma` 16x16x16, f32 inputs and accumulator, initialized from `%init` |
-| Streaming | `aarch64_pstate_sm_enabled` kernel and wrapper; assembly `smstart sm`/`smstop sm` shim; the shim clears `TPIDR2_EL0` before each kernel call |
+| Streaming | `aarch64_pstate_sm_enabled` kernel and wrapper; the wrapper's inherited ZA ownership is removed so it carries only the declared invocation attributes; assembly `smstart sm`/`smstop sm` shim; the shim clears `TPIDR2_EL0` before each kernel call |
 | ZA | `aarch64_new_za`: `smstart za`, `zero {za}`, slice extraction, `smstop za`; not preserved across calls. `TPIDR2_EL0` is zero on the native runner and is explicitly cleared on QEMU/Linux, where it is not |
 | ABI | `_mlir_ciface_<kernel>`, inputs then borrowed outputs, rank-two descriptors |
 | SVL | exactly 512 bits; `CNTB` = 64 bytes checked before the first call |

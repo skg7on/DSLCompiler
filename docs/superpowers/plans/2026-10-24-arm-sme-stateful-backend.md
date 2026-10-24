@@ -236,11 +236,17 @@ TEST(MappedCodegenRequirements, AppliesInvocationAttributesToTheWrapper) {
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), false),
       llvm::GlobalValue::ExternalLinkage, "_mlir_ciface_k", module);
   ASSERT_FALSE(wrapper->hasFnAttribute("aarch64_pstate_sm_enabled"));
+  // A wrapper may inherit ZA ownership from the kernel; the declared
+  // invocation attributes replace it.
+  wrapper->addFnAttr("aarch64_new_za");
+  wrapper->addFnAttr("aarch64_inout_za");
 
   llvm::Error error = llk::applyInvocationAttributes(
       module, "_mlir_ciface_k", {"aarch64_pstate_sm_enabled"});
   ASSERT_FALSE(static_cast<bool>(error));
   EXPECT_TRUE(wrapper->hasFnAttribute("aarch64_pstate_sm_enabled"));
+  EXPECT_FALSE(wrapper->hasFnAttribute("aarch64_new_za"));
+  EXPECT_FALSE(wrapper->hasFnAttribute("aarch64_inout_za"));
 
   // An empty attribute list is a no-op even when the wrapper is absent.
   EXPECT_FALSE(static_cast<bool>(
@@ -324,7 +330,11 @@ struct MappedObjectIdentity {
 /// An empty attribute list is a no-op and does not require the wrapper to
 /// exist. A nonempty list naming a missing wrapper is an error: silently
 /// dropping a required ABI attribute would emit an object whose entry runs in
-/// the wrong streaming state.
+/// the wrong streaming state. A nonempty list also removes inherited Arm
+/// ZA-ownership attributes from the wrapper (`aarch64_new_za`, `aarch64_in_za`,
+/// `aarch64_out_za`, `aarch64_inout_za`, `aarch64_preserves_za`): the exported
+/// entry declares its own ABI, and a wrapper with ZA ownership would establish
+/// a TPIDR2 save block around the kernel.
 llvm::Error applyInvocationAttributes(llvm::Module &module,
                                       llvm::StringRef wrapperSymbol,
                                       llvm::ArrayRef<std::string> attributes);
@@ -343,6 +353,15 @@ llvm::Error applyInvocationAttributes(llvm::Module &module,
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "invocation wrapper '" + wrapperSymbol.str() +
                                        "' is missing from the LLVM module");
+  // A C-interface wrapper is a plain caller. It must not inherit the callee's
+  // ZA ownership: a wrapper with `new_za` would establish a TPIDR2 save block
+  // around the call, which the kernel's own `new_za` prologue would then have
+  // to save. The target's declared attributes are the wrapper's complete ABI.
+  static constexpr llvm::StringLiteral kZaOwnershipAttributes[] = {
+      "aarch64_new_za", "aarch64_in_za", "aarch64_out_za",
+      "aarch64_inout_za", "aarch64_preserves_za"};
+  for (llvm::StringRef attribute : kZaOwnershipAttributes)
+    wrapper->removeFnAttr(attribute);
   for (const std::string &attribute : attributes)
     wrapper->addFnAttr(attribute);
   return llvm::Error::success();

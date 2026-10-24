@@ -62,7 +62,11 @@ struct MappedObjectIdentity {
 /// An empty attribute list is a no-op and does not require the wrapper to
 /// exist. A nonempty list naming a missing wrapper is an error: silently
 /// dropping a required ABI attribute would emit an object whose entry runs in
-/// the wrong streaming state.
+/// the wrong streaming state. A nonempty list also removes inherited Arm
+/// ZA-ownership attributes from the wrapper (`aarch64_new_za`, `aarch64_in_za`,
+/// `aarch64_out_za`, `aarch64_inout_za`, `aarch64_preserves_za`): the exported
+/// entry declares its own ABI, and a wrapper with ZA ownership would establish
+/// a TPIDR2 save block around the kernel.
 llvm::Error applyInvocationAttributes(llvm::Module &module,
                                       llvm::StringRef wrapperSymbol,
                                       llvm::ArrayRef<std::string> attributes);

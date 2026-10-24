@@ -367,7 +367,14 @@ attributes on the exported `_mlir_ciface_*` wrapper:
 - JIT: `MappedJitOptions.selectedTarget` already carries the contract; the
   runtime applies the same attributes.
 
-They are recorded in the identity sidecar. `checkHostRequirements` verifies
+They are recorded in the identity sidecar. A nonempty list also removes
+inherited Arm ZA-ownership attributes from the wrapper (`aarch64_new_za`,
+`aarch64_in_za`, `aarch64_out_za`, `aarch64_inout_za`,
+`aarch64_preserves_za`). MLIR's C-interface wrapper copies the kernel's
+discardable attributes; a wrapper with `new_za` would establish a `TPIDR2_EL0`
+save block around the kernel, which the kernel's own `new_za` prologue would
+then have to save. The wrapper therefore carries only the target's declared
+invocation attributes. `checkHostRequirements` verifies
 `streamingVectorLengthBits` when the host reports an SVL; a host that cannot
 report it is a refusal, not an assumed match. The runner additionally verifies
 SVL with `CNTB` under the entry shim. The JIT path is not the native evidence

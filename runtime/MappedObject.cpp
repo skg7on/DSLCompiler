@@ -54,6 +54,16 @@ llvm::Error applyInvocationAttributes(llvm::Module &module,
                                    "invocation wrapper '" +
                                        wrapperSymbol.str() +
                                        "' is missing from the LLVM module");
+  // A C-interface wrapper is a plain caller. It must not inherit the callee's
+  // ZA ownership: a wrapper with `new_za` would establish a TPIDR2 save block
+  // around the call, which the kernel's own `new_za` prologue would then have
+  // to save. The target's declared attributes are the wrapper's complete ABI
+  // contract.
+  static constexpr llvm::StringLiteral kZaOwnershipAttributes[] = {
+      "aarch64_new_za", "aarch64_in_za", "aarch64_out_za", "aarch64_inout_za",
+      "aarch64_preserves_za"};
+  for (llvm::StringRef attribute : kZaOwnershipAttributes)
+    wrapper->removeFnAttr(attribute);
   for (const std::string &attribute : attributes)
     wrapper->addFnAttr(attribute);
   return llvm::Error::success();

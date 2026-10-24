@@ -73,11 +73,17 @@ TEST(MappedCodegenRequirements, AppliesInvocationAttributesToTheWrapper) {
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), false),
       llvm::GlobalValue::ExternalLinkage, "_mlir_ciface_k", module);
   ASSERT_FALSE(wrapper->hasFnAttribute("aarch64_pstate_sm_enabled"));
+  // The wrapper may inherit ZA ownership from the kernel; the declared
+  // invocation attributes replace it.
+  wrapper->addFnAttr("aarch64_new_za");
+  wrapper->addFnAttr("aarch64_inout_za");
 
   llvm::Error error = llk::applyInvocationAttributes(
       module, "_mlir_ciface_k", {"aarch64_pstate_sm_enabled"});
   ASSERT_FALSE(static_cast<bool>(error));
   EXPECT_TRUE(wrapper->hasFnAttribute("aarch64_pstate_sm_enabled"));
+  EXPECT_FALSE(wrapper->hasFnAttribute("aarch64_new_za"));
+  EXPECT_FALSE(wrapper->hasFnAttribute("aarch64_inout_za"));
 
   // An empty attribute list is a no-op even when the wrapper is absent.
   EXPECT_FALSE(static_cast<bool>(
