@@ -289,7 +289,7 @@ emitMappedObject(PreparedMappedKernel &prepared,
 }
 ```
 
-Implement `writeMappedObjectIdentity` with `llvm::json::Object`, writing hashes as 16-digit hex strings (`llvm::formatv("{0:x}", value)`) and `targetFeatures` as an array. Add `MappedObject.cpp` to `runtime/CMakeLists.txt`.
+Implement `writeMappedObjectIdentity` with `llvm::json::Object`, writing hashes in the project's existing `llvm::formatv("{0:x}", value)` form (a `0x`-prefixed hex string, not zero-padded) and `targetFeatures` as an array. Consumers parse them with `int(value, 16)`, never by fixed width. Add `MappedObject.cpp` to `runtime/CMakeLists.txt`.
 
 - [ ] **Step 5: Wire `--emit=object` into the compiler**
 
@@ -1269,7 +1269,11 @@ In `.github/workflows/ci.yml`:
 2. Extend "Install build dependencies" with
    `qemu-user gcc-aarch64-linux-gnu`.
 3. Pass `-DLLK_BUILD_ARM_EVIDENCE=ON` to the project configure.
-4. Add a step after the build:
+4. Apply the same `X86;AArch64` target change and cache-key bump to
+   `.github/workflows/coverage.yml`, which also builds LLVM with `Native` and
+   runs the full CTest suite. `AOTObjectEmission` needs the AArch64 backend at
+   runtime, so the coverage job fails without it.
+5. Add a step after the build:
 
 ```yaml
       - name: Run Arm SVE emulated evidence
