@@ -270,8 +270,7 @@ an architecture exploration target rather than an accelerator hardware backend.
 The Arm profiles model VL=SVL=512 for static mapping and analysis. The executable
 ``arm-sve`` f32 add/multiply subset has an emulated acceptance path, and the
 executable ``arm-sme`` f32 16x16x16 initialized contraction has a native Apple M5
-acceptance path with a registered QEMU SME1 secondary runner (CI evidence
-pending). Other SME signatures, bf16/i8 SME execution, ZA preservation across
+acceptance path with a QEMU SME1 secondary runner (CI-emulated). Other SME signatures, bf16/i8 SME execution, ZA preservation across
 calls and timing remain non-executable.
 
 .. _concepts-layouts-and-movement-are-separate-decisions:

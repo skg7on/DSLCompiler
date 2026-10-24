@@ -183,8 +183,8 @@ rather than skips when either is missing.
   is x86_64. Cross-lowered artifacts plus QEMU are the strongest evidence
   available in this fleet.
 - E11 (#253) supersedes the SME half of this boundary: `arm-sme` now executes
-  the f32 16x16x16 initialized contraction on a native Apple M5 (T3), with a
-  registered QEMU SME1 runner whose CI evidence is pending. bf16/i8 SME
+  the f32 16x16x16 initialized contraction on a native Apple M5 (T3) and under
+  QEMU SME1 (T2) in CI. bf16/i8 SME
   execution, ZA preservation across calls, SME2 and calibrated timing remain
   out of scope. No ZA realization beyond the one contraction tile, no non-SME
   signature execution and no CPU-schedule retargeting is claimed. This ledger's
@@ -197,4 +197,4 @@ rather than skips when either is missing.
   and is unchanged.
 - #175 closes with E11's ledger
   (`docs/reviews/2026-10-24-arm-sme-stateful-backend-acceptance.md`), which
-  records the native T3 run and registers the QEMU T2 CI run (pending).
+  records the native T3 run and the QEMU T2 run.
