@@ -370,8 +370,11 @@ report it is a refusal, not an assumed match. The runner additionally verifies
 SVL with `CNTB` under the entry shim. The JIT path is not the native evidence
 path; the AOT object plus harness is. Consequently the JIT path refuses
 selected `arm-sme` execution on hosts without an SVL probe (including macOS),
-while AOT emission and the native harness remain supported. That refusal is
-recorded as a capability limit rather than worked around with an assumed SVL.
+while AOT emission and the native harness remain supported. On macOS,
+`llvm::sys::getHostCPUFeatures()` also does not report `sme`, so the JIT route
+refuses with "selected target requires host feature 'sme'" even on an
+SME-capable M5. That refusal is recorded as a capability limit rather than
+worked around with an assumed SVL or an assumed feature set.
 
 ## 7. Artifact and runner
 

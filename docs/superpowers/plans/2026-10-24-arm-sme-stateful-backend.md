@@ -2126,7 +2126,7 @@ git commit -m "test(execution): run the selected SME contraction natively on App
 ## Task 7: Add the QEMU SME1 evidence runner and CI job (tier T2, secondary)
 
 **Files:**
-- Modify: `test/Execution/arm_sme_evidence_common.py` (add `render_qemu_harness`)
+- Modify: `test/Execution/arm_sme_evidence_common.py` (verify the existing `render_qemu_harness` and streaming ABI shims)
 - Create: `test/Execution/arm_sme_qemu_evidence.py`
 - Modify: `test/FileCheck.cmake`
 - Modify: `.github/workflows/ci.yml`
@@ -2136,9 +2136,13 @@ git commit -m "test(execution): run the selected SME contraction natively on App
 - Consumes: Task 6's `emit_object`, `check_object_format`, `check_identity`, `check_sme_instructions`, `render_shim`
 - Produces: CTest `ArmSMEExecutionEvidence` under `LLK_BUILD_ARM_EVIDENCE`
 
-- [ ] **Step 1: Add the freestanding QEMU harness renderer**
+- [ ] **Step 1: Verify the freestanding QEMU harness renderer**
 
-Append to `test/Execution/arm_sme_evidence_common.py`:
+The common module already contains `render_qemu_harness` and the
+`__arm_sc_memcpy`/`__arm_sc_memmove` streaming ABI shims, added with Task 6's
+H25 fix. Verify the committed functions match the reference below (especially
+the `%(shims)s` placeholder and the shim calls); do not add a second copy.
+Task 7 owns the driver, CTest registration and CI only.
 
 ```python
 _QEMU_PREAMBLE = r"""
@@ -2816,7 +2820,10 @@ fails the evidence test; it is not skipped.
 - No bf16/i8 SME execution, no SME2, no multi-tile kernels, no ZA preservation
   across calls, no physical SRAM/L2/DMA realization, no calibrated timing.
 - The JIT path refuses selected `arm-sme` on hosts without an SVL probe
-  (`checkHostRequirements` never assumes SVL=512). The Python frontend's
+  (`checkHostRequirements` never assumes SVL=512). On macOS,
+  `llvm::sys::getHostCPUFeatures()` also does not report `sme`, so the JIT
+  route refuses with "selected target requires host feature 'sme'" even on an
+  SME-capable M5; the AOT path does not consult the host check. The Python frontend's
   selected-target check uses the no-vector-length overload, so it also refuses
   `arm-sve` and `arm-sme` even on capable Linux hardware; that is fail-closed
   and is left to the later frontend integration increment. The AOT object plus
