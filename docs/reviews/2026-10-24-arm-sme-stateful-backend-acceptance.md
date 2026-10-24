@@ -4,7 +4,8 @@ Implements `docs/superpowers/specs/2026-10-24-arm-sme-stateful-backend-design.md
 and `docs/superpowers/plans/2026-10-24-arm-sme-stateful-backend.md`.
 
 **Scope:** executable `arm-sme` f32 16x16x16 initialized contraction through a
-native Apple M5 run (T3, gating) and a QEMU linux-user SME1 run (T2, CI).
+native Apple M5 run (T3, gating) and an intended QEMU linux-user SME1 run
+(T2, CI, pending).
 
 ## Identity
 
@@ -84,7 +85,7 @@ fails the evidence test; it is not skipped.
 |---|---|---|---|
 | bf16 contraction selected compile | refuses; no reference fallback | pass — `ArmSMEBackend.SelectedBf16ContractionIsRefused` and the receipt's `unsupported` before any compile | pending CI |
 | i8 contraction mapping | retains no plan | pass — `ArmDtypeCoverage.UnsupportedSignaturesRetainNoPlan` (no plan, not a search cap) | pending CI |
-| missing SME | exit 70 | branch present in the native driver; not exercised on this `FEAT_SME=1` host | pending CI (`sme=off`, exit 70 expected) |
+| missing SME | exit 70 | the generated native harness implements the check and exit 70 (`host_has_sme()` reads `sysctl hw.optional.arm.FEAT_SME`); it is not exercised on this `FEAT_SME=1` host, and CMake registers the test only when `sysctl hw.optional.arm.FEAT_SME` is 1 | pending CI (`sme=off`, exit 70 expected) |
 | `smstart sm` then `zero {za}` | SIGILL | pass — `za-probe=SIGILL` (manual `za_probe` exit 132) | pending CI (`SIGILL` or `not-modeled-by-qemu` recorded) |
 | wrapper without the streaming shim | never a matching pass | pass — exit 132 (SIGILL) | pending CI |
 | wrong SVL | exit 71 | fixed at 512 and checked with `CNTB`; no wrong-SVL variant exists on this host | pending CI (`sme-default-vector-length=32`, exit 71 expected) |
@@ -92,9 +93,10 @@ fails the evidence test; it is not skipped.
 
 ## Claims and limits
 
-- T3 is native functional evidence on the recorded M5; T2 is emulated functional
-  evidence. Neither calibrates cycles, bytes, storage or timing; `micro-perf`
-  numbers remain modeled predictions.
+- T3 is native functional evidence on the recorded M5; T2 is the intended
+  emulated functional evidence, recorded once the T2 run executes. Neither
+  calibrates cycles, bytes, storage or timing; `micro-perf` numbers remain
+  modeled predictions.
 - The native T3 run is not reproducible in CI. CI is set up to prove T2; the
   first CI run of `ArmSMEExecutionEvidence` is the T2 evidence and is not yet
   recorded. The T3 record is pinned by the host, toolchain and artifact digests
