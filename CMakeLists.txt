@@ -24,6 +24,15 @@ endif()
 
 option(LLK_BUILD_TOOLS "Build the LLK command-line tools" ON)
 option(LLK_BUILD_E2E_TESTS "Build end-to-end JIT tests" ON)
+option(LLK_BUILD_PYTHON_CAPI
+       "Build the shared C ABI the Python frontend loads with ctypes" OFF)
+
+# LLKFrontendCAPI is a shared library over the project's static archives, and a
+# shared library can only link position-independent objects. Enable PIC for the
+# libraries built below rather than rebuilding each archive with it.
+if(LLK_BUILD_PYTHON_CAPI)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 
 include(cmake/LLKDependencies.cmake)
 include(cmake/LLKBuildOptions.cmake)
