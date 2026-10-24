@@ -103,4 +103,39 @@ TEST(ArmSMEBackend, SelectedBf16ContractionIsRefused) {
       << message;
 }
 
+TEST(ArmSMEBackend, SelectedContractionLowersToArmSME) {
+  auto fixture = arm_test::mapFixture("arm-sme", kContraction);
+  ASSERT_TRUE(static_cast<bool>(fixture))
+      << llvm::toString(fixture.takeError());
+  mlir::OwningOpRef<mlir::ModuleOp> source =
+      mlir::cast<mlir::ModuleOp>(fixture->source->clone());
+  llk::MappedCompileOptions options;
+  options.entrySymbol = "arm_contraction";
+  options.backend = llk::MappedBackend::SelectedTarget;
+  options.stop = llk::MappedStop::Lowered;
+  llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
+      *source, *fixture->target, fixture->plan, options);
+  ASSERT_TRUE(static_cast<bool>(compiled))
+      << llvm::toString(compiled.takeError());
+  EXPECT_GE(compiled->backendGroupsRealized, 1u);
+  EXPECT_EQ(compiled->referenceGroupsLowered, 0u);
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  compiled->module->print(stream);
+  // The ArmSME conversion consumes the vector contraction and leaves the
+  // dialect's SME intrinsic operations; the movement copies are already loops.
+  // Those operations become `llvm.aarch64.sme.*` calls only when the module is
+  // translated to LLVM IR, which is the executable step after this artifact,
+  // so the artifact is checked in its own dialect here.
+  EXPECT_NE(text.find("arm_sme.intr.mopa"), std::string::npos) << text;
+  EXPECT_EQ(text.find("vector.contract"), std::string::npos) << text;
+  EXPECT_EQ(text.find("vector.outerproduct"), std::string::npos) << text;
+  // The kernel owns PSTATE.SM and a fresh ZA array. `enable-arm-streaming`
+  // records them as MLIR attributes; the LLVM translation names the same two
+  // facts `aarch64_pstate_sm_enabled` and `aarch64_new_za`.
+  EXPECT_NE(text.find("llvm.arm_streaming"), std::string::npos) << text;
+  EXPECT_NE(text.find("llvm.arm_new_za"), std::string::npos) << text;
+}
+
 } // namespace
