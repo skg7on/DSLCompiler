@@ -175,6 +175,18 @@ runMappedTuningSession(ModuleOp source, const perf::SearchSpace &space,
                        const mapping::MappingTarget &target,
                        const MappedTuningOptions &options = {});
 
+/// Complete a retained contract-based selection through the same native
+/// compiler. Re-instantiation, source/binding/target/plan identity and complete
+/// ownership receipts must agree before JIT compilation. The returned artifact
+/// owns its executable and a verified bound-MicroIR inspection string; no MLIR
+/// object borrows from the temporary candidate instance.
+llvm::Expected<::llk::MappedCompilation>
+compileMappedTuningSelection(ModuleOp source, const perf::SearchSpace &space,
+                             const workload::WorkloadContract &contract,
+                             const mapping::MappingTarget &target,
+                             const MappedTuningCandidate &selected,
+                             const MappedTuningOptions &options);
+
 } // namespace mlir::llk::tuning
 
 #endif

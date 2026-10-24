@@ -11,7 +11,8 @@ capability reporting. The
 :source:`environment verification record <docs/reviews/2026-10-19-pf01-python-environment.md>`
 pins the implementation and validation evidence.
 
-Native frontend compilation and invocation remain unavailable. Calling the
+Python frontend compilation and invocation remain unavailable. PF06 exposes a
+native C++ compilation/invocation service described below. Calling the
 ``llk`` Dynamo backend raises ``UnsupportedFeatureError`` with code
 ``native_backend_unavailable``. Real ``torch.compile`` wraps this in
 ``BackendCompilerFailed.inner_exception``. The registration tests verify this
@@ -30,8 +31,8 @@ PF03 (`#214 <https://github.com/skg7on/DSLCompiler/issues/214>`__) adds the
 ``NumericalContract``, ``CompileOptions``, ``CompileRequest`` and
 ``CompilationReport`` records. Mappings and sequences are copied into immutable
 snapshots. This API validates authored programs and binds arguments; PF04 captures
-supported Python source into those records. Native compilation remains a later
-milestone.
+supported Python source into those records. PF06 adds native C++ compilation;
+the Python bridge remains a later milestone.
 
 ``bind_kernel(fn, args, kwargs, grid, options)`` returns a ``KernelBinding`` with
 ports in signature order, bound constexprs, accepted immutable closure/global
@@ -214,8 +215,8 @@ become singleton search domains with source-owned roles ``axis:d0`` and
 
 The explicit public/native port map preserves signature order. Native adapter
 ports are two read inputs, an internal no-read destination (port 2), and the
-write output (port 3). The destination is not a public buffer. PF06/runtime work
-must allocate separate owned scratch for it. The MLIR context must outlive the
+write output (port 3). The destination is not a public buffer. PF06 allocates separate owned scratch
+for it. The MLIR context must outlive the
 imported module. This API establishes structured import and source realization;
 Python native compilation/invocation remains unavailable.
 
@@ -228,6 +229,63 @@ Native tests consume both the literal PF03 request and live PF04 add, multiply
 and nested-loop capture requests generated with Python 3.11+ during the test
 build. No Torch or upstream Triton is needed for these fixtures. See the
 :source:`PF05 verification record <docs/reviews/2026-10-23-pf05-native-import.md>`.
+
+Shared native compilation and invocation
+----------------------------------------
+
+PF06 (`#217 <https://github.com/skg7on/DSLCompiler/issues/217>`__) adds
+``llk::frontend::compileFrontend(request) -> Expected<FrontendCompilation>``.
+The service imports the checked request, uses the workload-contract overload of
+``runMappedTuningSession`` and retains one candidate under explicit deterministic
+search limits. It never translates elementwise work into synthetic contraction
+extents. Initial retention is ``top_k=1``; wider requests fail explicitly.
+
+Target packages load only the request's frozen ``config_files`` snapshot,
+materialized in a private temporary directory for the existing registered target
+factory. ``config_root`` remains part of request identity; its live contents are
+never a fallback. Supply the target's machine/layout/rule files in their package
+relative paths. Empty or invalid snapshots fail before native compilation.
+
+The shared ``compileMappedTuningSelection`` completion helper re-instantiates the
+retained source and checks source, binding, graph, target and plan identities,
+plus complete source/mapping ownership receipts, before calling
+``compileMappedKernel``. Changed source, binding or target content and stale plan
+or receipt records reject. Existing CLI/replay and capability formats remain the
+native contracts; no separate search or optimizer is introduced.
+
+``FrontendCompilation`` owns the executable, report/inspection strings and
+independent internal destination storage. ``invoke(inputs, outputs)`` takes
+typed ``InvocationBuffer2D`` records in public signature order, filtered by input
+and output direction. It adds the private no-read destination to native input
+port 2, then calls ``MappedExecutable::invoke`` with the existing allocation,
+shape, dtype, compact-layout and disjointness checks. Calls on one compilation
+are serialized. The caller retains public buffers until the synchronous call
+returns; no input copy or dtype conversion occurs.
+
+``report()`` contains the full native request identity, compiler/workload/target/
+plan/ABI identities, actual native group and search counters, source bindings,
+ownership receipts, public/native adaptation and CapabilityReceipt v2. It is a
+compilation snapshot: invocation remains ``not_checked`` there. Reference and
+selected-target execution have different identities. Selected mode checks the
+target's declared ISA and never substitutes reference execution. Native counters
+are preserved as defined by the compiler; a reference backend does not imply a
+positive ``referenceGroupsLowered`` counter when all semantic emitter groups
+lowered before the portable backend.
+
+``inspect("frontend")``, ``inspect("llk")`` and ``inspect("micro")`` return owned
+request, structured source and verified bound MicroIR text. The bound text is
+captured once inside the shared compiler before lowering consumes the module.
+Unavailable stages, including ``asm``, report ``inspection_unavailable``. No MLIR
+object escapes the service's context lifetime. This C++ service does not yet
+provide a C ABI or Python launch; those remain PF07/PF08.
+
+.. code-block:: sh
+
+   cmake --build build --target LLKFrontendTests
+   build/bin/LLKFrontendTests --gtest_filter='FrontendCompiler.*'
+
+See the :source:`PF06 verification record <docs/reviews/2026-10-24-pf06-native-compilation.md>`
+for actual reference/selected lanes and native guard results.
 
 Legacy Triton safety boundary
 -----------------------------

@@ -71,6 +71,9 @@ struct MappedCompileOptions {
   MappedBackend backend = MappedBackend::Reference;
   /// Optional observer for the exact LLVM input handed to the mapped JIT.
   MappedJitEvidenceSink evidenceSink;
+  /// Preserve the verified bound MicroIR as owned inspection text before
+  /// lowering consumes it. Off for ordinary tuning/compilation calls.
+  bool captureMappedMicroIR = false;
 };
 
 /// What a mapped compilation produced.
@@ -110,6 +113,7 @@ struct MappedCompilation {
   std::string targetName;
   /// Compiler, target, math mode, and host/ISA contract identity.
   std::string executionIdentity;
+  std::string mappedMicroIR;
 };
 
 /// Runs the shared mapped-compilation sequence over `source`.
