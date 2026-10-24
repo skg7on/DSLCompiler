@@ -36,7 +36,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libgtest-dev
+          sudo apt-get install -y ninja-build libgtest-dev qemu-user gcc-aarch64-linux-gnu
 
       - name: Download LLVM source
         run: |
@@ -52,7 +52,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.LLVM_BUILD }}
-          key: llvm-build-${{ env.LLVM_VERSION }}-shared-v3
+          key: llvm-build-${{ env.LLVM_VERSION }}-shared-v4
 
       - name: Build LLVM
         if: steps.cache-llvm-build.outputs.cache-hit != 'true'
@@ -61,7 +61,7 @@ jobs:
           cmake $LLVM_SOURCE/llvm -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS=mlir \
-            -DLLVM_TARGETS_TO_BUILD=Native \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
             -DLLVM_BUILD_LLVM_DYLIB=ON \
             -DLLVM_LINK_LLVM_DYLIB=ON \
             -DLLVM_DYLIB_COMPONENTS=all \
@@ -93,10 +93,17 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLK_BUILD_TOOLS=ON \
             -DLLK_BUILD_E2E_TESTS=ON \
-            -DLLK_BUILD_PYTHON_CAPI=ON
+            -DLLK_BUILD_PYTHON_CAPI=ON \
+            -DLLK_BUILD_ARM_EVIDENCE=ON
 
       - name: Build
         run: cd build && ninja
+
+      - name: Run Arm SVE emulated evidence
+        run: |
+          cd build
+          set -o pipefail
+          ctest -R '^ArmSVEExecutionEvidence$' --no-tests=error --output-on-failure 2>&1 | tee arm-sve-evidence.log
 
       - name: Run selected AVX2 acceptance
         run: |
@@ -134,3 +141,5 @@ jobs:
             build/test/SelectedVectorWidth/selected-fused.mlir
             build/selected-execution-evidence/*
             build/prediction-validation-evidence/
+            build/arm-sve-evidence.log
+            build/test/ArmSVEExecutionEvidence/

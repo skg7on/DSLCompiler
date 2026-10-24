@@ -603,8 +603,9 @@ Limits and guidance
   change generated IR.
 * A predicted cost from a schedule record is not a measurement. Missing
   measurements are recorded as absent, never as zero.
-* ``schedules/aarch64_sve/`` is empty on purpose. Arm SVE currently has mapping
-  policy and a machine profile, not a schedule database or executable backend.
+* ``schedules/aarch64_sve/`` is empty on purpose. Arm SVE has mapping policy, a
+  machine profile and an executable f32 add/multiply subset with an emulated
+  (not native) acceptance path, but no schedule database.
 
 .. seealso::
 

@@ -11,8 +11,8 @@ available while the newer mapped path is being strengthened. Use this page to
 choose a workflow and understand what a successful run proves.
 
 This summary reflects merged PR #133 (2026-10-11, merge ``5ee61b1``), the
-generic framework increments A–D, and the bounded Arm SVE/SME static mapping
-increment E1–E7. The revision-pinned
+generic framework increments A–D, the bounded Arm SVE/SME static mapping
+increment E1–E7, and the E10 executable f32 SVE subset. The revision-pinned
 :source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
 records capability-based acceptance, exact test counts and retained limits.
 The :source:`Arm static acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`
@@ -88,7 +88,7 @@ What you can do today
      - :doc:`Tuner </tools/tuning>`, :doc:`Compiler </tools/compiler>`
    * - Report stage-specific capabilities
      - Capability receipts for structure, interpretation, mapping, physical plan, reference lowering, selected lowering, ABI eligibility, preparation, host compatibility and invocation, keyed by source/contract/target/plan identity
-     - ``supported``, ``unsupported`` and ``not_checked`` are distinct; printing a static receipt never runs lowering or JIT; a reference-backend run leaves selected lowering ``not_checked``
+     - ``supported``, ``unsupported`` and ``not_checked`` are distinct; printing a static receipt never runs lowering or JIT; a reference-backend run leaves selected lowering ``not_checked``; a selected compilation credits selected lowering only when it realized target groups without a reference fallback
      - :doc:`Architecture </architecture>`, :source:`conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
    * - Validate composed primitives and reduction
      - Direct 8x8→8 sum and add→multiply; selected AVX2 Vector reduction/vector IR; operation-aware target coverage before ranking
@@ -114,9 +114,9 @@ What you can do today
      - Generic accelerator topology, layouts, rules and mapping through the same canonical IR; static f32 add/mul/sum coverage with operation-aware validation
      - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered; accelerator mul/sum emitters verify only
      - :doc:`Mapping tutorial </tutorials/02-mapping>`
-   * - Map Arm SVE and SME statically
+   * - Map Arm SVE and SME statically, and run the SVE f32 subset
      - Both target names load a bounded machine profile and typed LLKMap policy, then map direct-MicroIR fixtures: f32/bf16 M=N=K=16 contraction, typed f32/bf16/i8 add and multiply, both bf16↔f32 conversions, f32 SiLU and reduce sum, and the fused convert→SiLU→multiply graph. Selected plans report concrete vector or matrix engine and accumulator identities, verify, replay from the reported plan id and analyze
-     - Static mapping and analysis only, at modeled VL=SVL=512: no executable SVE/SME, physical ZA realization, calibrated timing or automatic retargeting of CPU schedules. Emitters refuse lowering, and selected-target compilation is rejected
+     - Static mapping and analysis at modeled VL=SVL=512, plus an executable ``arm-sve`` f32 add/multiply subset with an emulated AArch64 acceptance path: a cross-compiled static object run under ``qemu-aarch64``. No native SVE execution, SME execution, physical ZA realization, calibrated timing or automatic retargeting of CPU schedules. Other signatures and all ``arm-sme`` lowering remain unimplemented, and selected-target compilation is rejected for them
      - :source:`Acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`, :doc:`Optimizer </tools/optimizer>`
 
 The broader goal does not imply arbitrary DNN support today. The LLK-to-Micro

@@ -1,6 +1,7 @@
 add_llk_test_category(Mapping
     SOURCES
         stable_hash.cpp
+        codegen_requirements.cpp
         cost_model.cpp
         search_binding.cpp
         workload_graph.cpp
@@ -15,6 +16,7 @@ add_llk_test_category(Mapping
         avx2_target.cpp
         arm_policy.cpp
         arm_targets.cpp
+        arm_sve_backend.cpp
         arm_target_fixture.cpp
         arm_placement.cpp
         generic_accelerator_target.cpp

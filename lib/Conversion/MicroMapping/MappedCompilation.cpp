@@ -357,7 +357,11 @@ lowerSelectedOperations(mlir::ModuleOp module, const MappingTarget &target,
   for (auto &[instance, group] : groups) {
     TargetLoweringContext context{target.machine(), group.placements,
                                   group.connections, instance};
-    if (!group.emitter->hasLowering()) {
+    // A key with a lowering may still not implement this group's signature.
+    // Ask about the covered group rather than the key: an unimplemented
+    // signature stays on the portable reference bridge, exactly as if the
+    // emitter had no lowering for it, instead of failing a reference run.
+    if (!group.emitter->hasLoweringFor(group.operations)) {
       compilation.referenceLowered += group.operations.size();
       ++compilation.referenceGroupsLowered;
       continue;

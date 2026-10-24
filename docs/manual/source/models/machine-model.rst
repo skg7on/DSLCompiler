@@ -39,7 +39,7 @@ Shipped profiles
    * - :source:`arm-sve-v2.yaml <machines/arm-sve-v2.yaml>`
      - ``arm-sve``
      - 8 workers with 512-bit vector engines; no matrix engine
-     - Static mapping/analysis at modeled VL=512
+     - Static mapping/analysis at modeled VL=512; executable f32 add/multiply subset (emulated, not native)
    * - :source:`arm-sme-v2.yaml <machines/arm-sme-v2.yaml>`
      - ``arm-sme``
      - 512-bit SVE plus a modeled matrix engine

@@ -118,9 +118,10 @@ Boundaries worth remembering
 ----------------------------
 
 * **A profile is not a backend.** ``machines/arm-sve-v2.yaml`` supports static
-  mapping and analysis; it does not execute SVE instructions. Only the AVX2
-  package has a selected-target execution path, and only on a compatible
-  x86_64 host.
+  mapping and analysis, plus an executable f32 add/multiply subset reached
+  through a cross-compiled object and an emulated (not native) AArch64 runner;
+  it does not execute SVE instructions natively. Only the AVX2 package has a
+  native selected-target execution path, and only on a compatible x86_64 host.
 * **A rule is not a cost proof.** Selecting a bundle says the target declares an
   implementation and an emitter. Whether that emitter lowers, and whether the
   code matches the modeled cost, are separate questions answered by target

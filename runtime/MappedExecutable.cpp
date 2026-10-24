@@ -55,28 +55,24 @@
 #include "llvm/TargetParser/Host.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 
-llvm::Error mlir::llk::mapping::checkHostRequirements(
-    const TargetCodegenRequirements &requirements,
-    llvm::StringRef hostArchitecture,
-    const llvm::StringMap<bool> &hostFeatures) {
-  if (!requirements.architecture.empty() &&
-      requirements.architecture != hostArchitecture)
-    return llvm::createStringError(
-        llvm::inconvertibleErrorCode(),
-        "selected target requires architecture '" + requirements.architecture +
-            "' but host architecture is '" + hostArchitecture.str() + "'");
-  for (const std::string &feature : requirements.requiredFeatures) {
-    auto available = hostFeatures.find(feature);
-    if (available == hostFeatures.end() || !available->second)
-      return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                     "selected target requires host feature '" +
-                                         feature + "'");
-  }
-  return llvm::Error::success();
-}
+#if defined(__linux__) && defined(__aarch64__)
+#include <sys/auxv.h>
+#include <sys/prctl.h>
+
+// Not every libc's <sys/auxv.h> declares the AArch64 SVE capability bit.
+#ifndef HWCAP_SVE
+#define HWCAP_SVE (1 << 22)
+#endif
+
+namespace {
+/// prctl() request code for PR_SVE_GET_VL.
+constexpr int kPrSveGetVl = 51;
+} // namespace
+#endif
 
 namespace llk {
 
@@ -87,6 +83,24 @@ using llvm::StringError;
 
 llvm::Error abiError(const std::string &message) {
   return llvm::make_error<StringError>(message, inconvertibleErrorCode());
+}
+
+/// The host's implemented vector length, when the platform can report one.
+///
+/// A target whose code assumes a particular length cannot be run on a host
+/// whose length differs, and an unreported length is not evidence of a match.
+std::optional<int64_t> detectHostVectorLengthBits() {
+#if defined(__linux__) && defined(__aarch64__)
+  unsigned long hwcap = getauxval(AT_HWCAP);
+  if (!(hwcap & HWCAP_SVE))
+    return std::nullopt;
+  long value = prctl(kPrSveGetVl, 0, 0, 0, 0);
+  if (value < 0)
+    return std::nullopt;
+  return mlir::llk::mapping::vectorLengthBitsFromPrctl(value);
+#else
+  return std::nullopt;
+#endif
 }
 
 /// Renders a type the way the ABI records it, for a diagnostic that names what
@@ -393,7 +407,8 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
     else if (hostArchitecture == "amd64")
       hostArchitecture = "x86_64";
     if (llvm::Error error = mlir::llk::mapping::checkHostRequirements(
-            *options.selectedTarget, hostArchitecture, hostFeatures))
+            *options.selectedTarget, hostArchitecture, hostFeatures,
+            detectHostVectorLengthBits()))
       return error;
     if (hostFeatures.empty())
       return abiError("cannot detect host CPU features for selected-target "

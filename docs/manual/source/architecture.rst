@@ -243,9 +243,11 @@ The shipped packages are :source:`x86-avx2 <mapping/x86-avx2>`,
 :source:`arm-sve <mapping/arm-sve>` and :source:`arm-sme <mapping/arm-sme>`, with
 corresponding :source:`machine profiles <machines>`. The generic accelerator
 demonstrates mapping onto an accelerator-shaped topology. The Arm packages are
-static mapping and analysis targets at modeled VL=SVL=512: their emitters verify
-opaque bundles and refuse lowering, so none of these three executes its modeled
-hardware. The :source:`Arm acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`
+static mapping and analysis targets at modeled VL=SVL=512, plus an executable
+``arm-sve`` f32 add/multiply subset that has an emulated (not native) acceptance
+path; SME, ZA, other signatures and timing remain non-executable, and none of
+these three packages supplies native hardware execution. The
+:source:`Arm acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`
 records their exact static domain and limits.
 See the :source:`formal LLKMap syntax <docs/design/llkmap-syntax.md>` and its
 :source:`EBNF <docs/design/llkmap.ebnf>` when authoring policy. The

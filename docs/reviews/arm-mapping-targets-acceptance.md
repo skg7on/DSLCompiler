@@ -158,6 +158,8 @@ nothing survived a cap and nothing was hidden by one.
 
 ## Static-only boundary
 
+As delivered by E1–E7:
+
 - Every ARM emitter reports `hasLowering() == false`; a valid bundle's `lower()`
   returns `target_lowering_unsupported`.
 - Neither package supplies codegen requirements, and `llk-compile` rejects
@@ -165,6 +167,18 @@ nothing survived a cap and nothing was hidden by one.
 - Static bind/report tests assert physical completeness separately and never
   require executable lowering. Reference execution is not counted as selected
   ARM evidence.
+
+Framework E10 (issue #184) changes part of that boundary for `arm-sve` only.
+`llk-compile` now rejects selected-target compilation for signatures without an
+implemented emitter; the f32 add/multiply subset is executable as of E10. The
+package publishes an AArch64 `+sve` code-generation contract, and that subset
+has an emulated AOT acceptance path: a cross-compiled static object run under
+`qemu-aarch64`. The emulated run is functional evidence at the modeled vector
+length, not a measurement. Every other `arm-sve` emitter key still reports
+`hasLowering() == false`, every other dtype still counts as reference-lowered,
+and a selected run refuses such a kernel rather than reporting reference code
+as target execution. `arm-sme` is unchanged: it supplies no codegen contract
+and selected-target compilation is still rejected.
 
 ## CLI parity and frozen replay (E7)
 
@@ -220,12 +234,18 @@ ninja -C build check-llk
 - `arm-sve` and `arm-sme` are static mapping and analysis targets at modeled
   VL=SVL=512. The deliverable is a complete, verified, replayable and analyzed
   plan over the bounded direct-MicroIR domain above.
-- No executable SVE/SME code, native or emulated ARM execution, physical ZA
-  allocation or addressing, length-agnostic semantics, calibrated timing or
-  automatic retargeting of CPU schedules is delivered or implied. The SVE
-  profile's vector-contraction selection does not make its vector engine a
-  matrix engine, and the SME ZA model is storage accounting, not an instruction
-  semantic.
+- The `arm-sve` f32 add/multiply subset is executable as of E10 through an
+  emulated AArch64 acceptance path (a cross-compiled static object run under
+  `qemu-aarch64`). That path is functional evidence, not a measurement, and it
+  does not widen this static ledger's delivery: no native SVE execution, no SME
+  execution, no physical ZA allocation or addressing, no length-agnostic
+  semantics, no calibrated timing and no automatic retargeting of CPU schedules
+  is delivered or implied. The SVE profile's vector-contraction selection does
+  not make its vector engine a matrix engine, and the SME ZA model is storage
+  accounting, not an instruction semantic.
+- Every `arm-sve` signature outside the executable f32 add/multiply subset, and
+  every `arm-sme` signature, remains static mapping and analysis. Their selected
+  lowering is rejected rather than emulated.
 - Small direct fixtures do not establish arbitrary DNN support. Both targets
   still need their own packages, and neither replaces the AVX2 executable path.
 - The executable-target baseline is unchanged. The selected-versus-reference
@@ -233,5 +253,5 @@ ninja -C build check-llk
   still governs AVX2 execution, and this ledger neither reclassifies reference
   runs nor revises that historical record.
 - Closing this static increment does not close #175. Its executable-backend
-  workstream (E9, #184) must compare fixed-VL execution, length-agnostic
+  workstream (E10, #184) must compare fixed-VL execution, length-agnostic
   semantics and SME stateful lowering, and must publish its own evidence.

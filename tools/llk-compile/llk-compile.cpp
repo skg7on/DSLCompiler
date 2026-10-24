@@ -17,6 +17,7 @@
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/MappedCompilation.h"
+#include "LLK/Conversion/MappedKernelAbi.h"
 #include "LLK/Conversion/TritonToLLK/GridToForall.h"
 #include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
 #include "LLK/Conversion/Workload/SourceAdapter.h"
@@ -29,6 +30,7 @@
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Runtime/JitCache.h"
+#include "LLK/Runtime/MappedObject.h"
 #include "LLK/Target/MappingTargets.h"
 #include "LLK/Transforms/ForallToLLRT.h"
 #include "LLK/Transforms/FuseDoubleContraction.h"
@@ -39,6 +41,7 @@
 #include "LLK/Transforms/SerialParallelDispatch.h"
 #include "LLK/Transforms/ShapeSpecialization.h"
 #include "LLK/Transforms/TileAndVectorize.h"
+#include "LLK/Version.h"
 
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
@@ -87,6 +90,11 @@
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
 #if LLVM_VERSION_MAJOR >= 21
 using BufOpts = mlir::bufferization::OneShotBufferizePassOptions;
 #else
@@ -106,8 +114,9 @@ static cl::opt<int64_t> optK("K", cl::desc("K dimension (hidden)"),
 static cl::opt<std::string> emitMode(
     "emit",
     cl::desc("What to emit: llvm (JIT-compile, the default), mlir (print the "
-             "fully lowered module), micro (print concrete Micro-IR), or "
-             "micro-search (print the tile search space)"),
+             "fully lowered module), micro (print concrete Micro-IR), "
+             "micro-search (print the tile search space), or object (write an "
+             "AOT object for --target-triple)"),
     cl::init("llvm"));
 
 // ---------------------------------------------------------------------------
@@ -171,6 +180,29 @@ static cl::opt<std::string> mappingPlanReport(
     cl::desc("Replay the frozen selection in this plan report instead of "
              "searching. The report's graph and target hashes must match."),
     cl::init(""));
+
+// ---------------------------------------------------------------------------
+// AOT object emission (Framework E10)
+// ---------------------------------------------------------------------------
+//
+// The compiled artifact is target-neutral: a triple and its features decide
+// the object, and the sidecar records the identity that will be checked
+// against it. These flags apply only to `--emit=object`.
+
+static cl::opt<std::string>
+    emitOutput("output", cl::desc("Output path for --emit=object"),
+               cl::init(""));
+static cl::opt<std::string>
+    emitTargetTriple("target-triple",
+                     cl::desc("Target triple for --emit=object"), cl::init(""));
+static cl::opt<std::string> emitTargetFeatures(
+    "target-features",
+    cl::desc("Comma-separated LLVM features for --emit=object, e.g. +sve"),
+    cl::init(""));
+static cl::opt<std::string>
+    emitIdentity("emit-identity",
+                 cl::desc("Write the AOT identity JSON record to this path"),
+                 cl::init(""));
 
 // ---------------------------------------------------------------------------
 // Pipeline
@@ -377,12 +409,23 @@ static int runMappedCompilation(mlir::ModuleOp module,
                                 mlir::MLIRContext &context) {
   mlir::llk::target::registerAllMappingTargets();
 
+  // Validate the caller's stop before object mode overrides it: an invalid
+  // value must be a diagnostic, not silently replaced by the forced stop.
   std::optional<llk::MappedStop> stop = parseStop(mappingStop);
   if (!stop) {
     llvm::errs() << "Unsupported --mapping-stop=" << mappingStop
                  << "; expected mapped-micro, target-lowered, lowered, or "
                     "executable\n";
     return 1;
+  }
+  // An AOT object is translated from the lowered module: it is the same
+  // `--mapping-stop=lowered` artifact the JIT path starts from. Asking for
+  // `executable` would hand the module to the JIT and leave nothing to emit,
+  // so the stop is forced and the report says which one actually ran. Only a
+  // valid caller request reaches here.
+  if (emitMode == "object") {
+    mappingStop = "lowered";
+    stop = llk::MappedStop::Lowered;
   }
   std::optional<llk::MappedBackend> backend = parseBackend(mappingBackend);
   if (!backend) {
@@ -634,6 +677,87 @@ static int runMappedCompilation(mlir::ModuleOp module,
                           capabilities))
                << "\n";
 
+  if (emitMode == "object") {
+    llvm::Expected<llk::PreparedMappedKernel> prepared =
+        llk::prepareMappedKernelForInvocation(*compiled->module,
+                                              options.entrySymbol);
+    if (!prepared) {
+      llvm::errs() << llvm::toString(prepared.takeError()) << "\n";
+      return 1;
+    }
+    std::vector<std::string> features;
+    llvm::SmallVector<llvm::StringRef> split;
+    llvm::StringRef(emitTargetFeatures).split(split, ',');
+    for (llvm::StringRef feature : split)
+      if (!feature.empty())
+        features.push_back(feature.str());
+    llk::MappedObjectOptions objectOptions;
+    objectOptions.triple = emitTargetTriple;
+    objectOptions.features = std::move(features);
+    std::error_code error;
+    llvm::raw_fd_ostream objectFile(emitOutput, error);
+    if (error) {
+      llvm::errs() << error.message() << "\n";
+      return 1;
+    }
+    llvm::Expected<std::string> wrapper =
+        llk::emitMappedObject(*prepared, objectOptions, objectFile);
+    if (!wrapper) {
+      llvm::errs() << llvm::toString(wrapper.takeError()) << "\n";
+      if (objectFile.has_error())
+        objectFile.clear_error();
+      return 1;
+    }
+    // A full disk or a closed descriptor must fail the run: printing the
+    // wrapper symbol after a failed write would claim an artifact that is not
+    // there. Clear the flag so the stream's destructor does not abort.
+    if (objectFile.has_error()) {
+      llvm::errs() << "cannot write AOT object '" << emitOutput
+                   << "': " << objectFile.error().message() << "\n";
+      objectFile.clear_error();
+      return 1;
+    }
+    llk::MappedObjectIdentity record;
+    record.compilerVersion = LLK_COMPILER_VERSION;
+    record.llvmVersion = LLVM_VERSION_STRING;
+    record.targetTriple = emitTargetTriple;
+    record.targetFeatures = objectOptions.features;
+    record.entrySymbol = prepared->entrySymbol;
+    record.wrapperSymbol = *wrapper;
+    record.abiVersion = prepared->abi.version;
+    record.abiHash = llk::computeKernelAbiHash(prepared->abi);
+    record.sourceGraphHash = sourceGraphHash;
+    record.planId = compiled->planId;
+    record.machineHash = compiled->machineHash;
+    record.targetHash = compiled->targetHash;
+    record.selectedGroupsVerified = compiled->selectedGroupsVerified;
+    record.backendGroupsRealized = compiled->backendGroupsRealized;
+    record.referenceGroupsLowered = compiled->referenceGroupsLowered;
+    record.executionIdentity = compiled->executionIdentity;
+    llvm::raw_fd_ostream identityFile(emitIdentity, error);
+    if (error) {
+      llvm::errs() << error.message() << "\n";
+      return 1;
+    }
+    if (llvm::Error writeError =
+            llk::writeMappedObjectIdentity(record, identityFile)) {
+      llvm::errs() << llvm::toString(std::move(writeError)) << "\n";
+      if (identityFile.has_error())
+        identityFile.clear_error();
+      return 1;
+    }
+    if (identityFile.has_error()) {
+      llvm::errs() << "cannot write AOT identity '" << emitIdentity
+                   << "': " << identityFile.error().message() << "\n";
+      identityFile.clear_error();
+      return 1;
+    }
+    llvm::outs() << "aot: object=" << emitOutput << " wrapper=" << *wrapper
+                 << " triple=" << emitTargetTriple
+                 << " stop=" << mappingStop.getValue() << "\n";
+    return 0;
+  }
+
   if (compiled->stopped != llk::MappedStop::Executable) {
     compiled->module->print(llvm::outs());
     llvm::outs() << "\n";
@@ -693,10 +817,43 @@ int main(int argc, char **argv) {
 
   const std::string emit = emitMode.getValue();
   if (emit != "llvm" && emit != "mlir" && emit != "micro" &&
-      emit != "micro-search") {
+      emit != "micro-search" && emit != "object") {
     llvm::errs() << "Unsupported --emit=" << emit
-                 << "; expected llvm, mlir, micro, or micro-search\n";
+                 << "; expected llvm, mlir, micro, micro-search, or object\n";
     return 1;
+  }
+  if (emit == "object" && mappingTargetName.empty()) {
+    llvm::errs() << "--emit=object requires --mapping-target\n";
+    return 1;
+  }
+  if (emit == "object" && (emitOutput.empty() || emitTargetTriple.empty() ||
+                           emitIdentity.empty())) {
+    llvm::errs() << "--emit=object requires --output, --target-triple and "
+                    "--emit-identity\n";
+    return 1;
+  }
+  if (emit == "object" && emitOutput == emitIdentity) {
+    // The object would overwrite its own identity record (or the reverse), so
+    // neither artifact would survive intact.
+    llvm::errs() << "--output and --emit-identity must name different paths\n";
+    return 1;
+  }
+  if (emit != "object") {
+    // These flags describe the AOT object contract only. Ignoring them on
+    // another path would silently drop what the caller asked for, so name the
+    // offending flag instead.
+    const std::pair<const char *, const std::string *> objectOnlyFlags[] = {
+        {"--output", &emitOutput.getValue()},
+        {"--target-triple", &emitTargetTriple.getValue()},
+        {"--target-features", &emitTargetFeatures.getValue()},
+        {"--emit-identity", &emitIdentity.getValue()},
+    };
+    for (const auto &flag : objectOnlyFlags) {
+      if (!flag.second->empty()) {
+        llvm::errs() << flag.first << " applies only to --emit=object\n";
+        return 1;
+      }
+    }
   }
   if (!mappingSourceAdapter.empty() && mappingTargetName.empty()) {
     llvm::errs() << "--source-adapter applies only to the mapped compilation "

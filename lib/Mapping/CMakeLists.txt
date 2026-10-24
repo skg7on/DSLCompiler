@@ -1,5 +1,6 @@
 add_llk_library(LLKMapping
     StableHash.cpp
+    CodegenRequirements.cpp
     Diagnostics.cpp
     TileFacts.cpp
     StoragePlan.cpp

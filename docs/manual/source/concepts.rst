@@ -267,8 +267,9 @@ static :source:`Arm SVE <machines/arm-sve-v2.yaml>` and
 schema and canonical IR. The :doc:`machine model guide </models/machine-model>`
 documents every key and the queries mapping asks it. The generic accelerator is
 an architecture exploration target rather than an accelerator hardware backend,
-and the Arm profiles model VL=SVL=512 for static mapping and analysis only —
-they do not establish executable SVE/SME or physical ZA behavior.
+and the Arm profiles model VL=SVL=512 for static mapping and analysis, plus the
+executable ``arm-sve`` f32 add/multiply subset with an emulated (not native)
+acceptance path; SME, ZA, other signatures and timing remain non-executable.
 
 .. _concepts-layouts-and-movement-are-separate-decisions:
 
