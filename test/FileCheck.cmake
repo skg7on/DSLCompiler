@@ -319,6 +319,30 @@ if(LLK_BUILD_TOOLS)
           $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
           ${CMAKE_CURRENT_BINARY_DIR}/AOTObjectEmission
   )
+  # Framework E11 (#253): the native Apple M5 T3 evidence. Register only on an
+  # arm64 macOS host that advertises SME; a host without SME does not register
+  # the test, and a registered run fails rather than skips.
+  if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
+    execute_process(COMMAND sysctl -n hw.optional.arm.FEAT_SME
+        OUTPUT_VARIABLE LLK_HOST_SME
+        OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(LLK_HOST_SME STREQUAL "1")
+      # On an SME host a missing disassembler is a configuration failure, not
+      # a reason to quietly drop the evidence test. The harness and shim use
+      # the SDK's clang rather than a Homebrew LLVM that may be the project's
+      # C compiler: the harness links libSystem.
+      find_program(LLK_LLVM_OBJDUMP NAMES llvm-objdump
+          HINTS "${LLVM_PROJECT_BUILD_DIR}/bin" REQUIRED)
+      find_program(LLK_APPLE_CLANG NAMES clang
+          HINTS /usr/bin NO_DEFAULT_PATH REQUIRED)
+      add_test(NAME ArmSMENativeEvidence
+          COMMAND ${LLK_TEST_PYTHON}
+              ${CMAKE_SOURCE_DIR}/test/Execution/arm_sme_native_evidence.py
+              $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+              ${CMAKE_CURRENT_BINARY_DIR}/ArmSMENativeEvidence
+              ${LLK_APPLE_CLANG} ${LLK_LLVM_OBJDUMP})
+    endif()
+  endif()
   # Framework E10 (#184): run the selected SVE object under qemu and compare
   # its numbers. This is functional evidence, not a measurement, and it needs
   # a real aarch64 runner: both lookups are REQUIRED so configuration fails

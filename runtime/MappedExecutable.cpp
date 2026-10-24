@@ -37,6 +37,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Target/LLVMIR/Dialect/ArmSME/ArmSMEToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
@@ -446,6 +447,12 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
 
   mlir::registerBuiltinDialectTranslation(*module.getContext());
   mlir::registerLLVMDialectTranslation(*module.getContext());
+  // A selected target may leave dialect ops whose only LLVM form is a
+  // translation interface. ArmSME's `arm_sme.intr.*` intrinsics are exactly
+  // that: the lowering pass keeps them in the dialect and the translation
+  // interface turns them into LLVM intrinsic calls. Registration is inert for
+  // a module with no ArmSME ops and does not select or branch on a target.
+  mlir::registerArmSMEDialectTranslation(*module.getContext());
 
   mlir::PassManager pm(module.getContext());
   addKernelToLLVMPasses(pm);
