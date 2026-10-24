@@ -527,9 +527,16 @@ public:
   codegenRequirements() const override {
     return inner_->codegenRequirements();
   }
+  const mlir::llk::mapping::LatencyProvider *latencyProvider() const override {
+    return inner_->latencyProvider();
+  }
   std::unique_ptr<mlir::llk::mapping::TargetEmitter>
   createEmitter(mlir::StringRef key) const override {
     return inner_->createEmitter(key);
+  }
+  std::unique_ptr<mlir::llk::mapping::TargetEmitter>
+  createEmitter() const override {
+    return inner_->createEmitter();
   }
   llvm::Error
   buildSelectedBackendPipeline(mlir::OpPassManager &pm) const override {
@@ -1544,7 +1551,6 @@ public:
     // The pre-bufferization pass left `vector.contract` and tensor transfers.
     // Bufferization has made the transfers memrefs, so the reference ArmSME
     // pattern order applies here.
-    IRRewriter rewriter(&getContext());
     RewritePatternSet patterns(&getContext());
     vector::populateVectorTransferPermutationMapLoweringPatterns(patterns);
     vector::populateVectorTransferDropUnitDimsPatterns(patterns);
@@ -2193,15 +2199,19 @@ In `test/FileCheck.cmake`, inside the `if(LLK_BUILD_TOOLS)` block after `AOTObje
         OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
     if(LLK_HOST_SME STREQUAL "1")
       # On an SME host a missing disassembler is a configuration failure, not
-      # a reason to quietly drop the evidence test.
+      # a reason to quietly drop the evidence test. The harness and shim use
+      # the SDK's clang rather than a Homebrew LLVM that may be the project's
+      # C compiler: the harness links libSystem.
       find_program(LLK_LLVM_OBJDUMP NAMES llvm-objdump
           HINTS "${LLVM_PROJECT_BUILD_DIR}/bin" REQUIRED)
+      find_program(LLK_APPLE_CLANG NAMES clang
+          HINTS /usr/bin NO_DEFAULT_PATH REQUIRED)
       add_test(NAME ArmSMENativeEvidence
           COMMAND ${LLK_TEST_PYTHON}
               ${CMAKE_SOURCE_DIR}/test/Execution/arm_sme_native_evidence.py
               $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
               ${CMAKE_CURRENT_BINARY_DIR}/ArmSMENativeEvidence
-              ${CMAKE_C_COMPILER} ${LLK_LLVM_OBJDUMP})
+              ${LLK_APPLE_CLANG} ${LLK_LLVM_OBJDUMP})
     endif()
   endif()
 ```
