@@ -7,8 +7,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-// Framework E5 (issue #180). This mirrors the integration `MicroMapPass` runs,
-// not the bare `CoveringSearch` a layer test can get away with:
+// Framework E5/E6 (issues #180/#181). This mirrors the integration
+// `MicroMapPass` runs, not the bare `CoveringSearch` a layer test can get away
+// with:
 //
 //   registry target -> extract graph -> search with
 //   `evaluateCompletePlan(..., BindContract::Partial, ...,
@@ -21,6 +22,12 @@
 // and only then is the plan ranked and returned. Binding the search proposal
 // directly would accept a plan whose real live footprint was never measured --
 // exactly the defect the ARM targets must not inherit.
+//
+// `searchFixture` stops one stage earlier and hands back the retained set, so a
+// negative control can show that nothing survived retention *and* why: the
+// frontier's stable codes and messages, with `searchTruncated` false to rule out
+// a search cap. `evaluatePlan` runs the same evaluator on a tampered plan copy;
+// it never mutates the fixture (the evaluator clones the module).
 
 #include "arm_target_fixture.h"
 
@@ -35,12 +42,18 @@
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <string>
 
 #ifndef LLK_SOURCE_DIR
 #error "LLK_SOURCE_DIR must name the repository root"
+#endif
+
+#ifndef LLK_TEST_BINARY_DIR
+#error "LLK_TEST_BINARY_DIR must name this test category's build directory"
 #endif
 
 namespace arm_test {
@@ -81,9 +94,10 @@ llvm::Expected<Operation *> singleKernel(ModuleOp module) {
 
 } // namespace
 
-llvm::Expected<MappedFixture> mapFixture(llvm::StringRef targetName,
-                                         llvm::StringRef inputPath,
-                                         llvm::StringRef machineOverride) {
+llvm::Expected<SearchedFixture> searchFixture(llvm::StringRef targetName,
+                                              llvm::StringRef inputPath,
+                                              llvm::StringRef machineOverride,
+                                              unsigned topK) {
   mlir::llk::target::registerAllMappingTargets();
   llvm::Expected<std::unique_ptr<MappingTarget>> target =
       createRegisteredMappingTarget(targetName, LLK_SOURCE_DIR,
@@ -91,7 +105,7 @@ llvm::Expected<MappedFixture> mapFixture(llvm::StringRef targetName,
   if (!target)
     return target.takeError();
 
-  MappedFixture fixture;
+  SearchedFixture fixture;
   fixture.target = std::move(*target);
   fixture.context = std::make_unique<MLIRContext>();
   fixture.context->getOrLoadDialect<micro::MicroDialect>();
@@ -114,6 +128,7 @@ llvm::Expected<MappedFixture> mapFixture(llvm::StringRef targetName,
 
   MappingSearchOptions options;
   options.mode = SearchMode::Deterministic;
+  options.topK = topK;
   options.requireCompleteEvaluation = true;
   const uint64_t memoryBudgetBytes = options.memoryBudgetBytes;
   options.evaluateCompletePlan =
@@ -132,17 +147,36 @@ llvm::Expected<MappedFixture> mapFixture(llvm::StringRef targetName,
   llvm::Expected<MappingSearchResult> result = search.search();
   if (!result)
     return result.takeError();
-  if (result->plans.empty()) {
+  fixture.result = std::move(*result);
+  return std::move(fixture);
+}
+
+llvm::Expected<MappedFixture> mapFixture(llvm::StringRef targetName,
+                                         llvm::StringRef inputPath,
+                                         llvm::StringRef machineOverride,
+                                         unsigned topK) {
+  llvm::Expected<SearchedFixture> searched =
+      searchFixture(targetName, inputPath, machineOverride, topK);
+  if (!searched)
+    return searched.takeError();
+  if (searched->result.plans.empty()) {
     std::string message =
-        "arm_test: the search produced no complete plan for '" + path + "'";
-    if (result->searchTruncated)
+        "arm_test: the search produced no complete plan for '" +
+        resolveInputPath(inputPath) + "'";
+    if (searched->result.searchTruncated)
       message += "\n  (a search cap was hit)";
     for (const mlir::llk::mapping::Diagnostic &detail :
-         result->frontier.diagnostics)
+         searched->result.frontier.diagnostics)
       message += "\n  " + detail.message;
     return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
   }
-  fixture.plan = result->plans.front();
+
+  MappedFixture fixture;
+  fixture.target = std::move(searched->target);
+  fixture.context = std::move(searched->context);
+  fixture.source = std::move(searched->source);
+  fixture.graph = std::move(searched->graph);
+  fixture.plan = searched->result.plans.front();
 
   // The dialect-aware half: selected movements and transforms become Micro
   // operations. The partial/static contract is the one a target without an
@@ -174,6 +208,14 @@ llvm::Expected<MappedFixture> mapFixture(llvm::StringRef targetName,
   return std::move(fixture);
 }
 
+llvm::Expected<CompletePlanEvaluation>
+evaluatePlan(const MappedFixture &fixture, const CoveringPlan &plan) {
+  return evaluateCompletePlan(*fixture.source, fixture.graph, *fixture.target,
+                              plan, BindContract::Partial,
+                              MappingSearchOptions{}.memoryBudgetBytes,
+                              AnalysisRequirement::Complete);
+}
+
 const PlanPlacement *contractionPlacement(const MappedFixture &fixture) {
   const WorkloadNode *contraction = nullptr;
   for (const WorkloadNode &node : fixture.graph.getNodes()) {
@@ -195,6 +237,26 @@ const PlanPlacement *contractionPlacement(const MappedFixture &fixture) {
     placement = &candidate;
   }
   return placement;
+}
+
+llvm::Expected<std::string> writeMachineVariant(llvm::StringRef yaml) {
+  int descriptor = -1;
+  llvm::SmallString<256> path;
+  if (std::error_code error = llvm::sys::fs::createUniqueFile(
+          LLK_TEST_BINARY_DIR "/arm-machine-variant-%%%%%%.yaml", descriptor,
+          path))
+    return llvm::errorCodeToError(error);
+  llvm::raw_fd_ostream stream(descriptor, /*shouldClose=*/true);
+  stream << yaml;
+  stream.close();
+  if (stream.has_error()) {
+    std::error_code error = stream.error();
+    stream.clear_error();
+    std::error_code removed = llvm::sys::fs::remove(path);
+    (void)removed;
+    return llvm::errorCodeToError(error);
+  }
+  return path.str().str();
 }
 
 } // namespace arm_test
