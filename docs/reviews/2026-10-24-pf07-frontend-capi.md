@@ -4,8 +4,8 @@
 
 **Scope:** [issue #218](https://github.com/skg7on/DSLCompiler/issues/218), PF07 in
 [the frontend plan](../superpowers/plans/2026-10-18-python-frontend-refinement.md).
-Base `main` `9cdb3b1` contains merged PF06 (PR #247). Work is on
-`feat/issue218-frontend-capi` in the isolated worktree
+Base `main` `9cdb3b1` contains merged PF06 (PR #247). Implementation commit
+`ab7a33c` is on `feat/issue218-frontend-capi` in the isolated worktree
 `.claude/worktrees/feat+issue218-frontend-capi`, which owns its own `build/`.
 
 ## Delivered behavior
