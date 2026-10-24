@@ -1399,14 +1399,18 @@ namespace {
 constexpr int64_t kSMEQuantumF32 = 4;      // vscale * 4 lanes
 constexpr int64_t kModeledContraction = 16; // M = N = K at SVL 512
 
-StringAttr selectedEmitter(Operation *op) {
-  auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
-  return mapping ? mapping.getAs<StringAttr>("emitter") : StringAttr();
-}
-
 bool isSelectedContraction(Operation *op) {
-  StringAttr emitter = selectedEmitter(op);
-  return emitter && emitter.getValue() == "sme_mma_za";
+  // `MicroToLinalg` casts narrower inputs to the accumulator type, so a bf16
+  // contraction reaches this pass with f32 operands and an f32 result. The
+  // selected bundle name is the surviving provenance that distinguishes it
+  // from the f32 signature the emitter accepted.
+  auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
+  if (!mapping)
+    return false;
+  auto emitter = mapping.getAs<StringAttr>("emitter");
+  auto bundle = mapping.getAs<StringAttr>("bundle");
+  return emitter && emitter.getValue() == "sme_mma_za" && bundle &&
+         bundle.getValue() == "sme.mma.f32";
 }
 
 bool isExecutableSignature(Operation *op) {
@@ -1693,9 +1697,13 @@ ninja -C build LLKMappingTests
 
 Expected: PASS. `SelectedContractionLowersToArmSME` sees `llvm.aarch64.sme`
 intrinsics, no `vector.contract`/`vector.outerproduct`, and the two streaming
-attributes. If the pre-bufferization vectorization produces a form
-`convert-vector-to-arm-sme` cannot consume, the pass fails with a diagnostic
-naming the stage; fix the pattern set rather than weakening the acceptance.
+attributes. The existing `SelectedBf16ContractionIsRefused` test must also
+still pass: the pre-pass identifies the f32 signature by the selected
+`sme.mma.f32` bundle name, because `MicroToLinalg` casts bf16 inputs to the f32
+accumulator type and the operand type alone cannot distinguish them. If the
+pre-bufferization vectorization produces a form `convert-vector-to-arm-sme`
+cannot consume, the pass fails with a diagnostic naming the stage; fix the
+pattern set rather than weakening the acceptance.
 
 - [ ] **Step 6: Commit**
 

@@ -260,12 +260,15 @@ selected-target compilation.
 
 1. **Pre-bufferization (`SMEVectorLoweringPass`)** runs after `micro-to-linalg`.
    It finds the selected `linalg.matmul` (`emitter == "sme_mma_za"`,
-   `micro.op == "mma"`), validates the signature, tiles with scalable
-   `[4]x[4]` sizes, and vectorizes to `vector.contract` while preserving the
-   initialized accumulator `vector.transfer_read` and the result
-   `vector.transfer_write`. It rejects a non-f32 dtype, a shape other than
-   16x16x16, a missing selection, or a conflicting value, without partial
-   rewrites.
+   `micro.op == "mma"`, and selected bundle `sme.mma.f32`), validates the
+   signature, tiles with scalable `[4]x[4]` sizes, and vectorizes to
+   `vector.contract` while preserving the initialized accumulator
+   `vector.transfer_read` and the result `vector.transfer_write`. The bundle
+   name, not the operand type, distinguishes the f32 signature from a bf16
+   contraction: `MicroToLinalg` casts narrower inputs to the f32 accumulator
+   type, so both reach the pass with f32 operands and an f32 result. It rejects
+   a shape other than 16x16x16, a missing selection, or a conflicting value,
+   without partial rewrites.
 2. **Post-bufferization (`SMEArmLoweringPass`)** runs after One-Shot Bufferize
    and before `convert-linalg-to-loops`. The reference ArmSME pipeline applies
    its Vector patterns after bufferization because the unit-dim transfer
