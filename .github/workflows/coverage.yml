@@ -104,6 +104,12 @@ jobs:
           set -o pipefail
           ctest -R '^ArmSVEExecutionEvidence$' --no-tests=error --output-on-failure 2>&1 | tee arm-sve-evidence.log
 
+      - name: Run Arm SME emulated evidence
+        run: |
+          cd build
+          set -o pipefail
+          ctest -R '^ArmSMEExecutionEvidence$' --no-tests=error --output-on-failure 2>&1 | tee arm-sme-evidence.log
+
       - name: Run tests
         run: cd build && ctest --output-on-failure
 

@@ -360,6 +360,18 @@ if(LLK_BUILD_TOOLS)
             ${CMAKE_CURRENT_BINARY_DIR}/ArmSVEExecutionEvidence
             ${LLK_QEMU_AARCH64} ${LLK_AARCH64_GCC}
     )
+    # Framework E11 (#253): the same qemu runner for the selected SME
+    # contraction. The disassembler must come from the cross toolchain: the
+    # host LLVM objdump may not decode SME without target flags.
+    find_program(LLK_AARCH64_OBJDUMP
+        NAMES aarch64-linux-gnu-objdump REQUIRED)
+    add_test(NAME ArmSMEExecutionEvidence
+        COMMAND ${LLK_TEST_PYTHON}
+            ${CMAKE_SOURCE_DIR}/test/Execution/arm_sme_qemu_evidence.py
+            $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}/ArmSMEExecutionEvidence
+            ${LLK_QEMU_AARCH64} ${LLK_AARCH64_GCC}
+            ${LLK_AARCH64_OBJDUMP})
   endif()
   # A target nobody registered is a diagnostic naming the ones that are, not a
   # silent fallback to a different backend.

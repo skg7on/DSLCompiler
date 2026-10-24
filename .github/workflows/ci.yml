@@ -105,6 +105,12 @@ jobs:
           set -o pipefail
           ctest -R '^ArmSVEExecutionEvidence$' --no-tests=error --output-on-failure 2>&1 | tee arm-sve-evidence.log
 
+      - name: Run Arm SME emulated evidence
+        run: |
+          cd build
+          set -o pipefail
+          ctest -R '^ArmSMEExecutionEvidence$' --no-tests=error --output-on-failure 2>&1 | tee arm-sme-evidence.log
+
       - name: Run selected AVX2 acceptance
         run: |
           export LLK_ACCEPTANCE_ARTIFACT_DIR="$GITHUB_WORKSPACE/build/selected-execution-evidence"
@@ -143,3 +149,5 @@ jobs:
             build/prediction-validation-evidence/
             build/arm-sve-evidence.log
             build/test/ArmSVEExecutionEvidence/
+            build/arm-sme-evidence.log
+            build/test/ArmSMEExecutionEvidence/
