@@ -92,7 +92,8 @@ jobs:
             -DLLVM_PROJECT_BUILD_DIR=$LLVM_BUILD \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLK_BUILD_TOOLS=ON \
-            -DLLK_BUILD_E2E_TESTS=ON
+            -DLLK_BUILD_E2E_TESTS=ON \
+            -DLLK_BUILD_PYTHON_CAPI=ON
 
       - name: Build
         run: cd build && ninja
