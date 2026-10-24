@@ -22,11 +22,11 @@ Tutorial 2: map a kernel and replay its plan
 
 These configuration files serve different purposes:
 
-* :source:`Machine profile <machines/x86-avx2-v2.yaml>`: physical topology, capability, capacity, and cost parameters.
+* :source:`Machine profile <machines/x86-avx2-v2.yaml>`: physical topology, capability, capacity, and cost parameters. See :doc:`the machine model guide </models/machine-model>`.
 
 * :source:`Layouts <mapping/x86-avx2/layouts.llkmap>`: declarative layout definitions and constraints.
 
-* :source:`Rules <mapping/x86-avx2/rules.llkmap>`: operation patterns, target bundles, placement requirements, and emitter names.
+* :source:`Rules <mapping/x86-avx2/rules.llkmap>`: operation patterns, target bundles, placement requirements, and emitter names. Both files are documented in :doc:`the mapping policy guide </models/mapping-policy>`.
 
 * ``emitters``: implementations this caller permits the mapper to select. This is an availability list; it does not prove each emitter produces the selected ISA faithfully.
 

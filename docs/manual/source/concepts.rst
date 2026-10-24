@@ -264,11 +264,12 @@ See the shipped :source:`AVX2 profile <machines/x86-avx2-v2.yaml>`,
 :source:`generic accelerator profile <machines/generic-ai-accel-v2.yaml>` and the
 static :source:`Arm SVE <machines/arm-sve-v2.yaml>` and
 :source:`Arm SME <machines/arm-sme-v2.yaml>` profiles. All use the same topology
-schema and canonical IR. The generic accelerator is an architecture exploration
-target rather than an accelerator hardware backend, and the Arm profiles model
-VL=SVL=512 for static mapping and analysis, plus the executable ``arm-sve`` f32
-add/multiply subset with an emulated (not native) acceptance path; SME, ZA,
-other signatures and timing remain non-executable.
+schema and canonical IR. The :doc:`machine model guide </models/machine-model>`
+documents every key and the queries mapping asks it. The generic accelerator is
+an architecture exploration target rather than an accelerator hardware backend,
+and the Arm profiles model VL=SVL=512 for static mapping and analysis, plus the
+executable ``arm-sve`` f32 add/multiply subset with an emulated (not native)
+acceptance path; SME, ZA, other signatures and timing remain non-executable.
 
 .. _concepts-layouts-and-movement-are-separate-decisions:
 
@@ -279,7 +280,8 @@ A canonical ``#micro.layout`` describes a layout kind and its parameters. LLKMap
 defines target-owned layout IDs, finite parameter domains, legality constraints,
 and logical-to-physical affine maps. A target ID such as ``avx2.blocked_2d`` is not a
 new canonical layout enum. An ``implements`` clause can connect a target layout to
-a canonical kind.
+a canonical kind. The :doc:`mapping policy guide </models/mapping-policy>` gives
+the full declaration grammar and the solver's behavior.
 
 Producer and consumer ports may require:
 

@@ -49,11 +49,15 @@ What you can do today
    * - Describe a machine
      - Versioned YAML topology with executor, memory, compute, transfer nodes and links; owner refinements and model validation
      - Shipped numerical costs are modeling seeds; a profile is not a hardware execution backend
-     - :doc:`Architecture </architecture>`, :doc:`performance tutorial </tutorials/03-performance>`
+     - :doc:`Machine model </models/machine-model>`, :doc:`performance tutorial </tutorials/03-performance>`
    * - Author target policy
      - LLKMap layouts, affine maps, finite constraints, port predicates, capability requirements, target bundles and emitter keys
      - Bounded solving can truncate or remain undecided; unsupported facts must be diagnosed
-     - :source:`Formal syntax <docs/design/llkmap-syntax.md>`
+     - :doc:`Mapping policy </models/mapping-policy>`, :source:`formal syntax <docs/design/llkmap-syntax.md>`
+   * - Choose a schedule
+     - JSON schedule database keyed by operation and M bucket; concrete or search-space Micro export; YAML schedule records from the tuner
+     - Selection matches operation and M bucket only; the schedule database does not configure the fixed legacy tiling pass
+     - :doc:`Schedules </models/schedules>`, :doc:`optimizer </tools/optimizer>`
    * - Match single and fused operations
      - Single-operation rules and bounded fused-group matching
      - Selected fused groups bind, lower and execute in the verified SwiGLU chain; unsupported effects/regions or emitters are rejected
