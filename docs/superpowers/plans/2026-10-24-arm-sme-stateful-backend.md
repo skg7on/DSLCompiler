@@ -1297,7 +1297,7 @@ git commit -m "feat(target): make arm-sme a selective executable target (#253)"
 - Consumes: `createSMEEmitter`, the target's two pipeline hooks, and the selected `linalg.matmul` provenance
 - Produces: module attribute `llk.sme.selected_groups` (i64)
 - Produces: `llk.backend_groups_realized` (i64) after the ArmSME conversion
-- Produces: kernel function attributes `aarch64_pstate_sm_enabled` and `aarch64_new_za`
+- Produces: kernel function attributes `llvm.arm_streaming` and `llvm.arm_new_za` at the MLIR level, which translate to `aarch64_pstate_sm_enabled` and `aarch64_new_za` in LLVM IR
 
 - [ ] **Step 1: Write the failing end-to-end test**
 
@@ -1324,14 +1324,18 @@ TEST(ArmSMEBackend, SelectedContractionLowersToArmSME) {
   std::string text;
   llvm::raw_string_ostream stream(text);
   compiled->module->print(stream);
-  // The ArmSME conversion consumes the vector contraction and leaves LLVM SME
-  // intrinsics; the movement copies are already loops.
-  EXPECT_NE(text.find("llvm.aarch64.sme"), std::string::npos) << text;
+  // At MappedStop::Lowered the module is still MLIR: the ArmSME conversion
+  // leaves `arm_sme.intr.*` intrinsics (translated to `llvm.aarch64.sme.*`
+  // only during MLIR-to-LLVM translation), and enable-arm-streaming records
+  // `llvm.arm_streaming`/`llvm.arm_new_za` on the function. The literal
+  // `aarch64_*` LLVM attribute names are checked on the AOT artifact in Tasks
+  // 6-7, where the LLVM IR exists.
+  EXPECT_NE(text.find("arm_sme.intr"), std::string::npos) << text;
   EXPECT_EQ(text.find("vector.contract"), std::string::npos) << text;
   EXPECT_EQ(text.find("vector.outerproduct"), std::string::npos) << text;
   // The kernel owns PSTATE.SM and a fresh ZA array.
-  EXPECT_NE(text.find("aarch64_pstate_sm_enabled"), std::string::npos) << text;
-  EXPECT_NE(text.find("aarch64_new_za"), std::string::npos) << text;
+  EXPECT_NE(text.find("llvm.arm_streaming"), std::string::npos) << text;
+  EXPECT_NE(text.find("llvm.arm_new_za"), std::string::npos) << text;
 }
 ```
 
@@ -1636,9 +1640,12 @@ public:
     toArmSME.addPass(createConvertArmSMEToSCFPass());
     toArmSME.addPass(createConvertVectorToSCFPass(
         VectorTransferToSCFOptions().enableFullUnroll()));
-    toArmSME.addPass(arm_sme::createEnableArmStreamingPass(
-        arm_sme::ArmStreamingMode::Streaming, arm_sme::ArmZaMode::NewZA,
-        /*ifRequiredByOps=*/true));
+    // The pass is func.func-scoped; inside a nested pipeline the module-level
+    // `addPass` form fatal-errors, so nest it explicitly.
+    toArmSME.addNestedPass<func::FuncOp>(
+        arm_sme::createEnableArmStreamingPass(
+            arm_sme::ArmStreamingMode::Streaming, arm_sme::ArmZaMode::NewZA,
+            /*ifRequiredByOps=*/true));
 #if LLVM_VERSION_MAJOR >= 21
     toArmSME.addPass(createSCFToControlFlowPass());
 #else
@@ -1695,9 +1702,11 @@ ninja -C build LLKMappingTests
 ./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*:BackendPipelineHooks.*'
 ```
 
-Expected: PASS. `SelectedContractionLowersToArmSME` sees `llvm.aarch64.sme`
-intrinsics, no `vector.contract`/`vector.outerproduct`, and the two streaming
-attributes. The existing `SelectedBf16ContractionIsRefused` test must also
+Expected: PASS. `SelectedContractionLowersToArmSME` sees `arm_sme.intr.*`
+intrinsics, no `vector.contract`/`vector.outerproduct`, and the MLIR-level
+`llvm.arm_streaming`/`llvm.arm_new_za` attributes (which translate to
+`aarch64_pstate_sm_enabled`/`aarch64_new_za`; Tasks 6-7 verify the LLVM/object
+form). The existing `SelectedBf16ContractionIsRefused` test must also
 still pass: the pre-pass identifies the f32 signature by the selected
 `sme.mma.f32` bundle name, because `MicroToLinalg` casts bf16 inputs to the f32
 accumulator type and the operand type alone cannot distinguish them. If the
