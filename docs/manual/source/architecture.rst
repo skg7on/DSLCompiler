@@ -238,10 +238,15 @@ LLKMap supplies target policy:
 * **Bundles and emitters** belong to the target. Generic code may persist and
   compare them but must not interpret their spelling as target behavior.
 
-The shipped packages are :source:`x86-avx2 <mapping/x86-avx2>` and
-:source:`generic-ai-accel <mapping/generic-ai-accel>`, with corresponding
-:source:`machine profiles <machines>`. The generic accelerator demonstrates mapping
-onto an accelerator-shaped topology; it does not execute accelerator hardware.
+The shipped packages are :source:`x86-avx2 <mapping/x86-avx2>`,
+:source:`generic-ai-accel <mapping/generic-ai-accel>`,
+:source:`arm-sve <mapping/arm-sve>` and :source:`arm-sme <mapping/arm-sme>`, with
+corresponding :source:`machine profiles <machines>`. The generic accelerator
+demonstrates mapping onto an accelerator-shaped topology. The Arm packages are
+static mapping and analysis targets at modeled VL=SVL=512: their emitters verify
+opaque bundles and refuse lowering, so none of these three executes its modeled
+hardware. The :source:`Arm acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`
+records their exact static domain and limits.
 See the :source:`formal LLKMap syntax <docs/design/llkmap-syntax.md>` and its
 :source:`EBNF <docs/design/llkmap.ebnf>` when authoring policy.
 
