@@ -114,10 +114,10 @@ What you can do today
      - Generic accelerator topology, layouts, rules and mapping through the same canonical IR; static f32 add/mul/sum coverage with operation-aware validation
      - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered; accelerator mul/sum emitters verify only
      - :doc:`Mapping tutorial </tutorials/02-mapping>`
-   * - Map Arm SVE and SME statically, and run the SVE f32 subset
+   * - Map Arm SVE and SME statically, and run the executable subsets
      - Both target names load a bounded machine profile and typed LLKMap policy, then map direct-MicroIR fixtures: f32/bf16 M=N=K=16 contraction, typed f32/bf16/i8 add and multiply, both bf16↔f32 conversions, f32 SiLU and reduce sum, and the fused convert→SiLU→multiply graph. Selected plans report concrete vector or matrix engine and accumulator identities, verify, replay from the reported plan id and analyze
-     - Static mapping and analysis at modeled VL=SVL=512, plus an executable ``arm-sve`` f32 add/multiply subset with an emulated AArch64 acceptance path: a cross-compiled static object run under ``qemu-aarch64``. No native SVE execution, SME execution, physical ZA realization, calibrated timing or automatic retargeting of CPU schedules. Other signatures and all ``arm-sme`` lowering remain unimplemented, and selected-target compilation is rejected for them
-     - :source:`Acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`, :doc:`Optimizer </tools/optimizer>`
+     - Static mapping and analysis at modeled VL=SVL=512, plus two executable subsets: the ``arm-sve`` f32 add/multiply subset with an emulated AArch64 acceptance path (a cross-compiled static object run under ``qemu-aarch64``) and the ``arm-sme`` f32 16x16x16 initialized contraction with a native Apple M5 acceptance path and a QEMU SME1 secondary run. No native SVE execution, no SME execution beyond that one contraction, no SME2, no ZA preservation across calls, no physical SRAM/DMA realization, no calibrated timing and no automatic retargeting of CPU schedules. Every other signature is rejected for selected-target compilation rather than emulated
+     - :source:`Static acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`, :source:`SME acceptance ledger <docs/reviews/2026-10-24-arm-sme-stateful-backend-acceptance.md>`, :doc:`Optimizer </tools/optimizer>`
 
 The broader goal does not imply arbitrary DNN support today. The LLK-to-Micro
 export and contraction source family remain contraction-shaped, while source

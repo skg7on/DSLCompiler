@@ -176,4 +176,58 @@ TEST(ArmSMEBackend, SelectedContractionLatePipelineFinishesArmSME) {
   EXPECT_EQ(text.find("arm_sme.outerproduct"), std::string::npos) << text;
 }
 
+// The receipt asks the same per-group question the lowering dispatch asks. The
+// contraction key `sme_mma_za` implements one signature; the bf16 contraction
+// is mapped by the same key, so a key-level `hasLowering()` would report the
+// bf16 plan as merely unchecked. Before any compile it must already be
+// `unsupported`, and the f32 group must still be credited by its own selected
+// compilation.
+TEST(ArmSMEBackend, CapabilityReceiptDrawsTheExecutableBoundary) {
+  using mlir::llk::framework::CapabilityReceipt;
+  using mlir::llk::framework::CapabilityStatus;
+
+  auto fixture = arm_test::mapFixture("arm-sme", kContraction);
+  ASSERT_TRUE(static_cast<bool>(fixture))
+      << llvm::toString(fixture.takeError());
+  mlir::Operation *kernel = nullptr;
+  fixture->source->walk([&](mlir::Operation *op) {
+    if (!kernel && op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+  });
+  ASSERT_NE(kernel, nullptr);
+  mlir::llk::workload::WorkloadContract contract;
+  CapabilityReceipt planned = mlir::llk::framework::describeCapabilities(
+      kernel, contract, *fixture->target, &fixture->analysis, &fixture->plan);
+  EXPECT_EQ(planned.selectedLowering, CapabilityStatus::NotChecked);
+
+  mlir::OwningOpRef<mlir::ModuleOp> source =
+      mlir::cast<mlir::ModuleOp>(fixture->source->clone());
+  llk::MappedCompileOptions options;
+  options.entrySymbol = "arm_contraction";
+  options.backend = llk::MappedBackend::SelectedTarget;
+  options.stop = llk::MappedStop::Lowered;
+  llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
+      *source, *fixture->target, fixture->plan, options);
+  ASSERT_TRUE(static_cast<bool>(compiled))
+      << llvm::toString(compiled.takeError());
+  CapabilityReceipt realized = mlir::llk::framework::describeCapabilities(
+      kernel, contract, *fixture->target, &fixture->analysis, &fixture->plan,
+      &*compiled);
+  EXPECT_EQ(realized.selectedLowering, CapabilityStatus::Supported);
+
+  auto bf16 = arm_test::mapFixture("arm-sme", kContractionBf16);
+  ASSERT_TRUE(static_cast<bool>(bf16)) << llvm::toString(bf16.takeError());
+  mlir::Operation *bf16Kernel = nullptr;
+  bf16->source->walk([&](mlir::Operation *op) {
+    if (!bf16Kernel && op->getName().getStringRef() == "micro.kernel")
+      bf16Kernel = op;
+  });
+  ASSERT_NE(bf16Kernel, nullptr);
+  CapabilityReceipt refused = mlir::llk::framework::describeCapabilities(
+      bf16Kernel, contract, *bf16->target, &bf16->analysis, &bf16->plan);
+  EXPECT_EQ(refused.selectedLowering, CapabilityStatus::Unsupported);
+  const std::string reasons = llvm::join(refused.reasons, "\n");
+  EXPECT_NE(reasons.find("sme_mma_za"), std::string::npos) << reasons;
+}
+
 } // namespace

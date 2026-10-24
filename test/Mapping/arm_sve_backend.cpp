@@ -295,6 +295,32 @@ TEST(ArmSVEBackend, CapabilityReceiptDrawsTheExecutableBoundary) {
   EXPECT_NE(reasons.find("sve_vector_silu"), std::string::npos) << reasons;
 }
 
+// The receipt answers the same per-group question as the lowering dispatch.
+// `sve_vector_add` implements the f32 signature only, so the bf16 plan is
+// `unsupported` before any compile -- not `not_checked` merely because the key
+// has a lowering. The reason names the emitter so a caller can see which group
+// refused.
+TEST(ArmSVEBackend, CapabilityReceiptRefusesUnimplementedDtypeGroup) {
+  using mlir::llk::framework::CapabilityReceipt;
+  using mlir::llk::framework::CapabilityStatus;
+
+  auto fixture = arm_test::mapFixture("arm-sve", kVectorBf16Add);
+  ASSERT_TRUE(static_cast<bool>(fixture))
+      << llvm::toString(fixture.takeError());
+  mlir::Operation *kernel = nullptr;
+  fixture->source->walk([&](mlir::Operation *op) {
+    if (!kernel && op->getName().getStringRef() == "micro.kernel")
+      kernel = op;
+  });
+  ASSERT_NE(kernel, nullptr);
+  mlir::llk::workload::WorkloadContract contract;
+  CapabilityReceipt receipt = mlir::llk::framework::describeCapabilities(
+      kernel, contract, *fixture->target, &fixture->analysis, &fixture->plan);
+  EXPECT_EQ(receipt.selectedLowering, CapabilityStatus::Unsupported);
+  const std::string reasons = llvm::join(receipt.reasons, "\n");
+  EXPECT_NE(reasons.find("sve_vector_add"), std::string::npos) << reasons;
+}
+
 // The prepared artifact is what the AOT object and the JIT both consume.
 // Ownership-based buffer deallocation runs there, and it inserts a constant
 // into every region it traverses -- which a `vector.mask` region (exactly one

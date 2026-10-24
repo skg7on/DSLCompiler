@@ -19,6 +19,8 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -279,6 +281,44 @@ describeCapabilities(mlir::Operation *kernel,
     if (!target.codegenRequirements())
       rejectSelected("target '" + target.name().str() +
                      "' declares no codegen contract");
+    // Ask the emitter about the operation group the lowering dispatch would
+    // hand it, not only about its key: one key can cover several dtype or
+    // shape signatures and implement a subset of them. A bound kernel records
+    // that group as `micro.mapping` instance metadata; the source kernel a
+    // caller is about to map does not, so resolve its placement nodes through
+    // the same workload graph the search used.
+    llvm::DenseMap<uint64_t, llvm::SmallVector<mlir::Operation *>>
+        opsByInstance;
+    bool kernelCarriesMapping = false;
+    if (kernel)
+      kernel->walk([&](mlir::Operation *op) {
+        auto mapping = op->getAttrOfType<mlir::DictionaryAttr>("micro.mapping");
+        if (!mapping)
+          return;
+        auto instance = mapping.getAs<mlir::IntegerAttr>("instance");
+        if (!instance)
+          return;
+        kernelCarriesMapping = true;
+        opsByInstance[instance.getInt()].push_back(op);
+      });
+    if (kernel && !kernelCarriesMapping && plan) {
+      mapping::WorkloadGraphBinding binding;
+      llvm::Expected<mapping::WorkloadGraph> graph =
+          mapping::extractWorkloadGraph(kernel, &binding);
+      if (!graph) {
+        llvm::consumeError(graph.takeError());
+        rejectSelected("the selected plan's operation groups could not be "
+                       "resolved from the kernel");
+      } else {
+        for (const mapping::PlanPlacement &placement : plan->placements)
+          if (mlir::Operation *op = binding.opFor(placement.node))
+            opsByInstance[placement.instance].push_back(op);
+          else
+            rejectSelected("the selected plan's node " +
+                           llvm::Twine(placement.node) +
+                           " has no operation in the kernel");
+      }
+    }
     if (plan)
       for (const mapping::PlanPlacement &placement : plan->placements) {
         const std::string &key = placement.bundle.emitterKey;
@@ -299,10 +339,11 @@ describeCapabilities(mlir::Operation *kernel,
           rejectSelected("emitter '" + key + "' rejected bundle '" +
                          placement.bundle.name +
                          "': " + llvm::toString(std::move(error)));
-        else if (!emitter->hasLowering())
+        else if (!emitter->hasLoweringFor(
+                     opsByInstance.lookup(placement.instance)))
           rejectSelected("emitter '" + key +
-                         "' only verifies its bundle, so the selected group "
-                         "would fall back to the reference bridge");
+                         "' cannot lower the selected group's operations, so "
+                         "it would fall back to the reference bridge");
       }
     // A reference-backend compilation carries no codegen contract even for a
     // target that has one: that run never attempted selected lowering, so the

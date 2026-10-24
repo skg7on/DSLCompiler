@@ -243,9 +243,10 @@ ninja -C build check-llk
   is delivered or implied. The SVE profile's vector-contraction selection does
   not make its vector engine a matrix engine, and the SME ZA model is storage
   accounting, not an instruction semantic.
-- Every `arm-sve` signature outside the executable f32 add/multiply subset, and
-  every `arm-sme` signature, remains static mapping and analysis. Their selected
-  lowering is rejected rather than emulated.
+- Every `arm-sve` signature outside the executable f32 add/multiply subset
+  remains static mapping and analysis. On `arm-sme`, the f32 16x16x16
+  initialized contraction is executable as of E11; every other signature
+  remains static and is rejected rather than emulated.
 - Small direct fixtures do not establish arbitrary DNN support. Both targets
   still need their own packages, and neither replaces the AVX2 executable path.
 - The executable-target baseline is unchanged. The selected-versus-reference

@@ -182,13 +182,18 @@ rather than skips when either is missing.
   Silicon exposes SME/streaming SVE but not non-streaming SVE, and the CI runner
   is x86_64. Cross-lowered artifacts plus QEMU are the strongest evidence
   available in this fleet.
-- No SME execution, no ZA realization, no bf16/i8/SiLU/reduction/conversion
-  execution, no calibrated timing and no CPU-schedule retargeting.
+- E11 (#253) supersedes the SME half of this boundary: `arm-sme` now executes
+  the f32 16x16x16 initialized contraction on a native Apple M5 (T3) and under
+  QEMU SME1 (T2). bf16/i8 SME execution, ZA preservation across calls, SME2 and
+  calibrated timing remain out of scope. No ZA realization beyond the one
+  contraction tile, no non-SME signature execution and no CPU-schedule
+  retargeting is claimed. This ledger's SVE evidence is unchanged.
 - Emulated functional results never calibrate native timing; `micro-perf`
   numbers remain modeled predictions.
 - The modeled SRAM/accumulator identities remain analysis facts; the executable
   path covers the ABI boundary buffers, not a physical SRAM realization.
 - The AVX2 selected-versus-reference acceptance remains the executable baseline
   and is unchanged.
-- #175 stays open until a native executable Arm acceptance is actually met;
-  E11 (#253) covers the SME stateful backend.
+- #175 closes with E11's ledger
+  (`docs/reviews/2026-10-24-arm-sme-stateful-backend-acceptance.md`), which
+  records the native T3 run and the QEMU T2 run.
