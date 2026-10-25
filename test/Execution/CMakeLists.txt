@@ -168,6 +168,9 @@ if(LLK_BUILD_E2E_TESTS)
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/arm_sve_evidence_test.py)
   set_tests_properties(ArmSVEEvidenceParser PROPERTIES
       LABELS "mapped-reference")
+  add_test(NAME ArmSMEEvidenceParser
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/arm_sme_evidence_test.py)
+  set_tests_properties(ArmSMEEvidenceParser PROPERTIES LABELS "mapped-reference")
   add_test(NAME SelectedExecutionEvidenceValidator
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_selected_execution_evidence.py
           --self-test)

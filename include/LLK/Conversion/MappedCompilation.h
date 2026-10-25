@@ -132,6 +132,19 @@ compileMappedKernel(mlir::ModuleOp source,
                     const mlir::llk::mapping::CoveringPlan &plan,
                     const MappedCompileOptions &options);
 
+/// Runs a selected target's late backend passes over an ownership-prepared
+/// module.
+///
+/// The shared preparation owns the module's structured control flow (buffer
+/// deallocation only accepts structured loops), so a target that needs a
+/// different control-flow shape for its final instruction selection registers
+/// those passes on `buildLateBackendPipeline` and they run here, after
+/// preparation and before the code is emitted. The default hook adds nothing,
+/// making this a no-op that returns success.
+llvm::Error
+runLateBackendPipeline(const mlir::llk::mapping::MappingTarget &target,
+                       mlir::ModuleOp module);
+
 /// Compiles concrete Micro-IR that carries no mapping plan.
 ///
 /// A bound tuning candidate is exactly that: the search space already selected

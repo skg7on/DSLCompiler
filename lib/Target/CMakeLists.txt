@@ -16,5 +16,8 @@ add_llk_library(LLKTargetMapping
     AArch64/Mapping/SVEBundleLowering.cpp
     AArch64/Mapping/SVEBackendLowering.cpp
     AArch64/Mapping/SMEMappingTarget.cpp
+    AArch64/Mapping/SMEBundleLowering.cpp
+    AArch64/Mapping/SMEVectorLowering.cpp
+    AArch64/Mapping/SMEArmLowering.cpp
     LINK_LIBRARIES LLKMapping LLKMachine MicroDialect LLK::MLIR
 )

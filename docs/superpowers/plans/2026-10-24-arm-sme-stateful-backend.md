@@ -126,7 +126,7 @@ TEST(CodegenRequirements, KeepsInvocationAttributesAsTargetPolicy) {
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=CodegenRequirements.*
+./build/bin/LLKMappingTests --gtest_filter=CodegenRequirements.*
 ```
 
 Expected: compile failure (`streamingVectorLengthBits` and the 5-argument call do not exist).
@@ -184,7 +184,7 @@ In `lib/Mapping/CodegenRequirements.cpp`, add the SVL check after the existing `
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=CodegenRequirements.*
+./build/bin/LLKMappingTests --gtest_filter=CodegenRequirements.*
 ```
 
 Expected: PASS, including every pre-existing `CodegenRequirements` case (the fifth argument defaults to `std::nullopt`).
@@ -236,11 +236,17 @@ TEST(MappedCodegenRequirements, AppliesInvocationAttributesToTheWrapper) {
       llvm::FunctionType::get(llvm::Type::getVoidTy(context), false),
       llvm::GlobalValue::ExternalLinkage, "_mlir_ciface_k", module);
   ASSERT_FALSE(wrapper->hasFnAttribute("aarch64_pstate_sm_enabled"));
+  // A wrapper may inherit ZA ownership from the kernel; the declared
+  // invocation attributes replace it.
+  wrapper->addFnAttr("aarch64_new_za");
+  wrapper->addFnAttr("aarch64_inout_za");
 
   llvm::Error error = llk::applyInvocationAttributes(
       module, "_mlir_ciface_k", {"aarch64_pstate_sm_enabled"});
   ASSERT_FALSE(static_cast<bool>(error));
   EXPECT_TRUE(wrapper->hasFnAttribute("aarch64_pstate_sm_enabled"));
+  EXPECT_FALSE(wrapper->hasFnAttribute("aarch64_new_za"));
+  EXPECT_FALSE(wrapper->hasFnAttribute("aarch64_inout_za"));
 
   // An empty attribute list is a no-op even when the wrapper is absent.
   EXPECT_FALSE(static_cast<bool>(
@@ -324,7 +330,11 @@ struct MappedObjectIdentity {
 /// An empty attribute list is a no-op and does not require the wrapper to
 /// exist. A nonempty list naming a missing wrapper is an error: silently
 /// dropping a required ABI attribute would emit an object whose entry runs in
-/// the wrong streaming state.
+/// the wrong streaming state. A nonempty list also removes inherited Arm
+/// ZA-ownership attributes from the wrapper (`aarch64_new_za`, `aarch64_in_za`,
+/// `aarch64_out_za`, `aarch64_inout_za`, `aarch64_preserves_za`): the exported
+/// entry declares its own ABI, and a wrapper with ZA ownership would establish
+/// a TPIDR2 save block around the kernel.
 llvm::Error applyInvocationAttributes(llvm::Module &module,
                                       llvm::StringRef wrapperSymbol,
                                       llvm::ArrayRef<std::string> attributes);
@@ -343,6 +353,15 @@ llvm::Error applyInvocationAttributes(llvm::Module &module,
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "invocation wrapper '" + wrapperSymbol.str() +
                                        "' is missing from the LLVM module");
+  // A C-interface wrapper is a plain caller. It must not inherit the callee's
+  // ZA ownership: a wrapper with `new_za` would establish a TPIDR2 save block
+  // around the call, which the kernel's own `new_za` prologue would then have
+  // to save. The target's declared attributes are the wrapper's complete ABI.
+  static constexpr llvm::StringLiteral kZaOwnershipAttributes[] = {
+      "aarch64_new_za", "aarch64_in_za", "aarch64_out_za",
+      "aarch64_inout_za", "aarch64_preserves_za"};
+  for (llvm::StringRef attribute : kZaOwnershipAttributes)
+    wrapper->removeFnAttr(attribute);
   for (const std::string &attribute : attributes)
     wrapper->addFnAttr(attribute);
   return llvm::Error::success();
@@ -368,6 +387,50 @@ In `writeMappedObjectIdentity`, add after the existing group counters:
   for (const std::string &attribute : identity.invocationAttributes)
     invocationAttributes.push_back(attribute);
   record["invocationAttributes"] = std::move(invocationAttributes);
+```
+
+In `runtime/MappedExecutable.cpp`, add the host streaming-length probe next to
+the existing SVE probe and pass it to the host check. Without this wiring the
+new contract field would be inert and every selected SME JIT run would refuse
+with "host streaming vector length is unknown".
+
+In the existing `#if defined(__linux__) && defined(__aarch64__)` block at the
+top of the file, next to `kPrSveGetVl`:
+
+```cpp
+#ifndef HWCAP2_SME
+#define HWCAP2_SME (1UL << 23)
+#endif
+/// prctl() request code for PR_SME_GET_VL.
+constexpr int kPrSmeGetVl = 64;
+```
+
+After `detectHostVectorLengthBits()`:
+
+```cpp
+std::optional<int64_t> detectHostStreamingVectorLengthBits() {
+#if defined(__linux__) && defined(__aarch64__)
+  unsigned long hwcap2 = getauxval(AT_HWCAP2);
+  if (!(hwcap2 & HWCAP2_SME))
+    return std::nullopt;
+  long value = prctl(kPrSmeGetVl, 0, 0, 0, 0);
+  if (value < 0)
+    return std::nullopt;
+  return mlir::llk::mapping::vectorLengthBitsFromPrctl(value);
+#else
+  return std::nullopt;
+#endif
+}
+```
+
+Replace the four-argument host check call with:
+
+```cpp
+    if (llvm::Error error = mlir::llk::mapping::checkHostRequirements(
+            *options.selectedTarget, hostArchitecture, hostFeatures,
+            detectHostVectorLengthBits(),
+            detectHostStreamingVectorLengthBits()))
+      return error;
 ```
 
 Add `#include "LLK/Runtime/MappedObject.h"` to `runtime/MappedExecutable.cpp`
@@ -585,7 +648,7 @@ Add `backend_pipeline_hooks.cpp` to `test/Mapping/CMakeLists.txt` after `arm_sve
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=BackendPipelineHooks.*
+./build/bin/LLKMappingTests --gtest_filter=BackendPipelineHooks.*
 ```
 
 Expected: compile failure (`buildPostBufferizationBackendPipeline` does not exist and is not virtual).
@@ -620,10 +683,19 @@ In `lib/Conversion/MicroMapping/MappedCompilation.cpp`, between the bufferize pa
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='BackendPipelineHooks.*:ArmSVEBackend.*'
+./build/bin/LLKMappingTests --gtest_filter='BackendPipelineHooks.*:ArmSVEBackend.*'
 ```
 
-Expected: PASS. The probe sees memrefs (bufferization ran) and at least one Linalg op (loops have not been rolled yet).
+Expected: PASS. The probe sees memrefs (bufferization ran) and at least one
+Linalg op (loops have not been rolled yet).
+
+The committed test adds a test-only `MarkerLinalgPass` after the inner target's
+pre-bufferization pipeline. The arm-sve pass consumes its own selected
+`linalg.generic` before bufferization, so without a dead marker
+`convert-linalg-to-loops` would have nothing to act on and the hook's position
+relative to it would be unobservable. The marker is dead code, is not part of
+any selected group, and does not affect the realized count; the reviewer should
+confirm it preserves the ordering claim without weakening the test.
 
 - [ ] **Step 5: Commit**
 
@@ -883,7 +955,7 @@ TEST(ArmPlacement, SelectedBundlesVerifyAndOnlyImplementedKeysLower) {
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*'
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*'
 ```
 
 Expected: compile failure (`createSMEEmitter` missing) and the old
@@ -1212,7 +1284,7 @@ void buildSMEPostBufferizationPipeline(mlir::OpPassManager &) {}
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*'
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*'
 ```
 
 Expected: PASS for the emitter and contract tests. The `SelectedBf16ContractionIsRefused` test passes because no target pass realizes a group yet; the f32 end-to-end test arrives in Task 5.
@@ -1236,17 +1308,43 @@ git commit -m "feat(target): make arm-sme a selective executable target (#253)"
 ## Task 5: Lower the selected contraction through MLIR ArmSME
 
 **Files:**
+- Modify: `include/LLK/Mapping/MappingTarget.h` (target-neutral late hook)
+- Modify: `include/LLK/Target/AArch64/Mapping/SMEMappingTarget.h` (late builder decl)
+- Modify: `lib/Target/AArch64/Mapping/SMEMappingTarget.cpp` (late hook override)
 - Modify: `lib/Target/AArch64/Mapping/SMEVectorLowering.cpp` (replace the stub)
-- Modify: `lib/Target/AArch64/Mapping/SMEArmLowering.cpp` (replace the stub)
+- Modify: `lib/Target/AArch64/Mapping/SMEArmLowering.cpp` (replace the stub; add the late pass)
+- Modify: `include/LLK/Conversion/MappedCompilation.h`,
+  `lib/Conversion/MicroMapping/MappedCompilation.cpp` (`runLateBackendPipeline`
+  and its call on the executable path)
+- Modify: `tools/llk-compile/llk-compile.cpp` (AOT object path)
 - Modify: `test/Mapping/arm_sme_backend.cpp`
 
 **Interfaces:**
-- Consumes: `createSMEEmitter`, the target's two pipeline hooks, and the selected `linalg.matmul` provenance
-- Produces: module attribute `llk.sme.selected_groups` (i64)
-- Produces: `llk.backend_groups_realized` (i64) after the ArmSME conversion
-- Produces: kernel function attributes `aarch64_pstate_sm_enabled` and `aarch64_new_za`
+- Consumes: `createSMEEmitter`, the target's three pipeline hooks, and the
+  selected `linalg.matmul` provenance
+- Produces (post-bufferization): module attribute `llk.sme.selected_groups`
+  (i64) and `llk.backend_groups_realized` (i64)
+- Produces (post-bufferization): kernel function attributes
+  `llvm.arm_streaming` and `llvm.arm_new_za` (translated to LLVM IR
+  `aarch64_pstate_sm_enabled` / `aarch64_new_za`)
+- Produces (late): flattened `cf` control flow and the ArmSME dialect's LLVM
+  intrinsic operations (`arm_sme.intr.*`, translated to `llvm.aarch64.sme.*`)
 
-- [ ] **Step 1: Write the failing end-to-end test**
+**Why three stages.** The shared ABI/ownership preparation
+(`prepareMappedKernelForInvocation`) runs ownership-based buffer deallocation,
+which accepts **only structured control flow**. ArmSME tile allocation inside
+`convert-arm-sme-to-llvm` needs **flattened** `cf` control flow. Both cannot run
+in the same pipeline position: flattening in the post-bufferization pass makes
+every ArmSME artifact fail preparation with "Only structured control-flow loops
+are supported." The lowering is therefore split at the ownership boundary:
+
+1. pre-bufferization — select and vectorize the contraction;
+2. post-bufferization (before ownership) — Vector lowering + the ArmSME sequence
+   through `enable-arm-streaming`, stopping with structured SCF;
+3. late (after ownership) — `convert-scf-to-cf`, `convert-arm-sme-to-llvm`,
+   cleanup.
+
+- [ ] **Step 1: Write the failing end-to-end tests**
 
 Append to `test/Mapping/arm_sme_backend.cpp`:
 
@@ -1271,384 +1369,191 @@ TEST(ArmSMEBackend, SelectedContractionLowersToArmSME) {
   std::string text;
   llvm::raw_string_ostream stream(text);
   compiled->module->print(stream);
-  // The ArmSME conversion consumes the vector contraction and leaves LLVM SME
-  // intrinsics; the movement copies are already loops.
-  EXPECT_NE(text.find("llvm.aarch64.sme"), std::string::npos) << text;
+  // The ArmSME conversion consumes the vector contraction and leaves the
+  // dialect's high-level tile operations; the movement copies are already
+  // loops. The SCF flattening and ArmSME-to-LLVM conversion are a late step,
+  // after the shared ownership preparation.
+  EXPECT_NE(text.find("arm_sme.outerproduct"), std::string::npos) << text;
   EXPECT_EQ(text.find("vector.contract"), std::string::npos) << text;
   EXPECT_EQ(text.find("vector.outerproduct"), std::string::npos) << text;
-  // The kernel owns PSTATE.SM and a fresh ZA array.
-  EXPECT_NE(text.find("aarch64_pstate_sm_enabled"), std::string::npos) << text;
-  EXPECT_NE(text.find("aarch64_new_za"), std::string::npos) << text;
+  // enable-arm-streaming records MLIR's streaming/ZA attributes; the LLVM
+  // translation names them aarch64_pstate_sm_enabled / aarch64_new_za.
+  EXPECT_NE(text.find("llvm.arm_streaming"), std::string::npos) << text;
+  EXPECT_NE(text.find("llvm.arm_new_za"), std::string::npos) << text;
+}
+
+TEST(ArmSMEBackend, SelectedContractionLatePipelineFinishesArmSME) {
+  auto fixture = arm_test::mapFixture("arm-sme", kContraction);
+  ASSERT_TRUE(static_cast<bool>(fixture))
+      << llvm::toString(fixture.takeError());
+  mlir::OwningOpRef<mlir::ModuleOp> source =
+      mlir::cast<mlir::ModuleOp>(fixture->source->clone());
+  llk::MappedCompileOptions options;
+  options.entrySymbol = "arm_contraction";
+  options.backend = llk::MappedBackend::SelectedTarget;
+  options.stop = llk::MappedStop::Lowered;
+  llvm::Expected<llk::MappedCompilation> compiled = llk::compileMappedKernel(
+      *source, *fixture->target, fixture->plan, options);
+  ASSERT_TRUE(static_cast<bool>(compiled))
+      << llvm::toString(compiled.takeError());
+  ASSERT_TRUE(static_cast<bool>(compiled->module));
+
+  // In the executable path this runs on the ownership-prepared clone; the
+  // lowered module is the same structured form.
+  ASSERT_FALSE(static_cast<bool>(
+      llk::runLateBackendPipeline(*fixture->target, *compiled->module)));
+
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  compiled->module->print(stream);
+  EXPECT_NE(text.find("cf.br"), std::string::npos) << text;
+  EXPECT_EQ(text.find("scf.for"), std::string::npos) << text;
+  EXPECT_NE(text.find("arm_sme.intr.mopa"), std::string::npos) << text;
+  EXPECT_EQ(text.find("arm_sme.outerproduct"), std::string::npos) << text;
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=ArmSMEBackend.SelectedContractionLowersToArmSME
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*'
 ```
 
-Expected: FAIL with `selected-target backend realized no selected compute groups` (both stub pipelines do nothing).
+Expected: FAIL with `selected-target backend realized no selected compute
+groups` (both pipeline hooks are still stubs), and the late test fails to run
+the pipeline.
 
 - [ ] **Step 3: Implement the pre-bufferization vector lowering**
 
-Replace `lib/Target/AArch64/Mapping/SMEVectorLowering.cpp` with:
+Replace `lib/Target/AArch64/Mapping/SMEVectorLowering.cpp` with
+`SMEVectorLoweringPass` (`llk-sme-vector-lowering`, module pass):
+
+- selects only `micro.mapping` with `emitter == "sme_mma_za"` **and**
+  `bundle == "sme.mma.f32"` (the bundle is the discriminator: `MicroToLinalg`
+  casts bf16 inputs to the f32 accumulator type, so operand types cannot
+  distinguish the unsupported bf16 selection);
+- requires `micro.op == "mma"` and a static 16x16 f32 `linalg.matmul` result,
+  failing with `SME selected lowering needs a static 16x16x16 f32 contraction`
+  otherwise;
+- tiles with scalable `[vscale*4, vscale*4, 1]` via `scf::tileUsingSCF` and
+  vectorizes with `linalg::vectorize(..., {4,4,1}, {true,true,false},
+  createNamedContraction=true)`;
+- sets `llk.sme.selected_groups` on the module (0 when nothing matched).
+
+`buildSMESelectedBackendPipeline` = pass + canonicalize + CSE.
+
+- [ ] **Step 4: Implement the post-bufferization pass and the late pass**
+
+`SMEArmLoweringPass` (`llk-sme-arm-lowering`, module pass) in
+`lib/Target/AArch64/Mapping/SMEArmLowering.cpp`:
+
+1. reads `llk.sme.selected_groups`; returns when absent or zero;
+2. applies the Vector patterns (`populateVectorTransferPermutationMapLowering`,
+   `populateVectorTransferDropUnitDims`, contract→outerproduct with
+   `disableOuterProductLowering`, mask lowering);
+3. runs, via `runPipeline` on a fresh module pass manager:
+
+   ```text
+   arm-sme-vector-legalization
+   canonicalize, cse
+   convert-arith-to-arm-sme
+   convert-vector-to-arm-sme
+   convert-arm-sme-to-scf
+   convert-vector-to-scf{full-unroll}
+   func.func(enable-arm-streaming{streaming-mode=streaming za-mode=new-za
+                                  if-required-by-ops})
+   ```
+
+   `enable-arm-streaming` is func-scoped and must be added with
+   `addNestedPass<func::FuncOp>`. Every dialect the nested pipeline creates must
+   also be declared by the enclosing pass (`getDependentDialects`), because a
+   pipeline run from inside a pass does not load its passes' dependencies;
+   otherwise ops such as `cf.br` are created unregistered.
+4. counts `arm_sme.*` ops and fails with `selected SME lowering produced no
+   ArmSME tile operations` when none exist (this check must run before the late
+   pass does the intrinsic conversion);
+5. sets `llk.backend_groups_realized`.
+
+`SMELateLoweringPass` (`llk-sme-late-lowering`, module pass, same file):
+
+1. reads `llk.sme.selected_groups`; returns when absent or zero;
+2. runs, via `runPipeline` on a fresh module pass manager:
+
+   ```text
+   convert-scf-to-cf                      # createSCFToControlFlowPass (LLVM >= 21)
+   func.func(convert-arm-sme-to-llvm)
+   canonicalize, cse
+   ```
+
+   `createSCFToControlFlowPass()` (LLVM >= 21) or `createConvertSCFToCFPass()`
+   picks the SCF-to-CF factory behind the existing version guard. Tile
+   allocation happens inside `convert-arm-sme-to-llvm` and requires the
+   flattened form.
+3. declares CF, LLVM, func, scf, vector, memref, arith and arm_sme as dependent
+   dialects.
+
+- [ ] **Step 5: Add the framework hook and call it after ownership preparation**
+
+In `include/LLK/Mapping/MappingTarget.h`:
 
 ```cpp
-//===- SMEVectorLowering.cpp - Selected SME vector lowering --------------===//
-//
-// Part of the LLK Compiler Project, under the Apache License v2.0 with LLVM
-// Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
-
-// The pre-bufferization half of the selected Arm SME backend. It reads only
-// opaque mapping provenance (`micro.mapping` with the selected emitter key),
-// tiles the selected matmul with scalable [4]x[4] sizes (16x16 at SVL 512) and
-// vectorizes it to `vector.contract`. The post-bufferization pass applies the
-// Vector lowering patterns and converts the result to ArmSME: the reference
-// ArmSME pipeline does the same after bufferization because the unit-dim
-// transfer patterns operate on memrefs.
-
-#include "LLK/Target/AArch64/Mapping/SMEMappingTarget.h"
-
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Linalg/Transforms/TilingInterfaceImpl.h"
-#include "mlir/Dialect/Linalg/Transforms/Transforms.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/UB/IR/UBOps.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/PatternMatch.h"
-#include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-
-#include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/Error.h"
-
-#include <cstdint>
-#include <memory>
-
-namespace mlir::llk::target::sme {
-namespace {
-
-constexpr int64_t kSMEQuantumF32 = 4;      // vscale * 4 lanes
-constexpr int64_t kModeledContraction = 16; // M = N = K at SVL 512
-
-StringAttr selectedEmitter(Operation *op) {
-  auto mapping = op->getAttrOfType<DictionaryAttr>("micro.mapping");
-  return mapping ? mapping.getAs<StringAttr>("emitter") : StringAttr();
+/// Runs after the shared ABI and ownership preparation, before code emission.
+/// The shared preparation owns structured control flow (buffer deallocation
+/// rejects backedges); a target whose instruction selection needs a flattened
+/// form changes it here. Default: no-op.
+virtual llvm::Error
+buildLateBackendPipeline(mlir::OpPassManager &) const {
+  return llvm::Error::success();
 }
-
-bool isSelectedContraction(Operation *op) {
-  StringAttr emitter = selectedEmitter(op);
-  return emitter && emitter.getValue() == "sme_mma_za";
-}
-
-bool isExecutableSignature(Operation *op) {
-  auto matmul = dyn_cast<linalg::MatmulOp>(op);
-  if (!matmul || matmul->getNumResults() != 1)
-    return false;
-  auto microOp = op->getAttrOfType<StringAttr>("micro.op");
-  if (!microOp || microOp.getValue() != "mma")
-    return false;
-  auto result = dyn_cast<ShapedType>(matmul->getResult(0).getType());
-  return result && result.getRank() == 2 && result.hasStaticShape() &&
-         result.getShape() == ArrayRef<int64_t>{kModeledContraction,
-                                                kModeledContraction} &&
-         result.getElementType().isF32();
-}
-
-class SMEVectorLoweringPass
-    : public PassWrapper<SMEVectorLoweringPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SMEVectorLoweringPass)
-  StringRef getArgument() const final { return "llk-sme-vector-lowering"; }
-  StringRef getDescription() const final {
-    return "Tile and vectorize the selected SME contraction";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<affine::AffineDialect, arith::ArithDialect,
-                    linalg::LinalgDialect, scf::SCFDialect,
-                    tensor::TensorDialect, ub::UBDialect,
-                    vector::VectorDialect>();
-    linalg::registerTilingInterfaceExternalModels(registry);
-  }
-
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-    SmallVector<Operation *> selected;
-    module.walk([&](linalg::LinalgOp op) {
-      if (isSelectedContraction(op))
-        selected.push_back(op);
-    });
-    if (selected.empty()) {
-      module->setAttr("llk.sme.selected_groups",
-                      IntegerAttr::get(IntegerType::get(&getContext(), 64), 0));
-      return;
-    }
-
-    IRRewriter rewriter(&getContext());
-    unsigned realized = 0;
-    for (Operation *op : selected) {
-      if (!isExecutableSignature(op)) {
-        op->emitError(
-            "SME selected lowering needs a static 16x16x16 f32 contraction");
-        signalPassFailure();
-        return;
-      }
-      if (failed(lowerSelectedMatmul(cast<linalg::MatmulOp>(op), rewriter))) {
-        signalPassFailure();
-        return;
-      }
-      ++realized;
-    }
-    module->setAttr("llk.sme.selected_groups",
-                    IntegerAttr::get(IntegerType::get(&getContext(), 64),
-                                     realized));
-  }
-
-private:
-  LogicalResult lowerSelectedMatmul(linalg::MatmulOp matmul,
-                                    IRRewriter &rewriter) {
-    Location loc = matmul.getLoc();
-    scf::SCFTilingOptions tiling;
-    tiling.setTileSizeComputationFunction(
-        [loc](OpBuilder &builder, Operation *) {
-          Value vscale = vector::VectorScaleOp::create(builder, loc,
-                                                       builder.getIndexType());
-          Value quantum = arith::ConstantIndexOp::create(
-              builder, loc, kSMEQuantumF32);
-          Value tile =
-              arith::MulIOp::create(builder, loc, quantum, vscale).getResult();
-          return SmallVector<OpFoldResult>{tile, tile,
-                                           builder.getIndexAttr(1)};
-        });
-    FailureOr<scf::SCFTilingResult> tiled = scf::tileUsingSCF(
-        rewriter, cast<TilingInterface>(matmul.getOperation()), tiling);
-    if (failed(tiled)) {
-      matmul.emitError("SME scalable tiling failed");
-      return failure();
-    }
-    rewriter.replaceOp(matmul, tiled->replacements);
-
-    SmallVector<int64_t> vectorSizes{kSMEQuantumF32, kSMEQuantumF32, 1};
-    SmallVector<bool> scalableVecDims{true, true, false};
-    for (Operation *tiledOp : tiled->tiledOps) {
-      FailureOr<linalg::VectorizationResult> vectorized = linalg::vectorize(
-          rewriter, tiledOp, vectorSizes, scalableVecDims,
-          /*vectorizeNDExtract=*/false, /*flatten1DDepthwiseConv=*/false,
-          /*assumeDynamicDimsMatchVecSizes=*/false,
-          /*createNamedContraction=*/true);
-      if (failed(vectorized)) {
-        tiledOp->emitError("SME contraction vectorization failed");
-        return failure();
-      }
-      rewriter.replaceOp(tiledOp, vectorized->replacements);
-    }
-    return success();
-  }
-};
-
-} // namespace
-
-void buildSMESelectedBackendPipeline(mlir::OpPassManager &pm) {
-  pm.addPass(std::make_unique<SMEVectorLoweringPass>());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createCSEPass());
-}
-
-} // namespace mlir::llk::target::sme
 ```
 
-- [ ] **Step 4: Implement the post-bufferization ArmSME conversion**
-
-Replace `lib/Target/AArch64/Mapping/SMEArmLowering.cpp` with:
+In `include/LLK/Conversion/MappedCompilation.h` / `MappedCompilation.cpp`:
 
 ```cpp
-//===- SMEArmLowering.cpp - Selected ArmSME conversion -------------------===//
-//
-// Part of the LLK Compiler Project, under the Apache License v2.0 with LLVM
-// Exceptions.
-// See https://llvm.org/LICENSE.txt for license information.
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
-
-// The post-bufferization half of the selected Arm SME backend. It applies the
-// Vector lowering patterns (permutation maps, unit-dim transfers,
-// contract-to-outerproduct, masks) now that the transfers are memrefs, then
-// runs the production MLIR ArmSME sequence with caller-managed streaming and a
-// new ZA array per call. The sequence deliberately omits
-// `arm-sme-outer-product-fusion`: fusion emits 2-way/4-way widening operations
-// that are outside this SME1 acceptance.
-
-#include "LLK/Target/AArch64/Mapping/SMEMappingTarget.h"
-
-#include "mlir/Conversion/ArithToArmSME/ArithToArmSME.h"
-#include "mlir/Conversion/ArmSMEToLLVM/ArmSMEToLLVM.h"
-#include "mlir/Conversion/ArmSMEToSCF/ArmSMEToSCF.h"
-#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
-#include "mlir/Conversion/VectorToArmSME/VectorToArmSME.h"
-#include "mlir/Conversion/VectorToSCF/VectorToSCF.h"
-#include "mlir/Dialect/ArmSME/IR/ArmSMEDialect.h"
-#include "mlir/Dialect/ArmSME/Transforms/Passes.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/MemRef/IR/MemRef.h"
-#include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/Vector/IR/VectorOps.h"
-#include "mlir/Dialect/Vector/Transforms/LoweringPatterns.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/PatternMatch.h"
-#include "mlir/Pass/Pass.h"
-#include "mlir/Pass/PassManager.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "mlir/Transforms/Passes.h"
-
-#include "llvm/Config/llvm-config.h"
-#include "llvm/Support/Error.h"
-
-#include <memory>
-
-namespace mlir::llk::target::sme {
-namespace {
-
-class SMEArmLoweringPass
-    : public PassWrapper<SMEArmLoweringPass, OperationPass<ModuleOp>> {
-public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SMEArmLoweringPass)
-  StringRef getArgument() const final { return "llk-sme-arm-lowering"; }
-  StringRef getDescription() const final {
-    return "Convert selected SME vector IR to ArmSME and LLVM intrinsics";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<arm_sme::ArmSMEDialect, arith::ArithDialect,
-                    func::FuncDialect, memref::MemRefDialect, scf::SCFDialect,
-                    vector::VectorDialect>();
-  }
-
-  void runOnOperation() override {
-    ModuleOp module = getOperation();
-    auto selected =
-        module->getAttrOfType<IntegerAttr>("llk.sme.selected_groups");
-    if (!selected || selected.getInt() == 0)
-      return; // nothing was selected; the shared contract reports that
-
-    // The pre-bufferization pass left `vector.contract` and tensor transfers.
-    // Bufferization has made the transfers memrefs, so the reference ArmSME
-    // pattern order applies here.
-    RewritePatternSet patterns(&getContext());
-    vector::populateVectorTransferPermutationMapLoweringPatterns(patterns);
-    vector::populateVectorTransferDropUnitDimsPatterns(patterns);
-    vector::populateVectorContractLoweringPatterns(
-        patterns, vector::VectorContractLowering::OuterProduct,
-        /*benefit=*/1, /*disableOuterProductLowering=*/true);
-    vector::populateVectorMaskLoweringPatternsForSideEffectingOps(patterns);
-    vector::populateVectorMaskOpLoweringPatterns(patterns);
-    if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
-      module.emitError(
-          "SME backend could not lower the vector contraction to outer "
-          "products");
-      signalPassFailure();
-      return;
-    }
-
-    // Convert through the point where ArmSME tile operations are live, then
-    // require that the selected contraction actually became SME code before
-    // the final LLVM lowering erases the evidence.
-    OpPassManager toArmSME(ModuleOp::getOperationName());
-    toArmSME.addPass(arm_sme::createVectorLegalizationPass());
-    toArmSME.addPass(createCanonicalizerPass());
-    toArmSME.addPass(createCSEPass());
-    toArmSME.addPass(createArithToArmSMEConversionPass());
-    toArmSME.addPass(createConvertVectorToArmSMEPass());
-    toArmSME.addPass(createConvertArmSMEToSCFPass());
-    toArmSME.addPass(createConvertVectorToSCFPass(
-        VectorTransferToSCFOptions().enableFullUnroll()));
-    toArmSME.addPass(arm_sme::createEnableArmStreamingPass(
-        arm_sme::ArmStreamingMode::Streaming, arm_sme::ArmZaMode::NewZA,
-        /*ifRequiredByOps=*/true));
-#if LLVM_VERSION_MAJOR >= 21
-    toArmSME.addPass(createSCFToControlFlowPass());
-#else
-    toArmSME.addPass(createConvertSCFToCFPass());
-#endif
-    if (failed(runPipeline(toArmSME, module))) {
-      module.emitError("SME ArmSME conversion pipeline failed");
-      signalPassFailure();
-      return;
-    }
-
-    unsigned armSMEOps = 0;
-    module.walk([&](Operation *op) {
-      if (op->getName().getStringRef().starts_with("arm_sme."))
-        ++armSMEOps;
-    });
-    if (armSMEOps == 0) {
-      module.emitError(
-          "selected SME lowering produced no ArmSME tile operations");
-      signalPassFailure();
-      return;
-    }
-
-    OpPassManager toLLVM(ModuleOp::getOperationName());
-    toLLVM.addNestedPass<func::FuncOp>(createConvertArmSMEToLLVMPass());
-    toLLVM.addPass(createCanonicalizerPass());
-    toLLVM.addPass(createCSEPass());
-    if (failed(runPipeline(toLLVM, module))) {
-      module.emitError("SME ArmSME-to-LLVM conversion failed");
-      signalPassFailure();
-      return;
-    }
-
-    module->setAttr(
-        "llk.backend_groups_realized",
-        IntegerAttr::get(IntegerType::get(&getContext(), 64),
-                         selected.getInt()));
-  }
-};
-
-} // namespace
-
-void buildSMEPostBufferizationPipeline(mlir::OpPassManager &pm) {
-  pm.addPass(std::make_unique<SMEArmLoweringPass>());
-}
-
-} // namespace mlir::llk::target::sme
+llvm::Error runLateBackendPipeline(const MappingTarget &target,
+                                   mlir::ModuleOp module);
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+It builds a `PassManager`, calls `target.buildLateBackendPipeline(pm)`, skips an
+empty pipeline, runs it and returns an error on failure.
+
+Call it:
+
+- `finishCompilation`: after `prepareMappedKernelForInvocation` succeeds and
+  before `createMappedExecutable`, only for `MappedBackend::SelectedTarget`, on
+  `*prepared->module`;
+- `tools/llk-compile/llk-compile.cpp`, `emitMode == "object"`: after
+  preparation and before `emitMappedObject`, on `*prepared->module`.
+
+`SMETarget` overrides `buildLateBackendPipeline` to add `SMELateLoweringPass`
+through `buildSMELateBackendPipeline`, declared in `SMEMappingTarget.h`.
+
+- [ ] **Step 6: Run the tests to verify they pass**
 
 ```bash
-ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*:BackendPipelineHooks.*'
+ninja -C build
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmTargets.*:ArmPlacement.*'
+./build/bin/LLKMappingTests
+ctest --test-dir build
 ```
 
-Expected: PASS. `SelectedContractionLowersToArmSME` sees `llvm.aarch64.sme`
-intrinsics, no `vector.contract`/`vector.outerproduct`, and the two streaming
-attributes. If the pre-bufferization vectorization produces a form
-`convert-vector-to-arm-sme` cannot consume, the pass fails with a diagnostic
-naming the stage; fix the pattern set rather than weakening the acceptance.
+Expected: the two new tests pass, `SelectedBf16ContractionIsRefused` still
+passes, and the full suite shows no new failure. `llk-compile --emit=object`
+then reaches LLVM translation (the ArmSME translation-interface registration and
+the native harness stubs are Task 6).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add lib/Target/AArch64/Mapping/SMEVectorLowering.cpp \
+git add include/LLK/Mapping/MappingTarget.h \
+        include/LLK/Target/AArch64/Mapping/SMEMappingTarget.h \
+        lib/Target/AArch64/Mapping/SMEMappingTarget.cpp \
+        lib/Target/AArch64/Mapping/SMEVectorLowering.cpp \
         lib/Target/AArch64/Mapping/SMEArmLowering.cpp \
+        include/LLK/Conversion/MappedCompilation.h \
+        lib/Conversion/MicroMapping/MappedCompilation.cpp \
+        tools/llk-compile/llk-compile.cpp \
         test/Mapping/arm_sme_backend.cpp
 git commit -m "feat(target): lower the selected SME contraction through ArmSME (#253)"
 ```
@@ -1826,6 +1731,11 @@ def render_shim(symbol_prefix, arch_directive=""):
     # The ELF path passes `.arch armv9-a+sme` because GNU as defaults to the
     # base architecture; the Mach-O path passes an empty directive and enables
     # SME with `clang -march=armv9-a+sme`.
+    #
+    # The shim clears TPIDR2_EL0 before the kernel call. A top-level kernel
+    # with `new_za` owns a fresh ZA array and has no incoming ZA save buffer;
+    # macOS starts with TPIDR2_EL0 zero, but QEMU/Linux does not, and the
+    # kernel's prologue would otherwise call `__arm_tpidr2_save`.
     return arch_directive + r"""
 	.text
 	.p2align 2
@@ -1839,6 +1749,7 @@ def render_shim(symbol_prefix, arch_directive=""):
 	mov	x2, x3
 	mov	x3, x4
 	smstart	sm
+	msr	tpidr2_el0, xzr
 	blr	x16
 	smstop	sm
 	ldp	x29, x30, [sp], #16
@@ -2240,7 +2151,7 @@ git commit -m "test(execution): run the selected SME contraction natively on App
 ## Task 7: Add the QEMU SME1 evidence runner and CI job (tier T2, secondary)
 
 **Files:**
-- Modify: `test/Execution/arm_sme_evidence_common.py` (add `render_qemu_harness`)
+- Modify: `test/Execution/arm_sme_evidence_common.py` (verify the existing `render_qemu_harness` and streaming ABI shims)
 - Create: `test/Execution/arm_sme_qemu_evidence.py`
 - Modify: `test/FileCheck.cmake`
 - Modify: `.github/workflows/ci.yml`
@@ -2250,9 +2161,13 @@ git commit -m "test(execution): run the selected SME contraction natively on App
 - Consumes: Task 6's `emit_object`, `check_object_format`, `check_identity`, `check_sme_instructions`, `render_shim`
 - Produces: CTest `ArmSMEExecutionEvidence` under `LLK_BUILD_ARM_EVIDENCE`
 
-- [ ] **Step 1: Add the freestanding QEMU harness renderer**
+- [ ] **Step 1: Verify the freestanding QEMU harness renderer**
 
-Append to `test/Execution/arm_sme_evidence_common.py`:
+The common module already contains `render_qemu_harness` and the
+`__arm_sc_memcpy`/`__arm_sc_memmove` streaming ABI shims, added with Task 6's
+H25 fix. Verify the committed functions match the reference below (especially
+the `%(shims)s` placeholder and the shim calls); do not add a second copy.
+Task 7 owns the driver, CTest registration and CI only.
 
 ```python
 _QEMU_PREAMBLE = r"""
@@ -2654,6 +2569,7 @@ git commit -m "test(execution): run the selected SME contraction under qemu (#25
 - Modify: `docs/reviews/2026-10-24-arm-sve-executable-acceptance.md`
 - Modify: `docs/reviews/arm-mapping-targets-acceptance.md`
 - Modify: `docs/manual/source/concepts.rst`
+- Modify: `docs/manual/source/tools/compiler.rst`
 
 **Interfaces:**
 - Consumes: Task 4's emitters, Task 5's compilation results, Task 6/7's evidence records
@@ -2717,7 +2633,7 @@ TEST(ArmSMEBackend, CapabilityReceiptDrawsTheExecutableBoundary) {
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter=ArmSMEBackend.CapabilityReceiptDrawsTheExecutableBoundary
+./build/bin/LLKMappingTests --gtest_filter=ArmSMEBackend.CapabilityReceiptDrawsTheExecutableBoundary
 ```
 
 Expected: FAIL. The receipt currently asks only `hasLowering()` on the key,
@@ -2770,7 +2686,7 @@ Add `#include "llvm/ADT/DenseMap.h"` and
 
 ```bash
 ninja -C build LLKMappingTests
-./build/test/Mapping/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmSVEBackend.*:ArmTargets.*'
+./build/bin/LLKMappingTests --gtest_filter='ArmSMEBackend.*:ArmSVEBackend.*:ArmTargets.*'
 ```
 
 Expected: PASS. The f32 contraction is `Supported` after its selected compile;
@@ -2841,6 +2757,12 @@ with:
   initialized contraction is executable as of E11; every other signature
   remains static and is rejected rather than emulated.
 ```
+
+In `docs/manual/source/tools/compiler.rst`, update the identity-sidecar prose
+(around lines 321-324) so it lists `schemaVersion`,
+`streamingVectorLengthBits` (null for non-SME targets) and
+`invocationAttributes` (the LLVM function attributes applied to the exported
+wrapper), in addition to the existing fields.
 
 - [ ] **Step 6: Write the revision-pinned acceptance ledger**
 
@@ -2923,8 +2845,14 @@ fails the evidence test; it is not skipped.
 - No bf16/i8 SME execution, no SME2, no multi-tile kernels, no ZA preservation
   across calls, no physical SRAM/L2/DMA realization, no calibrated timing.
 - The JIT path refuses selected `arm-sme` on hosts without an SVL probe
-  (`checkHostRequirements` never assumes SVL=512). The AOT object plus the
-  native/QEMU harness is the executable route.
+  (`checkHostRequirements` never assumes SVL=512). On macOS,
+  `llvm::sys::getHostCPUFeatures()` also does not report `sme`, so the JIT
+  route refuses with "selected target requires host feature 'sme'" even on an
+  SME-capable M5; the AOT path does not consult the host check. The Python frontend's
+  selected-target check uses the no-vector-length overload, so it also refuses
+  `arm-sve` and `arm-sme` even on capable Linux hardware; that is fail-closed
+  and is left to the later frontend integration increment. The AOT object plus
+  the native/QEMU harness is the executable route.
 - The E10 SVE evidence and the AVX2 baseline are unchanged.
 - #175 closes with this ledger: a non-AVX2 selected-target backend has
   reproducible numerical execution evidence, including initialized

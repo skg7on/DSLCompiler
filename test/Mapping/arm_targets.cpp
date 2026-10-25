@@ -225,27 +225,32 @@ TEST(ArmTargets, RejectsUnknownCrossKeyAndMalformedBundles) {
   }
 }
 
-// SME remains a configuration-only package: no code-generation contract, no
-// selected backend, and no emitter with a lowering.
-TEST(ArmTargets, SmeHasNoExecutableBackend) {
+// SME is executable for exactly one signature plus the fixture's movement
+// keys. Every other key keeps the explicit rejection.
+TEST(ArmTargets, SmeExecutableSubsetIsExplicit) {
   mlir::MLIRContext context;
-  mlir::IRRewriter rewriter(&context);
   auto target = loadRegistered(kConfigurations[1]); // arm-sme
   ASSERT_TRUE(bool(target)) << llvm::toString(target.takeError());
-  EXPECT_FALSE((*target)->codegenRequirements().has_value());
-  mlir::OpPassManager pipeline;
-  EXPECT_NE(llvm::toString((*target)->buildSelectedBackendPipeline(pipeline))
-                .find("unsupported"),
-            std::string::npos);
-  TargetLoweringContext lowering{(*target)->machine(), {}, {}};
+  auto requirements = (*target)->codegenRequirements();
+  ASSERT_TRUE(requirements.has_value());
+  EXPECT_EQ(requirements->architecture, "aarch64");
+  EXPECT_EQ(requirements->requiredFeatures, std::vector<std::string>{"sme"});
+  EXPECT_EQ(requirements->streamingVectorLengthBits, 512);
   for (const RuleDef &rule : (*target)->rules().all()) {
+    bool executable =
+        rule.emitter == "sme_mma_za" || rule.emitter == "sme_copy" ||
+        rule.emitter == "sme_tile_copy" || rule.emitter == "sme_tile_store";
     auto emitter = (*target)->createEmitter(rule.emitter);
     ASSERT_NE(emitter, nullptr);
-    EXPECT_FALSE(emitter->hasLowering());
-    TargetBundle bundle{rule.bundle, {}, rule.emitter};
-    EXPECT_NE(llvm::toString(emitter->lower({}, bundle, lowering, rewriter))
-                  .find("target_lowering_unsupported"),
-              std::string::npos);
+    EXPECT_EQ(emitter->hasLowering(), executable) << rule.emitter;
+    if (!executable) {
+      mlir::IRRewriter rewriter(&context);
+      TargetLoweringContext lowering{(*target)->machine(), {}, {}};
+      TargetBundle bundle{rule.bundle, {}, rule.emitter};
+      EXPECT_NE(llvm::toString(emitter->lower({}, bundle, lowering, rewriter))
+                    .find("target_lowering_unsupported"),
+                std::string::npos);
+    }
   }
 }
 

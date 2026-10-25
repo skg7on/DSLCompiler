@@ -206,6 +206,32 @@ public:
         llvm::inconvertibleErrorCode(),
         "selected backend is unsupported by target '" + name().str() + "'");
   }
+
+  /// Add this target's passes that must run after One-Shot Bufferize and
+  /// before `convert-linalg-to-loops`. Targets that lower before bufferization
+  /// leave this as the default no-op. A target that needs memrefs (Arm SME tile
+  /// operations) overrides it rather than making a target pass own the generic
+  /// pipeline's bufferization.
+  virtual llvm::Error
+  buildPostBufferizationBackendPipeline(mlir::OpPassManager &) const {
+    return llvm::Error::success();
+  }
+
+  /// Add this target's passes that run after the shared ABI and ownership
+  /// preparation has produced the callable form, and before the code is
+  /// emitted.
+  ///
+  /// The shared preparation owns the module's control flow: ownership-based
+  /// buffer deallocation only accepts structured loops. A target whose final
+  /// instruction selection needs a different control-flow shape -- flattened
+  /// `cf` loops for Arm SME tile allocation -- must not run those passes in
+  /// `buildPostBufferizationBackendPipeline`, or preparation sees the flattened
+  /// form and refuses. Splitting them here keeps the ownership contract shared
+  /// and the control-flow change target-owned. Targets that need nothing after
+  /// preparation leave this as the default no-op.
+  virtual llvm::Error buildLateBackendPipeline(mlir::OpPassManager &) const {
+    return llvm::Error::success();
+  }
 };
 
 /// A target built from already-loaded registries. `loadMappingTarget` is the

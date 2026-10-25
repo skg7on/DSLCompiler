@@ -212,11 +212,14 @@ depend on compiler-generated transitions.
   the ABI's ZA save/restore rules apply; that is out of scope here.
 - **ABI runtime**: `new_za` code consults `TPIDR2_EL0` and calls
   `__arm_tpidr2_save` only when it is nonzero. At the exported boundary it is
-  zero (measured by the native probe). The native runner links the platform
+  zero on the native runner (measured by the probe). QEMU/Linux does not leave
+  it zero, so the entry shim writes zero to `TPIDR2_EL0` after `smstart sm`
+  and before the kernel call, making the no-incoming-ZA precondition explicit
+  and identical on both runners. The native runner links the platform
   compiler-rt implementation. The freestanding QEMU runner supplies explicit
-  trap stubs for `__arm_tpidr2_save`/`__arm_tpidr2_restore` and documents that
-  the single-threaded, top-level call flow never enters them; a stub firing is
-  a test failure, not a silent continuation.
+  trap stubs for `__arm_tpidr2_save`/`__arm_tpidr2_restore`; the shim's clear
+  means the single-threaded, top-level call flow never enters them, and a stub
+  firing is a test failure, not a silent continuation.
 
 ### 5.4 Across-call correctness
 
@@ -253,25 +256,28 @@ before any mutation and never half-rewrites. It does not rely on a
 target-specific handoff attribute surviving `MicroToLinalg`; the target passes
 key off `micro.mapping` as the SVE backend does.
 
-### 6.2 Two-stage lowering
+### 6.2 Three-stage lowering
 
-Both stages are owned by the `arm-sme` target package and run only for a
+All three stages are owned by the `arm-sme` target package and run only for a
 selected-target compilation.
 
 1. **Pre-bufferization (`SMEVectorLoweringPass`)** runs after `micro-to-linalg`.
    It finds the selected `linalg.matmul` (`emitter == "sme_mma_za"`,
-   `micro.op == "mma"`), validates the signature, tiles with scalable
-   `[4]x[4]` sizes, and vectorizes to `vector.contract` while preserving the
-   initialized accumulator `vector.transfer_read` and the result
-   `vector.transfer_write`. It rejects a non-f32 dtype, a shape other than
-   16x16x16, a missing selection, or a conflicting value, without partial
-   rewrites.
+   `micro.op == "mma"`, and selected bundle `sme.mma.f32`), validates the
+   signature, tiles with scalable `[4]x[4]` sizes, and vectorizes to
+   `vector.contract` while preserving the initialized accumulator
+   `vector.transfer_read` and the result `vector.transfer_write`. The bundle
+   name, not the operand type, distinguishes the f32 signature from a bf16
+   contraction: `MicroToLinalg` casts narrower inputs to the f32 accumulator
+   type, so both reach the pass with f32 operands and an f32 result. It rejects
+   a shape other than 16x16x16, a missing selection, or a conflicting value,
+   without partial rewrites.
 2. **Post-bufferization (`SMEArmLoweringPass`)** runs after One-Shot Bufferize
    and before `convert-linalg-to-loops`. The reference ArmSME pipeline applies
    its Vector patterns after bufferization because the unit-dim transfer
    patterns operate on memrefs, so this pass first applies the permutation-map,
    unit-dim, contract-to-outerproduct and mask patterns, then the production
-   sequence:
+   sequence up to streaming enablement:
 
    ```text
    arm-sme-vector-legalization
@@ -280,20 +286,38 @@ selected-target compilation.
    convert-arm-sme-to-scf
    convert-vector-to-scf
    enable-arm-streaming{streaming-mode=streaming za-mode=new-za if-required-by-ops}
+   ```
+
+   It does **not** run `arm-sme-outer-product-fusion`: fusion creates
+   2-way/4-way widening operations that are not part of the SME1 acceptance
+   surface. It stops before `convert-scf-to-cf`. The module still carries
+   `arm_sme.outerproduct`/tile operations, so the required evidence is checked
+   here, before the late stage erases it: on success it sets
+   `llk.backend_groups_realized`, and if the selected contraction did not become
+   an SME tile computation it emits a diagnostic and leaves the group
+   unrealized. The result is still structured SCF.
+3. **Late (`SMELateLoweringPass`)** runs *after* the shared ABI/ownership
+   preparation (`prepareMappedKernelForInvocation`) and before code emission:
+
+   ```text
    convert-scf-to-cf
    convert-arm-sme-to-llvm
    canonicalize, cse
    ```
 
-   It does **not** run `arm-sme-outer-product-fusion`: fusion creates
-   2-way/4-way widening operations that are not part of the SME1 acceptance
-   surface. Tile allocation is performed inside `convert-arm-sme-to-llvm`.
-   On success it increments/sets `llk.backend_groups_realized`; if the selected
-   contraction did not become an SME tile computation it emits a diagnostic and
-   leaves the group unrealized.
+   Tile allocation, performed inside `convert-arm-sme-to-llvm`, needs the
+   flattened control flow this stage produces. Ownership-based buffer
+   deallocation, which preparation runs, accepts only structured loops and
+   refuses any function with a backedge. Running the flattening in stage 2 made
+   every ArmSME artifact uncompilable ("Only structured control-flow loops are
+   supported"); splitting it keeps the shared ownership contract and the
+   target-owned control-flow change apart. Stage 3 leaves the ArmSME dialect's
+   LLVM intrinsic operations (`arm_sme.intr.*`), which the runtime's LLVM
+   translation converts to `llvm.aarch64.sme.*` calls.
 
 The runtime LLVM stage (`addKernelToLLVMPasses`) is unchanged and target-neutral.
-It sees LLVM dialect intrinsics after `convert-arm-sme-to-llvm`.
+It sees ArmSME intrinsic operations after `convert-arm-sme-to-llvm`; the runtime
+registers the ArmSME translation interface (Task 6).
 
 ### 6.3 Framework hooks
 
@@ -306,6 +330,20 @@ It sees LLVM dialect intrinsics after `convert-arm-sme-to-llvm`.
 
   It is invoked after One-Shot Bufferize and before `convert-linalg-to-loops`.
   The existing pre-bufferization hook and all other targets are unchanged.
+- A third target-neutral hook covers passes that must follow the shared
+  ownership preparation:
+
+  ```cpp
+  virtual llvm::Error MappingTarget::buildLateBackendPipeline(
+      mlir::OpPassManager &pm) const;  // default: no-op
+  ```
+
+  `llk::runLateBackendPipeline(target, module)` builds and runs it. The shared
+  `finishCompilation` calls it for a selected-target executable after
+  `prepareMappedKernelForInvocation` and before `createMappedExecutable`, and
+  `llk-compile --emit=object` calls it before `emitMappedObject`. The split is
+  the ownership/control-flow contract: preparation owns structured loops, the
+  target owns any later flattening. It is inert for every other target.
 - No generic mapping, machine or perf code branches on `sme` or `arm-sme`.
 
 ### 6.4 Codegen contract and invocation attributes
@@ -329,14 +367,24 @@ attributes on the exported `_mlir_ciface_*` wrapper:
 - JIT: `MappedJitOptions.selectedTarget` already carries the contract; the
   runtime applies the same attributes.
 
-They are recorded in the identity sidecar. `checkHostRequirements` verifies
+They are recorded in the identity sidecar. A nonempty list also removes
+inherited Arm ZA-ownership attributes from the wrapper (`aarch64_new_za`,
+`aarch64_in_za`, `aarch64_out_za`, `aarch64_inout_za`,
+`aarch64_preserves_za`). MLIR's C-interface wrapper copies the kernel's
+discardable attributes; a wrapper with `new_za` would establish a `TPIDR2_EL0`
+save block around the kernel, which the kernel's own `new_za` prologue would
+then have to save. The wrapper therefore carries only the target's declared
+invocation attributes. `checkHostRequirements` verifies
 `streamingVectorLengthBits` when the host reports an SVL; a host that cannot
 report it is a refusal, not an assumed match. The runner additionally verifies
 SVL with `CNTB` under the entry shim. The JIT path is not the native evidence
 path; the AOT object plus harness is. Consequently the JIT path refuses
 selected `arm-sme` execution on hosts without an SVL probe (including macOS),
-while AOT emission and the native harness remain supported. That refusal is
-recorded as a capability limit rather than worked around with an assumed SVL.
+while AOT emission and the native harness remain supported. On macOS,
+`llvm::sys::getHostCPUFeatures()` also does not report `sme`, so the JIT route
+refuses with "selected target requires host feature 'sme'" even on an
+SME-capable M5. That refusal is recorded as a capability limit rather than
+worked around with an assumed SVL or an assumed feature set.
 
 ## 7. Artifact and runner
 
@@ -466,11 +514,13 @@ The implementation plan is written separately and owns exact files, tests and
 order. Its required shape, test-first per task:
 
 1. Framework: `streamingVectorLengthBits`, `invocationAttributes`, their generic
-   application and identity recording, and the post-bufferization target hook.
+   application and identity recording, the post-bufferization target hook, and
+   the late backend hook that runs after ownership preparation.
 2. `arm-sme` package: target wrapper, codegen contract, `SMEEmitter` for
    `sme_mma_za`, and the static-only tests narrowed to the unimplemented subset.
-3. SME lowering: `SMEVectorLoweringPass` and `SMEArmLoweringPass`, including
-   initialized-accumulator handling, rejections and group accounting.
+3. SME lowering: `SMEVectorLoweringPass`, `SMEArmLoweringPass` and
+   `SMELateLoweringPass`, including initialized-accumulator handling,
+   rejections, group accounting and the ownership/control-flow split.
 4. Native evidence: Mach-O AOT, wrapper attributes, assembly shim, macOS
    harness and driver, disassembly gate, negative controls, ledger identity.
 5. QEMU evidence: linux object, freestanding harness with ABI stubs, CI job,

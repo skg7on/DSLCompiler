@@ -419,6 +419,9 @@ llvm::Error lowerToBackendForm(mlir::ModuleOp module,
   options.functionBoundaryTypeConversion =
       mlir::bufferization::LayoutMapOption::IdentityLayoutMap;
   pm.addPass(mlir::bufferization::createOneShotBufferizePass(options));
+  if (backend == MappedBackend::SelectedTarget && target)
+    if (llvm::Error error = target->buildPostBufferizationBackendPipeline(pm))
+      return error;
   pm.addPass(mlir::createConvertLinalgToLoopsPass());
   if (mlir::failed(pm.run(module)))
     return compileError("selected/reference backend pass pipeline failed");
@@ -505,6 +508,22 @@ llvm::Error validateExecutableContract(mlir::ModuleOp module,
 }
 
 } // namespace
+
+llvm::Error runLateBackendPipeline(const MappingTarget &target,
+                                   mlir::ModuleOp module) {
+  if (!module)
+    return compileError("late backend pipeline needs a prepared module");
+  mlir::PassManager pm(module.getContext());
+  if (llvm::Error error = target.buildLateBackendPipeline(pm))
+    return error;
+  // Most targets need nothing after preparation; running an empty manager would
+  // only re-verify a module this stage did not touch.
+  if (pm.size() == 0)
+    return llvm::Error::success();
+  if (mlir::failed(pm.run(module)))
+    return compileError("late backend pass pipeline failed");
+  return llvm::Error::success();
+}
 
 /// The tail every compilation shares: Linalg and loops, then the calling
 /// convention, then the code.
@@ -629,6 +648,12 @@ finishCompilation(MappedCompilation compilation, const MappingTarget *target,
                                        options.entrySymbol);
   if (!prepared)
     return prepared.takeError();
+  // The ownership preparation above only accepts structured control flow, so a
+  // target whose instruction selection needs a flattened form changes it here,
+  // after preparation and before the module is handed to the JIT.
+  if (options.backend == MappedBackend::SelectedTarget && target)
+    if (llvm::Error error = runLateBackendPipeline(*target, *prepared->module))
+      return std::move(error);
   llvm::Expected<std::unique_ptr<MappedExecutable>> executable =
       createMappedExecutable(std::move(*prepared), jitOptions);
   if (!executable)

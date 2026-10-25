@@ -13,12 +13,14 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Target/LLVMIR/Dialect/ArmSME/ArmSMEToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/IR/Function.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/CodeGen.h"
@@ -41,6 +43,32 @@ std::string hexHash(uint64_t value) {
 
 } // namespace
 
+llvm::Error applyInvocationAttributes(llvm::Module &module,
+                                      llvm::StringRef wrapperSymbol,
+                                      llvm::ArrayRef<std::string> attributes) {
+  if (attributes.empty())
+    return llvm::Error::success();
+  llvm::Function *wrapper = module.getFunction(wrapperSymbol);
+  if (!wrapper)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "invocation wrapper '" +
+                                       wrapperSymbol.str() +
+                                       "' is missing from the LLVM module");
+  // A C-interface wrapper is a plain caller. It must not inherit the callee's
+  // ZA ownership: a wrapper with `new_za` would establish a TPIDR2 save block
+  // around the call, which the kernel's own `new_za` prologue would then have
+  // to save. The target's declared attributes are the wrapper's complete ABI
+  // contract.
+  static constexpr llvm::StringLiteral kZaOwnershipAttributes[] = {
+      "aarch64_new_za", "aarch64_in_za", "aarch64_out_za", "aarch64_inout_za",
+      "aarch64_preserves_za"};
+  for (llvm::StringRef attribute : kZaOwnershipAttributes)
+    wrapper->removeFnAttr(attribute);
+  for (const std::string &attribute : attributes)
+    wrapper->addFnAttr(attribute);
+  return llvm::Error::success();
+}
+
 llvm::Expected<std::string> emitMappedObject(PreparedMappedKernel &prepared,
                                              const MappedObjectOptions &options,
                                              llvm::raw_ostream &objectStream) {
@@ -58,6 +86,12 @@ llvm::Expected<std::string> emitMappedObject(PreparedMappedKernel &prepared,
 
   mlir::registerBuiltinDialectTranslation(*module.getContext());
   mlir::registerLLVMDialectTranslation(*module.getContext());
+  // A selected target may leave dialect ops whose only LLVM form is a
+  // translation interface. ArmSME's `arm_sme.intr.*` intrinsics are exactly
+  // that: the lowering pass keeps them in the dialect and the translation
+  // interface turns them into LLVM intrinsic calls. Registration is inert for
+  // a module with no ArmSME ops and does not select or branch on a target.
+  mlir::registerArmSMEDialectTranslation(*module.getContext());
   mlir::PassManager pm(module.getContext());
   addKernelToLLVMPasses(pm);
   if (mlir::failed(pm.run(module)))
@@ -76,6 +110,10 @@ llvm::Expected<std::string> emitMappedObject(PreparedMappedKernel &prepared,
   if (!llvmModule->getFunction(wrapper))
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "no C-interface wrapper '" + wrapper + "'");
+
+  if (llvm::Error error = applyInvocationAttributes(
+          *llvmModule, wrapper, options.invocationAttributes))
+    return std::move(error);
 
   llvm::InitializeAllTargetInfos();
   llvm::InitializeAllTargets();
@@ -161,6 +199,14 @@ llvm::Error writeMappedObjectIdentity(const MappedObjectIdentity &identity,
   record["selectedGroupsVerified"] = identity.selectedGroupsVerified;
   record["backendGroupsRealized"] = identity.backendGroupsRealized;
   record["referenceGroupsLowered"] = identity.referenceGroupsLowered;
+  if (identity.streamingVectorLengthBits)
+    record["streamingVectorLengthBits"] = *identity.streamingVectorLengthBits;
+  else
+    record["streamingVectorLengthBits"] = nullptr;
+  llvm::json::Array invocationAttributes;
+  for (const std::string &attribute : identity.invocationAttributes)
+    invocationAttributes.push_back(attribute);
+  record["invocationAttributes"] = std::move(invocationAttributes);
   record["executionIdentity"] = identity.executionIdentity;
   jsonStream << llvm::json::Value(std::move(record)) << "\n";
   jsonStream.flush();

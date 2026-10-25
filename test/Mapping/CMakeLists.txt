@@ -17,6 +17,8 @@ add_llk_test_category(Mapping
         arm_policy.cpp
         arm_targets.cpp
         arm_sve_backend.cpp
+        arm_sme_backend.cpp
+        backend_pipeline_hooks.cpp
         arm_target_fixture.cpp
         arm_placement.cpp
         generic_accelerator_target.cpp

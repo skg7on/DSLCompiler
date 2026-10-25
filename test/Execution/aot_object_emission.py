@@ -46,8 +46,12 @@ def main():
                 "wrapperSymbol", "abiVersion", "abiHash", "sourceGraphHash",
                 "planId", "machineHash", "targetHash", "selectedGroupsVerified",
                 "backendGroupsRealized", "referenceGroupsLowered",
+                "streamingVectorLengthBits", "invocationAttributes",
                 "executionIdentity"):
         assert key in record, "identity has no " + key
+    assert record["schemaVersion"] == 2
+    assert record["streamingVectorLengthBits"] is None
+    assert record["invocationAttributes"] == []
     assert record["targetTriple"] == "aarch64-unknown-linux-gnu"
     assert record["targetFeatures"] == ["+sve"]
     assert record["entrySymbol"] == "arm_vector_add_f32"
@@ -87,6 +91,10 @@ def main():
     assert struct.unpack_from("<H", selected_data, 18)[0] == 183, \
         "selected output is not EM_AARCH64"
     selected_record = json.load(open(selected_identity))
+    assert selected_record["schemaVersion"] == 2
+    # arm-sve is a non-streaming target: no SVL claim, no wrapper attributes.
+    assert selected_record["streamingVectorLengthBits"] is None
+    assert selected_record["invocationAttributes"] == []
     assert selected_record["wrapperSymbol"] == "_mlir_ciface_arm_vector_add_f32"
     assert selected_record["wrapperSymbol"].encode() in selected_data, \
         "selected wrapper symbol not exported"
