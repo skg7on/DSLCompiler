@@ -346,9 +346,12 @@ TEST(CandidateInstantiationTest,
   EXPECT_EQ(described->axes.at("N"), 16);
   EXPECT_EQ(described->axes.at("K"), 32);
   ASSERT_EQ(described->ports.size(), 4u);
-  EXPECT_EQ(described->ports[0].shape, (std::vector<int64_t>{8, 32}));
-  EXPECT_EQ(described->ports[1].shape, (std::vector<int64_t>{32, 16}));
-  EXPECT_EQ(described->ports[2].shape, (std::vector<int64_t>{8, 16}));
+  EXPECT_EQ(described->ports[0].shape,
+            (std::vector<mlir::llk::shape::Dimension>{8, 32}));
+  EXPECT_EQ(described->ports[1].shape,
+            (std::vector<mlir::llk::shape::Dimension>{32, 16}));
+  EXPECT_EQ(described->ports[2].shape,
+            (std::vector<mlir::llk::shape::Dimension>{8, 16}));
   EXPECT_EQ(described->ports[3].direction,
             mlir::llk::workload::PortDirection::Output);
   EXPECT_EQ(described->ports[3].effect, mlir::llk::workload::PortEffect::Write);
@@ -452,7 +455,10 @@ TEST(CandidateInstantiationTest,
     EXPECT_TRUE(bool(described)) << llvm::toString(described.takeError());
     if (!described)
       return {};
-    return mlir::llk::workload::encodeWorkloadContract(&context, *described);
+    auto encoded =
+        mlir::llk::workload::encodeWorkloadContract(&context, *described);
+    EXPECT_TRUE(bool(encoded));
+    return encoded ? *encoded : mlir::DictionaryAttr{};
   };
 
   // linalg.matmul: accumulator and output are both f32, and there is no
@@ -488,7 +494,7 @@ TEST(CandidateInstantiationTest,
   EXPECT_EQ(swigluContract->axes.at("K"), 32);
   ASSERT_EQ(swigluContract->ports.size(), 4u);
   for (const mlir::llk::workload::WorkloadPort &port : swigluContract->ports)
-    EXPECT_NE(port.shape, (std::vector<int64_t>{8, 16, 32}))
+    EXPECT_NE(port.shape, (std::vector<mlir::llk::shape::Dimension>{8, 16, 32}))
         << "a contraction port is rank two, never a fabricated rank three";
   EXPECT_TRUE(
       llvm::is_contained(swigluContract->requiredPrimitives, "micro.vector"));

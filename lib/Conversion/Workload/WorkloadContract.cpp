@@ -13,15 +13,18 @@
 #include "mlir/IR/BuiltinTypes.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <utility>
 
 namespace mlir::llk::workload {
 
-/// The only contract schema this increment accepts.
-static constexpr uint32_t kSupportedVersion = 1;
+/// The newest schema this increment accepts. Version 1 keeps its original
+/// integer encoding; version 2 adds symbolic dimensions and symbol bounds.
+static constexpr uint32_t kSupportedVersion = 2;
 
 llvm::StringRef stringifyPortDirection(PortDirection direction) {
   switch (direction) {
@@ -107,6 +110,54 @@ void appendInt(std::string &out, llvm::StringRef tag, int64_t value) {
   out += ';';
 }
 
+/// Version 1 renders a constant extent exactly as before. A symbolic extent
+/// cannot appear in a valid version 1 contract, but the renderer stays
+/// deterministic for callers that hash before validating.
+void appendV1Extent(std::string &out, llvm::StringRef tag,
+                    const shape::Dimension &dimension) {
+  if (dimension.isConstant()) {
+    appendInt(out, tag, dimension.getConstant());
+    return;
+  }
+  out.append(tag.data(), tag.size());
+  out += "=symbol:";
+  out += std::to_string(dimension.getSymbol().size());
+  out += ':';
+  out.append(dimension.getSymbol().data(), dimension.getSymbol().size());
+  out += ';';
+}
+
+/// Version 2 tags constants and symbols distinctly, so a symbol named "5"
+/// never collides with the constant five.
+void appendV2Dimension(std::string &out, const shape::Dimension &dimension) {
+  if (dimension.isConstant()) {
+    out += "dim=constant:";
+    out += std::to_string(dimension.getConstant());
+    out += ';';
+    return;
+  }
+  out += "dim=symbol:";
+  out += std::to_string(dimension.getSymbol().size());
+  out += ':';
+  out.append(dimension.getSymbol().data(), dimension.getSymbol().size());
+  out += ';';
+}
+
+/// True when a multiple of `divisor` lies in the inclusive range.
+bool hasMultipleInRange(int64_t minimum, std::optional<int64_t> maximum,
+                        int64_t divisor) {
+  if (divisor <= 0)
+    return false;
+  int64_t remainder = minimum % divisor;
+  if (remainder == 0)
+    return true;
+  int64_t delta = divisor - remainder;
+  if (minimum > std::numeric_limits<int64_t>::max() - delta)
+    return false;
+  int64_t first = minimum + delta;
+  return !maximum || first <= *maximum;
+}
+
 /// Sorts attributes by name; `DictionaryAttr::get` requires sorted, unique
 /// keys.
 void sortNamedAttrs(llvm::SmallVectorImpl<mlir::NamedAttribute> &attrs) {
@@ -133,12 +184,44 @@ mlir::DictionaryAttr makeDictionary(
   return mlir::DictionaryAttr::get(context, attrs);
 }
 
+/// The declared constraint for one symbol, or nullopt when the attribute is
+/// not a dictionary of integers.
+std::optional<shape::SymbolConstraint>
+decodeConstraint(mlir::DictionaryAttr attr) {
+  shape::SymbolConstraint constraint;
+  if (mlir::IntegerAttr min = attr.getAs<mlir::IntegerAttr>("min"))
+    constraint.min = min.getValue().getSExtValue();
+  else
+    return std::nullopt;
+  if (mlir::IntegerAttr max = attr.getAs<mlir::IntegerAttr>("max"))
+    constraint.max = max.getValue().getSExtValue();
+  if (mlir::IntegerAttr multiple = attr.getAs<mlir::IntegerAttr>("multiple_of"))
+    constraint.multipleOf = multiple.getValue().getSExtValue();
+  else
+    return std::nullopt;
+  return constraint;
+}
+
+/// A shape entry is an integer constant or a symbol name.
+std::optional<shape::Dimension> decodeDimension(mlir::Attribute attr,
+                                                bool &wellFormed) {
+  wellFormed = true;
+  if (auto constant = mlir::dyn_cast<mlir::IntegerAttr>(attr))
+    return shape::Dimension(constant.getValue().getSExtValue());
+  if (auto symbol = mlir::dyn_cast<mlir::StringAttr>(attr))
+    return shape::Dimension::symbol(symbol.getValue().str());
+  wellFormed = false;
+  return std::nullopt;
+}
+
 } // namespace
 
 llvm::Error validateWorkloadContract(const WorkloadContract &contract) {
-  if (contract.version != kSupportedVersion)
+  if (contract.version < 1 || contract.version > kSupportedVersion)
     return contractError("workload_contract: unknown_version: " +
                          std::to_string(contract.version));
+
+  const bool version1 = contract.version == 1;
 
   std::set<std::string> seen;
   for (const WorkloadPort &port : contract.ports)
@@ -146,19 +229,35 @@ llvm::Error validateWorkloadContract(const WorkloadContract &contract) {
       return contractError("workload_contract: duplicate_port: '" + port.name +
                            "'");
 
+  llvm::StringSet<> portSymbols;
   for (const WorkloadPort &port : contract.ports) {
     if (port.shape.empty())
       return contractError("workload_contract: rank_zero: port '" + port.name +
                            "'");
     for (size_t dim = 0; dim < port.shape.size(); ++dim) {
-      int64_t extent = port.shape[dim];
-      if (extent == mlir::ShapedType::kDynamic)
+      const shape::Dimension &extent = port.shape[dim];
+      if (extent.isSymbol()) {
+        // Version 1 has no symbolic encoding at all.
+        if (version1)
+          return contractError("workload_contract: dynamic_extent: port '" +
+                               port.name + "' dim " + std::to_string(dim));
+        if (extent.getSymbol().empty())
+          return contractError("workload_contract: empty_symbol: port '" +
+                               port.name + "' dim " + std::to_string(dim));
+        portSymbols.insert(extent.getSymbol());
+        continue;
+      }
+      int64_t value = extent.getConstant();
+      if (value == mlir::ShapedType::kDynamic)
         return contractError("workload_contract: dynamic_extent: port '" +
                              port.name + "' dim " + std::to_string(dim));
-      if (extent == 0)
-        return contractError("workload_contract: zero_extent: port '" +
-                             port.name + "' dim " + std::to_string(dim));
-      if (extent < 0)
+      if (value == 0) {
+        if (version1)
+          return contractError("workload_contract: zero_extent: port '" +
+                               port.name + "' dim " + std::to_string(dim));
+        continue;
+      }
+      if (value < 0)
         return contractError("workload_contract: negative_extent: port '" +
                              port.name + "' dim " + std::to_string(dim));
     }
@@ -167,10 +266,75 @@ llvm::Error validateWorkloadContract(const WorkloadContract &contract) {
                            port.elementType + "'");
   }
 
+  llvm::StringSet<> axisSymbols;
+  for (const auto &[name, extent] : contract.axes) {
+    if (extent.isSymbol()) {
+      if (version1)
+        return contractError("workload_contract: dynamic_extent: axis '" +
+                             name + "'");
+      if (extent.getSymbol().empty())
+        return contractError("workload_contract: empty_symbol: axis '" + name +
+                             "'");
+      axisSymbols.insert(extent.getSymbol());
+      continue;
+    }
+    if (!version1 && extent.getConstant() < 0)
+      return contractError("workload_contract: negative_extent: axis '" + name +
+                           "'");
+  }
+
+  if (version1) {
+    if (!contract.symbols.empty())
+      return contractError(
+          "workload_contract: unexpected_symbols: version 1 has no symbol "
+          "table");
+    return llvm::Error::success();
+  }
+
+  for (const auto &entry : portSymbols)
+    if (!contract.symbols.count(entry.getKey().str()))
+      return contractError("workload_contract: undeclared_symbol: '" +
+                           entry.getKey().str() + "'");
+  for (const auto &entry : axisSymbols) {
+    std::string name = entry.getKey().str();
+    if (!contract.symbols.count(name))
+      return contractError("workload_contract: undeclared_symbol: '" + name +
+                           "'");
+    if (!portSymbols.count(name))
+      return contractError("workload_contract: axis_symbol_not_in_port: '" +
+                           name + "'");
+  }
+
+  for (const auto &[name, constraint] : contract.symbols) {
+    if (name.empty())
+      return contractError(
+          "workload_contract: empty_symbol: a declared symbol has an empty "
+          "name");
+    if (constraint.min < 0)
+      return contractError("workload_contract: negative_minimum: '" + name +
+                           "'");
+    if (constraint.max && *constraint.max < constraint.min)
+      return contractError("workload_contract: unsatisfiable_bounds: '" + name +
+                           "' has max below min");
+    if (constraint.multipleOf <= 0)
+      return contractError("workload_contract: invalid_divisor: '" + name +
+                           "' has multiple_of " +
+                           std::to_string(constraint.multipleOf));
+    if (!hasMultipleInRange(constraint.min, constraint.max,
+                            constraint.multipleOf))
+      return contractError("workload_contract: unsatisfiable_bounds: '" + name +
+                           "' has no multiple of " +
+                           std::to_string(constraint.multipleOf) + " in range");
+    if (!portSymbols.count(name))
+      return contractError("workload_contract: unused_symbol: '" + name +
+                           "' is declared but no port uses it");
+  }
+
   return llvm::Error::success();
 }
 
 std::string canonicalWorkloadContract(const WorkloadContract &contract) {
+  const bool version1 = contract.version == 1;
   std::string out;
   appendInt(out, "version", static_cast<int64_t>(contract.version));
   appendInt(out, "ports", static_cast<int64_t>(contract.ports.size()));
@@ -179,8 +343,13 @@ std::string canonicalWorkloadContract(const WorkloadContract &contract) {
     appendField(out, "direction", stringifyPortDirection(port.direction));
     appendField(out, "effect", stringifyPortEffect(port.effect));
     appendInt(out, "rank", static_cast<int64_t>(port.shape.size()));
-    for (int64_t extent : port.shape)
-      appendInt(out, "extent", extent);
+    if (version1) {
+      for (const shape::Dimension &extent : port.shape)
+        appendV1Extent(out, "extent", extent);
+    } else {
+      for (const shape::Dimension &extent : port.shape)
+        appendV2Dimension(out, extent);
+    }
     appendField(out, "element_type", port.elementType);
   }
 
@@ -188,7 +357,23 @@ std::string canonicalWorkloadContract(const WorkloadContract &contract) {
   appendInt(out, "axes", static_cast<int64_t>(contract.axes.size()));
   for (const auto &[name, extent] : contract.axes) {
     appendField(out, "axis", name);
-    appendInt(out, "extent", extent);
+    if (version1)
+      appendV1Extent(out, "extent", extent);
+    else
+      appendV2Dimension(out, extent);
+  }
+
+  if (!version1) {
+    appendInt(out, "symbols", static_cast<int64_t>(contract.symbols.size()));
+    for (const auto &[name, constraint] : contract.symbols) {
+      appendField(out, "symbol", name);
+      appendInt(out, "min", constraint.min);
+      if (constraint.max)
+        appendInt(out, "max", *constraint.max);
+      else
+        out += "max=none;";
+      appendInt(out, "multiple_of", constraint.multipleOf);
+    }
   }
 
   appendField(out, "numerical_contract", contract.numericalContract);
@@ -205,15 +390,27 @@ std::string canonicalWorkloadContract(const WorkloadContract &contract) {
   return out;
 }
 
-mlir::DictionaryAttr encodeWorkloadContract(mlir::MLIRContext *context,
-                                            const WorkloadContract &contract) {
+llvm::Expected<mlir::DictionaryAttr>
+encodeWorkloadContract(mlir::MLIRContext *context,
+                       const WorkloadContract &contract) {
+  if (llvm::Error error = validateWorkloadContract(contract))
+    return std::move(error);
+
+  const bool version1 = contract.version == 1;
   mlir::IntegerType i64 = mlir::IntegerType::get(context, 64);
 
   llvm::SmallVector<mlir::Attribute> portAttrs;
   for (const WorkloadPort &port : contract.ports) {
     llvm::SmallVector<mlir::Attribute> shape;
-    for (int64_t extent : port.shape)
-      shape.push_back(mlir::IntegerAttr::get(i64, extent));
+    for (const shape::Dimension &extent : port.shape) {
+      if (extent.isConstant()) {
+        shape.push_back(mlir::IntegerAttr::get(i64, extent.getConstant()));
+        continue;
+      }
+      // Version 1 only carries positive constants; validation rejected any
+      // other value above, so this branch is unreachable for version 1.
+      shape.push_back(mlir::StringAttr::get(context, extent.getSymbol()));
+    }
 
     portAttrs.push_back(makeDictionary(
         context,
@@ -227,24 +424,60 @@ mlir::DictionaryAttr encodeWorkloadContract(mlir::MLIRContext *context,
   }
 
   llvm::SmallVector<mlir::NamedAttribute> axisAttrs;
-  for (const auto &[name, extent] : contract.axes)
+  for (const auto &[name, extent] : contract.axes) {
+    mlir::Attribute value =
+        extent.isConstant()
+            ? mlir::Attribute(mlir::IntegerAttr::get(i64, extent.getConstant()))
+            : mlir::Attribute(
+                  mlir::StringAttr::get(context, extent.getSymbol()));
     axisAttrs.push_back(
-        mlir::NamedAttribute(mlir::StringAttr::get(context, name),
-                             mlir::IntegerAttr::get(i64, extent)));
+        mlir::NamedAttribute(mlir::StringAttr::get(context, name), value));
+  }
   sortNamedAttrs(axisAttrs);
 
   llvm::SmallVector<mlir::Attribute> primitives;
   for (const std::string &primitive : contract.requiredPrimitives)
     primitives.push_back(mlir::StringAttr::get(context, primitive));
 
-  return makeDictionary(
-      context,
-      {{"version", mlir::IntegerAttr::get(i64, contract.version)},
-       {"ports", mlir::ArrayAttr::get(context, portAttrs)},
-       {"axes", mlir::DictionaryAttr::get(context, axisAttrs)},
-       {"numerical_contract",
-        mlir::StringAttr::get(context, contract.numericalContract)},
-       {"required_primitives", mlir::ArrayAttr::get(context, primitives)}});
+  llvm::SmallVector<mlir::NamedAttribute> entries = {
+      mlir::NamedAttribute(mlir::StringAttr::get(context, "version"),
+                           mlir::IntegerAttr::get(i64, contract.version)),
+      mlir::NamedAttribute(mlir::StringAttr::get(context, "ports"),
+                           mlir::ArrayAttr::get(context, portAttrs)),
+      mlir::NamedAttribute(mlir::StringAttr::get(context, "axes"),
+                           mlir::DictionaryAttr::get(context, axisAttrs)),
+      mlir::NamedAttribute(
+          mlir::StringAttr::get(context, "numerical_contract"),
+          mlir::StringAttr::get(context, contract.numericalContract)),
+      mlir::NamedAttribute(
+          mlir::StringAttr::get(context, "required_primitives"),
+          mlir::ArrayAttr::get(context, primitives))};
+
+  if (!version1) {
+    llvm::SmallVector<mlir::NamedAttribute> symbolAttrs;
+    for (const auto &[name, constraint] : contract.symbols) {
+      llvm::SmallVector<mlir::NamedAttribute> bounds = {
+          mlir::NamedAttribute(mlir::StringAttr::get(context, "min"),
+                               mlir::IntegerAttr::get(i64, constraint.min)),
+          mlir::NamedAttribute(
+              mlir::StringAttr::get(context, "multiple_of"),
+              mlir::IntegerAttr::get(i64, constraint.multipleOf))};
+      if (constraint.max)
+        bounds.push_back(
+            mlir::NamedAttribute(mlir::StringAttr::get(context, "max"),
+                                 mlir::IntegerAttr::get(i64, *constraint.max)));
+      symbolAttrs.push_back(
+          mlir::NamedAttribute(mlir::StringAttr::get(context, name),
+                               mlir::DictionaryAttr::get(context, bounds)));
+    }
+    sortNamedAttrs(symbolAttrs);
+    entries.push_back(
+        mlir::NamedAttribute(mlir::StringAttr::get(context, "symbols"),
+                             mlir::DictionaryAttr::get(context, symbolAttrs)));
+  }
+
+  sortNamedAttrs(entries);
+  return mlir::DictionaryAttr::get(context, entries);
 }
 
 llvm::Expected<WorkloadContract>
@@ -295,10 +528,11 @@ decodeWorkloadContract(mlir::DictionaryAttr attr) {
     if (!shape)
       return malformed("port 'shape' must be an array");
     for (mlir::Attribute extentAttr : shape) {
-      auto extent = mlir::dyn_cast<mlir::IntegerAttr>(extentAttr);
-      if (!extent)
-        return malformed("port 'shape' extents must be integers");
-      port.shape.push_back(extent.getValue().getSExtValue());
+      bool wellFormed = false;
+      auto extent = decodeDimension(extentAttr, wellFormed);
+      if (!wellFormed)
+        return malformed("port 'shape' extents must be integers or symbols");
+      port.shape.push_back(*extent);
     }
 
     mlir::StringAttr elementType =
@@ -314,11 +548,25 @@ decodeWorkloadContract(mlir::DictionaryAttr attr) {
   if (!axes)
     return malformed("'axes' must be a dictionary");
   for (const mlir::NamedAttribute &entry : axes) {
-    auto extent = mlir::dyn_cast<mlir::IntegerAttr>(entry.getValue());
-    if (!extent)
-      return malformed("axis extents must be integers");
-    contract.axes[entry.getName().getValue().str()] =
-        extent.getValue().getSExtValue();
+    bool wellFormed = false;
+    auto extent = decodeDimension(entry.getValue(), wellFormed);
+    if (!wellFormed)
+      return malformed("axis extents must be integers or symbols");
+    contract.axes[entry.getName().getValue().str()] = *extent;
+  }
+
+  if (mlir::DictionaryAttr symbols =
+          attr.getAs<mlir::DictionaryAttr>("symbols")) {
+    for (const mlir::NamedAttribute &entry : symbols) {
+      auto bounds = mlir::dyn_cast<mlir::DictionaryAttr>(entry.getValue());
+      if (!bounds)
+        return malformed("symbol constraints must be dictionaries");
+      auto constraint = decodeConstraint(bounds);
+      if (!constraint)
+        return malformed("symbol constraints need integer 'min' and "
+                         "'multiple_of'");
+      contract.symbols[entry.getName().getValue().str()] = *constraint;
+    }
   }
 
   mlir::StringAttr numerical =

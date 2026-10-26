@@ -146,24 +146,74 @@ public:
                                          op.getResult(),
                                          op.getAccumulatorType(), c);
   }
+  FailureOr<llk::ContractionDimensions>
+  inferDimensions(Operation *root) const override {
+    auto op = cast<llk::FusedSwiGLUOp>(root);
+    auto dims = llk::inferContractionDimensions(root, op.getX(), op.getWg(),
+                                                op.getResult());
+    if (failed(dims))
+      return failure();
+    // The up-projection weight and the initialized destination each pin the
+    // same axes; unify them so a mixed static/dynamic root resolves to the
+    // constants the source already guarantees.
+    auto resolve = [&](llvm::StringRef axis,
+                       const llk::shape::Dimension &current,
+                       llvm::ArrayRef<int64_t> extents)
+        -> FailureOr<llk::shape::Dimension> {
+      llvm::SmallVector<int64_t, 2> combined = {
+          current.isConstant() ? current.getConstant() : ShapedType::kDynamic};
+      combined.append(extents.begin(), extents.end());
+      return llk::resolveContractionDimension(root, axis, combined);
+    };
+    auto init = cast<ShapedType>(op.getInit().getType());
+    auto wu = cast<ShapedType>(op.getWu().getType());
+    FailureOr<llk::shape::Dimension> M =
+        resolve("M", dims->M, {init.getDimSize(0)});
+    if (failed(M))
+      return failure();
+    FailureOr<llk::shape::Dimension> N =
+        resolve("N", dims->N, {wu.getDimSize(1), init.getDimSize(1)});
+    if (failed(N))
+      return failure();
+    FailureOr<llk::shape::Dimension> K =
+        resolve("K", dims->K, {wu.getDimSize(0)});
+    if (failed(K))
+      return failure();
+    return llk::ContractionDimensions{*M, *N, *K};
+  }
   bool hasMicroLowering() const override { return true; }
-  LogicalResult
-  describeMicroKernel(Operation *root, const llk::KernelContract &contract,
-                      llk::MicroKernelFragment &f) const override {
+  LogicalResult describeMicroKernel(Operation *root,
+                                    const llk::KernelContract &contract,
+                                    llk::MicroKernelFragment &f,
+                                    bool requireStatic = true) const override {
     auto op = cast<llk::FusedSwiGLUOp>(root);
     auto validated = contract;
-    if (failed(llk::validateMicroContraction(
-            root, op.getX(), op.getWg(), op.getResult(),
-            op.getAccumulatorType(), validated)))
-      return failure();
-    if (failed(llk::checkMicroTensor(root, op.getWu(), "up-projection weight")))
-      return failure();
+    if (requireStatic) {
+      if (failed(llk::validateMicroContraction(
+              root, op.getX(), op.getWg(), op.getResult(),
+              op.getAccumulatorType(), validated)))
+        return failure();
+      if (failed(
+              llk::checkMicroTensor(root, op.getWu(), "up-projection weight")))
+        return failure();
+      auto wu = cast<ShapedType>(op.getWu().getType());
+      if (wu.getDimSize(0) != contract.K || wu.getDimSize(1) != contract.N)
+        return root->emitError()
+               << "the up-projection weight must be shaped [K, N] = ["
+               << contract.K << ", " << contract.N << "]";
+    } else {
+      // `validateMicroContractionShape` covers X/Wg/result; `inferDimensions`
+      // additionally unifies Wu, which the shared validation cannot see.
+      llk::ContractionDimensions dimensions;
+      if (failed(llk::validateMicroContractionShape(
+              root, op.getX(), op.getWg(), op.getResult(),
+              op.getAccumulatorType(), dimensions, validated)))
+        return failure();
+      if (failed(inferDimensions(root)))
+        return failure();
+    }
     auto wu = cast<ShapedType>(op.getWu().getType());
-    if (wu.getDimSize(0) != contract.K || wu.getDimSize(1) != contract.N)
-      return root->emitError()
-             << "the up-projection weight must be shaped [K, N] = ["
-             << contract.K << ", " << contract.N << "]";
-    if (wu.getElementType() != contract.inputElemType)
+    if (wu.getElementType() != validated.inputElemType)
       return root->emitError("the concrete Micro-IR exporter requires matching "
                              "input and up-projection weight element types");
     if (op.getActivation() != llk::Activation::silu)

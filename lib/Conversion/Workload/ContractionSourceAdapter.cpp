@@ -95,7 +95,12 @@ struct ContractionFacts {
 /// The contract and fragment the source root declares. `inferContract` and
 /// `describeMicroKernel` are the same calls the export makes, so a root this
 /// adapter describes is a root the export can emit.
-llvm::Expected<ContractionFacts> contractionFacts(Operation *root) {
+///
+/// `allowDynamic` is used only for contract description: the static export path
+/// keeps its pre-dynamic rejection, while a symbolic root can still report the
+/// fragment and axes it declares.
+llvm::Expected<ContractionFacts> contractionFacts(Operation *root,
+                                                  bool allowDynamic = false) {
   if (!root)
     return error("a contraction source root is required");
   LLKKernelRegistry registry = makeKernelRegistry();
@@ -107,8 +112,8 @@ llvm::Expected<ContractionFacts> contractionFacts(Operation *root) {
   ContractionFacts facts;
   if (failed(lowering->inferContract(root, facts.contract)))
     return error("source root does not describe a supported contraction");
-  if (failed(
-          lowering->describeMicroKernel(root, facts.contract, facts.fragment)))
+  if (failed(lowering->describeMicroKernel(root, facts.contract, facts.fragment,
+                                           /*requireStatic=*/!allowDynamic)))
     return error("source root has no Micro-IR lowering");
   return facts;
 }
@@ -120,14 +125,6 @@ std::string dtypeName(Type type) {
   auto dtype = micro::dtypeOfElementType(type);
   return dtype ? micro::stringifyDType(*dtype).str()
                : std::string("unsupported");
-}
-
-std::vector<int64_t> shapeOf(Type type) {
-  auto shaped = dyn_cast<ShapedType>(type);
-  if (!shaped || !shaped.hasStaticShape())
-    return {};
-  return std::vector<int64_t>(shaped.getShape().begin(),
-                              shaped.getShape().end());
 }
 
 /// The scalar element type of a shaped value. The registry reports the
@@ -198,6 +195,31 @@ contractionSchema(const perf::SearchSpace &space) {
     schema.push_back(std::move(binding));
   }
   return schema;
+}
+
+/// A symbolic or zero-extent contract has no version-1 encoding, so it is
+/// exported as version 2 with an explicit symbol table.
+bool needsVersion2(const ContractionDimensions &dims) {
+  for (const shape::Dimension &dim : {dims.M, dims.N, dims.K})
+    if (dim.isSymbol() || dim.getConstant() == 0)
+      return true;
+  return false;
+}
+
+/// Declares a default constraint for every symbol the contract uses. A
+/// contraction symbol has no source-level range facts yet, so the baseline is
+/// every nonnegative extent.
+void declareContractSymbols(WorkloadContract &contract) {
+  auto declare = [&](const shape::Dimension &dim) {
+    if (dim.isSymbol())
+      contract.symbols.emplace(dim.getSymbol().str(),
+                               shape::SymbolConstraint{});
+  };
+  for (const auto &[name, dim] : contract.axes)
+    declare(dim);
+  for (const WorkloadPort &port : contract.ports)
+    for (const shape::Dimension &dim : port.shape)
+      declare(dim);
 }
 
 /// The symbol of the module-level operation that contains `nested`. Source
@@ -316,6 +338,14 @@ llvm::Expected<ScheduleEntry> toSchedule(const perf::SearchSpace &space,
 llvm::Expected<perf::BindingFacts>
 realizedContractionFacts(Operation *root, const perf::SearchSpace &space,
                          const perf::Candidate &candidate) {
+  // The static analysis and export drivers still do integer shape arithmetic;
+  // a symbolic axis must never reach them as MLIR's dynamic sentinel.
+  auto dims = inferContractionDimensions(root);
+  if (failed(dims))
+    return error("source root does not declare contraction dimensions");
+  if (!dims->M.isConstant() || !dims->N.isConstant() || !dims->K.isConstant())
+    return error(
+        "dynamic contraction extents are not supported by the static export");
   auto facts = contractionFacts(root);
   if (!facts)
     return facts.takeError();
@@ -366,42 +396,49 @@ public:
   }
 
   llvm::Expected<WorkloadContract> describe(Operation *root) const override {
-    auto facts = contractionFacts(root);
+    auto facts = contractionFacts(root, /*allowDynamic=*/true);
     if (!facts)
       return facts.takeError();
+    auto dims = inferContractionDimensions(root);
+    if (failed(dims))
+      return error("source root does not declare contraction dimensions");
     const KernelContract &contract = facts->contract;
-    if (contract.M <= 0 || contract.N <= 0 || contract.K <= 0)
-      return error("source root has a non-positive contraction extent");
 
     WorkloadContract described;
-    described.axes = {{"M", contract.M}, {"N", contract.N}, {"K", contract.K}};
+    described.version = needsVersion2(*dims) ? 2u : 1u;
+    described.axes = {{"M", dims->M}, {"N", dims->N}, {"K", dims->K}};
     // Ports follow the emitted kernel's signature: the left operand, one port
     // per right-hand arm, the caller's initialized destination when the
-    // lowering takes one, and the written result.
+    // lowering takes one, and the written result. Reusing M/N/K relates the
+    // same axis across ports; an unresolved axis is a shared symbol.
     described.ports.push_back({"lhs",
                                PortDirection::Input,
                                PortEffect::Read,
-                               {contract.M, contract.K},
+                               {dims->M, dims->K},
                                dtypeName(contract.inputElemType)});
     if (facts->fragment.rhsOperandTypes.size() < facts->fragment.armCount)
       return error("source root declares more contraction arms than operands");
     for (size_t arm = 0; arm < facts->fragment.armCount; ++arm) {
       Type armType = facts->fragment.rhsOperandTypes[arm];
-      described.ports.push_back(
-          {"rhs" + std::to_string(arm), PortDirection::Input, PortEffect::Read,
-           shapeOf(armType), dtypeName(elementTypeOf(armType))});
+      described.ports.push_back({"rhs" + std::to_string(arm),
+                                 PortDirection::Input,
+                                 PortEffect::Read,
+                                 {dims->K, dims->N},
+                                 dtypeName(elementTypeOf(armType))});
     }
     if (facts->fragment.hasOutputInit)
       described.ports.push_back({"init",
                                  PortDirection::Input,
                                  PortEffect::Read,
-                                 {contract.M, contract.N},
+                                 {dims->M, dims->N},
                                  dtypeName(contract.outputElemType)});
     described.ports.push_back({"output",
                                PortDirection::Output,
                                PortEffect::Write,
-                               {contract.M, contract.N},
+                               {dims->M, dims->N},
                                dtypeName(contract.outputElemType)});
+    if (described.version == 2)
+      declareContractSymbols(described);
     described.numericalContract = numericalContractName(root);
     described.requiredPrimitives = emittedPrimitives(*facts);
     return described;
@@ -485,6 +522,13 @@ std::unique_ptr<SourceAdapter> makeContractionSourceAdapter() {
 
 llvm::Expected<perf::WorkloadShape>
 describeContractionShape(mlir::Operation *root) {
+  auto dims = inferContractionDimensions(root);
+  if (failed(dims))
+    return error("source root does not declare contraction dimensions");
+  if (!dims->M.isConstant() || !dims->N.isConstant() || !dims->K.isConstant())
+    return error(
+        "dynamic contraction extents are not supported by the static analysis "
+        "export");
   auto facts = contractionFacts(root);
   if (!facts)
     return facts.takeError();

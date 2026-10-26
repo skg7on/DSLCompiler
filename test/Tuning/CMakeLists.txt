@@ -9,6 +9,15 @@ target_compile_definitions(FrameworkSourceTest PRIVATE
     LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME FrameworkSourceTest COMMAND FrameworkSourceTest)
 
+# Symbolic shape data, checked binding and the versioned workload contract.
+# This target needs no JIT or E2E guard: it exercises data and MLIR attribute
+# encoding only.
+add_executable(DynamicShapeContractTest dynamic_shape_contract.cpp)
+target_link_libraries(DynamicShapeContractTest PRIVATE LLKShape
+    LLKWorkloadContracts LLKKernel LLKDialect MicroDialect
+    GTest::gtest_main LLK::MLIR)
+add_test(NAME DynamicShapeContractTest COMMAND DynamicShapeContractTest)
+
 if(LLK_BUILD_E2E_TESTS)
   add_executable(MappedTuningSessionTest mapped_tuning_session.cpp)
   target_link_libraries(MappedTuningSessionTest PRIVATE LLKMappedTuning

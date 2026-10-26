@@ -333,9 +333,10 @@ TEST_F(FrameworkTest,
   ASSERT_TRUE(source);
   auto retained = addContract();
   retained.ports[0].elementType = "f16";
+  auto encoded = workload::encodeWorkloadContract(context.get(), retained);
+  ASSERT_TRUE(bool(encoded));
   SymbolTable::lookupSymbolIn(*source, "add")
-      ->setAttr("micro.workload_contract",
-                workload::encodeWorkloadContract(context.get(), retained));
+      ->setAttr("micro.workload_contract", *encoded);
   const auto before = print(source->getOperation());
   expectError(tuning::instantiateCandidate(*source, singleton(), candidate(),
                                            addContract(), options()),

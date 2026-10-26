@@ -1,4 +1,5 @@
 # Define libraries from lower-level IR/data models to compiler integration.
+add_subdirectory(Shape)
 add_subdirectory(Dialect/LLK)
 add_subdirectory(Dialect/Micro)
 add_subdirectory(Machine)

@@ -146,9 +146,14 @@ llvm::Error verifyConcreteContract(Operation *kernel,
         input ? type.getInput(i) : type.getResult(i - type.getNumInputs());
     auto tensor = dyn_cast<RankedTensorType>(signatureType);
     if (!tensor || !tensor.hasStaticShape() ||
-        tensor.getShape() != ArrayRef<int64_t>(port.shape))
+        tensor.getRank() != static_cast<int64_t>(port.shape.size()))
       return error("workload_contract: port '" + port.name +
                    "' shape does not match static tensor signature");
+    for (size_t dim = 0; dim < port.shape.size(); ++dim)
+      if (!port.shape[dim].isConstant() ||
+          port.shape[dim].getConstant() != tensor.getDimSize(dim))
+        return error("workload_contract: port '" + port.name +
+                     "' shape does not match static tensor signature");
     std::string dtype;
     llvm::raw_string_ostream out(dtype);
     tensor.getElementType().print(out);
@@ -232,8 +237,10 @@ instantiateConcreteMicro(ModuleOp source, const perf::SearchSpace &space,
   instance.sourceGraphHash = mapping::stableHash(identity);
   auto *ctx = source.getContext();
   auto i64 = IntegerType::get(ctx, 64);
-  instance.kernel->setAttr("micro.workload_contract",
-                           workload::encodeWorkloadContract(ctx, contract));
+  auto encoded = workload::encodeWorkloadContract(ctx, contract);
+  if (!encoded)
+    return encoded.takeError();
+  instance.kernel->setAttr("micro.workload_contract", *encoded);
   instance.kernel->setAttr("source_symbol", StringAttr::get(ctx, symbol));
   instance.kernel->setAttr("source_semantics",
                            StringAttr::get(ctx, semanticText));
@@ -377,8 +384,10 @@ instantiateAdapterSource(ModuleOp source, const perf::SearchSpace &space,
 
   auto *ctx = source.getContext();
   auto i64 = IntegerType::get(ctx, 64);
-  instance.kernel->setAttr("micro.workload_contract",
-                           workload::encodeWorkloadContract(ctx, contract));
+  auto encoded = workload::encodeWorkloadContract(ctx, contract);
+  if (!encoded)
+    return encoded.takeError();
+  instance.kernel->setAttr("micro.workload_contract", *encoded);
   instance.kernel->setAttr("source_adapter", StringAttr::get(ctx, adapterKey));
   instance.kernel->setAttr("source_symbol", StringAttr::get(ctx, symbol));
   instance.kernel->setAttr("source_root_ordinal",

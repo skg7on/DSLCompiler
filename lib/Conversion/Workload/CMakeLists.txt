@@ -3,7 +3,7 @@
 # can sit below the source-candidate adapters, perf and mapping integration.
 add_llk_library(LLKWorkloadContracts
     WorkloadContract.cpp
-    LINK_LIBRARIES LLVM LLK::MLIR
+    LINK_LIBRARIES LLKShape LLVM LLK::MLIR
 )
 
 # The source-adapter boundary: registry, root selection, parameter ownership

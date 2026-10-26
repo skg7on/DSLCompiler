@@ -6,5 +6,5 @@ add_llk_library(LLKKernel
     Attention.cpp
     Matmul.cpp
     LinalgMatmul.cpp
-    LINK_LIBRARIES LLKDialect MicroDialect LLKCommon LLK::MLIR
+    LINK_LIBRARIES LLKDialect MicroDialect LLKCommon LLKShape LLK::MLIR
 )
