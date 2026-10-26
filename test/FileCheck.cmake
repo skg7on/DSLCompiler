@@ -32,6 +32,10 @@ if(LLK_BUILD_TOOLS)
   add_llk_filecheck_test(DialectOps test/Dialect/ops.mlir)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
+  # Bounded movement and exact-K reduction primitives: the dynamic-boundary
+  # spellings round-trip, and the legacy full-tile spellings stay byte-for-byte
+  # the same.
+  add_llk_filecheck_test(MicroDynamicBoundary test/Dialect/Micro/dynamic_boundary.mlir)
   add_llk_filecheck_test(MicroDialectSearchSpace test/Dialect/Micro/search_space.mlir)
   add_llk_filecheck_test(MicroDialectSearchSpaceSingleton
       test/Dialect/Micro/search_space_singleton.mlir)
@@ -440,6 +444,13 @@ if(LLK_BUILD_TOOLS)
               --micro-to-linalg
               ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/micro_to_linalg_invalid.mlir
   )
+  # MicroToLinalgDynamicBoundary: bounded loads lower to a clipped slice plus
+  # tile-local padding, clipped stores to clipped inserts, and an exact-K mma to
+  # a runtime-bounded contraction -- never a full-BK reduction over a padded
+  # tail.
+  add_test(NAME MicroToLinalgDynamicBoundary
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --micro-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/dynamic_boundary.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/dynamic_boundary.mlir"
+  )
   # MicroToLinalgJit: the lowered kernel reaches the JIT. This is the check that
   # the bridge produces IR the backend pipeline can finish -- which is why the
   # lowering stays in tensor land: an already-bufferized module leaves an
@@ -668,6 +679,10 @@ add_test(NAME MicroDialectOpsInvalid
 add_test(NAME MicroDialectTileOpsInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
             ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/tile_ops_invalid.mlir
+)
+add_test(NAME MicroDynamicBoundaryInvalid
+    COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file
+            ${CMAKE_SOURCE_DIR}/test/Dialect/Micro/dynamic_boundary_invalid.mlir
 )
 add_test(NAME MicroDialectSearchSpaceInvalid
     COMMAND $<TARGET_FILE:llk-opt> --verify-diagnostics --split-input-file

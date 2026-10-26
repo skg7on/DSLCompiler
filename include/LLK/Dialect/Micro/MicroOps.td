@@ -13,6 +13,17 @@
 include "MicroDialect.td"
 include "MicroTypes.td"
 
+// A typed attribute carries a scalar constant together with its type. The
+// dialect reuses MLIR's typed-attribute interface rather than inventing a
+// padding syntax: the verifier checks the attribute's type against the tile it
+// fills.
+def Micro_TypedAttr
+    : Attr<CPred<"::llvm::isa<::mlir::TypedAttr>($_self)">, "typed attribute"> {
+  let storageType = "::mlir::TypedAttr";
+  let returnType = "::mlir::TypedAttr";
+  let convertFromStorage = "$_self";
+}
+
 //===----------------------------------------------------------------------===//
 // Base class for all Micro dialect ops
 //===----------------------------------------------------------------------===//
@@ -210,6 +221,40 @@ def Micro_TileAsyncCopyOp : Micro_Op<"tile_async_copy"> {
 }
 
 //===----------------------------------------------------------------------===//
+// micro.tile_load — bounded materialization of a source rectangle
+//===----------------------------------------------------------------------===//
+
+def Micro_TileLoadOp : Micro_Op<"tile_load", [AttrSizedOperandSegments]> {
+  let summary =
+      "Bounded materialization of a source rectangle into a fixed tile";
+  let description = [{
+        Materializes a fixed-capacity tile from a ranked tensor or memref. The
+        copied rectangle is `[offset, offset + valid)` per source dimension; the
+        complement of the result tile is filled with `padding`. A runtime extent
+        smaller than the tile therefore never reads a source element outside
+        the valid rectangle and never pads the whole source.
+
+        The result shape is static and positive: only the boundary rectangle is
+        dynamic, so the materialized tile keeps a compile-time capacity. The
+        source is a ranked tensor or memref, not a tile -- an out-of-range view
+        must not be reinterpreted as padding.
+
+        This is movement with storage, routes and dependencies, not a zero-cost
+        view, so it returns an async token like `micro.tile_async_copy`.
+    }];
+
+  let arguments = (ins AnyType:$source, Variadic<Index>:$offsets,
+      Variadic<Index>:$valid_sizes, Micro_TypedAttr:$padding,
+      Micro_MemorySpaceAttr:$dst_memory, OptionalAttr<Micro_OwnerAttr>:$owner);
+
+  let results = (outs AnyType:$result, AnyType:$token);
+
+  let hasCustomAssemblyFormat = 1;
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // micro.tile_store — write back to external memory
 //===----------------------------------------------------------------------===//
 
@@ -234,10 +279,16 @@ def Micro_TileStoreOp : Micro_Op<"tile_store", [AttrSizedOperandSegments]> {
             , !micro.tile<16x64xbf16, memory = #micro.memory<dram>>
             -> !micro.tile<16x64xbf16, memory = #micro.memory<dram>>
         ```
+
+        Optional `valid[...]` operands clip the write: only the origin rectangle
+        of the source is stored at the destination offsets, and no element
+        outside it is written. Absent operands keep the full-tile semantics
+        above and print exactly as before.
     }];
 
   let arguments = (ins AnyType:$source, Optional<AnyType>:$destination,
-      Variadic<Index>:$offsets, Micro_MemorySpaceAttr:$dst_memory);
+      Variadic<Index>:$offsets, Micro_MemorySpaceAttr:$dst_memory,
+      Variadic<Index>:$valid_sizes);
 
   let results = (outs Optional<AnyType>:$result);
 
@@ -255,16 +306,23 @@ def Micro_MmaOp : Micro_Op<"mma"> {
   let description = [{
         Computes a tile-typed matrix fragment: acc += lhs x rhs. The shape
         attribute is interpreted as M, N, K.
+
+        An optional `valid_k` bounds the logical reduction length inside the
+        static K capacity. It is primitive semantics, not a hint: the baseline
+        computes only the first `valid_k` terms and preserves the accumulator's
+        incoming values. Omitting it reduces the full K, exactly as before.
     }];
 
   let arguments = (ins AnyType:$lhs, AnyType:$rhs, AnyType:$acc,
       DenseI64ArrayAttr:$shape, Micro_DTypeAttr:$input,
-      Micro_DTypeAttr:$accumulator, OptionalAttr<StrAttr>:$engine);
+      Micro_DTypeAttr:$accumulator, OptionalAttr<StrAttr>:$engine,
+      Optional<Index>:$valid_k);
 
   let results = (outs AnyType:$result);
 
   let assemblyFormat = [{
         $lhs `,` $rhs `,` $acc
+        (`valid_k` $valid_k^)?
         attr-dict
         `:` type($lhs) `,` type($rhs) `,` type($acc) `->` type($result)
     }];

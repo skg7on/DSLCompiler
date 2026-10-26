@@ -14,6 +14,7 @@
 
 #include "mlir/Bytecode/BytecodeOpInterface.h" // IWYU pragma: keep
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dialect.h"
@@ -471,6 +472,147 @@ LogicalResult TileAsyncCopyOp::verify() {
   return success();
 }
 
+ParseResult TileLoadOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto &builder = parser.getBuilder();
+
+  OpAsmParser::UnresolvedOperand source;
+  if (parser.parseOperand(source) || parser.parseLSquare())
+    return failure();
+
+  auto parseIndexList =
+      [&](SmallVectorImpl<OpAsmParser::UnresolvedOperand> &list) {
+        if (failed(parser.parseOptionalRSquare())) {
+          do {
+            OpAsmParser::UnresolvedOperand operand;
+            if (parser.parseOperand(operand))
+              return failure();
+            list.push_back(operand);
+          } while (succeeded(parser.parseOptionalComma()));
+          if (parser.parseRSquare())
+            return failure();
+        }
+        return success();
+      };
+
+  SmallVector<OpAsmParser::UnresolvedOperand> offsets;
+  if (failed(parseIndexList(offsets)))
+    return failure();
+
+  // `valid[...]` is required: a bounded load always states how much of the
+  // source rectangle is real, even when that is the whole tile.
+  if (parser.parseKeyword("valid") || parser.parseLSquare())
+    return failure();
+  SmallVector<OpAsmParser::UnresolvedOperand> validSizes;
+  if (failed(parseIndexList(validSizes)))
+    return failure();
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+
+  Type sourceType, resultType, tokenType;
+  if (parser.parseColonType(sourceType) || parser.parseArrow() ||
+      parser.parseType(resultType) || parser.parseComma() ||
+      parser.parseType(tokenType))
+    return failure();
+  result.addTypes({resultType, tokenType});
+
+  if (parser.resolveOperand(source, sourceType, result.operands))
+    return failure();
+  for (OpAsmParser::UnresolvedOperand offset : offsets)
+    if (parser.resolveOperand(offset, builder.getIndexType(), result.operands))
+      return failure();
+  for (OpAsmParser::UnresolvedOperand valid : validSizes)
+    if (parser.resolveOperand(valid, builder.getIndexType(), result.operands))
+      return failure();
+
+  result.getOrAddProperties<TileLoadOp::Properties>().operandSegmentSizes = {
+      1, static_cast<int32_t>(offsets.size()),
+      static_cast<int32_t>(validSizes.size())};
+  return success();
+}
+
+void TileLoadOp::print(OpAsmPrinter &printer) {
+  printer << ' ' << getSource() << '[';
+  llvm::interleaveComma(getOffsets(), printer);
+  printer << "] valid[";
+  llvm::interleaveComma(getValidSizes(), printer);
+  printer << ']';
+  // As with the store, the operand-segment split is recomputed by the parser.
+  printer.printOptionalAttrDict((*this)->getAttrs(),
+                                /*elidedAttrs=*/{"operandSegmentSizes"});
+  printer << " : " << getSource().getType() << " -> " << getResult().getType()
+          << ", " << getToken().getType();
+}
+
+LogicalResult TileLoadOp::verify() {
+  // A bounded load reads a ranked tensor or memref. A tile is already
+  // materialized: clipping one would make the padding of an existing
+  // allocation implicit instead of the load's own declared fill.
+  Type sourceType = getSource().getType();
+  auto sourceShaped = dyn_cast<ShapedType>(sourceType);
+  if (!sourceShaped || !sourceShaped.hasRank() ||
+      !(isa<RankedTensorType>(sourceType) || isa<BaseMemRefType>(sourceType)))
+    return emitOpError("source must be a ranked tensor or memref");
+
+  auto resultType = dyn_cast<TileType>(getResult().getType());
+  if (!resultType)
+    return emitOpError("result must be a tile type");
+  if (!isa<AsyncTokenType>(getToken().getType()))
+    return emitOpError("token result must be an async token");
+
+  // The result's capacity is fixed at compile time: only the copied rectangle
+  // is runtime-sized, so a dynamic tile extent has no storage footprint.
+  if (!resultType.getMemory())
+    return emitOpError("result tile must have a memory space");
+  if (resultType.getMemory().getValue() != getDstMemory())
+    return emitOpError("result tile memory must match destination memory");
+  for (int64_t dim : resultType.getShape())
+    if (ShapedType::isDynamic(dim) || dim <= 0)
+      return emitOpError("result tile shape must be static and positive");
+
+  ArrayRef<int64_t> tileShape = resultType.getShape();
+  if (sourceShaped.getRank() != static_cast<int64_t>(tileShape.size()))
+    return emitOpError("source rank must match the result tile rank");
+  if (getOffsets().size() != tileShape.size())
+    return emitOpError("offsets must name one index per source dimension");
+  if (getValidSizes().size() != tileShape.size())
+    return emitOpError("valid sizes must name one index per source dimension");
+  if (sourceShaped.getElementType() != resultType.getElementType())
+    return emitOpError(
+        "result tile element type must match the source element type");
+  if (getPadding().getType() != resultType.getElementType())
+    return emitOpError(
+        "padding value type must match the result tile element type");
+
+  if (failed(verifyOwnerAttrMatches(*this, getOwner(), resultType)))
+    return failure();
+  if (failed(verifyMovementNodeIdentity(getOperation(), /*sameSpace=*/false)))
+    return failure();
+
+  ArrayRef<int64_t> sourceShape = sourceShaped.getShape();
+  for (size_t i = 0, e = tileShape.size(); i < e; ++i) {
+    std::optional<int64_t> offsetConstant =
+        getConstantIntValue(getOffsets()[i]);
+    std::optional<int64_t> validConstant =
+        getConstantIntValue(getValidSizes()[i]);
+    if (offsetConstant && *offsetConstant < 0)
+      return emitOpError("load offset must be nonnegative");
+    if (!validConstant)
+      continue;
+    if (*validConstant < 0)
+      return emitOpError("valid size must be nonnegative");
+    if (*validConstant > tileShape[i])
+      return emitOpError("valid size must not exceed the tile extent");
+    // A statically known rectangle that leaves a statically known source is a
+    // compile-time error; clipping it silently would read past the source.
+    int64_t sourceExtent = sourceShape[i];
+    if (offsetConstant && !ShapedType::isDynamic(sourceExtent) &&
+        *offsetConstant + *validConstant > sourceExtent)
+      return emitOpError("load rectangle leaves the source");
+  }
+  return success();
+}
+
 ParseResult TileStoreOp::parse(OpAsmParser &parser, OperationState &result) {
   auto &builder = parser.getBuilder();
 
@@ -483,6 +625,7 @@ ParseResult TileStoreOp::parse(OpAsmParser &parser, OperationState &result) {
   OpAsmParser::UnresolvedOperand destination;
   bool hasDestination = false;
   SmallVector<OpAsmParser::UnresolvedOperand> offsets;
+  SmallVector<OpAsmParser::UnresolvedOperand> validSizes;
   if (succeeded(parser.parseOptionalKeyword("into"))) {
     hasDestination = true;
     if (parser.parseOperand(destination) || parser.parseLSquare())
@@ -496,6 +639,22 @@ ParseResult TileStoreOp::parse(OpAsmParser &parser, OperationState &result) {
       } while (succeeded(parser.parseOptionalComma()));
       if (parser.parseRSquare())
         return failure();
+    }
+    // Optional `valid[%vm, %vn]`: clip the write to the origin rectangle of the
+    // source. Absent operands keep the full-tile behavior.
+    if (succeeded(parser.parseOptionalKeyword("valid"))) {
+      if (parser.parseLSquare())
+        return failure();
+      if (failed(parser.parseOptionalRSquare())) {
+        do {
+          OpAsmParser::UnresolvedOperand valid;
+          if (parser.parseOperand(valid))
+            return failure();
+          validSizes.push_back(valid);
+        } while (succeeded(parser.parseOptionalComma()));
+        if (parser.parseRSquare())
+          return failure();
+      }
     }
   }
 
@@ -520,12 +679,16 @@ ParseResult TileStoreOp::parse(OpAsmParser &parser, OperationState &result) {
       if (parser.resolveOperand(offset, builder.getIndexType(),
                                 result.operands))
         return failure();
+    for (OpAsmParser::UnresolvedOperand valid : validSizes)
+      if (parser.resolveOperand(valid, builder.getIndexType(), result.operands))
+        return failure();
   }
 
-  // The op has two variadic operand groups, so the split between them has to
-  // be recorded: no destination and no offsets is the terminal form.
+  // The op has variadic operand groups, so the split between them has to be
+  // recorded: no destination and no offsets is the terminal form.
   result.getOrAddProperties<TileStoreOp::Properties>().operandSegmentSizes = {
-      1, hasDestination ? 1 : 0, static_cast<int32_t>(offsets.size())};
+      1, hasDestination ? 1 : 0, static_cast<int32_t>(offsets.size()),
+      static_cast<int32_t>(validSizes.size())};
   return success();
 }
 
@@ -535,6 +698,11 @@ void TileStoreOp::print(OpAsmPrinter &printer) {
     printer << " into " << getDestination() << '[';
     llvm::interleaveComma(getOffsets(), printer);
     printer << ']';
+    if (!getValidSizes().empty()) {
+      printer << " valid[";
+      llvm::interleaveComma(getValidSizes(), printer);
+      printer << ']';
+    }
   }
   // The operand-segment split is bookkeeping the parser recomputes, so it is
   // kept out of the printed form.
@@ -575,6 +743,32 @@ LogicalResult TileStoreOp::verify() {
     return emitOpError("result must have the destination's type");
   if (getOffsets().size() != destinationType.getShape().size())
     return emitOpError("offsets must name one index per destination dimension");
+
+  // `valid[...]` clips the write to the origin rectangle of the source. The
+  // rectangle lives in the source, so its extents are bounded by the source
+  // shape, and only the equally ranked destination can receive it lane for
+  // lane.
+  if (getValidSizes().empty())
+    return success();
+  ArrayRef<int64_t> sourceShape = sourceType.getShape();
+  if (sourceShape.size() != destinationType.getShape().size())
+    return emitOpError(
+        "a clipped tile_store needs a source and a destination of the same "
+        "rank");
+  if (getValidSizes().size() != sourceShape.size())
+    return emitOpError("valid sizes must name one index per source dimension");
+  if (sourceType.getElementType() != destinationType.getElementType())
+    return emitOpError("source and destination element types must match");
+  for (size_t i = 0, e = sourceShape.size(); i < e; ++i) {
+    std::optional<int64_t> validConstant =
+        getConstantIntValue(getValidSizes()[i]);
+    if (!validConstant)
+      continue;
+    if (*validConstant < 0)
+      return emitOpError("valid size must be nonnegative");
+    if (*validConstant > sourceShape[i])
+      return emitOpError("valid size must not exceed the source extent");
+  }
   return success();
 }
 
@@ -622,6 +816,16 @@ LogicalResult MmaOp::verify() {
     return emitOpError("input dtype must match operand element types");
   if (dtypeOfElementType(accType.getElementType()) != getAccumulator())
     return emitOpError("accumulator dtype must match accumulator element type");
+
+  // An exact reduction tail is bounded by the fragment's static K capacity: a
+  // larger constant would reduce lanes the operand tiles do not hold.
+  if (Value validK = getValidK())
+    if (std::optional<int64_t> constant = getConstantIntValue(validK)) {
+      if (*constant < 0)
+        return emitOpError("valid_k must be nonnegative");
+      if (*constant > k)
+        return emitOpError("valid_k must not exceed the mma K capacity");
+    }
   return success();
 }
 

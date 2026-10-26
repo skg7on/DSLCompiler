@@ -486,7 +486,8 @@ public:
         ValueRange{staged[0], staged[1]}, /*math_mode=*/StringAttr());
     Value written =
         micro::TileStoreOp::create(builder, loc, outputTileType, result,
-                                   d1Carried, ValueRange{d0, d1}, sram)
+                                   d1Carried, ValueRange{d0, d1}, sram,
+                                   /*valid_sizes=*/ValueRange())
             .getResult();
 
     if (auto terminator = dyn_cast<micro::YieldOp>(

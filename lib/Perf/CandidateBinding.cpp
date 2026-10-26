@@ -680,7 +680,8 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
                 ctx, *micro::dtypeOfElementType(context.inputElemType)),
             micro::DTypeAttr::get(
                 ctx, *micro::dtypeOfElementType(context.accumulatorElemType)),
-            /*engine=*/StringAttr())
+            /*engine=*/StringAttr(),
+            /*valid_k=*/Value())
             .getResult());
 
   // The pipeline hands the computed values out of its body, and the loop hands
@@ -731,7 +732,8 @@ micro::KernelOp emitKernel(ModuleOp module, const SearchSpace &space,
   // the destination with this tile written at the loop's own coordinates.
   Value written =
       micro::TileStoreOp::create(builder, loc, outputTileType, epilogue,
-                                 bnCarried, ValueRange{bm, bn}, outputSpace)
+                                 bnCarried, ValueRange{bm, bn}, outputSpace,
+                                 /*valid_sizes=*/ValueRange())
           .getResult();
 
   if (auto terminator =

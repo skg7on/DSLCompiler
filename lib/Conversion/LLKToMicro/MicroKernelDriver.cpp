@@ -726,7 +726,8 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
                 ctx, *micro::dtypeOfElementType(plan.inputElemType)),
             micro::DTypeAttr::get(
                 ctx, *micro::dtypeOfElementType(plan.accumulatorElemType)),
-            /*engine=*/StringAttr())
+            /*engine=*/StringAttr(),
+            /*valid_k=*/Value())
             .getResult());
 
   // The pipeline hands the computed values out of its body, and the loop hands
@@ -771,7 +772,8 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
   // the destination with this tile written at the loop's own coordinates.
   Value written =
       micro::TileStoreOp::create(builder, loc, outputTileType, epilogue,
-                                 bnCarried, ValueRange{bm, bn}, outputSpace)
+                                 bnCarried, ValueRange{bm, bn}, outputSpace,
+                                 /*valid_sizes=*/ValueRange())
           .getResult();
 
   // The inner loop hands the updated output out, the outer loop carries it, and
