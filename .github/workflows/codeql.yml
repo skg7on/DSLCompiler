@@ -89,7 +89,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLK_BUILD_TOOLS=OFF \
             -DLLK_BUILD_E2E_TESTS=OFF
-          ninja
+          # CodeQL extractors run alongside the compiler; bound their combined memory use.
+          ninja -j2
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3
