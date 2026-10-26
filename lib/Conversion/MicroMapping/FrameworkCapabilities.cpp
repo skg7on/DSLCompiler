@@ -93,7 +93,18 @@ contractMismatch(const workload::WorkloadContract &contract,
     bool isInput = port.direction == workload::PortDirection::Input;
     const auto &actual = isInput ? abi.inputs : abi.outputs;
     size_t index = isInput ? input++ : output++;
-    if (index >= actual.size() || port.shape != actual[index].shape ||
+    // ABI v1 transports concrete extents, so a symbolic contract dimension
+    // cannot match it.
+    bool shapeMatches = index < actual.size() &&
+                        port.shape.size() == actual[index].shape.size();
+    if (shapeMatches)
+      for (size_t dim = 0; dim < port.shape.size(); ++dim)
+        if (!port.shape[dim].isConstant() ||
+            port.shape[dim].getConstant() != actual[index].shape[dim]) {
+          shapeMatches = false;
+          break;
+        }
+    if (index >= actual.size() || !shapeMatches ||
         port.elementType != actual[index].elementType)
       return "the declared contract " + describePort(port) +
              " does not match the " + boundary.str();
@@ -398,8 +409,8 @@ describeCapabilities(mlir::Operation *kernel,
           rejectAbi(llvm::Twine("mapped ABI v1 requires rank-two ports; ") +
                     describePort(port) + " has rank " +
                     llvm::Twine(port.shape.size()));
-        for (int64_t extent : port.shape)
-          if (extent <= 0) {
+        for (const auto &extent : port.shape)
+          if (!extent.isConstant() || extent.getConstant() <= 0) {
             rejectAbi("mapped ABI v1 requires positive static extents; " +
                       describePort(port) + " has a nonpositive/dynamic extent");
             break;

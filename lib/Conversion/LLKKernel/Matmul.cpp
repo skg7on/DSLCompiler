@@ -131,15 +131,31 @@ public:
     op.erase();
     return success();
   }
+  FailureOr<llk::ContractionDimensions>
+  inferDimensions(Operation *root) const override {
+    return llk::inferContractionDimensions(
+        root, root->getOperand(0), root->getOperand(1), root->getResult(0));
+  }
   bool hasMicroLowering() const override { return true; }
-  LogicalResult
-  describeMicroKernel(Operation *root, const llk::KernelContract &c,
-                      llk::MicroKernelFragment &f) const override {
+  LogicalResult describeMicroKernel(Operation *root,
+                                    const llk::KernelContract &c,
+                                    llk::MicroKernelFragment &f,
+                                    bool requireStatic = true) const override {
     auto validated = c;
-    if (failed(llk::validateMicroContraction(
-            root, root->getOperand(0), root->getOperand(1), root->getResult(0),
-            root->getAttr("accumulator_type"), validated)))
-      return failure();
+    if (requireStatic) {
+      if (failed(llk::validateMicroContraction(
+              root, root->getOperand(0), root->getOperand(1),
+              root->getResult(0), root->getAttr("accumulator_type"),
+              validated)))
+        return failure();
+    } else {
+      llk::ContractionDimensions dimensions;
+      if (failed(llk::validateMicroContractionShape(
+              root, root->getOperand(0), root->getOperand(1),
+              root->getResult(0), root->getAttr("accumulator_type"), dimensions,
+              validated)))
+        return failure();
+    }
     f.armCount = 1;
     f.hasOutputInit = true;
     f.rhsOperandTypes = {root->getOperand(1).getType()};

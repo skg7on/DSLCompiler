@@ -60,7 +60,10 @@ WorkloadContract makeContract() {
 /// outlives the temporary MLIRContext.
 llvm::Expected<WorkloadContract> roundTrip(const WorkloadContract &contract) {
   mlir::MLIRContext context;
-  return decodeWorkloadContract(encodeWorkloadContract(&context, contract));
+  auto encoded = encodeWorkloadContract(&context, contract);
+  if (!encoded)
+    return encoded.takeError();
+  return decodeWorkloadContract(*encoded);
 }
 
 /// Serializes the validation error into text for a substring assertion.
@@ -144,7 +147,8 @@ TEST(WorkloadContract, RoundTripsRankOne) {
   EXPECT_EQ(canonicalWorkloadContract(*restored),
             canonicalWorkloadContract(contract));
   EXPECT_EQ(restored->ports.size(), 1u);
-  EXPECT_EQ(restored->ports[0].shape, std::vector<int64_t>({4}));
+  EXPECT_EQ(restored->ports[0].shape, std::vector<mlir::llk::shape::Dimension>{
+                                          mlir::llk::shape::Dimension(4)});
   EXPECT_EQ(restored->axes.count("K"), 0u);
 }
 
@@ -262,7 +266,7 @@ TEST(WorkloadContract, RejectsUnknownDtype) {
 
 TEST(WorkloadContract, RejectsUnknownVersion) {
   WorkloadContract contract = makeContract();
-  contract.version = 2;
+  contract.version = 3;
   auto error = validateWorkloadContract(contract);
   ASSERT_TRUE(bool(error));
   EXPECT_NE(

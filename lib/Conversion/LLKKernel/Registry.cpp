@@ -25,4 +25,16 @@ void populateLLKKernelLowerings(LLKKernelRegistry &r) {
   registerMatmulLowering(r);       // Linalg + Micro
   registerLinalgMatmulLowering(r); // Micro compatibility adapter
 }
+
+FailureOr<ContractionDimensions> inferContractionDimensions(Operation *root) {
+  if (!root)
+    return failure();
+  LLKKernelRegistry registry;
+  populateLLKKernelLowerings(registry);
+  const LLKKernelLowering *entry =
+      registry.lookup(root->getName().getStringRef());
+  if (!entry || !entry->hasMicroLowering())
+    return failure();
+  return entry->inferDimensions(root);
+}
 } // namespace mlir::llk

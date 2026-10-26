@@ -325,7 +325,7 @@ public:
     // Ports follow the source's operand order: the two read inputs, the
     // destination (declared, but with no incoming read), and the written
     // result.
-    const std::vector<int64_t> shape{program->d0, program->d1};
+    const std::vector<shape::Dimension> shape{program->d0, program->d1};
     const std::string dtype = "f32";
     described.ports.push_back(
         {"input0", PortDirection::Input, PortEffect::Read, shape, dtype});

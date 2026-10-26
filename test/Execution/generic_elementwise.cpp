@@ -122,7 +122,7 @@ module {
 /// are valid contract data; the execution envelope is a separate limit.
 WorkloadContract rankThreeContract() {
   WorkloadContract contract;
-  const std::vector<int64_t> shape{2, 4, 8};
+  const std::vector<mlir::llk::shape::Dimension> shape{2, 4, 8};
   contract.ports = {
       {"input0", PortDirection::Input, PortEffect::Read, shape, "f32"},
       {"input1", PortDirection::Input, PortEffect::Read, shape, "f32"},
@@ -426,9 +426,11 @@ TEST(GenericElementwise, RankThreeContractIsAnalyzableButNotExecutable) {
   module->walk([&](mlir::Operation *op) {
     if (op->getName().getStringRef() != "micro.kernel")
       return;
-    op->setAttr(
-        "micro.workload_contract",
-        mlir::llk::workload::encodeWorkloadContract(&context, contract));
+    auto encoded =
+        mlir::llk::workload::encodeWorkloadContract(&context, contract);
+    EXPECT_TRUE(bool(encoded));
+    if (encoded)
+      op->setAttr("micro.workload_contract", *encoded);
   });
 
   llk::MappedCompileOptions options;
@@ -529,9 +531,11 @@ TEST(GenericElementwise, ReadWriteInputContractIsRejectedBeforeCode) {
     contract.ports[1].shape = {2, 8};
     contract.ports[2].shape = {2, 8};
     contract.ports[0].effect = PortEffect::ReadWrite;
-    op->setAttr(
-        "micro.workload_contract",
-        mlir::llk::workload::encodeWorkloadContract(&context, contract));
+    auto encoded =
+        mlir::llk::workload::encodeWorkloadContract(&context, contract);
+    EXPECT_TRUE(bool(encoded));
+    if (encoded)
+      op->setAttr("micro.workload_contract", *encoded);
   });
 
   llk::MappedCompileOptions options;

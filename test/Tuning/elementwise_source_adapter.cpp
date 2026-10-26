@@ -375,17 +375,21 @@ TEST_F(ElementwiseSourceAdapter, DescribesBoundedElementwiseContract) {
   ASSERT_EQ(described->ports.size(), 4u);
   EXPECT_EQ(described->ports[0].direction, workload::PortDirection::Input);
   EXPECT_EQ(described->ports[0].effect, workload::PortEffect::Read);
-  EXPECT_EQ(described->ports[0].shape, (std::vector<int64_t>{8, 16}));
+  EXPECT_EQ(described->ports[0].shape,
+            (std::vector<mlir::llk::shape::Dimension>{8, 16}));
   EXPECT_EQ(described->ports[0].elementType, "f32");
   EXPECT_EQ(described->ports[1].direction, workload::PortDirection::Input);
   EXPECT_EQ(described->ports[1].effect, workload::PortEffect::Read);
-  EXPECT_EQ(described->ports[1].shape, (std::vector<int64_t>{8, 16}));
+  EXPECT_EQ(described->ports[1].shape,
+            (std::vector<mlir::llk::shape::Dimension>{8, 16}));
   EXPECT_EQ(described->ports[2].direction, workload::PortDirection::Input);
   EXPECT_EQ(described->ports[2].effect, workload::PortEffect::None);
-  EXPECT_EQ(described->ports[2].shape, (std::vector<int64_t>{8, 16}));
+  EXPECT_EQ(described->ports[2].shape,
+            (std::vector<mlir::llk::shape::Dimension>{8, 16}));
   EXPECT_EQ(described->ports[3].direction, workload::PortDirection::Output);
   EXPECT_EQ(described->ports[3].effect, workload::PortEffect::Write);
-  EXPECT_EQ(described->ports[3].shape, (std::vector<int64_t>{8, 16}));
+  EXPECT_EQ(described->ports[3].shape,
+            (std::vector<mlir::llk::shape::Dimension>{8, 16}));
 
   // Strict f32 is the first supported numerical mode; the primitive the
   // emitter actually produces is a vector add.

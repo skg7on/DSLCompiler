@@ -487,6 +487,10 @@ llvm::Error validateExecutableContract(mlir::ModuleOp module,
     if (port.shape.size() != 2)
       return prefix("mapped ABI v1 requires rank-two ports; port '" +
                     port.name + "' has rank " + llvm::Twine(port.shape.size()));
+    for (const auto &extent : port.shape)
+      if (!extent.isConstant() || extent.getConstant() <= 0)
+        return prefix("mapped ABI v1 requires positive static extents; port '" +
+                      port.name + "' has a nonpositive/dynamic extent");
     bool supported = port.elementType == "f32" || port.elementType == "bf16" ||
                      port.elementType == "f16" || port.elementType == "i32" ||
                      port.elementType == "i8";

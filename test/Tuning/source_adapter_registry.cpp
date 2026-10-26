@@ -16,6 +16,7 @@
 
 #include "FrameworkTestSupport.h"
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
+#include "LLK/Conversion/Workload/ContractionSourceAdapter.h"
 #include "LLK/Conversion/Workload/SourceAdapter.h"
 #include "LLK/Conversion/Workload/WorkloadContract.h"
 #include "LLK/Perf/Candidate.h"
@@ -1141,4 +1142,50 @@ TEST_F(FrameworkTest, SourceRoleBindingChangesActualEmittedWork) {
     EXPECT_EQ(result->workloadGraph.getNodes().size(), copies);
     EXPECT_EQ(result->receipt.source, std::vector<std::string>{"unroll"});
   }
+}
+
+TEST_F(FrameworkTest, DynamicContractionDescribesSymbolicContract) {
+  auto source = parse(R"mlir(
+func.func @dynamic(%x: tensor<?x?xbf16>, %wg: tensor<?x?xbf16>,
+                   %wu: tensor<?x?xbf16>, %init: tensor<?x?xbf16>)
+    -> tensor<?x?xbf16> {
+  %y = llk.fused_swiglu ins(%x, %wg, %wu : tensor<?x?xbf16>,
+                            tensor<?x?xbf16>, tensor<?x?xbf16>)
+      outs(%init : tensor<?x?xbf16>)
+      {accumulator_type = f32, activation = #llk.activation<silu>,
+       math_mode = #llk.math_mode<bounded_fast>}
+      -> tensor<?x?xbf16>
+  return %y : tensor<?x?xbf16>
+}
+)mlir");
+  ASSERT_TRUE(source);
+  Operation *root = nullptr;
+  source->walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "llk.fused_swiglu")
+      root = op;
+  });
+  ASSERT_NE(root, nullptr);
+
+  auto adapter = workload::makeContractionSourceAdapter();
+  ASSERT_TRUE(adapter->accepts(root));
+  auto described = adapter->describe(root);
+  ASSERT_TRUE(bool(described)) << llvm::toString(described.takeError());
+
+  // An unresolved relationship is a shared symbol, never the dynamic sentinel.
+  EXPECT_EQ(described->version, 2u);
+  EXPECT_EQ(described->axes.at("M"), mlir::llk::shape::Dimension::symbol("M"));
+  EXPECT_EQ(described->axes.at("K"), mlir::llk::shape::Dimension::symbol("K"));
+  ASSERT_EQ(described->ports.size(), 4u);
+  EXPECT_EQ(described->ports[0].shape,
+            (std::vector<mlir::llk::shape::Dimension>{
+                mlir::llk::shape::Dimension::symbol("M"),
+                mlir::llk::shape::Dimension::symbol("K")}));
+  EXPECT_EQ(described->ports[2].shape,
+            (std::vector<mlir::llk::shape::Dimension>{
+                mlir::llk::shape::Dimension::symbol("K"),
+                mlir::llk::shape::Dimension::symbol("N")}));
+  EXPECT_EQ(described->symbols.size(), 3u);
+
+  // The static analysis export still refuses to turn a symbol into an integer.
+  EXPECT_FALSE(bool(workload::describeContractionShape(root)));
 }
