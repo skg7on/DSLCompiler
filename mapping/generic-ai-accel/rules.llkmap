@@ -80,3 +80,28 @@ rule accel.async_copy {
   emit "accel_copy";
   cost 1;
 }
+
+// Bounded tile movement. The source is a plain tensor/memref, so the rule names
+// the DRAM -> tile path; the result tile states its own memory. The movement
+// emitter is the package's declared implementation and its `verifyBoundary`
+// states the boundary limits explicitly: clipped load/store are modeled, a
+// partial-K contraction is not.
+rule accel.tile_load {
+  match micro.tile_load();
+  require executor kind pe;
+  require memory input "source" kind dram;
+  input "source";
+  output "result";
+  bundle "accel.tile.load";
+  emit "accel_copy";
+  cost 1;
+}
+
+rule accel.tile_store {
+  match micro.tile_store();
+  require executor kind pe;
+  input "source";
+  bundle "accel.tile.store";
+  emit "accel_copy";
+  cost 1;
+}

@@ -52,7 +52,7 @@ foreach(_llk_tool llk-opt micro-perf llk-tune llk-compile llk-bench llk-validate
     MappedAcceptance MappedAVX2Acceptance MappedInvocationTest
     MappedAllocationLifetimeTest MappedCodegenRequirementsTest
     SelectedGroupLoweringTest MappedTuningSessionTest CandidateInstantiationTest
-    FrameworkSourceTest LLKCAPIFrontendTests)
+    FrameworkSourceTest LLKCAPIFrontendTests DynamicShapeMappingTest)
   if(TARGET ${_llk_tool})
     list(APPEND _llk_check_deps ${_llk_tool})
   endif()

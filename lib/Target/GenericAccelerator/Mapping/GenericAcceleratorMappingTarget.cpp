@@ -47,6 +47,18 @@ public:
   llvm::Error
   verifyOperations(llvm::ArrayRef<mlir::Operation *> coveredOps,
                    const mapping::TargetBundle &bundle) const override;
+
+  /// The accelerator's declared boundary limits, stated explicitly rather than
+  /// inherited silently. Bounded loads and stores *are* modeled: the shared
+  /// MicroToLinalg reference lowering realizes them as a clipped slice/pad and
+  /// a clipped insert with fixed-capacity tiles, which is exactly the static
+  /// conformance this analysis-only package claims. A partial-K contraction is
+  /// not: this package declares no matrix remainder implementation and no
+  /// hardware execution, so a plan that needs one is refused with the reason
+  /// instead of being admitted as conformance evidence.
+  llvm::Error verifyBoundary(
+      const mapping::TargetBundle &bundle,
+      const mapping::BoundaryRequirements &requirements) const override;
 };
 
 llvm::Error GenericAcceleratorEmitter::verifyOperations(
@@ -92,6 +104,24 @@ llvm::Error GenericAcceleratorEmitter::verifyOperations(
       return fail("result must be an f32 tile");
   }
   return llvm::Error::success();
+}
+
+llvm::Error GenericAcceleratorEmitter::verifyBoundary(
+    const mapping::TargetBundle &bundle,
+    const mapping::BoundaryRequirements &requirements) const {
+  if (llvm::Error error = verify(bundle))
+    return error;
+  // Bounded movement is modeled by the shared reference lowering; everything
+  // else is outside this package's declared capability. The message names the
+  // *requirement*, not a workload or target spelling, so the refusal is the
+  // same for any operation that needs it.
+  if (!requirements.partialK)
+    return llvm::Error::success();
+  return llvm::createStringError(
+      llvm::inconvertibleErrorCode(),
+      "boundary_unsupported: emitter '" + key().str() +
+          "' declares no partial-k remainder implementation (requires " +
+          mapping::renderBoundaryRequirements(requirements) + ")");
 }
 
 std::unique_ptr<mapping::TargetEmitter>

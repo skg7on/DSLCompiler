@@ -148,11 +148,14 @@ struct WorkloadNode {
   /// storage liveness multiplies a per-occurrence footprint by; the serial
   /// remainder of `executionMultiplicity` is reuse, not residency.
   ///
-  /// Unset when any enclosing bound is not statically recoverable -- the same
-  /// condition that makes `executionMultiplicity` unset -- or when the node was
-  /// built by hand without structural facts. A caller that cannot recover it
-  /// must fall back to `executionMultiplicity` (every occurrence simultaneous),
-  /// which is the conservative direction: it can over-count, never under-count.
+  /// Unset when any enclosing *spatial/pipeline* bound is not statically
+  /// recoverable, or when the node was built by hand without structural facts.
+  /// A temporal `micro.for` never contributes, so a runtime trip count leaves
+  /// this known: dynamic work does not multiply residency. A caller that cannot
+  /// recover it falls back to `executionMultiplicity` (every occurrence
+  /// simultaneous) when *that* is known, and otherwise to the selected
+  /// executor pool's concurrency (dynamic-shape design §6); only a residency
+  /// no such fact bounds is a rejection.
   /// Derived, so it stays out of every graph identity exactly as
   /// `executionMultiplicity`'s *rendering* is confined to
   /// `canonicalProjectedGraphString`.

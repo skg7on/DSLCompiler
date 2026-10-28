@@ -166,11 +166,21 @@ resolveEndpointMemory(const WorkloadGraph &graph,
 /// notes are recorded in `plan.diagnostics.storageNotes`.
 ///
 /// A value's footprint is its physical image under the layout the placement
-/// solved for it, multiplied by its producer's execution multiplicity. When
-/// `plan.materialized` (strict executable planning) an unknown multiplicity or
-/// an unsupported footprint is an error; a non-materialized (analysis) plan
-/// uses a reported conservative fallback instead. Every plan memory must be
-/// modeled by `machine`, and the graph must be acyclic and fully covered.
+/// solved for it, multiplied by its producer's *simultaneous* residency -- the
+/// recovered spatial/pipeline factor, or -- when that bound is a runtime value
+/// -- the selected executor pool's concurrency. It is deliberately never the
+/// whole execution multiplicity: a temporal loop reuses one buffer however many
+/// iterations it runs, so a dynamic M/N/K domain does not multiply local
+/// storage (dynamic-shape design §6). A runtime work count is carried and
+/// reported, never assumed to be one; it makes the plan unrankable rather than
+/// illegal.
+///
+/// When `plan.materialized` (strict executable planning) an unsupported
+/// footprint or an unbounded simultaneous residency -- a runtime spatial or
+/// pipeline bound with no selected executor pool to bound it -- is an error; a
+/// non-materialized (analysis) plan uses a reported conservative fallback
+/// instead. Every plan memory must be modeled by `machine`, and the graph must
+/// be acyclic and fully covered.
 ///
 /// When `capacityExceeded` is non-null it is set to true iff the error being
 /// returned is a *capacity* rejection (a memory's live peak over its own

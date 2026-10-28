@@ -1,3 +1,29 @@
+# Dynamic Shape Task 3 (issue #194): dynamic plan legality and resource
+# certification. A standalone binary so its CTest entry is the named
+# `DynamicShapeMappingTest` the task's verification gate runs, and so it can
+# reuse the issue #129 resource fixtures without joining that category's binary.
+add_executable(DynamicShapeMappingTest
+    dynamic_shape_mapping.cpp
+    resource_regression_fixture.cpp
+)
+target_link_libraries(DynamicShapeMappingTest PRIVATE
+    LLKMapping
+    LLKTargetMapping
+    LLKMicroMapping
+    LLKPerf
+    MicroDialect
+    LLKShape
+    LLK::MLIR
+    GTest::gtest_main
+)
+target_compile_definitions(DynamicShapeMappingTest PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+target_include_directories(DynamicShapeMappingTest PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+)
+add_test(NAME DynamicShapeMappingTest COMMAND DynamicShapeMappingTest)
+
 add_llk_test_category(Mapping
     SOURCES
         stable_hash.cpp

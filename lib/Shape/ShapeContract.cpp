@@ -278,4 +278,71 @@ std::string canonicalShapeContract(const ShapeContract &contract) {
   return out;
 }
 
+llvm::StringRef stringifyPredicateVerdict(PredicateVerdict verdict) {
+  switch (verdict) {
+  case PredicateVerdict::Proven:
+    return "proven";
+  case PredicateVerdict::Disproven:
+    return "disproven";
+  case PredicateVerdict::RuntimeGuard:
+    return "runtime_guard";
+  }
+  return "";
+}
+
+PredicateVerdict classifyPredicate(const ShapePredicate &predicate,
+                                   const ShapeContract &contract) {
+  auto declared = contract.symbols.find(predicate.symbol);
+  // A symbol the contract does not declare has no domain to prove anything
+  // over. Validation rejects the contract itself; classification stays
+  // conservative rather than inventing a domain from the value.
+  if (declared == contract.symbols.end())
+    return PredicateVerdict::RuntimeGuard;
+  const SymbolConstraint &constraint = declared->second;
+  // A contract that has not been validated may carry a nonpositive divisor.
+  // Classification never divides by it: an unvalidated domain proves nothing.
+  if (constraint.multipleOf <= 0)
+    return PredicateVerdict::RuntimeGuard;
+
+  switch (predicate.kind) {
+  case ShapePredicate::Kind::DivisibleBy: {
+    if (predicate.value <= 0)
+      return PredicateVerdict::Disproven;
+    // The declared congruence implies the predicate whenever it is a multiple
+    // of the queried divisor.
+    if (constraint.multipleOf % predicate.value == 0)
+      return PredicateVerdict::Proven;
+    // A single-point domain decides immediately.
+    if (constraint.max && constraint.min == *constraint.max)
+      return constraint.min % predicate.value == 0
+                 ? PredicateVerdict::Proven
+                 : PredicateVerdict::Disproven;
+    // No admissible extent can satisfy it.
+    if (!hasMultipleInRange(constraint.min, constraint.max, predicate.value))
+      return PredicateVerdict::Disproven;
+    return PredicateVerdict::RuntimeGuard;
+  }
+  case ShapePredicate::Kind::EqualTo: {
+    if (predicate.value < constraint.min ||
+        (constraint.max && predicate.value > *constraint.max))
+      return PredicateVerdict::Disproven;
+    // A declared congruence that the value violates rules it out even inside
+    // the range.
+    if (predicate.value % constraint.multipleOf != 0)
+      return PredicateVerdict::Disproven;
+    if (constraint.max && constraint.min == *constraint.max)
+      return PredicateVerdict::Proven;
+    return PredicateVerdict::RuntimeGuard;
+  }
+  case ShapePredicate::Kind::AtLeast: {
+    if (constraint.min >= predicate.value)
+      return PredicateVerdict::Proven;
+    if (constraint.max && *constraint.max < predicate.value)
+      return PredicateVerdict::Disproven;
+    return PredicateVerdict::RuntimeGuard;
+  }
+  }
+  return PredicateVerdict::RuntimeGuard;
+}
+
 } // namespace mlir::llk::shape

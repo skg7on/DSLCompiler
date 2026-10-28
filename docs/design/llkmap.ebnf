@@ -27,7 +27,7 @@ predicate = IDENT, "=", predicate_literal ;
 predicate_literal = UINT | STRING | IDENT ;
 micro_op = "micro.mma" | "micro.vector" | "micro.reduce"
          | "micro.async_copy" | "micro.tile_async_copy"
-         | "micro.store" | "micro.tile_store" ;
+         | "micro.tile_load" | "micro.store" | "micro.tile_store" ;
 kind_requirement = "require", role, "kind", IDENT, ";" ;
 role = "executor" | "compute" | "memory" ;
 layout_requirement = "require", "layout", IDENT, "satisfies", IDENT, ";" ;

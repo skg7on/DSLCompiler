@@ -462,7 +462,13 @@ TEST(StoragePlan, AChosenReuseOrdersThePlanBeforeOccupancyIsTaken) {
   EXPECT_EQ((*peak)["sram.0"], 512u);
 }
 
-TEST(StoragePlan, RejectsUnknownExecutionMultiplicityInStrictPlanning) {
+// Dynamic Shape Task 3 (issue #194): a runtime work count is not a resource
+// fact. The plan's local tiles are statically sized and a temporal loop reuses
+// one buffer, so the capacity verdict is the same whether the loop runs 8 times
+// or a runtime-determined number of times. The count is *carried* -- the plan
+// records that it is unknown, which is what keeps the plan unrankable -- rather
+// than assumed to be one.
+TEST(StoragePlan, CertifiesUnknownExecutionMultiplicityWithBoundedResidency) {
   mlir::MLIRContext context;
   WorkloadGraph graph =
       chainGraph(context, tileType(context, "8x8xf32"), std::nullopt);
@@ -473,8 +479,36 @@ TEST(StoragePlan, RejectsUnknownExecutionMultiplicityInStrictPlanning) {
   ASSERT_TRUE(plan->materialized); // strict executable planning
 
   llvm::Error error = finalizeStoragePlan(graph, *plan, storageMachine());
+  ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
+  bool reported = false;
+  for (const std::string &note : plan->diagnostics.storageNotes)
+    reported |= note.find("runtime multiplicity") != std::string::npos;
+  EXPECT_TRUE(reported) << "an unknown work count must be carried, not guessed";
+  // The graph carries no structural facts, so the conservative whole
+  // multiplicity fallback is unavailable; the selected executor pool (one slot
+  // in this machine) is the certified bound.
+  for (const StorageAllocation &allocation : plan->allocations)
+    if (!allocation.borrowed)
+      EXPECT_EQ(allocation.simultaneousOccurrences, 1u);
+}
+
+// When even the pool is unavailable, residency cannot be bounded and strict
+// planning must refuse rather than emit a capacity verdict it cannot prove.
+TEST(StoragePlan, RejectsUnboundedResidencyInStrictPlanning) {
+  mlir::MLIRContext context;
+  WorkloadGraph graph =
+      chainGraph(context, tileType(context, "8x8xf32"), std::nullopt);
+  std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
+  ASSERT_NE(target, nullptr);
+  std::optional<CoveringPlan> plan = searchOne(graph, *target, context);
+  ASSERT_TRUE(plan.has_value());
+  ASSERT_TRUE(plan->materialized);
+  ASSERT_FALSE(plan->placements.empty());
+  plan->placements.front().executor.clear();
+
+  llvm::Error error = finalizeStoragePlan(graph, *plan, storageMachine());
   ASSERT_TRUE(bool(error));
-  EXPECT_NE(llvm::toString(std::move(error)).find("multiplicity"),
+  EXPECT_NE(llvm::toString(std::move(error)).find("simultaneous residency"),
             std::string::npos);
 }
 
@@ -623,16 +657,22 @@ TEST(StoragePlan, ExtractedKnownLoopMultiplicityFinalizesInStrictMode) {
   EXPECT_EQ(plan->allocations[1].bytes, 256u);
 }
 
-TEST(StoragePlan, AnUnresolvedLoopBoundStaysUnknownAndRefusesStrictPlanning) {
+// A computed loop bound stays unknown rather than being assumed to run once.
+// Because the loop is *temporal*, its iterations reuse one buffer, so strict
+// planning still certifies the plan's static capacity (dynamic-shape design §6);
+// what the unknown count forbids is ranking the plan's cost, not materializing
+// it.
+TEST(StoragePlan, AnUnresolvedLoopBoundIsCertifiedButCarried) {
   ParsedKernel parsed = parseKernel(kLoopedKernel);
   ASSERT_TRUE(parsed.module);
   ASSERT_NE(parsed.kernel, nullptr);
   llvm::Expected<WorkloadGraph> graph = extractWorkloadGraph(parsed.kernel);
   ASSERT_TRUE(static_cast<bool>(graph)) << llvm::toString(graph.takeError());
   ASSERT_EQ(graph->getNodes().size(), 1u);
-  // A computed bound is not statically recoverable, so it stays unknown rather
-  // than being assumed to run once.
   EXPECT_FALSE(graph->getNodes()[0].executionMultiplicity.has_value());
+  // A temporal loop contributes nothing to residency, so that fact is known.
+  ASSERT_TRUE(graph->getNodes()[0].simultaneousMultiplicity.has_value());
+  EXPECT_EQ(*graph->getNodes()[0].simultaneousMultiplicity, 1u);
 
   std::unique_ptr<MappingTarget> target = storageTarget(storageMachine());
   ASSERT_NE(target, nullptr);
@@ -640,9 +680,11 @@ TEST(StoragePlan, AnUnresolvedLoopBoundStaysUnknownAndRefusesStrictPlanning) {
       searchOne(*graph, *target, *parsed.context);
   ASSERT_TRUE(plan.has_value());
   llvm::Error error = finalizeStoragePlan(*graph, *plan, storageMachine());
-  ASSERT_TRUE(bool(error));
-  EXPECT_NE(llvm::toString(std::move(error)).find("multiplicity"),
-            std::string::npos);
+  ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
+  bool reported = false;
+  for (const std::string &note : plan->diagnostics.storageNotes)
+    reported |= note.find("runtime multiplicity") != std::string::npos;
+  EXPECT_TRUE(reported);
 }
 
 //===----------------------------------------------------------------------===//
