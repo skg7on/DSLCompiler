@@ -64,6 +64,18 @@ def Micro_KernelOp
         contract and cannot be lowered for execution. An inferred signature is
         not an interface, so migrate such a kernel to the explicit form before
         executing it.
+
+        A kernel may also bind each signature entry to a contract port with an
+        `argument_bindings` array of role/port dictionaries and a
+        `result_bindings` array of output-port indices. Every signature argument
+        is bound exactly once. An argument bound to an output port is a
+        caller-owned destination, and the yielded result bound to that port must
+        describe the same data as the destination it updates. A kernel without
+        bindings keeps the positional convention: inputs first, then results.
+
+        Shape-only prologue operations -- dimension reification, comparisons and
+        asserts that compute or guard extents -- carry `micro.shape_only`, so
+        analysis can tell contract arithmetic from work.
     }];
 
   let arguments = (ins SymbolNameAttr:$sym_name,

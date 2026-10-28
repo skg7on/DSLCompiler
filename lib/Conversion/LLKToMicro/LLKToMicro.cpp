@@ -49,6 +49,7 @@
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h" // IWYU pragma: keep
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -78,15 +79,50 @@ using llk::ScheduleEntry;
 
 using namespace mlir::llk::kernel_driver;
 namespace {
+/// Resolves a root's contract, its symbolic M/N/K and the Micro-IR fragment.
+///
+/// `dynamic` is true when at least one axis is a symbol. The fragment is then
+/// described with `requireStatic = false`: the old positive-constant check is
+/// exactly what the bounded export removes, but every other semantic check
+/// (ranks, dtypes, accumulator, arm types) still has to hold.
 LogicalResult inferMicroContract(const llk::LLKKernelRegistry &registry,
-                                 Operation *root, llk::KernelContract &info) {
+                                 Operation *root, llk::KernelContract &info,
+                                 llk::ContractionDimensions &dimensions,
+                                 bool &dynamic,
+                                 llk::MicroKernelFragment &fragment) {
   auto *entry = registry.lookup(root->getName().getStringRef());
   if (!entry || !entry->hasMicroLowering())
     return failure();
-  llk::MicroKernelFragment fragment;
   if (failed(entry->inferContract(root, info)))
     return failure();
-  return entry->describeMicroKernel(root, info, fragment);
+
+  // A fully static contract keeps the pre-existing path exactly: the symbolic
+  // resolution is only consulted when some axis is actually unknown, so a
+  // static contradiction is still reported by the static validation that
+  // always rejected it.
+  const bool hasUnknownAxis = ShapedType::isDynamic(info.M) ||
+                              ShapedType::isDynamic(info.N) ||
+                              ShapedType::isDynamic(info.K);
+  if (hasUnknownAxis) {
+    FailureOr<llk::ContractionDimensions> resolved =
+        entry->inferDimensions(root);
+    // The registry entry owns the axis relationships: a failure here is a
+    // contradiction it has already diagnosed (or a family that cannot name
+    // its axes at all), never something to paper over with a static path.
+    if (failed(resolved))
+      return failure();
+    dimensions = *resolved;
+    dynamic = !(dimensions.M.isConstant() && dimensions.N.isConstant() &&
+                dimensions.K.isConstant());
+  } else {
+    // A fully static contract still carries its extents as tagged constants,
+    // so every consumer takes one representation rather than an empty one.
+    dimensions.M = llk::shape::Dimension(info.M);
+    dimensions.N = llk::shape::Dimension(info.N);
+    dimensions.K = llk::shape::Dimension(info.K);
+  }
+  return entry->describeMicroKernel(root, info, fragment,
+                                    /*requireStatic=*/!dynamic);
 }
 struct LLKToMicroPass
     : public PassWrapper<LLKToMicroPass, OperationPass<ModuleOp>> {
@@ -114,6 +150,14 @@ struct LLKToMicroPass
     return "Lower LLK root operations to concrete tile-centric micro.kernel IR";
   }
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    // The export builds its output programmatically, so the dialects it emits
+    // are registered here as well as loaded explicitly below; a driver that
+    // runs this pass without a pre-populated registry still gets them.
+    registry.insert<micro::MicroDialect, tensor::TensorDialect,
+                    arith::ArithDialect, cf::ControlFlowDialect>();
+  }
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
@@ -124,9 +168,10 @@ struct LLKToMicroPass
     MLIRContext *context = module.getContext();
     if (!context->getOrLoadDialect<micro::MicroDialect>() ||
         !context->getOrLoadDialect<tensor::TensorDialect>() ||
-        !context->getOrLoadDialect<arith::ArithDialect>()) {
+        !context->getOrLoadDialect<arith::ArithDialect>() ||
+        !context->getOrLoadDialect<cf::ControlFlowDialect>()) {
       module.emitError()
-          << "the micro, tensor, and arith dialects must be registered in "
+          << "the micro, tensor, arith, and cf dialects must be registered in "
              "this context";
       signalPassFailure();
       return;
@@ -161,18 +206,21 @@ struct LLKToMicroPass
         return;
       }
       llk::KernelContract info;
-      if (failed(inferMicroContract(registry, root, info))) {
+      llk::ContractionDimensions dimensions;
+      llk::MicroKernelFragment fragment;
+      bool dynamic = false;
+      if (failed(inferMicroContract(registry, root, info, dimensions, dynamic,
+                                    fragment))) {
         signalPassFailure();
         return;
       }
       ScheduleEntry schedule =
-          selectSchedule(root, info, scheduleDb.getValue());
+          selectSchedule(root, info, dynamic, scheduleDb.getValue());
       TilePlan validatedPlan;
       validatedPlan.inputElemType = info.inputElemType;
       validatedPlan.accumulatorElemType = info.accumulatorElemType;
       validatedPlan.outputElemType = info.outputElemType;
-      if (failed(resolvePlan(root, schedule, info.M, info.N, info.K,
-                             validatedPlan))) {
+      if (failed(resolvePlan(root, schedule, dimensions, validatedPlan))) {
         signalPassFailure();
         return;
       }
@@ -213,6 +261,10 @@ struct LLKToMicroSearchSpacePass
     return "Export tile-aware micro.search_space IR from the selected schedule";
   }
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<micro::MicroDialect>();
+  }
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
@@ -239,13 +291,17 @@ struct LLKToMicroSearchSpacePass
 
     for (Operation *root : roots) {
       llk::KernelContract info;
-      if (failed(inferMicroContract(registry, root, info))) {
+      llk::ContractionDimensions dimensions;
+      llk::MicroKernelFragment fragment;
+      bool dynamic = false;
+      if (failed(inferMicroContract(registry, root, info, dimensions, dynamic,
+                                    fragment))) {
         signalPassFailure();
         return;
       }
       ScheduleEntry schedule =
-          selectSchedule(root, info, scheduleDb.getValue());
-      if (failed(buildSearchSpace(module, root, info, schedule))) {
+          selectSchedule(root, info, dynamic, scheduleDb.getValue());
+      if (failed(buildSearchSpace(module, root, info, dimensions, schedule))) {
         signalPassFailure();
         return;
       }
@@ -287,13 +343,17 @@ exportMicroKernelFromSchedule(ModuleOp module, StringRef sourceSymbol,
 
   Operation *root = roots[sourceRootOrdinal];
   llk::KernelContract info;
-  if (failed(inferMicroContract(registry, root, info)))
+  llk::ContractionDimensions dimensions;
+  llk::MicroKernelFragment described;
+  bool dynamic = false;
+  if (failed(inferMicroContract(registry, root, info, dimensions, dynamic,
+                                described)))
     return fail("selected source root is not supported");
   TilePlan plan;
   plan.inputElemType = info.inputElemType;
   plan.accumulatorElemType = info.accumulatorElemType;
   plan.outputElemType = info.outputElemType;
-  if (failed(resolvePlan(root, schedule, info.M, info.N, info.K, plan)))
+  if (failed(resolvePlan(root, schedule, dimensions, plan)))
     return fail("selected schedule is not valid for the source root");
 
   // The checks above are read-only. Build only after exact selection and full
@@ -301,15 +361,15 @@ exportMicroKernelFromSchedule(ModuleOp module, StringRef sourceSymbol,
   // supplied clone byte-identical.
   if (!module.getContext()->getOrLoadDialect<micro::MicroDialect>() ||
       !module.getContext()->getOrLoadDialect<tensor::TensorDialect>() ||
-      !module.getContext()->getOrLoadDialect<arith::ArithDialect>())
+      !module.getContext()->getOrLoadDialect<arith::ArithDialect>() ||
+      !module.getContext()->getOrLoadDialect<cf::ControlFlowDialect>())
     return fail("the micro, tensor, and arith dialects must be registered");
   SymbolTable symbols(module);
-  llk::MicroKernelFragment fragment;
-  if (failed(registry.lookup(root->getName().getStringRef())
-                 ->describeMicroKernel(root, info, fragment)))
-    return fail("selected source root is not supported");
+  // `described` was resolved above with the same static/dynamic decision the
+  // plan was validated against; describing the root a second time with the
+  // static default would reject the dynamic contract just accepted.
   if (failed(buildKernel(module, root, plan, schedule, "x86-avx2-cpu",
-                         info.mBucket, symbols, info, fragment)))
+                         info.mBucket, symbols, info, described)))
     return fail("failed to emit concrete Micro-IR kernel");
   Operation *result = nullptr;
   module.walk([&](micro::KernelOp kernel) { result = kernel.getOperation(); });

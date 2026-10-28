@@ -151,9 +151,14 @@ std::string numericalContractName(Operation *root) {
 /// is unconditional; a vector operation appears only when the export material-
 /// izes a conversion or an activation epilogue, which is exactly the condition
 /// the exporter uses.
-std::vector<std::string> emittedPrimitives(const ContractionFacts &facts) {
-  std::vector<std::string> primitives{"micro.mma", "micro.tile_async_copy",
-                                      "micro.tile_store"};
+std::vector<std::string> emittedPrimitives(const ContractionFacts &facts,
+                                           bool bounded) {
+  // A bounded export materializes each boundary with `micro.tile_load`; the
+  // static export keeps the view-plus-async-copy path. Naming the wrong one
+  // would make the contract claim an operation the kernel does not contain.
+  std::vector<std::string> primitives{
+      "micro.mma", bounded ? "micro.tile_load" : "micro.tile_async_copy",
+      "micro.tile_store"};
   const bool epilogue = facts.fragment.armCount > 1;
   const bool conversion =
       facts.contract.accumulatorElemType != facts.contract.outputElemType;
@@ -338,14 +343,16 @@ llvm::Expected<ScheduleEntry> toSchedule(const perf::SearchSpace &space,
 llvm::Expected<perf::BindingFacts>
 realizedContractionFacts(Operation *root, const perf::SearchSpace &space,
                          const perf::Candidate &candidate) {
-  // The static analysis and export drivers still do integer shape arithmetic;
-  // a symbolic axis must never reach them as MLIR's dynamic sentinel.
+  // The realized facts describe concrete work, so a symbolic axis must never
+  // reach them as MLIR's dynamic sentinel. The export itself supports unknown
+  // extents; this analysis path needs an explicit shape sample instead.
   auto dims = inferContractionDimensions(root);
   if (failed(dims))
     return error("source root does not declare contraction dimensions");
   if (!dims->M.isConstant() || !dims->N.isConstant() || !dims->K.isConstant())
     return error(
-        "dynamic contraction extents are not supported by the static export");
+        "dynamic contraction extents need a concrete shape sample before work "
+        "facts can be described");
   auto facts = contractionFacts(root);
   if (!facts)
     return facts.takeError();
@@ -440,7 +447,11 @@ public:
     if (described.version == 2)
       declareContractSymbols(described);
     described.numericalContract = numericalContractName(root);
-    described.requiredPrimitives = emittedPrimitives(*facts);
+    // A symbolic axis is always realized by the bounded boundary form; a
+    // fully static root keeps the legacy view/copy path.
+    const bool bounded =
+        !(dims->M.isConstant() && dims->N.isConstant() && dims->K.isConstant());
+    described.requiredPrimitives = emittedPrimitives(*facts, bounded);
     return described;
   }
 
@@ -526,9 +537,8 @@ describeContractionShape(mlir::Operation *root) {
   if (failed(dims))
     return error("source root does not declare contraction dimensions");
   if (!dims->M.isConstant() || !dims->N.isConstant() || !dims->K.isConstant())
-    return error(
-        "dynamic contraction extents are not supported by the static analysis "
-        "export");
+    return error("dynamic contraction extents need a concrete shape sample "
+                 "before analysis work facts can be described");
   auto facts = contractionFacts(root);
   if (!facts)
     return facts.takeError();

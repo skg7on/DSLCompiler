@@ -200,3 +200,51 @@ func.func @loop_yields_the_wrong_type() {
   }
   return
 }
+
+// -----
+
+// Every signature argument is bound exactly once. Binding two arguments to the
+// same contract port leaves one port unowned and is refused.
+func.func @kernel_binding_repeats_a_port() {
+  // expected-error @+1 {{contract port 0 is bound more than once}}
+  micro.kernel @bad(%a: tensor<8x8xf32>, %b: tensor<8x8xf32>) -> tensor<8x8xf32> attributes {
+    argument_bindings = [{port = 0 : i64, role = "input"}, {port = 0 : i64, role = "input"}],
+    result_bindings = [0]
+  } {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+  return
+}
+
+// -----
+
+// A yielded result updates a caller-owned destination, so it must name a port
+// that an output argument actually binds.
+func.func @kernel_result_binding_has_no_destination() {
+  // expected-error @+1 {{which no output argument binds}}
+  micro.kernel @bad(%a: tensor<8x8xf32>) -> tensor<8x8xf32> attributes {
+    argument_bindings = [{port = 0 : i64, role = "input"}],
+    result_bindings = [1]
+  } {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+  return
+}
+
+// -----
+
+// The yielded value must describe the same data as the destination it is bound
+// to; a shape mismatch would update a destination the result does not cover.
+func.func @kernel_yield_does_not_match_destination() {
+  // expected-error @+1 {{does not match its bound destination}}
+  micro.kernel @bad(%a: tensor<8x8xf32>, %dst: tensor<8x4xf32>) -> tensor<8x8xf32> attributes {
+    argument_bindings = [{port = 0 : i64, role = "input"}, {port = 1 : i64, role = "output"}],
+    result_bindings = [1]
+  } {
+    %ta = micro.tile_view %a {shape = array<i64: 8, 8>} : tensor<8x8xf32> -> !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+    micro.yield %ta : !micro.tile<8x8xf32, memory = #micro.memory<sram>>
+  }
+  return
+}

@@ -48,6 +48,7 @@
 #include "LLK/Transforms/Common/ScheduleLoader.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h" // IWYU pragma: keep
 #include "mlir/Dialect/Tensor/IR/Tensor.h" // IWYU pragma: keep
 #include "mlir/IR/BuiltinAttributes.h"
@@ -294,16 +295,35 @@ LogicalResult parseOwnerHierarchy(Operation *root,
 /// Resolves the schedule entry against the operation's shapes, reporting every
 /// problem on `root` so the diagnostic points at the operation being lowered.
 LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
-                          int64_t M, int64_t N, int64_t K, TilePlan &plan) {
+                          const ContractionDimensions &dimensions,
+                          TilePlan &plan) {
   auto fail = [&](const Twine &message) {
     root->emitError() << message;
     return failure();
   };
 
-  if (schedule.tail_policy != "none" && schedule.tail_policy != "pad")
+  if (schedule.tail_policy != "none" && schedule.tail_policy != "pad" &&
+      schedule.tail_policy != "bounded")
     return fail("tail_policy '" + schedule.tail_policy +
-                "' is unsupported; expected 'none' or 'pad'");
+                "' is unsupported; expected 'none', 'pad' or 'bounded'");
   plan.tailPolicy = schedule.tail_policy;
+  plan.dimensions = dimensions;
+  plan.dynamic = !(dimensions.M.isConstant() && dimensions.N.isConstant() &&
+                   dimensions.K.isConstant());
+  plan.bounded = plan.dynamic || schedule.tail_policy == "bounded";
+
+  // A symbolic extent has no divisibility proof and no padded extent to round
+  // up, so only the bounded realization is legal for it. Without this the plan
+  // would silently pick a fixed-shape packing assumption for an unknown
+  // domain.
+  if (plan.dynamic && schedule.tail_policy != "bounded") {
+    StringRef axis = !dimensions.M.isConstant()   ? "M"
+                     : !dimensions.N.isConstant() ? "N"
+                                                  : "K";
+    return fail(Twine(axis) + " is dynamic; tail_policy '" +
+                schedule.tail_policy +
+                "' requires a static extent (use 'bounded')");
+  }
 
   // --- memory path -------------------------------------------------------
   if (failed(parseMemoryPath(root, schedule, plan.srcSpace, plan.stagingSpace)))
@@ -351,11 +371,24 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
   plan.declaredFragment = *declared;
 
   // --- tiling ------------------------------------------------------------
-  auto resolveTile = [&](const char *axis, int64_t extent, int64_t requested,
-                         int64_t &out, int64_t &padded) -> LogicalResult {
+  auto resolveTile = [&](const char *axis, const shape::Dimension &dim,
+                         int64_t requested, int64_t &out,
+                         int64_t &padded) -> LogicalResult {
     if (requested <= 0)
       return fail(Twine("schedule has no ") + axis + " tile size");
+    if (!dim.isConstant()) {
+      // The bounded realization keeps the scheduled capacity; the runtime
+      // rectangle is clipped per access, so there is no padded extent.
+      out = requested;
+      padded = 0;
+      return success();
+    }
+    int64_t extent = dim.getConstant();
+    // A zero extent runs no tile: the capacity stays positive so the local
+    // tile type is well formed, and the loops simply never execute.
     out = plan.tailPolicy == "pad" ? requested : std::min(requested, extent);
+    if (out <= 0)
+      out = requested;
     if (extent % out != 0 && plan.tailPolicy == "none")
       return fail(Twine(axis) + " tile " + Twine(out) + " does not divide " +
                   axis + " = " + Twine(extent) + "; tail_policy is 'none'");
@@ -367,12 +400,15 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
     return success();
   };
 
-  plan.M = M;
-  plan.N = N;
-  plan.K = K;
-  if (failed(resolveTile("BM", M, schedule.BM, plan.BM, plan.paddedM)) ||
-      failed(resolveTile("BN", N, schedule.BN, plan.BN, plan.paddedN)) ||
-      failed(resolveTile("BK", K, schedule.BK, plan.BK, plan.paddedK)))
+  plan.M = dimensions.M.isConstant() ? dimensions.M.getConstant() : 0;
+  plan.N = dimensions.N.isConstant() ? dimensions.N.getConstant() : 0;
+  plan.K = dimensions.K.isConstant() ? dimensions.K.getConstant() : 0;
+  if (failed(resolveTile("BM", dimensions.M, schedule.BM, plan.BM,
+                         plan.paddedM)) ||
+      failed(resolveTile("BN", dimensions.N, schedule.BN, plan.BN,
+                         plan.paddedN)) ||
+      failed(
+          resolveTile("BK", dimensions.K, schedule.BK, plan.BK, plan.paddedK)))
     return failure();
 
   plan.fM = largestDivisorAtMost(plan.BM, std::min((*declared)[0], plan.BM));
@@ -385,8 +421,545 @@ LogicalResult resolvePlan(Operation *root, const ScheduleEntry &schedule,
 }
 
 //===----------------------------------------------------------------------===//
+// Bounded (runtime-extent) emission helpers
+//===----------------------------------------------------------------------===//
+
+/// Marks an op as shape-only control: it computes or guards extents and
+/// addresses, never tensor data. Analysis treats these ops as contract
+/// preamble rather than work a target has to cover.
+void markShapeOnly(Operation *op) {
+  if (op)
+    op->setAttr("micro.shape_only", UnitAttr::get(op->getContext()));
+}
+
+/// An index constant used by shape or loop control, marked shape-only.
+Value shapeIndexConstant(OpBuilder &builder, Location loc, int64_t value) {
+  auto constant = arith::ConstantIndexOp::create(builder, loc, value);
+  markShapeOnly(constant.getOperation());
+  return constant.getResult();
+}
+
+/// One axis of one external port: an SSA value (a runtime `tensor.dim` or the
+/// constant a static dimension folds to) and, when the extent is known here,
+/// its constant value.
+struct AxisExtent {
+  Value value;
+  std::optional<int64_t> constant;
+};
+
+/// Reifies a tensor dimension. A static dimension is a constant rather than a
+/// `tensor.dim`, so a relationship between known extents stays provable and a
+/// guard is only emitted where it is actually needed.
+AxisExtent reifyDimension(OpBuilder &builder, Location loc, Value tensor,
+                          unsigned axis) {
+  auto type = mlir::cast<RankedTensorType>(tensor.getType());
+  int64_t extent = type.getDimSize(axis);
+  if (ShapedType::isDynamic(extent)) {
+    auto dim =
+        tensor::DimOp::create(builder, loc, tensor, static_cast<int64_t>(axis));
+    markShapeOnly(dim.getOperation());
+    return {dim.getResult(), std::nullopt};
+  }
+  return {shapeIndexConstant(builder, loc, extent), extent};
+}
+
+/// The typed zero a bounded load fills its complement with.
+TypedAttr zeroOfType(OpBuilder &builder, Type elementType) {
+  if (auto floatType = dyn_cast<FloatType>(elementType))
+    return builder.getFloatAttr(floatType, 0.0);
+  if (auto intType = dyn_cast<IntegerType>(elementType))
+    return builder.getIntegerAttr(intType, 0);
+  return {};
+}
+
+/// `min(capacity, extent - offset)`: the valid length of the tile starting at
+/// `offset`. The difference is never negative for a loop offset produced by
+/// `offset = iteration * capacity < extent`.
+Value clippedExtent(OpBuilder &builder, Location loc, Value extent,
+                    Value offset, int64_t capacity) {
+  Value remaining = arith::SubIOp::create(builder, loc, extent, offset);
+  markShapeOnly(remaining.getDefiningOp());
+  Value clipped = arith::MinSIOp::create(
+      builder, loc, shapeIndexConstant(builder, loc, capacity), remaining);
+  markShapeOnly(clipped.getDefiningOp());
+  return clipped;
+}
+
+/// `ceildiv(extent, divisor)` as quotient plus a nonzero-remainder bit. Forming
+/// `extent + divisor - 1` first would overflow for an extent near the index
+/// limit, so the quotient/remainder form is the checked one.
+Value ceilDivTileCount(OpBuilder &builder, Location loc, Value extent,
+                       int64_t divisor) {
+  Value divisorValue = shapeIndexConstant(builder, loc, divisor);
+  Value quotient = arith::DivUIOp::create(builder, loc, extent, divisorValue);
+  markShapeOnly(quotient.getDefiningOp());
+  Value remainder = arith::RemUIOp::create(builder, loc, extent, divisorValue);
+  markShapeOnly(remainder.getDefiningOp());
+  Value zero = shapeIndexConstant(builder, loc, 0);
+  Value hasRemainder = arith::CmpIOp::create(
+      builder, loc, arith::CmpIPredicate::ne, remainder, zero);
+  markShapeOnly(hasRemainder.getDefiningOp());
+  Value extra = arith::SelectOp::create(
+      builder, loc, hasRemainder, shapeIndexConstant(builder, loc, 1), zero);
+  markShapeOnly(extra.getDefiningOp());
+  Value count = arith::AddIOp::create(builder, loc, quotient, extra);
+  markShapeOnly(count.getDefiningOp());
+  return count;
+}
+
+//===----------------------------------------------------------------------===//
 // Kernel emission
 //===----------------------------------------------------------------------===//
+
+/// Emits the bounded, runtime-extent form of a concrete `micro.kernel`.
+///
+/// Local tiles keep the scheduled static capacity. Everything that depends on
+/// the problem extent is a runtime value reified inside the kernel:
+///
+///   * the M/N loops run to `tensor.dim` results,
+///   * every source/destination access is clipped to `min(tile, extent -
+///     offset)` by `micro.tile_load` / `micro.tile_store`,
+///   * the reduction carries `valid_k`, so only real K terms are accumulated,
+///   * the caller's destination is an explicit output argument, threaded
+///     through both spatial loops and yielded as the result -- there is no
+///     whole-output allocation and no whole-input pad.
+///
+/// The guard prologue compares the dimensions the source contract requires to
+/// agree (K across both operands, N across weights and destination, M across
+/// input and destination). A static contradiction is a compile error; only
+/// unresolved equalities become `cf.assert`. Guard and extent computations
+/// carry `micro.shape_only`, so analysis can tell contract arithmetic from
+/// work.
+LogicalResult buildBoundedKernel(ModuleOp module, Operation *root,
+                                 const TilePlan &plan,
+                                 const ScheduleEntry &schedule,
+                                 StringRef target, int64_t mBucket,
+                                 SymbolTable &symbols,
+                                 const llk::KernelContract &contract,
+                                 const llk::MicroKernelFragment &fragment) {
+  Location loc = root->getLoc();
+  MLIRContext *ctx = module.getContext();
+  auto fail = [&](const Twine &message) -> LogicalResult {
+    root->emitError() << message;
+    return failure();
+  };
+
+  // --- signature ---------------------------------------------------------
+  // The dynamic export keeps the source's own port types: an unknown extent is
+  // never replaced by a guessed constant. The output destination is the last
+  // argument and the yielded result is its updated value.
+  Type lhsType = fragment.lhsOperandType;
+  Type destinationType = fragment.destinationOperandType;
+  if (!lhsType || !destinationType)
+    return fail("the source root does not declare its external port types");
+
+  auto checkPort = [&](Type type, StringRef what) -> LogicalResult {
+    auto shaped = dyn_cast<RankedTensorType>(type);
+    if (!shaped || shaped.getRank() != 2)
+      return fail(what + " must be a rank-2 tensor");
+    if (!micro::dtypeOfElementType(shaped.getElementType()))
+      return fail(what +
+                  " element type is not a Micro tile dtype (expected f32, f16, "
+                  "bf16, i32, or i8)");
+    return success();
+  };
+  if (failed(checkPort(lhsType, "left-hand side")) ||
+      failed(checkPort(destinationType, "output destination")))
+    return failure();
+  for (Type arm : fragment.rhsOperandTypes)
+    if (failed(checkPort(arm, "right-hand side")))
+      return failure();
+  if (fragment.hasOutputInit &&
+      failed(checkPort(fragment.initOperandType, "initializer")))
+    return failure();
+  auto destinationShaped = mlir::cast<RankedTensorType>(destinationType);
+  if (destinationShaped.getElementType() != plan.outputElemType)
+    return fail("the output destination element type does not match the "
+                "contraction result type");
+
+  SmallVector<Type, 4> inputTypes;
+  inputTypes.push_back(lhsType);
+  inputTypes.append(fragment.rhsOperandTypes.begin(),
+                    fragment.rhsOperandTypes.end());
+  if (fragment.hasOutputInit)
+    inputTypes.push_back(fragment.initOperandType);
+  inputTypes.push_back(destinationType);
+
+  // --- symbol name -------------------------------------------------------
+  std::string base =
+      contract.workload + (plan.dynamic ? "_dynamic" : "_bounded");
+  std::string symName = base;
+  for (unsigned suffix = 1; symbols.lookup(symName); ++suffix)
+    symName = base + "_" + Twine(suffix).str();
+
+  OpBuilder builder(ctx);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto kernel = micro::KernelOp::create(
+      builder, loc, symName,
+      TypeAttr::get(FunctionType::get(ctx, inputTypes, {destinationType})),
+      StringAttr::get(ctx, contract.workload), StringAttr::get(ctx, target),
+      StringAttr(),
+      mBucket >= 0 ? IntegerAttr::get(IntegerType::get(ctx, 64), mBucket)
+                   : IntegerAttr());
+
+  // Schedule intent the concrete ops cannot carry themselves.
+  kernel->setAttr("memory_path", StringAttr::get(ctx, schedule.memory_path));
+  kernel->setAttr("owner_mapping", StringAttr::get(ctx, plan.outerOwner + "/" +
+                                                            plan.innerOwner));
+  kernel->setAttr("tile_layout", StringAttr::get(ctx, schedule.tile_layout));
+  kernel->setAttr("mma_shape",
+                  DenseI64ArrayAttr::get(ctx, plan.declaredFragment));
+  kernel->setAttr("fragment_shape",
+                  DenseI64ArrayAttr::get(
+                      ctx, SmallVector<int64_t, 3>{plan.fM, plan.fN, plan.fK}));
+  kernel->setAttr("tail_policy", StringAttr::get(ctx, plan.tailPolicy));
+  if (Attribute mathMode = root->getAttr("math_mode"))
+    kernel->setAttr("source_math_mode", mathMode);
+
+  // Explicit argument/result bindings. Ports follow the emitted signature:
+  // the left operand, one port per right arm, the read initializer when the
+  // lowering takes one, and the caller-owned output destination. The
+  // destination argument binds to the output port and the yielded result
+  // updates exactly that port.
+  auto i64 = IntegerType::get(ctx, 64);
+  SmallVector<Attribute> argumentBindings;
+  unsigned port = 0;
+  auto bindArgument = [&](StringRef role) {
+    argumentBindings.push_back(DictionaryAttr::get(
+        ctx, {NamedAttribute(StringAttr::get(ctx, "role"),
+                             StringAttr::get(ctx, role)),
+              NamedAttribute(StringAttr::get(ctx, "port"),
+                             IntegerAttr::get(i64, port))}));
+    ++port;
+  };
+  bindArgument("input"); // left-hand side
+  for (size_t arm = 0; arm < fragment.armCount; ++arm)
+    bindArgument("input");
+  if (fragment.hasOutputInit)
+    bindArgument("input");
+  unsigned outputPort = port;
+  bindArgument("output");
+  kernel->setAttr("argument_bindings", ArrayAttr::get(ctx, argumentBindings));
+  kernel->setAttr("result_bindings",
+                  ArrayAttr::get(ctx, {IntegerAttr::get(i64, outputPort)}));
+
+  Block *kernelBody =
+      startRegionBody(builder, kernel.getBody(), loc, inputTypes);
+  unsigned argument = 0;
+  Value lhsTensor = kernelBody->getArgument(argument++);
+  SmallVector<Value, 2> rhsTensors;
+  for (size_t arm = 0; arm < fragment.armCount; ++arm)
+    rhsTensors.push_back(kernelBody->getArgument(argument++));
+  Value initTensor =
+      fragment.hasOutputInit ? kernelBody->getArgument(argument++) : Value();
+  Value destinationTensor = kernelBody->getArgument(argument++);
+
+  // --- dynamic guard prologue -------------------------------------------
+  // Every port axis is reified once. A static axis is a constant, so an
+  // equality between two known extents is decided here rather than lowered
+  // into a runtime assertion.
+  SmallVector<AxisExtent, 4> mExtents, nExtents, kExtents;
+  auto addExtent = [&](SmallVectorImpl<AxisExtent> &axis, Value tensor,
+                       unsigned dimension) {
+    axis.push_back(reifyDimension(builder, loc, tensor, dimension));
+  };
+  addExtent(mExtents, lhsTensor, 0);
+  addExtent(kExtents, lhsTensor, 1);
+  for (Value rhs : rhsTensors) {
+    addExtent(kExtents, rhs, 0);
+    addExtent(nExtents, rhs, 1);
+  }
+  if (initTensor) {
+    addExtent(mExtents, initTensor, 0);
+    addExtent(nExtents, initTensor, 1);
+  }
+  addExtent(mExtents, destinationTensor, 0);
+  addExtent(nExtents, destinationTensor, 1);
+
+  auto guardAxis = [&](StringRef axis,
+                       ArrayRef<AxisExtent> extents) -> LogicalResult {
+    for (size_t i = 1; i < extents.size(); ++i) {
+      const AxisExtent &first = extents.front();
+      const AxisExtent &other = extents[i];
+      if (first.constant && other.constant) {
+        if (*first.constant != *other.constant)
+          return fail("contraction dimension mismatch: " + axis + " is " +
+                      Twine(*first.constant) + " in one operand and " +
+                      Twine(*other.constant) + " in another");
+        continue;
+      }
+      Value equal = arith::CmpIOp::create(
+          builder, loc, arith::CmpIPredicate::eq, first.value, other.value);
+      markShapeOnly(equal.getDefiningOp());
+      auto assertion = cf::AssertOp::create(
+          builder, loc, equal,
+          ("contraction dimension mismatch: " + axis).str());
+      markShapeOnly(assertion.getOperation());
+    }
+    return success();
+  };
+  // The spec's order: K agreement first, then N, then the destination's M.
+  if (failed(guardAxis("K", kExtents)) || failed(guardAxis("N", nExtents)) ||
+      failed(guardAxis("M", mExtents)))
+    return failure();
+
+  // --- tile and memory vocabulary ---------------------------------------
+  micro::LayoutAttr layout =
+      makeLayoutAttr(ctx, plan.layoutKind, plan.vectorWidth);
+  micro::OwnerAttr workerOwner = micro::OwnerAttr::get(ctx, plan.outerOwner);
+  micro::OwnerAttr fragmentOwner =
+      micro::OwnerAttr::get(ctx, plan.fragmentOwner);
+  auto memoryAttr = [&](micro::MemorySpace space) {
+    return micro::MemorySpaceAttr::get(ctx, space);
+  };
+  micro::MemorySpaceAttr stageSpace = memoryAttr(plan.stagingSpace);
+  micro::MemorySpaceAttr accSpace = memoryAttr(plan.accumulatorSpace);
+  micro::MemorySpaceAttr dramSpace = memoryAttr(micro::MemorySpace::dram);
+  Type tokenType = micro::AsyncTokenType::get(ctx);
+  auto tile = [&](ArrayRef<int64_t> shape, Type element,
+                  micro::LayoutAttr tileLayout, micro::MemorySpaceAttr memory,
+                  micro::OwnerAttr owner) {
+    return micro::TileType::get(ctx, shape, element, tileLayout, memory, owner);
+  };
+
+  Value c0 = shapeIndexConstant(builder, loc, 0);
+
+  // --- explicit caller-owned destination --------------------------------
+  // A view names the caller's storage; it allocates nothing. Its shape stays
+  // dynamic, so the whole-output extent is never materialized as a local tile.
+  Type destinationTileType =
+      tile(destinationShaped.getShape(), plan.outputElemType,
+           /*tileLayout=*/micro::LayoutAttr(), dramSpace,
+           /*owner=*/micro::OwnerAttr());
+  Value destination = micro::TileViewOp::create(
+      builder, loc, destinationTileType, destinationTensor, ValueRange{c0, c0},
+      DenseI64ArrayAttr::get(ctx, destinationShaped.getShape()),
+      /*layout=*/micro::LayoutAttr());
+
+  // --- spatial tiling ----------------------------------------------------
+  // Loops iterate over tile numbers, not offsets: `t < ceildiv(extent, B)` and
+  // `offset = t * B`. The tile-count form is the one the checked ceildiv
+  // supports; the offset is then an ordinary multiply.
+  Value extentM = mExtents.front().value;
+  Value extentN = nExtents.front().value;
+  Value extentK = kExtents.front().value;
+  Value one = shapeIndexConstant(builder, loc, 1);
+  auto openSpatialLoop = [&](Value extent, int64_t step, StringRef axis,
+                             ValueRange carried) -> micro::SpatialForOp {
+    Value tiles = ceilDivTileCount(builder, loc, extent, step);
+    auto loop = micro::SpatialForOp::create(
+        builder, loc, carried.getTypes(), c0, tiles, one,
+        micro::MappingTargetAttr::get(ctx, axis), carried);
+    SmallVector<Type> bodyTypes{IndexType::get(ctx)};
+    bodyTypes.append(carried.getTypes().begin(), carried.getTypes().end());
+    startRegionBody(builder, loop.getBody(), loc, bodyTypes);
+    return loop;
+  };
+  auto tileOffset = [&](Value tile, int64_t step) {
+    Value offset = arith::MulIOp::create(
+        builder, loc, tile, shapeIndexConstant(builder, loc, step));
+    markShapeOnly(offset.getDefiningOp());
+    return offset;
+  };
+
+  micro::SpatialForOp bmLoop = openSpatialLoop(
+      extentM, plan.BM, plan.outerOwner, ValueRange{destination});
+  BlockArgument bmTile = bmLoop.getBody().front().getArgument(0);
+  Value bmCarried = bmLoop.getBody().front().getArgument(1);
+  Value bm = tileOffset(bmTile, plan.BM);
+
+  micro::SpatialForOp bnLoop =
+      openSpatialLoop(extentN, plan.BN, plan.innerOwner, ValueRange{bmCarried});
+  BlockArgument bnTile = bnLoop.getBody().front().getArgument(0);
+  Value bnCarried = bnLoop.getBody().front().getArgument(1);
+  Value bn = tileOffset(bnTile, plan.BN);
+
+  Value validM = clippedExtent(builder, loc, extentM, bm, plan.BM);
+  Value validN = clippedExtent(builder, loc, extentN, bn, plan.BN);
+
+  // --- accumulators ------------------------------------------------------
+  SmallVector<int64_t, 2> accExtent{plan.BM, plan.BN};
+  Type accTileType =
+      tile(accExtent, plan.accumulatorElemType,
+           /*tileLayout=*/micro::LayoutAttr(), accSpace, workerOwner);
+  SmallVector<Value, 2> accumulators;
+  if (initTensor) {
+    // The initializer is read: copy the valid rectangle into the accumulator.
+    // Unlike a whole-input pad, only the tile's own capacity is allocated and
+    // only the valid rectangle is read.
+    Type initElemType =
+        mlir::cast<RankedTensorType>(initTensor.getType()).getElementType();
+    Type initTileType =
+        tile(accExtent, initElemType,
+             /*tileLayout=*/micro::LayoutAttr(), accSpace, workerOwner);
+    auto loaded = micro::TileLoadOp::create(
+        builder, loc, initTileType, tokenType, initTensor, ValueRange{bm, bn},
+        ValueRange{validM, validN}, zeroOfType(builder, initElemType), accSpace,
+        workerOwner);
+    micro::WaitOp::create(builder, loc, ValueRange{loaded.getToken()});
+    Value initial = loaded.getResult();
+    if (initElemType != plan.accumulatorElemType)
+      initial = micro::VectorOp::create(builder, loc, accTileType, "convert",
+                                        ValueRange{initial}, StringAttr());
+    accumulators.push_back(initial);
+  } else {
+    // A zero reduction must still produce zero, so the accumulator starts from
+    // an explicit fill. The bounded load copies no source lane (`valid = 0`);
+    // its typed padding materializes the whole tile.
+    for (size_t arm = 0; arm < rhsTensors.size(); ++arm) {
+      Type zeroTileType =
+          tile(accExtent, plan.outputElemType,
+               /*tileLayout=*/micro::LayoutAttr(), accSpace, workerOwner);
+      auto loaded = micro::TileLoadOp::create(
+          builder, loc, zeroTileType, tokenType, destinationTensor,
+          ValueRange{c0, c0}, ValueRange{c0, c0},
+          zeroOfType(builder, plan.outputElemType), accSpace, workerOwner);
+      micro::WaitOp::create(builder, loc, ValueRange{loaded.getToken()});
+      Value zero = loaded.getResult();
+      if (plan.outputElemType != plan.accumulatorElemType)
+        zero = micro::VectorOp::create(builder, loc, accTileType, "convert",
+                                       ValueRange{zero}, StringAttr());
+      accumulators.push_back(zero);
+    }
+  }
+
+  // --- K loop ------------------------------------------------------------
+  SmallVector<Type> carriedTypes(accumulators.size(), accTileType);
+  Value kTiles = ceilDivTileCount(builder, loc, extentK, plan.BK);
+  auto kLoop = micro::ForOp::create(builder, loc, carriedTypes, c0, kTiles, one,
+                                    ValueRange(accumulators));
+  SmallVector<Type> kBodyTypes{IndexType::get(ctx)};
+  kBodyTypes.append(carriedTypes);
+  Block *kBody = startRegionBody(builder, kLoop.getBody(), loc, kBodyTypes);
+  BlockArgument bkTile = kBody->getArgument(0);
+  Value bk = tileOffset(bkTile, plan.BK);
+  SmallVector<BlockArgument> carried;
+  for (size_t arm = 0; arm < accumulators.size(); ++arm)
+    carried.push_back(kBody->getArgument(arm + 1));
+
+  auto pipeline = micro::PipelineOp::create(builder, loc, carriedTypes,
+                                            static_cast<uint64_t>(plan.stages));
+  startRegionBody(builder, pipeline.getBody(), loc);
+
+  Value validK = clippedExtent(builder, loc, extentK, bk, plan.BK);
+
+  // --- bounded staged loads ---------------------------------------------
+  // `micro.tile_load` is the bounded materialization primitive: it copies
+  // `[offset, offset + valid)` and fills the remainder with a typed zero. The
+  // result tile keeps its static capacity, so the local footprint does not
+  // grow with the problem.
+  SmallVector<int64_t, 2> lhsTileExtent{plan.BM, plan.BK};
+  Type lhsTileType =
+      tile(lhsTileExtent, plan.inputElemType, layout, stageSpace, workerOwner);
+  auto lhsLoad = micro::TileLoadOp::create(
+      builder, loc, lhsTileType, tokenType, lhsTensor, ValueRange{bm, bk},
+      ValueRange{validM, validK}, zeroOfType(builder, plan.inputElemType),
+      stageSpace, workerOwner);
+  Value lhsStaged = lhsLoad.getResult();
+  SmallVector<Value, 4> tokens{lhsLoad.getToken()};
+
+  SmallVector<int64_t, 2> rhsTileExtent{plan.BK, plan.BN};
+  SmallVector<Value, 2> rhsStaged;
+  for (Value source : rhsTensors) {
+    Type rhsTileType = tile(rhsTileExtent, plan.inputElemType, layout,
+                            stageSpace, workerOwner);
+    auto load = micro::TileLoadOp::create(
+        builder, loc, rhsTileType, tokenType, source, ValueRange{bk, bn},
+        ValueRange{validK, validN}, zeroOfType(builder, plan.inputElemType),
+        stageSpace, workerOwner);
+    rhsStaged.push_back(load.getResult());
+    tokens.push_back(load.getToken());
+  }
+  micro::WaitOp::create(builder, loc, tokens);
+
+  // --- instruction fragments ---------------------------------------------
+  SmallVector<int64_t, 2> lhsFragmentExtent{plan.fM, plan.fK};
+  SmallVector<int64_t, 2> rhsFragmentExtent{plan.fK, plan.fN};
+  if (plan.fM != plan.BM || plan.fK != plan.BK)
+    micro::TilePartitionOp::create(
+        builder, loc,
+        tile(lhsFragmentExtent, plan.inputElemType, layout, stageSpace,
+             fragmentOwner),
+        lhsStaged, DenseI64ArrayAttr::get(ctx, lhsFragmentExtent),
+        fragmentOwner, /*tail=*/BoolAttr());
+  if (plan.fK != plan.BK || plan.fN != plan.BN)
+    for (Value staged : rhsStaged)
+      micro::TilePartitionOp::create(
+          builder, loc,
+          tile(rhsFragmentExtent, plan.inputElemType, layout, stageSpace,
+               fragmentOwner),
+          staged, DenseI64ArrayAttr::get(ctx, rhsFragmentExtent), fragmentOwner,
+          /*tail=*/BoolAttr());
+
+  // --- MMA with an exact reduction length -------------------------------
+  DenseI64ArrayAttr mmaShape = DenseI64ArrayAttr::get(
+      ctx, SmallVector<int64_t, 3>{plan.BM, plan.BN, plan.BK});
+  llvm::SmallVector<Value> nextAccumulators;
+  for (size_t arm = 0; arm < rhsStaged.size(); ++arm)
+    nextAccumulators.push_back(
+        micro::MmaOp::create(
+            builder, loc, accTileType, lhsStaged, rhsStaged[arm], carried[arm],
+            mmaShape,
+            micro::DTypeAttr::get(
+                ctx, *micro::dtypeOfElementType(plan.inputElemType)),
+            micro::DTypeAttr::get(
+                ctx, *micro::dtypeOfElementType(plan.accumulatorElemType)),
+            /*engine=*/StringAttr(), /*valid_k=*/validK)
+            .getResult());
+
+  if (auto terminator = dyn_cast<micro::YieldOp>(
+          pipeline.getBody().front().getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, nextAccumulators);
+    terminator.erase();
+  }
+  if (auto terminator = dyn_cast<micro::YieldOp>(kBody->getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, pipeline.getResults());
+    terminator.erase();
+  }
+  for (size_t arm = 0; arm < accumulators.size(); ++arm)
+    accumulators[arm] = kLoop.getResults()[arm];
+
+  // The epilogue belongs to the output tile, not to one K iteration.
+  builder.setInsertionPoint(kLoop->getNextNode());
+  Value epilogue = fragment.buildEpilogue(builder, loc, accumulators);
+  if (plan.accumulatorElemType != plan.outputElemType) {
+    Type convertedType =
+        tile(accExtent, plan.outputElemType,
+             /*tileLayout=*/micro::LayoutAttr(), accSpace, workerOwner);
+    epilogue = micro::VectorOp::create(builder, loc, convertedType, "convert",
+                                       ValueRange{epilogue},
+                                       /*math_mode=*/StringAttr());
+  }
+
+  // --- clipped write-back ------------------------------------------------
+  Value written = micro::TileStoreOp::create(
+                      builder, loc, destinationTileType, epilogue, bnCarried,
+                      ValueRange{bm, bn}, dramSpace, ValueRange{validM, validN})
+                      .getResult();
+  if (auto terminator =
+          dyn_cast<micro::YieldOp>(bnLoop.getBody().front().getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, ValueRange{written});
+    terminator.erase();
+  }
+  if (auto terminator =
+          dyn_cast<micro::YieldOp>(bmLoop.getBody().front().getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, bnLoop.getResults());
+    terminator.erase();
+  }
+  if (auto terminator = dyn_cast<micro::YieldOp>(kernelBody->getTerminator())) {
+    builder.setInsertionPoint(terminator);
+    micro::YieldOp::create(builder, loc, ValueRange{bmLoop.getResult(0)});
+    terminator.erase();
+  }
+
+  builder.setInsertionPointToEnd(module.getBody());
+  symbols.insert(kernel);
+  return success();
+}
 
 /// Emits one concrete `micro.kernel` for `root` into `module`.
 ///
@@ -399,6 +972,12 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
                           SymbolTable &symbols,
                           const llk::KernelContract &contract,
                           const llk::MicroKernelFragment &fragment) {
+  // A dynamic or explicitly bounded plan uses the runtime-extent builder; the
+  // legacy static builder below is unchanged for `none`/`pad` plans.
+  if (plan.bounded || plan.dynamic)
+    return buildBoundedKernel(module, root, plan, schedule, target, mBucket,
+                              symbols, contract, fragment);
+
   StringRef workload = contract.workload;
   Location loc = root->getLoc();
   MLIRContext *ctx = module.getContext();
@@ -822,7 +1401,20 @@ LogicalResult buildKernel(ModuleOp module, Operation *root,
 /// database has nothing to offer. Shared so the concrete and search-space
 /// exports cannot disagree about which schedule an operation runs under.
 ScheduleEntry selectSchedule(Operation *root, const llk::KernelContract &info,
-                             StringRef dbPath) {
+                             bool dynamic, StringRef dbPath) {
+  // A fixed-shape schedule entry -- or the M bucket derived from a known M --
+  // says nothing about an unknown extent, and a packing choice proven for one
+  // shape is not proven for the domain. Any symbolic axis therefore selects
+  // the explicit bounded baseline instead of classifying unknown work.
+  if (dynamic) {
+    ScheduleEntry baseline = llk::selectBoundedBaselineSchedule();
+    root->emitRemark() << "dynamic contraction dimensions: using the bounded "
+                          "baseline schedule (BM="
+                       << baseline.BM << ", BN=" << baseline.BN
+                       << ", BK=" << baseline.BK
+                       << ", tail_policy=" << baseline.tail_policy << ")";
+    return baseline;
+  }
   std::vector<ScheduleEntry> matches =
       llk::loadScheduleDB(dbPath, info.mBucket, info.N, info.K, info.workload);
   if (matches.empty())
@@ -838,8 +1430,12 @@ ScheduleEntry selectSchedule(Operation *root, const llk::KernelContract &info,
 
 /// Returns true when the module already holds a search space named `name`.
 /// Unlike `micro.kernel`, `micro.search_space` is not a symbol, so uniqueness
-/// is maintained here rather than by a SymbolTable.
+/// is maintained here rather than by a SymbolTable. Module symbols still count
+/// as taken: a space that renames a function is a redefinition, not a new
+/// space.
 bool searchSpaceNameTaken(ModuleOp module, StringRef name) {
+  if (SymbolTable::lookupSymbolIn(module, name))
+    return true;
   for (micro::SearchSpaceOp space : module.getOps<micro::SearchSpaceOp>())
     if (space.getSymName() == name)
       return true;
@@ -854,6 +1450,7 @@ bool searchSpaceNameTaken(ModuleOp module, StringRef name) {
 /// schedule is the space's first candidate.
 LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
                                const llk::KernelContract &info,
+                               const llk::ContractionDimensions &dimensions,
                                const ScheduleEntry &schedule) {
   // The symbolic choices copy values out of the schedule, so each has to be a
   // value the dialect accepts before it can become a micro.param choice. The
@@ -876,17 +1473,25 @@ LogicalResult buildSearchSpace(ModuleOp module, Operation *root,
     return root->emitError()
            << "schedule fragment_shape '" << schedule.fragment_shape
            << "' must be a positive MxNxK triple";
-  if (schedule.tail_policy != "none" && schedule.tail_policy != "pad")
-    return root->emitError() << "tail_policy '" << schedule.tail_policy
-                             << "' is unsupported; expected 'none' or 'pad'";
+  if (schedule.tail_policy != "none" && schedule.tail_policy != "pad" &&
+      schedule.tail_policy != "bounded")
+    return root->emitError()
+           << "tail_policy '" << schedule.tail_policy
+           << "' is unsupported; expected 'none', 'pad' or 'bounded'";
 
   MLIRContext *context = module.getContext();
   Location loc = root->getLoc();
 
   // --- symbol name ---
-  std::string base = (info.workload + "_M" + Twine(info.M) + "_N" +
-                      Twine(info.N) + "_K" + Twine(info.K))
-                         .str();
+  // An unknown extent is never spelled as a number: a dynamic space is named
+  // by the workload alone, while a static one keeps its exact M/N/K identity.
+  const bool dynamic =
+      !(dimensions.M.isConstant() && dimensions.N.isConstant() &&
+        dimensions.K.isConstant());
+  std::string base = dynamic ? info.workload + "_dynamic"
+                             : (info.workload + "_M" + Twine(info.M) + "_N" +
+                                Twine(info.N) + "_K" + Twine(info.K))
+                                   .str();
   std::string symName = base;
   for (unsigned suffix = 1; searchSpaceNameTaken(module, symName); ++suffix)
     symName = base + "_" + Twine(suffix).str();

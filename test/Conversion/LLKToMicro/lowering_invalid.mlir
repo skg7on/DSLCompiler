@@ -14,19 +14,22 @@
 // expected here because --verify-diagnostics accounts for every diagnostic the
 // run produces.
 
-// Dynamic shapes cannot become static !micro.tile values, and the kernel has
-// no tile mask to fall back on.
-func.func @dynamic_shape(%x: tensor<?x64xbf16>, %wg: tensor<64x64xbf16>,
-                         %wu: tensor<64x64xbf16>, %init: tensor<?x64xbf16>)
-    -> tensor<?x64xbf16> {
-  // expected-error @below {{left-hand side must have a static shape; dynamic shapes are not supported by the Micro-IR export}}
-  %y = llk.fused_swiglu ins(%x, %wg, %wu : tensor<?x64xbf16>,
-                            tensor<64x64xbf16>, tensor<64x64xbf16>)
-      outs(%init : tensor<?x64xbf16>)
-      {accumulator_type = f32, activation = #llk.activation<silu>,
+// Dynamic extents are exported with static tile capacities, but the rest of
+// the contract still has to hold: an accumulator dtype Micro does not model is
+// rejected before any runtime loop or guard is emitted.
+func.func @dynamic_accumulator_dtype(%x: tensor<?x?xbf16>,
+                                     %wg: tensor<?x?xbf16>,
+                                     %wu: tensor<?x?xbf16>,
+                                     %init: tensor<?x?xbf16>)
+    -> tensor<?x?xbf16> {
+  // expected-error @below {{accumulator_type must be a type attribute naming a Micro tile dtype}}
+  %y = llk.fused_swiglu ins(%x, %wg, %wu : tensor<?x?xbf16>,
+                            tensor<?x?xbf16>, tensor<?x?xbf16>)
+      outs(%init : tensor<?x?xbf16>)
+      {accumulator_type = f64, activation = #llk.activation<silu>,
        math_mode = #llk.math_mode<bounded_fast>}
-      -> tensor<?x64xbf16>
-  return %y : tensor<?x64xbf16>
+      -> tensor<?x?xbf16>
+  return %y : tensor<?x?xbf16>
 }
 
 // -----

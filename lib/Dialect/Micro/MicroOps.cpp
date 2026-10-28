@@ -20,6 +20,8 @@
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/CallInterfaces.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -244,6 +246,88 @@ LogicalResult KernelOp::verify() {
                            << ", which does not match the declared result "
                            << signature.getResult(i);
   }
+
+  // Explicit argument/result port bindings. A bound kernel names the contract
+  // port every signature argument realizes and the output port every yielded
+  // result updates, so neither a caller nor a lowerer infers a binding from
+  // argument positions. All signature arguments are bound exactly once, and a
+  // yielded result describes the same data as the destination it updates.
+  auto argumentBindings =
+      (*this)->getAttrOfType<ArrayAttr>("argument_bindings");
+  auto resultBindings = (*this)->getAttrOfType<ArrayAttr>("result_bindings");
+  if (!argumentBindings && !resultBindings)
+    return success();
+  if (!argumentBindings)
+    return emitOpError("result_bindings requires argument_bindings");
+  if (argumentBindings.size() != signature.getNumInputs())
+    return emitOpError() << "argument_bindings has " << argumentBindings.size()
+                         << " entry(ies) but the signature declares "
+                         << signature.getNumInputs() << " input(s)";
+
+  llvm::DenseMap<unsigned, unsigned> portToArgument;
+  llvm::SmallDenseSet<unsigned, 4> outputPorts;
+  for (unsigned i = 0, e = argumentBindings.size(); i < e; ++i) {
+    auto entry = dyn_cast<DictionaryAttr>(argumentBindings[i]);
+    if (!entry)
+      return emitOpError() << "argument binding #" << i
+                           << " must be a dictionary";
+    if (entry.size() != 2)
+      return emitOpError() << "argument binding #" << i
+                           << " must name exactly 'role' and 'port'";
+    auto role = entry.getAs<StringAttr>("role");
+    auto port = entry.getAs<IntegerAttr>("port");
+    if (!role || !port)
+      return emitOpError() << "argument binding #" << i
+                           << " must name exactly 'role' and 'port'";
+    if (role.getValue() != "input" && role.getValue() != "output")
+      return emitOpError() << "argument binding #" << i
+                           << " role must be 'input' or 'output'";
+    int64_t portIndex = port.getInt();
+    if (portIndex < 0)
+      return emitOpError() << "argument binding #" << i
+                           << " port must be nonnegative";
+    if (!portToArgument
+             .try_emplace(static_cast<unsigned>(portIndex),
+                          static_cast<unsigned>(i))
+             .second)
+      return emitOpError() << "contract port " << portIndex
+                           << " is bound more than once";
+    if (role.getValue() == "output")
+      outputPorts.insert(static_cast<unsigned>(portIndex));
+  }
+
+  if (!resultBindings)
+    return emitOpError(
+        "a kernel with argument_bindings must also declare result_bindings");
+  if (resultBindings.size() != signature.getNumResults())
+    return emitOpError() << "result_bindings has " << resultBindings.size()
+                         << " entry(ies) but the signature declares "
+                         << signature.getNumResults() << " result(s)";
+  llvm::SmallDenseSet<unsigned, 4> updatedPorts;
+  for (unsigned i = 0, e = resultBindings.size(); i < e; ++i) {
+    auto port = dyn_cast<IntegerAttr>(resultBindings[i]);
+    if (!port || port.getInt() < 0)
+      return emitOpError() << "result binding #" << i
+                           << " must be a nonnegative port index";
+    unsigned portIndex = static_cast<unsigned>(port.getInt());
+    auto argument = portToArgument.find(portIndex);
+    if (argument == portToArgument.end() || !outputPorts.contains(portIndex))
+      return emitOpError() << "result binding #" << i << " names port "
+                           << portIndex << ", which no output argument binds";
+    Type produced = yield.getOperand(i).getType();
+    Type destination =
+        entry.getArgument(static_cast<unsigned>(argument->second)).getType();
+    if (!sameLogicalData(produced, destination))
+      return emitOpError() << "yielded value #" << i << " has type " << produced
+                           << ", which does not match its bound destination "
+                           << destination;
+    updatedPorts.insert(portIndex);
+  }
+  for (unsigned portIndex : outputPorts)
+    if (!updatedPorts.contains(portIndex))
+      return emitOpError() << "output port " << portIndex
+                           << " is bound by an argument but no yielded result "
+                              "updates it";
 
   return success();
 }
@@ -1441,7 +1525,10 @@ static LogicalResult verifySymbolicChoice(Operation *op, StringRef kind,
 
   // Tail policies are schema-level choices. Whether the selected realization
   // supports one is checked by binding/legality, where the target is known.
-  if (choice != "none" && choice != "pad" && choice != "mask")
+  // `bounded` is the fixed-capacity boundary realization: it clips every
+  // access to the runtime valid rectangle instead of proving divisibility.
+  if (choice != "none" && choice != "pad" && choice != "mask" &&
+      choice != "bounded")
     return op->emitOpError("tail_policy choice '")
            << choice << "' is not a recognized policy";
   return success();

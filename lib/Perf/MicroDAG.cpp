@@ -1206,6 +1206,11 @@ llvm::Error DAGBuilder::buildOp(mlir::Operation &op, State &state) {
   ++opOccurrences[&op];
   const auto *handler = builders.lookup(op.getName().getStringRef());
   if (!handler) {
+    // A `micro.shape_only` prologue op reifies, compares or guards extents; it
+    // carries no tensor data and no work to model. The dynamic contract covers
+    // it, so it must not be reported as an unmodeled leaf.
+    if (op.hasAttr("micro.shape_only"))
+      return llvm::Error::success();
     if (options.coverage != CoverageMode::LegacyPermissive)
       noteIncomplete("unmodeled_leaf: " + op.getName().getStringRef().str());
     return llvm::Error::success();

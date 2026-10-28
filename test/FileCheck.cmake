@@ -413,6 +413,19 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME LLKToMicroMatmul
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/matmul_to_micro.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/matmul_to_micro.mlir"
   )
+  # Fully dynamic export: runtime loop bounds over static tile capacities,
+  # clipped boundary loads/stores, an exact runtime K and an explicit
+  # caller-owned output destination.
+  add_test(NAME LLKToMicroDynamicMatmul
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/dynamic_matmul.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/dynamic_matmul.mlir"
+  )
+  add_test(NAME LLKToMicroDynamicSwiGLU
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/dynamic_swiglu.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/dynamic_swiglu.mlir"
+  )
+  # A dynamic root still exports finite search choices.
+  add_test(NAME LLKToMicroDynamicSearch
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro-search-space=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/dynamic_search.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToMicro/dynamic_search.mlir"
+  )
   # The search-space export, anchored on a fixture database that spells out the
   # Micro/tile schedule fields for one operation and leaves the other on the
   # pre-M11 fields, so one run covers both loaded and defaulted values.
@@ -438,6 +451,11 @@ if(LLK_BUILD_TOOLS)
   # LLKToLinalgConversion test: run llk-opt --llk-to-linalg then FileCheck
   add_test(NAME LLKToLinalgConversion
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/llk_to_linalg.mlir"
+  )
+  # Dynamic SwiGLU accepts runtime extents at the tensor level: every temporary
+  # is sized from the source's own dimensions.
+  add_test(NAME LLKToLinalgDynamicSwiGLU
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToLinalg/dynamic_swiglu.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/LLKToLinalg/dynamic_swiglu.mlir"
   )
 
   # MicroToLinalg: the bridge from canonical Micro-IR to the backend pipeline.

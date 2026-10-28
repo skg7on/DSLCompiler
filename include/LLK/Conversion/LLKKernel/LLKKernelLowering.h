@@ -38,7 +38,18 @@ struct ContractionDimensions {
 struct MicroKernelFragment {
   unsigned armCount = 1;
   bool hasOutputInit = false;
+  /// The left operand's source type. The bounded export keeps source port
+  /// types, so an unknown extent is never replaced by a guessed constant.
+  Type lhsOperandType;
   SmallVector<Type> rhsOperandTypes;
+  /// The read initializer operand's source type, when `hasOutputInit`. A
+  /// dynamic export keeps the source type instead of fabricating a static one.
+  Type initOperandType;
+  /// The caller-owned output destination's source type. A contraction family
+  /// sets this so the dynamic export can name the destination port: it is the
+  /// destination operand for SwiGLU (whose incoming values are not read) and
+  /// the result for matmul.
+  Type destinationOperandType;
   SmallVector<NamedAttribute> extraAttrs;
   std::function<Value(OpBuilder &, Location, ArrayRef<Value>)> buildEpilogue;
 };

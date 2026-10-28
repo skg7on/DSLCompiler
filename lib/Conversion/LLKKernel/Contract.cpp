@@ -116,7 +116,9 @@ LogicalResult inferContractionContract(Operation *root, Value lhs, Value rhs,
   info.outputElemType = o.getElementType();
   auto acc = dyn_cast_or_null<TypeAttr>(accumulatorAttribute);
   info.accumulatorElemType = acc ? acc.getValue() : Type();
-  info.mBucket = l.hasStaticShape() ? classifyM(info.M) : -1;
+  // The M bucket is about M only: a dynamic N or K does not make a known M
+  // unclassifiable. Unknown M stays -1 and is never sent to classifyM.
+  info.mBucket = ShapedType::isDynamic(info.M) ? -1 : classifyM(info.M);
   return success();
 }
 

@@ -16,9 +16,18 @@
 #include "mlir/IR/SymbolTable.h"
 namespace mlir::llk::kernel_driver {
 struct TilePlan {
-  // Problem shape and element types.
+  // Problem extent and element types. An axis that resolves statically is a
+  // constant; the integer fields are filled only for those axes, so an unknown
+  // extent never reaches numeric shape arithmetic.
   int64_t M = 0, N = 0, K = 0;
   int64_t paddedM = 0, paddedN = 0, paddedK = 0;
+  ContractionDimensions dimensions;
+  /// True when at least one axis is a symbol rather than a constant.
+  bool dynamic = false;
+  /// True when the plan realizes its boundary with fixed-capacity tiles and
+  /// clipped accesses. Dynamic plans are always bounded; a static plan can
+  /// also select it explicitly.
+  bool bounded = false;
   std::string tailPolicy{"none"};
   Type inputElemType, accumulatorElemType, outputElemType;
 
@@ -46,14 +55,19 @@ struct TilePlan {
   micro::MemorySpace stagingSpace = micro::MemorySpace::sram;
   micro::MemorySpace accumulatorSpace = micro::MemorySpace::acc;
 };
-LogicalResult resolvePlan(Operation *, const ScheduleEntry &, int64_t, int64_t,
-                          int64_t, TilePlan &);
-ScheduleEntry selectSchedule(Operation *, const KernelContract &, StringRef);
+LogicalResult resolvePlan(Operation *, const ScheduleEntry &,
+                          const ContractionDimensions &, TilePlan &);
+/// Selects a schedule entry for `info`. A root with any symbolic extent does
+/// not consult the database -- a fixed-shape entry cannot be proven legal for
+/// an unknown domain -- and uses the explicit bounded baseline instead.
+ScheduleEntry selectSchedule(Operation *, const KernelContract &, bool dynamic,
+                             StringRef);
 LogicalResult buildKernel(ModuleOp, Operation *, const TilePlan &,
                           const ScheduleEntry &, StringRef, int64_t,
                           SymbolTable &, const KernelContract &,
                           const MicroKernelFragment &);
 LogicalResult buildSearchSpace(ModuleOp, Operation *, const KernelContract &,
+                               const ContractionDimensions &,
                                const ScheduleEntry &);
 } // namespace mlir::llk::kernel_driver
 #endif
