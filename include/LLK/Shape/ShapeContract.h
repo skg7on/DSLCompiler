@@ -141,6 +141,48 @@ bindShapeValues(const ShapeContract &contract,
 /// port order is preserved while the symbol table is lexical.
 std::string canonicalShapeContract(const ShapeContract &contract);
 
+//===----------------------------------------------------------------------===//
+// Predicate classification (dynamic-shape design §6)
+//===----------------------------------------------------------------------===//
+
+/// How a predicate over the declared shape domain is decided:
+///
+///   * `Proven` -- it holds for every extent the contract admits;
+///   * `Disproven` -- it holds for none, so a plan relying on it is illegal;
+///   * `RuntimeGuard` -- it depends on the invocation, so the executable form
+///     must carry a guard (or fall back to bounded movements) rather than
+///     assume it. Symbolic divisibility is deliberately *not* automatically
+///     legal: only a proven predicate lets a full-tile form replace a bounded
+///     one.
+enum class PredicateVerdict { Proven, Disproven, RuntimeGuard };
+
+llvm::StringRef stringifyPredicateVerdict(PredicateVerdict verdict);
+
+/// One predicate the mapping layer can classify without a solver.
+struct ShapePredicate {
+  enum class Kind {
+    /// `symbol % value == 0`.
+    DivisibleBy,
+    /// `symbol == value`.
+    EqualTo,
+    /// `symbol >= value`.
+    AtLeast,
+  };
+
+  Kind kind = Kind::DivisibleBy;
+  std::string symbol;
+  int64_t value = 1;
+};
+
+/// Classifies `predicate` against the domain `contract` declares for its
+/// symbol. The answer is conservative in both directions: a predicate is
+/// `Proven` only when every admissible extent satisfies it and `Disproven` only
+/// when none can. Everything else -- including a symbol the contract does not
+/// declare, which validation already rejects -- is `RuntimeGuard`, because a
+/// fact that cannot be established is not a fact that holds.
+PredicateVerdict classifyPredicate(const ShapePredicate &predicate,
+                                   const ShapeContract &contract);
+
 } // namespace mlir::llk::shape
 
 #endif // LLK_SHAPE_SHAPECONTRACT_H

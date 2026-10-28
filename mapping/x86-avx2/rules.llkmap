@@ -158,6 +158,24 @@ rule avx2.async_copy v1 {
   cost 2;
 }
 
+// A bounded source materialization: a fixed-capacity tile is filled from a
+// runtime-sized source rectangle and its complement from the op's typed padding
+// value. The source is a plain tensor/memref and therefore states no memory, so
+// the rule names the DRAM -> tile path the profile's load takes -- the same
+// reason `avx2.async_copy` names its ports. It shares the movement emitter with
+// tile copies because bounded movement is a movement implementation; the
+// emitter answers for the clipped behaviour through `verifyBoundary`.
+rule avx2.tile_load v1 {
+  match micro.tile_load();
+  require executor kind worker;
+  require memory input "source" kind dram;
+  input "source";
+  output "result";
+  bundle "avx2.tile.load";
+  emit "avx2_tile_copy";
+  cost 2;
+}
+
 rule avx2.tile_async_copy v1 {
   match micro.tile_async_copy();
   require executor kind worker;

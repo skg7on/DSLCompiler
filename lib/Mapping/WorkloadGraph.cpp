@@ -28,7 +28,7 @@ namespace {
 constexpr llvm::StringLiteral kNodeOps[] = {
     "micro.mma",        "micro.vector",          "micro.reduce",
     "micro.async_copy", "micro.tile_async_copy", "micro.store",
-    "micro.tile_store"};
+    "micro.tile_store", "micro.tile_load"};
 
 /// Logical ops folded into their consumer rather than becoming nodes.
 constexpr llvm::StringLiteral kTransparentOps[] = {"micro.tile_view",

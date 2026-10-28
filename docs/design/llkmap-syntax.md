@@ -137,8 +137,9 @@ cost_stmt = "cost", UINT, ";" ;
 ```
 
 The accepted `micro_op` vocabulary is exactly `micro.mma`, `micro.vector`,
-`micro.reduce`, `micro.async_copy`, `micro.tile_async_copy`, `micro.store`, and
-`micro.tile_store`. Other `micro.*` operations cannot be matched by this profile.
+`micro.reduce`, `micro.async_copy`, `micro.tile_async_copy`,
+`micro.tile_load`, `micro.store`, and `micro.tile_store`. Other `micro.*`
+operations cannot be matched by this profile.
 
 Rule ids must be unique. The version defaults to 1; `v0` and leading zeros
 are accepted. Each rule needs one match and nonempty bundle and emitter names.

@@ -12,7 +12,8 @@ add_llk_library(LLKMicroMapping
     PlanMaterialization.cpp
     CompletePlanEvaluation.cpp
     TargetCoverageValidation.cpp
-    LINK_LIBRARIES LLKMapping LLKTargetMapping LLKMachine LLKPerf LLKToMicro LLKWorkloadContracts LLKSourceCandidates LLK::MLIR
+    BoundaryDerivation.cpp
+    LINK_LIBRARIES LLKMapping LLKTargetMapping LLKMachine LLKPerf LLKToMicro LLKWorkloadContracts LLKSourceCandidates LLKShape LLK::MLIR
 )
 
 add_llk_library(LLKMappedCompilation

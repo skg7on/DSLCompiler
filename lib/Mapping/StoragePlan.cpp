@@ -1119,25 +1119,47 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     return allocation.id;
   };
 
-  // How many occurrences of `node`'s work are simultaneously resident: the
-  // recovered spatial/pipeline factor, or -- when the node was built without
-  // structural facts -- the conservative whole execution multiplicity, which
-  // can only over-count.
-  auto occurrencesOf = [](const WorkloadNode *node) -> uint64_t {
+  // How many occurrences of `node`'s work can be simultaneously resident
+  // (dynamic-shape design §6). The recovered spatial/pipeline factor decides
+  // when it exists, and -- for a graph built without structural facts -- the
+  // conservative whole execution multiplicity stands in, which can only
+  // over-count.
+  //
+  // Neither is known when the enclosing spatial/pipeline bound is a runtime
+  // value. That is not an unbounded residency: the placement selected an
+  // executor, and a declared launch policy cannot have more occurrences in
+  // flight than that executor's pool has slots. The pool is therefore the
+  // certified upper bound -- the *logical* grid size is deliberately never used
+  // as a concurrency count. `nullopt` means even that fact is unavailable, and
+  // strict planning refuses to emit a capacity verdict it cannot prove.
+  auto residencyBound =
+      [&](const WorkloadNode *node,
+          const PlanPlacement *placement) -> std::optional<uint64_t> {
     if (node->simultaneousMultiplicity)
       return *node->simultaneousMultiplicity;
-    return node->executionMultiplicity.value_or(1);
+    if (node->executionMultiplicity)
+      return *node->executionMultiplicity;
+    if (!placement || placement->executor.empty())
+      return std::nullopt;
+    const machine::ExecutorNode *executor =
+        machine.findExecutor(placement->executor);
+    if (!executor)
+      return std::nullopt;
+    return std::max<uint64_t>(1, executor->concurrency);
   };
 
   // The residential factor of the value `value`'s producer, for the staged
   // copies a connection materializes: a copy inside a spatial loop is resident
   // once per occurrence exactly as its producer is.
-  auto occurrencesForValue = [&](WorkloadValueId value) -> uint64_t {
+  auto occurrencesForValue =
+      [&](WorkloadValueId value) -> std::optional<uint64_t> {
     auto producer = valueProducer.find(storageValueOf(value));
     if (producer == valueProducer.end())
       return 1;
     const WorkloadNode *node = graph.findNode(producer->second);
-    return node ? occurrencesOf(node) : 1;
+    if (!node)
+      return 1;
+    return residencyBound(node, placementFor.lookup(node->id));
   };
 
   for (WorkloadNodeId nodeId : topo) {
@@ -1149,34 +1171,42 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     const PlanPlacement *placement = placementFor.lookup(nodeId);
 
     // Execution multiplicity: how many times this node runs, recovered during
-    // extraction from its enclosing structural ops. An unknown count is refused
-    // by a strict (materialized) plan and reported by an analysis one.
-    //
-    // The analysis-mode fallback uses a single iteration. That is a *lower*
-    // bound, not a conservative one: a genuinely unknown loop may run many
-    // times, so an analysis-mode capacity result is advisory and must not be
-    // read as a proof. No finite upper bound exists for an unknown trip count,
-    // which is exactly why an executable (materialized) plan refuses instead of
-    // guessing -- strict mode is the gate, and the note below names the node so
-    // the under-report is never silent.
+    // extraction from its enclosing structural ops. A runtime count is *carried
+    // explicitly*, not assumed away and no longer a rejection (dynamic-shape
+    // design §6): capacity is a function of the static tile footprints and the
+    // bounded simultaneous residency, never of how many temporal iterations the
+    // loop eventually performs. The count still matters to cost, where an
+    // unknown value leaves the plan unrankable -- so under-reporting it here
+    // would be a modelling error, and the note names the node instead.
     const std::optional<uint64_t> multiplicity = node->executionMultiplicity;
-    if (multiplicity) {
-      (void)multiplicity;
-    } else if (strict) {
-      return storageError(
-          "storage plan: node " + std::to_string(nodeId) + " ('" +
-          node->opName +
-          "') has unknown execution multiplicity; strict "
-          "executable planning cannot assume a single iteration "
-          "(recover the bound from the enclosing structural ops "
-          "or use analysis mode)");
-    } else {
+    if (!multiplicity)
       notes.push_back(
           "storage plan: node " + std::to_string(nodeId) + " ('" +
           node->opName +
-          "') has unknown execution multiplicity; the single-iteration used "
-          "here is a lower bound, so this analysis result is advisory");
+          "') has a runtime multiplicity (its enclosing loop bound is not "
+          "statically recoverable); capacity is certified from static tile "
+          "footprints and bounded residency, not from it");
+
+    // Simultaneous residency, bounded independently of the logical grid: the
+    // structural spatial/pipeline factor when it is static, otherwise the
+    // selected executor pool's concurrency.
+    std::optional<uint64_t> occurrences = residencyBound(node, placement);
+    if (!occurrences) {
+      if (strict)
+        return storageError(
+            "storage plan: node " + std::to_string(nodeId) + " ('" +
+            node->opName +
+            "') has unknown simultaneous residency; its spatial/pipeline "
+            "bound is not statically recoverable and no selected executor "
+            "pool bounds it");
+      notes.push_back(
+          "storage plan: node " + std::to_string(nodeId) + " ('" +
+          node->opName +
+          "') has unknown simultaneous residency; one resident occurrence is "
+          "assumed for analysis, so this result is advisory");
+      occurrences = 1;
     }
+    const uint64_t residentOccurrences = *occurrences;
 
     for (unsigned index = 0; index < node->outputs.size(); ++index) {
       const WorkloadValueId value = node->outputs[index].value;
@@ -1209,7 +1239,7 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
       std::optional<PlanStepId> last = lastReaderStep(value);
       const PlanStepId end = last ? std::max(begin, *last) : begin;
       const uint64_t id = allocate(value, resolvedMemory, bytes, begin, end,
-                                   /*borrowed=*/false, occurrencesOf(node));
+                                   /*borrowed=*/false, residentOccurrences);
       allocationWriter[id] = nodeId;
       auto connections = connectionsByValue.find(value);
       if (connections != connectionsByValue.end())
@@ -1260,6 +1290,25 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
           "storage plan: connection " + std::to_string(connection.id) +
           " carries unknown value " + std::to_string(connection.value));
 
+    // The staged copies a connection materializes are resident exactly as often
+    // as their producer's work is (dynamic-shape design §6). An unbounded
+    // producer residency is refused by strict planning and reported by an
+    // analysis artifact, never silently charged as one copy.
+    std::optional<uint64_t> producerResidency =
+        occurrencesForValue(connection.value);
+    if (!producerResidency) {
+      if (strict)
+        return storageError(
+            "storage plan: connection " + std::to_string(connection.id) +
+            " stages a value whose producing occurrence's simultaneous "
+            "residency cannot be bounded");
+      notes.push_back(
+          "storage plan: connection " + std::to_string(connection.id) +
+          " stages a value whose producing occurrence's simultaneous "
+          "residency cannot be bounded; one copy is assumed for analysis");
+      producerResidency = 1;
+    }
+
     /// The physical bytes a hop's destination holds: the value's image under
     /// the layout it carries there. An unsupported footprint is a strict
     /// rejection and a reported analysis fallback, exactly as the producer's
@@ -1307,7 +1356,7 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
 
         const uint64_t id =
             allocate(connection.value, hops[hop].dstMemory, *bytes, begin, end,
-                     /*borrowed=*/false, occurrencesForValue(connection.value));
+                     /*borrowed=*/false, *producerResidency);
         hops[hop].destinationStorageId = id;
 
         if (hop == 0) {
@@ -1413,9 +1462,8 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
     const PlanStepId begin = connectionStep.lookup(connection.id);
     std::optional<PlanStepId> last = lastReaderStep(connection.value);
     const PlanStepId end = last ? std::max(begin, *last) : begin;
-    const uint64_t id =
-        allocate(connection.value, *memory, bytes, begin, end,
-                 /*borrowed=*/false, occurrencesForValue(connection.value));
+    const uint64_t id = allocate(connection.value, *memory, bytes, begin, end,
+                                 /*borrowed=*/false, *producerResidency);
     if (!llvm::is_contained(connectionStorage[index], id))
       connectionStorage[index].push_back(id);
   }

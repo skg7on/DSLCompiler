@@ -9,6 +9,8 @@
 
 #include "TargetCoverageValidation.h"
 
+#include "BoundaryDerivation.h"
+
 #include "LLK/Mapping/MappingMetadata.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -166,6 +168,18 @@ llvm::Error verifyTargetOperationCoverage(mlir::ModuleOp bound,
       return coverageError("selected instance " + llvm::Twine(instance) +
                            " rule '" + group.placement->rule +
                            "' coverage validation failed: " +
+                           llvm::toString(std::move(failure)));
+    // Dynamic-shape design §5/§6: the covered operations' boundary behaviour is
+    // a typed requirement, and the emitter the rule selected is the one that
+    // must implement it. A target that can lower the operation but not its
+    // clipped access or short reduction refuses the plan here, before ranking,
+    // instead of emitting a full-tile access over a runtime extent.
+    BoundaryRequirements boundary = boundaryRequirementsFor(group.operations);
+    if (llvm::Error failure =
+            emitter->verifyBoundary(group.placement->bundle, boundary))
+      return coverageError("selected instance " + llvm::Twine(instance) +
+                           " rule '" + group.placement->rule +
+                           "' boundary validation failed: " +
                            llvm::toString(std::move(failure)));
   }
   return llvm::Error::success();

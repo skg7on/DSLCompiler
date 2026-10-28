@@ -23,6 +23,7 @@
 #define LLK_MAPPING_MAPPINGTARGET_H
 
 #include "LLK/Machine/MachineModel.h"
+#include "LLK/Mapping/BoundaryRequirements.h"
 #include "LLK/Mapping/CodegenRequirements.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/LayoutConstraints.h"
@@ -81,6 +82,34 @@ public:
                    const TargetBundle &bundle) const {
     (void)coveredOps;
     return verify(bundle);
+  }
+
+  /// Verifies this emitter can realize the typed boundary behaviour the covered
+  /// operations require (dynamic-shape design §5/§6).
+  ///
+  /// `requirements` is derived from the covered operations, never from a
+  /// bundle parameter: a bundle is opaque target data and generic mapping code
+  /// must not read a capability out of it. The rule selects *which* emitter
+  /// implements the operation, and that emitter answers here whether it also
+  /// implements the clipped access or short reduction the operation needs.
+  ///
+  /// The default rejects any nonempty requirement. Declaring an emitter key is
+  /// not implementing bounded movement or a partial reduction, and silently
+  /// lowering a runtime extent into a full-tile access would read or write
+  /// outside the valid rectangle. A target opts in by overriding this, exactly
+  /// as it opts in to `lower` and `hasLowering`. `verifyBoundary` is pure and
+  /// read-only; it never inspects or rewrites the covered IR.
+  virtual llvm::Error
+  verifyBoundary(const TargetBundle &bundle,
+                 const BoundaryRequirements &requirements) const {
+    (void)bundle;
+    if (!requirements.any())
+      return llvm::Error::success();
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "boundary_unsupported: emitter '" + key().str() +
+            "' has no boundary implementation for " +
+            renderBoundaryRequirements(requirements));
   }
 
   /// True when this emitter lowers the bundles it verifies.

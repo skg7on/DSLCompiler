@@ -248,7 +248,8 @@ The accepted operation vocabulary is exactly the set of operations that become
 workload nodes:
 
 ``micro.mma``, ``micro.vector``, ``micro.reduce``, ``micro.async_copy``,
-``micro.tile_async_copy``, ``micro.store``, ``micro.tile_store``.
+``micro.tile_async_copy``, ``micro.tile_load``, ``micro.store``,
+``micro.tile_store``.
 
 ``micro.tile_view`` and ``micro.tile_partition`` are logical operations folded
 into their consumers; they are not matchable nodes. Other ``micro.*`` operations

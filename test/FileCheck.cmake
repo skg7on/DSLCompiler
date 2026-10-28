@@ -71,6 +71,17 @@ if(LLK_BUILD_TOOLS)
               ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/verify_mapping_invalid.mlir
   )
 
+  # MicroMappingDynamicLoopUnranked (Dynamic Shape Task 3, issue #194): a loop
+  # with a runtime bound keeps its plan legal -- static tile capacities and
+  # temporal reuse certify storage for the whole domain -- but its unknown work
+  # count makes the latency unrankable, so an executable run refuses the plan on
+  # analysis completeness rather than on storage. The fixture asserts exactly
+  # that split: no storage error, an analysis-incomplete rejection, and no
+  # partial artifact claimed as executable.
+  add_test(NAME MicroMappingDynamicLoopUnranked
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> \"--micro-map=target=x86-avx2 machine=${CMAKE_SOURCE_DIR}/machines/x86-avx2-v2.yaml layouts=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/layouts.llkmap rules=${CMAKE_SOURCE_DIR}/mapping/x86-avx2/rules.llkmap emitters=avx2_vector_add,avx2_vector_convert,avx2_vector_silu,avx2_vector_mul,avx2_mma,avx2_reduce,avx2_copy,avx2_tile_copy,avx2_tile_store,avx2_fused_convert_silu_mul mode=deterministic require-executable=1\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_incomplete_loop.mlir 2>&1 | ${FILECHECK_BIN} --check-prefix=MAP ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/strict_incomplete_loop.mlir"
+  )
+
   # MicroMappingUnmaterialized: the canonical tile-transfer fixture is now a
   # *materialized* plan (task B4): the CLI supplies the canonical
   # PlanMaterializer, so the vector->tile-store edge becomes a typed

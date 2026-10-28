@@ -127,7 +127,9 @@ execution tile that contains it. Do not equate tile size with SIMD width.
 
 The implemented logical operations include ``micro.tile_view`` and
 ``micro.tile_partition``; materialized operations include ``micro.tile_alloc``,
-``micro.tile_async_copy``, and ``micro.tile_store``. Compute uses ``micro.mma``,
+``micro.tile_async_copy``, ``micro.tile_load`` (a bounded, padded source
+materialization), and ``micro.tile_store`` (with optional clipped extents).
+Compute uses ``micro.mma``,
 ``micro.vector``, and ``micro.reduce``. The definitive operation set is in
 :source:`MicroOps.td <include/LLK/Dialect/Micro/MicroOps.td>`, with checks in
 :source:`MicroOps.cpp <lib/Dialect/Micro/MicroOps.cpp>`.

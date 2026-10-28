@@ -234,6 +234,35 @@ public:
            isBackendHandoffKey(key());
   }
 
+  /// AVX2 realizes every typed boundary behaviour through the shared
+  /// MicroToLinalg lowering the selected pipeline runs before this backend: a
+  /// bounded load becomes a clipped tensor slice plus a tile-local typed fill,
+  /// a clipped store an insert of the valid rectangle, and a partial-K
+  /// contraction a runtime reduction bound over dynamic K slices rather than a
+  /// padded full-K reduction. Those are the existing safe copy/fill/vector
+  /// mechanisms, not a new primitive. The movement and contraction emitters
+  /// below hand the operation through untouched for exactly that lowering; they
+  /// never widen a runtime extent back into a full-tile access.
+  llvm::Error verifyBoundary(
+      const mapping::TargetBundle &bundle,
+      const mapping::BoundaryRequirements &requirements) const override {
+    if (llvm::Error error = verify(bundle))
+      return error;
+    // Each key hands off exactly the operation whose boundary behaviour it can
+    // name. A requirement arriving on a key that does not carry that operation
+    // has no implementation here, so it is refused rather than accepted by the
+    // target as a whole.
+    const bool implementsLoad = key() == "avx2_tile_copy";
+    const bool implementsStore = key() == "avx2_tile_store";
+    const bool implementsPartialK = key() == "avx2_mma";
+    if ((requirements.boundedLoad && !implementsLoad) ||
+        (requirements.boundedStore && !implementsStore) ||
+        (requirements.partialK && !implementsPartialK))
+      return avx2Error("emitter '" + key().str() + "' cannot realize " +
+                       mapping::renderBoundaryRequirements(requirements));
+    return llvm::Error::success();
+  }
+
   llvm::Error lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
                     const mapping::TargetBundle &bundle,
                     const mapping::TargetLoweringContext &context,
@@ -266,7 +295,8 @@ llvm::Error AVX2Emitter::lower(llvm::ArrayRef<mlir::Operation *> coveredOps,
           (key() == "avx2_mma" && name == "micro.mma") ||
           (key() == "avx2_reduce" && name == "micro.reduce") ||
           (key() == "avx2_copy" && name == "micro.async_copy") ||
-          (key() == "avx2_tile_copy" && name == "micro.tile_async_copy") ||
+          (key() == "avx2_tile_copy" &&
+           (name == "micro.tile_async_copy" || name == "micro.tile_load")) ||
           (key() == "avx2_tile_store" && name == "micro.tile_store");
       if (!supported)
         return avx2Error("emitter '" + key().str() +
