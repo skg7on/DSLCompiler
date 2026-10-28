@@ -773,6 +773,83 @@ struct PipelineOpLowering : OpConversionPattern<micro::PipelineOp> {
   }
 };
 
+/// `micro.tile_load` materializes a fixed tile from a runtime-sized source
+/// rectangle. The reference form is exactly the two halves the op names: a
+/// clipped `tensor.extract_slice` of the valid rectangle, then a tile-local
+/// `tensor.pad` that fills the complement from the op's typed padding value.
+///
+/// Padding the source instead would allocate a whole-input image, and reading
+/// the full tile would touch lanes outside the source. Only the boundary
+/// rectangle is dynamic; the materialized tile keeps its compile-time capacity.
+struct TileLoadOpLowering : OpConversionPattern<micro::TileLoadOp> {
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(micro::TileLoadOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // The reference bridge is tensor-based. A memref source would have to be
+    // bridged into tensor land first, which is the bufferization question this
+    // pass deliberately stays out of.
+    auto sourceType = dyn_cast<RankedTensorType>(adaptor.getSource().getType());
+    auto resultType = dyn_cast<RankedTensorType>(
+        getTypeConverter()->convertType(op.getResult().getType()));
+    if (!sourceType || !resultType)
+      return rewriter.notifyMatchFailure(
+          op, "a bounded load lowers against a ranked tensor source");
+
+    size_t rank = static_cast<size_t>(sourceType.getRank());
+    if (adaptor.getOffsets().size() != rank ||
+        adaptor.getValidSizes().size() != rank ||
+        static_cast<size_t>(resultType.getRank()) != rank)
+      return rewriter.notifyMatchFailure(
+          op, "a bounded load needs one offset and one valid extent per "
+              "source dimension");
+
+    SmallVector<OpFoldResult> offsets(adaptor.getOffsets().begin(),
+                                      adaptor.getOffsets().end());
+    SmallVector<OpFoldResult> sizes(adaptor.getValidSizes().begin(),
+                                    adaptor.getValidSizes().end());
+    SmallVector<OpFoldResult> strides(rank, rewriter.getIndexAttr(1));
+
+    // The slice is exactly the copied rectangle, so a lane outside it is never
+    // read even when the runtime extent is smaller than the tile.
+    SmallVector<int64_t> sliceShape(rank, ShapedType::kDynamic);
+    auto sliceType =
+        RankedTensorType::get(sliceShape, resultType.getElementType());
+    Value slice = tensor::ExtractSliceOp::create(rewriter, op.getLoc(),
+                                                 sliceType, adaptor.getSource(),
+                                                 offsets, sizes, strides);
+
+    // The complement is filled inside the fixed tile: tile extent - valid, per
+    // axis, computed at runtime when the extent is.
+    SmallVector<OpFoldResult> low(rank, rewriter.getIndexAttr(0));
+    SmallVector<OpFoldResult> high;
+    for (size_t i = 0; i < rank; ++i) {
+      int64_t tileExtent = resultType.getShape()[i];
+      std::optional<int64_t> constant =
+          getConstantIntValue(adaptor.getValidSizes()[i]);
+      if (constant)
+        high.push_back(rewriter.getIndexAttr(tileExtent - *constant));
+      else
+        high.push_back(
+            arith::SubIOp::create(rewriter, op.getLoc(),
+                                  arith::ConstantIndexOp::create(
+                                      rewriter, op.getLoc(), tileExtent),
+                                  adaptor.getValidSizes()[i])
+                .getResult());
+    }
+    Value padding =
+        arith::ConstantOp::create(rewriter, op.getLoc(), op.getPadding());
+    Value padded = tensor::PadOp::create(rewriter, op.getLoc(), resultType,
+                                         slice, low, high, padding);
+
+    recordStructuralMapping(op, "tile_load", op->getAttr("micro.math_mode"));
+    // The movement is synchronous once lowered; the token only models overlap.
+    auto token = arith::ConstantIndexOp::create(rewriter, op.getLoc(), 0);
+    rewriter.replaceOp(op, ValueRange{padded, token});
+    return success();
+  }
+};
+
 /// `micro.tile_store` with a destination updates it: the result is the
 /// destination with the tile written at the store's offsets, which is a
 /// `tensor.insert_slice` and therefore a value the enclosing loop can carry.
@@ -796,18 +873,39 @@ struct TileStoreOpLowering : OpConversionPattern<micro::TileStoreOp> {
         !dyn_cast<RankedTensorType>(adaptor.getDestination().getType()))
       return rewriter.notifyMatchFailure(op, "not convertible to a tensor");
 
-    // The slice written is the source's own shape; the offsets say where.
+    // The slice written is the source's own shape, or only its origin
+    // rectangle when the store is clipped; the offsets say where.
     SmallVector<OpFoldResult> offsets(adaptor.getOffsets().begin(),
                                       adaptor.getOffsets().end());
     SmallVector<OpFoldResult> sizes;
-    for (int64_t dim : sourceType.getShape())
-      sizes.push_back(rewriter.getIndexAttr(dim));
+    Value inserted = adaptor.getSource();
+    if (adaptor.getValidSizes().empty()) {
+      for (int64_t dim : sourceType.getShape())
+        sizes.push_back(rewriter.getIndexAttr(dim));
+    } else {
+      sizes.assign(adaptor.getValidSizes().begin(),
+                   adaptor.getValidSizes().end());
+    }
     SmallVector<OpFoldResult> strides(sourceType.getRank(),
                                       rewriter.getIndexAttr(1));
 
-    auto insert = tensor::InsertSliceOp::create(
-        rewriter, op.getLoc(), adaptor.getSource(), adaptor.getDestination(),
-        offsets, sizes, strides);
+    // A clipped write first cuts the origin rectangle out of the tile, so no
+    // lane outside `valid` reaches the destination.
+    if (!adaptor.getValidSizes().empty()) {
+      SmallVector<int64_t> sliceShape(sourceType.getRank(),
+                                      ShapedType::kDynamic);
+      auto sliceType =
+          RankedTensorType::get(sliceShape, sourceType.getElementType());
+      SmallVector<OpFoldResult> sliceOffsets(sourceType.getRank(),
+                                             rewriter.getIndexAttr(0));
+      inserted = tensor::ExtractSliceOp::create(rewriter, op.getLoc(),
+                                                sliceType, inserted,
+                                                sliceOffsets, sizes, strides);
+    }
+
+    auto insert = tensor::InsertSliceOp::create(rewriter, op.getLoc(), inserted,
+                                                adaptor.getDestination(),
+                                                offsets, sizes, strides);
     recordStructuralMapping(op, "tile_store", op->getAttr("micro.math_mode"));
     rewriter.replaceOp(op, insert.getResult());
     return success();
@@ -959,6 +1057,43 @@ struct MmaOpLowering : OpConversionPattern<micro::MmaOp> {
         return rewriter.notifyMatchFailure(op, "rhs is not a rank-2 tensor");
     }
 
+    // An exact-K tail reduces only the logical K, never a full BK with an
+    // assumed-equivalent padded tail: both operands are sliced to the runtime
+    // reduction length. The accumulator stays the contraction's `outs`, so its
+    // incoming values are preserved and only those K terms are accumulated.
+    if (Value validK = adaptor.getValidK()) {
+      auto extentOrAttr = [&](Value tensor, int64_t dim) -> OpFoldResult {
+        int64_t extent =
+            cast<RankedTensorType>(tensor.getType()).getShape()[dim];
+        if (!ShapedType::isDynamic(extent))
+          return rewriter.getIndexAttr(extent);
+        return tensor::DimOp::create(rewriter, op.getLoc(), tensor, dim)
+            .getResult();
+      };
+      SmallVector<OpFoldResult> origin = {rewriter.getIndexAttr(0),
+                                          rewriter.getIndexAttr(0)};
+      SmallVector<OpFoldResult> unit = {rewriter.getIndexAttr(1),
+                                        rewriter.getIndexAttr(1)};
+
+      SmallVector<int64_t> lhsSliceShape{
+          cast<RankedTensorType>(lhs.getType()).getShape()[0],
+          ShapedType::kDynamic};
+      SmallVector<OpFoldResult> lhsSizes{extentOrAttr(lhs, /*dim=*/0), validK};
+      lhs = tensor::ExtractSliceOp::create(
+          rewriter, op.getLoc(),
+          RankedTensorType::get(lhsSliceShape, elementType), lhs, origin,
+          lhsSizes, unit);
+
+      SmallVector<int64_t> rhsSliceShape{
+          ShapedType::kDynamic,
+          cast<RankedTensorType>(rhs.getType()).getShape()[1]};
+      SmallVector<OpFoldResult> rhsSizes{validK, extentOrAttr(rhs, /*dim=*/1)};
+      rhs = tensor::ExtractSliceOp::create(
+          rewriter, op.getLoc(),
+          RankedTensorType::get(rhsSliceShape, elementType), rhs, origin,
+          rhsSizes, unit);
+    }
+
     auto matmul = linalg::MatmulOp::create(
         rewriter, op.getLoc(), TypeRange{accType}, ValueRange{lhs, rhs},
         ValueRange{adaptor.getAcc()});
@@ -1077,14 +1212,15 @@ struct MicroToLinalgPass
                            tensor::TensorDialect>();
 
     RewritePatternSet patterns(context);
-    patterns.add<TileAllocOpLowering, TileViewOpLowering,
-                 TilePartitionOpLowering, TileStoreOpLowering, VectorOpLowering,
-                 TransformOpLowering, AsyncCopyOpLowering<micro::AsyncCopyOp>,
-                 AsyncCopyOpLowering<micro::TileAsyncCopyOp>, WaitOpLowering,
-                 YieldOpLowering, LoopOpLowering<micro::ForOp>,
-                 LoopOpLowering<micro::SpatialForOp>, PipelineOpLowering,
-                 MmaOpLowering, ReduceOpLowering, BarrierOpLowering>(converter,
-                                                                     context);
+    patterns
+        .add<TileAllocOpLowering, TileViewOpLowering, TilePartitionOpLowering,
+             TileLoadOpLowering, TileStoreOpLowering, VectorOpLowering,
+             TransformOpLowering, AsyncCopyOpLowering<micro::AsyncCopyOp>,
+             AsyncCopyOpLowering<micro::TileAsyncCopyOp>, WaitOpLowering,
+             YieldOpLowering, LoopOpLowering<micro::ForOp>,
+             LoopOpLowering<micro::SpatialForOp>, PipelineOpLowering,
+             MmaOpLowering, ReduceOpLowering, BarrierOpLowering>(converter,
+                                                                 context);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();
