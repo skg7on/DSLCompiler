@@ -1195,6 +1195,17 @@ struct MicroToLinalgPass
           rewriter, kernel.getLoc(), name,
           rewriter.getFunctionType(argumentTypes, resultTypes));
 
+      // The kernel's port bindings and symbolic workload contract are the
+      // callable ABI, not scheduling metadata: keep them on the function the
+      // kernel becomes. Preparing the invocation reads them to decide which
+      // arguments are caller-owned outputs and to bind every declared symbol
+      // at a call. Dropping them here would erase the only record of an
+      // output-role argument.
+      for (llvm::StringRef attribute :
+           {"micro.workload_contract", "argument_bindings", "result_bindings"})
+        if (mlir::Attribute value = kernel->getAttr(attribute))
+          function->setAttr(attribute, value);
+
       // The entry block already carries the declared inputs, so moving the
       // region wholesale turns them into the function's parameters. Nothing is
       // inferred from `tensor.empty`: an internal allocation stays internal.

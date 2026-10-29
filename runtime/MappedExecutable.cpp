@@ -206,10 +206,25 @@ MappedExecutable::invoke(llvm::ArrayRef<InvocationBuffer2D> inputs,
     return error;
 
   llvm::SmallVector<MemRef2D, kMaxDescriptors> descriptors;
-  for (const InvocationBuffer2D &input : inputs)
-    descriptors.push_back(input.descriptor);
-  for (const InvocationBuffer2D &output : outputs)
-    descriptors.push_back(output.descriptor);
+  if (abi_.arguments.empty()) {
+    // Version 1's positional convention: inputs, then caller-owned outputs.
+    for (const InvocationBuffer2D &input : inputs)
+      descriptors.push_back(input.descriptor);
+    for (const InvocationBuffer2D &output : outputs)
+      descriptors.push_back(output.descriptor);
+  } else {
+    // A version 2 signature says exactly where each descriptor goes, so a
+    // destination bound to an output port is passed at its declared position
+    // rather than after every input.
+    for (const KernelAbiArgument &binding : abi_.arguments) {
+      llvm::ArrayRef<InvocationBuffer2D> buffers =
+          binding.role == AbiPortRole::Input ? inputs : outputs;
+      if (binding.port >= buffers.size())
+        return abiError("mapped ABI binding names a descriptor the invocation "
+                        "did not supply");
+      descriptors.push_back(buffers[binding.port].descriptor);
+    }
+  }
   llvm::SmallVector<MemRef2D *, kMaxDescriptors> args;
   for (MemRef2D &descriptor : descriptors)
     args.push_back(&descriptor);
@@ -261,6 +276,13 @@ MappedExecutable::invoke(llvm::ArrayRef<InvocationBuffer2D> inputs,
 
 llvm::Error MappedExecutable::invoke(llvm::ArrayRef<MemRef2D *> inputs,
                                      llvm::ArrayRef<MemRef2D *> outputs) {
+  // A version 2 call binds symbolic extents and requires dtype and allocation
+  // checks an untagged descriptor cannot supply. Refusing is the honest answer;
+  // silently skipping those checks would accept a descriptor the kernel cannot
+  // safely address.
+  if (isSymbolicKernelAbi(abi_))
+    return abiError("mapped ABI version 2 requires typed InvocationBuffer2D "
+                    "buffers");
   return invokeUncheckedLegacy(inputs, outputs);
 }
 
@@ -392,31 +414,68 @@ MappedExecutable::createWithAllocatorHooks(PreparedMappedKernel prepared,
       llvm::toHex(llvm::ArrayRef<uint8_t>(loweredIRDigest), true);
 
   size_t argumentCount =
-      prepared.abi.inputs.size() + prepared.abi.outputs.size();
+      prepared.abi.arguments.empty()
+          ? prepared.abi.inputs.size() + prepared.abi.outputs.size()
+          : prepared.abi.arguments.size();
   if (function.getFunctionType().getNumInputs() != argumentCount)
     return abiError(
         "prepared mapped kernel argument count does not match its ABI");
-  auto validateArguments = [&](llvm::ArrayRef<KernelAbi::Port> ports,
-                               size_t offset,
-                               llvm::StringRef side) -> llvm::Error {
-    for (size_t i = 0; i < ports.size(); ++i) {
-      mlir::Type argType = function.getFunctionType().getInput(offset + i);
-      auto memref = mlir::dyn_cast<mlir::MemRefType>(argType);
-      if (!memref)
+  auto validateArgument = [&](mlir::Type argType, const KernelAbi::Port &port,
+                              llvm::StringRef side,
+                              size_t index) -> llvm::Error {
+    auto memref = mlir::dyn_cast<mlir::MemRefType>(argType);
+    if (!memref)
+      return abiError("prepared " + side.str() + " argument " +
+                      std::to_string(index) + " is not a memref");
+    if (typeToString(memref.getElementType()) != port.elementType)
+      return abiError("prepared " + side.str() + " argument " +
+                      std::to_string(index) + " does not match its ABI port");
+    if (port.dimensions.empty()) {
+      if (memref.getShape() != llvm::ArrayRef<int64_t>(port.shape))
         return abiError("prepared " + side.str() + " argument " +
-                        std::to_string(i) + " is not a memref");
-      if (memref.getShape() != llvm::ArrayRef<int64_t>(ports[i].shape) ||
-          typeToString(memref.getElementType()) != ports[i].elementType)
+                        std::to_string(index) + " does not match its ABI port");
+      return llvm::Error::success();
+    }
+    if (memref.getRank() != 2 || port.dimensions.size() != 2)
+      return abiError("prepared " + side.str() + " argument " +
+                      std::to_string(index) + " is not rank two");
+    for (size_t dim = 0; dim < 2; ++dim) {
+      int64_t actual = memref.getShape()[dim];
+      const ::mlir::llk::shape::Dimension &expected = port.dimensions[dim];
+      if (expected.isConstant() ? actual != expected.getConstant()
+                                : actual != mlir::ShapedType::kDynamic)
         return abiError("prepared " + side.str() + " argument " +
-                        std::to_string(i) + " does not match its ABI port");
+                        std::to_string(index) +
+                        " does not match its symbolic ABI port");
     }
     return llvm::Error::success();
   };
-  if (llvm::Error error = validateArguments(prepared.abi.inputs, 0, "input"))
-    return std::move(error);
-  if (llvm::Error error = validateArguments(
-          prepared.abi.outputs, prepared.abi.inputs.size(), "output"))
-    return std::move(error);
+  if (prepared.abi.arguments.empty()) {
+    for (size_t i = 0; i < prepared.abi.inputs.size(); ++i)
+      if (llvm::Error error =
+              validateArgument(function.getFunctionType().getInput(i),
+                               prepared.abi.inputs[i], "input", i))
+        return std::move(error);
+    for (size_t i = 0; i < prepared.abi.outputs.size(); ++i)
+      if (llvm::Error error =
+              validateArgument(function.getFunctionType().getInput(
+                                   prepared.abi.inputs.size() + i),
+                               prepared.abi.outputs[i], "output", i))
+        return std::move(error);
+  } else {
+    for (size_t i = 0; i < prepared.abi.arguments.size(); ++i) {
+      const KernelAbiArgument &binding = prepared.abi.arguments[i];
+      const std::vector<KernelAbi::Port> &ports =
+          binding.role == AbiPortRole::Input ? prepared.abi.inputs
+                                             : prepared.abi.outputs;
+      if (binding.port >= ports.size())
+        return abiError("mapped ABI binding names a port that does not exist");
+      if (llvm::Error error = validateArgument(
+              function.getFunctionType().getInput(i), ports[binding.port],
+              binding.role == AbiPortRole::Input ? "input" : "output", i))
+        return std::move(error);
+    }
+  }
 
   const auto detectedFeatures = llvm::sys::getHostCPUFeatures();
   llvm::StringMap<bool> hostFeatures;

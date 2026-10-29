@@ -1,6 +1,6 @@
 add_llk_library(LLKMappedKernelAbi
     MappedKernelAbi.cpp
-    LINK_LIBRARIES LLK::MLIR
+    LINK_LIBRARIES LLKWorkloadContracts LLK::MLIR
 )
 
 add_llk_library(LLKMicroMapping

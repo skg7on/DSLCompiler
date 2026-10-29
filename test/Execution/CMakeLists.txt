@@ -86,6 +86,7 @@ if(LLK_BUILD_E2E_TESTS)
 
   add_executable(MappedAllocationLifetimeTest mapped_allocation_lifetime.cpp)
   target_link_libraries(MappedAllocationLifetimeTest PRIVATE LLKRuntime
+      LLKMappedCompilation LLKWorkloadContracts MicroDialect LLKDialect
       GTest::gtest_main LLK::MLIR)
   target_compile_definitions(MappedAllocationLifetimeTest PRIVATE
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
@@ -177,3 +178,16 @@ if(LLK_BUILD_E2E_TESTS)
   set_tests_properties(SelectedExecutionEvidenceValidator PROPERTIES
       LABELS "selected-avx2")
 endif()
+
+# ABI v2 and output-destination preparation are IR and descriptor contracts, so
+# they are exercised without a JIT: descriptor resolution binds symbols before
+# entry, and the prepared callable signature is inspected directly. Runtime
+# allocation and ownership behavior stays in the JIT lifetime tests.
+add_executable(DynamicMappedInvocationTest dynamic_mapped_invocation.cpp)
+target_link_libraries(DynamicMappedInvocationTest PRIVATE LLKMappedCompilation
+    LLKToMicro LLKTargetMapping LLKMapping LLKWorkloadContracts MicroDialect
+    LLKDialect GTest::gtest_main LLK::MLIR)
+target_compile_definitions(DynamicMappedInvocationTest PRIVATE
+    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+add_test(NAME DynamicMappedInvocationTest COMMAND DynamicMappedInvocationTest)
+set_tests_properties(DynamicMappedInvocationTest PROPERTIES LABELS "Execution")

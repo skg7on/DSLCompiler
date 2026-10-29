@@ -32,11 +32,13 @@
 #include "LLK/Mapping/PlanBinder.h"
 
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Linalg/Transforms/BufferizableOpInterfaceImpl.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Tensor/Transforms/BufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Vector/Transforms/BufferizableOpInterfaceImpl.h"
@@ -79,7 +81,7 @@ using mlir::llk::mapping::PlanMaterializer;
 using mlir::llk::mapping::TargetBundle;
 using mlir::llk::mapping::TargetLoweringContext;
 
-llvm::Error compileError(const std::string &message) {
+llvm::Error compileError(const llvm::Twine &message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message);
 }
 
@@ -394,6 +396,75 @@ void registerBufferizationInterfaces(mlir::MLIRContext *context) {
   context->appendDialectRegistry(registry);
 }
 
+/// Turns every output-role kernel argument into a caller-owned memref before
+/// ordinary bufferization.
+///
+/// MicroToLinalg leaves the kernel signature as it was declared, so an output
+/// destination is still a tensor at this point and One-Shot Bufferize is free
+/// to decide it needs a fresh buffer for the update. Binding the destination as
+/// a memref and handing the tensor program a writable `to_tensor` view of it
+/// removes that choice: the update is a write into caller storage, and an
+/// output-sized compiler allocation is no longer a legal outcome. The result
+/// that carries the updated value stays until invocation preparation, where it
+/// is verified to be exactly this destination and then dropped.
+llvm::Error lowerOutputDestinations(mlir::ModuleOp module) {
+  mlir::MLIRContext *context = module.getContext();
+  context->getOrLoadDialect<mlir::bufferization::BufferizationDialect>();
+
+  llvm::SmallVector<mlir::func::FuncOp> functions;
+  module.walk([&](mlir::func::FuncOp function) {
+    if (function->hasAttr("argument_bindings"))
+      functions.push_back(function);
+  });
+
+  for (mlir::func::FuncOp function : functions) {
+    auto bindings =
+        function->getAttrOfType<mlir::ArrayAttr>("argument_bindings");
+    mlir::FunctionType type = function.getFunctionType();
+    if (!bindings || bindings.size() != type.getNumInputs())
+      return compileError("function '" + function.getSymName().str() +
+                          "' has argument bindings that do not cover its "
+                          "signature");
+    if (function.getBody().empty())
+      return compileError("function '" + function.getSymName().str() +
+                          "' has no body to lower");
+    mlir::Block &entry = function.getBody().front();
+    if (entry.getNumArguments() != type.getNumInputs())
+      return compileError("function '" + function.getSymName().str() +
+                          "' entry block does not match its signature");
+
+    llvm::SmallVector<mlir::Type> inputs(type.getInputs());
+    bool changed = false;
+    for (unsigned i = 0; i < type.getNumInputs(); ++i) {
+      auto binding = mlir::dyn_cast<mlir::DictionaryAttr>(bindings[i]);
+      auto role = binding ? binding.getAs<mlir::StringAttr>("role")
+                          : mlir::StringAttr();
+      if (!role || role.getValue() != "output")
+        continue;
+      auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(inputs[i]);
+      if (!tensor)
+        return compileError("output argument " + llvm::Twine(i) + " of '" +
+                            function.getSymName().str() +
+                            "' is not a ranked tensor");
+      auto memref =
+          mlir::MemRefType::get(tensor.getShape(), tensor.getElementType());
+      mlir::BlockArgument argument = entry.getArgument(i);
+      mlir::OpBuilder builder(&entry, entry.begin());
+      auto toTensor = mlir::bufferization::ToTensorOp::create(
+          builder, function.getLoc(), tensor, argument,
+          /*restrict=*/true, /*writable=*/true);
+      argument.setType(memref);
+      argument.replaceAllUsesExcept(toTensor.getResult(), toTensor);
+      inputs[i] = memref;
+      changed = true;
+    }
+    if (changed)
+      function.setType(
+          mlir::FunctionType::get(context, inputs, type.getResults()));
+  }
+  return llvm::Error::success();
+}
+
 /// Buffers the mapped kernel and rolls its loops: the Linalg form the existing
 /// backend pipeline already consumes.
 llvm::Error lowerToBackendForm(mlir::ModuleOp module,
@@ -402,6 +473,8 @@ llvm::Error lowerToBackendForm(mlir::ModuleOp module,
   registerBufferizationInterfaces(module.getContext());
   mlir::PassManager pm(module.getContext());
   pm.addPass(mlir::llk::createMicroToLinalgPass());
+  if (llvm::Error error = lowerOutputDestinations(module))
+    return error;
   if (backend == MappedBackend::SelectedTarget) {
     if (!target)
       return compileError(
@@ -481,31 +554,40 @@ llvm::Error validateExecutableContract(mlir::ModuleOp module,
              : llvm::Twine("kernel '") + retainedSymbol + "': " + detail)
             .str());
   };
+  // Version 1's envelope is the static one it always had. Version 2 accepts
+  // zero and symbolic extents because the invocation binds them, but it keeps
+  // the same rank, element-type and port-effect rules.
+  const bool staticExtents = contract.version == 1;
+  const std::string abiName = staticExtents ? "mapped ABI v1" : "mapped ABI v2";
   if (contract.ports.size() > kMappedMaxDescriptors)
-    return prefix("mapped ABI v1 supports at most 12 descriptors");
+    return prefix(abiName + " supports at most 12 descriptors");
   for (const mlir::llk::workload::WorkloadPort &port : contract.ports) {
     if (port.shape.size() != 2)
-      return prefix("mapped ABI v1 requires rank-two ports; port '" +
-                    port.name + "' has rank " + llvm::Twine(port.shape.size()));
-    for (const auto &extent : port.shape)
-      if (!extent.isConstant() || extent.getConstant() <= 0)
-        return prefix("mapped ABI v1 requires positive static extents; port '" +
+      return prefix(abiName + " requires rank-two ports; port '" + port.name +
+                    "' has rank " + llvm::Twine(port.shape.size()));
+    for (const auto &extent : port.shape) {
+      if (staticExtents && (!extent.isConstant() || extent.getConstant() <= 0))
+        return prefix(abiName + " requires positive static extents; port '" +
                       port.name + "' has a nonpositive/dynamic extent");
+      if (!staticExtents && extent.isConstant() && extent.getConstant() < 0)
+        return prefix(abiName + " requires nonnegative extents; port '" +
+                      port.name + "' has a negative extent");
+    }
     bool supported = port.elementType == "f32" || port.elementType == "bf16" ||
                      port.elementType == "f16" || port.elementType == "i32" ||
                      port.elementType == "i8";
     if (!supported)
-      return prefix("mapped ABI v1 does not support element type '" +
+      return prefix(abiName + " does not support element type '" +
                     port.elementType + "' on port '" + port.name + "'");
     using mlir::llk::workload::PortDirection;
     using mlir::llk::workload::PortEffect;
     if (port.direction == PortDirection::Input &&
         port.effect == PortEffect::ReadWrite)
-      return prefix("mapped ABI v1 requires read-only inputs; port '" +
-                    port.name + "' is read-write");
+      return prefix(abiName + " requires read-only inputs; port '" + port.name +
+                    "' is read-write");
     if (port.direction == PortDirection::Output &&
         port.effect != PortEffect::Write)
-      return prefix("mapped ABI v1 requires write-only outputs; port '" +
+      return prefix(abiName + " requires write-only outputs; port '" +
                     port.name + "' is not write-only");
   }
   return llvm::Error::success();

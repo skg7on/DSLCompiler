@@ -93,19 +93,40 @@ contractMismatch(const workload::WorkloadContract &contract,
     bool isInput = port.direction == workload::PortDirection::Input;
     const auto &actual = isInput ? abi.inputs : abi.outputs;
     size_t index = isInput ? input++ : output++;
-    // ABI v1 transports concrete extents, so a symbolic contract dimension
-    // cannot match it.
-    bool shapeMatches = index < actual.size() &&
-                        port.shape.size() == actual[index].shape.size();
+    if (index >= actual.size())
+      return "the declared contract " + describePort(port) +
+             " does not match the " + boundary.str();
+    const ::llk::KernelAbi::Port &realized = actual[index];
+    // A version 1 port transports concrete extents only; a version 2 port
+    // carries either a concrete extent or the symbol the contract declared,
+    // so an equality is only credited when the symbol itself matches.
+    const bool symbolic = !realized.dimensions.empty();
+    size_t actualRank =
+        symbolic ? realized.dimensions.size() : realized.shape.size();
+    bool shapeMatches = port.shape.size() == actualRank;
     if (shapeMatches)
-      for (size_t dim = 0; dim < port.shape.size(); ++dim)
-        if (!port.shape[dim].isConstant() ||
-            port.shape[dim].getConstant() != actual[index].shape[dim]) {
+      for (size_t dim = 0; dim < port.shape.size(); ++dim) {
+        const auto &expected = port.shape[dim];
+        if (!symbolic) {
+          if (!expected.isConstant() ||
+              expected.getConstant() != realized.shape[dim]) {
+            shapeMatches = false;
+            break;
+          }
+          continue;
+        }
+        const auto &got = realized.dimensions[dim];
+        bool matches =
+            expected.isConstant()
+                ? got.isConstant() &&
+                      got.getConstant() == expected.getConstant()
+                : got.isSymbol() && got.getSymbol() == expected.getSymbol();
+        if (!matches) {
           shapeMatches = false;
           break;
         }
-    if (index >= actual.size() || !shapeMatches ||
-        port.elementType != actual[index].elementType)
+      }
+    if (!shapeMatches || port.elementType != realized.elementType)
       return "the declared contract " + describePort(port) +
              " does not match the " + boundary.str();
   }
@@ -401,32 +422,46 @@ describeCapabilities(mlir::Operation *kernel,
           (llvm::Twine("invocation: runtime_capability: ") + detail).str());
     };
     if (!contract.ports.empty()) {
+      // Version 1 is the static envelope it always was. Version 2 binds zero
+      // and symbolic extents per invocation but keeps the same rank,
+      // element-type and port-effect rules.
+      const bool staticExtents = contract.version == 1;
+      const std::string abiName =
+          staticExtents ? "mapped ABI v1" : "mapped ABI v2";
       if (contract.ports.size() > ::llk::kMappedMaxDescriptors)
-        rejectAbi(llvm::Twine("mapped ABI v1 supports at most ") +
+        rejectAbi(llvm::Twine(abiName + " supports at most ") +
                   llvm::Twine(::llk::kMappedMaxDescriptors) + " descriptors");
       for (const workload::WorkloadPort &port : contract.ports) {
         if (port.shape.size() != 2)
-          rejectAbi(llvm::Twine("mapped ABI v1 requires rank-two ports; ") +
+          rejectAbi(llvm::Twine(abiName + " requires rank-two ports; ") +
                     describePort(port) + " has rank " +
                     llvm::Twine(port.shape.size()));
-        for (const auto &extent : port.shape)
-          if (!extent.isConstant() || extent.getConstant() <= 0) {
-            rejectAbi("mapped ABI v1 requires positive static extents; " +
+        for (const auto &extent : port.shape) {
+          if (staticExtents &&
+              (!extent.isConstant() || extent.getConstant() <= 0)) {
+            rejectAbi(abiName + " requires positive static extents; " +
                       describePort(port) + " has a nonpositive/dynamic extent");
             break;
           }
+          if (!staticExtents && extent.isConstant() &&
+              extent.getConstant() < 0) {
+            rejectAbi(abiName + " requires nonnegative extents; " +
+                      describePort(port) + " has a negative extent");
+            break;
+          }
+        }
         if (!isSupportedAbiDtype(port.elementType))
-          rejectAbi("mapped ABI v1 does not support element type '" +
+          rejectAbi(abiName + " does not support element type '" +
                     port.elementType + "' on " + describePort(port));
         using workload::PortDirection;
         using workload::PortEffect;
         if (port.direction == PortDirection::Input &&
             port.effect == PortEffect::ReadWrite)
-          rejectAbi("mapped ABI v1 requires read-only inputs; " +
+          rejectAbi(abiName + " requires read-only inputs; " +
                     describePort(port) + " is read-write");
         if (port.direction == PortDirection::Output &&
             port.effect != PortEffect::Write)
-          rejectAbi("mapped ABI v1 requires write-only outputs; " +
+          rejectAbi(abiName + " requires write-only outputs; " +
                     describePort(port) + " is not write-only");
       }
     }
@@ -457,8 +492,13 @@ describeCapabilities(mlir::Operation *kernel,
         reject(receipt.invocation, "invocation", *reason);
       }
     };
-    if (auto signature = sourceSignature(kernel))
-      checkAssociation(*signature, "source signature");
+    // A bound kernel's declared signature carries dynamic extents and no port
+    // roles; only the executable ABI records what its symbolic ports are, so
+    // it is the authoritative association for version 2.
+    bool bound = kernel && kernel->hasAttr("argument_bindings");
+    if (!bound)
+      if (auto signature = sourceSignature(kernel))
+        checkAssociation(*signature, "source signature");
     if (compilation && compilation->executable)
       checkAssociation(compilation->executable->abi(), "executable ABI");
   }
