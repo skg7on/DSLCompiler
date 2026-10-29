@@ -82,6 +82,7 @@ if(LLK_BUILD_E2E_TESTS)
   target_link_libraries(MappedInvocationTest PRIVATE LLKRuntime GTest::gtest_main
       LLK::MLIR)
   add_test(NAME MappedInvocationTest COMMAND MappedInvocationTest)
+  set_tests_properties(MappedInvocationTest PROPERTIES LABELS "Execution")
 
   add_executable(MappedAllocationLifetimeTest mapped_allocation_lifetime.cpp)
   target_link_libraries(MappedAllocationLifetimeTest PRIVATE LLKRuntime
@@ -99,6 +100,8 @@ if(LLK_BUILD_E2E_TESTS)
       GTest::gtest_main)
   add_test(NAME MappedCodegenRequirementsTest
       COMMAND MappedCodegenRequirementsTest)
+  set_tests_properties(MappedCodegenRequirementsTest PROPERTIES
+      LABELS "Execution")
 
   set(_llk_generic_elementwise_libs
       LLKMappedCompilation LLKMappedTuning LLKSourceCandidates
@@ -157,6 +160,7 @@ if(LLK_BUILD_E2E_TESTS)
   target_link_libraries(SelectedGroupLoweringTest PRIVATE LLKMappedCompilation
       LLKMapping GTest::gtest_main LLK::MLIR)
   add_test(NAME SelectedGroupLoweringTest COMMAND SelectedGroupLoweringTest)
+  set_tests_properties(SelectedGroupLoweringTest PROPERTIES LABELS "Execution")
 
   add_test(NAME RequiredExecutionEvidenceParser
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_required_execution_test.py)
