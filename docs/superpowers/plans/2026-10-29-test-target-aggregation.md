@@ -371,9 +371,10 @@ Expected: `1`.
 
 ```bash
 ctest --test-dir build --output-on-failure -L 'Conversion|Perf|Mapping' -j 1
+ctest --test-dir build --output-on-failure -R '^DynamicShapeMappingTest$'
 ```
 
-Expected: all pass. (`-j 1` avoids the known `ScheduleLoader` parallel flake; that test lives in `LLKTransformsTests` but the ordering rule is cheapest to apply here.)
+Expected: both pass. (`-j 1` avoids the known `ScheduleLoader` parallel flake; that test lives in `LLKTransformsTests` but the ordering rule is cheapest to apply here.) The second command is required because `DynamicShapeMappingTest` is registered without a `LABELS` property, so the label filter does not select it even though it is the fourth consumer of the fixture. Task 7 adds the label; until then it must be named explicitly.
 
 - [ ] **Step 8: Run the whole suite**
 
@@ -381,7 +382,7 @@ Expected: all pass. (`-j 1` avoids the known `ScheduleLoader` parallel flake; th
 ninja -C build check-llk
 ```
 
-Expected: same pass count as baseline minus the 13 duplicate `MappedAcceptance.*` entries removed in Task 2.
+Expected: the same failure set as the pre-change baseline. On a non-x86_64 host that baseline already includes the three `selected-avx2` entries (`MappedAVX2Acceptance`, `GenericElementwiseAVX2Test`, `FrameworkPrimitivesAVX2Test`) failing with "selected target requires architecture 'x86_64' but host architecture is 'aarch64'" — those binaries are built with `LLK_REQUIRE_SELECTED_TARGET` and fail rather than skip when AVX2 is absent, which is their purpose. Compare against a baseline run, not against zero failures. On x86_64 CI the whole suite passes.
 
 - [ ] **Step 9: Commit**
 
