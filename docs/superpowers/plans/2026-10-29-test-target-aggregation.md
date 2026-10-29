@@ -443,7 +443,7 @@ Title: `refactor(build): fold single-purpose test binaries into category binarie
 | `test/Mapping/CMakeLists.txt` | `DynamicShapeMappingTest` folds into `LLKMappingTests` behind an alias |
 | `test/Execution/CMakeLists.txt` | Five standalone binaries fold into `LLKExecutionTests`; one alias kept |
 
-**Alias rule used throughout this PR:** a former standalone binary keeps a CTest entry under its old name **only if** that name is referenced outside `test/CMakeLists.txt` (CI, a validation script, or a plan document). Names referenced only by the old `check-llk` list need no alias because PR 1 made that list automatic. Accepted cost: an aliased suite is registered twice (once per-case via discovery, once as the alias) and therefore runs twice.
+**Alias rule used throughout this PR:** a former standalone binary keeps its CTest entry name only if that name is referenced by CI, by `test/Execution/check_required_execution.py`, or by a plan document that is still an active execution guide. Names that appear only in older plan documents are not aliased; those documents' commands were updated where they would otherwise silently match nothing. Four names are preserved on that basis: `FrameworkSourceTest`, `DynamicShapeContractTest`, `DynamicShapeMappingTest`, and `MappedAllocationLifetimeTest`. Names referenced only by the old `check-llk` list need no alias because PR 1 made that list automatic. Accepted cost: an aliased suite is registered twice (once per-case via discovery, once as the alias) and therefore runs twice.
 
 ---
 
@@ -734,15 +734,32 @@ Ten single-purpose binaries become part of their category binary:
   `MappedCodegenRequirementsTest`, `MappedAllocationLifetimeTest`,
   `SelectedGroupLoweringTest` -> `LLKExecutionTests`
 
-Every CTest name referenced outside `test/CMakeLists.txt` is preserved as a
-filtered gate entry: `FrameworkSourceTest`, `DynamicShapeContractTest`,
-`DynamicShapeMappingTest`, and `MappedAllocationLifetimeTest` (required by
-`check_required_execution.py`). Suites without such a reference now appear as
-per-case entries via `gtest_discover_tests`.
+Four former standalone names are preserved as filtered gate entries because
+something outside `test/CMakeLists.txt` references them: `FrameworkSourceTest`
+and `DynamicShapeContractTest` (cited in
+`docs/superpowers/plans/2026-10-17-dynamic-shape-llk-microir.md`),
+`DynamicShapeMappingTest` (same plan), and `MappedAllocationLifetimeTest`
+(required by `test/Execution/check_required_execution.py`). Every other folded
+suite now appears only as per-case entries via `gtest_discover_tests`. Older plan
+documents that reference other entry names were updated where their commands
+would otherwise match nothing.
+
+`LLK_BUILD_E2E_TESTS` still gates what it gated before: the four JIT sources
+folded into `LLKExecutionTests` ride in `_llk_execution_e2e_sources`, and the
+`MappedAllocationLifetimeTest` alias is inside the same guard, so an E2E-off
+tree neither builds those tests nor registers the gate.
+
+The `DynamicMappedAcceptance` / `DynamicMappedAVX2Acceptance` pair added by
+#265 is deliberately untouched — it is a reference/selected pair and belongs to
+the follow-up that collapses those.
 
 Accepted trade-off: an aliased suite is registered twice and runs twice under
-`ctest`. That is 4 duplicated cases for `MappedAllocationLifetime` and 9 for
-`DynamicShapeMapping`.
+`ctest`, once per-case via discovery and once as the gate alias. That is 93
+duplicated cases for `FrameworkSourceTest` + `DynamicShapeContractTest`, 9 for
+`DynamicShapeMapping`, and 4 for `MappedAllocationLifetime`. The cost is the
+duplicated process launches for those repeated runs, not a longer single suite.
+
+Test executables: 29 -> 20 with `LLK_BUILD_PYTHON_CAPI=ON`, 27 -> 18 with it off.
 
 Part of #266.
 
