@@ -37,7 +37,10 @@ add_test(NAME FrameworkSourceTest COMMAND LLKTuningTests
 add_test(NAME DynamicShapeContractTest COMMAND LLKTuningTests
     --gtest_filter=ShapeContract.*)
 set_tests_properties(FrameworkSourceTest DynamicShapeContractTest
-    PROPERTIES LABELS "Tuning")
+    PROPERTIES
+        LABELS "Tuning"
+        TIMEOUT 60
+        SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
 if(LLK_BUILD_E2E_TESTS)
   add_test(NAME MappedTuneCLI

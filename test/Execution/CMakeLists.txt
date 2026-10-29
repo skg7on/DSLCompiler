@@ -56,7 +56,10 @@ add_llk_test_category(Execution
 if(LLK_BUILD_E2E_TESTS)
   add_test(NAME MappedAllocationLifetimeTest COMMAND LLKExecutionTests
       --gtest_filter=MappedAllocationLifetime.*)
-  set_tests_properties(MappedAllocationLifetimeTest PROPERTIES LABELS "Execution")
+  set_tests_properties(MappedAllocationLifetimeTest PROPERTIES
+      LABELS "mapped-reference;Execution"
+      TIMEOUT 60
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 endif()
 
 # Separate mapped binaries keep the portable and required-selected-target

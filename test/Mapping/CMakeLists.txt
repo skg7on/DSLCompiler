@@ -53,4 +53,7 @@ add_llk_test_category(Mapping
 # Historical gate name from docs/superpowers/plans/2026-10-17-dynamic-shape-llk-microir.md.
 add_test(NAME DynamicShapeMappingTest COMMAND LLKMappingTests
     --gtest_filter=DynamicShapeMapping.*)
-set_tests_properties(DynamicShapeMappingTest PROPERTIES LABELS "Mapping")
+set_tests_properties(DynamicShapeMappingTest PROPERTIES
+    LABELS "Mapping"
+    TIMEOUT 60
+    SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
