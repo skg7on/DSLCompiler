@@ -806,14 +806,21 @@ LogicalResult buildBoundedKernel(ModuleOp module, Operation *root,
     // A zero reduction must still produce zero, so the accumulator starts from
     // an explicit fill. The bounded load copies no source lane (`valid = 0`);
     // its typed padding materializes the whole tile.
+    //
+    // The empty rectangle is taken from a read-only input, never from the
+    // destination. A destination operand is a read of caller storage: the
+    // bufferizer then cannot write the result in place and materializes a
+    // whole-output temporary, which the caller-owned-output contract forbids.
+    // No lane of `lhsTensor` is read here (every valid extent is zero), so
+    // naming it does not widen the kernel's read set.
     for (size_t arm = 0; arm < rhsTensors.size(); ++arm) {
       Type zeroTileType =
           tile(accExtent, plan.outputElemType,
                /*tileLayout=*/micro::LayoutAttr(), accSpace, workerOwner);
       auto loaded = micro::TileLoadOp::create(
-          builder, loc, zeroTileType, tokenType, destinationTensor,
-          ValueRange{c0, c0}, ValueRange{c0, c0},
-          zeroOfType(builder, plan.outputElemType), accSpace, workerOwner);
+          builder, loc, zeroTileType, tokenType, lhsTensor, ValueRange{c0, c0},
+          ValueRange{c0, c0}, zeroOfType(builder, plan.outputElemType),
+          accSpace, workerOwner);
       micro::WaitOp::create(builder, loc, ValueRange{loaded.getToken()});
       Value zero = loaded.getResult();
       if (plan.outputElemType != plan.accumulatorElemType)

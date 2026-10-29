@@ -15,6 +15,7 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
+#include "llvm/TargetParser/Host.h"
 
 #include "gtest/gtest.h"
 
@@ -64,6 +65,27 @@ TEST(MappedCodegenRequirements, ChecksOptionalFmaOnlyWhenRequired) {
   features["fma"] = true;
   EXPECT_FALSE(
       static_cast<bool>(checkHostRequirements(avx2AndFma, "x86_64", features)));
+}
+
+TEST(MappedCodegenRequirements,
+     RequiredSelectedAcceptanceGateMatchesTheDeclaredRequirements) {
+  // The required selected acceptance binaries gate on `checkHostRequirements`
+  // with the AVX2 target's declared ISA contract, exactly as the runtime does
+  // before entering compiled code. This pins the gate to the shared check: a
+  // host the runtime would refuse cannot be reported as selected evidence.
+  const TargetCodegenRequirements avx2 = avx2Requirements();
+  const llvm::StringMap<bool> host = llvm::sys::getHostCPUFeatures();
+  const std::string triple = llvm::sys::getDefaultTargetTriple();
+  const llvm::StringRef architecture = llvm::StringRef(triple).split('-').first;
+
+  llvm::Error error = checkHostRequirements(avx2, architecture, host);
+  const bool admitted = !static_cast<bool>(error);
+  if (error)
+    llvm::consumeError(std::move(error));
+
+  const bool expected =
+      architecture.starts_with("x86_64") && host.lookup("avx2");
+  EXPECT_EQ(admitted, expected);
 }
 
 TEST(MappedCodegenRequirements, AppliesInvocationAttributesToTheWrapper) {

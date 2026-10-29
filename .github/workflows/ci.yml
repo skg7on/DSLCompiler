@@ -123,6 +123,9 @@ jobs:
           ./MappedAVX2Acceptance --require-selected-target \
             --gtest_filter=MappedAcceptance.* \
             --gtest_output=xml:selected-avx2-results.xml 2>&1 | tee selected-avx2.log
+          ./DynamicMappedAVX2Acceptance --require-selected-target \
+            --gtest_filter=DynamicMapped*.* \
+            --gtest_output=xml:selected-avx2-dynamic-results.xml 2>&1 | tee selected-avx2-dynamic.log
           python3 ../test/Execution/check_selected_execution_evidence.py selected-execution-evidence
 
       - name: Run tests
@@ -142,6 +145,8 @@ jobs:
             build/ctest-output.log
             build/selected-avx2-results.xml
             build/selected-avx2.log
+            build/selected-avx2-dynamic-results.xml
+            build/selected-avx2-dynamic.log
             build/selected-avx2-host.txt
             build/test/SelectedVectorWidth/selected-width-*.mlir
             build/test/SelectedVectorWidth/selected-fused.mlir

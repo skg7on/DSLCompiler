@@ -314,6 +314,27 @@ struct AVX2BackendLoweringPass
              "divisible by VW");
         return;
       }
+
+      // A dynamic extent can only be a reduction length: the shared lowering
+      // slices both operands to the runtime `valid_k` so a partial tail never
+      // becomes padded full-capacity arithmetic. AVX2 has no masked
+      // runtime-length vector reduction, and pretending the extent equals the
+      // static tile capacity would read past the slice and change the source
+      // numerical contract. Leave this contraction to the shared loop
+      // lowering, which keeps exact-K semantics; the decision is reported
+      // rather than silently taken, and every static contraction still takes
+      // the native path below.
+      auto lhsType =
+          dyn_cast<RankedTensorType>(matmul.getInputs()[0].getType());
+      if (!lhsType || lhsType.getRank() != 2)
+        return fail("selected contraction needs rank-two operands");
+      if (lhsType.isDynamicDim(1)) {
+        matmul.emitRemark()
+            << "runtime reduction length: the selected vector contraction "
+               "leaves exact-K reduction to the shared loop lowering";
+        continue;
+      }
+
       SmallVector<int64_t> tileSizes{1, *width, 0};
       linalg::LinalgTilingOptions tiling;
       tiling.setTileSizes(tileSizes);
@@ -324,7 +345,6 @@ struct AVX2BackendLoweringPass
         fail("Linalg matmul tiling failed for the selected vector width");
         return;
       }
-      auto lhsType = cast<RankedTensorType>(matmul.getInputs()[0].getType());
       SmallVector<int64_t> vectorSizes{1, *width, lhsType.getShape()[1]};
       SmallVector<bool> scalableVecDims(3, false);
       FailureOr<linalg::VectorizationResult> vectorized = linalg::vectorize(
