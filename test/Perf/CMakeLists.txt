@@ -1,6 +1,6 @@
 add_llk_test_category(Perf
     SOURCES
-        ../Mapping/resource_regression_fixture.cpp
+        $<TARGET_OBJECTS:LLKTestFixtures>
         measurement_record.cpp
         prediction_validation.cpp
         op_dag_builders.cpp

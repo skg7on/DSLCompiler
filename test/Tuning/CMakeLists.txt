@@ -8,6 +8,7 @@ target_link_libraries(FrameworkSourceTest PRIVATE LLKWorkloadContracts
 target_compile_definitions(FrameworkSourceTest PRIVATE
     LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 add_test(NAME FrameworkSourceTest COMMAND FrameworkSourceTest)
+set_tests_properties(FrameworkSourceTest PROPERTIES LABELS "Tuning")
 
 # Symbolic shape data, checked binding and the versioned workload contract.
 # This target needs no JIT or E2E guard: it exercises data and MLIR attribute
@@ -17,6 +18,7 @@ target_link_libraries(DynamicShapeContractTest PRIVATE LLKShape
     LLKWorkloadContracts LLKKernel LLKDialect MicroDialect
     GTest::gtest_main LLK::MLIR)
 add_test(NAME DynamicShapeContractTest COMMAND DynamicShapeContractTest)
+set_tests_properties(DynamicShapeContractTest PROPERTIES LABELS "Tuning")
 
 if(LLK_BUILD_E2E_TESTS)
   add_executable(MappedTuningSessionTest mapped_tuning_session.cpp)
@@ -25,6 +27,7 @@ if(LLK_BUILD_E2E_TESTS)
   target_compile_definitions(MappedTuningSessionTest PRIVATE
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME MappedTuningSessionTest COMMAND MappedTuningSessionTest)
+  set_tests_properties(MappedTuningSessionTest PROPERTIES LABELS "Tuning")
 
   add_executable(CandidateInstantiationTest candidate_instantiation.cpp)
   target_link_libraries(CandidateInstantiationTest PRIVATE LLKToMicro
@@ -33,6 +36,7 @@ if(LLK_BUILD_E2E_TESTS)
   target_compile_definitions(CandidateInstantiationTest PRIVATE
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME CandidateInstantiationTest COMMAND CandidateInstantiationTest)
+  set_tests_properties(CandidateInstantiationTest PROPERTIES LABELS "Tuning")
 
   add_test(NAME MappedTuneCLI
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/mapped_tune_cli.py

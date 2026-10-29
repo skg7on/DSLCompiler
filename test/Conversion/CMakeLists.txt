@@ -8,7 +8,7 @@ add_llk_test_category(Conversion
         framework_capabilities.cpp
         framework_conformance.cpp
         framework_target_portability.cpp
-        ../Mapping/resource_regression_fixture.cpp
+        $<TARGET_OBJECTS:LLKTestFixtures>
     LIBRARIES
         LLKKernel
         LLKMappedCompilation

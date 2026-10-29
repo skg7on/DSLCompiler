@@ -4,7 +4,7 @@
 # reuse the issue #129 resource fixtures without joining that category's binary.
 add_executable(DynamicShapeMappingTest
     dynamic_shape_mapping.cpp
-    resource_regression_fixture.cpp
+    $<TARGET_OBJECTS:LLKTestFixtures>
 )
 target_link_libraries(DynamicShapeMappingTest PRIVATE
     LLKMapping
@@ -54,7 +54,7 @@ add_llk_test_category(Mapping
         plan_report.cpp
         properties.cpp
         exact_resource_oracle.cpp
-        resource_regression_fixture.cpp
+        $<TARGET_OBJECTS:LLKTestFixtures>
         storage_liveness.cpp
     LIBRARIES
         LLKMapping
