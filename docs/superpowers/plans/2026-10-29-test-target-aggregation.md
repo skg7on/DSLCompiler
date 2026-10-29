@@ -20,16 +20,19 @@
 - Every task ends with `ninja check-llk` green (or its documented equivalent) before committing.
 - Commit messages end with the project's Claude Code attribution line.
 
-## Baseline facts (measured 2026-10-29 on `main` @ `1a20d69`)
+## Baseline facts (re-measured 2026-10-29 on `main` @ `02e7e25`, after PR 1 and #265 merged)
 
 | Fact | Value |
 |---|---|
-| Test executables | 27 (10 category + 17 standalone) |
-| Registered CTest cases | 1,505 |
-| Binaries in `build/bin` | 23, ~300 MB |
-| `MappedAcceptance.*` registrations | 14 (13 discovered via `LLKExecutionTests` + 1 named entry) |
-| `resource_regression_fixture.cpp` compiles | 4 (`Conversion`, `Perf`, `Mapping`, `DynamicShapeMappingTest`) |
-| Binaries missing from `check-llk` deps | 5 |
+| Test executables | 29 (10 category + 19 standalone), 27 with `LLK_BUILD_PYTHON_CAPI=OFF` |
+| `MappedAcceptance.*` registrations | 1 suite entry (PR 1 removed the 13 duplicate per-case entries) |
+| `resource_regression_fixture.cpp` compiles | 1 (PR 1's `LLKTestFixtures` OBJECT library) |
+| Binaries missing from `check-llk` deps | 0 (PR 1 derives the set from the directory graph) |
+| Reference/selected pairs | 4: `MappedAcceptance`, `GenericElementwise`, `FrameworkPrimitives`, `DynamicMappedAcceptance` |
+
+The figures recorded for `main` @ `1a20d69` (27 executables, 1,505 CTest cases, 4 fixture compiles, 5 missing dependencies) describe the state PR 1 fixed; they are kept in the PR 1 sections as the "before" side of those tasks and are no longer the branch baseline.
+
+`#265` added a fourth reference/selected pair, `DynamicMappedAcceptance` / `DynamicMappedAVX2Acceptance`, built from `test/Execution/dynamic_mapped_acceptance.cpp` with the same `LLK_REQUIRE_SELECTED_TARGET` macro and custom `main` as the other three. It belongs to PR 3, not PR 2. `#265` also changed `test/Execution/check_selected_target_flag.py` to check **two** pairs (2 or 4 positional arguments) and added a second CI invocation of `./DynamicMappedAVX2Acceptance`.
 
 Cases per standalone source (needed to size the alias duplication in PR 2): `mapped_allocation_lifetime.cpp` 4, `dynamic_mapped_invocation.cpp` 13, `mapped_invocation.cpp` 7, `mapped_codegen_requirements.cpp` 5, `selected_group_lowering.cpp` 5, `dynamic_shape_mapping.cpp` 9.
 
@@ -650,7 +653,7 @@ Remove these blocks from `test/Execution/CMakeLists.txt`:
 - `add_executable(SelectedGroupLoweringTest ...)` through its `add_test` (lines 157-160)
 - `add_executable(DynamicMappedInvocationTest ...)` through `set_tests_properties(...)` (lines 186-193)
 
-Keep `MappedAcceptance`, `MappedAVX2Acceptance`, `GenericElementwise*`, and `FrameworkPrimitives*` untouched; PR 3 handles those.
+Keep `MappedAcceptance`, `MappedAVX2Acceptance`, `DynamicMappedAcceptance`, `DynamicMappedAVX2Acceptance`, `GenericElementwise*`, and `FrameworkPrimitives*` untouched; PR 3 handles those. `DynamicMappedAcceptance` is the reference half of the pair added by #265 — do not fold it into the category binary, because PR 3 collapses it with its selected half.
 
 - [ ] **Step 5: Re-add the one required gate name**
 
@@ -902,13 +905,11 @@ def run(binary, *arguments, env=None):
     )
 
 
-def main():
-    binary = sys.argv[1]
-
+def check_pair(binary, suite, gtest_filter):
     reference = run(binary, "--gtest_list_tests",
                     env={"LLK_TEST_DISABLE_AVX2": "1"})
     assert reference.returncode == 0, reference.stderr
-    assert "MappedAcceptance." in reference.stdout
+    assert suite in reference.stdout
 
     required = run(binary, "--require-selected-target", "--gtest_list_tests")
     assert required.returncode == 0, required.stderr
@@ -916,7 +917,7 @@ def main():
     unsupported = run(
         binary,
         "--require-selected-target",
-        "--gtest_filter=MappedAcceptance.SelectedAvx2BackendExecutesNumerically",
+        f"--gtest_filter={gtest_filter}",
         env={"LLK_TEST_DISABLE_AVX2": "1"},
     )
     assert unsupported.returncode != 0, (
@@ -927,9 +928,27 @@ def main():
     )
 
 
+def main():
+    arguments = sys.argv[1:]
+    assert len(arguments) in (1, 2), "expected one or two collapsed binaries"
+    check_pair(
+        arguments[0],
+        "MappedAcceptance.",
+        "MappedAcceptance.SelectedAvx2BackendExecutesNumerically",
+    )
+    if len(arguments) == 2:
+        check_pair(
+            arguments[1],
+            "DynamicMappedAcceptance.",
+            "DynamicMappedAcceptance.CompilesOnceAndExecutesUnrelatedMatmulShapes",
+        )
+
+
 if __name__ == "__main__":
     main()
 ```
+
+Each argument is now **one** binary serving both modes. The second `check_pair` call is dormant until Task 13 collapses the `DynamicMappedAcceptance` pair; passing that pair here before then would fail, because its reference half rejects `--require-selected-target` by design.
 
 - [ ] **Step 6: Update the CMake invocation of the contract test**
 
@@ -942,24 +961,28 @@ In `test/Execution/CMakeLists.txt`, change the `SelectedTargetFlagContract` test
   set_tests_properties(SelectedTargetFlagContract PROPERTIES LABELS "selected-avx2")
 ```
 
+Before #265 this test passed four paths (two pairs). Task 10 drops it to one binary because the `DynamicMappedAcceptance` pair has not been collapsed yet and its reference half rejects the flag. Task 13 restores the second argument. The gap exists only between those two commits in this PR, and the merged state checks both pairs.
+
 - [ ] **Step 7: Update CI**
 
-In `.github/workflows/ci.yml`, change line 123 from `./MappedAVX2Acceptance --require-selected-target \` to:
+In `.github/workflows/ci.yml`, in the step "Run selected AVX2 acceptance", change the first invocation `./MappedAVX2Acceptance --require-selected-target \` to:
 
 ```yaml
           ./MappedAcceptance --require-selected-target \
 ```
 
+Leave the second invocation, `./DynamicMappedAVX2Acceptance --require-selected-target \`, untouched — Task 13 changes it.
+
 - [ ] **Step 8: Verify**
 
 ```bash
 cmake -S . -B build -GNinja -DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build
-ninja -C build -t targets all | grep -c 'MappedAVX2Acceptance'
+ninja -C build -t targets all | grep -c 'CXX_EXECUTABLE_LINKER__MappedAVX2Acceptance_'
 ninja -C build MappedAcceptance
 ctest --test-dir build --output-on-failure -R 'MappedAcceptance|SelectedTargetFlagContract'
 ```
 
-Expected: `0`, then PASS for both entries and the contract test.
+Expected: `0`, then PASS for both entries and the contract test. Do not grep for the bare name `MappedAVX2Acceptance`: it also matches `DynamicMappedAVX2Acceptance`, `cmake_object_order_depends_target_*` rules, and `.o` targets.
 
 - [ ] **Step 9: Commit**
 
@@ -1116,7 +1139,198 @@ git commit -m "refactor(build): serve both framework primitives gates from one b
 
 ---
 
-### Task 13: Full suite and PR 3
+### Task 13: Collapse the `DynamicMappedAcceptance` pair
+
+**Files:**
+- Modify: `test/Execution/dynamic_mapped_acceptance.cpp` (macro sites at 127, 162, 1269, and `main` at 1623)
+- Modify: `test/Execution/CMakeLists.txt:170-193`
+- Modify: `test/Execution/check_selected_target_flag.py` (the second `check_pair` call becomes live)
+- Modify: `.github/workflows/ci.yml` (the second invocation in "Run selected AVX2 acceptance")
+
+**Interfaces:**
+- Consumes: the runtime switch established in Task 10 and the `check_pair(binary, suite, gtest_filter)` signature.
+- Produces: one `DynamicMappedAcceptance` binary; CTest entries `DynamicMappedAcceptance` and `DynamicMappedAVX2Acceptance`.
+
+`#265` added this pair after the plan was written, so it is the same transformation as Task 10 with one structural difference: the two cases in suite `DynamicMappedSelected` are declared **inside** `#ifdef LLK_REQUIRE_SELECTED_TARGET`, so in the reference binary they do not exist at all. After the collapse they always exist and must skip instead of fail when the flag is absent.
+
+- [ ] **Step 1: Write the failing check**
+
+```bash
+ninja -C build -t targets all | grep -c 'CXX_EXECUTABLE_LINKER__DynamicMappedAVX2Acceptance_'
+```
+
+Expected before: `1`. After: `0`.
+
+- [ ] **Step 2: Replace the default-backend constant**
+
+At `test/Execution/dynamic_mapped_acceptance.cpp:162-166` the backend is chosen at compile time:
+
+```cpp
+#ifdef LLK_REQUIRE_SELECTED_TARGET
+constexpr llk::MappedBackend kDefaultBackend =
+    llk::MappedBackend::SelectedTarget;
+#else
+constexpr llk::MappedBackend kDefaultBackend = llk::MappedBackend::Reference;
+#endif
+```
+
+Replace it with a mutable global set from `argv` during `main`, declared before its first use:
+
+```cpp
+namespace {
+/// Set from --require-selected-target. One binary serves the reference and the
+/// required-AVX2 gates.
+bool requireSelectedTarget = false;
+} // namespace
+
+llk::MappedBackend defaultBackend() {
+  return requireSelectedTarget ? llk::MappedBackend::SelectedTarget
+                               : llk::MappedBackend::Reference;
+}
+```
+
+Then replace every read of `kDefaultBackend` with a call to `defaultBackend()`.
+
+- [ ] **Step 3: Make the helper functions unconditional**
+
+Delete the `#ifdef LLK_REQUIRE_SELECTED_TARGET` / `#endif` pair around `avx2DisabledByTestOverride()` and the `selectedAvx2Available()` block at lines 127-160. Both are host feature queries, not selected-mode behaviour, and the reference binary needs them to decide skip-vs-run once the selected cases exist in it.
+
+- [ ] **Step 4: Make the `DynamicMappedSelected` suite unconditional**
+
+Remove the `#ifdef LLK_REQUIRE_SELECTED_TARGET` / `#endif` at lines 1269-1290 and change each of the two cases to skip instead of fail when selected mode is not requested:
+
+```cpp
+TEST(DynamicMappedSelected, SelectedAvx2ExecutesCompileOnceDynamicAcceptance) {
+  if (!selectedAvx2Available()) {
+    if (requireSelectedTarget) {
+      if (avx2DisabledByTestOverride())
+        FAIL() << "test override disabled required selected AVX2 execution";
+      else
+        FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+    } else {
+      GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
+    }
+  }
+  ...
+```
+
+Apply the same guard shape to the second `DynamicMappedSelected` case.
+
+- [ ] **Step 5: Simplify `main`**
+
+In `main` (line 1623), keep the `--require-selected-target` parsing loop but delete both compile-time branches that follow it. The runtime contract becomes:
+
+```cpp
+int main(int argc, char **argv) {
+  for (int index = 1; index < argc;) {
+    if (std::strcmp(argv[index], "--require-selected-target") == 0) {
+      requireSelectedTarget = true;
+      for (int move = index; move + 1 < argc; ++move)
+        argv[move] = argv[move + 1];
+      --argc;
+      continue;
+    }
+    ++index;
+  }
+
+  // A required selected run on a host that cannot execute AVX2 is a failure,
+  // never a skip. Listing tests runs nothing, so it stays host-independent.
+  if (requireSelectedTarget) {
+    bool listingTests = false;
+    for (int index = 1; index < argc; ++index)
+      listingTests |= std::strcmp(argv[index], "--gtest_list_tests") == 0;
+    if (!listingTests && !selectedAvx2Available()) {
+      if (avx2DisabledByTestOverride())
+        std::fprintf(stderr,
+                     "test override disabled required selected AVX2 execution\n");
+      else
+        std::fprintf(
+            stderr,
+            "required selected AVX2 execution needs an x86_64 AVX2 host\n");
+      return 1;
+    }
+  }
+
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
+```
+
+- [ ] **Step 6: Replace the two CMake targets with one**
+
+In `test/Execution/CMakeLists.txt`, replace the two blocks at lines 170-193 with:
+
+```cmake
+  add_executable(DynamicMappedAcceptance dynamic_mapped_acceptance.cpp)
+  target_link_libraries(DynamicMappedAcceptance PRIVATE
+      ${_llk_dynamic_acceptance_libs})
+  target_compile_definitions(DynamicMappedAcceptance PRIVATE
+      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  set_target_properties(DynamicMappedAcceptance PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_test(NAME DynamicMappedAcceptance COMMAND DynamicMappedAcceptance
+      --gtest_filter=DynamicMappedAcceptance.*)
+  set_tests_properties(DynamicMappedAcceptance PROPERTIES
+      LABELS "mapped-reference"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
+  add_test(NAME DynamicMappedAVX2Acceptance COMMAND DynamicMappedAcceptance
+      --require-selected-target --gtest_filter=DynamicMapped*.*)
+  set_tests_properties(DynamicMappedAVX2Acceptance PROPERTIES
+      LABELS "selected-avx2")
+```
+
+The reference entry now filters `DynamicMappedAcceptance.*` rather than running the whole binary, because the binary always contains the `DynamicMappedSelected` suite; those cases would otherwise run in reference mode where the previous reference binary did not have them at all.
+
+- [ ] **Step 7: Restore the second pair in the contract test**
+
+In `test/Execution/CMakeLists.txt`, change the `SelectedTargetFlagContract` invocation back to two arguments:
+
+```cmake
+  add_test(NAME SelectedTargetFlagContract
+      COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_selected_target_flag.py
+          $<TARGET_FILE:MappedAcceptance> $<TARGET_FILE:DynamicMappedAcceptance>)
+```
+
+The `check_pair` call for the second argument is already present in the script from Task 10.
+
+- [ ] **Step 8: Update CI**
+
+In `.github/workflows/ci.yml`, in the step "Run selected AVX2 acceptance", change the second invocation from `./DynamicMappedAVX2Acceptance --require-selected-target \` to:
+
+```yaml
+          ./DynamicMappedAcceptance --require-selected-target \
+```
+
+- [ ] **Step 9: Verify**
+
+```bash
+cmake -S . -B build -GNinja -DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build
+ninja -C build DynamicMappedAcceptance
+ninja -C build -t targets all | grep -c 'CXX_EXECUTABLE_LINKER__DynamicMappedAVX2Acceptance_'
+ctest --test-dir build --output-on-failure -R 'DynamicMapped|SelectedTargetFlagContract'
+```
+
+Expected: `0`, then PASS for `DynamicMappedAcceptance`, Skipped or Passed for `DynamicMappedAVX2Acceptance` depending on host (exit 0 either way is not expected on aarch64 — the required entry fails by design there), and PASS for `SelectedTargetFlagContract`.
+
+- [ ] **Step 10: Confirm no macro references remain**
+
+```bash
+grep -rn 'LLK_REQUIRE_SELECTED_TARGET' test/ || echo "none"
+```
+
+Expected: `none`.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add test/Execution/dynamic_mapped_acceptance.cpp test/Execution/CMakeLists.txt \
+        test/Execution/check_selected_target_flag.py .github/workflows/ci.yml
+git commit -m "refactor(build): serve both dynamic acceptance gates from one binary"
+```
+
+---
+
+### Task 14: Full suite and PR 3
 
 - [ ] **Step 1: Full clean verification**
 
@@ -1132,7 +1346,9 @@ Expected: all pass, documented JIT skips unchanged.
 ninja -C build -t targets all | grep -cE 'CXX_EXECUTABLE_LINKER__([A-Za-z0-9]*Tests|[A-Za-z0-9]*Test|MappedAcceptance)_'
 ```
 
-Expected: `15` with `LLK_BUILD_PYTHON_CAPI=ON` — `LLKBenchmarkTests`, `LLKCAPITests`, `LLKConversionTests`, `LLKExecutionTests`, `LLKFrontendTests`, `LLKMachineTests`, `LLKMappingTests`, `LLKNumericalTests`, `LLKPerfTests`, `LLKTransformsTests`, `LLKTuningTests`, `LLKCAPIFrontendTests`, `GenericElementwiseTest`, `FrameworkPrimitivesTest`, `MappedAcceptance`. With `LLK_BUILD_PYTHON_CAPI=OFF` (the default) the CAPI pair is absent and the count is `13`.
+Expected: `16` with `LLK_BUILD_PYTHON_CAPI=ON` — `LLKBenchmarkTests`, `LLKCAPITests`, `LLKConversionTests`, `LLKExecutionTests`, `LLKFrontendTests`, `LLKMachineTests`, `LLKMappingTests`, `LLKNumericalTests`, `LLKPerfTests`, `LLKTransformsTests`, `LLKTuningTests`, `LLKCAPIFrontendTests`, `GenericElementwiseTest`, `FrameworkPrimitivesTest`, `MappedAcceptance`, `DynamicMappedAcceptance`. With `LLK_BUILD_PYTHON_CAPI=OFF` (the default) the CAPI pair is absent and the count is `14`.
+
+The count went up by one relative to the original plan because `#265` added a fourth reference/selected pair; the reduction is still 29 → 16 (29 → 14 with CAPI off).
 
 - [ ] **Step 3: Confirm the evidence contract still holds**
 
@@ -1151,16 +1367,17 @@ gh pr create --title "refactor(build): collapse reference and selected-target te
 `LLK_REQUIRE_SELECTED_TARGET` selected the backend at compile time, so each
 reference/selected pair was built twice from the same source:
 `MappedAcceptance`/`MappedAVX2Acceptance`, `GenericElementwise{,AVX2}Test`,
-`FrameworkPrimitives{,AVX2}Test`.
+`FrameworkPrimitives{,AVX2}Test`, and — added by #265 —
+`DynamicMappedAcceptance`/`DynamicMappedAVX2Acceptance`.
 
 The binaries already parsed `--require-selected-target`; the macro only supplied
 a default and chose skip-vs-fail. It is now a process global set from `argv`, so
 one binary serves both CTest entries per pair.
 
-CI changes from `./MappedAVX2Acceptance` to
-`./MappedAcceptance --require-selected-target`. `check_selected_target_flag.py`
-now proves the required mode enforces AVX2 by running one binary twice with
-`LLK_TEST_DISABLE_AVX2=1`.
+CI runs `./MappedAcceptance` and `./DynamicMappedAcceptance` with
+`--require-selected-target` instead of the two `*AVX2Acceptance` binaries.
+`check_selected_target_flag.py` now proves the required mode enforces AVX2 by
+running each collapsed binary twice with `LLK_TEST_DISABLE_AVX2=1`.
 
 CTest names are unchanged: `MappedAcceptance`, `MappedAVX2Acceptance`,
 `GenericElementwiseTest`, `GenericElementwiseAVX2Test`,
