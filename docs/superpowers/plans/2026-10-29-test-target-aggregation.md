@@ -38,7 +38,7 @@ Cases per standalone source (needed to size the alias duplication in PR 2): `map
 # PR 1 — `refactor(build): register test targets automatically and share test fixtures`
 
 Branch: `refactor/test-target-aggregation-pass01`
-Title: `refactor(build): register every test target with check-llk and compile the mapping fixture once`
+Title: `refactor(build): auto-register check-llk test deps and share fixtures`
 
 ## File Structure
 
@@ -137,7 +137,7 @@ cmake -S . -B build -GNinja -DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Pro
 ninja -C build -t query test/check-llk | grep -cE 'GenericElementwiseTest|GenericElementwiseAVX2Test|FrameworkPrimitivesTest|FrameworkPrimitivesAVX2Test|DynamicShapeContractTest'
 ```
 
-Expected: `5`. The pattern must name all five binaries. A pattern naming only the three non-AVX2 names also matches their AVX2 siblings as substrings, so it would print `3` and look like a failure.
+Expected: `5` when `LLK_BUILD_E2E_TESTS=ON` (the default). If the configure used `-DLLK_BUILD_E2E_TESTS=OFF`, this is `1` and that is correct: `GenericElementwise{,AVX2}Test` and `FrameworkPrimitives{,AVX2}Test` are declared inside `if(LLK_BUILD_E2E_TESTS)`, so only `DynamicShapeContractTest` remains. The pattern must name all five binaries. A pattern naming only the three non-AVX2 names also matches their AVX2 siblings as substrings, so it would print `3` and look like a failure.
 
 - [ ] **Step 6: Verify the tool subset still resolves**
 
@@ -209,7 +209,7 @@ ninja -C build LLKExecutionTests MappedAcceptance MappedAVX2Acceptance
 ctest --test-dir build -R '^MappedAcceptance$' --output-on-failure
 ```
 
-Expected: PASS (skips the `SelectedAvx2*` cases on a non-AVX2 host).
+Expected: the entry reports **Skipped** on a host without AVX2 — the `SelectedAvx2*` cases skip, and `SKIP_REGULAR_EXPRESSION` makes CTest report the entry as Skipped — with exit code 0, and **Passed** on an x86_64 host with AVX2.
 
 - [ ] **Step 5: Commit**
 
@@ -399,8 +399,8 @@ git commit -m "refactor(build): compile the mapping regression fixture once"
 
 ```bash
 git push -u origin refactor/test-target-aggregation-pass01
-gh pr create --title "refactor(build): register every test target with check-llk and compile the mapping fixture once" --body "$(cat <<'EOF'
-Three build-hygiene fixes in `test/`:
+gh pr create --title "refactor(build): auto-register check-llk test deps and share fixtures" --body "$(cat <<'EOF'
+Four build-hygiene fixes in `test/`:
 
 - `check-llk` now derives its dependencies from the CMake directory graph
   instead of a hand-maintained list. Five binaries
@@ -408,14 +408,14 @@ Three build-hygiene fixes in `test/`:
   `DynamicShapeContractTest`) were missing from that list, so `ninja check-llk`
   could run without building them.
 - `mapped_acceptance.cpp` was compiled into `LLKExecutionTests` as well as its
-  own binary, registering 13 cases twice. The category binary no longer
+  own binary, so each of its 13 cases ran twice. The category binary no longer
   includes it.
 - `resource_regression_fixture.cpp` is now an `OBJECT` library compiled once
   instead of four times (Conversion, Perf, Mapping, DynamicShapeMappingTest).
 - The four Tuning binaries and three unlabelled Execution binaries now carry
   category labels.
 
-No test behavior changes; every CTest name is preserved.
+Each of the 13 `MappedAcceptance.*` cases folds from its own CTest entry into the single named `MappedAcceptance` entry; every externally referenced CTest name is preserved.
 
 Part of #266.
 
@@ -1177,7 +1177,7 @@ EOF
 
 ## Self-review
 
-**Spec coverage.** F1 → Task 1. F2 → Task 2. F3 → Tasks 3 and 6. F4 → Task 4. F5 → Tasks 10-12. F6 (mixed `python3` vs `find_package(Python3)`) is deliberately **out of scope**: it is unrelated to aggregation and would add churn to three PRs. Recorded here so it is not silently dropped.
+**Spec coverage.** F1 → Task 1. F2 → Task 2. F3 → Tasks 3 and 6. F4 → Task 4. F5 → Tasks 10-12. F6 → Tasks 7 and 8. F7 (mixed `python3` versus `find_package(Python3)`) is deliberately **out of scope**: it is unrelated to aggregation and would add churn to three PRs. Recorded here so it is not silently dropped.
 
 **Placeholder scan.** No `TBD`, no "similar to Task N" without code. Task 11 Step 2 and Task 12 Step 2 reference Task 10 Step 2's transformation, but the exact `main` bodies are reproduced in each task so each can be read standalone; the guarded sites differ per file and are listed by line number.
 
