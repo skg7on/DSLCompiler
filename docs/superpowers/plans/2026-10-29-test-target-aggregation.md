@@ -8,7 +8,7 @@
 
 **Tech Stack:** CMake 3.20, Ninja, GoogleTest via `gtest_discover_tests`, CTest, GitHub Actions.
 
-**Spec:** This plan implements the review findings recorded in the session of 2026-10-29 (F1-F6 in "Review: `test/` CMake build"). No separate spec document exists; the findings are restated verbatim in the Global Constraints section below.
+**Spec:** Issue #266, which records the review findings (F1-F7) that this plan implements. No separate spec document exists; the findings are restated in the Global Constraints section below.
 
 ## Global Constraints
 
@@ -416,6 +416,8 @@ Three build-hygiene fixes in `test/`:
 
 No test behavior changes; every CTest name is preserved.
 
+Part of #266.
+
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
 )"
@@ -737,6 +739,8 @@ per-case entries via `gtest_discover_tests`.
 Accepted trade-off: an aliased suite is registered twice and runs twice under
 `ctest`. That is 4 duplicated cases for `MappedAllocationLifetime` and 9 for
 `DynamicShapeMapping`.
+
+Part of #266.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
@@ -1160,6 +1164,8 @@ now proves the required mode enforces AVX2 by running one binary twice with
 CTest names are unchanged: `MappedAcceptance`, `MappedAVX2Acceptance`,
 `GenericElementwiseTest`, `GenericElementwiseAVX2Test`,
 `FrameworkPrimitivesTest`, `FrameworkPrimitivesAVX2Test`.
+
+Fixes #266.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 EOF
