@@ -3,7 +3,6 @@ set(_llk_execution_jit_sources
       swiglu_scalar.cpp
       triton_swiglu_staged.cpp
       swiglu_vector_avx2.cpp
-      mapped_acceptance.cpp
       micro_kernel_execution.cpp
       swiglu_fused_memory.cpp)
 
