@@ -48,43 +48,58 @@ struct ScheduleSelectionPass
   void runOnOperation() override {
     llk::LLKKernelRegistry registry;
     llk::populateLLKKernelLowerings(registry);
-    getOperation().walk([&](Operation *op) {
-      if (op->getName().getDialectNamespace() != "llk")
-        return;
-      auto *entry = registry.lookup(op->getName().getStringRef());
-      if (!entry)
-        return;
-      llk::KernelContract contract;
-      if (failed(entry->inferContract(op, contract)))
-        return;
-      if (contract.mBucket < 0) {
-        op->emitWarning() << "Cannot select schedule for dynamic shape";
-        return;
-      }
-      StringRef opName = contract.workload;
-      int64_t N = contract.N, K = contract.K;
-      int bucket = contract.mBucket;
+    getOperation().walk(
+        [&](Operation *op) {
+          if (op->getName().getDialectNamespace() != "llk")
+            return;
+          auto *entry = registry.lookup(op->getName().getStringRef());
+          if (!entry)
+            return;
+          llk::KernelContract contract;
+          if (failed(entry->inferContract(op, contract)))
+            return;
+          // A symbolic axis has no M bucket and no fixed-shape entry can be proven
+          // legal for its domain. Selection is explicit -- the bounded baseline --
+          // rather than a database lookup keyed on unknown extents. The contract
+          // reports an unknown axis with MLIR's dynamic sentinel; it is a
+          // dispatch fact here, never a shape.
+          const bool dynamic = contract.mBucket < 0 ||
+                               ShapedType::isDynamic(contract.N) ||
+                               ShapedType::isDynamic(contract.K);
+          if (dynamic) {
+            llk::ScheduleEntry baseline = llk::selectBoundedBaselineSchedule();
+            op->emitRemark()
+                << "dynamic contraction dimensions: using the bounded baseline "
+                   "schedule (BM="
+                << baseline.BM << ", BN=" << baseline.BN
+                << ", BK=" << baseline.BK
+                << ", tail_policy=" << baseline.tail_policy << ")";
+            return;
+          }
+          StringRef opName = contract.workload;
+          int64_t N = contract.N, K = contract.K;
+          int bucket = contract.mBucket;
 
-      auto matches =
-          loadScheduleDB("schedules/schedule_db.json", bucket, N, K, opName);
+          auto matches = loadScheduleDB("schedules/schedule_db.json", bucket, N,
+                                        K, opName);
 
-      if (matches.empty()) {
-        op->emitWarning() << "No schedule entry for " << opName
-                          << " M_bucket=" << bucket
-                          << " in schedules/schedule_db.json; using fallback";
-      }
+          if (matches.empty()) {
+            op->emitWarning()
+                << "No schedule entry for " << opName << " M_bucket=" << bucket
+                << " in schedules/schedule_db.json; using fallback";
+          }
 
-      ScheduleEntry selected = selectBestSchedule(matches, N, K);
+          ScheduleEntry selected = selectBestSchedule(matches, N, K);
 
-      op->emitRemark() << "selected schedule for " << opName
-                       << ": BM=" << selected.BM << " BN=" << selected.BN
-                       << " BK=" << selected.BK << " VM=" << selected.VM
-                       << " VN=" << selected.VN
-                       << " threads=" << selected.num_threads
-                       << " grain=" << selected.grain_size
-                       << " axis=" << selected.parallel_axis
-                       << " (M_bucket=" << bucket << ")";
-    });
+          op->emitRemark() << "selected schedule for " << opName
+                           << ": BM=" << selected.BM << " BN=" << selected.BN
+                           << " BK=" << selected.BK << " VM=" << selected.VM
+                           << " VN=" << selected.VN
+                           << " threads=" << selected.num_threads
+                           << " grain=" << selected.grain_size
+                           << " axis=" << selected.parallel_axis
+                           << " (M_bucket=" << bucket << ")";
+        });
   }
 };
 

@@ -158,7 +158,12 @@ public:
     }
     f.armCount = 1;
     f.hasOutputInit = true;
+    f.lhsOperandType = root->getOperand(0).getType();
     f.rhsOperandTypes = {root->getOperand(1).getType()};
+    // Matmul reads its initializer; the caller-owned destination is the
+    // result, which is a separate output port.
+    f.initOperandType = root->getOperand(2).getType();
+    f.destinationOperandType = root->getResult(0).getType();
     f.buildEpilogue = [](OpBuilder &, Location, ArrayRef<Value> acc) {
       return acc[0];
     };

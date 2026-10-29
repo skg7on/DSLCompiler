@@ -60,23 +60,28 @@ LogicalResult lowerSwiGLU(OpBuilder &builder, mlir::llk::FusedSwiGLUOp op) {
   int64_t M = xType.getDimSize(0);
   int64_t N = wgType.getDimSize(1);
 
-  if (ShapedType::isDynamic(M) || ShapedType::isDynamic(N)) {
-    op.emitError("SwiGLU requires static shapes");
-    return failure();
-  }
-
   llk::MathMode mode = op.getMathMode();
 
   auto bf16Type = builder.getBF16Type();
   auto f32Type = builder.getF32Type();
   auto gateUpType = RankedTensorType::get({M, N}, bf16Type);
 
+  // A dynamic extent is never fabricated: the conversion tensors are sized
+  // from the source's own runtime dimensions, so the arithmetic and
+  // math-mode semantics below are the same for a known and an unknown M or N.
+  SmallVector<Value> dynamicSizes;
+  if (ShapedType::isDynamic(M))
+    dynamicSizes.push_back(tensor::DimOp::create(builder, loc, x, /*index=*/0));
+  if (ShapedType::isDynamic(N))
+    dynamicSizes.push_back(
+        tensor::DimOp::create(builder, loc, wg, /*index=*/1));
+
   Value bf16Zero = arith::ConstantOp::create(
       builder, loc, bf16Type, builder.getFloatAttr(bf16Type, 0.0));
 
   // Gate projection: X @ Wg
   Value gateInit =
-      tensor::EmptyOp::create(builder, loc, gateUpType, ValueRange{});
+      tensor::EmptyOp::create(builder, loc, gateUpType, dynamicSizes);
   Value gateFilled = linalg::FillOp::create(builder, loc, ValueRange{bf16Zero},
                                             ValueRange{gateInit})
                          .getResult(0);
@@ -86,7 +91,7 @@ LogicalResult lowerSwiGLU(OpBuilder &builder, mlir::llk::FusedSwiGLUOp op) {
 
   // Up projection: X @ Wu
   Value upInit =
-      tensor::EmptyOp::create(builder, loc, gateUpType, ValueRange{});
+      tensor::EmptyOp::create(builder, loc, gateUpType, dynamicSizes);
   Value upFilled = linalg::FillOp::create(builder, loc, ValueRange{bf16Zero},
                                           ValueRange{upInit})
                        .getResult(0);
@@ -221,7 +226,11 @@ public:
           "unsupported SwiGLU activation; the Micro-IR export emits silu only");
     f.armCount = 2;
     f.hasOutputInit = false;
+    f.lhsOperandType = op.getX().getType();
     f.rhsOperandTypes = {op.getWg().getType(), op.getWu().getType()};
+    // The SwiGLU destination is the output port, not a read input: its
+    // incoming values never feed the computation.
+    f.destinationOperandType = op.getInit().getType();
     auto mode = op.getMathMode();
     f.buildEpilogue = [mode](OpBuilder &b, Location loc,
                              ArrayRef<Value> acc) -> Value {

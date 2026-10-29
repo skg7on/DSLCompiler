@@ -21,6 +21,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSet.h"
 
@@ -114,26 +115,111 @@ llvm::Error verifyConcreteContract(Operation *kernel,
   if (!type)
     return error(
         "ConcreteMicro kernel requires function_type for port validation");
-  if (contract.ports.size() != type.getNumInputs() + type.getNumResults())
-    return error(
-        "workload_contract: port count does not match kernel signature");
-  for (size_t i = 0; i < contract.ports.size(); ++i) {
-    const auto &port = contract.ports[i];
-    bool input = i < type.getNumInputs();
-    auto direction = input ? workload::PortDirection::Input
-                           : workload::PortDirection::Output;
+  // Which contract port each signature entry realizes. An unbound (v1)
+  // kernel keeps the positional convention -- inputs first, then results. A
+  // bound kernel names the port explicitly, which is what lets an output
+  // destination be an *argument* rather than a positional result.
+  SmallVector<unsigned> argumentPort;
+  SmallVector<bool> argumentIsOutputPort;
+  SmallVector<unsigned> resultPort;
+  const bool hasBindings =
+      static_cast<bool>(kernel->getAttrOfType<ArrayAttr>("argument_bindings"));
+  if (auto bindings = kernel->getAttrOfType<ArrayAttr>("argument_bindings")) {
+    if (bindings.size() != type.getNumInputs())
+      return error("workload_contract: argument bindings do not cover the "
+                   "kernel signature");
+    llvm::SmallDenseSet<unsigned, 8> bound;
+    for (unsigned i = 0, e = bindings.size(); i < e; ++i) {
+      auto entry = dyn_cast<DictionaryAttr>(bindings[i]);
+      auto role = entry ? entry.getAs<StringAttr>("role") : StringAttr();
+      auto port = entry ? entry.getAs<IntegerAttr>("port") : IntegerAttr();
+      if (!role || !port || port.getInt() < 0 ||
+          static_cast<size_t>(port.getInt()) >= contract.ports.size() ||
+          (role.getValue() != "input" && role.getValue() != "output"))
+        return error("workload_contract: malformed argument binding");
+      unsigned index = static_cast<unsigned>(port.getInt());
+      if (!bound.insert(index).second)
+        return error(
+            "workload_contract: contract port is bound more than once");
+      argumentPort.push_back(index);
+      argumentIsOutputPort.push_back(role.getValue() == "output");
+    }
+    if (bound.size() != contract.ports.size())
+      return error(
+          "workload_contract: kernel does not bind every contract port");
+    auto results = kernel->getAttrOfType<ArrayAttr>("result_bindings");
+    if (!results || results.size() != type.getNumResults())
+      return error("workload_contract: result bindings do not cover the kernel "
+                   "signature");
+    for (Attribute attr : results) {
+      auto port = dyn_cast<IntegerAttr>(attr);
+      if (!port || port.getInt() < 0 ||
+          static_cast<size_t>(port.getInt()) >= contract.ports.size())
+        return error("workload_contract: malformed result binding");
+      resultPort.push_back(static_cast<unsigned>(port.getInt()));
+    }
+  } else {
+    if (contract.ports.size() != type.getNumInputs() + type.getNumResults())
+      return error(
+          "workload_contract: port count does not match kernel signature");
+    for (unsigned i = 0; i < type.getNumInputs(); ++i) {
+      argumentPort.push_back(i);
+      argumentIsOutputPort.push_back(false);
+    }
+    for (unsigned i = 0; i < type.getNumResults(); ++i)
+      resultPort.push_back(type.getNumInputs() + i);
+  }
+
+  // A port's declared direction/effect has to agree with how the signature
+  // uses it, and a static extent has to match a constant port dimension. A
+  // dynamic extent is bound by the invocation's symbol values.
+  auto validatePort = [&](const workload::WorkloadPort &port, bool asOutput,
+                          Type signatureType) -> llvm::Error {
+    auto direction = asOutput ? workload::PortDirection::Output
+                              : workload::PortDirection::Input;
     // An input port is read, except when it is a destination whose contents
     // are never consumed (`PortEffect::None`). Such a port is still part of
     // the ordered signature -- a local `tensor.empty` destination is passed,
     // not fabricated -- but the kernel must not read it.
     const bool effectMatches =
-        input ? port.effect == workload::PortEffect::Read ||
-                    port.effect == workload::PortEffect::None
-              : port.effect == workload::PortEffect::Write;
+        asOutput ? port.effect == workload::PortEffect::Write
+                 : port.effect == workload::PortEffect::Read ||
+                       port.effect == workload::PortEffect::None;
     if (port.direction != direction || !effectMatches)
       return error("workload_contract: port '" + port.name +
                    "' direction/effect does not match tensor signature");
-    if (input && port.effect == workload::PortEffect::None) {
+    auto tensor = dyn_cast<RankedTensorType>(signatureType);
+    if (!tensor || tensor.getRank() != static_cast<int64_t>(port.shape.size()))
+      return error("workload_contract: port '" + port.name +
+                   "' shape does not match tensor signature");
+    for (size_t dim = 0; dim < port.shape.size(); ++dim) {
+      int64_t extent = tensor.getDimSize(dim);
+      if (ShapedType::isDynamic(extent)) {
+        if (port.shape[dim].isConstant())
+          return error("workload_contract: port '" + port.name +
+                       "' dynamic dimension does not match its static shape");
+        continue;
+      }
+      if (!port.shape[dim].isConstant() ||
+          port.shape[dim].getConstant() != extent)
+        return error("workload_contract: port '" + port.name +
+                     "' shape does not match tensor signature");
+    }
+    std::string dtype;
+    llvm::raw_string_ostream out(dtype);
+    tensor.getElementType().print(out);
+    if (dtype != port.elementType)
+      return error("workload_contract: port '" + port.name +
+                   "' dtype does not match kernel signature");
+    return llvm::Error::success();
+  };
+
+  for (unsigned i = 0, e = argumentPort.size(); i < e; ++i) {
+    const workload::WorkloadPort &port = contract.ports[argumentPort[i]];
+    if (llvm::Error invalid =
+            validatePort(port, argumentIsOutputPort[i], type.getInput(i)))
+      return invalid;
+    if (!argumentIsOutputPort[i] && port.effect == workload::PortEffect::None) {
       // Only completely unused inputs have no incoming data effect. Keep this
       // conservative until logical-only uses have an explicit effect analysis.
       if (kernel->getNumRegions() != 1 || kernel->getRegion(0).empty() ||
@@ -142,24 +228,28 @@ llvm::Error verifyConcreteContract(Operation *kernel,
         return error("workload_contract: port '" + port.name +
                      "' with effect none requires an unused kernel input");
     }
-    Type signatureType =
-        input ? type.getInput(i) : type.getResult(i - type.getNumInputs());
-    auto tensor = dyn_cast<RankedTensorType>(signatureType);
-    if (!tensor || !tensor.hasStaticShape() ||
-        tensor.getRank() != static_cast<int64_t>(port.shape.size()))
-      return error("workload_contract: port '" + port.name +
-                   "' shape does not match static tensor signature");
-    for (size_t dim = 0; dim < port.shape.size(); ++dim)
-      if (!port.shape[dim].isConstant() ||
-          port.shape[dim].getConstant() != tensor.getDimSize(dim))
-        return error("workload_contract: port '" + port.name +
-                     "' shape does not match static tensor signature");
-    std::string dtype;
-    llvm::raw_string_ostream out(dtype);
-    tensor.getElementType().print(out);
-    if (dtype != port.elementType)
-      return error("workload_contract: port '" + port.name +
-                   "' dtype does not match kernel signature");
+  }
+  for (unsigned i = 0, e = resultPort.size(); i < e; ++i) {
+    unsigned portIndex = resultPort[i];
+    // A bound kernel updates a caller-owned destination argument; the
+    // unbound v1 convention has no such argument, so its results are simply
+    // the trailing output ports.
+    if (hasBindings) {
+      bool realized = false;
+      for (unsigned a = 0; a < argumentPort.size(); ++a)
+        if (argumentPort[a] == portIndex && argumentIsOutputPort[a]) {
+          realized = true;
+          break;
+        }
+      if (!realized)
+        return error("workload_contract: result binds port " +
+                     std::to_string(portIndex) +
+                     " that no output argument realizes");
+    }
+    if (llvm::Error invalid =
+            validatePort(contract.ports[portIndex],
+                         /*asOutput=*/true, type.getResult(i)))
+      return invalid;
   }
   Attribute numericalAttr = kernel->getAttr("micro.numerical_contract");
   auto numerical = dyn_cast_or_null<StringAttr>(numericalAttr);

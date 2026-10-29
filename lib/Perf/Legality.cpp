@@ -532,6 +532,10 @@ LegalityResult checkTailSupported(const SearchSpace &space,
     // instruction-fragment shape.
   } else if (*policy == "pad") {
     return legal();
+  } else if (*policy == "bounded") {
+    // Fixed-capacity tiles with clipped accesses and an exact runtime K need
+    // no divisibility proof: they are legal for every nonnegative extent.
+    return legal();
   } else if (*policy == "mask") {
     return illegal(kind, "tail_policy 'mask' is unsupported");
   } else {

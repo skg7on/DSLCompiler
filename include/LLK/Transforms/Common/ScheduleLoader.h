@@ -56,8 +56,12 @@ struct ScheduleEntry {
   /// Defaults to mma_shape when an entry does not name one.
   std::string fragment_shape{"16x16x32"};
   bool enable_tile_masks{true};
-  /// Tail contract for Micro export: none rejects non-dividing tiles; pad
-  /// zero-pads input footprints and crops stores to the valid result region.
+  /// Tail contract for Micro export. `none` rejects non-dividing tiles and
+  /// needs a divisibility proof; `pad` zero-pads input footprints and crops
+  /// stores to the valid result region (static legacy behavior); `bounded`
+  /// keeps the tile capacity fixed and clips every boundary access to the
+  /// runtime valid rectangle. A dynamic extent can only be realized with
+  /// `bounded`, because no divisibility proof exists.
   std::string tail_policy{"none"};
 };
 
@@ -76,6 +80,15 @@ std::vector<ScheduleEntry> loadScheduleDB(llvm::StringRef dbPath, int M_bucket,
 /// "no schedule entry" behaviour.
 ScheduleEntry selectBestSchedule(const std::vector<ScheduleEntry> &matches,
                                  int64_t N, int64_t K);
+
+/// The explicit schedule a dynamic contraction starts from.
+///
+/// A dynamic extent has no M bucket and cannot be matched against a fixed-shape
+/// schedule entry, so the exporter does not consult the database at all: it
+/// uses this deterministic baseline, whose `bounded` tail policy clips every
+/// boundary access. The tile capacities are compile-time constants, so the
+/// local footprint stays bounded even though the extent is not.
+ScheduleEntry selectBoundedBaselineSchedule();
 
 /// Classify M into one of 5 buckets: {1}, [2,4], [5,16], [17,64], ≥65.
 int classifyM(int64_t M);

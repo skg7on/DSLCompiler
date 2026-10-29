@@ -133,27 +133,44 @@ std::vector<ScheduleEntry> loadScheduleDB(llvm::StringRef dbPath, int M_bucket,
   return matches;
 }
 
+namespace {
+/// The conservative small-tile schedule the loader falls back to. One
+/// definition so the no-entry path and the dynamic baseline cannot drift.
+ScheduleEntry conservativeSchedule() {
+  ScheduleEntry def;
+  def.BM = 8;
+  def.BN = 32;
+  def.BK = 32;
+  def.VM = 1;
+  def.VN = 4;
+  def.vector_width = 8;
+  def.num_threads = 4;
+  def.grain_size = 1;
+  def.parallel_axis = "n";
+  return def;
+}
+} // namespace
+
 ScheduleEntry selectBestSchedule(const std::vector<ScheduleEntry> &matches,
                                  int64_t N, int64_t K) {
-  if (matches.empty()) {
-    // Built-in default: conservative small-tile schedule.
-    ScheduleEntry def;
-    def.BM = 8;
-    def.BN = 32;
-    def.BK = 32;
-    def.VM = 1;
-    def.VN = 4;
-    def.vector_width = 8;
-    def.num_threads = 4;
-    def.grain_size = 1;
-    def.parallel_axis = "n";
-    return def;
-  }
+  if (matches.empty())
+    return conservativeSchedule();
 
   // All entries from loadScheduleDB already match M_bucket.
   // N and K are accepted but currently unused for filtering or ranking.
   // Both consumers pass the actual contraction dimensions.
   return matches.front();
+}
+
+ScheduleEntry selectBoundedBaselineSchedule() {
+  ScheduleEntry baseline = conservativeSchedule();
+  // The only choice that makes runtime extents legal: fixed tile capacities
+  // with clipped boundary accesses and an exact runtime reduction length.
+  baseline.tail_policy = "bounded";
+  // The export emits one serial lowering, so the parallel axis count is not a
+  // resource claim; keep it at the single thread the exporter actually emits.
+  baseline.num_threads = 1;
+  return baseline;
 }
 
 } // namespace llk

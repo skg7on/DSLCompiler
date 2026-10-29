@@ -1626,6 +1626,61 @@ module {
   }
 }
 
+// A dynamic contract's prologue reifies and guards extents. Those operations
+// carry `micro.shape_only`: they are contract arithmetic, not dataflow, so the
+// analysis must not report them as unmodeled leaves. The identical operation
+// without the marker is still reported -- the exemption is the annotation, not
+// an operator allowlist.
+TEST(L1ResourceDag, ShapeOnlyPrologueIsCoveredButAnUnmarkedLeafIsNot) {
+  auto marked = parseKernel(R"mlir(
+module {
+  micro.kernel @marked {
+    %c0 = arith.constant {micro.shape_only} 0 : index
+    %c4 = arith.constant {micro.shape_only} 4 : index
+    %eq = arith.cmpi eq, %c0, %c4 {micro.shape_only} : index
+    cf.assert %eq, "shape" {micro.shape_only}
+    %t = micro.tile_alloc : !micro.tile<4x4xf32, memory = #micro.memory<sram>>
+    %v = micro.vector "add" %t, %t : !micro.tile<4x4xf32, memory = #micro.memory<sram>>, !micro.tile<4x4xf32, memory = #micro.memory<sram>> -> !micro.tile<4x4xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(marked);
+  machine::MachineModel model = parseMachine(testMachine(1, 1, 1));
+
+  llvm::Expected<SelectedKernelAnalysis> covered =
+      analyzeSelectedKernel(marked->kernel, model, /*requireComplete=*/false);
+  ASSERT_TRUE(static_cast<bool>(covered))
+      << llvm::toString(covered.takeError());
+  for (const std::string &reason : covered->incompleteReasons)
+    EXPECT_EQ(reason.find("unmodeled_leaf"), std::string::npos) << reason;
+
+  auto unmarked = parseKernel(R"mlir(
+module {
+  micro.kernel @unmarked {
+    %c0 = arith.constant 0 : index
+    %c4 = arith.constant 4 : index
+    %eq = arith.cmpi eq, %c0, %c4 : index
+    cf.assert %eq, "shape"
+    %t = micro.tile_alloc : !micro.tile<4x4xf32, memory = #micro.memory<sram>>
+    %v = micro.vector "add" %t, %t : !micro.tile<4x4xf32, memory = #micro.memory<sram>>, !micro.tile<4x4xf32, memory = #micro.memory<sram>> -> !micro.tile<4x4xf32, memory = #micro.memory<sram>>
+    micro.yield
+  }
+}
+)mlir");
+  ASSERT_TRUE(unmarked);
+  llvm::Expected<SelectedKernelAnalysis> reported =
+      analyzeSelectedKernel(unmarked->kernel, model, /*requireComplete=*/false);
+  ASSERT_TRUE(static_cast<bool>(reported))
+      << llvm::toString(reported.takeError());
+  bool reportsUnmarkedLeaf = false;
+  for (const std::string &reason : reported->incompleteReasons)
+    if (reason == "unmodeled_leaf: arith.cmpi" ||
+        reason == "unmodeled_leaf: cf.assert")
+      reportsUnmarkedLeaf = true;
+  EXPECT_TRUE(reportsUnmarkedLeaf);
+}
+
 // The traffic and peak summaries are the analysis's own, and the L0 block reads
 // the same traffic rule, so a plan consumer and the report cannot disagree.
 TEST(L1ResourceDag, TrafficAndPeakSummariesMatchTheStaticBound) {
