@@ -193,11 +193,14 @@ set(_llk_execution_jit_sources
 
 ```bash
 cmake -S . -B build -GNinja -DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build
+ninja -C build LLKExecutionTests
 ctest --test-dir build -N 2>/dev/null | grep -cE 'Test +#.*: MappedAcceptance'
 ctest --test-dir build -N 2>/dev/null | grep -E 'Test +#.*: MappedAcceptance$'
 ```
 
 Expected: the first prints `1`; the second prints exactly `  Test #NNN: MappedAcceptance`.
+
+The relink is not optional. `gtest_discover_tests` writes its case list POST_BUILD, so after a configure alone the stale 13 case entries survive and the count still reads `14`. The count drops only when `LLKExecutionTests` actually relinks.
 
 - [ ] **Step 4: Build and run the affected binaries**
 
