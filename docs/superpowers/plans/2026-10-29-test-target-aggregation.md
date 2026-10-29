@@ -64,13 +64,13 @@ Title: `refactor(build): register every test target with check-llk and compile t
 
 - [ ] **Step 1: Write the failing check**
 
-Run from the build tree:
+Run from the worktree root:
 
 ```bash
-ninja -t query check-llk | grep -E 'GenericElementwiseTest|FrameworkPrimitivesTest|DynamicShapeContractTest'
+ninja -C build -t query test/check-llk | grep -cE 'GenericElementwiseTest|FrameworkPrimitivesTest|DynamicShapeContractTest'
 ```
 
-Expected before the change: **no output** (exit 1). These five binaries are absent from `check-llk` dependencies today.
+Expected before the change: **`0`** (exit 1 from `grep -c`). These five binaries are absent from `check-llk` dependencies today. Note the query target is `test/check-llk`, not `check-llk`: `ninja -t query check-llk` reports only an alias and silently hides the dependency list.
 
 - [ ] **Step 2: Add the recursive collector to `test/CMakeLists.txt`**
 
@@ -134,15 +134,15 @@ list(REMOVE_DUPLICATES _llk_check_deps)
 
 ```bash
 cmake -S . -B build -GNinja -DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build
-ninja -C build -t query check-llk | grep -cE 'GenericElementwiseTest|FrameworkPrimitivesTest|DynamicShapeContractTest'
+ninja -C build -t query test/check-llk | grep -cE 'GenericElementwiseTest|GenericElementwiseAVX2Test|FrameworkPrimitivesTest|FrameworkPrimitivesAVX2Test|DynamicShapeContractTest'
 ```
 
-Expected: `5`.
+Expected: `5`. The pattern must name all five binaries. A pattern naming only the three non-AVX2 names also matches their AVX2 siblings as substrings, so it would print `3` and look like a failure.
 
 - [ ] **Step 6: Verify the tool subset still resolves**
 
 ```bash
-ninja -C build -t query check-llk | grep -cE 'llk-opt|micro-perf|llk-tune|llk-compile|llk-bench|llk-validate'
+ninja -C build -t query test/check-llk | grep -cE 'bin/(llk-opt|micro-perf|llk-tune|llk-compile|llk-bench|llk-validate)$'
 ```
 
 Expected: `6` when `LLK_BUILD_TOOLS=ON` (the default). If the configure used `-DLLK_BUILD_TOOLS=OFF`, this is `0` and that is correct.
@@ -167,7 +167,10 @@ git commit -m "refactor(build): derive check-llk dependencies from the test dire
 
 - [ ] **Step 1: Write the failing check**
 
+`gtest_discover_tests` registers cases POST_BUILD, so the binary must exist before `ctest -N` reports them.
+
 ```bash
+ninja -C build LLKExecutionTests
 ctest --test-dir build -N 2>/dev/null | grep -cE 'Test +#.*: MappedAcceptance\.'
 ```
 
@@ -234,13 +237,7 @@ Expected before: `Total Tests: 0`.
 
 - [ ] **Step 2: Add the label in Tuning**
 
-Change each `add_test(NAME ... COMMAND ...)` in `test/Tuning/CMakeLists.txt` to be followed by:
-
-```cmake
-set_tests_properties(${name} PROPERTIES LABELS "Tuning")
-```
-
-Concretely, append after each of the four `add_test` calls (lines 10, 19, 27, 35):
+Append one of these lines immediately after each of the four `add_test` calls (lines 10, 19, 27, 35 of `test/Tuning/CMakeLists.txt`):
 
 ```cmake
 set_tests_properties(FrameworkSourceTest PROPERTIES LABELS "Tuning")
@@ -304,10 +301,10 @@ git commit -m "fix(build): label standalone Tuning and Execution test entries"
 - [ ] **Step 1: Write the failing check**
 
 ```bash
-ninja -C build -t commands | grep -c 'resource_regression_fixture\.cpp'
+ninja -C build -t targets all | grep -c 'resource_regression_fixture\.cpp\.o'
 ```
 
-Expected before: `4` distinct compile commands. Expected after: `1`.
+Expected before: `4` object targets. Expected after: `1`. Do not use `ninja -t commands` here: it prints link lines too, and every link line that mentions the object inflates the count.
 
 - [ ] **Step 2: Define the object library**
 
@@ -362,7 +359,7 @@ In `test/Mapping/CMakeLists.txt`, replace `resource_regression_fixture.cpp` at l
 cmake -S . -B build -GNinja -DLLVM_PROJECT_BUILD_DIR=/Users/skg7on/Workspace/Projects/llvm-project/build
 ninja -C build -t clean LLKTestFixtures >/dev/null 2>&1 || true
 ninja -C build LLKConversionTests LLKPerfTests LLKMappingTests DynamicShapeMappingTest
-ninja -C build -t commands | grep -c 'resource_regression_fixture\.cpp'
+ninja -C build -t targets all | grep -c 'resource_regression_fixture\.cpp\.o'
 ```
 
 Expected: `1`.
@@ -774,10 +771,10 @@ Title: `refactor(build): collapse reference and selected-target test binaries`
 - [ ] **Step 1: Write the failing check**
 
 ```bash
-ninja -C build -t targets all | grep -c 'MappedAVX2Acceptance'
+ninja -C build -t targets all | grep -c 'CXX_EXECUTABLE_LINKER__MappedAVX2Acceptance_'
 ```
 
-Expected before: `1`. After: `0`.
+Expected before: `1`. After: `0`. Match the linker rule, not the bare name: the bare name also appears in `cmake_object_order_depends_target_*` rules and in `.o` targets.
 
 - [ ] **Step 2: Add the runtime switch in `mapped_acceptance.cpp`**
 
@@ -983,7 +980,7 @@ git commit -m "refactor(build): serve both acceptance gates from one binary"
 - [ ] **Step 1: Write the failing check**
 
 ```bash
-ninja -C build -t targets all | grep -c 'GenericElementwiseAVX2Test'
+ninja -C build -t targets all | grep -c 'CXX_EXECUTABLE_LINKER__GenericElementwiseAVX2Test_'
 ```
 
 Expected before: `1`. After: `0`.
@@ -1059,7 +1056,7 @@ git commit -m "refactor(build): serve both generic elementwise gates from one bi
 - [ ] **Step 1: Write the failing check**
 
 ```bash
-ninja -C build -t targets all | grep -c 'FrameworkPrimitivesAVX2Test'
+ninja -C build -t targets all | grep -c 'CXX_EXECUTABLE_LINKER__FrameworkPrimitivesAVX2Test_'
 ```
 
 Expected before: `1`. After: `0`.
@@ -1128,10 +1125,10 @@ Expected: all pass, documented JIT skips unchanged.
 - [ ] **Step 2: Confirm the final binary count**
 
 ```bash
-ninja -C build -t targets all | grep -cE 'bin/(LLK[A-Za-z]*Tests|[A-Za-z]*Test)$'
+ninja -C build -t targets all | grep -cE 'CXX_EXECUTABLE_LINKER__([A-Za-z0-9]*Tests|[A-Za-z0-9]*Test|MappedAcceptance)_'
 ```
 
-Expected: `15` — `LLKBenchmarkTests`, `LLKCAPITests`, `LLKConversionTests`, `LLKExecutionTests`, `LLKFrontendTests`, `LLKMachineTests`, `LLKMappingTests`, `LLKNumericalTests`, `LLKPerfTests`, `LLKTransformsTests`, `LLKTuningTests`, `LLKCAPIFrontendTests`, `GenericElementwiseTest`, `FrameworkPrimitivesTest`, plus `MappedAcceptance` at the build root.
+Expected: `15` with `LLK_BUILD_PYTHON_CAPI=ON` — `LLKBenchmarkTests`, `LLKCAPITests`, `LLKConversionTests`, `LLKExecutionTests`, `LLKFrontendTests`, `LLKMachineTests`, `LLKMappingTests`, `LLKNumericalTests`, `LLKPerfTests`, `LLKTransformsTests`, `LLKTuningTests`, `LLKCAPIFrontendTests`, `GenericElementwiseTest`, `FrameworkPrimitivesTest`, `MappedAcceptance`. With `LLK_BUILD_PYTHON_CAPI=OFF` (the default) the CAPI pair is absent and the count is `13`.
 
 - [ ] **Step 3: Confirm the evidence contract still holds**
 
