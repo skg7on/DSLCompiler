@@ -76,7 +76,9 @@ if(LLK_BUILD_E2E_TESTS)
 
   add_test(NAME SelectedTargetFlagContract
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_selected_target_flag.py
-          $<TARGET_FILE:MappedAVX2Acceptance> $<TARGET_FILE:MappedAcceptance>)
+          $<TARGET_FILE:MappedAVX2Acceptance> $<TARGET_FILE:MappedAcceptance>
+          $<TARGET_FILE:DynamicMappedAVX2Acceptance>
+          $<TARGET_FILE:DynamicMappedAcceptance>)
   set_tests_properties(SelectedTargetFlagContract PROPERTIES LABELS "selected-avx2")
 
   add_executable(MappedInvocationTest mapped_invocation.cpp)
@@ -152,6 +154,39 @@ if(LLK_BUILD_E2E_TESTS)
       --require-selected-target
       --gtest_filter=FrameworkPrimitives.SelectedAvx2*)
   set_tests_properties(FrameworkPrimitivesAVX2Test PROPERTIES
+      LABELS "selected-avx2")
+
+  # Compile-once dynamic acceptance (issue #197). The portable binary runs the
+  # reference chain; the AVX2 binary compiles the same sources for the selected
+  # target and fails, rather than skips, when the host cannot run it. Both live
+  # at the build root because the pinned workflow invokes them directly there.
+  set(_llk_dynamic_acceptance_libs
+      LLKMappedCompilation LLKToMicro LLKMicroToLinalg LLKMapping
+      LLKTargetMapping LLKSourceCandidates LLKWorkloadContracts LLKRuntime
+      LLKPerf LLKShape MicroDialect LLKDialect GTest::gtest_main LLK::MLIR)
+
+  add_executable(DynamicMappedAcceptance dynamic_mapped_acceptance.cpp)
+  target_link_libraries(DynamicMappedAcceptance PRIVATE
+      ${_llk_dynamic_acceptance_libs})
+  target_compile_definitions(DynamicMappedAcceptance PRIVATE
+      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  set_target_properties(DynamicMappedAcceptance PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_test(NAME DynamicMappedAcceptance COMMAND DynamicMappedAcceptance)
+  set_tests_properties(DynamicMappedAcceptance PROPERTIES
+      LABELS "mapped-reference"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
+
+  add_executable(DynamicMappedAVX2Acceptance dynamic_mapped_acceptance.cpp)
+  target_link_libraries(DynamicMappedAVX2Acceptance PRIVATE
+      ${_llk_dynamic_acceptance_libs})
+  target_compile_definitions(DynamicMappedAVX2Acceptance PRIVATE
+      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
+  set_target_properties(DynamicMappedAVX2Acceptance PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  add_test(NAME DynamicMappedAVX2Acceptance COMMAND DynamicMappedAVX2Acceptance
+      --require-selected-target --gtest_filter=DynamicMapped*.*)
+  set_tests_properties(DynamicMappedAVX2Acceptance PROPERTIES
       LABELS "selected-avx2")
 
   add_executable(SelectedGroupLoweringTest selected_group_lowering.cpp)

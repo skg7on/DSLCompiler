@@ -480,6 +480,14 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME MicroToLinalgDynamicBoundary
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --micro-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/dynamic_boundary.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroToLinalg/dynamic_boundary.mlir"
   )
+  # MicroToLinalgDynamicElementwise: the direct Micro-IR elementwise fixture
+  # (no contraction axes) lowers its two reads to clipped slices and its write
+  # to a clipped insert into the caller's destination. The same file is the
+  # execution fixture for DynamicMappedAcceptance, so the IR checked here is
+  # exactly the IR that runs.
+  add_test(NAME MicroToLinalgDynamicElementwise
+      COMMAND sh -c "$<TARGET_FILE:llk-opt> --micro-to-linalg ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/dynamic_elementwise.mlir | ${FILECHECK_BIN} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/dynamic_elementwise.mlir"
+  )
   # MicroToLinalgJit: the lowered kernel reaches the JIT. This is the check that
   # the bridge produces IR the backend pipeline can finish -- which is why the
   # lowering stays in tensor land: an already-bufferized module leaves an
