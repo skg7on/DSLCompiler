@@ -44,6 +44,21 @@ function(add_llk_test_category category)
                  SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 endfunction()
 
+# Test-only fixtures shared by several categories. An OBJECT library compiles
+# them once without packaging a fixture-only TU into a production library.
+add_library(LLKTestFixtures OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/Mapping/resource_regression_fixture.cpp)
+target_link_libraries(LLKTestFixtures PRIVATE
+    LLKBuildOptions
+    LLKMachine
+    LLKMapping
+    LLKMicroMapping
+    LLKTargetMapping
+    LLK::MLIR)
+target_include_directories(LLKTestFixtures PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+    ${CMAKE_CURRENT_SOURCE_DIR}/Mapping)
+
 add_subdirectory(CMake)
 add_subdirectory(Execution)
 add_subdirectory(Numerical)
