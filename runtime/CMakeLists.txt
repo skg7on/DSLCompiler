@@ -5,7 +5,7 @@ add_llk_library(LLKRuntime
     MappedObject.cpp
     PackedWeights.cpp
     ThreadPool.cpp
-    LINK_LIBRARIES LLKMappedKernelAbi LLKMapping LLVM LLK::MLIR
+    LINK_LIBRARIES LLKMappedKernelAbi LLKMapping LLKShape LLVM LLK::MLIR
                    mlir_c_runner_utils
 )
 

@@ -7,7 +7,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/MappedKernelAbi.h"
+#include "LLK/Conversion/Workload/WorkloadContract.h"
+#include "LLK/Dialect/LLKDialect.h"
+#include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Runtime/MappedExecutable.h"
 #include "mapped_jit_test_factory.h"
 
@@ -328,5 +332,167 @@ TEST(MappedAllocationLifetime,
   EXPECT_EQ(tracker.outstandingPointers(), before);
   EXPECT_FALSE(tracker.freedAny(callerPointers));
   EXPECT_EQ(tracker.doubleFreeCount(), 0u);
+}
+
+//===----------------------------------------------------------------------===//
+// Dynamic ABI v2: caller-owned output destinations
+//===----------------------------------------------------------------------===//
+
+/// A fully dynamic copy whose destination is an explicit caller-owned output
+/// port. The signature carries the symbolic contract ABI v2 records.
+constexpr llvm::StringLiteral kDynamicCopyKernel = R"mlir(
+module {
+  micro.kernel @copy_dynamic(%src: tensor<?x?xf32>, %dst: tensor<?x?xf32>)
+      -> tensor<?x?xf32>
+      attributes {
+        argument_bindings = [{port = 0 : i64, role = "input"},
+                             {port = 1 : i64, role = "output"}],
+        result_bindings = [1]
+      } {
+    %c0 = arith.constant 0 : index
+    %m = tensor.dim %src, %c0 : tensor<?x?xf32>
+    %c1 = arith.constant 1 : index
+    %n = tensor.dim %src, %c1 : tensor<?x?xf32>
+    %sv = micro.tile_view %src {shape = array<i64: -9223372036854775808, -9223372036854775808>}
+        : tensor<?x?xf32>
+       -> !micro.tile<?x?xf32, memory = #micro.memory<sram>>
+    %dv = micro.tile_view %dst {shape = array<i64: -9223372036854775808, -9223372036854775808>}
+        : tensor<?x?xf32>
+       -> !micro.tile<?x?xf32, memory = #micro.memory<dram>>
+    %r = micro.tile_store %sv into %dv[%c0, %c0] valid[%m, %n]
+        {dst_memory = #micro.memory<dram>}
+        : !micro.tile<?x?xf32, memory = #micro.memory<sram>>,
+          !micro.tile<?x?xf32, memory = #micro.memory<dram>>
+       -> !micro.tile<?x?xf32, memory = #micro.memory<dram>>
+    micro.yield %r : !micro.tile<?x?xf32, memory = #micro.memory<dram>>
+  }
+}
+)mlir";
+
+/// Compiles the dynamic copy through the mapped compiler at the lowered stop,
+/// attaches the canonical contract, and prepares the callable form so the test
+/// can install allocator hooks on the generated code.
+llvm::Expected<llk::PreparedMappedKernel>
+prepareDynamicCopy(mlir::MLIRContext &context) {
+  namespace workload = mlir::llk::workload;
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::parseSourceString<mlir::ModuleOp>(kDynamicCopyKernel, &context);
+  if (!module)
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "the dynamic copy fixture did not parse");
+  const auto symbol = [](llvm::StringRef name) {
+    return ::mlir::llk::shape::Dimension::symbol(name.str());
+  };
+  workload::WorkloadContract contract;
+  contract.version = 2;
+  contract.ports = {
+      {"src",
+       workload::PortDirection::Input,
+       workload::PortEffect::Read,
+       {symbol("M"), symbol("N")},
+       "f32"},
+      {"dst",
+       workload::PortDirection::Output,
+       workload::PortEffect::Write,
+       {symbol("M"), symbol("N")},
+       "f32"},
+  };
+  contract.symbols = {{"M", {}}, {"N", {}}};
+  llvm::Expected<mlir::DictionaryAttr> encoded =
+      workload::encodeWorkloadContract(&context, contract);
+  if (!encoded)
+    return encoded.takeError();
+  module->walk([&](mlir::Operation *op) {
+    if (op->getName().getStringRef() == "micro.kernel")
+      op->setAttr("micro.workload_contract", *encoded);
+  });
+
+  llk::MappedCompileOptions options;
+  options.entrySymbol = "copy_dynamic";
+  options.backend = llk::MappedBackend::Reference;
+  options.stop = llk::MappedStop::Lowered;
+  llvm::Expected<llk::MappedCompilation> compiled =
+      llk::compileConcreteMicroKernel(*module, options);
+  if (!compiled)
+    return compiled.takeError();
+  if (!compiled->module)
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "the dynamic copy produced no lowered module");
+  return llk::prepareMappedKernelForInvocation(*compiled->module,
+                                               "copy_dynamic");
+}
+
+TEST(MappedAllocationLifetime, WritesDynamicDestinationIntoCallerStorage) {
+  mlir::DialectRegistry registry;
+  mlir::registerAllDialects(registry);
+  registry.insert<mlir::llk::LLKDialect, mlir::micro::MicroDialect>();
+  mlir::MLIRContext context(registry);
+  context.loadAllAvailableDialects();
+
+  llvm::Expected<llk::PreparedMappedKernel> prepared =
+      prepareDynamicCopy(context);
+  ASSERT_TRUE(static_cast<bool>(prepared))
+      << llvm::toString(prepared.takeError());
+  ASSERT_EQ(prepared->abi.version, llk::kMappedAbiVersionV2);
+  ASSERT_EQ(prepared->abi.inputs.size(), 1u);
+  ASSERT_EQ(prepared->abi.outputs.size(), 1u);
+
+  AllocationTracker tracker;
+  ActiveTracker active(tracker);
+  llk::testing::TestAllocatorHooks hooks{allocateHook, alignedAllocateHook,
+                                         releaseHook};
+  llvm::Expected<std::unique_ptr<llk::MappedExecutable>> executable =
+      llk::testing::createMappedExecutableForTest(std::move(*prepared), {},
+                                                  hooks);
+  ASSERT_TRUE(static_cast<bool>(executable))
+      << llvm::toString(executable.takeError());
+
+  const int64_t rows = 40, columns = 48;
+  std::vector<float> source(static_cast<size_t>(rows * columns));
+  for (size_t i = 0; i < source.size(); ++i)
+    source[i] = static_cast<float>(i) + 0.5f;
+  std::vector<float> destination(source.size(), -1.0f);
+  const uint64_t destinationBytes = destination.size() * sizeof(float);
+  llvm::SmallVector<void *> callerPointers{source.data(), destination.data()};
+
+  llk::InvocationBuffer2D input{
+      {source.data(), source.data(), 0, rows, columns, columns, 1},
+      llk::InvocationElementType::F32,
+      source.size() * sizeof(float)};
+  llk::InvocationBuffer2D output{
+      {destination.data(), destination.data(), 0, rows, columns, columns, 1},
+      llk::InvocationElementType::F32,
+      destination.size() * sizeof(float)};
+
+  const std::set<void *> empty;
+  for (int round = 0; round < 3; ++round) {
+    destination.assign(destination.size(), -1.0f);
+    ASSERT_EQ(tracker.outstandingPointers(), empty);
+    if (llvm::Error error = (*executable)->invoke({input}, {output}))
+      FAIL() << llvm::toString(std::move(error));
+    EXPECT_EQ(destination, source) << "round " << round;
+    // The destination is caller storage: no output-sized buffer is ever
+    // allocated by the generated code, and the caller's pointers survive.
+    EXPECT_LT(tracker.maximumLiveBytes(), destinationBytes);
+    EXPECT_EQ(tracker.outstandingPointers(), empty);
+    EXPECT_FALSE(tracker.freedAny(callerPointers));
+  }
+  EXPECT_EQ(tracker.doubleFreeCount(), 0u);
+  EXPECT_EQ(tracker.allocateCount(), tracker.releaseCount());
+
+  // A descriptor that disagrees with the symbolic contract is refused before
+  // entry and allocates nothing.
+  llk::InvocationBuffer2D tooNarrow = output;
+  tooNarrow.descriptor.size1 = columns - 1;
+  tooNarrow.descriptor.stride0 = columns - 1;
+  tooNarrow.allocationBytes = destinationBytes;
+  uint64_t allocationsBefore = tracker.allocateCount();
+  if (llvm::Error error = (*executable)->invoke({input}, {tooNarrow}))
+    llvm::consumeError(std::move(error));
+  else
+    FAIL() << "a destination that disagrees with the source was accepted";
+  EXPECT_EQ(tracker.allocateCount(), allocationsBefore);
+  EXPECT_FALSE(tracker.freedAny(callerPointers));
 }
 } // namespace

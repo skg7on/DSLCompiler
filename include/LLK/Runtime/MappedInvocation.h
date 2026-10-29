@@ -24,5 +24,20 @@ llvm::Error
 validateMappedInvocation(const KernelAbi &abi,
                          llvm::ArrayRef<InvocationBuffer2D> inputs,
                          llvm::ArrayRef<InvocationBuffer2D> outputs);
+
+/// Validates an invocation and returns the concrete extent of every symbol the
+/// ABI declares.
+///
+/// A successful resolution means the whole invocation is admissible: arity,
+/// dtype, rank, offsets, compact strides, nonnegative and non-overflowing
+/// extents, allocation bounds, disjoint outputs, and every declared symbol
+/// bound consistently. Version 1 returns an empty value map because it declares
+/// no symbols; its validation is otherwise the same one it always performed.
+/// An empty invocation (a zero extent with a null pointer and zero bytes) is
+/// valid, and its zero extent still participates in symbol binding.
+llvm::Expected<::mlir::llk::shape::ShapeValues>
+resolveMappedShapeValues(const KernelAbi &abi,
+                         llvm::ArrayRef<InvocationBuffer2D> inputs,
+                         llvm::ArrayRef<InvocationBuffer2D> outputs);
 } // namespace llk
 #endif

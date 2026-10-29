@@ -57,6 +57,7 @@
 #include "mlir/Dialect/Bufferization/Transforms/FuncBufferizableOpInterfaceImpl.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h" // IWYU pragma: keep
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -884,7 +885,7 @@ int main(int argc, char **argv) {
                   mlir::tensor::TensorDialect, mlir::scf::SCFDialect,
                   mlir::arith::ArithDialect, mlir::math::MathDialect,
                   mlir::memref::MemRefDialect, mlir::LLVM::LLVMDialect,
-                  mlir::ub::UBDialect>();
+                  mlir::ub::UBDialect, mlir::cf::ControlFlowDialect>();
 
   // Register TilingInterface external models so Linalg ops can be tiled.
   mlir::linalg::registerTilingInterfaceExternalModels(registry);
