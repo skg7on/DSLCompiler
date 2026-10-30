@@ -123,7 +123,7 @@ jobs:
           ./MappedAcceptance --require-selected-target \
             --gtest_filter=MappedAcceptance.* \
             --gtest_output=xml:selected-avx2-results.xml 2>&1 | tee selected-avx2.log
-          ./DynamicMappedAVX2Acceptance --require-selected-target \
+          ./DynamicMappedAcceptance --require-selected-target \
             --gtest_filter=DynamicMapped*.* \
             --gtest_output=xml:selected-avx2-dynamic-results.xml 2>&1 | tee selected-avx2-dynamic.log
           python3 ../test/Execution/check_selected_execution_evidence.py selected-execution-evidence

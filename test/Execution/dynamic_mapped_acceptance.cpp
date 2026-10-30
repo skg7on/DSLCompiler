@@ -23,9 +23,9 @@
 // the compilation count stays at one is the evidence for it.
 //
 // The chains are host-portable: the exported program is Linalg, SCF and
-// memref, and the JIT compiles it for the machine running the test. The
-// selected-target binary makes a missing AVX2 host a failure rather than a
-// skip, so selected evidence cannot silently come from reference execution.
+// memref, and the JIT compiles it for the machine running the test. A
+// required-selected-target run makes a missing AVX2 host a failure rather than
+// a skip, so selected evidence cannot silently come from reference execution.
 
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/MappedCompilation.h"
@@ -124,7 +124,6 @@ float nextSignedValue(uint32_t &state) {
   return static_cast<float>(state & 0xffffu) / 65535.0f - 0.5f;
 }
 
-#ifdef LLK_REQUIRE_SELECTED_TARGET
 bool avx2DisabledByTestOverride() {
   const char *disabled = std::getenv("LLK_TEST_DISABLE_AVX2");
   return disabled && std::strcmp(disabled, "1") == 0;
@@ -157,14 +156,17 @@ bool selectedAvx2Available() {
   }
   return true;
 }
-#endif
 
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-constexpr llk::MappedBackend kDefaultBackend =
-    llk::MappedBackend::SelectedTarget;
-#else
-constexpr llk::MappedBackend kDefaultBackend = llk::MappedBackend::Reference;
-#endif
+namespace {
+/// Set from --require-selected-target. One binary serves the reference and the
+/// required-AVX2 gates.
+bool requireSelectedTarget = false;
+} // namespace
+
+llk::MappedBackend defaultBackend() {
+  return requireSelectedTarget ? llk::MappedBackend::SelectedTarget
+                               : llk::MappedBackend::Reference;
+}
 
 /// The fully dynamic matmul the acceptance chain exports. Every port is
 /// `?x?`: M, N and K are all runtime values, including K.
@@ -459,7 +461,7 @@ exportDynamicSource(mlir::MLIRContext &context, llvm::StringRef sourceText,
 llvm::Expected<DynamicArtifact>
 compileDynamicSource(mlir::MLIRContext &context, llvm::StringRef sourceText,
                      llvm::StringRef sourceSymbol,
-                     llk::MappedBackend backend = kDefaultBackend,
+                     llk::MappedBackend backend = defaultBackend(),
                      std::unique_ptr<MappingTarget> target = nullptr) {
   workload::WorkloadContract contract;
   llvm::Expected<mlir::OwningOpRef<mlir::ModuleOp>> module =
@@ -935,7 +937,7 @@ TEST(DynamicMappedAcceptance,
                    .str();
 
   llvm::Expected<llk::MappedCompilation> lowered =
-      searchAndCompile(context, **module, contract, entry, kDefaultBackend,
+      searchAndCompile(context, **module, contract, entry, defaultBackend(),
                        llk::MappedStop::Lowered, nullptr);
   ASSERT_TRUE(static_cast<bool>(lowered))
       << llvm::toString(lowered.takeError());
@@ -1080,7 +1082,7 @@ TEST(DynamicMappedAcceptance, ExecutesADirectDynamicElementwiseMicroKernel) {
   kernel->setAttr("micro.workload_contract", *encoded);
 
   llvm::Expected<DynamicArtifact> artifact =
-      compileMappedModule(context, *module, contract, kDefaultBackend);
+      compileMappedModule(context, *module, contract, defaultBackend());
   ASSERT_TRUE(static_cast<bool>(artifact))
       << llvm::toString(artifact.takeError());
   EXPECT_EQ(artifact->compilations, 1u);
@@ -1266,13 +1268,16 @@ TEST(DynamicMappedSelected, SelectedLoweringKeepsBoundedBoundariesAndRuntimeK) {
       << "the selected lowering padded a whole source instead of bounding it";
 }
 
-#ifdef LLK_REQUIRE_SELECTED_TARGET
 TEST(DynamicMappedSelected, SelectedAvx2ExecutesCompileOnceDynamicAcceptance) {
   if (!selectedAvx2Available()) {
-    if (avx2DisabledByTestOverride())
-      FAIL() << "test override disabled required selected AVX2 execution";
-    else
-      FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+    if (requireSelectedTarget) {
+      if (avx2DisabledByTestOverride())
+        FAIL() << "test override disabled required selected AVX2 execution";
+      else
+        FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+    } else {
+      GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
+    }
   }
 
   mlir::DialectRegistry registry = buildRegistry();
@@ -1314,7 +1319,6 @@ TEST(DynamicMappedSelected, SelectedAvx2ExecutesCompileOnceDynamicAcceptance) {
   // the handoff is accounted for, not silently treated as reference output.
   EXPECT_GT(artifact->selectedGroupsVerified, 0u);
 }
-#endif
 
 TEST(DynamicMappedAcceptance, ExecutesExternalOutputsLargerThanLocalSram) {
   mlir::DialectRegistry registry = buildRegistry();
@@ -1341,7 +1345,7 @@ TEST(DynamicMappedAcceptance, ExecutesExternalOutputsLargerThanLocalSram) {
 
   llvm::Expected<DynamicArtifact> artifact =
       compileDynamicSource(context, kDynamicMatmulSource, "matmul_dynamic_root",
-                           kDefaultBackend, std::move(*target));
+                           defaultBackend(), std::move(*target));
   ASSERT_TRUE(static_cast<bool>(artifact))
       << llvm::toString(artifact.takeError());
   EXPECT_EQ(artifact->compilations, 1u);
@@ -1621,7 +1625,6 @@ TEST(DynamicMappedAcceptance, ServesUnrelatedShapesFromOneMixedStaticSwiGLU) {
 } // namespace
 
 int main(int argc, char **argv) {
-  bool requireSelectedTarget = false;
   for (int index = 1; index < argc;) {
     if (std::strcmp(argv[index], "--require-selected-target") == 0) {
       requireSelectedTarget = true;
@@ -1633,36 +1636,24 @@ int main(int argc, char **argv) {
     ++index;
   }
 
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-  if (!requireSelectedTarget) {
-    std::fprintf(stderr, "DynamicMappedAVX2Acceptance requires "
-                         "--require-selected-target\n");
-    return 2;
-  }
   // A required selected run on a host that cannot execute AVX2 is a failure,
-  // never a skip: otherwise reference success could be reported as selected
-  // evidence. Listing tests runs nothing, so it stays host-independent and the
-  // command-line contract can be checked anywhere.
-  bool listingTests = false;
-  for (int index = 1; index < argc; ++index)
-    listingTests |= std::strcmp(argv[index], "--gtest_list_tests") == 0;
-  if (!listingTests && !selectedAvx2Available()) {
-    if (avx2DisabledByTestOverride())
-      std::fprintf(stderr,
-                   "test override disabled required selected AVX2 execution\n");
-    else
-      std::fprintf(
-          stderr,
-          "required selected AVX2 execution needs an x86_64 AVX2 host\n");
-    return 1;
-  }
-#else
+  // never a skip. Listing tests runs nothing, so it stays host-independent.
   if (requireSelectedTarget) {
-    std::fprintf(stderr, "--require-selected-target is only valid for the "
-                         "selected-target executable\n");
-    return 2;
+    bool listingTests = false;
+    for (int index = 1; index < argc; ++index)
+      listingTests |= std::strcmp(argv[index], "--gtest_list_tests") == 0;
+    if (!listingTests && !selectedAvx2Available()) {
+      if (avx2DisabledByTestOverride())
+        std::fprintf(
+            stderr,
+            "test override disabled required selected AVX2 execution\n");
+      else
+        std::fprintf(
+            stderr,
+            "required selected AVX2 execution needs an x86_64 AVX2 host\n");
+      return 1;
+    }
   }
-#endif
 
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
