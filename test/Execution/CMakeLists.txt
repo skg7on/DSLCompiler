@@ -105,15 +105,9 @@ if(LLK_BUILD_E2E_TESTS)
   add_test(NAME GenericElementwiseTest COMMAND GenericElementwiseTest)
   set_tests_properties(GenericElementwiseTest PROPERTIES
       LABELS "mapped-reference")
-
-  # The required-selected-target binary makes a missing AVX2 lane a failure,
-  # not a skip, so CI evidence cannot silently pass on the wrong host.
-  add_executable(GenericElementwiseAVX2Test generic_elementwise.cpp)
-  target_link_libraries(GenericElementwiseAVX2Test PRIVATE
-      ${_llk_generic_elementwise_libs})
-  target_compile_definitions(GenericElementwiseAVX2Test PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
-  add_test(NAME GenericElementwiseAVX2Test COMMAND GenericElementwiseAVX2Test
+  # Same binary, required-selected-target mode: a missing AVX2 lane is a
+  # failure, not a skip, so CI evidence cannot silently pass on the wrong host.
+  add_test(NAME GenericElementwiseAVX2Test COMMAND GenericElementwiseTest
       --require-selected-target
       --gtest_filter=GenericElementwise.SelectedAvx2*)
   set_tests_properties(GenericElementwiseAVX2Test PROPERTIES
