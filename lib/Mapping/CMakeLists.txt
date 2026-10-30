@@ -7,6 +7,7 @@ add_llk_library(LLKMapping
     StorageLiveness.cpp
     CostModel.cpp
     CostEvent.cpp
+    ShapeEvaluation.cpp
     EventSchedule.cpp
     LatencyProvider.cpp
     SearchBinding.cpp

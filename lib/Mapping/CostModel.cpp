@@ -166,6 +166,77 @@ Cost addCost(const Cost &lhs, const Cost &rhs) {
   return sum;
 }
 
+llvm::Expected<Cost> weightedMeanCost(llvm::ArrayRef<WeightedCost> samples) {
+  if (samples.empty())
+    return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                   "weighted cost aggregation requires at "
+                                   "least one sample");
+  double totalWeight = 0.0;
+  double latency = 0.0;
+  double dram = 0.0;
+  double local = 0.0;
+  double spill = 0.0;
+  double compute = 0.0;
+  double transfer = 0.0;
+  for (const WeightedCost &sample : samples) {
+    if (!std::isfinite(sample.weight) || sample.weight <= 0.0)
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "weighted cost aggregation requires finite positive weights");
+    if (!std::isfinite(sample.cost.latencyCycles))
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          "weighted cost aggregation received a non-finite latency");
+    totalWeight += sample.weight;
+    latency += sample.cost.latencyCycles * sample.weight;
+    dram += static_cast<double>(sample.cost.dramBytes) * sample.weight;
+    local += static_cast<double>(sample.cost.localBytes) * sample.weight;
+    spill += static_cast<double>(sample.cost.spillBytes) * sample.weight;
+    compute += sample.cost.computeUtilization * sample.weight;
+    transfer += sample.cost.transferUtilization * sample.weight;
+  }
+  if (!std::isfinite(totalWeight) || totalWeight <= 0.0)
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "weighted cost aggregation overflowed its total weight");
+
+  auto roundCount = [&](double value,
+                        llvm::StringRef what) -> llvm::Expected<uint64_t> {
+    double mean = value / totalWeight;
+    if (!std::isfinite(mean) || mean < 0.0 ||
+        mean > static_cast<double>(std::numeric_limits<uint64_t>::max()))
+      return llvm::createStringError(
+          llvm::inconvertibleErrorCode(),
+          ("weighted cost aggregation produced an unrepresentable " + what)
+              .str());
+    return static_cast<uint64_t>(std::llround(mean));
+  };
+
+  Cost result;
+  result.latencyCycles = latency / totalWeight;
+  llvm::Expected<uint64_t> dramBytes = roundCount(dram, "dram byte count");
+  if (!dramBytes)
+    return dramBytes.takeError();
+  llvm::Expected<uint64_t> localBytes = roundCount(local, "local byte count");
+  if (!localBytes)
+    return localBytes.takeError();
+  llvm::Expected<uint64_t> spillBytes = roundCount(spill, "spill byte count");
+  if (!spillBytes)
+    return spillBytes.takeError();
+  result.dramBytes = *dramBytes;
+  result.localBytes = *localBytes;
+  result.spillBytes = *spillBytes;
+  result.computeUtilization = compute / totalWeight;
+  result.transferUtilization = transfer / totalWeight;
+  if (!std::isfinite(result.latencyCycles) ||
+      !std::isfinite(result.computeUtilization) ||
+      !std::isfinite(result.transferUtilization))
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "weighted cost aggregation produced a non-finite metric");
+  return result;
+}
+
 std::optional<double> utilizationEstimate(double busyCycles,
                                           const machine::MachineModel &machine,
                                           uint32_t parallelUnits) {

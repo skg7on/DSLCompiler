@@ -77,6 +77,96 @@ llvm::Error buildAlloc(micro::AllocOp alloc, OpDAGBuildContext &context) {
                                 micro::stringifyMemorySpace(alloc.getMemory()));
 }
 
+/// Evaluates a boundary extent list in the current iteration environment.
+/// On failure the reason is recorded as an incompleteness fact and the caller
+/// falls back to the full static capacity, which keeps a lenient report honest
+/// while a strict analysis refuses the stream.
+std::optional<llvm::SmallVector<int64_t>>
+evaluatedExtents(mlir::ValueRange extents, OpDAGBuildContext &context,
+                 llvm::StringRef what) {
+  llvm::SmallVector<int64_t> values;
+  values.reserve(extents.size());
+  for (mlir::Value extent : extents) {
+    llvm::Expected<int64_t> value = context.evaluateIndex(extent);
+    if (!value) {
+      context.noteIncomplete(what.str() + " is not statically evaluable: " +
+                             llvm::toString(value.takeError()));
+      return std::nullopt;
+    }
+    if (*value < 0) {
+      context.noteIncomplete(what.str() + " evaluates to a negative extent");
+      return std::nullopt;
+    }
+    values.push_back(*value);
+  }
+  return values;
+}
+
+std::optional<uint64_t> checkedElements(llvm::ArrayRef<int64_t> extents) {
+  uint64_t elements = 1;
+  for (int64_t extent : extents) {
+    if (extent < 0)
+      return std::nullopt;
+    if (__builtin_mul_overflow(elements, static_cast<uint64_t>(extent),
+                               &elements))
+      return std::nullopt;
+  }
+  return elements;
+}
+
+llvm::Error buildTileLoad(micro::TileLoadOp load, OpDAGBuildContext &context) {
+  TileInfo resultInfo = describeType(load.getResult().getType());
+  TileInfo sourceInfo = describeType(load.getSource().getType());
+  std::string sourceMemory = context.memoryOf(load.getSource());
+  if (sourceMemory.empty())
+    sourceMemory = "dram"; // an untagged operand is an external buffer
+  std::string destinationMemory =
+      micro::stringifyMemorySpace(load.getDstMemory()).str();
+  if (!resultInfo.isTile || resultInfo.hasDynamicShape() ||
+      resultInfo.bytes() == 0) {
+    context.noteIncomplete("micro.tile_load destination tile has no static "
+                           "capacity");
+    return context.buildMovement(sourceMemory, destinationMemory, sourceInfo,
+                                 resultInfo, EventKind::Load,
+                                 {load.getResult(), load.getToken()});
+  }
+
+  llvm::ArrayRef<int64_t> capacity = resultInfo.shape;
+  std::optional<llvm::SmallVector<int64_t>> valid = evaluatedExtents(
+      load.getValidSizes(), context, "micro.tile_load valid extent");
+  if (!valid || valid->size() != capacity.size()) {
+    if (!valid)
+      return context.buildMovement(sourceMemory, destinationMemory, sourceInfo,
+                                   resultInfo, EventKind::Load,
+                                   {load.getResult(), load.getToken()});
+    return invalid("micro.tile_load valid size rank does not match its "
+                   "destination tile");
+  }
+  for (size_t axis = 0; axis < capacity.size(); ++axis)
+    if ((*valid)[axis] > capacity[axis])
+      return invalid(
+          "micro.tile_load valid extent " + llvm::Twine((*valid)[axis]) +
+          " exceeds its static tile capacity " + llvm::Twine(capacity[axis]));
+
+  std::optional<uint64_t> validElements = checkedElements(*valid);
+  std::optional<uint64_t> capacityElements = checkedElements(capacity);
+  unsigned elementBytes = TileInfo::dtypeBytes(resultInfo.dtype);
+  if (!validElements || !capacityElements || elementBytes == 0)
+    return invalid("micro.tile_load byte count overflows or its dtype has no "
+                   "modeled width");
+
+  uint64_t sourceBytes = 0;
+  if (__builtin_mul_overflow(*validElements,
+                             static_cast<uint64_t>(elementBytes), &sourceBytes))
+    return invalid("micro.tile_load external byte count overflows 64 bits");
+  const uint64_t destinationBytes = resultInfo.bytes();
+  const uint64_t fillElements = *capacityElements - *validElements;
+  return context.buildMovement(sourceMemory, destinationMemory, sourceInfo,
+                               resultInfo, EventKind::Load,
+                               {load.getResult(), load.getToken()},
+                               {sourceBytes, destinationBytes, fillElements});
+}
+
 llvm::Error buildTileAsyncCopy(micro::TileAsyncCopyOp copy,
                                OpDAGBuildContext &context) {
   TileInfo resultInfo = describeType(copy.getResult().getType());
@@ -105,9 +195,39 @@ llvm::Error buildTileStore(micro::TileStoreOp store,
   std::string src = context.memoryOf(store.getSource());
   if (src.empty())
     src = "sram"; // a tile without a tag came from on-chip storage
-  return context.buildMovement(
-      src, micro::stringifyMemorySpace(store.getDstMemory()), sourceInfo,
-      TileInfo(), EventKind::Store, {});
+  std::string destination =
+      micro::stringifyMemorySpace(store.getDstMemory()).str();
+
+  // An absent `valid[...]` keeps the legacy full-tile write. A present one is a
+  // clipped store: only the valid rectangle reaches external memory, so its
+  // traffic and its work are the rectangle, not the static tile capacity.
+  if (store.getValidSizes().empty())
+    return context.buildMovement(src, destination, sourceInfo, TileInfo(),
+                                 EventKind::Store, {});
+
+  std::optional<llvm::SmallVector<int64_t>> valid = evaluatedExtents(
+      store.getValidSizes(), context, "micro.tile_store valid extent");
+  if (!valid || valid->size() != sourceInfo.shape.size())
+    return context.buildMovement(src, destination, sourceInfo, TileInfo(),
+                                 EventKind::Store, {});
+  for (size_t axis = 0; axis < valid->size(); ++axis)
+    if ((*valid)[axis] > sourceInfo.shape[axis])
+      return invalid("micro.tile_store valid extent " +
+                     llvm::Twine((*valid)[axis]) +
+                     " exceeds its source tile capacity " +
+                     llvm::Twine(sourceInfo.shape[axis]));
+
+  std::optional<uint64_t> elements = checkedElements(*valid);
+  unsigned elementBytes = TileInfo::dtypeBytes(sourceInfo.dtype);
+  if (!elements || elementBytes == 0)
+    return invalid("micro.tile_store byte count overflows or its dtype has no "
+                   "modeled width");
+  uint64_t bytes = 0;
+  if (__builtin_mul_overflow(*elements, static_cast<uint64_t>(elementBytes),
+                             &bytes))
+    return invalid("micro.tile_store byte count overflows 64 bits");
+  return context.buildMovement(src, destination, sourceInfo, TileInfo(),
+                               EventKind::Store, {}, {bytes, bytes, 0});
 }
 
 llvm::Error buildStore(micro::StoreOp store, OpDAGBuildContext &context) {
@@ -134,8 +254,27 @@ llvm::Error buildMma(micro::MmaOp mma, OpDAGBuildContext &context) {
   if (shape.size() != 3)
     return invalid("micro.mma shape must have three dimensions");
 
+  // The reduction length is the static K capacity unless the op carries an
+  // explicit `valid_k`. A partial K tail computes only the real terms, so its
+  // work and cost are the valid reduction, never the padded capacity.
+  int64_t reduction = shape[2];
+  if (mlir::Value validK = mma.getValidK()) {
+    llvm::Expected<int64_t> evaluated = context.evaluateIndex(validK);
+    if (!evaluated) {
+      context.noteIncomplete("micro.mma valid_k is not statically evaluable: " +
+                             llvm::toString(evaluated.takeError()));
+    } else if (*evaluated < 0 || *evaluated > shape[2]) {
+      return invalid("micro.mma valid_k " + llvm::Twine(*evaluated) +
+                     " is outside its static K capacity " +
+                     llvm::Twine(shape[2]));
+    } else {
+      reduction = *evaluated;
+    }
+  }
+
+  llvm::SmallVector<int64_t, 3> cycleShape{shape[0], shape[1], reduction};
   uint64_t macs = 1;
-  for (int64_t extent : shape) {
+  for (int64_t extent : cycleShape) {
     std::optional<uint64_t> product =
         llvm::checkedMulUnsigned<uint64_t>(macs, static_cast<uint64_t>(extent));
     if (!product)
@@ -189,7 +328,7 @@ llvm::Error buildMma(micro::MmaOp mma, OpDAGBuildContext &context) {
   event.ownerPool = mappedExecutor(op).str();
   event.workItems = macs;
   llvm::Expected<uint64_t> cycles =
-      context.contractionCycles(*engine, shape, *flops, accumulatorDtype);
+      context.contractionCycles(*engine, cycleShape, *flops, accumulatorDtype);
   if (!cycles)
     return cycles.takeError();
   event.minCycles = *cycles;
@@ -471,6 +610,7 @@ OpDAGBuilderRegistry makeDefaultOpDAGBuilders() {
       builders.registerBuilder<micro::TilePartitionOp>(buildTilePartition));
   llvm::cantFail(builders.registerBuilder<micro::TileAllocOp>(buildTileAlloc));
   llvm::cantFail(builders.registerBuilder<micro::AllocOp>(buildAlloc));
+  llvm::cantFail(builders.registerBuilder<micro::TileLoadOp>(buildTileLoad));
   llvm::cantFail(
       builders.registerBuilder<micro::TileAsyncCopyOp>(buildTileAsyncCopy));
   llvm::cantFail(builders.registerBuilder<micro::AsyncCopyOp>(buildAsyncCopy));

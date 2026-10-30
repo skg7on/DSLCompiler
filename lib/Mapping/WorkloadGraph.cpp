@@ -80,16 +80,19 @@ std::optional<int64_t> constantIndex(Value value) {
 
 /// The number of iterations a `micro.for` / `micro.spatial_for` performs, when
 /// its lower bound, upper bound, and step are all constant indices. `nullopt`
-/// when any bound is not a constant (a non-positive step or an empty range is
-/// likewise not represented as a multiplicity).
+/// when any bound is not a constant; a constant empty range is a *known zero*
+/// trip count, which is deliberately distinct from an unknown one (a zero
+/// extent must produce zero occurrences, not an unrankable plan).
 std::optional<uint64_t> loopTripCount(Operation *loop) {
   if (loop->getNumOperands() < 3)
     return std::nullopt;
   std::optional<int64_t> lower = constantIndex(loop->getOperand(0));
   std::optional<int64_t> upper = constantIndex(loop->getOperand(1));
   std::optional<int64_t> step = constantIndex(loop->getOperand(2));
-  if (!lower || !upper || !step || *step <= 0 || *upper <= *lower)
+  if (!lower || !upper || !step || *step <= 0)
     return std::nullopt;
+  if (*upper <= *lower)
+    return uint64_t{0};
   // Compute the span in unsigned arithmetic: `*upper - *lower` as signed int64
   // would be UB for pathological bounds (for example INT64_MIN..INT64_MAX) even
   // though the `*upper > *lower` guard above makes the difference positive.

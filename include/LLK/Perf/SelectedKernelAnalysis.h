@@ -104,6 +104,10 @@ struct SelectedKernelAnalysis {
   /// allocation accounting (`MicroDAG::liveTileBytesByMemory`), the kernel-side
   /// analogue. `storageLivenessFromPlan` says which.
   std::map<std::string, uint64_t> peakBytes;
+  /// Lanes a bounded movement wrote as padding rather than copied. This is
+  /// reported separately from external traffic so a clipped edge tile is never
+  /// priced as a full padded transfer.
+  uint64_t fillElements = 0;
   /// The reuse ordering edges the plan's liveness analysis requires: one per
   /// accepted alias, from the step that last reads the reused buffer to the
   /// step that first writes the alias. Empty unless `storageLivenessFromPlan`.

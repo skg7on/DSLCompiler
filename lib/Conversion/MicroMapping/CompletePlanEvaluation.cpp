@@ -19,7 +19,10 @@
 
 #include "MicroMappingCommon.h"
 
+#include "LLK/Conversion/MicroMapping/ShapeSpecialization.h"
+
 #include "LLK/Mapping/CostEvent.h"
+#include "LLK/Mapping/CostModel.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/StoragePlan.h"
 
@@ -138,12 +141,205 @@ void recordAnalysisCompleteness(const perf::SelectedKernelAnalysis &analysis,
         reason);
 }
 
+namespace {
+
+std::string sampleLabel(const shape::ShapeValues &values) {
+  std::string label;
+  for (const auto &entry : values) {
+    if (!label.empty())
+      label += ",";
+    label += entry.first + "=" + std::to_string(entry.second);
+  }
+  return label;
+}
+
+/// Scores one dynamic plan on its explicit samples.
+///
+/// Capacity and backend legality are established over the full symbolic domain
+/// first: the plan's storage liveness is independent of loop trip counts, so a
+/// sample can never make an illegal plan legal. Each sample then materializes
+/// an analysis-only clone, binds the *same* plan to it and runs the same strict
+/// analysis a static plan uses. The final cost is the profile's weighted mean;
+/// the per-sample costs stay on the plan so a report and a materialized-IR run
+/// can be compared at each observation.
 llvm::Expected<CompletePlanEvaluation>
-evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
-                     const MappingTarget &target, const CoveringPlan &proposal,
-                     BindContract contract,
-                     std::optional<uint64_t> memoryBudgetBytes,
-                     AnalysisRequirement requirement) {
+evaluateSampledPlan(mlir::ModuleOp source, const WorkloadGraph &graph,
+                    const MappingTarget &target, CoveringPlan plan,
+                    const BoundPlan &bound, const ShapeSampleOptions &shapes,
+                    std::optional<uint64_t> memoryBudgetBytes) {
+  const machine::MachineModel &machine = target.machine();
+  if (!shapes.contract)
+    return llvm::createStringError(
+        llvm::inconvertibleErrorCode(),
+        "sampled plan evaluation requires a shape contract");
+  if (llvm::Error error =
+          perf::validateShapeProfile(*shapes.contract, *shapes.profile))
+    return std::move(error);
+
+  // Full-domain capacity/backend legality. The bound dynamic kernel's loop
+  // bounds are runtime values, so only the plan's own storage liveness is
+  // required here -- never a one-iteration event stream.
+  llvm::Expected<perf::SelectedKernelAnalysis> domain =
+      perf::analyzeSelectedKernel(bound.kernel, machine,
+                                  /*requireComplete=*/false, plan, graph);
+  if (!domain)
+    return rejected(DiagnosticCode::UnsupportedMaterialization,
+                    "analysis_incomplete: " +
+                        llvm::toString(domain.takeError()));
+  if (!domain->storageLivenessFromPlan)
+    return rejected(DiagnosticCode::UnsupportedMaterialization,
+                    "analysis_incomplete: the full symbolic domain's capacity "
+                    "could not be certified from the plan's liveness");
+  if (std::string overflow = occupancyOverflow(*domain, machine);
+      !overflow.empty())
+    return rejected(DiagnosticCode::MemoryCapacityExceeded,
+                    std::move(overflow));
+  if (memoryBudgetBytes) {
+    if (std::string overflow = budgetOverflow(*domain, *memoryBudgetBytes);
+        !overflow.empty())
+      return rejected(DiagnosticCode::MemoryCapacityExceeded,
+                      std::move(overflow));
+  }
+
+  std::vector<WeightedCost> costs;
+  costs.reserve(shapes.profile->samples.size());
+  plan.shapeSamples.clear();
+  plan.shapeSamples.reserve(shapes.profile->samples.size());
+  for (const perf::ShapeSample &sample : shapes.profile->samples) {
+    const std::string label = sampleLabel(sample.values);
+    llvm::Expected<mlir::OwningOpRef<mlir::ModuleOp>> clone =
+        materializeShapeSample(source, *shapes.contract, sample.values);
+    if (!clone)
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      "shape_sample(" + label +
+                          "): " + llvm::toString(clone.takeError()));
+
+    mlir::Operation *sampleKernel = nullptr;
+    unsigned kernels = 0;
+    (*clone)->walk([&](mlir::Operation *op) {
+      if (op->getName().getStringRef() == "micro.kernel") {
+        ++kernels;
+        if (!sampleKernel)
+          sampleKernel = op;
+      }
+    });
+    if (!sampleKernel || kernels != 1)
+      return rejected(
+          DiagnosticCode::UnsupportedMaterialization,
+          "shape_sample(" + label +
+              "): the source must contain exactly one micro.kernel");
+    llvm::Expected<WorkloadGraph> sampleGraph =
+        extractWorkloadGraph(sampleKernel);
+    if (!sampleGraph)
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      "shape_sample(" + label +
+                          "): " + llvm::toString(sampleGraph.takeError()));
+
+    std::unique_ptr<PlanMaterializer> materializer =
+        micro_mapping_detail::createCanonicalPlanMaterializer();
+    llvm::Expected<BoundPlan> sampleBound =
+        bindPlan(clone->get(), plan, target, BindContract::Executable,
+                 materializer.get());
+    if (!sampleBound)
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      "shape_sample(" + label +
+                          "): " + llvm::toString(sampleBound.takeError()));
+    if (!sampleBound->unmaterialized.empty())
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      "shape_sample(" + label +
+                          "): selected decisions were not materialized: " +
+                          llvm::join(sampleBound->unmaterialized, "; "));
+    if (llvm::Error error =
+            verifyTargetOperationCoverage(*sampleBound->module, plan, target))
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      "shape_sample(" + label + "): target_coverage: " +
+                          llvm::toString(std::move(error)));
+
+    llvm::Expected<perf::SelectedKernelAnalysis> analysis =
+        perf::analyzeSelectedKernel(sampleBound->kernel, machine,
+                                    /*requireComplete=*/true, plan,
+                                    *sampleGraph);
+    if (!analysis)
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      "shape_sample(" + label +
+                          "): " + llvm::toString(analysis.takeError()));
+    if (std::string overflow = occupancyOverflow(*analysis, machine);
+        !overflow.empty())
+      return rejected(DiagnosticCode::MemoryCapacityExceeded,
+                      "shape_sample(" + label + "): " + std::move(overflow));
+    if (memoryBudgetBytes) {
+      if (std::string overflow = budgetOverflow(*analysis, *memoryBudgetBytes);
+          !overflow.empty())
+        return rejected(DiagnosticCode::MemoryCapacityExceeded,
+                        "shape_sample(" + label + "): " + std::move(overflow));
+    }
+
+    PlanShapeSampleCost record;
+    record.values = sample.values;
+    record.weight = sample.weight;
+    record.cost = analysis->cost;
+    record.peakBytes = analysis->peakBytes;
+    record.fillElements = analysis->fillElements;
+    plan.shapeSamples.push_back(std::move(record));
+    costs.push_back({analysis->cost, sample.weight});
+
+    // A single observation is also a usable event snapshot. A multi-sample plan
+    // deliberately carries none: no one sample's stream describes the weighted
+    // mean, and presenting one as if it did would make the plan's score and its
+    // snapshot disagree.
+    if (shapes.profile->samples.size() == 1) {
+      if (llvm::Error error =
+              attachPlanAnalysisEvents(plan, analysis->events, machine))
+        plan.diagnostics.warnings.push_back(
+            "sampled plan evaluation: the sample's event snapshot could not be "
+            "attached: " +
+            llvm::toString(std::move(error)));
+    }
+  }
+
+  llvm::Expected<Cost> total = weightedMeanCost(costs);
+  if (!total)
+    return total.takeError();
+  plan.totalCost = *total;
+  plan.scoreSource = PlanScoreSource::Schedule;
+  plan.shapeAggregation = shapes.profile->aggregation;
+  plan.shapeMaxVariants = shapes.profile->maxVariants;
+  plan.shapeProfileCanonical = perf::canonicalShapeProfile(*shapes.profile);
+  if (shapes.profile->samples.size() > 1)
+    plan.diagnostics.warnings.push_back(
+        "sampled plan evaluation: cost is the " + plan.shapeAggregation +
+        " over " + std::to_string(shapes.profile->samples.size()) +
+        " shape samples; the event snapshot is absent by design");
+
+  // The durable choices must still reproduce their id. This is the same check
+  // the static path applies; sampling changes the score, never the decisions.
+  bool stable = false;
+  for (unsigned pass = 0; pass < kMaxEvaluationPasses; ++pass) {
+    CoveringPlan probe = plan;
+    if (llvm::Error error = finalizeStoragePlan(graph, probe, machine))
+      break;
+    if (probe.id == plan.id) {
+      stable = true;
+      break;
+    }
+  }
+  if (!stable)
+    return rejected(DiagnosticCode::UnsupportedMaterialization,
+                    "plan evaluation: the finalized plan's decisions do not "
+                    "reproduce a stable identity");
+
+  CompletePlanEvaluation evaluation;
+  evaluation.plan = std::move(plan);
+  return evaluation;
+}
+
+} // namespace
+
+llvm::Expected<CompletePlanEvaluation> evaluateCompletePlan(
+    mlir::ModuleOp source, const WorkloadGraph &graph,
+    const MappingTarget &target, const CoveringPlan &proposal,
+    BindContract contract, std::optional<uint64_t> memoryBudgetBytes,
+    AnalysisRequirement requirement, const ShapeSampleOptions &shapes) {
   const machine::MachineModel &machine = target.machine();
   const bool strict = contract == BindContract::Executable;
   const bool requireComplete =
@@ -251,6 +447,21 @@ evaluateCompletePlan(mlir::ModuleOp source, const WorkloadGraph &graph,
           verifyTargetOperationCoverage(*bound->module, plan, target))
     return rejected(DiagnosticCode::UnsupportedMaterialization,
                     "target_coverage: " + llvm::toString(std::move(error)));
+
+  // --- 3c. sampled dynamic analysis ---------------------------------------
+  //
+  // A plan whose executable kernel has runtime loop bounds cannot be ranked
+  // from one charged iteration. When the caller supplies explicit samples, the
+  // full symbolic domain is certified first and every sample is then scored on
+  // its own analysis-only clone. Without a profile the pre-sample behavior is
+  // preserved exactly: the strict analysis below refuses the plan.
+  if (shapes.profile) {
+    if (requirement != AnalysisRequirement::Complete)
+      return rejected(DiagnosticCode::UnsupportedMaterialization,
+                      "sampled analysis requires complete evaluation");
+    return evaluateSampledPlan(source, graph, target, plan, *bound, shapes,
+                               memoryBudgetBytes);
+  }
 
   // --- 4. selected static analysis ----------------------------------------
   //

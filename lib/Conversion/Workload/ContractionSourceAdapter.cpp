@@ -349,11 +349,15 @@ realizedContractionFacts(Operation *root, const perf::SearchSpace &space,
   auto dims = inferContractionDimensions(root);
   if (failed(dims))
     return error("source root does not declare contraction dimensions");
-  if (!dims->M.isConstant() || !dims->N.isConstant() || !dims->K.isConstant())
-    return error(
-        "dynamic contraction extents need a concrete shape sample before work "
-        "facts can be described");
-  auto facts = contractionFacts(root);
+  // A symbolic axis has no concrete work extent to describe. Candidate
+  // legality is still decided over the *full* domain: the facts carry the
+  // source dtypes and tile choices, while the extents stay explicitly unknown
+  // (zero) so a constraint that needs a static extent cannot silently treat a
+  // sample as the whole domain. The plan-level boundary checks, not this cheap
+  // filter, are what prove the dynamic domain's movement legality.
+  const bool symbolic =
+      !dims->M.isConstant() || !dims->N.isConstant() || !dims->K.isConstant();
+  auto facts = contractionFacts(root, /*allowDynamic=*/symbolic);
   if (!facts)
     return facts.takeError();
 
@@ -368,6 +372,11 @@ realizedContractionFacts(Operation *root, const perf::SearchSpace &space,
           : dtypeName(elementTypeOf(facts->fragment.rhsOperandTypes.front()));
   sourceShape.accumulatorDType = dtypeName(facts->contract.accumulatorElemType);
   sourceShape.outputDType = dtypeName(facts->contract.outputElemType);
+  if (symbolic) {
+    sourceShape.M = 0;
+    sourceShape.N = 0;
+    sourceShape.K = 0;
+  }
 
   std::optional<int64_t> bm = candidate.integer("BM");
   std::optional<int64_t> bn = candidate.integer("BN");
@@ -379,9 +388,15 @@ realizedContractionFacts(Operation *root, const perf::SearchSpace &space,
     return error("candidate must bind BM, BN, and BK before legality checking");
   const bool padded = tail && *tail == "pad";
   perf::WorkloadShape contraction = sourceShape;
-  contraction.M = padded ? *bm : std::min(*bm, sourceShape.M);
-  contraction.N = padded ? *bn : std::min(*bn, sourceShape.N);
-  contraction.K = padded ? *bk : std::min(*bk, sourceShape.K);
+  // A symbolic axis keeps the scheduled tile capacity: the bounded export's
+  // MMA describes the static instruction tile, and its runtime `valid_k` (plus
+  // clipped boundary movement) carries the concrete extent.
+  const bool symbolicM = !dims->M.isConstant();
+  const bool symbolicN = !dims->N.isConstant();
+  const bool symbolicK = !dims->K.isConstant();
+  contraction.M = padded || symbolicM ? *bm : std::min(*bm, sourceShape.M);
+  contraction.N = padded || symbolicN ? *bn : std::min(*bn, sourceShape.N);
+  contraction.K = padded || symbolicK ? *bk : std::min(*bk, sourceShape.K);
   contraction.outputDType = sourceShape.accumulatorDType;
 
   perf::BindingFacts realized;

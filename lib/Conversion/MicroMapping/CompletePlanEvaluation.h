@@ -32,6 +32,8 @@
 #include "LLK/Mapping/PlanBinder.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Perf/SelectedKernelAnalysis.h"
+#include "LLK/Perf/ShapeProfile.h"
+#include "LLK/Shape/ShapeContract.h"
 
 #include "mlir/IR/BuiltinOps.h"
 
@@ -45,6 +47,16 @@ namespace mlir::llk::mapping {
 /// Complete is required for ranking, independently of executable lowering.
 /// PartialReport is an inspectable, explicitly non-ranked artifact.
 enum class AnalysisRequirement { Complete, PartialReport };
+
+/// Explicit concrete observations for a dynamic plan. A null profile keeps the
+/// pre-sample behaviour: a plan whose kernel has runtime loop bounds cannot be
+/// ranked. When both are set, every candidate must first be legal over its full
+/// symbolic domain and then analyzable at every sample; the plan's final cost
+/// is the profile's weighted mean and its per-sample costs are retained.
+struct ShapeSampleOptions {
+  const shape::ShapeContract *contract = nullptr;
+  const perf::ShapeProfile *profile = nullptr;
+};
 
 /// Evaluates one complete proposal against `target`, in the context of the
 /// `source` module it would be bound to and the `graph` it was planned from.
@@ -113,7 +125,8 @@ llvm::Expected<CompletePlanEvaluation> evaluateCompletePlan(
     const MappingTarget &target, const CoveringPlan &proposal,
     BindContract contract,
     std::optional<uint64_t> memoryBudgetBytes = std::nullopt,
-    AnalysisRequirement requirement = AnalysisRequirement::Complete);
+    AnalysisRequirement requirement = AnalysisRequirement::Complete,
+    const ShapeSampleOptions &shapes = {});
 
 /// Applies a selected-kernel analysis's completeness verdict to `plan` (issue
 /// #129, task R7 review): a **complete** analysis records nothing; an

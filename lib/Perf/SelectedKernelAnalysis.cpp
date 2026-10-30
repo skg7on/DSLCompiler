@@ -72,13 +72,17 @@ uint64_t eventCycles(const mapping::PlanCostEvent &event) {
 std::map<std::string, uint64_t> dagTrafficByMemory(const MicroDAG &dag) {
   std::map<std::string, uint64_t> traffic;
   for (const MicroEvent &event : dag.events) {
-    if (event.bytes == 0)
-      continue;
-    // A movement crosses two levels; both see the traffic.
-    if (!event.srcMemory.empty())
-      traffic[event.srcMemory] += event.bytes;
-    if (!event.tileMemory.empty())
-      traffic[event.tileMemory] += event.bytes;
+    // A movement crosses two levels; both see their own side's traffic. A
+    // clipped load external side is the valid rectangle while its local side is
+    // the full static tile it fills, so the two counts differ.
+    const uint64_t sourceBytes =
+        event.sourceBytes ? event.sourceBytes : event.bytes;
+    const uint64_t destinationBytes =
+        event.destinationBytes ? event.destinationBytes : event.bytes;
+    if (!event.srcMemory.empty() && sourceBytes)
+      traffic[event.srcMemory] += sourceBytes;
+    if (!event.tileMemory.empty() && destinationBytes)
+      traffic[event.tileMemory] += destinationBytes;
   }
   return traffic;
 }
@@ -116,6 +120,8 @@ analyzeSelectedDag(const MicroDAG &dag, const machine::MachineModel &machine,
   analysis.trafficBytes = dagTrafficByMemory(dag);
 
   analysis.peakBytes = dag.liveTileBytesByMemory;
+  for (const MicroEvent &event : dag.events)
+    analysis.fillElements += event.fillElements;
 
   // --- completeness ---------------------------------------------------------
   //

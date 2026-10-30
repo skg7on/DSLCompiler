@@ -18,6 +18,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
 #include <functional>
+#include <optional>
 #include <utility>
 
 namespace mlir::llk::perf {
@@ -51,11 +52,38 @@ public:
   virtual llvm::Error buildLogicalTile(mlir::Value source, mlir::Value result,
                                        const std::optional<std::string> &owner,
                                        EventKind kind) = 0;
+  /// Per-side byte facts for a boundary movement. An absent side means "use
+  /// the movement's ordinary shape-derived byte count"; a present zero is a
+  /// known empty rectangle (an all-zero valid extent), which is different from
+  /// an unknown footprint.
+  struct MovementBytes {
+    std::optional<uint64_t> sourceBytes;
+    std::optional<uint64_t> destinationBytes;
+    uint64_t fillElements = 0;
+  };
   /// Resolve the current operation's route and bind outputs to its final hop.
   virtual llvm::Error buildMovement(llvm::StringRef src, llvm::StringRef dst,
                                     const TileInfo &source,
                                     const TileInfo &result, EventKind kind,
                                     llvm::ArrayRef<mlir::Value> outputs) = 0;
+  /// The bounded form. A clipped load/store moves only its valid rectangle but
+  /// may fill a full static destination tile; the overrides carry those facts
+  /// so external traffic and local fill stay separate.
+  virtual llvm::Error buildMovement(llvm::StringRef src, llvm::StringRef dst,
+                                    const TileInfo &source,
+                                    const TileInfo &result, EventKind kind,
+                                    llvm::ArrayRef<mlir::Value> outputs,
+                                    const MovementBytes &bytes) {
+    if (bytes.sourceBytes || bytes.destinationBytes || bytes.fillElements)
+      return llvm::make_error<llvm::StringError>(
+          "bounded movement facts are not modeled by this DAG context",
+          llvm::inconvertibleErrorCode());
+    return buildMovement(src, dst, source, result, kind, outputs);
+  }
+  /// Evaluate a checked shape index in the current iteration environment. The
+  /// default resolves constants only; the core context binds induction
+  /// variables and evaluates the emitted shape arithmetic.
+  virtual llvm::Expected<int64_t> evaluateIndex(mlir::Value value) const;
   virtual llvm::Error noteAllocation(const TileInfo &info,
                                      llvm::StringRef memory) = 0;
   /// Select the requested capability, honoring the current mapped placement.

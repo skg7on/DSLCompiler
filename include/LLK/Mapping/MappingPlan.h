@@ -668,6 +668,17 @@ enum class PlanScoreSource { Accumulation, Schedule };
 llvm::StringRef stringifyPlanScoreSource(PlanScoreSource source);
 
 /// A complete executable proposal covering every required node.
+/// The cost one explicit concrete shape sample produced for a dynamic plan.
+/// These are observations, not a domain-wide claim: the plan's declared
+/// executable domain remains the symbolic contract it was compiled for.
+struct PlanShapeSampleCost {
+  std::map<std::string, int64_t> values;
+  double weight = 1.0;
+  Cost cost;
+  std::map<std::string, uint64_t> peakBytes;
+  uint64_t fillElements = 0;
+};
+
 struct CoveringPlan {
   PlanId id = 0;
   uint64_t sourceBindingHash = 0;
@@ -727,6 +738,16 @@ struct CoveringPlan {
   /// replay re-derives it (or refuses to rank) rather than trusting a snapshot
   /// that may no longer describe the kernel it would be bound to.
   std::optional<PlanEventDAG> analysisEvents;
+  /// Per-sample costs of a dynamic plan ranked on an explicit shape profile,
+  /// in profile order. Empty for a statically shaped plan or one evaluated
+  /// without a profile. Derived, so it never joins `canonicalPlanString`.
+  std::vector<PlanShapeSampleCost> shapeSamples;
+  /// The aggregation policy that combined `shapeSamples` (`weighted_mean`), or
+  /// empty when no sample was scored.
+  std::string shapeAggregation;
+  uint32_t shapeMaxVariants = 1;
+  /// The canonical profile identity the samples came from, for report replay.
+  std::string shapeProfileCanonical;
   PlanDiagnostics diagnostics;
 
   // --- persisted selected state (schema v3, tasks B1/R1) -------------------

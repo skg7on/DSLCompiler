@@ -16,6 +16,7 @@
 #include "LLK/Conversion/MicroMapping/MeasurementStore.h"
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Perf/CandidateGenerator.h"
+#include "LLK/Perf/ShapeProfile.h"
 #include "LLK/Perf/TuningSession.h"
 #include "LLK/Runtime/MappedExecutable.h"
 #include "LLK/Runtime/MappedInvocation.h"
@@ -106,6 +107,11 @@ struct MappedTuningOptions {
   uint64_t measureTop = 1;
   uint64_t maxMeasurementAttempts = 0;
   MappedMeasurementOptions measurement;
+  /// Explicit concrete observations for a dynamic workload. Every candidate
+  /// must be legal over the full symbolic domain and analyzable at every
+  /// sample; its ranking metric is the profile's weighted mean. Absent means
+  /// the pre-sample behaviour: a kernel with runtime loop bounds is unrankable.
+  std::optional<perf::ShapeProfile> shapeProfile;
 };
 
 struct MappedTuningCandidate {

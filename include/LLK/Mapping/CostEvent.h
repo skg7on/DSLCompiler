@@ -98,6 +98,17 @@ struct PlanCostEvent {
   /// `MicroEvent::workItems` uses.
   uint64_t workItems = 0;
   uint64_t bytes = 0;
+  /// A bounded movement can move fewer bytes across its link than it
+  /// materializes at its destination: a clipped load copies only the valid
+  /// rectangle from external memory but fills the whole static tile locally.
+  /// Zero means "the same as `bytes`", preserving every existing event.
+  /// The traffic helpers and the DRAM total read these per-side counts so
+  /// external traffic is never inflated by padded local capacity.
+  uint64_t sourceBytes = 0;
+  uint64_t destinationBytes = 0;
+  /// Lanes the movement wrote as padding rather than copied. Reported work, not
+  /// traffic; zero for a full-tile movement.
+  uint64_t fillElements = 0;
   std::vector<uint32_t> deps;
   /// The executor the work runs on, when the plan records one.
   std::string owner{};

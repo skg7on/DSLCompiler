@@ -136,6 +136,13 @@ llvm::Expected<ShapeValues>
 bindShapeValues(const ShapeContract &contract,
                 llvm::ArrayRef<PortShapeValues> values);
 
+/// Checks a complete symbol binding without port extents: every declared symbol
+/// must occur exactly once, no unknown symbol may be present, and each bound
+/// value must be nonnegative and satisfy its declared constraint. This is the
+/// check a shape sample performs before an analysis clone is materialized.
+llvm::Error validateShapeValues(const ShapeContract &contract,
+                                const ShapeValues &values);
+
 /// The canonical, collision-safe identity of a contract. Every variable-length
 /// string is length-delimited, constants and symbols carry distinct tags, and
 /// port order is preserved while the symbol table is lexical.

@@ -348,6 +348,13 @@ void printMicroPerfYaml(llvm::raw_ostream &os, const MicroPerfReport &report) {
 
   os << "complete: " << (report.complete ? "true" : "false") << "\n";
   emitStringList(os, "", "incomplete_reasons", report.incompleteReasons);
+  if (report.sampled) {
+    os << "sampled: true\nshape_values:\n";
+    for (const auto &entry : report.shapeValues)
+      os << "  " << entry.first << ": " << entry.second << "\n";
+  } else {
+    os << "sampled: false\n";
+  }
 
   os << "totals:\n";
   os << "  flops: " << report.l0.totalFlops << "\n";
@@ -400,6 +407,12 @@ void printMicroPerfText(llvm::raw_ostream &os, const MicroPerfReport &report) {
 
   os << "complete: " << (report.complete ? "true" : "false") << "\n";
   emitTextList(os, "incomplete reasons", report.incompleteReasons);
+  if (report.sampled) {
+    os << "shape sample:";
+    for (const auto &entry : report.shapeValues)
+      os << " " << entry.first << "=" << entry.second;
+    os << "\n";
+  }
 
   os << "work\n";
   os << "  flops         " << report.l0.totalFlops << "\n";
