@@ -86,7 +86,9 @@ if(LLK_BUILD_E2E_TESTS)
   # failure, not a skip, so CI evidence cannot silently pass on the wrong host.
   add_test(NAME MappedAVX2Acceptance COMMAND MappedAcceptance
       --require-selected-target --gtest_filter=MappedAcceptance.*)
-  set_tests_properties(MappedAVX2Acceptance PROPERTIES LABELS "selected-avx2")
+  set_tests_properties(MappedAVX2Acceptance PROPERTIES
+      LABELS "selected-avx2"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
   add_test(NAME SelectedTargetFlagContract
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_selected_target_flag.py
@@ -111,7 +113,8 @@ if(LLK_BUILD_E2E_TESTS)
       --require-selected-target
       --gtest_filter=GenericElementwise.SelectedAvx2*)
   set_tests_properties(GenericElementwiseAVX2Test PROPERTIES
-      LABELS "selected-avx2")
+      LABELS "selected-avx2"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
   set(_llk_framework_primitives_libs
       LLKMappedCompilation LLKMapping LLKTargetMapping LLKPerf MicroDialect
@@ -128,7 +131,9 @@ if(LLK_BUILD_E2E_TESTS)
   add_test(NAME FrameworkPrimitivesAVX2Test COMMAND FrameworkPrimitivesTest
       --require-selected-target
       --gtest_filter=FrameworkPrimitives.SelectedAvx2*)
-  set_tests_properties(FrameworkPrimitivesAVX2Test PROPERTIES LABELS "selected-avx2")
+  set_tests_properties(FrameworkPrimitivesAVX2Test PROPERTIES
+      LABELS "selected-avx2"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
   # Compile-once dynamic acceptance (issue #197). One binary serves both the
   # portable and the required-selected-target contracts; the run-time flag picks
@@ -146,8 +151,13 @@ if(LLK_BUILD_E2E_TESTS)
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   set_target_properties(DynamicMappedAcceptance PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  # The reference entry keeps the host-independent lowering case that ran in the
+  # old reference binary; the execution case needs AVX2 and stays out.
+  string(CONCAT _llk_dynamic_reference_filter
+      "DynamicMappedAcceptance.*:"
+      "DynamicMappedSelected.SelectedLoweringKeepsBoundedBoundariesAndRuntimeK")
   add_test(NAME DynamicMappedAcceptance COMMAND DynamicMappedAcceptance
-      --gtest_filter=DynamicMappedAcceptance.*:DynamicMappedSelected.SelectedLoweringKeepsBoundedBoundariesAndRuntimeK)
+      --gtest_filter=${_llk_dynamic_reference_filter})
   set_tests_properties(DynamicMappedAcceptance PROPERTIES
       LABELS "mapped-reference"
       SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
@@ -156,7 +166,8 @@ if(LLK_BUILD_E2E_TESTS)
   add_test(NAME DynamicMappedAVX2Acceptance COMMAND DynamicMappedAcceptance
       --require-selected-target --gtest_filter=DynamicMapped*.*)
   set_tests_properties(DynamicMappedAVX2Acceptance PROPERTIES
-      LABELS "selected-avx2")
+      LABELS "selected-avx2"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
   add_test(NAME RequiredExecutionEvidenceParser
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_required_execution_test.py)

@@ -23,6 +23,7 @@ def check_pair(binary, suite, gtest_filter):
 
     required = run(binary, "--require-selected-target", "--gtest_list_tests")
     assert required.returncode == 0, required.stderr
+    assert suite in required.stdout
 
     unsupported = run(
         binary,
