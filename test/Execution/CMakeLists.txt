@@ -7,7 +7,12 @@ set(_llk_execution_jit_sources
       swiglu_fused_memory.cpp)
 
 if(LLK_BUILD_E2E_TESTS)
-  set(_llk_execution_e2e_sources ${_llk_execution_jit_sources})
+  set(_llk_execution_e2e_sources
+      ${_llk_execution_jit_sources}
+      mapped_invocation.cpp
+      mapped_codegen_requirements.cpp
+      mapped_allocation_lifetime.cpp
+      selected_group_lowering.cpp)
   set(_llk_execution_e2e_libs
       LLKToLinalg LLKTransforms LLKFuseDoubleContraction LLKPackWeights
       LLKToMicro LLKMicroToLinalg LLKMappedCompilation LLKMapping
@@ -35,13 +40,27 @@ add_llk_test_category(Execution
         jit_cache_hit.cpp
         cache_eviction.cpp
         ${_llk_execution_e2e_sources}
+        dynamic_mapped_invocation.cpp
     LIBRARIES
         LLKTargetX86
         LLKRuntime
         ${_llk_execution_e2e_libs}
+        LLKMappedCompilation
+        LLKWorkloadContracts
     DEFINITIONS
         LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
+
+# check_required_execution.py requires this name in the CI JUnit evidence. The
+# suite it filters only exists when JIT tests are built.
+if(LLK_BUILD_E2E_TESTS)
+  add_test(NAME MappedAllocationLifetimeTest COMMAND LLKExecutionTests
+      --gtest_filter=MappedAllocationLifetime.*)
+  set_tests_properties(MappedAllocationLifetimeTest PROPERTIES
+      LABELS "mapped-reference;Execution"
+      TIMEOUT 60
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
+endif()
 
 # Separate mapped binaries keep the portable and required-selected-target
 # contracts independently invokable by CI. Place the acceptance executable at
@@ -79,31 +98,6 @@ if(LLK_BUILD_E2E_TESTS)
           $<TARGET_FILE:DynamicMappedAVX2Acceptance>
           $<TARGET_FILE:DynamicMappedAcceptance>)
   set_tests_properties(SelectedTargetFlagContract PROPERTIES LABELS "selected-avx2")
-
-  add_executable(MappedInvocationTest mapped_invocation.cpp)
-  target_link_libraries(MappedInvocationTest PRIVATE LLKRuntime GTest::gtest_main
-      LLK::MLIR)
-  add_test(NAME MappedInvocationTest COMMAND MappedInvocationTest)
-  set_tests_properties(MappedInvocationTest PROPERTIES LABELS "Execution")
-
-  add_executable(MappedAllocationLifetimeTest mapped_allocation_lifetime.cpp)
-  target_link_libraries(MappedAllocationLifetimeTest PRIVATE LLKRuntime
-      LLKMappedCompilation LLKWorkloadContracts MicroDialect LLKDialect
-      GTest::gtest_main LLK::MLIR)
-  target_compile_definitions(MappedAllocationLifetimeTest PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-  add_test(NAME MappedAllocationLifetimeTest COMMAND MappedAllocationLifetimeTest)
-  set_tests_properties(MappedAllocationLifetimeTest PROPERTIES
-      LABELS "mapped-reference")
-
-  add_executable(MappedCodegenRequirementsTest
-      mapped_codegen_requirements.cpp)
-  target_link_libraries(MappedCodegenRequirementsTest PRIVATE LLKRuntime
-      GTest::gtest_main)
-  add_test(NAME MappedCodegenRequirementsTest
-      COMMAND MappedCodegenRequirementsTest)
-  set_tests_properties(MappedCodegenRequirementsTest PROPERTIES
-      LABELS "Execution")
 
   set(_llk_generic_elementwise_libs
       LLKMappedCompilation LLKMappedTuning LLKSourceCandidates
@@ -191,12 +185,6 @@ if(LLK_BUILD_E2E_TESTS)
   set_tests_properties(DynamicMappedAVX2Acceptance PROPERTIES
       LABELS "selected-avx2")
 
-  add_executable(SelectedGroupLoweringTest selected_group_lowering.cpp)
-  target_link_libraries(SelectedGroupLoweringTest PRIVATE LLKMappedCompilation
-      LLKMapping GTest::gtest_main LLK::MLIR)
-  add_test(NAME SelectedGroupLoweringTest COMMAND SelectedGroupLoweringTest)
-  set_tests_properties(SelectedGroupLoweringTest PROPERTIES LABELS "Execution")
-
   add_test(NAME RequiredExecutionEvidenceParser
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_required_execution_test.py)
   set_tests_properties(RequiredExecutionEvidenceParser PROPERTIES
@@ -216,16 +204,3 @@ if(LLK_BUILD_E2E_TESTS)
   set_tests_properties(SelectedExecutionEvidenceValidator PROPERTIES
       LABELS "selected-avx2")
 endif()
-
-# ABI v2 and output-destination preparation are IR and descriptor contracts, so
-# they are exercised without a JIT: descriptor resolution binds symbols before
-# entry, and the prepared callable signature is inspected directly. Runtime
-# allocation and ownership behavior stays in the JIT lifetime tests.
-add_executable(DynamicMappedInvocationTest dynamic_mapped_invocation.cpp)
-target_link_libraries(DynamicMappedInvocationTest PRIVATE LLKMappedCompilation
-    LLKToMicro LLKTargetMapping LLKMapping LLKWorkloadContracts MicroDialect
-    LLKDialect GTest::gtest_main LLK::MLIR)
-target_compile_definitions(DynamicMappedInvocationTest PRIVATE
-    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-add_test(NAME DynamicMappedInvocationTest COMMAND DynamicMappedInvocationTest)
-set_tests_properties(DynamicMappedInvocationTest PROPERTIES LABELS "Execution")

@@ -289,8 +289,8 @@ And in the selected-record block:
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-ninja -C build MappedCodegenRequirementsTest AOTObjectEmission
-ctest --test-dir build -R '^(MappedCodegenRequirementsTest|AOTObjectEmission)$' --output-on-failure
+ninja -C build LLKExecutionTests AOTObjectEmission
+ctest --test-dir build -R '^(MappedCodegenRequirements\.|AOTObjectEmission)' --output-on-failure
 ```
 
 Expected: compile failure (`applyInvocationAttributes` missing) and identity-key failures.
@@ -472,8 +472,8 @@ The `record` is declared later in the function; move the two `record` assignment
 - [ ] **Step 4: Run the tests to verify they pass**
 
 ```bash
-ninja -C build MappedCodegenRequirementsTest AOTObjectEmission llk-compile
-ctest --test-dir build -R '^(MappedCodegenRequirementsTest|AOTObjectEmission)$' --output-on-failure
+ninja -C build LLKExecutionTests AOTObjectEmission llk-compile
+ctest --test-dir build -R '^(MappedCodegenRequirements\.|AOTObjectEmission)' --output-on-failure
 ```
 
 Expected: PASS. The AOT test's sidecar now records `schemaVersion = 2`, `streamingVectorLengthBits = null` and an empty `invocationAttributes` for both the reference and selected SVE objects.

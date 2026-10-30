@@ -1,32 +1,7 @@
-# Dynamic Shape Task 3 (issue #194): dynamic plan legality and resource
-# certification. A standalone binary so its CTest entry is the named
-# `DynamicShapeMappingTest` the task's verification gate runs, and so it can
-# reuse the issue #129 resource fixtures without joining that category's binary.
-add_executable(DynamicShapeMappingTest
-    dynamic_shape_mapping.cpp
-    $<TARGET_OBJECTS:LLKTestFixtures>
-)
-target_link_libraries(DynamicShapeMappingTest PRIVATE
-    LLKMapping
-    LLKTargetMapping
-    LLKMicroMapping
-    LLKPerf
-    MicroDialect
-    LLKShape
-    LLK::MLIR
-    GTest::gtest_main
-)
-target_compile_definitions(DynamicShapeMappingTest PRIVATE
-    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-)
-target_include_directories(DynamicShapeMappingTest PRIVATE
-    ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
-)
-add_test(NAME DynamicShapeMappingTest COMMAND DynamicShapeMappingTest)
-
 add_llk_test_category(Mapping
     SOURCES
         stable_hash.cpp
+        dynamic_shape_mapping.cpp
         codegen_requirements.cpp
         cost_model.cpp
         search_binding.cpp
@@ -62,6 +37,7 @@ add_llk_test_category(Mapping
         LLKMicroMapping
         LLKMappedCompilation
         LLKPerf
+        LLKShape
         LLKMicroToLinalg
         MicroDialect
         LLK::MLIR
@@ -73,3 +49,11 @@ add_llk_test_category(Mapping
     INCLUDE_DIRECTORIES
         ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
 )
+
+# Historical gate name from docs/superpowers/plans/2026-10-17-dynamic-shape-llk-microir.md.
+add_test(NAME DynamicShapeMappingTest COMMAND LLKMappingTests
+    --gtest_filter=DynamicShapeMapping.*)
+set_tests_properties(DynamicShapeMappingTest PROPERTIES
+    LABELS "Mapping"
+    TIMEOUT 60
+    SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")

@@ -1,43 +1,48 @@
-# The framework source tests must run without an E2E/JIT guard.
-add_executable(FrameworkSourceTest workload_contract.cpp
-    generic_source_candidates.cpp source_adapter_registry.cpp
-    elementwise_source_adapter.cpp measurement_store.cpp)
-target_link_libraries(FrameworkSourceTest PRIVATE LLKWorkloadContracts
-    LLKSourceCandidates LLKMappedTuning LLKMicroMapping LLKMicroToLinalg
-    LLKDialect MicroDialect GTest::gtest_main LLK::MLIR)
-target_compile_definitions(FrameworkSourceTest PRIVATE
-    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-add_test(NAME FrameworkSourceTest COMMAND FrameworkSourceTest)
-set_tests_properties(FrameworkSourceTest PROPERTIES LABELS "Tuning")
+# One binary for the whole category. Two suites are also reachable under their
+# historical binary names because the dynamic-shape plan cites them as gates.
+set(_llk_tuning_sources
+    workload_contract.cpp
+    generic_source_candidates.cpp
+    source_adapter_registry.cpp
+    elementwise_source_adapter.cpp
+    measurement_store.cpp
+    dynamic_shape_contract.cpp)
+if(LLK_BUILD_E2E_TESTS)
+  list(APPEND _llk_tuning_sources
+      mapped_tuning_session.cpp
+      candidate_instantiation.cpp)
+endif()
 
-# Symbolic shape data, checked binding and the versioned workload contract.
-# This target needs no JIT or E2E guard: it exercises data and MLIR attribute
-# encoding only.
-add_executable(DynamicShapeContractTest dynamic_shape_contract.cpp)
-target_link_libraries(DynamicShapeContractTest PRIVATE LLKShape
-    LLKWorkloadContracts LLKKernel LLKDialect MicroDialect
-    GTest::gtest_main LLK::MLIR)
-add_test(NAME DynamicShapeContractTest COMMAND DynamicShapeContractTest)
-set_tests_properties(DynamicShapeContractTest PROPERTIES LABELS "Tuning")
+add_llk_test_category(Tuning
+    SOURCES ${_llk_tuning_sources}
+    LIBRARIES
+        LLKWorkloadContracts
+        LLKSourceCandidates
+        LLKMappedTuning
+        LLKMicroMapping
+        LLKMicroToLinalg
+        LLKShape
+        LLKKernel
+        LLKToMicro
+        LLKDialect
+        MicroDialect
+        LLK::MLIR
+    DEFINITIONS
+        LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+
+# Historical gate names. See docs/superpowers/plans/2026-10-17-dynamic-shape-llk-microir.md.
+add_test(NAME FrameworkSourceTest COMMAND LLKTuningTests
+    --gtest_filter=WorkloadContract.*:FrameworkTest.*:BindingSchema.*:SourceAdapterRegistry.*:SourceSelection.*:ElementwiseSourceAdapter.*:ElementwiseSourceAdapterContext.*:MeasurementStoreTest.*)
+add_test(NAME DynamicShapeContractTest COMMAND LLKTuningTests
+    --gtest_filter=ShapeContract.*)
+set_tests_properties(FrameworkSourceTest DynamicShapeContractTest
+    PROPERTIES
+        LABELS "Tuning"
+        TIMEOUT 60
+        SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
 if(LLK_BUILD_E2E_TESTS)
-  add_executable(MappedTuningSessionTest mapped_tuning_session.cpp)
-  target_link_libraries(MappedTuningSessionTest PRIVATE LLKMappedTuning
-      GTest::gtest_main LLK::MLIR)
-  target_compile_definitions(MappedTuningSessionTest PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-  add_test(NAME MappedTuningSessionTest COMMAND MappedTuningSessionTest)
-  set_tests_properties(MappedTuningSessionTest PROPERTIES LABELS "Tuning")
-
-  add_executable(CandidateInstantiationTest candidate_instantiation.cpp)
-  target_link_libraries(CandidateInstantiationTest PRIVATE LLKToMicro
-      LLKMicroMapping LLKDialect MicroDialect GTest::gtest_main
-      LLK::MLIR)
-  target_compile_definitions(CandidateInstantiationTest PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-  add_test(NAME CandidateInstantiationTest COMMAND CandidateInstantiationTest)
-  set_tests_properties(CandidateInstantiationTest PROPERTIES LABELS "Tuning")
-
   add_test(NAME MappedTuneCLI
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/mapped_tune_cli.py
           $<TARGET_FILE:llk-tune> $<TARGET_FILE:llk-compile> ${CMAKE_SOURCE_DIR})
