@@ -784,7 +784,7 @@ Title: `refactor(build): collapse reference and selected-target test binaries`
 
 **Files:**
 - Modify: `test/Execution/mapped_acceptance.cpp:264,462,660,1106,1130,1170-1200`
-- Modify: `test/Execution/CMakeLists.txt:50-80`
+- Modify: `test/Execution/CMakeLists.txt:74-100`
 - Modify: `test/Execution/check_selected_target_flag.py`
 - Modify: `.github/workflows/ci.yml:123`
 
@@ -879,7 +879,7 @@ int main(int argc, char **argv) {
 
 - [ ] **Step 4: Delete the second target from `test/Execution/CMakeLists.txt`**
 
-Replace the `MappedAVX2Acceptance` block (lines 67-75) and the `MappedAcceptance` block (lines 56-65) with one target and two entries:
+Replace the `MappedAVX2Acceptance` block (lines 85-93) and the `MappedAcceptance` block (lines 74-83) with one target and two entries:
 
 ```cmake
   add_executable(MappedAcceptance mapped_acceptance.cpp)
@@ -1015,7 +1015,7 @@ git commit -m "refactor(build): serve both acceptance gates from one binary"
 
 **Files:**
 - Modify: `test/Execution/generic_elementwise.cpp:621,669,679-687`
-- Modify: `test/Execution/CMakeLists.txt:104-128`
+- Modify: `test/Execution/CMakeLists.txt:106-126`
 
 **Interfaces:**
 - Consumes: the runtime-switch pattern from Task 10.
@@ -1091,7 +1091,7 @@ git commit -m "refactor(build): serve both generic elementwise gates from one bi
 
 **Files:**
 - Modify: `test/Execution/framework_primitives.cpp:442,488,498-506`
-- Modify: `test/Execution/CMakeLists.txt:130-155`
+- Modify: `test/Execution/CMakeLists.txt:131-154`
 
 **Interfaces:**
 - Consumes: the runtime-switch pattern from Task 10.
@@ -1160,7 +1160,7 @@ git commit -m "refactor(build): serve both framework primitives gates from one b
 
 **Files:**
 - Modify: `test/Execution/dynamic_mapped_acceptance.cpp` (macro sites at 127, 162, 1269, and `main` at 1623)
-- Modify: `test/Execution/CMakeLists.txt:170-193`
+- Modify: `test/Execution/CMakeLists.txt:164-187`
 - Modify: `test/Execution/check_selected_target_flag.py` (the second `check_pair` call becomes live)
 - Modify: `.github/workflows/ci.yml` (the second invocation in "Run selected AVX2 acceptance")
 
