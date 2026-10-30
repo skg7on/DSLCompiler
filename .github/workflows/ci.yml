@@ -120,7 +120,7 @@ jobs:
           "$LLVM_BUILD/bin/llvm-config" --version | tee -a build/selected-avx2-host.txt
           cd build
           set -o pipefail
-          ./MappedAVX2Acceptance --require-selected-target \
+          ./MappedAcceptance --require-selected-target \
             --gtest_filter=MappedAcceptance.* \
             --gtest_output=xml:selected-avx2-results.xml 2>&1 | tee selected-avx2.log
           ./DynamicMappedAVX2Acceptance --require-selected-target \

@@ -62,9 +62,9 @@ if(LLK_BUILD_E2E_TESTS)
       SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 endif()
 
-# Separate mapped binaries keep the portable and required-selected-target
-# contracts independently invokable by CI. Place the acceptance executable at
-# the build root because the pinned workflow runs it directly from build/.
+# One mapped acceptance binary serves both the portable and the required-
+# selected-target contracts; the run-time flag picks the mode. Place it at the
+# build root because the pinned workflow runs it directly from build/.
 if(LLK_BUILD_E2E_TESTS)
   set(_llk_mapped_libs
       LLKMappedCompilation LLKToMicro LLKMicroToLinalg LLKMapping
@@ -77,26 +77,20 @@ if(LLK_BUILD_E2E_TESTS)
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   set_target_properties(MappedAcceptance PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-  add_test(NAME MappedAcceptance COMMAND MappedAcceptance)
+  add_test(NAME MappedAcceptance COMMAND MappedAcceptance
+      --gtest_filter=MappedAcceptance.*)
   set_tests_properties(MappedAcceptance PROPERTIES
       LABELS "mapped-reference"
       SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
-
-  add_executable(MappedAVX2Acceptance mapped_acceptance.cpp)
-  target_link_libraries(MappedAVX2Acceptance PRIVATE ${_llk_mapped_libs})
-  target_compile_definitions(MappedAVX2Acceptance PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
-  set_target_properties(MappedAVX2Acceptance PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-  add_test(NAME MappedAVX2Acceptance COMMAND MappedAVX2Acceptance
+  # Same binary, required-selected-target mode: a missing AVX2 lane is a
+  # failure, not a skip, so CI evidence cannot silently pass on the wrong host.
+  add_test(NAME MappedAVX2Acceptance COMMAND MappedAcceptance
       --require-selected-target --gtest_filter=MappedAcceptance.*)
   set_tests_properties(MappedAVX2Acceptance PROPERTIES LABELS "selected-avx2")
 
   add_test(NAME SelectedTargetFlagContract
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_selected_target_flag.py
-          $<TARGET_FILE:MappedAVX2Acceptance> $<TARGET_FILE:MappedAcceptance>
-          $<TARGET_FILE:DynamicMappedAVX2Acceptance>
-          $<TARGET_FILE:DynamicMappedAcceptance>)
+          $<TARGET_FILE:MappedAcceptance>)
   set_tests_properties(SelectedTargetFlagContract PROPERTIES LABELS "selected-avx2")
 
   set(_llk_generic_elementwise_libs
