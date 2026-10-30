@@ -60,7 +60,6 @@
 #include "gtest/gtest.h"
 
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -72,6 +71,10 @@
 #endif
 
 namespace {
+
+/// Set from --require-selected-target. Selecting the failure mode at run time
+/// keeps one binary serving both the reference and the required-AVX2 gates.
+bool requireSelectedTarget = false;
 
 using mlir::llk::mapping::BindContract;
 using mlir::llk::mapping::CoveringPlan;
@@ -439,14 +442,14 @@ TEST(FrameworkPrimitives, AddMulReferenceExecutesLiteralFormula) {
 
 TEST(FrameworkPrimitives, SelectedAvx2AddMulExecutesLiteralFormula) {
   if (!selectedAvx2Available()) {
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-    if (avx2DisabledByTestOverride())
-      FAIL() << "test override disabled required selected AVX2 execution";
-    else
-      FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
-#else
-    GTEST_SKIP() << "selected AVX2 execution requires an x86_64 AVX2 host";
-#endif
+    if (requireSelectedTarget) {
+      if (avx2DisabledByTestOverride())
+        FAIL() << "test override disabled required selected AVX2 execution";
+      else
+        FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+    } else {
+      GTEST_SKIP() << "selected AVX2 execution requires an x86_64 AVX2 host";
+    }
   }
 
   mlir::DialectRegistry registry = buildRegistry();
@@ -483,7 +486,6 @@ TEST(FrameworkPrimitives, SelectedAvx2AddMulExecutesLiteralFormula) {
 }
 
 int main(int argc, char **argv) {
-  bool requireSelectedTarget = false;
   for (int index = 1; index < argc;) {
     if (std::strcmp(argv[index], "--require-selected-target") == 0) {
       requireSelectedTarget = true;
@@ -494,20 +496,6 @@ int main(int argc, char **argv) {
     }
     ++index;
   }
-
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-  if (!requireSelectedTarget) {
-    std::fprintf(stderr, "FrameworkPrimitivesAVX2Test requires "
-                         "--require-selected-target\n");
-    return 2;
-  }
-#else
-  if (requireSelectedTarget) {
-    std::fprintf(stderr, "--require-selected-target is only valid for the "
-                         "selected-target executable\n");
-    return 2;
-  }
-#endif
 
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

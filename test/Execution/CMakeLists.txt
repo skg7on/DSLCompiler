@@ -124,21 +124,11 @@ if(LLK_BUILD_E2E_TESTS)
   target_include_directories(FrameworkPrimitivesTest PRIVATE
       ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping)
   add_test(NAME FrameworkPrimitivesTest COMMAND FrameworkPrimitivesTest)
-  set_tests_properties(FrameworkPrimitivesTest PROPERTIES
-      LABELS "mapped-reference")
-
-  add_executable(FrameworkPrimitivesAVX2Test framework_primitives.cpp)
-  target_link_libraries(FrameworkPrimitivesAVX2Test PRIVATE
-      ${_llk_framework_primitives_libs})
-  target_compile_definitions(FrameworkPrimitivesAVX2Test PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
-  target_include_directories(FrameworkPrimitivesAVX2Test PRIVATE
-      ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping)
-  add_test(NAME FrameworkPrimitivesAVX2Test COMMAND FrameworkPrimitivesAVX2Test
+  set_tests_properties(FrameworkPrimitivesTest PROPERTIES LABELS "mapped-reference")
+  add_test(NAME FrameworkPrimitivesAVX2Test COMMAND FrameworkPrimitivesTest
       --require-selected-target
       --gtest_filter=FrameworkPrimitives.SelectedAvx2*)
-  set_tests_properties(FrameworkPrimitivesAVX2Test PROPERTIES
-      LABELS "selected-avx2")
+  set_tests_properties(FrameworkPrimitivesAVX2Test PROPERTIES LABELS "selected-avx2")
 
   # Compile-once dynamic acceptance (issue #197). The portable binary runs the
   # reference chain; the AVX2 binary compiles the same sources for the selected
