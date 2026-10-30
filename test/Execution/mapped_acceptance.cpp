@@ -255,19 +255,23 @@ llk::MappedJitEvidenceSink acceptanceEvidenceSink() {
   return acceptanceEvidenceSinkForDirectory(directory);
 }
 
+namespace {
+/// Set from --require-selected-target. Selecting the backend at run time keeps
+/// one binary serving both the reference and the required-AVX2 gates.
+bool requireSelectedTarget = false;
+} // namespace
+
 /// Runs the whole chain on `source` and returns the executable it produced:
 /// export to concrete Micro, search the shipped AVX2 target, and compile the
 /// plan the search selected.
-llvm::Expected<std::unique_ptr<llk::MappedExecutable>>
-compileChain(mlir::MLIRContext &context, llvm::StringRef sourceText,
-             llvm::StringRef entrySymbol,
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-             llk::MappedBackend backend = llk::MappedBackend::SelectedTarget,
-#else
-             llk::MappedBackend backend = llk::MappedBackend::Reference,
-#endif
-             llvm::StringRef scheduleDb = {},
-             llk::MappedJitEvidenceSink evidenceSink = {}) {
+llvm::Expected<std::unique_ptr<llk::MappedExecutable>> compileChain(
+    mlir::MLIRContext &context, llvm::StringRef sourceText,
+    llvm::StringRef entrySymbol,
+    llk::MappedBackend backend = requireSelectedTarget
+                                     ? llk::MappedBackend::SelectedTarget
+                                     : llk::MappedBackend::Reference,
+    llvm::StringRef scheduleDb = {},
+    llk::MappedJitEvidenceSink evidenceSink = {}) {
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::parseSourceString<mlir::ModuleOp>(sourceText, &context);
   if (!module)
@@ -459,13 +463,10 @@ compileMicroKernel(mlir::MLIRContext &context, llvm::StringRef sourceText,
   }
   llk::MappedCompileOptions options;
   options.entrySymbol = entrySymbol.str();
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-  options.backend = (requireTransform || vectorWidth == 4)
-                        ? llk::MappedBackend::Reference
-                        : llk::MappedBackend::SelectedTarget;
-#else
-  options.backend = llk::MappedBackend::Reference;
-#endif
+  options.backend =
+      (requireSelectedTarget && !(requireTransform || vectorWidth == 4))
+          ? llk::MappedBackend::SelectedTarget
+          : llk::MappedBackend::Reference;
   if (options.backend == llk::MappedBackend::SelectedTarget)
     options.evidenceSink = acceptanceEvidenceSink();
   if (requireTransform) {
@@ -657,13 +658,11 @@ TEST(MappedAcceptance, InvokesTheCompilerGeneratedMatmulAndChecksEveryElement) {
       compileChain(context, kMatmulSource, "matmul_M16_N64_K64");
   ASSERT_TRUE(static_cast<bool>(executable))
       << llvm::toString(executable.takeError());
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-  EXPECT_NE((*executable)->executionIdentity().find("backend=selected-target"),
+  EXPECT_NE((*executable)
+                ->executionIdentity()
+                .find(requireSelectedTarget ? "backend=selected-target"
+                                            : "backend=reference"),
             llvm::StringRef::npos);
-#else
-  EXPECT_NE((*executable)->executionIdentity().find("backend=reference"),
-            llvm::StringRef::npos);
-#endif
   EXPECT_NE((*executable)->executionIdentity().find("abi="),
             llvm::StringRef::npos);
   EXPECT_NE((*executable)->executionIdentity().find("lowered-ir-sha256="),
@@ -1103,14 +1102,14 @@ TEST(MappedAcceptance, ExecutesPaddedTailsWithNonzeroAccumulators) {
 
 TEST(MappedAcceptance, SelectedAvx2ExecutesThePaddedTailFixtures) {
   if (!selectedAvx2Available()) {
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-    if (avx2DisabledByTestOverride())
-      FAIL() << "test override disabled required selected AVX2 execution";
-    else
-      FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
-#else
-    GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
-#endif
+    if (requireSelectedTarget) {
+      if (avx2DisabledByTestOverride())
+        FAIL() << "test override disabled required selected AVX2 execution";
+      else
+        FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+    } else {
+      GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
+    }
   }
 
   mlir::DialectRegistry registry = buildRegistry();
@@ -1127,14 +1126,14 @@ TEST(MappedAcceptance, SelectedAvx2ExecutesThePaddedTailFixtures) {
 
 TEST(MappedAcceptance, SelectedAvx2BackendExecutesNumerically) {
   if (!selectedAvx2Available()) {
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-    if (avx2DisabledByTestOverride())
-      FAIL() << "test override disabled required selected AVX2 execution";
-    else
-      FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
-#else
-    GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
-#endif
+    if (requireSelectedTarget) {
+      if (avx2DisabledByTestOverride())
+        FAIL() << "test override disabled required selected AVX2 execution";
+      else
+        FAIL() << "required selected AVX2 execution needs an x86_64 AVX2 host";
+    } else {
+      GTEST_SKIP() << "selected AVX2 invocation requires an x86_64 host";
+    }
   }
 
   mlir::DialectRegistry registry = buildRegistry();
@@ -1168,7 +1167,6 @@ TEST(MappedAcceptance, SelectedAvx2BackendExecutesNumerically) {
 }
 
 int main(int argc, char **argv) {
-  bool requireSelectedTarget = false;
   for (int index = 1; index < argc;) {
     if (std::strcmp(argv[index], "--require-selected-target") == 0) {
       requireSelectedTarget = true;
@@ -1179,20 +1177,6 @@ int main(int argc, char **argv) {
     }
     ++index;
   }
-
-#ifdef LLK_REQUIRE_SELECTED_TARGET
-  if (!requireSelectedTarget) {
-    std::fprintf(stderr,
-                 "MappedAVX2Acceptance requires --require-selected-target\n");
-    return 2;
-  }
-#else
-  if (requireSelectedTarget) {
-    std::fprintf(stderr, "--require-selected-target is only valid for the "
-                         "selected-target executable\n");
-    return 2;
-  }
-#endif
 
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

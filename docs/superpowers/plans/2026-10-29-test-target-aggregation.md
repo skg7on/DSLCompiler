@@ -784,7 +784,7 @@ Title: `refactor(build): collapse reference and selected-target test binaries`
 
 **Files:**
 - Modify: `test/Execution/mapped_acceptance.cpp:264,462,660,1106,1130,1170-1200`
-- Modify: `test/Execution/CMakeLists.txt:50-80`
+- Modify: `test/Execution/CMakeLists.txt:74-100`
 - Modify: `test/Execution/check_selected_target_flag.py`
 - Modify: `.github/workflows/ci.yml:123`
 
@@ -879,7 +879,7 @@ int main(int argc, char **argv) {
 
 - [ ] **Step 4: Delete the second target from `test/Execution/CMakeLists.txt`**
 
-Replace the `MappedAVX2Acceptance` block (lines 67-75) and the `MappedAcceptance` block (lines 56-65) with one target and two entries:
+Replace the `MappedAVX2Acceptance` block (lines 85-93) and the `MappedAcceptance` block (lines 74-83) with one target and two entries:
 
 ```cmake
   add_executable(MappedAcceptance mapped_acceptance.cpp)
@@ -1015,7 +1015,7 @@ git commit -m "refactor(build): serve both acceptance gates from one binary"
 
 **Files:**
 - Modify: `test/Execution/generic_elementwise.cpp:621,669,679-687`
-- Modify: `test/Execution/CMakeLists.txt:104-128`
+- Modify: `test/Execution/CMakeLists.txt:106-126`
 
 **Interfaces:**
 - Consumes: the runtime-switch pattern from Task 10.
@@ -1091,7 +1091,7 @@ git commit -m "refactor(build): serve both generic elementwise gates from one bi
 
 **Files:**
 - Modify: `test/Execution/framework_primitives.cpp:442,488,498-506`
-- Modify: `test/Execution/CMakeLists.txt:130-155`
+- Modify: `test/Execution/CMakeLists.txt:131-154`
 
 **Interfaces:**
 - Consumes: the runtime-switch pattern from Task 10.
@@ -1160,7 +1160,7 @@ git commit -m "refactor(build): serve both framework primitives gates from one b
 
 **Files:**
 - Modify: `test/Execution/dynamic_mapped_acceptance.cpp` (macro sites at 127, 162, 1269, and `main` at 1623)
-- Modify: `test/Execution/CMakeLists.txt:170-193`
+- Modify: `test/Execution/CMakeLists.txt:164-187`
 - Modify: `test/Execution/check_selected_target_flag.py` (the second `check_pair` call becomes live)
 - Modify: `.github/workflows/ci.yml` (the second invocation in "Run selected AVX2 acceptance")
 
@@ -1286,7 +1286,7 @@ In `test/Execution/CMakeLists.txt`, replace the two blocks at lines 170-193 with
   set_target_properties(DynamicMappedAcceptance PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
   add_test(NAME DynamicMappedAcceptance COMMAND DynamicMappedAcceptance
-      --gtest_filter=DynamicMappedAcceptance.*)
+      --gtest_filter=DynamicMappedAcceptance.*:DynamicMappedSelected.SelectedLoweringKeepsBoundedBoundariesAndRuntimeK)
   set_tests_properties(DynamicMappedAcceptance PROPERTIES
       LABELS "mapped-reference"
       SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
@@ -1296,7 +1296,7 @@ In `test/Execution/CMakeLists.txt`, replace the two blocks at lines 170-193 with
       LABELS "selected-avx2")
 ```
 
-The reference entry now filters `DynamicMappedAcceptance.*` rather than running the whole binary, because the binary always contains the `DynamicMappedSelected` suite; those cases would otherwise run in reference mode where the previous reference binary did not have them at all.
+The reference entry now filters `DynamicMappedAcceptance.*` plus the host-independent `DynamicMappedSelected.SelectedLoweringKeepsBoundedBoundariesAndRuntimeK` case. The binary always contains the `DynamicMappedSelected` suite, but only the lowering case ran in the old reference binary because it is host-independent; it is named explicitly so the reference entry keeps that coverage, while the execution case needs AVX2 and is excluded so the entry stays Passed instead of Skipped.
 
 - [ ] **Step 7: Restore the second pair in the contract test**
 
@@ -1389,16 +1389,29 @@ reference/selected pair was built twice from the same source:
 
 The binaries already parsed `--require-selected-target`; the macro only supplied
 a default and chose skip-vs-fail. It is now a process global set from `argv`, so
-one binary serves both CTest entries per pair.
+one binary serves both CTest entries per pair. `LLK_REQUIRE_SELECTED_TARGET`
+appears nowhere in `test/`.
 
 CI runs `./MappedAcceptance` and `./DynamicMappedAcceptance` with
 `--require-selected-target` instead of the two `*AVX2Acceptance` binaries.
-`check_selected_target_flag.py` now proves the required mode enforces AVX2 by
-running each collapsed binary twice with `LLK_TEST_DISABLE_AVX2=1`.
+`check_selected_target_flag.py` now runs each collapsed binary under
+`LLK_TEST_DISABLE_AVX2=1` and requires the required-mode invocation to fail.
 
 CTest names are unchanged: `MappedAcceptance`, `MappedAVX2Acceptance`,
 `GenericElementwiseTest`, `GenericElementwiseAVX2Test`,
-`FrameworkPrimitivesTest`, `FrameworkPrimitivesAVX2Test`.
+`FrameworkPrimitivesTest`, `FrameworkPrimitivesAVX2Test`,
+`DynamicMappedAcceptance`, `DynamicMappedAVX2Acceptance`.
+
+Reference-mode coverage is preserved rather than reduced. Of the two
+`DynamicMappedSelected` cases, only
+`SelectedAvx2ExecutesCompileOnceDynamicAcceptance` was inside the compile-time
+guard and existed solely in the selected binary;
+`SelectedLoweringKeepsBoundedBoundariesAndRuntimeK` was already unconditional
+and ran in the reference binary. Both are accounted for now: the reference
+entry's filter names the host-independent lowering case explicitly and excludes
+the execution case, so the entry stays Passed rather than Skipped.
+
+Test executables: 20 -> 16 with `LLK_BUILD_PYTHON_CAPI=ON`, 18 -> 14 with it off.
 
 Fixes #266.
 
