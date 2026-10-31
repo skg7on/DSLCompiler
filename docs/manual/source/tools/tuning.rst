@@ -78,6 +78,32 @@ source or already-materialized input is not equivalent. ``--candidate-source``
 also accepts ``concrete-micro`` and explicit ``synthetic`` compatibility mode.
 ``--source-symbol`` identifies the semantic source root.
 
+Dynamic source tuning
+---------------------
+
+For a symbolic contraction source, add ``--shape-profile=<path>`` (or inline JSON)
+to the target-aware semantic workflow. It supplies complete concrete symbol
+bindings and positive finite weights, with schema ``version: 1``,
+``aggregation: "weighted_mean"`` and a positive ``max_variants`` budget. The
+current tuner selects the full-domain baseline; the budget does not generate
+guarded specializations. Exact ``-M/-N/-K`` options are not a replacement for a
+dynamic profile.
+
+Each candidate must pass complete selected-plan analysis for every sample
+before weighted ranking. Reports retain the ordered ``shape_profile``,
+``shape_samples`` costs and ``shape_aggregation``. Missing profiles or incomplete
+analysis cannot supply a rankable prediction. Sampling specializes analysis
+clones while exported source and executable contracts stay symbolic.
+
+Compiled-variant identity captures the source/contract, guards, numerical
+semantics, ABI, schedule/resources and target/backend/compiler. Measurement
+identity adds the concrete shape and profile, so code reuse across shapes
+does not reuse incompatible timing. The tuner also includes its frozen sampled
+plan report in variant identity; changing profiles can change
+``compiled_variant`` even for equivalent baseline code. Preserve ``source.mlir`` and ``plan.json``
+for frozen replay. The :doc:`dynamic shape guide </dynamic-shapes>` includes
+downloadable inputs, model-capacity requirements and a tested CLI workflow.
+
 Non-contraction sources and contract inference
 ----------------------------------------------
 
@@ -201,6 +227,9 @@ Options and ranking
   contract supplies the shape.
 * ``--source-adapter`` names the registered family explicitly; otherwise exactly
   one adapter must accept the selected root.
+* ``--shape-profile`` supplies explicit observations for symbolic semantic-source
+  tuning; see :ref:`dynamic shape analysis <dynamic-shapes-analysis>` for schema
+  validation and report fields.
 
 The objective comes from ``micro.objective``. Unknown metrics are diagnosed;
 missing measurement metrics are unavailable, not zero-cost winners. Reports

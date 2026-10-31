@@ -24,8 +24,20 @@ These files are small, checked-in inputs for the :doc:`developer tutorials </ind
    * - :download:`swiglu.search.mlir </examples/swiglu.search.mlir>`
      - A deliberately small, one-candidate search space
      - A predicted schedule YAML record from ``llk-tune``
+   * - :download:`dynamic-matmul.mlir </examples/dynamic-matmul.mlir>`
+     - Independently dynamic M/N/K with BF16 inputs/output and FP32 accumulation
+     - Bounded MicroIR with a read initializer and separate output destination
+   * - :download:`dynamic-shape-profile.json </examples/dynamic-shape-profile.json>`
+     - Explicit weighted M/N/K observations for dynamic tuning
+     - Per-sample costs and weighted ranking; see :doc:`/dynamic-shapes`
 
-The first two are semantic source programs, not tensor data files. Their destination operands express the LLK interface. The current Micro exporter declares the computation's external input operands and creates its result internally; it does not preserve an arbitrary destination accumulator's initial contents. The tile example is an analysis fixture with ``tensor.empty``, not a numerical invocation example. The search-only example exercises compatibility binding. The target-aware tuning tutorial uses a source-plus-space fixture and saves frozen mapping artifacts.
+The static matmul and SwiGLU files are semantic source programs, not tensor data
+files. Static Micro export retains its legacy internally created result form;
+dynamic export preserves matmul's initializer as a read input and adds a
+separate caller-owned output. SwiGLU uses zero-initialized projections. The tile
+example is an analysis fixture with ``tensor.empty``, not a numerical invocation
+example. The search-only example exercises compatibility binding. Target-aware
+tuning uses a source-plus-space fixture and saves frozen mapping artifacts.
 
 The tutorial commands are exercised by :download:`run_tutorials.py </tutorials/run_tutorials.py>`, which checks generated IR, plan replay, prediction reports, and schedule output. It does not claim numerical execution or selected AVX2 instruction verification.
 

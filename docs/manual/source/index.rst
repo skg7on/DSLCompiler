@@ -19,6 +19,7 @@ the options, output contracts, and failure modes in detail.
    concepts
    architecture
    features
+   dynamic-shapes
    getting-started
    python-frontend
 
@@ -74,6 +75,9 @@ Choose a starting point
    * - Explore schedule choices
      - :doc:`Tuning tutorial </tutorials/04-tuning>`
      - :doc:`Tuner manual </tools/tuning>`
+   * - Reuse a kernel across runtime shapes
+     - :doc:`Dynamic shapes </dynamic-shapes>`
+     - Symbolic export, checked invocation, sampled analysis and replay
    * - Develop the Python frontend
      - :doc:`Python frontend </python-frontend>`
      - Project ``.venv`` setup, PF01 tests and current capability boundaries

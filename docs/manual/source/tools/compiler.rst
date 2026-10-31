@@ -28,16 +28,20 @@ Selected lowering establishes ``selected_lowering`` only; a separate reference
 compilation establishes ``reference_lowering``.
 
 The runtime fields distinguish four facts: ``abi_eligibility`` checks a supplied
-workload contract against ABI v1 (an absent contract stays ``not_checked``),
+workload contract against the applicable mapped ABI version (an absent contract
+stays ``not_checked``),
 ``abi_preparation`` records successful callable preparation,
 ``host_compatibility`` records successful executable creation on the current
 host, and ``invocation`` requires a call that returned successfully. This driver
 does not invoke kernels, so successful executable compilation leaves
 ``invocation`` as ``not_checked``. A successful call alone does not establish
 numerical correctness.
-Eligibility requires positive static extents. A supplied contract that fits the
-ABI envelope must also match the source signature and the executable's ordered
-input/output shapes and dtypes before preparation or invocation is credited.
+ABI v1 requires positive static extents. ABI v2 admits nonnegative constant or
+symbolic extents with declared relationships and caller-owned destinations.
+A supplied contract that fits the ABI envelope must also match the source
+signature and the executable's ordered input/output ports and dtypes before
+preparation or invocation is credited. See :doc:`/dynamic-shapes` for symbolic
+contracts and per-call validation.
 
 Without ``--mapping-target``, ``--emit`` chooses the path:
 
@@ -155,13 +159,17 @@ The first artifact contains ``micro.kernel @matmul_M16_N64_K64``. The second con
 
 Both exports read ``schedules/schedule_db.json`` relative to the current directory. An unreadable database or a missing matching entry selects the built-in conservative schedule; the optimizer export also surfaces a warning. That fallback is useful for experiments, but record whether it was used when comparing results. To choose a different database explicitly, use ``llk-opt --llk-to-micro="schedule-db=<path>"`` or ``--llk-to-micro-search-space="schedule-db=<path>"``; ``llk-compile`` does not expose a driver-level schedule-database option.
 
-The current shared selector filters entries by operation and M bucket, then chooses the first match. It does not select by exact N/K, target, dtype, or math mode even though the database records those fields. The M buckets are ``{1}``, ``[2,4]``, ``[5,16]``, ``[17,64]``, and ``≥65``. The no-match fallback uses ``BM=8``, ``BN=32``, ``BK=32``, ``VM=1``, ``VN=4``, vector width 8, four threads, and grain size 1; resolved tiles can be clamped to smaller problem extents.
+For static inputs, the shared selector filters entries by operation and M bucket, then chooses the first match. It does not select by exact N/K, target, dtype, or math mode even though the database records those fields. The M buckets are ``{1}``, ``[2,4]``, ``[5,16]``, ``[17,64]``, and ``≥65``. The no-match fallback uses ``BM=8``, ``BN=32``, ``BK=32``, ``VM=1``, ``VN=4``, vector width 8, four threads, and grain size 1; resolved tiles can be clamped to smaller problem extents.
 
 Current export support is narrower than the set of operations the parser accepts:
 
 * Roots are ``llk.matmul`` and ``llk.fused_swiglu``; SwiGLU activation must be ``silu``.
 
-* Operands and result must have static rank-two shapes. Matrix dimensions must agree: ``[M,K] × [K,N] → [M,N]``; SwiGLU's second weight must also be ``[K,N]``.
+* Operands and result must have rank-two shapes. Static, mixed and independently
+  dynamic M/N/K are supported, including both runtime weight axes. Dimensions
+  must agree: ``[M,K] × [K,N] → [M,N]``; SwiGLU's second weight must also be
+  ``[K,N]``. Known contradictions fail during compilation; unresolved equality
+  becomes runtime guards.
 
 * Supported Micro tile element types are ``f32``, ``f16``, ``bf16``, ``i32``, and ``i8``; the accumulator attribute must name a Micro tile dtype. Parsing/export support does not imply every target has an executable rule for that dtype.
 
@@ -172,6 +180,14 @@ Current export support is narrower than the set of operations the parser accepts
 * A file with no supported root can pass the export without adding a kernel or search space. Check the expected operation in the output before moving on.
 
 ``--emit=micro-search`` describes choices; it does not automatically choose a ``micro.candidate``, instantiate every candidate, or map candidates to target rules. See the :doc:`tuning manual </tools/tuning>` and the optimizer's :ref:`candidate= workflow <tools-optimizer-map-at-an-explicit-candidate>`.
+
+Dynamic export selects a bounded baseline rather than a fixed-shape database
+entry. It emits fixed-capacity local tiles, bounded loads, clipped stores and
+exact ``valid_k`` reductions with explicit output destinations. Dynamic matmul
+retains its read initializer separately from the output; SwiGLU starts both
+projections from zero. M=0/N=0 are empty and K=0 retains initialization/epilogue
+semantics. Follow :ref:`the dynamic export example <dynamic-shapes-export>`;
+rank-two descriptor limits still apply to execution.
 
 .. _tools-compiler-legacy-cpu-compilation:
 
@@ -386,14 +402,16 @@ can be re-parsed as an artifact. A reference-backend run leaves selected
 lowering ``not_checked``: the absence of a codegen contract means the stage was
 not attempted, not that it failed.
 
-The mapped ABI v1 is a rank-two, compact, offset-zero descriptor envelope with
-at most 12 ports and read-only inputs. Analysis, reporting and lowering are
-rank-neutral; only executable preparation applies that envelope. A rank-three
-contract or a rank-one reduction can therefore reach lowered IR, while
-``--mapping-stop=executable`` fails explicitly with a ``runtime_capability:``
-diagnostic naming the rank, dtype, descriptor count or port effect it cannot
-express. Ports whose contract declares unknown or dynamic extents are rejected
-earlier as contract errors, not as execution-capability errors.
+Mapped ABI v1/v2 retain a rank-two, compact, offset-zero descriptor envelope
+with at most 12 ports, read-only inputs and disjoint caller-owned outputs.
+V1 preserves its positive-static format; v2 adds named symbolic dimensions,
+constraints and explicit argument/result bindings. Analysis, reporting and
+lowering are rank-neutral; executable preparation applies that envelope. A
+rank-three contract or rank-one reduction can reach lowered IR, while
+``--mapping-stop=executable`` fails with a ``runtime_capability:`` diagnostic for
+unsupported rank, dtype, descriptor count or effect. A malformed symbolic
+contract fails as a contract error. The ``linalg-elementwise-v1`` semantic adapter
+still rejects dynamic source shapes; direct dynamic MicroIR is a separate path.
 
 .. _tools-compiler-runtime-boundary:
 
@@ -410,12 +428,15 @@ machine code. Caller buffers remain caller-owned; compiler scratch is released
 per invocation. Unsupported ranks/dtypes are rejected before publishing an
 executable. ``Tensor2D``, ``MemRef2D`` and ``KernelContext`` are distinct structures.
 
-The deprecated untagged ``MemRef2D*`` overload checks arity/shape/stride but cannot
-validate runtime dtype or backing allocation size. Do not treat it as equivalent
-to typed invocation. The Micro matmul exporter has A/B inputs and one result;
-its original ``%init`` is not an input in that exported ABI. Candidate semantic
-instantiation can have a different ABI; read the executable's ``KernelAbi``
-rather than inferring its ports from the original function.
+The deprecated untagged ``MemRef2D*`` overload checks v1 arity/shape/stride but
+cannot validate runtime dtype or backing allocation size and rejects ABI v2.
+Dynamic matmul exposes A/B plus its read initializer and a separate caller-owned
+output; dynamic SwiGLU exposes X/Wg/Wu and a write-only destination. Invocation
+binds actual descriptor extents and checks all relationships even for empty
+outputs. Static export retains its legacy A/B/result form. Read the executable's
+``KernelAbi`` rather than inferring ports from the original function. See
+:ref:`dynamic invocation <dynamic-shapes-invocation>` for empty-buffer rules and
+descriptor limits.
 
 .. _tools-compiler-troubleshooting:
 
@@ -433,7 +454,7 @@ Troubleshooting
    * - Micro output contains no kernel
      - The exporter found no ``llk.matmul``/``llk.fused_swiglu`` root. Export success can be a no-op.
    * - Dynamic-shape or rank diagnostic
-     - Edit tensor types to supported static rank-two shapes. ``--M/--N/--K`` cannot repair the IR.
+     - Dynamic rank-two contraction shapes are supported. Check port equalities, rank, bounded schedule and source-adapter support; ``--M/--N/--K`` cannot repair the IR. See :doc:`/dynamic-shapes`.
    * - Conservative-schedule warning
      - Check the current directory and ``schedules/schedule_db.json``. Use the optimizer export option for an explicit database.
    * - ``op was not bufferized`` for ``llk.matmul``
@@ -445,7 +466,7 @@ Troubleshooting
    * - No selected vector width / fused emitter failure
      - Inspect the selected rule and bundle. The shipped fused ``convert → silu → mul`` chain is verified. Inspect unsupported emitter/effect/region diagnostics and use the intended backend policy.
    * - ``runtime_capability:`` rank/dtype/effect diagnostic
-     - The selected workload or reference program is valid, but the mapped ABI v1 cannot call it: it requires rank-two static ports, a supported dtype, at most 12 descriptors, read-only inputs and write-only outputs. Use a supported shape for execution, or stop at ``--mapping-stop=lowered`` for analysis/lowering evidence.
+     - The selected program exceeds the mapped ABI v1/v2 envelope: rank-two compact zero-offset ports, a supported dtype, at most 12 descriptors, read-only inputs and disjoint outputs. Symbolic dimensions are supported through v2. Stop at ``--mapping-stop=lowered`` for analysis/lowering evidence outside the invocation envelope.
    * - Report hash/version mismatch
      - Use the original pre-mapping Micro input and the exact target configuration that produced the report; regenerate after intentional changes.
    * - Saved mapped output does not parse

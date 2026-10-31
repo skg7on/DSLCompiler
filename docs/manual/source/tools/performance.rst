@@ -9,7 +9,8 @@ diagnostics. It does not execute the kernel, produce tensors, check numerical
 accuracy, or measure the host CPU. Use it to compare explicit Micro schedules
 under the same model and to inspect assumptions before attempting execution.
 
-This manual reflects merged PR #133. Complete-plan selection and materialized
+This manual includes PR #133 and the concrete-sample dynamic analysis added by
+#191/#198. Complete-plan selection and materialized
 analysis share normalized events/resources, per-engine DMA capacity and storage
 lifetimes. The :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
 records static parity controls. Measurements and calibration (#51/#52) remain
@@ -76,6 +77,9 @@ Options and defaults
    * - ``--kernel=<string>``
      - Empty
      - Symbol name, without ``@``; required if the file contains more than one kernel.
+   * - ``--shape-values=<bindings>``
+     - Empty
+     - Bind a dynamic kernel's contract symbols for one analysis sample, for example ``M=7,N=13,K=5``. This specializes an analysis clone, not the reusable executable.
    * - ``--fail-on-capacity-violation``
      - Disabled
      - Print the report, then return status 2 if modeled capacity violations exist.
@@ -261,6 +265,26 @@ To make modeled capacity a shell gate:
 This checked fixture fits the model and returns zero. A capacity violation
 reports the memory, required bytes, and modeled available bytes. Incomplete model facts or unsupported programs remain analysis limits; a standalone report does not certify executable backend support. Layout and owner warnings do not
 become fatal merely because the capacity flag is enabled.
+
+.. _tools-performance-dynamic-shape-samples:
+
+Dynamic shape samples and completeness
+--------------------------------------
+
+Use ``--shape-values`` with names from the kernel's workload contract. Sampled
+analysis evaluates actual loop counts, bounded movement, padding work and exact
+K tails. The report records the concrete binding and ``sampled: true``. Missing
+symbol values and unresolved facts are explicit diagnostics; read ``complete``
+before treating costs as rankable. An incomplete report can return status 0
+while omitting predictions. Unknown iteration counts are never silently one
+iteration.
+
+Binding shapes alone does not resolve abstract resources in an unmapped kernel.
+Complete selected-plan analysis must also establish operation coverage, selected
+resources and bounded local storage. Dynamic plan ranking uses an explicit
+``llk-tune --shape-profile`` with complete analysis for every sample. See the
+:ref:`dynamic shape analysis workflow <dynamic-shapes-analysis>` for commands,
+the profile schema and a runnable CLI smoke test.
 
 .. _tools-performance-current-limits-and-contributor-entry-points:
 
