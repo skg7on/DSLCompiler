@@ -1,5 +1,6 @@
 add_llk_library(LLKRuntime
     JitCache.cpp
+    CompiledVariantIdentity.cpp
     MappedExecutable.cpp
     MappedInvocation.cpp
     MappedObject.cpp

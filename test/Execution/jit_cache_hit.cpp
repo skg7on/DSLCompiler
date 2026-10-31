@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <vector>
 
 using namespace llk;
 
@@ -265,4 +266,27 @@ TEST(WeightKeyTest, DifferentPointersHashDiffer) {
   b.weight_ptr = &y;
   std::hash<WeightKey> hasher;
   EXPECT_NE(hasher(a), hasher(b));
+}
+
+TEST(WeightKeyTest, ActualExtentsArePartOfTheIdentity) {
+  std::vector<float> storage(64 * 128);
+  Tensor2D weight{storage.data(), 64, 128, 128, 1};
+
+  WeightKey base = makeWeightKey(weight, /*BK=*/64);
+  EXPECT_EQ(base.K, 64);
+  EXPECT_EQ(base.N, 128);
+  EXPECT_EQ(base.weight_ptr, storage.data());
+
+  // The same allocation packed for a different actual K/N is a different key.
+  Tensor2D changedK = weight;
+  changedK.dim0 = 32;
+  WeightKey otherK = makeWeightKey(changedK, /*BK=*/64);
+  EXPECT_EQ(otherK.K, 32);
+  EXPECT_NE(base, otherK);
+  EXPECT_NE(base.shape_hash, otherK.shape_hash);
+
+  // A different lifetime with identical extents is also distinct.
+  std::vector<float> otherStorage(64 * 128);
+  Tensor2D other{otherStorage.data(), 64, 128, 128, 1};
+  EXPECT_NE(base, makeWeightKey(other, /*BK=*/64));
 }

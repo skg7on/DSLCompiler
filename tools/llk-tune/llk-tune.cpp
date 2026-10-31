@@ -1106,6 +1106,10 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
     if (candidate.measurementIdentity) {
       const auto &identity = *candidate.measurementIdentity;
       llvm::json::Object id;
+      // Reusable compiled code is reported separately from the measurement
+      // observation, so a profile or shape change is visible as a measurement
+      // identity change without implying a recompilation.
+      id["compiled_variant"] = identity.compiledVariant;
       id["canonical"] = identity.canonical;
       id["content_hash"] = identity.contentHash;
       id["plan_id"] = llvm::formatv("{0:x}", identity.planId).str();

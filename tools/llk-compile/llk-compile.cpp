@@ -29,6 +29,7 @@
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanReport.h"
 #include "LLK/Mapping/WorkloadGraph.h"
+#include "LLK/Runtime/CompiledVariantIdentity.h"
 #include "LLK/Runtime/JitCache.h"
 #include "LLK/Runtime/MappedObject.h"
 #include "LLK/Target/MappingTargets.h"
@@ -83,6 +84,7 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/Support/JSON.h"
 
@@ -595,6 +597,31 @@ static int runMappedCompilation(mlir::ModuleOp module,
       "|binding=" + llvm::formatv("{0:x}", selected->sourceBindingHash).str() +
       "|plan=" + llvm::formatv("{0:x}", selected->id).str();
 
+  // The reusable-code identity. It intentionally excludes every concrete
+  // invocation shape: a dynamic kernel's symbolic contract and guard domain
+  // describe the whole domain this one compiled artifact serves.
+  std::string sourceContent;
+  {
+    llvm::raw_string_ostream stream(sourceContent);
+    module->print(stream);
+  }
+  std::vector<std::string> mathModes;
+  module->walk([&](mlir::Operation *op) {
+    if (mlir::Attribute mode = op->getAttr("math_mode")) {
+      std::string printed;
+      llvm::raw_string_ostream stream(printed);
+      mode.print(stream);
+      mathModes.push_back(stream.str());
+    }
+  });
+  llvm::sort(mathModes);
+  std::string numericalContract;
+  for (const std::string &mode : mathModes) {
+    numericalContract += std::to_string(mode.size());
+    numericalContract += ':';
+    numericalContract += mode;
+  }
+
   llk::MappedCompileOptions options;
   options.stop = *stop;
   options.backend = *backend;
@@ -609,6 +636,41 @@ static int runMappedCompilation(mlir::ModuleOp module,
       llk::compileMappedKernel(module, **target, *selected, options);
   if (!compiled) {
     llvm::errs() << llvm::toString(compiled.takeError()) << "\n";
+    return 1;
+  }
+
+  llk::CompiledVariantIdentityInputs variantInputs;
+  variantInputs.sourceContent = std::move(sourceContent);
+  if (sourceContract) {
+    variantInputs.symbolicContract =
+        mlir::llk::workload::canonicalWorkloadContract(*sourceContract);
+    variantInputs.symbolicContractVersion = sourceContract->version;
+  }
+  variantInputs.numericalContract = std::move(numericalContract);
+  variantInputs.abiVersion =
+      compiled->executable ? compiled->executable->abi().version : 0;
+  variantInputs.abiHash =
+      compiled->executable ? compiled->executable->abiHash() : 0;
+  variantInputs.staticSchedule = replayIdentity;
+  variantInputs.targetIdentity = compiled->targetName + "|machine-hash=" +
+                                 std::to_string(compiled->machineHash);
+  variantInputs.backendIdentity = compiled->executionIdentity;
+  variantInputs.executionMode = mappingBackend;
+  variantInputs.compilerVersion = LLK_COMPILER_VERSION;
+  const llk::CompiledVariantIdentity variantIdentity =
+      llk::makeCompiledVariantIdentity(variantInputs);
+
+  // The baseline covers the whole declared domain. Its frozen set identity is
+  // the deterministic dispatch order replay would reproduce; guarded variants
+  // may later be prepended within the same budget.
+  llvm::Expected<llk::DynamicVariantSet> variantSet =
+      llk::DynamicVariantSet::create({llk::GuardedVariant{"baseline",
+                                                          variantIdentity,
+                                                          {},
+                                                          /*baseline=*/true}},
+                                     /*maxVariants=*/1);
+  if (!variantSet) {
+    llvm::errs() << llvm::toString(variantSet.takeError()) << "\n";
     return 1;
   }
 
@@ -658,7 +720,9 @@ static int runMappedCompilation(mlir::ModuleOp module,
     llvm::outs() << " source-adapter=" << sourceAdapter;
   if (sourceContract)
     llvm::outs() << " source-contract-version=" << sourceContract->version;
-  llvm::outs() << " replay-identity=" << replayIdentity << "\n";
+  llvm::outs() << " variant-identity=" << variantIdentity.contentHash
+               << " variant-set=" << variantSet->contentHash()
+               << " replay-identity=" << replayIdentity << "\n";
 
   // What this run established, stage by stage. The compilation is real
   // evidence for the lowering stages; this tool runs no selected static

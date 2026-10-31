@@ -121,10 +121,15 @@ struct WeightKey {
   uint64_t shape_hash{0};
   int64_t BK{0};
   int64_t BN{0};
+  /// The actual weight extents. A packed buffer is only valid for the K/N it
+  /// was built from, so the shape is part of the identity rather than implied
+  /// by the lifetime pointer alone.
+  int64_t K{0};
+  int64_t N{0};
 
   bool operator==(const WeightKey &other) const {
     return weight_ptr == other.weight_ptr && shape_hash == other.shape_hash &&
-           BK == other.BK && BN == other.BN;
+           BK == other.BK && BN == other.BN && K == other.K && N == other.N;
   }
 };
 
@@ -142,7 +147,8 @@ template <> struct std::hash<llk::WeightKey> {
   size_t operator()(const llk::WeightKey &w) const {
     return reinterpret_cast<size_t>(w.weight_ptr) ^
            static_cast<size_t>(w.shape_hash) ^ static_cast<size_t>(w.BK) ^
-           (static_cast<size_t>(w.BN) << 16);
+           (static_cast<size_t>(w.BN) << 16) ^
+           (static_cast<size_t>(w.K) << 32) ^ (static_cast<size_t>(w.N) << 48);
   }
 };
 

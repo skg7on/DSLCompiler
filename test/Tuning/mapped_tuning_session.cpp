@@ -398,6 +398,10 @@ TEST(MappedTuningSessionTest, MeasuresExactExecutableAndKeepsIdentity) {
     EXPECT_FALSE(request.identity.operationKeys.empty());
     EXPECT_FALSE(request.identity.contentHash.empty());
     EXPECT_FALSE(request.identity.canonical.empty());
+    // Two-level identity: reusable code is identified separately from the
+    // observation that measured it.
+    EXPECT_FALSE(request.identity.compiledVariant.empty());
+    EXPECT_NE(request.identity.canonical, request.identity.compiledVariant);
     EXPECT_EQ(request.executable.abiHash(), request.identity.abiHash);
     if (llvm::Error error =
             request.executable.invoke(request.inputs, request.outputs))

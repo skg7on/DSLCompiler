@@ -75,6 +75,10 @@ with tempfile.TemporaryDirectory(prefix="llk-mapped-tune-") as temp:
     assert "selected-groups-verified=8" in replay.stdout
     assert "micro.selected_connections" in replay.stdout
     assert "arith.extf" in replay.stdout
+    # The reusable-code identity and its frozen baseline-set identity are
+    # reported next to the plan replay identity, and are stable across replay.
+    assert "variant-identity=" in replay.stdout
+    assert "variant-set=" in replay.stdout
     replay_again = subprocess.run(
         [
             str(compile_tool), *replay_common, "--mapping-backend=reference",

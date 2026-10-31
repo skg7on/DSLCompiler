@@ -16,6 +16,7 @@
 #ifndef LLK_RUNTIME_JITCACHE_H
 #define LLK_RUNTIME_JITCACHE_H
 
+#include "LLK/Runtime/CompiledVariantIdentity.h"
 #include "LLK/Runtime/KernelKey.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -60,6 +61,11 @@ struct MemRef2D {
 inline MemRef2D makeMemRef2D(const Tensor2D &t) {
   return MemRef2D{t.data, t.data, 0, t.dim0, t.dim1, t.stride0, t.stride1};
 }
+
+/// Builds the L4 packed-weight key from the actual weight extents and lifetime.
+/// `K`/`N` are the real extents the buffer was packed for, so a different shape
+/// can never hit a buffer packed for another one.
+llk::WeightKey makeWeightKey(const Tensor2D &weight, int64_t BK);
 
 /// Stable C ABI: scratch and context pointer for compiled kernels.
 struct KernelContext {
@@ -147,6 +153,16 @@ public:
 
   /// Insert a compiled kernel into the object-code cache.
   void insertObjectCode(const KernelKey &key, KernelFn fn);
+
+  /// Look up code by reusable variant identity rather than exact shapes. A
+  /// dynamic baseline covers a whole domain, so every invocation inside that
+  /// domain asks for the same key and reuses the same compiled entry point.
+  std::optional<KernelFn>
+  lookupVariantObjectCode(const CompiledVariantIdentity &identity);
+
+  /// Insert code under a reusable variant identity.
+  void insertVariantObjectCode(const CompiledVariantIdentity &identity,
+                               KernelFn fn);
 
   // -----------------------------------------------------------------------
   // L2: Optimized-MLIR cache (string key → serialized MLIR module)
@@ -239,6 +255,10 @@ private:
   /// reinterprets it as the `KernelFn` convention or, through `lookupTyped`,
   /// as the signature its own kernel has.
   std::unordered_map<std::string, KernelFn> cache_;
+  /// Variant-identity keyed compiled entry points (see
+  /// `lookupVariantObjectCode`). Kept separate from the legacy string-keyed
+  /// map so a caller-chosen cache key can never alias a variant identity.
+  std::unordered_map<std::string, KernelFn> variant_cache_;
   mutable std::shared_mutex mutex_;
 
   // 4 cache levels (all store serialized strings)

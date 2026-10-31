@@ -57,6 +57,20 @@ M/N/K and dtype inputs, while the bounded elementwise family describes its own
 ordered ports and axes. Compatibility mode remains synthetic. Optional verified
 measurement uses the shared mapped compiler and typed inputs.
 
+Dynamic contractions separate reusable code from the observation that measured
+it. A compiled variant is identified by the source content, symbolic contract and
+version, numerical contract, guard domain, ABI version and hash, schedule,
+target/backend identity and compiler version; concrete invocation shapes are
+deliberately excluded, so one baseline artifact serves every valid M/N/K triple.
+A measurement identity adds the concrete shape observation or the ordered shape
+profile and the measurement protocol, so reused code never reuses another
+shape's latency. ``llk-compile`` reports the variant identity and the frozen
+baseline-set identity beside the plan replay identity, and packed-weight cache
+keys carry the actual weight K/N with the existing allocation and block-shape
+identity. The runtime also validates ordered guarded variants with a full-domain
+baseline and an explicit variant budget (``DynamicVariantSet``); tuning selects
+the baseline only, so guarded specialization is not yet a claimed capability.
+
 .. _architecture-generic-contracts-and-current-limits:
 
 Generic contracts and current limits
