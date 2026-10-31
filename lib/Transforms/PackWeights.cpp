@@ -25,7 +25,9 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
 
 /// Declare isa/cast/dyn_cast for AffineExpr.
@@ -40,6 +42,17 @@ namespace {
 // Helper: annotate a weight value with the packed layout attribute
 //===----------------------------------------------------------------------===//
 
+/// The actual weight K/N when they are statically known. A fully dynamic weight
+/// has no compile-time extents to record: the packed-weight cache key carries
+/// the runtime K/N instead, so the artifact must not claim a concrete shape.
+static DenseI64ArrayAttr staticPackedShape(Value weight) {
+  auto shaped = dyn_cast<ShapedType>(weight.getType());
+  if (!shaped || !shaped.hasStaticShape() || shaped.getRank() != 2)
+    return {};
+  return DenseI64ArrayAttr::get(weight.getContext(),
+                                {shaped.getDimSize(0), shaped.getDimSize(1)});
+}
+
 static void annotateWeight(Value weight, MLIRContext *ctx) {
   // If already annotated, skip.
   if (auto blockArg = dyn_cast<BlockArgument>(weight)) {
@@ -51,6 +64,9 @@ static void annotateWeight(Value weight, MLIRContext *ctx) {
       return;
     funcOp.setArgAttr(argNo, "llk.packed_layout",
                       IntegerAttr::get(IntegerType::get(ctx, 64), kDefaultBK));
+    if (!funcOp.getArgAttr(argNo, "llk.packed_shape"))
+      if (auto shape = staticPackedShape(weight))
+        funcOp.setArgAttr(argNo, "llk.packed_shape", shape);
     return;
   }
 
@@ -66,6 +82,9 @@ static void annotateWeight(Value weight, MLIRContext *ctx) {
     return;
   defOp->setAttr("llk.packed_layout",
                  IntegerAttr::get(IntegerType::get(ctx, 64), kDefaultBK));
+  if (!defOp->hasAttr("llk.packed_shape"))
+    if (auto shape = staticPackedShape(weight))
+      defOp->setAttr("llk.packed_shape", shape);
 }
 
 //===----------------------------------------------------------------------===//

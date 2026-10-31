@@ -6,7 +6,8 @@ set(_llk_tuning_sources
     source_adapter_registry.cpp
     elementwise_source_adapter.cpp
     measurement_store.cpp
-    dynamic_shape_contract.cpp)
+    dynamic_shape_contract.cpp
+    dynamic_shape_replay.cpp)
 if(LLK_BUILD_E2E_TESTS)
   list(APPEND _llk_tuning_sources
       mapped_tuning_session.cpp
@@ -36,7 +37,10 @@ add_test(NAME FrameworkSourceTest COMMAND LLKTuningTests
     --gtest_filter=WorkloadContract.*:FrameworkTest.*:BindingSchema.*:SourceAdapterRegistry.*:SourceSelection.*:ElementwiseSourceAdapter.*:ElementwiseSourceAdapterContext.*:MeasurementStoreTest.*)
 add_test(NAME DynamicShapeContractTest COMMAND LLKTuningTests
     --gtest_filter=ShapeContract.*)
+add_test(NAME DynamicShapeReplayTest COMMAND LLKTuningTests
+    --gtest_filter=DynamicShapeReplay.*)
 set_tests_properties(FrameworkSourceTest DynamicShapeContractTest
+                     DynamicShapeReplayTest
     PROPERTIES
         LABELS "Tuning"
         TIMEOUT 60

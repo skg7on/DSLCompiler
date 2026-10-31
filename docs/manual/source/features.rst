@@ -82,6 +82,10 @@ What you can do today
      - Verified raw-sample records, exact reproducible reuse, comparable-regime JSON/text error reports and disjoint full-identity holdout manifests
      - Whole-kernel timing remains separate from event costs; unknown time bases are excluded; no automatic fitting or calibrated accuracy threshold
      - :doc:`Validation </tools/validation>`, :doc:`Tuner </tools/tuning>`
+   * - Reuse dynamic code across shapes
+     - Two-level execution identity: a compiled variant (source, symbolic contract/version, numerical contract, guard domain, ABI version/hash, schedule, target/backend/compiler) and a measurement identity that adds the concrete shape/profile; ordered guarded variants with one full-domain baseline and an explicit budget; packed-weight keys include actual weight K/N
+     - Baseline reuse and measurement separation are exercised by the registered ``DynamicShapeReplay`` suite; guarded specialization is validated data only and tuning selects the baseline; production persistence and calibration remain separate
+     - :doc:`Tuner </tools/tuning>`, :doc:`architecture </architecture>`
    * - Search a non-contraction source
      - Versioned workload contract, source adapter registry, bounded rank-two f32 elementwise add/multiply with tiled spatial schedules
      - The bounded elementwise adapter is the first delivered non-contraction family; arbitrary Linalg import, broadcasting, reductions, dynamic shapes and approximation modes are rejected

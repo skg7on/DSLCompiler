@@ -33,6 +33,9 @@ namespace mlir::llk::tuning {
 /// The complete, length-delimited identity of one mapped executable. The
 /// canonical string is suitable for exact persistent measurement records.
 struct MappedMeasurementIdentity {
+  /// The reusable compiled-variant identity (code only, no invocation shapes).
+  /// `canonical` is this identity plus the concrete shape/profile observation.
+  std::string compiledVariant;
   std::string canonical;
   std::string contentHash;
   uint64_t planId = 0;

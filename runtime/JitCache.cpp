@@ -187,14 +187,18 @@ std::string JitCache::kernelKeyToString(const KernelKey &key) {
 }
 
 std::string JitCache::weightKeyToString(const WeightKey &key) {
-  // Pack: ptr(8) shape_hash(8) BK(8) BN(8) = 32 bytes
-  std::string s(32, '\0');
+  // Pack: ptr(8) shape_hash(8) BK(8) BN(8) K(8) N(8) = 48 bytes. The actual
+  // extents are part of the key, not merely encoded in shape_hash, so a packed
+  // buffer can never be retrieved for another shape.
+  std::string s(48, '\0');
   char *p = s.data();
   uint64_t ptrVal = reinterpret_cast<uint64_t>(key.weight_ptr);
   std::memcpy(p, &ptrVal, 8);
   std::memcpy(p + 8, &key.shape_hash, 8);
   std::memcpy(p + 16, &key.BK, 8);
   std::memcpy(p + 24, &key.BN, 8);
+  std::memcpy(p + 32, &key.K, 8);
+  std::memcpy(p + 40, &key.N, 8);
   return s;
 }
 
@@ -492,6 +496,7 @@ void JitCache::clear() {
   {
     std::unique_lock lock(mutex_);
     cache_.clear();
+    variant_cache_.clear();
   }
   ir_cache_.clear();
   optimized_cache_.clear();
@@ -501,8 +506,52 @@ void JitCache::clear() {
 
 size_t JitCache::size() const {
   std::shared_lock lock(mutex_);
-  return cache_.size() + ir_cache_.size() + optimized_cache_.size() +
-         object_cache_.size() + weight_cache_.size();
+  return cache_.size() + variant_cache_.size() + ir_cache_.size() +
+         optimized_cache_.size() + object_cache_.size() + weight_cache_.size();
+}
+
+std::optional<JitCache::KernelFn>
+JitCache::lookupVariantObjectCode(const CompiledVariantIdentity &identity) {
+  // An empty canonical string names no variant; accepting it would alias every
+  // unidentified request onto one cache slot.
+  if (identity.canonical.empty())
+    return std::nullopt;
+  std::shared_lock lock(mutex_);
+  auto found = variant_cache_.find(identity.canonical);
+  if (found == variant_cache_.end())
+    return std::nullopt;
+  return found->second;
+}
+
+void JitCache::insertVariantObjectCode(const CompiledVariantIdentity &identity,
+                                       KernelFn fn) {
+  if (identity.canonical.empty())
+    return;
+  std::unique_lock lock(mutex_);
+  variant_cache_[identity.canonical] = fn;
 }
 
 } // namespace llk
+
+namespace {
+uint64_t weightShapeHash(const Tensor2D &weight) {
+  uint64_t hash = 14695981039346656037ull;
+  for (int64_t value :
+       {weight.dim0, weight.dim1, weight.stride0, weight.stride1}) {
+    hash ^= static_cast<uint64_t>(value);
+    hash *= 1099511628211ull;
+  }
+  return hash;
+}
+} // namespace
+
+::llk::WeightKey makeWeightKey(const Tensor2D &weight, int64_t BK) {
+  ::llk::WeightKey key;
+  key.weight_ptr = weight.data;
+  key.shape_hash = weightShapeHash(weight);
+  key.BK = BK;
+  key.BN = weight.dim1;
+  key.K = weight.dim0;
+  key.N = weight.dim1;
+  return key;
+}

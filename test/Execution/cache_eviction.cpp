@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 #include <string>
+#include <vector>
 
 using namespace llk;
 
@@ -83,17 +84,22 @@ TEST(JitCache, L2_OptimizedMLIR_Cache) {
 TEST(JitCache, L4_PackedWeight_Cache) {
   JitCache cache;
 
-  WeightKey key{};
-  key.weight_ptr = reinterpret_cast<const void *>(0xDEADBEEF);
-  key.shape_hash = 12345;
-  key.BK = 64;
-  key.BN = 64;
+  std::vector<float> weight(64 * 128);
+  Tensor2D descriptor{weight.data(), 64, 128, 128, 1};
+  WeightKey key = makeWeightKey(descriptor, /*BK=*/64);
 
   cache.insertPackedWeights(key, "packed_blob_data");
   auto val = cache.lookupPackedWeights(key);
 
   EXPECT_TRUE(val.has_value());
   EXPECT_EQ(*val, "packed_blob_data");
+
+  // The same buffer packed for another actual shape is a different entry; the
+  // L4 cache must never return weights packed for a different K/N.
+  Tensor2D otherShape = descriptor;
+  otherShape.dim0 = 32;
+  EXPECT_FALSE(cache.lookupPackedWeights(makeWeightKey(otherShape, /*BK=*/64))
+                   .has_value());
 }
 
 TEST(JitCache, CacheStats_Accumulate) {

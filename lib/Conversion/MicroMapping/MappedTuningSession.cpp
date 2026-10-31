@@ -17,6 +17,7 @@
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/WorkloadGraph.h"
 #include "LLK/Perf/MeasurementRecord.h"
+#include "LLK/Runtime/CompiledVariantIdentity.h"
 #include "LLK/Version.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -25,6 +26,7 @@
 #include "llvm/Support/Chrono.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
 #include <cmath>
@@ -176,6 +178,28 @@ bool buffersAreOwned(const OwnedInvocationBuffers &buffers) {
          llvm::all_of(buffers.outputs, owned);
 }
 
+/// The numerical contract an executable carries: every explicit math mode in
+/// the compiled content, in deterministic order. Approximation is IR semantics,
+/// so it belongs to reusable-code identity rather than to one measurement.
+std::string canonicalMathModes(ModuleOp module) {
+  std::vector<std::string> modes;
+  module.walk([&](Operation *op) {
+    if (Attribute mode = op->getAttr("math_mode")) {
+      std::string printed;
+      llvm::raw_string_ostream stream(printed);
+      mode.print(stream);
+      modes.push_back(stream.str());
+    }
+  });
+  llvm::sort(modes);
+  std::string out;
+  appendField(out, "math-modes-v1");
+  appendField(out, std::to_string(modes.size()));
+  for (const std::string &mode : modes)
+    appendField(out, mode);
+  return out;
+}
+
 MappedMeasurementIdentity
 makeMeasurementIdentity(ModuleOp source, const MappedTuningCandidate &candidate,
                         const CandidateInstance &instance,
@@ -311,36 +335,51 @@ makeMeasurementIdentity(ModuleOp source, const MappedTuningCandidate &candidate,
     identity.operationKeys.push_back(candidate.planReport);
   if (identity.connectionKeys.empty())
     identity.connectionKeys.push_back(candidate.planReport);
-  // The durable key includes full content as well as the compact graph/ABI
-  // indices. Length-delimited fields prevent ambiguous concatenations.
-  std::string canonical;
-  appendField(canonical, "mapped-measurement-v1");
-  appendField(canonical, std::to_string(identity.planId));
-  appendField(canonical, std::to_string(identity.originalGraphHash));
-  appendField(canonical, std::to_string(identity.instantiatedGraphHash));
-  appendField(canonical, std::to_string(identity.bindingHash));
-  appendField(canonical, std::to_string(identity.abiHash));
-  appendField(canonical, identity.targetIdentity);
-  appendField(canonical, identity.backendIdentity);
-  appendField(canonical, LLK_COMPILER_VERSION);
-  appendField(canonical, std::to_string(mapping::kCostModelVersion));
-  appendField(canonical, std::to_string(mapping::kConnectionKeyVersion));
-  appendField(canonical, candidate.planReport);
+
+  // Level 1: reusable code. The level-2 key below adds the observation to this
+  // identity; different invocations of one dynamic variant share this part.
+  std::string schedule;
+  appendField(schedule, "mapped-schedule-v1");
+  appendField(schedule, std::to_string(identity.planId));
+  appendField(schedule, std::to_string(identity.originalGraphHash));
+  appendField(schedule, std::to_string(identity.instantiatedGraphHash));
+  appendField(schedule, std::to_string(identity.bindingHash));
+  appendField(schedule, std::to_string(mapping::kCostModelVersion));
+  appendField(schedule, std::to_string(mapping::kConnectionKeyVersion));
+  appendField(schedule, candidate.planReport);
   for (const std::string &key : identity.operationKeys)
-    appendField(canonical, key);
+    appendField(schedule, key);
   for (const std::string &key : identity.connectionKeys)
-    appendField(canonical, key);
-  // Full source and instantiated content guard against short-hash collisions.
-  appendField(canonical, render(source));
-  appendField(canonical, render(instance.module.get()));
-  appendField(canonical,
-              workload::canonicalWorkloadContract(instance.workloadContract));
-  // A sampled measurement is an observation of a profile, not of the symbolic
-  // domain as a whole. Two profiles that rank the same code differently must
-  // not share a stored latency.
-  if (!shapeProfileCanonical.empty())
-    appendField(canonical, shapeProfileCanonical);
-  identity.canonical = std::move(canonical);
+    appendField(schedule, key);
+
+  std::string sourceContent;
+  appendField(sourceContent, render(source));
+  appendField(sourceContent, render(instance.module.get()));
+
+  ::llk::CompiledVariantIdentityInputs variantInputs;
+  variantInputs.sourceContent = std::move(sourceContent);
+  variantInputs.symbolicContract =
+      workload::canonicalWorkloadContract(instance.workloadContract);
+  variantInputs.symbolicContractVersion = instance.workloadContract.version;
+  variantInputs.numericalContract = canonicalMathModes(instance.module.get());
+  variantInputs.abiVersion = compiled.executable->abi().version;
+  variantInputs.abiHash = identity.abiHash;
+  variantInputs.staticSchedule = std::move(schedule);
+  variantInputs.targetIdentity = identity.targetIdentity;
+  variantInputs.backendIdentity = identity.backendIdentity;
+  variantInputs.executionMode = "mapped";
+  variantInputs.compilerVersion = LLK_COMPILER_VERSION;
+
+  ::llk::CompiledVariantIdentity variant =
+      ::llk::makeCompiledVariantIdentity(variantInputs);
+  identity.compiledVariant = variant.canonical;
+
+  // Level 2: the observation. A sampled measurement is an observation of a
+  // profile, not of the symbolic domain as a whole. Two profiles that rank the
+  // same code differently must not share a stored latency, and neither may two
+  // concrete shapes under one profile.
+  identity.canonical = ::llk::canonicalMeasurementIdentity(
+      identity.compiledVariant, /*values=*/{}, shapeProfileCanonical);
   identity.contentHash = perf::measurementContentHash(identity.canonical);
   return identity;
 }
