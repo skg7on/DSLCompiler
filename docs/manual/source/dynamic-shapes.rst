@@ -17,6 +17,63 @@ and :source:`implementation plan <docs/superpowers/plans/2026-10-17-dynamic-shap
 record the original design; current interfaces and registered tests define the
 implemented boundary.
 
+.. _dynamic-shapes-scenarios:
+
+Supported scenarios
+-------------------
+
+Choose the entry path as well as the shape pattern. Dynamic contraction
+execution is delivered through the mapped compiler and typed C++ invocation;
+Python frontend execution and arbitrary semantic import have separate limits.
+
+.. list-table::
+   :header-rows: 1
+   :class: wide-table
+
+   * - Scenario
+     - Supported behavior
+     - Boundary
+   * - Fully dynamic matmul or fused SwiGLU
+     - One executable handles independently changing M, N and K, including
+       runtime weight dimensions
+     - Rank-two signatures; both SwiGLU weight arms must agree on K/N
+   * - Mixed static/dynamic contraction
+     - Fix any subset of M/N/K and vary the remaining dimensions
+     - Every invocation must retain the declared constant extents
+   * - Partial tiles and K tails
+     - Non-divisible dimensions use bounded loads, clipped stores and exact
+       reduction lengths
+     - The selected target emitters must support those boundary requirements
+   * - Empty output or empty reduction
+     - M=0/N=0 is empty; K=0 retains initialization and epilogue semantics
+     - Shape relationships and descriptors are still validated
+   * - External tensors larger than local memory
+     - Caller-owned inputs/outputs remain external; fixed local tiles stream
+       through the computation
+     - Local storage and simultaneous residency must be certified; descriptor
+       arithmetic and backing allocations must fit
+   * - Direct dynamic elementwise MicroIR
+     - The acceptance suite also executes directly authored dynamic elementwise
+       kernels
+     - This does not extend the static-only ``linalg-elementwise-v1`` semantic
+       source adapter
+   * - Dynamic performance analysis and tuning
+     - Analyze explicit bindings and rank complete plans over weighted samples
+     - A model prediction for those observations, with explicit completeness;
+       no calibrated timing or domain-wide latency claim
+   * - Baseline reuse and frozen replay
+     - Reinvoke a compiled baseline at valid new shapes and replay its saved
+       source/plan
+     - Automatic guarded specialization is not generated; cross-profile tuner
+       cache reuse is not guaranteed
+
+The numerical acceptance examples use BF16 contractions with FP32 accumulation,
+plus direct f32 elementwise coverage. Export recognizes additional Micro tile
+dtypes, but parsing/export support alone does not establish a matching target
+rule, executable lowering or numerical acceptance for every dtype. Reference
+execution and selected AVX2 execution are separate modes; selected AVX2 requires
+a compatible x86_64 AVX2 host. See :ref:`coverage and limits <dynamic-shapes-coverage>`.
+
 .. _dynamic-shapes-contracts:
 
 Shapes and semantic guards
@@ -54,6 +111,61 @@ bindings for caller-owned destinations. Static version-1 contracts remain
 readable with their existing canonical encoding and identity.
 See :source:`ShapeContract.h <include/LLK/Shape/ShapeContract.h>` and
 :source:`WorkloadContract.h <include/LLK/Conversion/Workload/WorkloadContract.h>`.
+
+.. _dynamic-shapes-binding-algorithm:
+
+How dimension resolution and guards work
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The contraction adapter resolves each semantic axis from all of its occurrences.
+For K, for example, it examines A's columns and B's rows, and SwiGLU includes
+both weight rows. Conflicting known constants fail immediately. A known constant
+pins the axis; if no occurrence pins it, the adapter introduces the symbol
+``K``. The same process resolves M and N. This keeps mixed signatures consistent
+without treating an unknown extent as an integer sentinel in shape arithmetic.
+
+At invocation, typed descriptor validation and symbol binding form a gate before
+kernel entry:
+
+#. Validate the buffer envelope, dtype, extent/stride/offset arithmetic, allocation
+   bounds and output disjointness.
+#. Match every ordered input/output port to its declared shape. Check constant
+   axes directly; bind a symbol on its first occurrence and compare subsequent
+   occurrences with that value.
+#. Check every bound symbol against its minimum, maximum and ``multipleOf``.
+   Only a consistent complete binding may enter generated code. Exported IR also
+   carries assertions for unresolved semantic dimension equalities.
+
+Thus ``X[7,5], Wg[5,13], Wu[5,13], out[7,13]`` binds
+``{M:7, N:13, K:5}``. Replacing Wu with ``[6,13]`` is an error rather than a
+different workload. Making X/output empty in M does not make that K disagreement
+legal. The binding implementation is :source:`ShapeContract.cpp <lib/Shape/ShapeContract.cpp>`;
+the descriptor gate is :source:`MappedInvocation.cpp <runtime/MappedInvocation.cpp>`.
+
+The reusable predicate classifier exposes three conservative verdicts against
+the declared domain; one example input cannot establish a domain-wide fact:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Verdict
+     - Meaning
+     - Example for ``K % 32 == 0``
+   * - ``Proven``
+     - Every admitted extent satisfies the predicate
+     - The contract declares ``K.multipleOf = 32``
+   * - ``Disproven``
+     - No admitted extent satisfies it
+     - K is constrained to exactly 35
+   * - ``RuntimeGuard``
+     - The declared facts do not settle it
+     - K is an otherwise unconstrained nonnegative symbol
+
+A path requiring a disproven predicate is illegal. An unresolved predicate
+requires a checked guard or a bounded realization; it cannot silently justify a
+full-tile access. This classifier supports divisibility, equality and lower-bound
+predicates over range/congruence constraints. It does not solve arbitrary
+symbolic expressions or automatically create guarded specializations.
 
 .. _dynamic-shapes-export:
 
@@ -97,6 +209,45 @@ come from invocation descriptors.
 Boundaries, empty dimensions and local storage
 ----------------------------------------------
 
+.. _dynamic-shapes-tiling-algorithm:
+
+Fixed capacities with runtime tile counts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The exporter fixes ``BM``, ``BN`` and ``BK`` in the schedule and computes the
+number of tiles from runtime extents. It implements ``ceildiv(E,T)`` as
+``E // T + (E % T != 0)`` instead of forming ``E + T - 1``, avoiding that addition's
+overflow near the index limit. Each visited tile uses
+``valid = min(capacity, extent - offset)``. Offsets are generated only for tiles
+inside the extent, so empty axes visit no tile.
+
+The following is semantic pseudocode for matmul. The actual MicroIR expresses
+M/N work with spatial loops, K with a temporal loop, and staging with
+``micro.pipeline`` and completion tokens:
+
+.. code-block:: text
+
+   for mi in [0, ceildiv(M, BM)):
+     m0 = mi * BM; vm = min(BM, M - m0)
+     for ni in [0, ceildiv(N, BN)):
+       n0 = ni * BN; vn = min(BN, N - n0)
+       acc = load_and_convert_init_tile(m0, n0, valid=[vm, vn])
+       for ki in [0, ceildiv(K, BK)):
+         k0 = ki * BK; vk = min(BK, K - k0)
+         a = bounded_load(A, [m0, k0], valid=[vm, vk], capacity=[BM, BK])
+         b = bounded_load(B, [k0, n0], valid=[vk, vn], capacity=[BK, BN])
+         wait_for_loads()
+         acc = mma(a, b, acc, valid_k=vk)
+       result = output_conversion(acc)
+       clipped_store(out, [m0, n0], result, valid=[vm, vn])
+
+SwiGLU shares the X tile across two weight loads and two accumulators. Both
+accumulators start at zero; after the K loop finishes, the output tile evaluates
+``silu(gate) * up`` with the source math mode and output conversion. Applying the
+epilogue once after the full reduction is essential: applying SiLU per K tile
+would change the function being computed. See
+:source:`MicroKernelDriver.cpp <lib/Conversion/LLKToMicro/MicroKernelDriver.cpp>`.
+
 ``micro.tile_load`` copies only its valid rectangle into a fixed-capacity tile
 and fills the remaining lanes with typed padding. ``micro.tile_store`` writes
 only the valid destination rectangle. ``micro.mma valid_k`` reduces exactly
@@ -104,11 +255,25 @@ the valid K elements: it does not execute a full padded BK reduction. This
 preserves the source's initialization, conversion and math-mode semantics,
 including the strict signed-zero/nonfinite cases covered by acceptance tests.
 
+For example, with ``BM=8, BN=32, BK=32`` and ``M=9, N=33, K=35``, the grid is
+2×2 output tiles with two K iterations each. The last output tile has
+``validM=1, validN=1`` and the last reduction tile has ``validK=3``. Its local
+capacities remain 8×32 for A, 32×32 for B and 8×32 for the accumulator. Only the
+valid external rectangles are read/written, and only three K terms are reduced
+in the tail. Padding makes local tiles well-defined; it does not add semantic
+reduction terms. Under strict arithmetic, extra padded ``+0`` contributions can
+even change an accumulated ``-0`` to ``+0``.
+
 M=0 or N=0 produces an empty output without compute or movement. K=0 still
 performs initialization and stores the specified result: matmul preserves its
 initializer and SwiGLU evaluates its epilogue from zero projections. Null data
 pointers are allowed for genuinely empty buffers after descriptor and shape
 validation.
+
+.. _dynamic-shapes-storage-algorithm:
+
+Certify storage independently of total work
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 External tensor dimensions may be dynamic, but local tiles and maximum
 concurrent residency must be bounded at compilation. Complete-plan evaluation
@@ -117,6 +282,34 @@ an executable candidate. A large external output is not a whole-output SRAM
 allocation. Unbounded dynamic local allocation is rejected. An unknown
 divisibility predicate requires a runtime guard or bounded movement; it is not
 evidence that a full tile is legal.
+
+The storage planner separates **execution multiplicity** (how many times an
+operation eventually runs) from **simultaneous residency** (how many tile
+instances may be live together). A long serial K loop increases work without
+making every iteration's storage live at once. Spatial owners and pipeline
+overlap can increase residency and must be included.
+
+For a complete selected plan, certification:
+
+#. Resolves concrete placements and memory routes, including intermediate
+   movement buffers, then computes each local allocation's physical footprint
+   from its static tile shape, element size and selected layout.
+#. Bounds simultaneous occurrences from recovered structural facts. When the
+   dynamic spatial grid is not a static count, the selected executor pool's
+   concurrency supplies the bound; the logical grid size is not a concurrency
+   count. Strict planning rejects a missing residency bound.
+#. Accounts for allocation lifetimes, per-hop staging and required reuse
+   ordering, and checks peak live bytes against the selected memories' capacities
+   before executable candidate retention. Borrowed external tensors do not
+   become local scratch allocations.
+
+For one allocation the contribution is its physical bytes times its resident
+occurrences; the peak also depends on which lifetimes overlap. This is why neither
+``M*N*sizeof(dtype)`` nor the sum of all sequential tile iterations is the local
+capacity requirement. Larger runtime tensors can keep the same bounded local
+plan, while increasing pipeline depth or owner concurrency can make that plan
+illegal. See :source:`StoragePlan.cpp <lib/Mapping/StoragePlan.cpp>` and the
+:source:`dynamic mapping tests <test/Mapping/dynamic_shape_mapping.cpp>`.
 
 .. _dynamic-shapes-invocation:
 
@@ -178,6 +371,43 @@ or incomplete samples cannot become a one-iteration or zero-cost score. The JSON
 report retains ``shape_profile``, per-candidate ``shape_samples`` and
 ``shape_aggregation``. Samples guide ranking; they do not narrow the baseline's
 valid shape domain. Predictions remain uncalibrated model outputs.
+
+.. _dynamic-shapes-sampling-algorithm:
+
+How sampled ranking works
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The evaluator keeps the executable's symbolic source and the candidate's fixed
+mapping decisions, then evaluates each profile observation separately:
+
+#. Validate the sample's complete symbol binding and clone the source module.
+   Replace dimension queries with the sample values and canonicalize the clone
+   so shape guards, ceil-div tile counts and boundary sizes become concrete.
+#. Extract the sampled workload graph, bind/materialize the same selected plan,
+   and verify target operation coverage. Run shared selected-kernel analysis
+   with completeness required, including the plan's storage liveness and
+   capacity checks. Reject the candidate if any sample fails.
+#. Retain per-sample costs and combine comparable cost fields with the weighted
+   mean. For latency this is ``sum(weight[i] * cycles[i]) / sum(weight[i])``;
+   byte-count means are rounded to integer counters. Weights need not sum to one.
+
+The profile shipped here has weights 1, 2 and 1, so the middle observation
+contributes half the latency score. That score is not worst-case latency and is
+not one physical execution trace. A single-sample plan may attach its event
+snapshot; a multi-sample plan omits that snapshot because no individual stream
+represents the weighted mean. Per-sample results remain available.
+
+This establishes a ranking for the declared observations, not numerical
+correctness or a performance guarantee at unobserved shapes. Domain legality
+still relies on symbolic guards, bounded movement and storage certification;
+actual timings require verified invocation and measurement. The implementation
+is :source:`ShapeSpecialization.cpp <lib/Conversion/MicroMapping/ShapeSpecialization.cpp>`
+and :source:`CompletePlanEvaluation.cpp <lib/Conversion/MicroMapping/CompletePlanEvaluation.cpp>`.
+
+.. _dynamic-shapes-analysis-walkthrough:
+
+Run the sampling workflow
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 A machine profile must describe the selected movement paths and enough local
 capacity for the fixed tiles and simultaneous owners. The shipped CPU profile
@@ -307,8 +537,61 @@ fallback. Runtime-K contractions use shared exact-K loop lowering within that
 selected path; static contractions retain their native vector path. Export or
 successful compilation alone does not establish numerical correctness.
 
-Dynamic rank, ragged/data-dependent shapes, arbitrary strides/offsets,
-unbounded local tiles, general Linalg import and automatic guarded
-specialization are outside this increment. The narrow Arm executable subsets
-do not gain dynamic contraction execution from this work. Native Python
-frontend execution remains a separate milestone (see :doc:`python-frontend`).
+.. list-table::
+   :header-rows: 1
+   :class: wide-table
+
+   * - Area
+     - Current limit
+     - Practical consequence
+   * - Rank and shape relationships
+     - Rank is compile-time known; dimensions are constants or symbols with
+       equality, range and multiple-of constraints
+     - Dynamic rank, ragged/data-dependent extents and arbitrary symbolic
+       relations such as ``N = 2*M`` are not supplied by this shape contract
+   * - Callable buffers
+     - Rank two, compact row-major, zero offset, at most 12 descriptors;
+       per-port dtype fixed by the compiled ABI
+     - Transposed/strided views, nonzero-offset descriptors and runtime dtype
+       changes are rejected; a new shape does not change the buffer format
+   * - Ownership and effects
+     - Read-only inputs and disjoint caller-owned outputs; v2 requires typed
+       descriptors with allocation sizes
+     - Allocate the correctly sized output before invocation. In-place aliases
+       and untagged v2 invocation are not supported
+   * - Local storage and target boundaries
+     - Fixed tile footprints, provable simultaneous residency and emitters that
+       accept bounded-load/store/partial-K requirements
+     - An unbounded local allocation, missing residency proof, capacity overflow
+       or unsupported boundary realization prevents executable retention
+   * - Semantic import and frontend
+     - Dynamic LLK export covers matmul/SwiGLU; the semantic elementwise adapter
+       remains static-only
+     - General Linalg import and native Python frontend execution are separate
+       capabilities (see :doc:`python-frontend`)
+   * - Target execution
+     - Reference and selected-target modes are distinct; the demonstrated
+       dynamic selected execution path is AVX2
+     - Existing Arm executable subsets and generic-accelerator analysis do not
+       establish dynamic contraction execution on those targets
+   * - Numerical semantics
+     - Accumulator type, initializer, exact K extent, math mode and output
+       conversion points remain source semantics
+     - Dynamic shapes do not authorize extra padded reduction terms, moving an
+       epilogue into the K loop or silently relaxing strict math
+   * - Performance evidence
+     - Explicit samples and complete selected-plan analysis are required for
+       ranking; standalone incomplete reports can still contain advisory costs
+     - Do not interpret ``complete: false`` as a usable ranking or a weighted
+       model score as measured/worst-case latency
+   * - Specialization and reuse
+     - Guarded variants have validated ordering and a budget, while tuning
+       currently selects the baseline and retains sampled report provenance
+     - No automatic specialization dispatcher or guaranteed cross-profile
+       compiled-cache hit; never reuse incompatible measurements or packed weights
+
+When a workload is refused, first identify the failing boundary. A dimension
+conflict is a semantic/descriptor error; a capacity or boundary-emitter failure
+is plan legality; missing samples/resources are analysis completeness; an
+incompatible ISA is host eligibility. Changing M/N/K flags or lowering to a
+reference backend does not repair an invalid shape or descriptor.
