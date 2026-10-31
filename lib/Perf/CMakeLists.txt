@@ -15,6 +15,7 @@ add_llk_library(LLKPerf
     PredictionValidation.cpp
     CandidateBinding.cpp
     ScheduleRecord.cpp
+    ShapeProfile.cpp
     TuningSession.cpp
-    LINK_LIBRARIES MicroDialect LLKMachine LLKMapping LLK::MLIR LLVM
+    LINK_LIBRARIES MicroDialect LLKMachine LLKMapping LLKShape LLK::MLIR LLVM
 )

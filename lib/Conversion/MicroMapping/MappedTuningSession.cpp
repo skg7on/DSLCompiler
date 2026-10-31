@@ -11,6 +11,7 @@
 
 #include "CompletePlanEvaluation.h"
 #include "LLK/Conversion/MappedCompilation.h"
+#include "LLK/Conversion/MicroMapping/ShapeSpecialization.h"
 #include "LLK/Mapping/CostEvent.h"
 #include "LLK/Mapping/LatencyProvider.h"
 #include "LLK/Mapping/MappingMetadata.h"
@@ -179,7 +180,8 @@ MappedMeasurementIdentity
 makeMeasurementIdentity(ModuleOp source, const MappedTuningCandidate &candidate,
                         const CandidateInstance &instance,
                         const ::llk::MappedCompilation &compiled,
-                        const mapping::MappingTarget &target) {
+                        const mapping::MappingTarget &target,
+                        llvm::StringRef shapeProfileCanonical = {}) {
   MappedMeasurementIdentity identity;
   identity.planId = candidate.plan.id;
   identity.originalGraphHash = instance.sourceGraphHash;
@@ -333,6 +335,11 @@ makeMeasurementIdentity(ModuleOp source, const MappedTuningCandidate &candidate,
   appendField(canonical, render(instance.module.get()));
   appendField(canonical,
               workload::canonicalWorkloadContract(instance.workloadContract));
+  // A sampled measurement is an observation of a profile, not of the symbolic
+  // domain as a whole. Two profiles that rank the same code differently must
+  // not share a stored latency.
+  if (!shapeProfileCanonical.empty())
+    appendField(canonical, shapeProfileCanonical);
   identity.canonical = std::move(canonical);
   identity.contentHash = perf::measurementContentHash(identity.canonical);
   return identity;
@@ -537,13 +544,15 @@ auto makeCompletePlanEvaluator(const CandidateInstance &instance,
                                const mapping::MappingTarget &target,
                                mapping::BindContract contract,
                                uint64_t memoryBudget,
+                               const mapping::ShapeSampleOptions *shapes,
                                PlanReceipts *acceptedReceipts = nullptr) {
   return [&instance, &space, &candidate, &target, contract, memoryBudget,
-          acceptedReceipts](const mapping::CoveringPlan &proposal)
+          shapes, acceptedReceipts](const mapping::CoveringPlan &proposal)
              -> llvm::Expected<mapping::CompletePlanEvaluation> {
     auto evaluation = mapping::evaluateCompletePlan(
         instance.module.get(), instance.workloadGraph, target, proposal,
-        contract, memoryBudget, mapping::AnalysisRequirement::Complete);
+        contract, memoryBudget, mapping::AnalysisRequirement::Complete,
+        shapes ? *shapes : mapping::ShapeSampleOptions{});
     if (!evaluation)
       return evaluation.takeError();
     if (!evaluation->plan || instance.schema.empty())
@@ -564,12 +573,11 @@ auto makeCompletePlanEvaluator(const CandidateInstance &instance,
   };
 }
 
-llvm::Error measureSelectedCandidates(ModuleOp source,
-                                      const perf::SearchSpace &space,
-                                      const mapping::MappingTarget &target,
-                                      const MappedTuningOptions &options,
-                                      const InstantiateCandidateFn &instantiate,
-                                      MappedTuningReport &report) {
+llvm::Error measureSelectedCandidates(
+    ModuleOp source, const perf::SearchSpace &space,
+    const mapping::MappingTarget &target, const MappedTuningOptions &options,
+    const mapping::ShapeSampleOptions *sampled,
+    const InstantiateCandidateFn &instantiate, MappedTuningReport &report) {
   const auto &measurement = options.measurement;
   if (!measurement.measure && !measurement.measureDetailed)
     return llvm::Error::success();
@@ -626,9 +634,10 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
     auto binding = toBinding(candidate.ranking.candidate);
     mapping::MappingSearchOptions searchOptions = options.mapping;
     searchOptions.requireCompleteEvaluation = true;
-    searchOptions.evaluateCompletePlan = makeCompletePlanEvaluator(
-        *instance, space, candidate.ranking.candidate, target,
-        mapping::BindContract::Executable, searchOptions.memoryBudgetBytes);
+    searchOptions.evaluateCompletePlan =
+        makeCompletePlanEvaluator(*instance, space, candidate.ranking.candidate,
+                                  target, mapping::BindContract::Executable,
+                                  searchOptions.memoryBudgetBytes, sampled);
     mapping::CoveringSearch search(
         instance->workloadGraph, target, *instance->module->getContext(),
         layoutContext(instance->workloadGraph), searchOptions, binding,
@@ -703,7 +712,10 @@ llvm::Error measureSelectedCandidates(ModuleOp source,
       continue;
     }
     MappedMeasurementIdentity identity = makeMeasurementIdentity(
-        source, candidate, *instance, *compiled, target);
+        source, candidate, *instance, *compiled, target,
+        options.shapeProfile
+            ? perf::canonicalShapeProfile(*options.shapeProfile)
+            : llvm::StringRef());
     MappedMeasurementRequest request{candidate, *compiled->executable, identity,
                                      buffers->inputs, buffers->outputs};
     perf::MeasurementRecord record;
@@ -919,6 +931,21 @@ runMappedTuningSessionImpl(ModuleOp source, const perf::SearchSpace &space,
   }
   if (measuredObjective && !hasProvider)
     return fail("a measured objective requires a mapped measurement provider");
+
+  std::optional<shape::ShapeContract> shapeContract;
+  mapping::ShapeSampleOptions sampled;
+  if (options.shapeProfile) {
+    if (!workloadContract)
+      return fail("a shape profile requires a source with a symbolic workload "
+                  "contract");
+    shapeContract = mapping::toShapeContract(*workloadContract);
+    if (llvm::Error error =
+            perf::validateShapeProfile(*shapeContract, *options.shapeProfile))
+      return std::move(error);
+    sampled.contract = &*shapeContract;
+    sampled.profile = &*options.shapeProfile;
+  }
+
   MappedTuningReport report;
   std::vector<perf::Candidate> candidates =
       perf::generateCandidates(space, options.generator);
@@ -977,9 +1004,9 @@ runMappedTuningSessionImpl(ModuleOp source, const perf::SearchSpace &space,
     // here. A failed receipt rejects that proposal and the search keeps
     // enumerating; it is never a post-top-K filter.
     PlanReceipts acceptedReceipts;
-    searchOptions.evaluateCompletePlan =
-        makeCompletePlanEvaluator(*instance, space, candidate, target, contract,
-                                  memoryBudget, &acceptedReceipts);
+    searchOptions.evaluateCompletePlan = makeCompletePlanEvaluator(
+        *instance, space, candidate, target, contract, memoryBudget,
+        sampled.profile ? &sampled : nullptr, &acceptedReceipts);
     searchOptions.requireCompleteEvaluation = true;
     mapping::CoveringSearch search(
         instance->workloadGraph, target, *instance->module->getContext(),
@@ -1114,7 +1141,8 @@ runMappedTuningSessionImpl(ModuleOp source, const perf::SearchSpace &space,
         return ranksBefore(a, b, space.objective);
       });
   if (llvm::Error error = measureSelectedCandidates(
-          source, space, target, options, instantiate, report))
+          source, space, target, options, sampled.profile ? &sampled : nullptr,
+          instantiate, report))
     return std::move(error);
   if (measuredObjective) {
     report.measuredCohortOnly = true;

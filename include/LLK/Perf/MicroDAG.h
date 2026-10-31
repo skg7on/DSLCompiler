@@ -129,6 +129,14 @@ struct MicroEvent {
   /// two flops per unit, which is how the L0 bound recovers total flops.
   uint64_t workItems = 0;
   uint64_t bytes = 0;
+  /// Per-side traffic for a bounded movement (dynamic-shape design §5.1/§5.2):
+  /// a clipped load copies only the valid rectangle from its source but fills
+  /// the whole static destination tile. Zero means "the same as `bytes`".
+  uint64_t sourceBytes = 0;
+  uint64_t destinationBytes = 0;
+  /// Lanes written as padding rather than copied. Reported separately so the
+  /// external traffic and the padded local fill are never conflated.
+  uint64_t fillElements = 0;
   uint64_t minCycles = 0;
   std::vector<uint32_t> deps;
   std::string sourceOpName;

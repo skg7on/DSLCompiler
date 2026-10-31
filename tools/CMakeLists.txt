@@ -61,6 +61,8 @@ target_link_libraries(llk-tune PRIVATE LLKBuildOptions
 add_executable(micro-perf micro-perf/micro-perf.cpp)
 target_link_libraries(micro-perf PRIVATE LLKBuildOptions
     LLKPerf
+    LLKMicroMapping
+    LLKWorkloadContracts
     MicroDialect
     LLKDialect
     LLK::MLIR

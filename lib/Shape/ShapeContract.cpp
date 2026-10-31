@@ -253,6 +253,38 @@ bindShapeValues(const ShapeContract &contract,
   return bound;
 }
 
+llvm::Error validateShapeValues(const ShapeContract &contract,
+                                const ShapeValues &values) {
+  if (llvm::Error error = validateShapeContract(contract))
+    return error;
+  for (const auto &[name, constraint] : contract.symbols) {
+    auto found = values.find(name);
+    if (found == values.end())
+      return shapeError("missing_value: '" + name + "'");
+    if (found->second < 0)
+      return shapeError("negative_value: '" + name + "'");
+    if (found->second < constraint.min)
+      return shapeError("constraint_violation: '" + name + "' bound " +
+                        std::to_string(found->second) +
+                        " is below its minimum " +
+                        std::to_string(constraint.min));
+    if (constraint.max && found->second > *constraint.max)
+      return shapeError("constraint_violation: '" + name + "' bound " +
+                        std::to_string(found->second) +
+                        " is above its maximum " +
+                        std::to_string(*constraint.max));
+    if (found->second % constraint.multipleOf != 0)
+      return shapeError("constraint_violation: '" + name + "' bound " +
+                        std::to_string(found->second) +
+                        " is not a multiple of " +
+                        std::to_string(constraint.multipleOf));
+  }
+  for (const auto &entry : values)
+    if (!contract.symbols.count(entry.first))
+      return shapeError("unknown_value: '" + entry.first + "'");
+  return llvm::Error::success();
+}
+
 std::string canonicalShapeContract(const ShapeContract &contract) {
   std::string out;
   appendInt(out, "ports", static_cast<int64_t>(contract.ports.size()));

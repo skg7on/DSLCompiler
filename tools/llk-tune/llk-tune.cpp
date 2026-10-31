@@ -20,6 +20,7 @@
 
 #include "LLK/Conversion/MicroMapping/CandidateInstantiation.h"
 #include "LLK/Conversion/MicroMapping/MappedTuningSession.h"
+#include "LLK/Conversion/MicroMapping/ShapeSpecialization.h"
 #include "LLK/Conversion/Workload/ContractionSourceAdapter.h"
 #include "LLK/Conversion/Workload/SourceAdapter.h"
 #include "LLK/Conversion/Workload/WorkloadContract.h"
@@ -30,6 +31,7 @@
 #include "LLK/Mapping/MappingTarget.h"
 #include "LLK/Mapping/PlanReport.h" // IWYU pragma: keep
 #include "LLK/Perf/ScheduleRecord.h"
+#include "LLK/Perf/ShapeProfile.h"
 #include "LLK/Perf/TuningSession.h"
 #include "LLK/Target/MappingTargets.h"
 
@@ -123,6 +125,12 @@ static cl::opt<std::string>
     tuneMappingMode("mapping-mode",
                     cl::desc("Mapping search mode: deterministic, beam, exact"),
                     cl::init("exact"));
+static cl::opt<std::string> tuneShapeProfile(
+    "shape-profile",
+    cl::desc("Versioned JSON shape profile (a file path or inline JSON) used "
+             "to rank a dynamic workload on concrete samples"),
+    cl::init(""), cl::value_desc("json|path"));
+
 static cl::opt<std::string> tuneMappingBackend(
     "mapping-backend",
     cl::desc("Mapped compile backend: reference or selected-target"),
@@ -195,6 +203,21 @@ namespace {
 int reportError(const llvm::Twine &message) {
   llvm::errs() << "llk-tune: error: " << message << "\n";
   return 1;
+}
+
+/// Reads a shape profile from an inline JSON document or from a file. The
+/// version-1 schema is parsed strictly; contract validation is the caller's
+/// job because only the caller knows the workload's symbols.
+llvm::Expected<mlir::llk::perf::ShapeProfile>
+loadShapeProfile(llvm::StringRef source) {
+  if (source.starts_with("{"))
+    return mlir::llk::perf::parseShapeProfile(source);
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+      llvm::MemoryBuffer::getFile(source);
+  if (!buffer)
+    return llvm::createStringError(
+        buffer.getError(), "cannot read shape profile '" + source.str() + "'");
+  return mlir::llk::perf::parseShapeProfile((*buffer)->getBuffer());
 }
 
 //===----------------------------------------------------------------------===//
@@ -901,6 +924,21 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
                                   ? tuning::SourceMode::ConcreteMicro
                                   : tuning::SourceMode::Synthetic;
   options.executable = true;
+  if (!tuneShapeProfile.empty()) {
+    if (!sourceContract)
+      return reportError(
+          "--shape-profile requires a source with a symbolic workload "
+          "contract; the selected source declares none");
+    llvm::Expected<perf::ShapeProfile> parsed =
+        loadShapeProfile(tuneShapeProfile);
+    if (!parsed)
+      return reportError(llvm::toString(parsed.takeError()));
+    mlir::llk::shape::ShapeContract shapeContract =
+        mapping::toShapeContract(*sourceContract);
+    if (llvm::Error error = perf::validateShapeProfile(shapeContract, *parsed))
+      return reportError(llvm::toString(std::move(error)));
+    options.shapeProfile = std::move(*parsed);
+  }
   std::optional<tuning::MeasurementStore> measurementStore;
   if (!tuneMeasurementStore.empty()) {
     measurementStore.emplace(tuneMeasurementStore);
@@ -976,7 +1014,9 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
       return llvm::Error::success();
     };
   }
-  auto report = !contractionSource && sourceContract
+  const bool contractPath =
+      sourceContract && (!contractionSource || options.shapeProfile);
+  auto report = contractPath
                     ? tuning::runMappedTuningSession(
                           source, space, *sourceContract, **target, options)
                     : tuning::runMappedTuningSession(source, space, shape,
@@ -1008,6 +1048,25 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
       bindings[v.first] = v.second;
     row["bindings"] = std::move(bindings);
     row["source_mode"] = tuneCandidateSource;
+    if (!candidate.plan.shapeSamples.empty()) {
+      llvm::json::Array samples;
+      for (const mapping::PlanShapeSampleCost &sample :
+           candidate.plan.shapeSamples) {
+        llvm::json::Object entry;
+        llvm::json::Object values;
+        for (const auto &value : sample.values)
+          values[value.first] = value.second;
+        entry["values"] = std::move(values);
+        entry["weight"] = sample.weight;
+        entry["latency_cycles"] = sample.cost.latencyCycles;
+        entry["dram_bytes"] = sample.cost.dramBytes;
+        entry["local_bytes"] = sample.cost.localBytes;
+        entry["fill_elements"] = sample.fillElements;
+        samples.push_back(std::move(entry));
+      }
+      row["shape_samples"] = std::move(samples);
+      row["shape_aggregation"] = candidate.plan.shapeAggregation;
+    }
     if (!sourceAdapterKey.empty()) {
       row["source_adapter"] = sourceAdapterKey;
       llvm::json::Object receipt;
@@ -1116,7 +1175,7 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
       tuning::CandidateInstantiationOptions sourceOptions = options.source;
       sourceOptions.machine = &(*target)->machine();
       auto instance =
-          !contractionSource && sourceContract
+          contractPath
               ? tuning::instantiateCandidate(source, space, record.candidate,
                                              *sourceContract, sourceOptions)
               : tuning::instantiateCandidate(source, space, record.candidate,
@@ -1163,6 +1222,24 @@ int runMappedSearch(ModuleOp source, const mlir::llk::perf::SearchSpace &space,
             mlir::llk::workload::canonicalWorkloadContract(*sourceContract);
         out["source_contract"] = std::move(contract);
       }
+    }
+    if (options.shapeProfile) {
+      llvm::json::Object profile;
+      profile["canonical"] = perf::canonicalShapeProfile(*options.shapeProfile);
+      profile["aggregation"] = options.shapeProfile->aggregation;
+      profile["max_variants"] = options.shapeProfile->maxVariants;
+      llvm::json::Array samples;
+      for (const perf::ShapeSample &sample : options.shapeProfile->samples) {
+        llvm::json::Object entry;
+        llvm::json::Object values;
+        for (const auto &value : sample.values)
+          values[value.first] = value.second;
+        entry["values"] = std::move(values);
+        entry["weight"] = sample.weight;
+        samples.push_back(std::move(entry));
+      }
+      profile["samples"] = std::move(samples);
+      out["shape_profile"] = std::move(profile);
     }
     out["generated"] = report->generated;
     out["mapping_truncated"] = report->mappingTruncated;
@@ -1228,7 +1305,8 @@ int runMicroSearch() {
       !tuneMappingReport.empty() || !tuneCandidateArtifacts.empty() ||
       tuneCandidateSource != "semantic" || !tuneSourceSymbol.empty() ||
       tuneSourceRoot != 0 || !tuneSourceAdapter.empty() ||
-      tuneMeasureTop != 0 || !tuneMeasurementInputs.empty();
+      tuneMeasureTop != 0 || !tuneMeasurementInputs.empty() ||
+      !tuneShapeProfile.empty();
   if (tuneMappingTarget.empty() && mappedOptionsUsed)
     return reportError("target-aware options require --mapping-target");
 

@@ -234,6 +234,38 @@ std::string writePlanReport(const MappingSearchResult &result,
             json.attribute("transferUtilization",
                            fixedDouble(plan.totalCost.transferUtilization));
           });
+          // A dynamic plan ranked on explicit samples: the profile identity,
+          // the aggregation policy that produced `totalCost`, and each
+          // observation's own cost. These are observations, not a domain-wide
+          // latency claim; a reader must not extrapolate them to other shapes.
+          if (!plan.shapeSamples.empty()) {
+            json.attributeObject("shapeProfile", [&] {
+              json.attribute("canonical", plan.shapeProfileCanonical);
+              json.attribute("aggregation", plan.shapeAggregation);
+              json.attribute("maxVariants",
+                             static_cast<uint64_t>(plan.shapeMaxVariants));
+              json.attributeArray("samples", [&] {
+                for (const PlanShapeSampleCost &sample : plan.shapeSamples) {
+                  json.object([&] {
+                    json.attributeObject("values", [&] {
+                      for (const auto &entry : sample.values)
+                        json.attribute(entry.first, entry.second);
+                    });
+                    json.attribute("weight", fixedDouble(sample.weight));
+                    json.attribute("latencyCycles",
+                                   fixedDouble(sample.cost.latencyCycles));
+                    json.attribute("dramBytes", sample.cost.dramBytes);
+                    json.attribute("localBytes", sample.cost.localBytes);
+                    json.attribute("fillElements", sample.fillElements);
+                    json.attributeObject("peakBytes", [&] {
+                      for (const auto &entry : sample.peakBytes)
+                        json.attribute(entry.first, entry.second);
+                    });
+                  });
+                }
+              });
+            });
+          }
           json.attributeObject("diagnostics", [&] {
             json.attribute("searchTruncated", plan.diagnostics.searchTruncated);
             // The plan's error and warning lists. The search itself produces

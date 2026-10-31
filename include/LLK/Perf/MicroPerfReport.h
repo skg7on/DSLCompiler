@@ -51,6 +51,10 @@ struct MicroPerfReport {
 
   bool complete = true;
   std::vector<std::string> incompleteReasons;
+  /// True when the analysis ran on a concrete shape sample rather than the
+  /// kernel's runtime-parametric form. `shapeValues` is that sample.
+  bool sampled = false;
+  std::map<std::string, int64_t> shapeValues;
 
   L0Report l0;
   /// Present only when level == 1.

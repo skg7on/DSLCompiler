@@ -1227,8 +1227,19 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
                        std::to_string(value) + ")");
       const MemoryNodeId resolvedMemory = memory->memory;
       llvm::Expected<uint64_t> base = footprintBytes(value, ref, *placement);
-      if (!base)
+      if (!base) {
+        // A runtime-sized value whose occurrence lives in caller-owned
+        // external memory is not compiler storage: the caller owns the whole
+        // tensor, and the kernel touches only the clipped rectangle rendered by
+        // its bounded movement. It must not be sized as a local allocation.
+        const machine::MemoryNode *external =
+            machine.findMemory(resolvedMemory);
+        if (external && external->kind == "dram") {
+          llvm::consumeError(base.takeError());
+          continue;
+        }
         return base.takeError();
+      }
       // `bytes` is the footprint of *one* occurrence; how many of them are
       // resident at once is what liveness multiplies it by (issue #129, task
       // R5). Scaling the bytes by the whole execution multiplicity -- the
@@ -1450,6 +1461,13 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
       bytes = footprint->bytes;
     } else {
       llvm::Error error = footprint.takeError();
+      const machine::MemoryNode *external = machine.findMemory(*memory);
+      if (external && external->kind == "dram") {
+        // The staged copy lands in caller-owned external storage, which is not
+        // a compiler allocation and has no static capacity to reserve.
+        llvm::consumeError(std::move(error));
+        continue;
+      }
       if (strict)
         return error;
       notes.push_back(
@@ -1535,6 +1553,11 @@ llvm::Error finalizeStoragePlan(const WorkloadGraph &graph, CoveringPlan &plan,
         bytes = footprint->bytes;
       } else {
         llvm::Error error = footprint.takeError();
+        const machine::MemoryNode *external = machine.findMemory(entry.first);
+        if (external && external->kind == "dram") {
+          llvm::consumeError(std::move(error));
+          continue;
+        }
         if (strict)
           return error;
         notes.push_back("storage plan: borrowed boundary value " +

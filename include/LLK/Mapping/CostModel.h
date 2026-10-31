@@ -93,6 +93,21 @@ double costMetric(const Cost &cost, CostMetric metric);
 /// not per-component efficiency.
 Cost addCost(const Cost &lhs, const Cost &rhs);
 
+/// One concrete-shape observation of a cost, weighted by the profile that
+/// selected it.
+struct WeightedCost {
+  Cost cost;
+  double weight = 1.0;
+};
+
+/// The weighted mean of every `Cost` dimension across explicit samples. This is
+/// the aggregation a `weighted_mean` shape profile declares; it never infers a
+/// domain-wide optimum from the samples and never treats a missing sample as a
+/// zero-cost observation. Integer dimensions are rounded to the nearest count
+/// after weighting, deterministically. Empty samples, a non-finite or
+/// non-positive weight, and a non-finite aggregate are errors.
+llvm::Expected<Cost> weightedMeanCost(llvm::ArrayRef<WeightedCost> samples);
+
 /// First-order component utilization (design §17.2): the `busyCycles` a
 /// resource spent over the cycles it had available in one machine sync period,
 /// spread across `parallelUnits` interchangeable units. The sync period is what

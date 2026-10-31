@@ -233,12 +233,14 @@ uint64_t dramTrafficBytes(llvm::ArrayRef<PlanCostEvent> events,
   };
   uint64_t total = 0;
   for (const PlanCostEvent &event : events) {
-    if (event.bytes == 0)
-      continue;
+    const uint64_t sourceBytes =
+        event.sourceBytes ? event.sourceBytes : event.bytes;
+    const uint64_t destinationBytes =
+        event.destinationBytes ? event.destinationBytes : event.bytes;
     if (!event.srcMemory.empty() && kindOf(event.srcMemory) == "dram")
-      total += event.bytes;
+      total += sourceBytes;
     if (!event.dstMemory.empty() && kindOf(event.dstMemory) == "dram")
-      total += event.bytes;
+      total += destinationBytes;
   }
   return total;
 }

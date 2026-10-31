@@ -20,16 +20,20 @@
 //   1  the input, machine model, or kernel selection could not be read
 //   2  --fail-on-capacity-violation was given and the kernel does not fit
 
+#include "LLK/Conversion/MicroMapping/ShapeSpecialization.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Machine/MachineModelLoader.h"
 #include "LLK/Perf/MicroPerfReport.h"
+#include "LLK/Shape/ShapeContract.h"
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/Parser/Parser.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
@@ -63,6 +67,13 @@ static cl::opt<bool> failOnCapacityViolation(
     cl::desc("Exit with status 2 when live tiles exceed machine capacity"),
     cl::init(false));
 
+static cl::opt<std::string> shapeValuesOption(
+    "shape-values",
+    cl::desc("Concrete symbol values for a dynamic kernel, e.g. "
+             "M=7,N=13,K=5; symbol names come from the kernel's workload "
+             "contract"),
+    cl::init(""), cl::value_desc("SYM=V,..."));
+
 static cl::opt<std::string>
     inputFile(cl::Positional, cl::desc("<input micro IR>"), cl::Required);
 
@@ -78,6 +89,31 @@ constexpr const char *kDescription =
 int reportError(const Twine &message) {
   errs() << "micro-perf: error: " << message << "\n";
   return 1;
+}
+
+llvm::Expected<mlir::llk::shape::ShapeValues>
+parseShapeValues(llvm::StringRef text) {
+  mlir::llk::shape::ShapeValues values;
+  llvm::SmallVector<llvm::StringRef> entries;
+  text.split(entries, ',');
+  for (llvm::StringRef entry : entries) {
+    auto [name, value] = entry.split('=');
+    if (name.empty() || value.empty())
+      return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                     "malformed --shape-values entry '" +
+                                         entry.str() +
+                                         "'; expected SYMBOL=VALUE");
+    int64_t parsed = 0;
+    if (value.getAsInteger(10, parsed))
+      return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                     "shape value for '" + name.str() +
+                                         "' is not an integer");
+    if (!values.emplace(name.str(), parsed).second)
+      return llvm::createStringError(llvm::inconvertibleErrorCode(),
+                                     "shape symbol '" + name.str() +
+                                         "' is bound more than once");
+  }
+  return values;
 }
 
 } // namespace
@@ -119,15 +155,97 @@ int main(int argc, char **argv) {
   if (!kernel)
     return reportError(toString(kernel.takeError()));
 
-  auto report =
-      mlir::llk::perf::analyzeKernel(*kernel, *model, analysisLevel.getValue());
+  auto print = [&](const mlir::llk::perf::MicroPerfReport &report) {
+    if (format == "yaml")
+      mlir::llk::perf::printMicroPerfYaml(outs(), report);
+    else
+      mlir::llk::perf::printMicroPerfText(outs(), report);
+  };
+
+  if (shapeValuesOption.empty()) {
+    auto report = mlir::llk::perf::analyzeKernel(*kernel, *model,
+                                                 analysisLevel.getValue());
+    if (!report)
+      return reportError(toString(report.takeError()));
+    print(*report);
+    if (failOnCapacityViolation && !report->capacityViolations.empty())
+      return 2;
+    return 0;
+  }
+
+  // A sampled analysis needs the kernel's symbolic contract: the symbol names
+  // the caller supplies are the names that contract declares, never a
+  // positional guess from the signature.
+  mlir::llk::shape::ShapeContract contract;
+  {
+    auto described = mlir::llk::mapping::shapeContractOf(*kernel);
+    if (!described)
+      return reportError(toString(described.takeError()));
+    contract = std::move(*described);
+  }
+
+  auto requested = parseShapeValues(shapeValuesOption);
+  if (!requested)
+    return reportError(toString(requested.takeError()));
+
+  mlir::llk::perf::MicroPerfReport sampled;
+  sampled.machine = model->target;
+  sampled.kernel =
+      kernelSymbol.empty() ? std::string() : kernelSymbol.getValue();
+  if (auto name = (*kernel)->getAttrOfType<mlir::StringAttr>("sym_name"))
+    sampled.kernel = name.getValue().str();
+  sampled.level = analysisLevel.getValue();
+  sampled.clockHz = model->clockHz ? *model->clockHz : 0;
+  sampled.sampled = true;
+  sampled.shapeValues = *requested;
+
+  // Missing or inconsistent bindings are reported as an incomplete analysis,
+  // never as a zero-cost one-iteration estimate. The output deliberately has
+  // no score block at all: a zero would be a rankable-looking number.
+  if (llvm::Error error =
+          mlir::llk::shape::validateShapeValues(contract, *requested)) {
+    const std::string reason = "shape_values: " + toString(std::move(error));
+    if (format == "yaml") {
+      outs() << "schema_version: 1\n"
+             << "machine: " << sampled.machine << "\n"
+             << "kernel: " << sampled.kernel << "\n"
+             << "level: " << sampled.level << "\n"
+             << "complete: false\n"
+             << "incomplete_reasons:\n"
+             << "  - \"" << reason << "\"\n"
+             << "sampled: true\n"
+             << "shape_values:\n";
+      for (const auto &entry : *requested)
+        outs() << "  " << entry.first << ": " << entry.second << "\n";
+    } else {
+      outs() << "kernel: " << sampled.kernel << "\n"
+             << "machine: " << sampled.machine << "\n"
+             << "complete: false\n"
+             << "incomplete reason: " << reason << "\n"
+             << "shape sample:";
+      for (const auto &entry : *requested)
+        outs() << " " << entry.first << "=" << entry.second;
+      outs() << "\n";
+    }
+    return 0;
+  }
+
+  auto clone = mlir::llk::mapping::materializeShapeSample(module.get(),
+                                                          contract, *requested);
+  if (!clone)
+    return reportError(toString(clone.takeError()));
+  auto sampledKernel =
+      mlir::llk::perf::findMicroKernel(clone->get(), kernelSymbol.getValue());
+  if (!sampledKernel)
+    return reportError(toString(sampledKernel.takeError()));
+
+  auto report = mlir::llk::perf::analyzeKernel(*sampledKernel, *model,
+                                               analysisLevel.getValue());
   if (!report)
     return reportError(toString(report.takeError()));
-
-  if (format == "yaml")
-    mlir::llk::perf::printMicroPerfYaml(outs(), *report);
-  else
-    mlir::llk::perf::printMicroPerfText(outs(), *report);
+  report->sampled = true;
+  report->shapeValues = *requested;
+  print(*report);
 
   if (failOnCapacityViolation && !report->capacityViolations.empty())
     return 2;

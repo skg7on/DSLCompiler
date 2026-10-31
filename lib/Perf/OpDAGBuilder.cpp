@@ -9,6 +9,8 @@
 
 #include "LLK/Perf/OpDAGBuilder.h"
 
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+
 namespace mlir::llk::perf {
 namespace {
 llvm::Error invalid(const llvm::Twine &message) {
@@ -79,5 +81,12 @@ llvm::Expected<uint64_t> OpDAGBuildContext::contractionCycles(
     uint64_t flops, llvm::StringRef accumulatorDtype) const {
   (void)accumulatorDtype;
   return mmaCycles(engine, shape, flops);
+}
+
+llvm::Expected<int64_t>
+OpDAGBuildContext::evaluateIndex(mlir::Value value) const {
+  if (std::optional<int64_t> constant = mlir::getConstantIntValue(value))
+    return *constant;
+  return invalid("a shape index is not a constant in this DAG context");
 }
 } // namespace mlir::llk::perf

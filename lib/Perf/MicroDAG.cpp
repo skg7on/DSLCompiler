@@ -23,8 +23,9 @@
 
 #include "LLK/Dialect/Micro/MicroEnums.h" // IWYU pragma: keep
 #include "LLK/Mapping/CostModel.h"
+#include "LLK/Mapping/ShapeEvaluation.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinOps.h" // IWYU pragma: keep
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -52,26 +53,23 @@ llvm::Error invalid(const llvm::Twine &message) {
 }
 
 /// Trip count of a `micro.for`/`micro.spatial_for` when both bounds and the
-/// step are constants, which is what a concrete schedule is expected to have.
+/// step are constant indices. A concrete schedule is expected to fold its
+/// `ceildiv` bounds to constants (sample materialization does), so an
+/// arithmetic expression here is still an unknown bound rather than an
+/// invitation to invent a value. A known empty range is zero iterations, which
+/// is deliberately distinct from an unknown bound (`nullopt`).
 std::optional<uint64_t> staticTripCount(mlir::Value lower, mlir::Value upper,
                                         mlir::Value step) {
-  auto constantOf = [](mlir::Value value) -> std::optional<int64_t> {
-    auto constant = value.getDefiningOp<mlir::arith::ConstantOp>();
-    if (!constant)
-      return std::nullopt;
-    if (auto integer = mlir::dyn_cast<mlir::IntegerAttr>(constant.getValue()))
-      return integer.getInt();
-    return std::nullopt;
-  };
-
-  std::optional<int64_t> begin = constantOf(lower);
-  std::optional<int64_t> end = constantOf(upper);
-  std::optional<int64_t> stride = constantOf(step);
+  std::optional<int64_t> begin = mlir::getConstantIntValue(lower);
+  std::optional<int64_t> end = mlir::getConstantIntValue(upper);
+  std::optional<int64_t> stride = mlir::getConstantIntValue(step);
   if (!begin || !end || !stride || *stride <= 0)
     return std::nullopt;
   if (*end <= *begin)
     return uint64_t{0};
-  return static_cast<uint64_t>((*end - *begin + *stride - 1) / *stride);
+  uint64_t span = static_cast<uint64_t>(*end) - static_cast<uint64_t>(*begin);
+  return (span + static_cast<uint64_t>(*stride) - 1) /
+         static_cast<uint64_t>(*stride);
 }
 
 } // namespace
@@ -169,6 +167,10 @@ private:
     /// Buffers a body must hold at once: pipeline stages, times the owners a
     /// spatial loop spreads its iterations over.
     uint64_t storageFactor = 1;
+    /// Concrete values of the enclosing induction variables and of any
+    /// sample-materialized dimension. A handler asks this context for a
+    /// boundary extent instead of assuming a constant.
+    mapping::ShapeEvaluationContext shapeFacts;
   };
 
   class Context final : public OpDAGBuildContext {
@@ -226,6 +228,17 @@ private:
                               llvm::ArrayRef<mlir::Value> outputs) override {
       return builder.buildCopyOp(op, src, dst, source, result, kind, state,
                                  outputs);
+    }
+    llvm::Error buildMovement(llvm::StringRef src, llvm::StringRef dst,
+                              const TileInfo &source, const TileInfo &result,
+                              EventKind kind,
+                              llvm::ArrayRef<mlir::Value> outputs,
+                              const MovementBytes &bytes) override {
+      return builder.buildCopyOp(op, src, dst, source, result, kind, state,
+                                 outputs, bytes);
+    }
+    llvm::Expected<int64_t> evaluateIndex(mlir::Value value) const override {
+      return mapping::evaluateShapeIndex(value, state.shapeFacts);
     }
     llvm::Error noteAllocation(const TileInfo &info,
                                llvm::StringRef memory) override {
@@ -291,7 +304,8 @@ private:
   llvm::Error buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
                           llvm::StringRef dstMemory, const TileInfo &sourceInfo,
                           const TileInfo &resultInfo, EventKind kind,
-                          State &state, llvm::ArrayRef<mlir::Value> results);
+                          State &state, llvm::ArrayRef<mlir::Value> results,
+                          const OpDAGBuildContext::MovementBytes &bytes = {});
   llvm::Error noteAllocation(mlir::Operation &op, const TileInfo &info,
                              llvm::StringRef space, const State &state);
 
@@ -1161,6 +1175,21 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
     }
   }
 
+  // The loop's own induction value is part of the sampled environment: a
+  // boundary extent such as `min(B, D - offset)` is constant only once `offset`
+  // -- and therefore the induction variable -- is bound for this iteration.
+  auto evaluated = [&](mlir::Value value) -> std::optional<int64_t> {
+    llvm::Expected<int64_t> result =
+        mapping::evaluateShapeIndex(value, outer.shapeFacts);
+    if (!result) {
+      llvm::consumeError(result.takeError());
+      return std::nullopt;
+    }
+    return *result;
+  };
+  std::optional<int64_t> lowerValue = evaluated(lower);
+  std::optional<int64_t> stepValue = evaluated(step);
+
   std::vector<uint32_t> previousIteration;
   for (uint64_t iteration = 0; iteration < trips; ++iteration) {
     State inner;
@@ -1170,6 +1199,22 @@ llvm::Error DAGBuilder::walkLoop(mlir::Block &body, mlir::Value lower,
     // (issue #129, task R6).
     inner.ownerPool = outer.ownerPool;
     inner.storageFactor = storageFactor;
+    inner.shapeFacts = outer.shapeFacts;
+    if (lowerValue && stepValue) {
+      int64_t induction = 0;
+      if (__builtin_mul_overflow(static_cast<int64_t>(iteration), *stepValue,
+                                 &induction) ||
+          __builtin_add_overflow(*lowerValue, induction, &induction))
+        return invalid("kernel '" + kernelName +
+                       "' has an induction value that overflows 64 bits");
+      if (!body.empty() && body.getNumArguments() > 0)
+        inner.shapeFacts.bind(body.getArgument(0), induction);
+    } else if (!body.empty() && body.getNumArguments() > 0) {
+      // The bound itself was unknown; the single charged iteration still needs
+      // a value, but the stream is already marked incomplete so it can never be
+      // presented as a complete one-iteration score.
+      inner.shapeFacts.bind(body.getArgument(0), 0);
+    }
     if (iteration == 0) {
       inner.hasPrevious = outer.hasPrevious;
       inner.previous = outer.previous;
@@ -1277,7 +1322,8 @@ llvm::Error
 DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
                         llvm::StringRef dstMemory, const TileInfo &sourceInfo,
                         const TileInfo &resultInfo, EventKind kind,
-                        State &state, llvm::ArrayRef<mlir::Value> results) {
+                        State &state, llvm::ArrayRef<mlir::Value> results,
+                        const OpDAGBuildContext::MovementBytes &movementBytes) {
   if (llvm::Error err = requireMemory(op, dstMemory))
     return err;
   if (llvm::Error err = requireMemory(op, srcMemory))
@@ -1287,8 +1333,21 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
 
   const TileInfo &shapeInfo = resultInfo.elements() ? resultInfo : sourceInfo;
   uint64_t bytes = shapeInfo.bytes();
-  noteUnsizable(sourceInfo, op);
-  noteUnsizable(resultInfo, op);
+  // A bounded movement moves its valid rectangle across the link while it may
+  // fill a full static destination tile. `bytes` is the transferred count;
+  // the per-side counts are what traffic accounting reads, and charging the
+  // larger side under the link cost keeps padding work from being free.
+  const uint64_t sourceBytes = movementBytes.sourceBytes.value_or(bytes);
+  const uint64_t destinationBytes =
+      movementBytes.destinationBytes.value_or(bytes);
+  const uint64_t cycleBytes = std::max(sourceBytes, destinationBytes);
+  // A bounded movement's dynamic *source tensor* is not an unknown footprint:
+  // the explicit valid extents say exactly how many bytes it reads. Only an
+  // unoverridden side still needs the extraction's unsizable warning.
+  if (!movementBytes.sourceBytes)
+    noteUnsizable(sourceInfo, op);
+  if (!movementBytes.destinationBytes)
+    noteUnsizable(resultInfo, op);
 
   // A movement the selected plan routed is charged per hop: the mapper chose a
   // path through the hierarchy, and the simulator has to see every link on it
@@ -1305,7 +1364,10 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
     event.resourceName =
         link.transferEngines.empty() ? "dma" : link.transferEngines.front();
     event.workItems = shapeInfo.elements();
-    event.bytes = bytes;
+    event.bytes = sourceBytes;
+    event.sourceBytes = sourceBytes;
+    event.destinationBytes = destinationBytes;
+    event.fillElements = movementBytes.fillElements;
     event.minCycles = cycles;
     applyMeasuredDuration(op, event);
     event.sourceOpName = op.getName().getStringRef().str();
@@ -1343,16 +1405,20 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
             ? machine.findLinkByKinds(srcMemory, dstMemory)
             : nullptr;
     if (link) {
-      id = addEvent(describe(*link, copyCycles(srcMemory, dstMemory, bytes)),
-                    state, sourceDeps);
+      id = addEvent(
+          describe(*link, copyCycles(srcMemory, dstMemory, cycleBytes)), state,
+          sourceDeps);
     } else {
       MicroEvent event;
       event.kind = kind;
       event.resource = ResourceKind::Dma;
       event.resourceName = "dma";
       event.workItems = shapeInfo.elements();
-      event.bytes = bytes;
-      event.minCycles = copyCycles(srcMemory, dstMemory, bytes);
+      event.bytes = sourceBytes;
+      event.sourceBytes = sourceBytes;
+      event.destinationBytes = destinationBytes;
+      event.fillElements = movementBytes.fillElements;
+      event.minCycles = copyCycles(srcMemory, dstMemory, cycleBytes);
       applyMeasuredDuration(op, event);
       event.sourceOpName = op.getName().getStringRef().str();
       event.tileShape = shapeString(shapeInfo.shape);
@@ -1368,8 +1434,8 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
       const machine::LinkEdge &link = *hops[hop];
       uint64_t cycles = link.latencyCycles;
       if (link.bandwidthBytesPerCycle > 0)
-        cycles += static_cast<uint64_t>(std::ceil(static_cast<double>(bytes) /
-                                                  link.bandwidthBytesPerCycle));
+        cycles += static_cast<uint64_t>(std::ceil(
+            static_cast<double>(cycleBytes) / link.bandwidthBytesPerCycle));
       llvm::SmallVector<uint32_t, 4> chain;
       if (hop > 0)
         chain.push_back(id);
@@ -1382,8 +1448,10 @@ DAGBuilder::buildCopyOp(mlir::Operation &op, llvm::StringRef srcMemory,
     producers[result] = id;
 
   // The moved tile is live in its destination. A pipelined or spatially mapped
-  // body needs one buffer per concurrent iteration.
-  noteStorage(op, dstMemory, bytes, state.storageFactor);
+  // body needs one buffer per concurrent iteration. A clipped load fills the
+  // whole static tile, so its local footprint is the destination capacity, not
+  // the valid rectangle it copied.
+  noteStorage(op, dstMemory, destinationBytes, state.storageFactor);
   return llvm::Error::success();
 }
 
@@ -1603,6 +1671,9 @@ mapping::PlanCostEvent normalizedPlanEvent(const MicroEvent &event) {
       event.ownerPool.empty() ? event.tileOwner : event.ownerPool;
   normalized.srcMemory = event.srcMemory;
   normalized.dstMemory = event.tileMemory;
+  normalized.sourceBytes = event.sourceBytes;
+  normalized.destinationBytes = event.destinationBytes;
+  normalized.fillElements = event.fillElements;
   return normalized;
 }
 
