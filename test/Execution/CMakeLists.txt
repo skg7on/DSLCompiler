@@ -3,12 +3,16 @@ set(_llk_execution_jit_sources
       swiglu_scalar.cpp
       triton_swiglu_staged.cpp
       swiglu_vector_avx2.cpp
-      mapped_acceptance.cpp
       micro_kernel_execution.cpp
       swiglu_fused_memory.cpp)
 
 if(LLK_BUILD_E2E_TESTS)
-  set(_llk_execution_e2e_sources ${_llk_execution_jit_sources})
+  set(_llk_execution_e2e_sources
+      ${_llk_execution_jit_sources}
+      mapped_invocation.cpp
+      mapped_codegen_requirements.cpp
+      mapped_allocation_lifetime.cpp
+      selected_group_lowering.cpp)
   set(_llk_execution_e2e_libs
       LLKToLinalg LLKTransforms LLKFuseDoubleContraction LLKPackWeights
       LLKToMicro LLKMicroToLinalg LLKMappedCompilation LLKMapping
@@ -36,17 +40,31 @@ add_llk_test_category(Execution
         jit_cache_hit.cpp
         cache_eviction.cpp
         ${_llk_execution_e2e_sources}
+        dynamic_mapped_invocation.cpp
     LIBRARIES
         LLKTargetX86
         LLKRuntime
         ${_llk_execution_e2e_libs}
+        LLKMappedCompilation
+        LLKWorkloadContracts
     DEFINITIONS
         LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 
-# Separate mapped binaries keep the portable and required-selected-target
-# contracts independently invokable by CI. Place the acceptance executable at
-# the build root because the pinned workflow runs it directly from build/.
+# check_required_execution.py requires this name in the CI JUnit evidence. The
+# suite it filters only exists when JIT tests are built.
+if(LLK_BUILD_E2E_TESTS)
+  add_test(NAME MappedAllocationLifetimeTest COMMAND LLKExecutionTests
+      --gtest_filter=MappedAllocationLifetime.*)
+  set_tests_properties(MappedAllocationLifetimeTest PROPERTIES
+      LABELS "mapped-reference;Execution"
+      TIMEOUT 60
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
+endif()
+
+# One mapped acceptance binary serves both the portable and the required-
+# selected-target contracts; the run-time flag picks the mode. Place it at the
+# build root because the pinned workflow runs it directly from build/.
 if(LLK_BUILD_E2E_TESTS)
   set(_llk_mapped_libs
       LLKMappedCompilation LLKToMicro LLKMicroToLinalg LLKMapping
@@ -59,49 +77,23 @@ if(LLK_BUILD_E2E_TESTS)
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   set_target_properties(MappedAcceptance PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-  add_test(NAME MappedAcceptance COMMAND MappedAcceptance)
+  add_test(NAME MappedAcceptance COMMAND MappedAcceptance
+      --gtest_filter=MappedAcceptance.*)
   set_tests_properties(MappedAcceptance PROPERTIES
       LABELS "mapped-reference"
       SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
-
-  add_executable(MappedAVX2Acceptance mapped_acceptance.cpp)
-  target_link_libraries(MappedAVX2Acceptance PRIVATE ${_llk_mapped_libs})
-  target_compile_definitions(MappedAVX2Acceptance PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
-  set_target_properties(MappedAVX2Acceptance PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-  add_test(NAME MappedAVX2Acceptance COMMAND MappedAVX2Acceptance
+  # Same binary, required-selected-target mode: a missing AVX2 lane is a
+  # failure, not a skip, so CI evidence cannot silently pass on the wrong host.
+  add_test(NAME MappedAVX2Acceptance COMMAND MappedAcceptance
       --require-selected-target --gtest_filter=MappedAcceptance.*)
-  set_tests_properties(MappedAVX2Acceptance PROPERTIES LABELS "selected-avx2")
+  set_tests_properties(MappedAVX2Acceptance PROPERTIES
+      LABELS "selected-avx2"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
   add_test(NAME SelectedTargetFlagContract
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_selected_target_flag.py
-          $<TARGET_FILE:MappedAVX2Acceptance> $<TARGET_FILE:MappedAcceptance>
-          $<TARGET_FILE:DynamicMappedAVX2Acceptance>
-          $<TARGET_FILE:DynamicMappedAcceptance>)
+          $<TARGET_FILE:MappedAcceptance> $<TARGET_FILE:DynamicMappedAcceptance>)
   set_tests_properties(SelectedTargetFlagContract PROPERTIES LABELS "selected-avx2")
-
-  add_executable(MappedInvocationTest mapped_invocation.cpp)
-  target_link_libraries(MappedInvocationTest PRIVATE LLKRuntime GTest::gtest_main
-      LLK::MLIR)
-  add_test(NAME MappedInvocationTest COMMAND MappedInvocationTest)
-
-  add_executable(MappedAllocationLifetimeTest mapped_allocation_lifetime.cpp)
-  target_link_libraries(MappedAllocationLifetimeTest PRIVATE LLKRuntime
-      LLKMappedCompilation LLKWorkloadContracts MicroDialect LLKDialect
-      GTest::gtest_main LLK::MLIR)
-  target_compile_definitions(MappedAllocationLifetimeTest PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-  add_test(NAME MappedAllocationLifetimeTest COMMAND MappedAllocationLifetimeTest)
-  set_tests_properties(MappedAllocationLifetimeTest PROPERTIES
-      LABELS "mapped-reference")
-
-  add_executable(MappedCodegenRequirementsTest
-      mapped_codegen_requirements.cpp)
-  target_link_libraries(MappedCodegenRequirementsTest PRIVATE LLKRuntime
-      GTest::gtest_main)
-  add_test(NAME MappedCodegenRequirementsTest
-      COMMAND MappedCodegenRequirementsTest)
 
   set(_llk_generic_elementwise_libs
       LLKMappedCompilation LLKMappedTuning LLKSourceCandidates
@@ -115,19 +107,14 @@ if(LLK_BUILD_E2E_TESTS)
   add_test(NAME GenericElementwiseTest COMMAND GenericElementwiseTest)
   set_tests_properties(GenericElementwiseTest PROPERTIES
       LABELS "mapped-reference")
-
-  # The required-selected-target binary makes a missing AVX2 lane a failure,
-  # not a skip, so CI evidence cannot silently pass on the wrong host.
-  add_executable(GenericElementwiseAVX2Test generic_elementwise.cpp)
-  target_link_libraries(GenericElementwiseAVX2Test PRIVATE
-      ${_llk_generic_elementwise_libs})
-  target_compile_definitions(GenericElementwiseAVX2Test PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
-  add_test(NAME GenericElementwiseAVX2Test COMMAND GenericElementwiseAVX2Test
+  # Same binary, required-selected-target mode: a missing AVX2 lane is a
+  # failure, not a skip, so CI evidence cannot silently pass on the wrong host.
+  add_test(NAME GenericElementwiseAVX2Test COMMAND GenericElementwiseTest
       --require-selected-target
       --gtest_filter=GenericElementwise.SelectedAvx2*)
   set_tests_properties(GenericElementwiseAVX2Test PROPERTIES
-      LABELS "selected-avx2")
+      LABELS "selected-avx2"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
   set(_llk_framework_primitives_libs
       LLKMappedCompilation LLKMapping LLKTargetMapping LLKPerf MicroDialect
@@ -140,26 +127,18 @@ if(LLK_BUILD_E2E_TESTS)
   target_include_directories(FrameworkPrimitivesTest PRIVATE
       ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping)
   add_test(NAME FrameworkPrimitivesTest COMMAND FrameworkPrimitivesTest)
-  set_tests_properties(FrameworkPrimitivesTest PROPERTIES
-      LABELS "mapped-reference")
-
-  add_executable(FrameworkPrimitivesAVX2Test framework_primitives.cpp)
-  target_link_libraries(FrameworkPrimitivesAVX2Test PRIVATE
-      ${_llk_framework_primitives_libs})
-  target_compile_definitions(FrameworkPrimitivesAVX2Test PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
-  target_include_directories(FrameworkPrimitivesAVX2Test PRIVATE
-      ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping)
-  add_test(NAME FrameworkPrimitivesAVX2Test COMMAND FrameworkPrimitivesAVX2Test
+  set_tests_properties(FrameworkPrimitivesTest PROPERTIES LABELS "mapped-reference")
+  add_test(NAME FrameworkPrimitivesAVX2Test COMMAND FrameworkPrimitivesTest
       --require-selected-target
       --gtest_filter=FrameworkPrimitives.SelectedAvx2*)
   set_tests_properties(FrameworkPrimitivesAVX2Test PROPERTIES
-      LABELS "selected-avx2")
+      LABELS "selected-avx2"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
-  # Compile-once dynamic acceptance (issue #197). The portable binary runs the
-  # reference chain; the AVX2 binary compiles the same sources for the selected
-  # target and fails, rather than skips, when the host cannot run it. Both live
-  # at the build root because the pinned workflow invokes them directly there.
+  # Compile-once dynamic acceptance (issue #197). One binary serves both the
+  # portable and the required-selected-target contracts; the run-time flag picks
+  # the mode. It lives at the build root because the pinned workflow invokes it
+  # directly there.
   set(_llk_dynamic_acceptance_libs
       LLKMappedCompilation LLKToMicro LLKMicroToLinalg LLKMapping
       LLKTargetMapping LLKSourceCandidates LLKWorkloadContracts LLKRuntime
@@ -172,27 +151,23 @@ if(LLK_BUILD_E2E_TESTS)
       LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   set_target_properties(DynamicMappedAcceptance PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-  add_test(NAME DynamicMappedAcceptance COMMAND DynamicMappedAcceptance)
+  # The reference entry keeps the host-independent lowering case that ran in the
+  # old reference binary; the execution case needs AVX2 and stays out.
+  string(CONCAT _llk_dynamic_reference_filter
+      "DynamicMappedAcceptance.*:"
+      "DynamicMappedSelected.SelectedLoweringKeepsBoundedBoundariesAndRuntimeK")
+  add_test(NAME DynamicMappedAcceptance COMMAND DynamicMappedAcceptance
+      --gtest_filter=${_llk_dynamic_reference_filter})
   set_tests_properties(DynamicMappedAcceptance PROPERTIES
       LABELS "mapped-reference"
       SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
-
-  add_executable(DynamicMappedAVX2Acceptance dynamic_mapped_acceptance.cpp)
-  target_link_libraries(DynamicMappedAVX2Acceptance PRIVATE
-      ${_llk_dynamic_acceptance_libs})
-  target_compile_definitions(DynamicMappedAVX2Acceptance PRIVATE
-      LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}" LLK_REQUIRE_SELECTED_TARGET=1)
-  set_target_properties(DynamicMappedAVX2Acceptance PROPERTIES
-      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-  add_test(NAME DynamicMappedAVX2Acceptance COMMAND DynamicMappedAVX2Acceptance
+  # Same binary, required-selected-target mode: a missing AVX2 lane is a
+  # failure, not a skip, so CI evidence cannot silently pass on the wrong host.
+  add_test(NAME DynamicMappedAVX2Acceptance COMMAND DynamicMappedAcceptance
       --require-selected-target --gtest_filter=DynamicMapped*.*)
   set_tests_properties(DynamicMappedAVX2Acceptance PROPERTIES
-      LABELS "selected-avx2")
-
-  add_executable(SelectedGroupLoweringTest selected_group_lowering.cpp)
-  target_link_libraries(SelectedGroupLoweringTest PRIVATE LLKMappedCompilation
-      LLKMapping GTest::gtest_main LLK::MLIR)
-  add_test(NAME SelectedGroupLoweringTest COMMAND SelectedGroupLoweringTest)
+      LABELS "selected-avx2"
+      SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 
   add_test(NAME RequiredExecutionEvidenceParser
       COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/check_required_execution_test.py)
@@ -213,16 +188,3 @@ if(LLK_BUILD_E2E_TESTS)
   set_tests_properties(SelectedExecutionEvidenceValidator PROPERTIES
       LABELS "selected-avx2")
 endif()
-
-# ABI v2 and output-destination preparation are IR and descriptor contracts, so
-# they are exercised without a JIT: descriptor resolution binds symbols before
-# entry, and the prepared callable signature is inspected directly. Runtime
-# allocation and ownership behavior stays in the JIT lifetime tests.
-add_executable(DynamicMappedInvocationTest dynamic_mapped_invocation.cpp)
-target_link_libraries(DynamicMappedInvocationTest PRIVATE LLKMappedCompilation
-    LLKToMicro LLKTargetMapping LLKMapping LLKWorkloadContracts MicroDialect
-    LLKDialect GTest::gtest_main LLK::MLIR)
-target_compile_definitions(DynamicMappedInvocationTest PRIVATE
-    LLK_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-add_test(NAME DynamicMappedInvocationTest COMMAND DynamicMappedInvocationTest)
-set_tests_properties(DynamicMappedInvocationTest PROPERTIES LABELS "Execution")

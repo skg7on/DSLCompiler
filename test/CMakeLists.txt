@@ -1,6 +1,29 @@
 # One GTest executable per category; CTest still runs each case separately.
 include(GoogleTest)
 
+# Collect every executable created under test/ into LLK_TEST_TARGETS. Walking
+# the directory graph instead of maintaining a list is what makes it
+# impossible for a new test binary to be omitted from check-llk; five binaries
+# were missing from the hand-written list before this replaced it.
+function(_llk_collect_test_targets dir)
+  get_property(_subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+  foreach(_subdir IN LISTS _subdirs)
+    _llk_collect_test_targets("${_subdir}")
+  endforeach()
+
+  get_property(_targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+  set(_executables)
+  foreach(_target IN LISTS _targets)
+    get_target_property(_target_type ${_target} TYPE)
+    if(_target_type STREQUAL "EXECUTABLE")
+      list(APPEND _executables ${_target})
+    endif()
+  endforeach()
+  if(_executables)
+    set_property(GLOBAL APPEND PROPERTY LLK_TEST_TARGETS ${_executables})
+  endif()
+endfunction()
+
 function(add_llk_test_category category)
   cmake_parse_arguments(ARG "" "" "SOURCES;LIBRARIES;DEFINITIONS;INCLUDE_DIRECTORIES" ${ARGN})
   set(test_target "LLK${category}Tests")
@@ -19,8 +42,22 @@ function(add_llk_test_category category)
       PROPERTIES LABELS "${category}"
                  TIMEOUT 60
                  SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
-  set_property(GLOBAL APPEND PROPERTY LLK_TEST_TARGETS ${test_target})
 endfunction()
+
+# Test-only fixtures shared by several categories. An OBJECT library compiles
+# them once without packaging a fixture-only TU into a production library.
+add_library(LLKTestFixtures OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/Mapping/resource_regression_fixture.cpp)
+target_link_libraries(LLKTestFixtures PRIVATE
+    LLKBuildOptions
+    LLKMachine
+    LLKMapping
+    LLKMicroMapping
+    LLKTargetMapping
+    LLK::MLIR)
+target_include_directories(LLKTestFixtures PRIVATE
+    ${CMAKE_SOURCE_DIR}/lib/Conversion/MicroMapping
+    ${CMAKE_CURRENT_SOURCE_DIR}/Mapping)
 
 add_subdirectory(CMake)
 add_subdirectory(Execution)
@@ -47,18 +84,18 @@ if(_llk_ir_tests)
       SKIP_REGULAR_EXPRESSION "\\[  SKIPPED \\]")
 endif()
 
-get_property(_llk_check_deps GLOBAL PROPERTY LLK_TEST_TARGETS)
-foreach(_llk_tool llk-opt micro-perf llk-tune llk-compile llk-bench llk-validate
-    MappedAcceptance MappedAVX2Acceptance MappedInvocationTest
-    MappedAllocationLifetimeTest MappedCodegenRequirementsTest
-    DynamicMappedInvocationTest
-    SelectedGroupLoweringTest MappedTuningSessionTest CandidateInstantiationTest
-    FrameworkSourceTest LLKCAPIFrontendTests DynamicShapeMappingTest
-    DynamicShapeAnalysisTest)
-  if(TARGET ${_llk_tool})
-    list(APPEND _llk_check_deps ${_llk_tool})
+# Tools are not test executables but CLI tests invoke them by path.
+set(_llk_check_deps llk-opt micro-perf llk-tune llk-compile llk-bench llk-validate)
+foreach(_llk_tool IN LISTS _llk_check_deps)
+  if(NOT TARGET ${_llk_tool})
+    list(REMOVE_ITEM _llk_check_deps ${_llk_tool})
   endif()
 endforeach()
+
+_llk_collect_test_targets("${CMAKE_CURRENT_SOURCE_DIR}")
+get_property(_llk_test_targets GLOBAL PROPERTY LLK_TEST_TARGETS)
+list(APPEND _llk_check_deps ${_llk_test_targets})
+list(REMOVE_DUPLICATES _llk_check_deps)
 # Multi-config add_test entries require an active configuration. A single-
 # config tree may have no build type, in which case omit the -C argument.
 set(_llk_ctest_config_args)
