@@ -92,7 +92,15 @@ Semantic and Micro conversion
    * - ``--micro-to-linalg``
      - Reference bridge: turn explicit-signature kernels and tile operations into tensor/Linalg/SCF functions. No pass options. Does not run target emitters, preserve selected SIMD width as explicit Vector ops, bufferize, or JIT-compile.
 
-The export passes leave their semantic source functions intact. They support static rank-two matmul/SwiGLU roots and Micro tile dtypes ``f32``, ``f16``, ``bf16``, ``i32``, ``i8``; the accumulator attribute must name a supported dtype. SwiGLU requires SiLU. Shape mismatches, unsupported dynamic/rank types, or schedules the exporter cannot realize fail with diagnostics. A module with no supported root is unchanged. Read the :ref:`compiler export details <tools-compiler-export-a-concrete-kernel-and-a-search-space>` for the output contract.
+The export passes leave their semantic source functions intact. They support
+static, mixed and fully dynamic rank-two matmul/SwiGLU roots and Micro tile
+dtypes ``f32``, ``f16``, ``bf16``, ``i32``, ``i8``; the accumulator attribute must
+name a supported dtype. SwiGLU requires SiLU. Dynamic export uses fixed-capacity
+tiles, bounded loads/clipped stores, exact runtime K and shape guards. Shape
+contradictions, unsupported ranks or schedules the exporter cannot realize fail
+with diagnostics. A module with no supported root is unchanged. Read the
+:ref:`compiler export details <tools-compiler-export-a-concrete-kernel-and-a-search-space>`
+and :doc:`dynamic shape guide </dynamic-shapes>` for the output contract.
 
 To make experiments independent of the shipped database, point at an intentionally absent file:
 

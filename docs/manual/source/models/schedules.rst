@@ -229,7 +229,7 @@ Schedule fields
    * - ``tail_policy``
      - ``none``
      - ``none`` rejects non-dividing tiles; ``pad`` zero-pads inputs and crops
-       stores
+       stores; ``bounded`` uses valid rectangles and exact runtime K
      - Yes
 
 Every schedule field is optional in the JSON and keeps the default above when
@@ -242,7 +242,7 @@ diagnostic rather than silently choosing a tile.
 How an entry is selected
 ------------------------
 
-M is classified into five buckets:
+For static Micro export, M is classified into five buckets:
 
 .. list-table::
    :header-rows: 1
@@ -271,6 +271,13 @@ M is classified into five buckets:
 The bucket is an adapter heuristic for the current contraction family. It
 carries no inherent cost meaning and is not compared against a measured
 threshold.
+
+If any contraction axis remains symbolic, Micro export bypasses fixed-shape
+database entries and selects an explicit bounded baseline, even when M is
+known. Runtime M/N/K do not become schedule choices: local tile capacities,
+fragment sizes, vector width and pipeline depth stay compile-time constants.
+Dynamic ranking instead uses an explicit ``llk-tune --shape-profile`` and
+complete per-sample analysis. See :doc:`/dynamic-shapes`.
 
 The shared selector then:
 

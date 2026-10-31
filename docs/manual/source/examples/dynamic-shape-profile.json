@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "samples": [
+    {"values": {"M": 7, "N": 13, "K": 5}, "weight": 1.0},
+    {"values": {"M": 9, "N": 33, "K": 35}, "weight": 2.0},
+    {"values": {"M": 17, "N": 65, "K": 67}, "weight": 1.0}
+  ],
+  "aggregation": "weighted_mean",
+  "max_variants": 1
+}

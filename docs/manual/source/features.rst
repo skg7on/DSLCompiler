@@ -12,7 +12,9 @@ choose a workflow and understand what a successful run proves.
 
 This summary reflects merged PR #133 (2026-10-11, merge ``5ee61b1``), the
 generic framework increments A–D, the bounded Arm SVE/SME static mapping
-increment E1–E7, and the E10 executable f32 SVE subset. The revision-pinned
+increment E1–E7, the E10 executable f32 SVE subset, and the dynamic shape series
+(#191, PRs #260–#265, #270 and #271). See :doc:`dynamic-shapes` for the runtime
+M/N/K, ABI v2, analysis and replay contracts. The revision-pinned
 :source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
 records capability-based acceptance, exact test counts and retained limits.
 The :source:`Arm static acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`
@@ -43,9 +45,9 @@ What you can do today
      - ``llk.matmul`` is left untouched by the legacy conversion and uses the Micro route; kernel, shape, dtype, math-mode and host support remain specific
      - :doc:`Compiler </tools/compiler>`
    * - Export supported semantic kernels to MicroIR
-     - Concrete kernel and search-space export for LLK matmul and fused SwiGLU
+     - Concrete kernel and finite search-space export for static, mixed and fully dynamic rank-two LLK matmul and fused SwiGLU; fixed local tile capacities, bounded movement and exact K tails
      - General Linalg, RoPE and attention export are not implemented by ``LLKToMicro``
-     - :doc:`Compiler </tools/compiler>`
+     - :doc:`Compiler </tools/compiler>`, :doc:`Dynamic shapes </dynamic-shapes>`
    * - Describe a machine
      - Versioned YAML topology with executor, memory, compute, transfer nodes and links; owner refinements and model validation
      - Shipped numerical costs are modeling seeds; a profile is not a hardware execution backend
@@ -56,7 +58,7 @@ What you can do today
      - :doc:`Mapping policy </models/mapping-policy>`, :source:`formal syntax <docs/design/llkmap-syntax.md>`
    * - Choose a schedule
      - JSON schedule database keyed by operation and M bucket; concrete or search-space Micro export; YAML schedule records from the tuner
-     - Selection matches operation and M bucket only; the schedule database does not configure the fixed legacy tiling pass
+     - Static selection matches operation and M bucket only; symbolic contractions use a bounded baseline. The database does not configure the fixed legacy tiling pass
      - :doc:`Schedules </models/schedules>`, :doc:`optimizer </tools/optimizer>`
    * - Match single and fused operations
      - Single-operation rules and bounded fused-group matching
@@ -72,7 +74,7 @@ What you can do today
      - :doc:`Optimizer </tools/optimizer>`, :doc:`architecture </architecture>`
    * - Estimate performance
      - Level-0 work/bandwidth bounds and level-1 dependency/resource scheduling; cycles, traffic, utilization, bottleneck and capacity reporting
-     - Selected-plan and materialized static analysis share resource/event accounting with parity controls; predictions remain uncalibrated
+     - Dynamic analysis requires concrete symbol bindings; dynamic ranking requires an explicit shape profile and complete analysis for every sample. Predictions remain uncalibrated
      - :doc:`Performance analyzer </tools/performance>`
    * - Tune schedule parameters
      - Original-source candidate instantiation, mapped selection/analysis/compilation, static ranking, candidate artifacts, frozen replay and optional verified measurement
@@ -84,8 +86,8 @@ What you can do today
      - :doc:`Validation </tools/validation>`, :doc:`Tuner </tools/tuning>`
    * - Reuse dynamic code across shapes
      - Two-level execution identity: a compiled variant (source, symbolic contract/version, numerical contract, guard domain, ABI version/hash, schedule, target/backend/compiler) and a measurement identity that adds the concrete shape/profile; ordered guarded variants with one full-domain baseline and an explicit budget; packed-weight keys include actual weight K/N
-     - Baseline reuse and measurement separation are exercised by the registered ``DynamicShapeReplay`` suite; guarded specialization is validated data only and tuning selects the baseline; production persistence and calibration remain separate
-     - :doc:`Tuner </tools/tuning>`, :doc:`architecture </architecture>`
+     - The tuner also retains its sampled plan report in variant identity, so cross-profile cache reuse is not guaranteed. Guarded specialization is validated data only and tuning selects the baseline
+     - :doc:`Dynamic shapes </dynamic-shapes>`, :doc:`Tuner </tools/tuning>`
    * - Search a non-contraction source
      - Versioned workload contract, source adapter registry, bounded rank-two f32 elementwise add/multiply with tiled spatial schedules
      - The bounded elementwise adapter is the first delivered non-contraction family; arbitrary Linalg import, broadcasting, reductions, dynamic shapes and approximation modes are rejected
@@ -96,15 +98,15 @@ What you can do today
      - :doc:`Architecture </architecture>`, :source:`conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
    * - Validate composed primitives and reduction
      - Direct 8x8→8 sum and add→multiply; selected AVX2 Vector reduction/vector IR; operation-aware target coverage before ranking
-     - Rank-one invocation is outside mapped ABI v1; generic-accelerator mul/sum are analysis-only; Linalg reduction import is not implemented
+     - Rank-one invocation is outside mapped ABI v1/v2; generic-accelerator mul/sum are analysis-only; Linalg reduction import is not implemented
      - :doc:`Performance analyzer </tools/performance>`, conformance review
    * - Extend a target without generic dispatch
      - Renamed-target portability, literal topology variants and a generic-library boundary scan
      - A target still needs its own machine/layout/rule/emitter package; no physical accelerator backend is delivered
      - :source:`conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
    * - Run supported mapped kernels
-     - Shared mapped compilation, typed descriptor invocation, caller-buffer ownership and per-call scratch release; reference and selected AVX2 numeric fixtures including generic elementwise add/multiply
-     - Selected-target execution requires x86_64 AVX2; rank-two supported dtypes/strides/bounds are checked by typed invocation; analysis/lowering are rank-neutral but executable ABI v1 rejects other ranks with ``runtime_capability:`` diagnostics; deprecated untagged descriptors cannot check dtype/allocation size
+     - Shared mapped compilation, typed descriptor invocation, caller-owned outputs and per-call scratch release; ABI v2 binds runtime shapes, including independent M/N/K, and checks relationships before access
+     - Selected AVX2 execution requires x86_64 AVX2; ABI v1/v2 retain rank-two compact row-major, zero-offset buffers and at most 12 descriptors. Untagged invocation rejects ABI v2; other ranks fail executable preparation
      - :doc:`Compiler </tools/compiler>`
    * - Exercise the benchmark harness
      - ``llk-bench`` runs a synthetic host loop and reports timing

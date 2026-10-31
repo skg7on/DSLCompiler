@@ -71,6 +71,13 @@ identity. The runtime also validates ordered guarded variants with a full-domain
 baseline and an explicit variant budget (``DynamicVariantSet``); tuning selects
 the baseline only, so guarded specialization is not yet a claimed capability.
 
+The tuner currently includes the frozen plan report in its compiled-variant
+schedule identity. Sampled reports contain profile values, weights and costs;
+a changed profile can therefore change ``compiled_variant`` even for equivalent
+baseline code. This conservative workflow identity does not guarantee
+cross-profile compiled-cache reuse. An already compiled baseline still accepts
+different valid invocation shapes. See :ref:`dynamic replay <dynamic-shapes-replay>`.
+
 .. _architecture-generic-contracts-and-current-limits:
 
 Generic contracts and current limits
@@ -92,6 +99,12 @@ envelope, not an analysis limit: rank-three contracts and rank-one reductions
 reach static reporting and lowered IR, while executable preparation fails with an
 explicit ``runtime_capability:`` diagnostic. General structured import, wider
 invocation and additional non-contraction families remain capability work.
+
+Within that envelope, :doc:`dynamic-shapes` supports independent runtime M/N/K,
+symbolic workload contracts and ABI v2 caller-owned destinations. Local tile
+capacities remain fixed; bounded movement and exact K tails preserve semantics.
+Dynamic analysis/ranking binds explicit samples on clones while the reusable
+artifact keeps its symbolic contract.
 
 Conformance is reported per compiler stage. ``CapabilityReceipt`` records
 structure, interpretation, mapping, physical plan, reference lowering, selected

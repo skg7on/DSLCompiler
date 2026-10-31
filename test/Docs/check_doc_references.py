@@ -40,6 +40,7 @@ DOCS = [
     "docs/manual/source/concepts.rst",
     "docs/manual/source/architecture.rst",
     "docs/manual/source/features.rst",
+    "docs/manual/source/dynamic-shapes.rst",
     "docs/manual/source/models/index.rst",
     "docs/manual/source/models/machine-model.rst",
     "docs/manual/source/models/mapping-policy.rst",
