@@ -21,7 +21,6 @@
 #include "LLK/Dialect/Micro/MicroDialect.h"
 #include "LLK/Frontend/Compiler.h"
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/Parser/Parser.h"
@@ -486,6 +485,47 @@ TEST(FrontendContractions, NaNPropagatesThroughTheFusedEpilogue) {
   ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
   EXPECT_TRUE(std::isnan(out.at(0, 0)));
   out.expectGuards();
+}
+
+TEST(FrontendContractions, NaNAndInfinityFollowTheDeclaredArithmetic) {
+  // A non-finite source element must not be clamped, zeroed or skipped by the
+  // contraction. Row 0 carries the non-finite value and row 1 stays finite, so
+  // the check pins both the propagation and that the rest of the domain is
+  // unaffected.
+  struct Case {
+    float value;
+    bool expectNaN;
+    const char *name;
+  };
+  const Case cases[] = {
+      {std::numeric_limits<float>::infinity(), false, "inf"},
+      {std::numeric_limits<float>::quiet_NaN(), true, "nan"},
+  };
+  for (const Case &test : cases) {
+    SCOPED_TRACE(test.name);
+    std::string message;
+    auto compiled =
+        compileFixture("matmul_32x64x16.json", "reference", nullptr, &message);
+    if (!compiled)
+      FAIL() << "matmul did not compile: " << message;
+    constexpr int64_t M = 32, N = 64, K = 16;
+    Guarded2D a(M, K), b(K, N), out(M, N);
+    fill(a, [](int64_t) { return 0.0F; });
+    fill(b, [](int64_t) { return 1.0F; });
+    a.at(0, 0) = test.value;
+    // The reference stays finite: every other row is a finite dot product.
+    for (int64_t column = 0; column != N; ++column)
+      b.at(0, column) = 2.0F;
+    auto error = compiled->invoke({a.checked(), b.checked()}, {out.checked()});
+    ASSERT_FALSE(bool(error)) << llvm::toString(std::move(error));
+    if (test.expectNaN)
+      EXPECT_TRUE(std::isnan(out.at(0, 0)));
+    else
+      EXPECT_TRUE(std::isinf(out.at(0, 0)) && out.at(0, 0) > 0.0F);
+    for (int64_t column = 0; column != N; ++column)
+      EXPECT_EQ(out.at(1, column), 0.0F) << column;
+    out.expectGuards();
+  }
 }
 
 TEST(FrontendContractions, SelectedTargetExecutesOrReportsUnavailableHost) {

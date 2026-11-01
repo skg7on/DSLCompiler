@@ -77,7 +77,7 @@ cmake --build build --target LLKFrontendTests
 build/bin/LLKFrontendTests --gtest_filter='FrontendContractions.*'
 ```
 
-10 tests pass: four import/contract tests and six execution/negative tests.
+11 tests pass: four import/contract tests and seven execution/negative tests.
 
 | Test | Evidence |
 |---|---|
@@ -90,6 +90,7 @@ build/bin/LLKFrontendTests --gtest_filter='FrontendContractions.*'
 | `ReferencePreservesACallerAccumulator` | `init + A@B` executed, `init` read-only |
 | `RelaxedActivationIsADifferentNumericalIdentity` | workload and native-request identities differ; relaxed result executed |
 | `NaNPropagatesThroughTheFusedEpilogue` | NaN input yields NaN output; guards intact |
+| `NaNAndInfinityFollowTheDeclaredArithmetic` | `+inf` and NaN propagate through matmul; the finite rows are unchanged |
 | `SelectedTargetExecutesOrReportsUnavailableHost` | selected AVX2 on a qualified host, else `native_backend_unavailable` |
 
 Dialect:
@@ -110,7 +111,8 @@ LLK_FRONTEND_LIBRARY=build/lib/libLLKFrontendCAPI.so \
     python -m pytest test/python/test_frontend_contractions.py -q
 ```
 
-12 tests pass, covering the same shapes and negatives through `@llk.jit`, plus
+13 tests pass, covering the same shapes and negatives (including the `+inf`
+case) through `@llk.jit`, plus
 the launch contract (the grid tiles the output domain; input extents may differ).
 
 Full frontend binary: 70/70 pass, including the pre-existing PF05–PF10 tests.
@@ -121,7 +123,7 @@ Full local suite:
 ctest --output-on-failure
 ```
 
-1693 registered, 1689 passed, 4 failed. All four failures are the
+1694 registered, 1690 passed, 4 failed. All four failures are the
 `selected-avx2` lanes (`MappedAVX2Acceptance`, `GenericElementwiseAVX2Test`,
 `FrameworkPrimitivesAVX2Test`, `DynamicMappedAVX2Acceptance`), whose required
 execution asserts an x86_64 AVX2 host; the local host is aarch64. They are CI

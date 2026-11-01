@@ -471,6 +471,28 @@ def test_nan_propagates_instead_of_being_hidden():
         compiled.close()
 
 
+def test_infinity_propagates_and_leaves_the_rest_finite():
+    args, buffers, _ = _matmul_arguments(MATMUL_SHAPE, MATMUL_TILE)
+    a, b, out = buffers
+    for row in range(a.rows):
+        for column in range(a.columns):
+            a.view[row, column] = 0.0
+    for row in range(b.rows):
+        for column in range(b.columns):
+            b.view[row, column] = 1.0
+    a.view[0, 0] = float("inf")
+    for column in range(b.columns):
+        b.view[0, column] = 2.0
+    compiled = _kernel(matmul).compile(*args, grid=_launch(MATMUL_TILE))
+    try:
+        _invoke(compiled, (a.view, b.view, out.view))
+        assert math.isinf(out.view[0, 0]) and out.view[0, 0] > 0.0
+        assert [out.view[1, column] for column in range(b.columns)] == [0.0] * b.columns
+        assert out.guards_intact()
+    finally:
+        compiled.close()
+
+
 def test_selected_target_executes_or_reports_an_unavailable_host():
     args, buffers, _ = _matmul_arguments(MATMUL_SHAPE, MATMUL_TILE)
     a, b, out = buffers
