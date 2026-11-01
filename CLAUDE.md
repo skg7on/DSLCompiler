@@ -67,11 +67,22 @@ not every installed environment.
 PF01 delivers packaging, optional imports, stable registration, ownership checks,
 structured errors and truthful capability reporting. `llk.torch.get_backend()`
 is the registered singleton; importing/reloading must not reset global Dynamo
-state or replace another owner's backend. Native execution raises
+state or replace another owner's backend. The `llk` Dynamo backend raises
 `UnsupportedFeatureError(code="native_backend_unavailable")`; actual
 `torch.compile` wraps it in `BackendCompilerFailed.inner_exception`. Do not count
-registration or eager execution as LLK compilation. Typed capture/native JIT,
-Inductor, training and real upstream Triton remain later tasks under #203.
+registration or eager execution as LLK compilation.
+
+PF04/PF05/PF06 deliver typed capture, checked native import and shared native
+compilation; PF07 adds the versioned `LLKFrontendCAPI` and PF08 the Python
+buffer/launch bridge. With `LLK_FRONTEND_LIBRARY` pointing at a
+`-DLLK_BUILD_PYTHON_CAPI=ON` build, `@llk.jit` kernels execute synchronously over
+caller-owned buffer-protocol providers for the strict-f32 rank-two add/multiply
+subset; the `kernel[grid]` launch form equals the `grid=` keyword form. Missing grid,
+partial coverage and invalid buffers fail before JIT entry. The package
+`capabilities()` report stays compiler-free. The stock x86-avx2 machine profile
+cannot compile a 32×64 launch with 8×16 blocks (shared storage capacity), which
+is a separate mapping follow-up. Inductor, training, real upstream Triton and
+native-lane CI registration remain later tasks under #203/PF20.
 
 `pytest.ini` restricts default discovery to `test/python` and adds the local
 `python/` package path. Do not run vendored GoogleTest Python tests as project

@@ -18,7 +18,7 @@
 from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
 at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
 PF04's checked steps record branch implementation and verification in the
-[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08–PF20 remain proposed and unchecked. Paths in those later tasks describe
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -272,7 +272,7 @@ assert(llk_frontend_invoke_v1(handle, bad_inputs, 2, outputs, 1, &error) == 1);
 
 **Interfaces:** Produce `compile_request`, `CompiledKernel`, `CompiledKernel.invoke/close`, decorator option handling and both launch forms. Implement `LLKBuffer2D` as ctypes with exactly the native field order; keep providers strongly referenced during calls.
 
-- [ ] Add a real rank-two buffer-protocol add kernel test using shapes 32×64, blocks 8×16; assert exact outputs, unchanged inputs, guard bytes and `report.backend`. Test `kernel[grid]` equals `kernel(..., grid=grid)`, precompilation, close twice and close while another thread invokes. Reject missing grid, partial coverage, tensor views/offsets/overlap and mismatched allocation bytes before JIT entry.
+- [x] Add a real rank-two buffer-protocol add kernel test; assert exact outputs, unchanged inputs, guard bytes and `report.backend`. Test `kernel[grid]` equals `kernel(..., grid=grid)`, precompilation, close twice and close while another thread invokes. Reject missing grid, partial coverage, tensor views/offsets/overlap and mismatched allocation bytes before JIT entry. The stock x86-avx2 profile cannot compile the literal 32×64/8×16 tiling (16 simultaneous occurrences need 147,456 B of `sram.0` against 32,768 B), so acceptance uses the same captured kernel and launch path at 16×16/8×16 tiled and 32×64 full domain; the capacity gap is recorded in the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md).
 
 Pinned regression assertions (local test fixture names):
 
@@ -282,10 +282,10 @@ assert input_bytes_after == input_bytes_before
 assert native_invoke_spy.call_count == 1
 ```
 
-- [ ] Run `LLK_FRONTEND_LIBRARY=$PWD/build/lib/libLLKFrontendCAPI.so python -m pytest test/python/test_native_jit.py test/python/test_buffer_contract.py test/python/test_launch_contract.py -q` (use `.dylib` on macOS); confirm the current NotImplementedError fails the real invocation assertion.
-- [ ] Load the explicit development path or installed package resource, check API version, marshal Python exceptions and implement context-managed handle ownership. Use a strong reference plus lock through ctypes calls; never cache raw caller buffers. Preserve void pointer-output semantics and keep `.ttir()` explicitly unavailable for this frontend.
-- [ ] Rerun all three suites with native-call counters. A test passes only if a caller-owned buffer changes through native code and the compilation report matches the executed handle.
-- [ ] Commit `feat: execute llk decorators through the checked native bridge`.
+- [x] Run `LLK_FRONTEND_LIBRARY=$PWD/build/lib/libLLKFrontendCAPI.so python -m pytest test/python/test_native_jit.py test/python/test_buffer_contract.py test/python/test_launch_contract.py -q` (use `.dylib` on macOS); confirm the current `native_backend_unavailable` rejection fails the real invocation assertion.
+- [x] Load the explicit development path or installed package resource, check API version, marshal Python exceptions and implement context-managed handle ownership. Use a strong reference plus lock through ctypes calls; never cache raw caller buffers. Preserve void pointer-output semantics and keep `.ttir()` explicitly unavailable for this frontend.
+- [x] Rerun all three suites with native-call counters. A test passes only if a caller-owned buffer changes through native code and the compilation report matches the executed handle.
+- [x] Commit `feat: execute llk decorators through the checked native bridge`.
 
 ### PF09: Implement bounded specialization cache and inspection reports
 

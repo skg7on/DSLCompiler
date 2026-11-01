@@ -11,15 +11,16 @@ capability reporting. The
 :source:`environment verification record <docs/reviews/2026-10-19-pf01-python-environment.md>`
 pins the implementation and validation evidence.
 
-Python frontend compilation and invocation remain unavailable. PF06 exposes a
-native C++ compilation/invocation service described below. Calling the
-``llk`` Dynamo backend raises ``UnsupportedFeatureError`` with code
-``native_backend_unavailable``. Real ``torch.compile`` wraps this in
-``BackendCompilerFailed.inner_exception``. The registration tests verify this
-diagnostic; their passing result does not establish native kernel execution.
-PF04 provides typed AST capture for the subset described below. Executable
-decorators, Inductor composition, training and genuine upstream Triton launches
-remain later tasks under
+PF06 exposes the native C++ compilation/invocation service, PF07 the versioned C
+ABI and PF08 the Python decorator path that executes through it. ``@llk.jit``
+kernels invoke native code synchronously over caller-owned buffers for the
+strict-f32 rank-two add/multiply subset described below. The ``llk`` Dynamo
+backend still raises ``UnsupportedFeatureError`` with code
+``native_backend_unavailable``; real ``torch.compile`` wraps this in
+``BackendCompilerFailed.inner_exception``. The registration tests verify that
+diagnostic; their passing result does not establish native kernel execution
+through Dynamo. Inductor composition, training and genuine upstream Triton
+launches remain later tasks under
 `#203 <https://github.com/skg7on/DSLCompiler/issues/203>`__.
 
 Typed program and binding contract
@@ -170,8 +171,8 @@ construct a request using that full contract:
 ``@llk.jit`` definitions expose ``frontend_ir(binding)`` for the same metadata.
 The former ``ttir()`` method raises ``upstream_toolchain_unqualified``; private
 frontend records are never labeled upstream TTIR. The old string builder raises
-``legacy_ir_builder_unavailable``. Invocation still raises
-``native_backend_unavailable`` until the native service/runtime milestones land.
+``legacy_ir_builder_unavailable``. Capture itself performs no compilation; PF08
+adds synchronous invocation to the decorated kernel.
 
 .. code-block:: sh
 
@@ -218,7 +219,7 @@ ports are two read inputs, an internal no-read destination (port 2), and the
 write output (port 3). The destination is not a public buffer. PF06 allocates separate owned scratch
 for it. The MLIR context must outlive the
 imported module. This API establishes structured import and source realization;
-Python native compilation/invocation remains unavailable.
+Python native compilation/invocation is delivered separately by PF06–PF08.
 
 .. code-block:: sh
 
@@ -276,8 +277,8 @@ lowered before the portable backend.
 request, structured source and verified bound MicroIR text. The bound text is
 captured once inside the shared compiler before lowering consumes the module.
 Unavailable stages, including ``asm``, report ``inspection_unavailable``. No MLIR
-object escapes the service's context lifetime. This C++ service does not yet
-provide a C ABI or Python launch; those remain PF07/PF08.
+object escapes the service's context lifetime. PF07 adds the versioned C ABI and
+PF08 the Python launch described below.
 
 .. code-block:: sh
 
@@ -286,6 +287,88 @@ provide a C ABI or Python launch; those remain PF07/PF08.
 
 See the :source:`PF06 verification record <docs/reviews/2026-10-24-pf06-native-compilation.md>`
 for actual reference/selected lanes and native guard results.
+
+Native decorator execution
+--------------------------
+
+PF07 (`#218 <https://github.com/skg7on/DSLCompiler/issues/218>`__) adds the
+versioned ``LLKFrontendCAPI`` shared library and PF08 (`#219
+<https://github.com/skg7on/DSLCompiler/issues/219>`__) loads it from ctypes.
+Set ``LLK_FRONTEND_LIBRARY`` to a development build of
+``libLLKFrontendCAPI``; otherwise the installed ``llk`` package looks for the
+library at its resource root or ``lib/`` subdirectory. The bridge checks
+``llk_frontend_api_version() == 1`` before any other entry point. A missing or
+incompatible library raises ``UnsupportedFeatureError`` with
+``native_backend_unavailable`` or ``frontend_api_version_mismatch``; it never
+falls back to eager execution.
+
+Both block-programming forms are synchronous and equivalent::
+
+   grid = LaunchSpec((1, 1, 1), (32, 64, 1))
+   launch = add_kernel[grid]
+   launch(a, b, out, 32, 64, 32, 64)
+   add_kernel(a, b, out, 32, 64, 32, 64, grid=grid)
+
+Omission of ``grid`` fails with ``invalid_launch_coverage`` before binding or
+native entry. Grid times BLOCK must equal every public tensor extent, and the
+third grid/block axes must be singleton. A callable grid runs exactly once after
+argument validation and must return a ``LaunchSpec`` (or tuple) that satisfies
+the same coverage proof. ``@llk.jit`` and ``@llk.jit()`` both work; keyword
+options become a frozen ``CompileOptions``, for example
+``@llk.jit(backend="reference", config_root=..., config_files=...)``.
+
+``kernel.compile(*args, grid=...)`` returns a ``CompiledKernel`` without
+invoking. It exposes ``report`` (the checked ``CompilationReport`` including
+``backend`` and ``source_adapter``), ``invoke(inputs, outputs)``, ``inspect``
+for the available native stages, and idempotent ``close``; it is also a context
+manager. ``llk.compile_request(request)`` provides the same handle for an
+explicit ``CompileRequest``. Every ``invoke`` holds a lock for the whole native
+call, so ``close`` waits for an in-flight invocation and later calls raise
+``ExecutionError`` with ``invalid_frontend_handle``. The caller must close a
+precompiled handle; a plain decorator call compiles, invokes and closes itself.
+
+Inputs and outputs are caller-owned providers wrapped in
+``TensorArgument(TensorSpec, provider)``. A provider must expose the Python
+buffer protocol (or an explicit ``__array_interface__``) with a positive rank-two
+shape, compact row-major strides, an element type matching the declared
+``TensorSpec``, enough allocation bytes for the declared extent, and writability
+for outputs. Array-interface views whose ``base`` names a different data pointer,
+negative or otherwise non-compact strides, unaligned pointers, mismatched
+shapes/dtypes/extents, read-only outputs, non-buffer objects, and outputs that
+overlap inputs or other outputs are rejected with ``TensorContractError`` and
+``invalid_frontend_buffer`` before the JIT is entered. A raw byte provider must
+be a unit-stride contiguous rank-one region; reversed or strided byte views are
+rejected. The exposed buffer pointer is otherwise treated as the base of the
+caller-owned allocation, matching the C ABI, so storage outside the exported
+payload (for example canaries) is not part of the declared allocation. No input
+copy, dtype conversion or provider caching occurs. The adapter holds a live
+buffer export for every provider through the native call, so a resizable
+``bytearray``/``array`` cannot move its storage mid-invocation, and the provider
+objects and native executable stay strongly referenced until the call finishes.
+``ttir()`` remains unavailable with ``upstream_toolchain_unqualified``;
+the checked metadata is exposed through ``frontend_ir(binding)``.
+
+The initial executable envelope is the PF05/PF06 one: positive static rank-two
+compact row-major f32 add or multiply with exact two-input/one-output coverage,
+ABI v1, and explicit ``reference`` or ``selected-target`` execution. Selected
+mode checks the host ISA and never substitutes reference execution. The stock
+``x86-avx2-v2`` machine profile cannot realize the literal 32×64 launch with
+8×16 blocks: its shared storage analysis needs 147,456 B of ``sram.0`` for 16
+simultaneous program occurrences against 32,768 B, so such a request fails with
+``frontend_compilation_failed``/``memory_capacity_exceeded``. The acceptance
+tests exercise the same kernel, adapter and launch path at 16×16/8×16 tiled and
+32×64 full domain; broader tilings need a separate mapping-capacity follow-up.
+
+.. code-block:: sh
+
+   export LLK_FRONTEND_LIBRARY=$PWD/build/lib/libLLKFrontendCAPI.dylib
+   "$LLK_PYTHON" -m pytest test/python/test_native_jit.py \
+     test/python/test_buffer_contract.py test/python/test_launch_contract.py -q
+
+Use ``libLLKFrontendCAPI.so`` on Linux. The library requires a build configured
+with ``-DLLK_BUILD_PYTHON_CAPI=ON``. See the
+:source:`PF08 verification record <docs/reviews/2026-11-01-pf08-python-native-jit.md>`
+for exact commands, counts, buffer guards and native identities.
 
 Legacy Triton safety boundary
 -----------------------------
@@ -428,6 +511,8 @@ After installing the package into the chosen environment:
 ``get_backend()`` returns the exact registered callable. Repeated registration
 and module reload preserve it without clearing Dynamo's global state. A foreign
 owner of the ``llk`` backend name is preserved and produces
-``backend_registration_conflict``. Decorator inspection returns checked frontend
-metadata; it does not establish verified MLIR, real upstream TTIR or a native
-JIT invocation.
+``backend_registration_conflict``. ``capabilities()`` remains compiler-free and
+conservative about the Torch/Dynamo backend, which is still unavailable; it is
+not evidence either way for a decorator invocation. ``frontend_ir`` returns
+checked metadata only, while a decorated call with a loaded CAPI library
+compiles and invokes native code as described above.
