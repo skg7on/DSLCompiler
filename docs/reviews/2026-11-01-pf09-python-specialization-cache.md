@@ -4,8 +4,8 @@
 
 **Scope:** [issue #220](https://github.com/skg7on/DSLCompiler/issues/220), PF09 in
 [the frontend plan](../superpowers/plans/2026-10-18-python-frontend-refinement.md).
-Base `main` `29f772e` contains merged PF08 (PR #273). The implementation is on
-`feat/python-specialization-cache` in the isolated worktree
+Base `main` `29f772e` contains merged PF08 (PR #273). Implementation commit
+`1f6ccd0` is on `feat/python-specialization-cache` in the isolated worktree
 `.claude/worktrees/feat+dynamic-acceptance`, which owns its own `build/`.
 
 ## Delivered behavior
