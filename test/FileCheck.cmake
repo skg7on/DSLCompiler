@@ -397,6 +397,20 @@ if(LLK_BUILD_TOOLS)
   add_test(NAME MicroMappingCompileRejectsUnknownTarget
       COMMAND sh -c "$<TARGET_FILE:llk-compile> --mapping-target=not-a-target --mapping-root=${CMAKE_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir 2>&1 | grep -q 'no mapping target is registered'"
   )
+  # PF12 (#223): the CLI's frontend-json entry path is the same native service
+  # the C API and Python use. One canonical request is compiled both ways and
+  # the identity-bearing report fields must agree; malformed requests, option
+  # conflicts and legacy tt.* input must fail with an actionable diagnostic.
+  # The C API library is a required part of that comparison, so the test is
+  # registered only when it is built.
+  if(LLK_BUILD_PYTHON_CAPI)
+    add_test(NAME FrontendCLI
+        COMMAND ${LLK_TEST_PYTHON} ${CMAKE_SOURCE_DIR}/test/Frontend/cli.py
+            $<TARGET_FILE:llk-compile> $<TARGET_FILE:LLKFrontendCAPI>
+            ${CMAKE_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/FrontendCLI)
+    set_tests_properties(FrontendCLI PROPERTIES
+        LABELS "Frontend" TIMEOUT 300)
+  endif()
   add_test(NAME MicroMappingMatmulTraverses
       COMMAND sh -c "$<TARGET_FILE:llk-opt> --llk-to-micro=\"schedule-db=missing.json\" ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir | $<TARGET_FILE:llk-opt> --micro-to-linalg | ${FILECHECK_BIN} --check-prefix=TRAVERSE ${CMAKE_SOURCE_DIR}/test/Conversion/MicroMapping/matmul_e2e.mlir"
   )

@@ -11,19 +11,25 @@
 // runs the full progressive lowering pipeline (LLK→Linalg→...→LLVM IR),
 // JIT-compiles the result, and reports success.
 //
-// Usage: llk-compile <input.mlir> [--M=<dim>] [--N=<dim>] [--K=<dim>]
+// A canonical frontend request (`--input-format=frontend-json`) takes the
+// shared native service instead: it is parsed, imported, mapped and compiled
+// by the same code path the Python package and the C API use, and the tool
+// prints that service's report.
+//
+// Usage: llk-compile [--input-format=mlir|frontend-json] <input>
+//                    [--M=<dim>] [--N=<dim>] [--K=<dim>]
 
 #include "LLK/Conversion/FrameworkCapabilities.h"
 #include "LLK/Conversion/LLKToLinalg.h"
 #include "LLK/Conversion/LLKToMicro/LLKToMicro.h"
 #include "LLK/Conversion/MappedCompilation.h"
 #include "LLK/Conversion/MappedKernelAbi.h"
-#include "LLK/Conversion/TritonToLLK/GridToForall.h"
-#include "LLK/Conversion/TritonToLLK/TritonToStructured.h"
 #include "LLK/Conversion/Workload/SourceAdapter.h"
 #include "LLK/Conversion/Workload/WorkloadContract.h"
 #include "LLK/Dialect/LLKDialect.h"
 #include "LLK/Dialect/Micro/MicroDialect.h"
+#include "LLK/Frontend/Compiler.h"
+#include "LLK/Frontend/Program.h"
 #include "LLK/Mapping/CoveringSearch.h"
 #include "LLK/Mapping/MappingMetadata.h"
 #include "LLK/Mapping/MappingTarget.h"
@@ -85,8 +91,11 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Config/llvm-config.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -106,8 +115,25 @@ using BufOpts = mlir::bufferization::OneShotBufferizationOptions;
 
 namespace cl = llvm::cl;
 
-static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input .mlir>"),
-                                      cl::Required);
+static cl::opt<std::string>
+    inputFile(cl::Positional,
+              cl::desc("<input> (an MLIR module, or a frontend request with "
+                       "--input-format=frontend-json)"),
+              cl::Required);
+
+static cl::opt<std::string> inputFormat(
+    "input-format",
+    cl::desc("Input format: mlir (the default) or frontend-json. A "
+             "frontend-json request is compiled by the shared native frontend "
+             "service, so it carries its own target, backend and search "
+             "options."),
+    cl::init("mlir"));
+
+static cl::opt<std::string> inspectStage(
+    "inspect",
+    cl::desc("With --input-format=frontend-json, print this inspection stage "
+             "(frontend, llk or micro) instead of the compile report"),
+    cl::init(""));
 
 static cl::opt<int64_t> optM("M", cl::desc("M dimension (rows)"), cl::init(0));
 static cl::opt<int64_t> optN("N", cl::desc("N dimension (cols)"), cl::init(0));
@@ -213,24 +239,6 @@ static cl::opt<std::string>
 
 static mlir::LogicalResult runCompilationPipeline(mlir::ModuleOp module) {
   mlir::PassManager pm(module->getContext());
-
-  // Triton IR path (M8b): staged lowering before the existing pipeline.
-  // Detect Triton IR by checking for tt.* ops (unregistered dialect, so the
-  // check is on the op name prefix rather than a dialect namespace).
-  bool hasTritonOps = false;
-  module.walk([&](mlir::Operation *op) {
-    if (op->getName().getStringRef().starts_with("tt."))
-      hasTritonOps = true;
-  });
-
-  if (hasTritonOps) {
-    // Stage 0a: Triton compute ops (tt.dot) → Linalg structured ops.
-    pm.addPass(mlir::llk::createTritonToStructuredPass());
-    // Stage 0b: Clean up the lowered IR before grid dispatch lowering.
-    pm.addPass(mlir::createCanonicalizerPass(mlir::GreedyRewriteConfig()));
-    // Stage 0c: Triton grid dispatch (tt.get_program_id) → scf.forall.
-    pm.addPass(mlir::llk::createTritonGridToForallPass());
-  }
 
   // Stage 1: Lower LLK dialect ops to Linalg + Arith + Math.
   pm.addPass(mlir::llk::createLLKToLinalgPass());
@@ -849,6 +857,112 @@ static int runMappedCompilation(mlir::ModuleOp module,
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Shared frontend service (PF12)
+// ---------------------------------------------------------------------------
+//
+// A frontend request is complete: it names its target, backend, search policy
+// and frozen configuration. Compiling it is exactly the operation the Python
+// package and the C API perform, so the CLI calls the service directly and
+// prints its report. CLI options that would compete with the request are
+// rejected rather than silently ignored.
+
+namespace {
+
+/// True when a CLI option that also feeds compilation was supplied explicitly.
+/// Options left at their defaults do not conflict: the request is then the only
+/// source of that decision.
+bool conflictingFrontendOption() {
+  const std::pair<const char *, unsigned> options[] = {
+      {"--emit", emitMode.getNumOccurrences()},
+      {"-M", optM.getNumOccurrences()},
+      {"-N", optN.getNumOccurrences()},
+      {"-K", optK.getNumOccurrences()},
+      {"--mapping-target", mappingTargetName.getNumOccurrences()},
+      {"--mapping-root", mappingRoot.getNumOccurrences()},
+      {"--machine", mappingMachine.getNumOccurrences()},
+      {"--mapping-mode", mappingMode.getNumOccurrences()},
+      {"--mapping-stop", mappingStop.getNumOccurrences()},
+      {"--mapping-backend", mappingBackend.getNumOccurrences()},
+      {"--mapping-entry", mappingEntry.getNumOccurrences()},
+      {"--source-adapter", mappingSourceAdapter.getNumOccurrences()},
+      {"--plan-report", mappingPlanReport.getNumOccurrences()},
+      {"--output", emitOutput.getNumOccurrences()},
+      {"--target-triple", emitTargetTriple.getNumOccurrences()},
+      {"--target-features", emitTargetFeatures.getNumOccurrences()},
+      {"--emit-identity", emitIdentity.getNumOccurrences()},
+  };
+  for (const auto &option : options) {
+    if (option.second == 0)
+      continue;
+    llvm::errs() << "conflicting_compile_options: " << option.first
+                 << " conflicts with a frontend-json request, which carries "
+                    "its own target, backend and search options\n";
+    return true;
+  }
+  return false;
+}
+
+/// Legacy Triton fixtures are an explicitly experimental llk-opt flow. The
+/// production compiler refuses them with a message that names the supported
+/// path instead of pretending an unregistered dialect is upstream support.
+bool looksLikeLegacyTriton(llvm::StringRef source) {
+  llvm::StringRef rest = source;
+  while (!rest.empty()) {
+    size_t at = rest.find("tt.");
+    if (at == llvm::StringRef::npos)
+      return false;
+    bool boundary = at == 0 || !(llvm::isAlnum(rest[at - 1]) ||
+                                 rest[at - 1] == '_' || rest[at - 1] == '.');
+    bool name = at + 3 < rest.size() &&
+                (llvm::isAlpha(rest[at + 3]) || rest[at + 3] == '_');
+    if (boundary && name)
+      return true;
+    rest = rest.drop_front(at + 1);
+  }
+  return false;
+}
+
+} // namespace
+
+/// Compile one canonical frontend request through the shared native service.
+/// The report and the inspection stages are the service's own text: the CLI
+/// adds no second interpretation of the request.
+static int runFrontendCompilation() {
+  auto buffer = llvm::MemoryBuffer::getFileOrSTDIN(inputFile.getValue());
+  if (!buffer) {
+    llvm::errs() << "cannot read request '" << inputFile
+                 << "': " << buffer.getError().message() << "\n";
+    return 1;
+  }
+  llvm::Expected<llk::frontend::FrontendRequest> request =
+      llk::frontend::parseRequest((*buffer)->getBuffer());
+  if (!request) {
+    llvm::errs() << llvm::toString(request.takeError()) << "\n";
+    return 1;
+  }
+  llvm::Expected<llk::frontend::FrontendCompilation> compiled =
+      llk::frontend::compileFrontend(*request);
+  if (!compiled) {
+    llvm::errs() << llvm::toString(compiled.takeError()) << "\n";
+    return 1;
+  }
+  if (!inspectStage.empty()) {
+    llvm::StringRef stage = inspectStage.getValue();
+    llvm::Expected<llvm::StringRef> text = compiled->inspect(stage);
+    if (!text) {
+      llvm::errs() << llvm::toString(text.takeError()) << "\n";
+      return 1;
+    }
+    // The service's inspection text is printed verbatim: the CLI and the C API
+    // must be able to hand a caller the identical artifact.
+    llvm::outs() << *text;
+    return 0;
+  }
+  llvm::outs() << compiled->report() << "\n";
+  return 0;
+}
+
 int main(int argc, char **argv) {
   llvm::InitLLVM y(argc, argv);
 
@@ -895,6 +1009,26 @@ int main(int argc, char **argv) {
 
   // Parse command line.
   cl::ParseCommandLineOptions(argc, argv, "LLK kernel compiler\n");
+
+  // A canonical frontend request takes the shared service before any MLIR
+  // parsing: the request is not MLIR, and its options are complete. The emit,
+  // mapping and AOT flags describe the MLIR path, so an explicit occurrence
+  // here is a conflict rather than a silent override.
+  const std::string format = inputFormat.getValue();
+  if (format != "mlir" && format != "frontend-json") {
+    llvm::errs() << "Unsupported --input-format=" << format
+                 << "; expected mlir or frontend-json\n";
+    return 1;
+  }
+  if (format == "frontend-json") {
+    if (conflictingFrontendOption())
+      return 1;
+    return runFrontendCompilation();
+  }
+  if (!inspectStage.empty()) {
+    llvm::errs() << "--inspect applies only to --input-format=frontend-json\n";
+    return 1;
+  }
 
   const std::string emit = emitMode.getValue();
   if (emit != "llvm" && emit != "mlir" && emit != "micro" &&
@@ -984,9 +1118,26 @@ int main(int argc, char **argv) {
   mlir::MLIRContext ctx(registry);
   ctx.loadAllAvailableDialects();
 
-  // Parse the input MLIR file.
-  auto module = mlir::parseSourceFile<mlir::ModuleOp>(inputFile, &ctx);
+  // Parse the input MLIR file. The text is read once so a failed parse can
+  // distinguish a legacy Triton fixture from an ordinary syntax error.
+  auto buffer = llvm::MemoryBuffer::getFileOrSTDIN(inputFile.getValue());
+  if (!buffer) {
+    llvm::errs() << "Cannot read " << inputFile << ": "
+                 << buffer.getError().message() << "\n";
+    return 1;
+  }
+  llvm::StringRef source = (*buffer)->getBuffer();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(source, &ctx);
   if (!module) {
+    if (looksLikeLegacyTriton(source)) {
+      llvm::errs()
+          << "unsupported_input: input declares legacy tt.* operations, "
+             "which llk-compile does not accept as production Triton "
+             "support. Run them through llk-opt's explicit experimental flow "
+             "(--allow-unregistered-dialect plus the --triton-* passes), or "
+             "compile a canonical request with --input-format=frontend-json.\n";
+      return 1;
+    }
     llvm::errs() << "Failed to parse " << inputFile << "\n";
     return 1;
   }
