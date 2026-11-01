@@ -114,6 +114,7 @@ python scripts/check-license-headers.py
 | Full Python suite | 137 passed, 0 failed, 0 skipped |
 | Native `Frontend` + `FrontendCAPI` | 58 of 58 passed |
 | Full native CTest in this worktree | 1,678 run; 4 failed (host-ISA lane), 4 skipped, 1 disabled |
+| Linux CI, [PR #273](https://github.com/skg7on/DSLCompiler/pull/273), LLVM/MLIR 22.1.8 | `build-and-test`, `coverage`, `analyze`, `html` and `license-headers` passed |
 | License-header audit | 370 files checked, clean |
 
 The 104-test PF06 baseline becomes 137 with the 33 new cases; no existing Python
