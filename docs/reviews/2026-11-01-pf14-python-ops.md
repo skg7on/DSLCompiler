@@ -102,6 +102,20 @@ LLK_FRONTEND_LIBRARY=$PWD/build/lib/libLLKFrontendCAPI.dylib \
 # 27 passed (21 operator/registration + 6 fake-contract)
 ```
 
+Pinned Torch 2.9.0 lane (same Python 3.14.8 interpreter, separate reference
+venv):
+
+```sh
+LLK_FRONTEND_LIBRARY=$PWD/build/lib/libLLKFrontendCAPI.dylib \
+    /tmp/llk-torch29-venv/bin/python -m pytest \
+        test/python/test_torch_ops.py \
+        test/python/test_fake_tensor_contract.py -q
+# 27 passed
+```
+
+The `custom_op`, `register_fake` and `opcheck` forms used here exist in the
+pinned reference release; no Torch 2.14-only behavior is required.
+
 The pinned assertions are exercised literally:
 
 ```python
