@@ -1,3 +1,4 @@
+import ast_cases
 import llk
 import pytest
 from ast_cases import binding, masked_add
@@ -18,7 +19,8 @@ def test_frontend_ir_cannot_be_reported_as_upstream_ttir():
     assert caught.value.code == "upstream_toolchain_unqualified"
 
 
-def test_invocation_stays_explicitly_unavailable():
-    with pytest.raises(llk.UnsupportedFeatureError) as caught:
-        llk.jit(masked_add)()
-    assert caught.value.code == "native_backend_unavailable"
+def test_invocation_requires_an_explicit_grid():
+    ports = ast_cases.ports()
+    with pytest.raises(llk.LLKError) as caught:
+        llk.jit(masked_add)(*ports, 8)
+    assert caught.value.code == "invalid_launch_coverage"

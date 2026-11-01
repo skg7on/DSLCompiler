@@ -417,6 +417,8 @@ class CompilationReport:
     selected_group_count: int
     reference_group_count: int
     stages: tuple[str, ...]
+    backend: str = "reference"
+    source_adapter: str = "linalg-elementwise-v1"
 
     def __post_init__(self):
         for name in self.__dataclass_fields__:
