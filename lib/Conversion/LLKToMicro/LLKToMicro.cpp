@@ -390,5 +390,45 @@ std::unique_ptr<Pass> createLLKToMicroSearchSpacePass() {
   return std::make_unique<LLKToMicroSearchSpacePass>();
 }
 
+llvm::Error exportBaselineSearchSpaces(ModuleOp module,
+                                       const ScheduleEntry &anchor) {
+  auto fail = [](const llvm::Twine &message) {
+    return llvm::make_error<llvm::StringError>(message.str(),
+                                               llvm::inconvertibleErrorCode());
+  };
+  if (!module)
+    return fail("a module is required");
+  if (!module.getContext()->getOrLoadDialect<micro::MicroDialect>())
+    return fail("the micro dialect must be registered in this context");
+  llk::LLKKernelRegistry registry;
+  llk::populateLLKKernelLowerings(registry);
+  SmallVector<Operation *> roots;
+  module.walk([&](Operation *op) {
+    if (auto *entry = registry.lookup(op->getName().getStringRef());
+        entry && entry->hasMicroLowering())
+      roots.push_back(op);
+  });
+  if (roots.empty())
+    return fail("the module holds no supported root");
+  for (Operation *root : roots) {
+    llk::KernelContract info;
+    llk::ContractionDimensions dimensions;
+    llk::MicroKernelFragment fragment;
+    bool dynamic = false;
+    if (failed(inferMicroContract(registry, root, info, dimensions, dynamic,
+                                  fragment)))
+      return fail("the source root does not describe a supported contraction");
+    // A symbolic root keeps the bounded baseline; a static root uses the
+    // caller's anchor, whose `pad` boundary policy is what makes an extent the
+    // tiled schedule does not divide exact.
+    ScheduleEntry schedule =
+        dynamic ? llk::selectBoundedBaselineSchedule() : anchor;
+    schedule.tail_policy = dynamic ? "bounded" : "pad";
+    if (failed(buildSearchSpace(module, root, info, dimensions, schedule)))
+      return fail("failed to emit a micro.search_space for the source root");
+  }
+  return llvm::Error::success();
+}
+
 } // namespace llk
 } // namespace mlir

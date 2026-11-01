@@ -15,14 +15,16 @@
 // run produces.
 
 // Dynamic extents are exported with static tile capacities, but the rest of
-// the contract still has to hold: an accumulator dtype Micro does not model is
-// rejected before any runtime loop or guard is emitted.
+// the contract still has to hold: an accumulator dtype neither storage
+// contract accumulates in is rejected before any runtime loop or guard is
+// emitted. (PF11: the op now verifies this itself, so the diagnostic is the
+// dialect's rather than the export's.)
 func.func @dynamic_accumulator_dtype(%x: tensor<?x?xbf16>,
                                      %wg: tensor<?x?xbf16>,
                                      %wu: tensor<?x?xbf16>,
                                      %init: tensor<?x?xbf16>)
     -> tensor<?x?xbf16> {
-  // expected-error @below {{accumulator_type must be a type attribute naming a Micro tile dtype}}
+  // expected-error @below {{accumulator_type must be f32 for both the bf16 and f32 storage contracts}}
   %y = llk.fused_swiglu ins(%x, %wg, %wu : tensor<?x?xbf16>,
                             tensor<?x?xbf16>, tensor<?x?xbf16>)
       outs(%init : tensor<?x?xbf16>)

@@ -27,26 +27,30 @@ def LLK_FusedSwiGLUOp : LLK_Op<"fused_swiglu", [
     let description = [{
         Computes: Y = SiLU(X @ Wg^T) * (X @ Wu^T)
 
-        X:   [M, K] bf16 input
-        Wg:  [K, N] bf16 gate projection weight
-        Wu:  [K, N] bf16 up projection weight
-        Y:   [M, N] bf16 output
+        X:   [M, K] input
+        Wg:  [K, N] gate projection weight
+        Wu:  [K, N] up projection weight
+        Y:   [M, N] output
 
-        Uses FP32 accumulation internally.
+        All operands and the result share one storage element type, which is
+        bf16 or f32. The accumulator is always f32. Mixed storage is rejected
+        by the verifier: a source that rounds between the projections and the
+        gated product has to state those conversions explicitly, so widening
+        or narrowing one operand here would silently change its semantics.
     }];
 
     let arguments = (ins
-        TensorOf<[BF16]>:$x,
-        TensorOf<[BF16]>:$wg,
-        TensorOf<[BF16]>:$wu,
-        TensorOf<[BF16]>:$init,
+        TensorOf<[BF16, F32]>:$x,
+        TensorOf<[BF16, F32]>:$wg,
+        TensorOf<[BF16, F32]>:$wu,
+        TensorOf<[BF16, F32]>:$init,
         AnyAttr:$accumulator_type,
         LLK_ActivationAttr:$activation,
         LLK_MathModeAttr:$math_mode
     );
 
     let results = (outs
-        TensorOf<[BF16]>:$result
+        TensorOf<[BF16, F32]>:$result
     );
 
     let assemblyFormat = [{

@@ -52,6 +52,18 @@ std::unique_ptr<mlir::Pass> createLLKToMicroPass(llvm::StringRef scheduleDb);
 /// operation, holding the legal choices around the schedule it selects.
 std::unique_ptr<mlir::Pass> createLLKToMicroSearchSpacePass();
 
+/// Appends one `micro.search_space` for every supported root in `module`,
+/// anchored on `anchor`.
+///
+/// A caller with no schedule database (the frontend service) still needs an
+/// anchor the exporter can realize: a static root keeps the anchor's tile sizes
+/// and uses the `pad` boundary policy, which keeps whole-tile arithmetic exact
+/// for an extent the tiled schedule does not divide; a symbolic root keeps the
+/// bounded baseline's `bounded` policy. The space is emitted by the same driver
+/// the concrete export uses, so the anchor is a schedule the export can lower.
+llvm::Error exportBaselineSearchSpaces(mlir::ModuleOp module,
+                                       const ScheduleEntry &anchor);
+
 } // namespace llk
 } // namespace mlir
 

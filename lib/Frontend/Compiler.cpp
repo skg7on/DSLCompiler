@@ -99,7 +99,7 @@ struct FrontendCompilation::State {
   std::unique_ptr<float[]> destination;
   uint64_t destinationBytes = 0;
   std::vector<unsigned> inputMap;
-  unsigned destinationPort = 2;
+  std::optional<unsigned> destinationPort;
   std::mutex invocation;
 };
 FrontendCompilation::FrontendCompilation(std::unique_ptr<State> state)
@@ -138,13 +138,15 @@ FrontendCompilation::invoke(llvm::ArrayRef<InvocationBuffer2D> inputs,
       state->executable->abi().inputs.size());
   for (size_t i = 0; i != inputs.size(); ++i)
     nativeInputs[state->inputMap[i]] = inputs[i];
-  const auto &shape =
-      state->executable->abi().inputs[state->destinationPort].shape;
-  nativeInputs[state->destinationPort] = {{state->destination.get(),
-                                           state->destination.get(), 0,
-                                           shape[0], shape[1], shape[1], 1},
-                                          InvocationElementType::F32,
-                                          state->destinationBytes};
+  if (state->destinationPort) {
+    const auto &shape =
+        state->executable->abi().inputs[*state->destinationPort].shape;
+    nativeInputs[*state->destinationPort] = {{state->destination.get(),
+                                              state->destination.get(), 0,
+                                              shape[0], shape[1], shape[1], 1},
+                                             InvocationElementType::F32,
+                                             state->destinationBytes};
+  }
   // MappedExecutable validates every native descriptor and disjointness before
   // entering code. The private no-read destination follows the same ABI rules.
   if (auto error = state->executable->invoke(nativeInputs, outputs))
@@ -163,9 +165,6 @@ compileFrontend(const FrontendRequest &request) {
   mlir::registerAllDialects(registry);
   registry.insert<mlir::micro::MicroDialect, native::LLKDialect>();
   mlir::MLIRContext context(registry);
-  auto imported = importProgram(request, context);
-  if (!imported)
-    return imported.takeError();
   auto snapshot = ConfigurationSnapshot::create(options.configFiles);
   if (!snapshot)
     return snapshot.takeError();
@@ -190,6 +189,12 @@ compileFrontend(const FrontendRequest &request) {
       return frontendError("native_backend_unavailable",
                            llvm::toString(std::move(error)), {}, "compile");
   }
+  // The target is known before the source is imported, so a contraction's
+  // tile anchor is derived from the machine that will realize it. The
+  // elementwise family has no tiled schedule and never reads the machine.
+  auto imported = importProgram(request, context, (*target)->machine());
+  if (!imported)
+    return imported.takeError();
   native::tuning::MappedTuningOptions tuning;
   tuning.source.sourceSymbol = imported->selection.symbol;
   tuning.source.sourceRootOrdinal = imported->selection.rootOrdinal;
@@ -232,33 +237,73 @@ compileFrontend(const FrontendRequest &request) {
   if (auto error = validateKernelAbi(abi))
     return frontendError("frontend_compilation_failed",
                          llvm::toString(std::move(error)), {}, "compile");
-  if (abi.inputs.size() != 3 || abi.outputs.size() != 1 ||
-      imported->internalDestinationPort != 2)
+  size_t publicInputs = 0;
+  for (const auto &tensor : request.program().tensors)
+    publicInputs += tensor.direction == "input";
+  if (abi.outputs.size() != 1 ||
+      abi.inputs.size() !=
+          publicInputs + (imported->internalDestinationPort ? 1 : 0))
     return frontendError("frontend_compilation_failed",
                          "unsupported destination adaptation ABI", {},
                          "compile");
   state->destinationPort = imported->internalDestinationPort;
+  if (state->destinationPort && *state->destinationPort >= abi.inputs.size())
+    return frontendError("frontend_compilation_failed",
+                         "internal destination port is outside the ABI", {},
+                         "compile");
   llvm::json::Array publicPorts;
+  std::vector<bool> claimed(abi.inputs.size(), false);
   for (const auto &map : imported->publicToNativePorts) {
+    if (map.publicPort >= request.program().tensors.size())
+      return frontendError("frontend_compilation_failed",
+                           "public port map names an unknown tensor", {},
+                           "compile");
     const auto &port = request.program().tensors[map.publicPort];
-    if (port.direction == "input")
+    // Output entries are informational (the output is passed as the caller's
+    // destination, not an input), so only input entries index the input list.
+    if (port.direction == "input") {
+      if (map.nativePort >= abi.inputs.size())
+        return frontendError("frontend_compilation_failed",
+                             "public input port is outside the ABI", {},
+                             "compile");
       state->inputMap.push_back(map.nativePort);
+      claimed[map.nativePort] = true;
+    }
     publicPorts.push_back(llvm::json::Object{{"public", map.publicPort},
                                              {"native", map.nativePort}});
   }
-  const auto &shape = abi.inputs[state->destinationPort].shape;
-  uint64_t elements =
-      static_cast<uint64_t>(shape[0]) * static_cast<uint64_t>(shape[1]);
-  if (elements > std::numeric_limits<size_t>::max() / sizeof(float))
-    return frontendError("frontend_compilation_failed",
-                         "destination allocation exceeds host range", {},
-                         "compile");
-  state->destinationBytes = elements * sizeof(float);
-  state->destination.reset(
-      new (std::nothrow) float[static_cast<size_t>(elements)]);
-  if (!state->destination)
-    return frontendError("frontend_compilation_failed",
-                         "destination allocation failed", {}, "compile");
+  if (state->destinationPort) {
+    if (claimed[*state->destinationPort])
+      return frontendError("frontend_compilation_failed",
+                           "a public input also claims the internal "
+                           "destination port",
+                           {}, "compile");
+    claimed[*state->destinationPort] = true;
+  }
+  for (bool isBound : claimed)
+    if (!isBound)
+      return frontendError("frontend_compilation_failed",
+                           "a native input port has no public or internal "
+                           "source",
+                           {}, "compile");
+  if (state->destinationPort) {
+    const auto &shape = abi.inputs[*state->destinationPort].shape;
+    uint64_t elements =
+        static_cast<uint64_t>(shape[0]) * static_cast<uint64_t>(shape[1]);
+    if (elements > std::numeric_limits<size_t>::max() / sizeof(float))
+      return frontendError("frontend_compilation_failed",
+                           "destination allocation exceeds host range", {},
+                           "compile");
+    state->destinationBytes = elements * sizeof(float);
+    // The destination is also a contraction's seed. It is never read through
+    // the public API, so zeroing it makes a zero accumulator exact rather than
+    // whatever the allocator happened to return.
+    state->destination.reset(
+        new (std::nothrow) float[static_cast<size_t>(elements)]());
+    if (!state->destination)
+      return frontendError("frontend_compilation_failed",
+                           "destination allocation failed", {}, "compile");
+  }
   auto bound =
       mlir::parseSourceString<mlir::ModuleOp>(state->microIR, &context);
   if (!bound)
@@ -336,7 +381,10 @@ compileFrontend(const FrontendRequest &request) {
        native::framework::capabilityReceiptToJson(capabilities)},
       {"plan_report", selected.planReport},
       {"adaptation",
-       llvm::json::Object{{"internal_destination_port", state->destinationPort},
+       llvm::json::Object{{"internal_destination_port",
+                           state->destinationPort
+                               ? llvm::json::Value(*state->destinationPort)
+                               : llvm::json::Value(nullptr)},
                           {"allocation_bytes", state->destinationBytes},
                           {"public_to_native", std::move(publicPorts)}}},
       {"search",

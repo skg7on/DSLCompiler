@@ -62,9 +62,13 @@ LogicalResult lowerSwiGLU(OpBuilder &builder, mlir::llk::FusedSwiGLUOp op) {
 
   llk::MathMode mode = op.getMathMode();
 
-  auto bf16Type = builder.getBF16Type();
+  // The verifier guarantees one uniform storage element type, bf16 or f32.
+  // The activation and the gated product are evaluated in f32 in either case;
+  // only the uniform-f32 contract needs no width conversion at the edges.
+  Type storageType = xType.getElementType();
+  const bool uniformF32 = storageType.isF32();
   auto f32Type = builder.getF32Type();
-  auto gateUpType = RankedTensorType::get({M, N}, bf16Type);
+  auto gateUpType = RankedTensorType::get({M, N}, storageType);
 
   // A dynamic extent is never fabricated: the conversion tensors are sized
   // from the source's own runtime dimensions, so the arithmetic and
@@ -76,13 +80,13 @@ LogicalResult lowerSwiGLU(OpBuilder &builder, mlir::llk::FusedSwiGLUOp op) {
     dynamicSizes.push_back(
         tensor::DimOp::create(builder, loc, wg, /*index=*/1));
 
-  Value bf16Zero = arith::ConstantOp::create(
-      builder, loc, bf16Type, builder.getFloatAttr(bf16Type, 0.0));
+  Value zero = arith::ConstantOp::create(
+      builder, loc, storageType, builder.getFloatAttr(storageType, 0.0));
 
   // Gate projection: X @ Wg
   Value gateInit =
       tensor::EmptyOp::create(builder, loc, gateUpType, dynamicSizes);
-  Value gateFilled = linalg::FillOp::create(builder, loc, ValueRange{bf16Zero},
+  Value gateFilled = linalg::FillOp::create(builder, loc, ValueRange{zero},
                                             ValueRange{gateInit})
                          .getResult(0);
   Value gateResult = linalg::MatmulOp::create(builder, loc, ValueRange{x, wg},
@@ -92,9 +96,9 @@ LogicalResult lowerSwiGLU(OpBuilder &builder, mlir::llk::FusedSwiGLUOp op) {
   // Up projection: X @ Wu
   Value upInit =
       tensor::EmptyOp::create(builder, loc, gateUpType, dynamicSizes);
-  Value upFilled = linalg::FillOp::create(builder, loc, ValueRange{bf16Zero},
-                                          ValueRange{upInit})
-                       .getResult(0);
+  Value upFilled =
+      linalg::FillOp::create(builder, loc, ValueRange{zero}, ValueRange{upInit})
+          .getResult(0);
   Value upResult = linalg::MatmulOp::create(builder, loc, ValueRange{x, wu},
                                             ValueRange{upFilled})
                        .getResult(0);
@@ -114,11 +118,17 @@ LogicalResult lowerSwiGLU(OpBuilder &builder, mlir::llk::FusedSwiGLUOp op) {
                                         utils::IteratorType::parallel},
           /*bodyBuilder=*/
           [&](OpBuilder &b, Location l, ValueRange args) {
-            Value g = args[0]; // bf16
-            Value u = args[1]; // bf16
+            Value g = args[0]; // storage element type
+            Value u = args[1]; // storage element type
 
-            Value gF32 = arith::ExtFOp::create(b, l, f32Type, g);
-            Value uF32 = arith::ExtFOp::create(b, l, f32Type, u);
+            // A uniform-f32 source is already in the arithmetic dtype; a bf16
+            // source widens for the activation and rounds once on the way out.
+            Value gF32 = g;
+            Value uF32 = u;
+            if (!uniformF32) {
+              gF32 = arith::ExtFOp::create(b, l, f32Type, g);
+              uF32 = arith::ExtFOp::create(b, l, f32Type, u);
+            }
 
             // SiLU(g) = g * sigmoid(g) = g / (1 + exp(-g))
             Value neg = arith::NegFOp::create(b, l, gF32);
@@ -130,8 +140,10 @@ LogicalResult lowerSwiGLU(OpBuilder &builder, mlir::llk::FusedSwiGLUOp op) {
             Value silu = arith::MulFOp::create(b, l, gF32, invDen);
             Value r = arith::MulFOp::create(b, l, silu, uF32);
 
-            Value trunc = arith::TruncFOp::create(b, l, bf16Type, r);
-            linalg::YieldOp::create(b, l, trunc);
+            Value stored = r;
+            if (!uniformF32)
+              stored = arith::TruncFOp::create(b, l, storageType, r);
+            linalg::YieldOp::create(b, l, stored);
           })
           .getResult(0);
 

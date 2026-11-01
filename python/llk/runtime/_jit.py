@@ -24,12 +24,16 @@ def _options(options, changes):
 
 
 def _check_launch(binding):
-    """Require whole blocks to cover every public tensor domain.
+    """Require whole blocks to cover every public *output* domain.
 
-    A divisible domain needs exactly ``shape / block`` blocks. A rounded domain
-    needs ``ceil(shape / block)`` blocks: the extra lanes are the declared tail,
-    which the native importer must prove safe from the kernel's own mask before
-    any code is emitted. Partial or over-provisioned grids are still invalid.
+    The launch tiles the output domain. A contraction's inputs may have other
+    extents (an ``[M, K]`` left operand and a ``[K, N]`` weight), so their
+    accesses are proven by the native importer from the kernel's own addresses
+    rather than by the launch grid. A divisible domain needs exactly
+    ``shape / block`` blocks. A rounded domain needs ``ceil(shape / block)``
+    blocks: the extra lanes are the declared tail, which the native importer
+    must prove safe from the kernel's own mask before any code is emitted.
+    Partial or over-provisioned grids are still invalid.
     """
     grid, block = binding.launch.grid, binding.launch.block
     if grid[2] != 1 or block[2] != 1:
@@ -39,6 +43,8 @@ def _check_launch(binding):
             code="invalid_launch_coverage",
         )
     for spec in binding.tensors:
+        if spec.direction != "output":
+            continue
         for axis in (0, 1):
             covered = grid[axis] * block[axis]
             whole_blocks = -(-spec.shape[axis] // block[axis])
