@@ -15,9 +15,9 @@ Read, build, then trace one workflow
 ------------------------------------
 
 #. Read :doc:`concepts </concepts>`, :doc:`architecture </architecture>`, and
-   :source:`CLAUDE.md <CLAUDE.md>`. For current status, consult the
-   :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`. The October 7
-   gap assessment records the historical pre-#133 baseline.
+   :source:`CLAUDE.md <CLAUDE.md>`. For current status, consult :doc:`features`,
+   :doc:`dynamic-shapes` and :doc:`python-frontend`. Historical gap assessments do
+   not define current support.
 
 #. Follow :doc:`getting started </getting-started>` to obtain a working toolchain.
 
@@ -98,8 +98,8 @@ Run Python frontend checks
 
 Use the project ``.venv`` interpreter by absolute path while working in an isolated
 worktree. The :doc:`Python frontend guide </python-frontend>` records setup and
-the current Python 3.14.8 / Torch 2.14.1 environment alongside the separately
-verified Python 3.11/3.12 + Torch 2.9.0 reference matrix.
+typed capture/import/launch contracts and the Python 3.11/3.12 + Torch 2.9.0
+registration reference matrix.
 
 .. code-block:: sh
 
@@ -109,10 +109,12 @@ verified Python 3.11/3.12 + Torch 2.9.0 reference matrix.
 
 Default discovery selects ``test/python``. The real-Torch tests must execute;
 missing Torch or wheel-build dependencies are setup failures. Wheel tests also
-exercise a clean Torch-absent environment outside the checkout. PF01 has 21
-passing Python tests; native frontend execution and required CMake/CI execution
-lanes remain later milestones. Keep native compiler checks separate and report
-their skips and target identities as above.
+exercise a clean Torch-absent environment outside the checkout. Native Python
+launch tests require ``LLK_FRONTEND_LIBRARY`` pointing at a C API-enabled build;
+include buffer, coverage, masked-edge, cache, lifetime and inspection checks from
+the frontend guide. C++ frontend tests are registered with CTest; required
+combined Python/native CI coverage remains incomplete. Report host eligibility
+separately from selected execution, and retain actual reports and test counts.
 
 .. _contributing-source-file-headers:
 
@@ -261,15 +263,12 @@ errors, then inspect each changed page in a browser. Add new pages to the
 appropriate ``toctree`` so they appear in the sidebar and search. The manual's
 build is independent of the LLVM toolchain; command checks use the actual tools.
 
-Keep commits focused. In the PR, describe the trigger and resulting behavior,
+Keep changes focused. Describe the trigger and resulting behavior,
 include the verification actually run, and state any relevant limits. Record
 skips separately from passes. Distinguish static predictions, portable numerical
 correctness, selected-target execution and calibrated measurements.
 
-Before extending the PR #133 contracts, read the completed #129
-:source:`resource <docs/superpowers/plans/2026-10-07-issue129-resources-and-costs.md>`,
-:source:`runtime <docs/superpowers/plans/2026-10-07-issue129-execution-and-runtime.md>`, or
-:source:`tuner/acceptance <docs/superpowers/plans/2026-10-07-issue129-tuning-and-acceptance.md>`
-companion plan. Those documents coordinate shared interfaces and dependencies;
-consult current headers and tests for implemented APIs; historical task prose
-is not a broader support promise.
+Before extending a contract, read the :doc:`architecture`, the relevant current
+headers and registered tests. In particular, preserve source/target identity,
+complete-plan storage checks, typed invocation and source/mapping ownership
+receipts. Design proposals explain intent; they are not a broader support promise.

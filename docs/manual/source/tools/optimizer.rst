@@ -335,7 +335,7 @@ Verification has three boundaries:
 
 #. A target emitter validates/interprets its selected bundle during mapped compilation.
 
-``micro-verify-mapping`` has only the five configuration keys. It accepts no ``mode``, ``top-k``, ``beam-width``, ``report``, ``candidate``, or ``plan-id``, and it does not search. Verifying a saved module without loading its target cannot establish layer two. Mapping verification resolves persisted decisions; execution and numerical correctness still require the backend/invocation gate. PR #133 separately verifies complete storage, selected width/fused realization and selected AVX2 execution. Partial analysis does not establish executable support.
+``micro-verify-mapping`` has only the five configuration keys. It accepts no ``mode``, ``top-k``, ``beam-width``, ``report``, ``candidate``, or ``plan-id``, and it does not search. Verifying a saved module without loading its target cannot establish layer two. Mapping verification resolves persisted decisions; execution and numerical correctness still require the backend/invocation gate. Complete storage, selected width/fused realization and selected AVX2 execution have separate validation gates. Partial analysis does not establish executable support.
 
 .. _tools-optimizer-reproduce-a-plan-id-with-micro-bind-plan:
 

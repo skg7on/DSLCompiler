@@ -100,7 +100,7 @@ After :doc:`Tutorial 2 </tutorials/02-mapping>`:
    build/bin/micro-perf --machine=machines/x86-avx2-v2.yaml --level=1 \
      build/tutorial/matmul.mapped.mlir > build/tutorial/matmul.mapped.perf.yaml
 
-Keep this report beside ``matmul.plan.json``. PR #133 uses shared normalized materialized analysis and verifies planner/perf cycles, DRAM traffic and capacity in all five public chains. Compare equivalent source/plan/machine configurations and preserve the reports. Static parity is not calibrated hardware prediction; see the :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`.
+Keep this report beside ``matmul.plan.json``. Complete-plan evaluation uses shared normalized materialized analysis; acceptance tests verify planner/perf cycles, DRAM traffic and capacity in all five public chains. Compare equivalent source/plan/machine configurations and preserve the reports. Static parity is not calibrated hardware prediction; see the :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`.
 
 .. _tutorials-03-performance-5-compare-a-machine-change-responsibly:
 
@@ -109,6 +109,6 @@ Keep this report beside ``matmul.plan.json``. PR #133 uses shared normalized mat
 
 Copy a machine YAML into ``build/tutorial/``, change one capacity or clock/cost parameter while preserving the schema, and rerun ``micro-perf --machine=<your-file>`` on the same IR. Record the original profile, edited profile, compiler revision, IR, and both reports. For mapped IR, changing topology invalidates the old selection's provenance; remap before claiming the new machine can realize the same plan.
 
-Use predicted changes to formulate an experiment. To claim real latency or accuracy, invoke a compiled kernel with defined input data, compare outputs to a numerical reference, and time repeated invocations with a documented methodology. The current :doc:`benchmark tool </tools/benchmark>` does not measure your compiled Micro kernel, and the current CLI tuner has no production measurement provider. Calibration remains separate work in #51/#52.
+Use predicted changes to formulate an experiment. To claim real latency or accuracy, invoke a compiled kernel with defined input data, compare outputs to a numerical reference, and time repeated invocations with a documented methodology. The current :doc:`benchmark tool </tools/benchmark>` does not measure your compiled Micro kernel, while verified mapped timing uses target-aware tuning with typed measurement inputs. Calibration remains separate work.
 
 **What you established:** interpretable static/resource predictions and a reproducible report, with assumptions preserved. See the :doc:`performance manual </tools/performance>` for exact options, report fields, multi-kernel selection, and error behavior.

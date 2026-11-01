@@ -10,10 +10,11 @@ Build the tools, parse a small kernel, and export its execution representation. 
 Prerequisites
 -------------
 
-Python frontend development has a separate project ``.venv`` workflow, verified
-locally with Python 3.14.8 / Torch 2.14.1. See :doc:`python-frontend` for setup,
-the reference compatibility matrix and the PF01 scope. Native frontend execution
-is not delivered by installing that package.
+Python frontend development uses the project ``.venv``. See :doc:`python-frontend`
+for typed capture, static f32 elementwise/contraction execution and proved
+elementwise edge tiles.
+Native execution also requires a ``LLKFrontendCAPI`` build and a frozen target
+configuration; installing the Python package alone does not supply them.
 
 * Git, CMake 3.20 or newer, Ninja, Python 3 for registered script tests, and a C++20 compiler.
 

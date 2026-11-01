@@ -10,12 +10,54 @@ tile capacities, instruction fragments, vector widths, pipeline depths and
 selected resources stay fixed. Mixed static/dynamic tensor types use the same
 checked path.
 
-This guide covers the implementation delivered by issue #191's eight tasks
-(PRs #260–#265, #270 and #271). The older
-:source:`design proposal <docs/superpowers/specs/2026-10-17-dynamic-shape-llk-microir-design.md>`
-and :source:`implementation plan <docs/superpowers/plans/2026-10-17-dynamic-shape-llk-microir.md>`
-record the original design; current interfaces and registered tests define the
-implemented boundary.
+The design separates runtime tensor extents from compile-time execution
+resources. Shape contracts describe admitted invocations; fixed tile capacities
+and selected resources bound local storage; explicit observations supply analysis
+costs. A shape sample guides ranking without becoming the executable's shape
+contract. Current interfaces and registered tests define the supported boundary.
+
+.. _dynamic-shapes-implementation-map:
+
+Implementation map
+-------------------
+
+.. list-table::
+   :header-rows: 1
+   :class: wide-table
+
+   * - Layer
+     - Contract
+     - Implementation
+   * - Shape semantics
+     - Constants/symbols, cross-port equality, range/congruence checks and predicate classification
+     - :source:`ShapeContract <lib/Shape/ShapeContract.cpp>`
+   * - Source export
+     - Runtime tile counts, fixed capacities, bounded movement and exact reduction extent
+     - :source:`MicroKernelDriver <lib/Conversion/LLKToMicro/MicroKernelDriver.cpp>`
+   * - Mapping/storage
+     - Concrete resources, routes, lifetimes and bounded simultaneous residency before executable retention
+     - :source:`StoragePlan <lib/Mapping/StoragePlan.cpp>`
+   * - Runtime
+     - ABI v2 symbolic ports and typed descriptor validation before entry
+     - :source:`KernelAbi <include/LLK/Runtime/KernelAbi.h>`, :source:`MappedInvocation <runtime/MappedInvocation.cpp>`
+   * - Analysis/ranking
+     - Concrete sample clones, complete selected-plan analysis and weighted aggregation
+     - :source:`ShapeSpecialization <lib/Conversion/MicroMapping/ShapeSpecialization.cpp>`, :source:`CompletePlanEvaluation <lib/Conversion/MicroMapping/CompletePlanEvaluation.cpp>`
+   * - Reuse/replay
+     - Separate compiled variant and measurement identity, ordered guarded variants and frozen baseline selection
+     - :source:`CompiledVariantIdentity <runtime/CompiledVariantIdentity.cpp>`
+
+.. _dynamic-shapes-python-boundary:
+
+Native dynamic shapes and Python specialization
+------------------------------------------------
+
+Dynamic contraction execution uses the native mapped compiler and typed C++
+invocation. The :doc:`Python frontend <python-frontend>` currently imports
+positive static rank-two f32 add/multiply with proved rounded edges, plus
+canonical counted matmul/SwiGLU with exact static coverage. Its concrete ``TensorSpec``, constexprs and launch enter each cache identity;
+changing shape can compile a new specialization. Masked static edges do not
+expose symbolic ABI v2 or compile-once dynamic contraction reuse through Python.
 
 .. _dynamic-shapes-scenarios:
 

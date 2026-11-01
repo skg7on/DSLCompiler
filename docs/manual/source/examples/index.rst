@@ -27,6 +27,9 @@ These files are small, checked-in inputs for the :doc:`developer tutorials </ind
    * - :download:`dynamic-matmul.mlir </examples/dynamic-matmul.mlir>`
      - Independently dynamic M/N/K with BF16 inputs/output and FP32 accumulation
      - Bounded MicroIR with a read initializer and separate output destination
+   * - :download:`python-add.py </examples/python-add.py>`
+     - Static 1×7 f32 add with a proved rounded 8×16 block, using standard-library buffers
+     - Checked native output, bound MicroIR inspection and a repeated specialization-cache hit; see :doc:`/python-frontend`
    * - :download:`dynamic-shape-profile.json </examples/dynamic-shape-profile.json>`
      - Explicit weighted M/N/K observations for dynamic tuning
      - Per-sample costs and weighted ranking; see :doc:`/dynamic-shapes`

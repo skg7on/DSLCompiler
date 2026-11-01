@@ -87,7 +87,7 @@ Baseline and optional device corpus
 The :source:`uncalibrated arithmetic baseline <docs/reviews/issue164-prediction-baseline.json>`
 is generated from checked-in synthetic records: it verifies report arithmetic,
 provenance, counts and exclusions, and makes no hardware-accuracy claim.
-The :source:`Phase D acceptance review <docs/reviews/issue164-prediction-validation.md>`
+The :source:`Prediction-validation acceptance review <docs/reviews/issue164-prediction-validation.md>`
 records the implementation and tested boundary.
 
 For a device baseline, collect fresh verified records on a compatible host using

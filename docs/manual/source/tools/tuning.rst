@@ -3,7 +3,7 @@
 ``llk-tune``: enumerate and rank schedules
 ==========================================
 
-PR #133 adds target-aware tuning from original source alongside the existing
+``llk-tune`` supports target-aware tuning from original source alongside the
 compatibility and legacy workflows. Use the mode that matches the result you
 need; static predictions and measured observations are separate outputs.
 

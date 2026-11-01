@@ -9,7 +9,7 @@ It does not load MLIR, use a schedule database, invoke the LLK JIT, or execute a
 selected mapped kernel. Its GFLOPS numbers are synthetic-workload throughput,
 not SwiGLU/GEMM compiler performance.
 
-This harness remains separate from the mapped execution delivered in PR #133; see
+This harness remains separate from the mapped execution path; see
 :source:`tools/llk-bench/llk-bench.cpp <tools/llk-bench/llk-bench.cpp>`. A mapped
 executable and its numerical tests are separate paths; their presence does not
 mean this benchmark invokes them.
@@ -163,5 +163,5 @@ For modeled cycles and capacity diagnostics, use
 :doc:`micro-perf </tools/performance>`. For schedule enumeration, use
 :doc:`llk-tune </tools/tuning>`, remembering that its shipped CLI is prediction-based.
 Neither converts this benchmark's synthetic GFLOPS into calibrated Micro costs.
-Production mapped-kernel measurement and calibration remain separate work
-under #51/#52.
+Verified mapped-kernel timing uses the target-aware tuner and typed measurement
+fixtures described in :doc:`tuning`. Model calibration remains separate work.
