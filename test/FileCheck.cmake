@@ -30,6 +30,10 @@ if(LLK_BUILD_TOOLS)
   endfunction()
 
   add_llk_filecheck_test(DialectOps test/Dialect/ops.mlir)
+  # PF11: the fused SwiGLU op covers uniform f32 and bf16 storage, and its
+  # Linalg lowering keeps the f32 form f32 end to end.
+  add_llk_filecheck_test(DialectSwiGLUF32 test/Dialect/swiglu_f32.mlir
+      --llk-to-linalg)
   add_llk_filecheck_test(MicroDialectOps test/Dialect/Micro/ops.mlir)
   add_llk_filecheck_test(MicroDialectTileOps test/Dialect/Micro/tile_ops.mlir)
   # Bounded movement and exact-K reduction primitives: the dynamic-boundary

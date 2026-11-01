@@ -48,6 +48,7 @@ LogicalResult FusedSwiGLUOp::verify() {
   auto wgType = getWg().getType();
   auto wuType = getWu().getType();
   auto initType = getInit().getType();
+  auto resultType = getResult().getType();
 
   if (!xType.hasRank() || xType.getRank() != 2)
     return emitOpError("X must be a 2D tensor");
@@ -55,6 +56,26 @@ LogicalResult FusedSwiGLUOp::verify() {
     return emitOpError("Wg must be a 2D tensor");
   if (!wuType.hasRank() || wuType.getRank() != 2)
     return emitOpError("Wu must be a 2D tensor");
+  if (!initType.hasRank() || initType.getRank() != 2)
+    return emitOpError("init must be a 2D tensor");
+  if (!resultType.hasRank() || resultType.getRank() != 2)
+    return emitOpError("result must be a 2D tensor");
+
+  // PF11: one uniform storage contract. bf16 keeps its established f32
+  // accumulation; f32 is the exact uniform form. A mixture would require an
+  // implicit conversion the source never declared, so it is rejected.
+  Type storageType = xType.getElementType();
+  if (wgType.getElementType() != storageType ||
+      wuType.getElementType() != storageType ||
+      initType.getElementType() != storageType)
+    return emitOpError("X, Wg, Wu and init must share one storage element "
+                       "type");
+  if (resultType.getElementType() != storageType)
+    return emitOpError("result must use the operands' storage element type");
+  auto accumulator = mlir::dyn_cast<TypeAttr>(getAccumulatorType());
+  if (!accumulator || !accumulator.getValue().isF32())
+    return emitOpError("accumulator_type must be f32 for both the bf16 and "
+                       "f32 storage contracts");
 
   auto xM = xType.getDimSize(0);
   auto xK = xType.getDimSize(1);
@@ -82,6 +103,17 @@ LogicalResult FusedSwiGLUOp::verify() {
   if (!ShapedType::isDynamic(wgN) && !ShapedType::isDynamic(wuN) && wgN != wuN)
     return emitOpError("N dimension mismatch between Wg=")
            << wgN << " and Wu=" << wuN;
+
+  auto resultM = resultType.getDimSize(0);
+  auto resultN = resultType.getDimSize(1);
+  if (!ShapedType::isDynamic(initM) && !ShapedType::isDynamic(resultM) &&
+      initM != resultM)
+    return emitOpError("result M=")
+           << resultM << " does not match init=" << initM;
+  if (!ShapedType::isDynamic(initN) && !ShapedType::isDynamic(resultN) &&
+      initN != resultN)
+    return emitOpError("result N=")
+           << resultN << " does not match init=" << initN;
 
   return success();
 }

@@ -141,10 +141,15 @@ Type elementTypeOf(Type type) {
 /// it as the contract's numerical semantics is what makes an approximation an
 /// explicit IR fact rather than a compiler-flag side effect.
 std::string numericalContractName(Operation *root) {
-  auto mode = dyn_cast_or_null<IntegerAttr>(root->getAttr("math_mode"));
-  if (!mode)
-    return std::string();
-  return stringifyMathMode(static_cast<MathMode>(mode.getInt())).str();
+  // A source that states its numerical policy explicitly (the frontend does,
+  // because its activation policy is part of the cache identity) carries it as
+  // a canonical name. The opaque `math_mode` attribute of a hand-written root
+  // is not turned into contract text here: doing so would silently widen every
+  // existing contraction contract.
+  if (auto text =
+          dyn_cast_or_null<StringAttr>(root->getAttr("llk.numerical_contract")))
+    return text.getValue().str();
+  return std::string();
 }
 
 /// The primitives this export emits for `facts`. The movement and compute core
