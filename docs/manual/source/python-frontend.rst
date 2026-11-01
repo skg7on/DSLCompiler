@@ -204,7 +204,9 @@ quotient/remainder expressions from PF04 flat offsets are accepted when the
 residue bounds prove their affine form. Grid times BLOCK must equal each tensor
 axis; the third grid/BLOCK axes must be singleton. Tails, flattened lane tiles,
 axis permutations, non-affine indexing, loops, casts, activations and relaxed
-numerical policies fail explicitly in this initial importer.
+numerical policies fail explicitly in this elementwise importer. Counted loops
+and activations are accepted only by the contraction family described below,
+which proves its own structural predicates rather than relaxing this one.
 
 The resulting ``ImportedProgram`` owns a verified module with registered
 ``func``, ``arith``, ``tensor`` and ``linalg`` operations. Its source selection
@@ -287,6 +289,58 @@ PF08 the Python launch described below.
 
 See the :source:`PF06 verification record <docs/reviews/2026-10-24-pf06-native-compilation.md>`
 for actual reference/selected lanes and native guard results.
+
+Counted contractions and fused SwiGLU
+-------------------------------------
+
+PF11 (`#222 <https://github.com/skg7on/DSLCompiler/issues/222>`__) recognizes a
+canonical counted-K loop with one or two ``tl.dot`` accumulators and emits
+``llk.matmul`` or ``llk.fused_swiglu``. The tile program is only accepted when it
+is exactly the whole-tensor contraction:
+
+* the launch tiles the output domain exactly, with ``grid * block == shape`` and
+  singleton third axes;
+* the loop starts at zero and traverses exactly the declared ``K`` extent in
+  whole ``BK`` blocks;
+* every load reads the compact row-major tensor it names at
+  ``row = program_id * block + lane`` and ``col = k + lane``;
+* accumulators are explicit loop-carried values, seeded either by a zero tile or
+  by a caller tensor; and
+* the two-projection form reads the *same* left-hand tile, uses two distinct
+  weight tensors, and applies exactly ``silu(gate) * up``.
+
+The frontend's contraction contract is uniform f32 and static. A bf16 captured
+source declines, because every explicit cast is a numerical site the fused f32
+epilogue does not realize. A caller accumulator is preserved for matmul: it
+becomes the public native ``init`` port and is read-only. A zero accumulator has
+no public buffer; the compiler allocates a zeroed init port. Fused SwiGLU reads
+no accumulator, so every public input is caller-owned.
+
+The source family is realized with the static ``pad`` boundary policy on an
+anchor derived from the target machine: the largest divisor tile of ``M x N x K``
+whose whole-operand materialization fits the machine's staging capacity. A shape
+with no feasible tile fails explicitly (``unsupported_frontend_program``) rather
+than allocating a padded copy that exceeds the machine. Layout, memory path and
+owner hierarchy are not source choices; the mapping stage solves them.
+
+``silu``'s ``approximation="exact"`` maps to ``#llk.math_mode<strict>`` and
+``"native"`` to ``#llk.math_mode<bounded_fast>``. The policy is part of the
+source contract, the Micro-IR fact (``micro.numerical_contract``) and the cache
+identity, so a relaxed activation is a different program.
+
+Patterns outside the family fail by name: a second writer, a different
+left-hand tile per projection, a reduction extent that is not ``K``, a
+non-shared left operand, or any explicit intermediate cast
+(``unsupported_numerical_contract``).
+
+.. code-block:: sh
+
+   cmake --build build --target LLKFrontendTests
+   build/bin/LLKFrontendTests --gtest_filter='FrontendContractions.*'
+   LLK_FRONTEND_LIBRARY=build/lib/libLLKFrontendCAPI.dylib \
+       python -m pytest test/python/test_frontend_contractions.py -q
+
+See the :source:`PF11 verification record <docs/reviews/2026-11-01-pf11-python-frontend-contractions.md>`.
 
 Native decorator execution
 --------------------------

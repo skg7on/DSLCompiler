@@ -18,7 +18,7 @@
 from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
 at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
 PF04's checked steps record branch implementation and verification in the
-[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09 implements the bounded full-identity specialization cache, strong leases and real-artifact inspection; see the [PF09 evidence](../../reviews/2026-11-01-pf09-python-specialization-cache.md). PF10 implements proved bounded elementwise tails with static edge rectangles; see the [PF10 evidence](../../reviews/2026-11-01-pf10-python-frontend-tails.md). PF11–PF20 remain proposed and unchecked. Paths in those later tasks describe
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09 implements the bounded full-identity specialization cache, strong leases and real-artifact inspection; see the [PF09 evidence](../../reviews/2026-11-01-pf09-python-specialization-cache.md). PF10 implements proved bounded elementwise tails with static edge rectangles; see the [PF10 evidence](../../reviews/2026-11-01-pf10-python-frontend-tails.md). PF11 implements counted-contraction recovery and the uniform-f32 fused SwiGLU contract; see the [PF11 evidence](../../reviews/2026-11-01-pf11-python-frontend-contractions.md). PF12–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -334,7 +334,7 @@ assert suffix_guard_after == suffix_guard_before
 
 **Interfaces:** Accept canonical counted K loops with one/two dot accumulators, explicit initial values and numerical contract. Produce LLK matmul or fused SwiGLU only when all shape, access, shared-input and effect predicates hold. Nonzero accumulators and every intermediate cast remain explicit; reject if the chosen native adapter cannot preserve them. Initial automatic SwiGLU fusion is f32-only and requires a native activation/reduction capability matching the source; bf16 Torch intermediate-rounding patterns decline the rewrite or raise in strict LLK. Explicit relaxed decorator semantics use a different NumericalContract and cache key.
 
-- [ ] First pin the current BF16-only SwiGLU verifier failure on uniform f32 inputs/results, retain BF16 behavior and reject mixed types. Add f32 matmul cases M,N,K=(32,64,16) and (7,9,5), a nonzero accumulator negative/positive case according to the adapter contract, and SwiGLU with shared X. Negative cases: different X, additional users/stores, wrong reduction extent, ignored `acc=` keyword, unsupported math mode. Add bf16 Torch fixtures whose rounded mm/SiLU intermediates differ from the current f32 fused epilogue; assert rewrite rejection rather than accepting a loose allclose. Add strict-versus-relaxed activation and explicit-cast tests. Pin f32 tolerance `rtol=1e-4, atol=1e-5`; bf16-input/f32-accumulation tolerance `rtol=2e-2, atol=2e-2` only in a certified lane.
+- [x] First pin the current BF16-only SwiGLU verifier failure on uniform f32 inputs/results, retain BF16 behavior and reject mixed types. Add f32 matmul cases M,N,K=(32,64,16) and (7,9,5), a nonzero accumulator negative/positive case according to the adapter contract, and SwiGLU with shared X. Negative cases: different X, additional users/stores, wrong reduction extent, ignored `acc=` keyword, unsupported math mode. Add bf16 Torch fixtures whose rounded mm/SiLU intermediates differ from the current f32 fused epilogue; assert rewrite rejection rather than accepting a loose allclose. Add strict-versus-relaxed activation and explicit-cast tests. Pin f32 tolerance `rtol=1e-4, atol=1e-5`; bf16-input/f32-accumulation tolerance `rtol=2e-2, atol=2e-2` only in a certified lane.
 
 Pinned regression assertions (local test fixture names):
 
@@ -343,10 +343,25 @@ torch.testing.assert_close(result, reference, rtol=1e-4, atol=1e-5)
 assert bf16_intermediate_rounding_rewrite.accepted is False
 ```
 
-- [ ] Run contraction GTests and `python -m pytest test/python/test_frontend_contractions.py -q`; verify missing loop/accumulator behavior fails.
-- [ ] Extend the native SwiGLU type/verifier and lowering contract to uniform f32 operands/results while preserving BF16 semantics; keep automatic f32 fusion disabled until its native tests pass. Implement explicit loop-carried SSA, accumulator initialization and typed dot validation, then structured kernel recovery/fusion. Preserve reduction/numerical semantics and explicit cast sites; implement a matching strict-f32 activation/native epilogue if missing, and otherwise reject that selected target. Test tolerances do not grant permission to erase casts or reassociate a source that forbids it. Constrain source tile choices through the existing contraction source adapter and receipts. Reject patterns outside the declared family.
-- [ ] Rerun numerical/negative tests and compare frontend-derived MicroIR contract/plan evidence with directly authored native fixtures. Exercise NaN/Inf and activation numerical-policy boundaries.
-- [ ] Commit `feat: lower captured contractions and verified SwiGLU patterns`.
+Delivered: the pinned numerics are exercised with the compiler-free FFI lane, so
+this milestone does not import Torch (that belongs to PF13). The equivalent
+checks are `test/frontend_contractions.py`'s `F32_TOLERANCE = {"rel": 1e-4,
+"abs": 1e-5}` and `test_a_rounded_intermediate_is_declined_not_approximated`,
+which records the bf16 intermediate-rounding pattern as a *rejected* capture
+(`unsupported_numerical_contract`) rather than an approximate match. A bf16 Torch
+fixture is deferred with the Torch composition milestone.
+
+- [x] Run contraction GTests and `python -m pytest test/python/test_frontend_contractions.py -q`; verify missing loop/accumulator behavior fails. See the [PF11 evidence](../../reviews/2026-11-01-pf11-python-frontend-contractions.md).
+- [x] Extend the native SwiGLU type/verifier and lowering contract to uniform f32 operands/results while preserving BF16 semantics; keep automatic f32 fusion disabled until its native tests pass. Implement explicit loop-carried SSA, accumulator initialization and typed dot validation, then structured kernel recovery/fusion. Preserve reduction/numerical semantics and explicit cast sites; implement a matching strict-f32 activation/native epilogue if missing, and otherwise reject that selected target. Test tolerances do not grant permission to erase casts or reassociate a source that forbids it. Constrain source tile choices through the existing contraction source adapter and receipts. Reject patterns outside the declared family.
+- [x] Rerun numerical/negative tests and compare frontend-derived MicroIR contract/plan evidence with directly authored native fixtures. Exercise NaN/Inf and activation numerical-policy boundaries.
+- [x] Commit `feat: lower captured contractions and verified SwiGLU patterns`.
+
+Delivered envelope, stated as limitations rather than assumed support:
+
+- Uniform f32 storage only in the frontend. The bf16 `llk.fused_swiglu` contract is preserved and tested, but a captured bf16 source declines: every explicit cast is a numerical site the fused f32 epilogue does not realize.
+- Static extents only, and only shapes whose anchored `pad` schedule fits the machine's staging capacity. The anchor is the largest divisor tile of `M x N x K` that fits; a shape with no feasible tile fails explicitly with `unsupported_frontend_program` instead of allocating a padded copy that exceeds the machine.
+- A caller accumulator is preserved for matmul (it becomes the public native `init` port and is read-only); fused SwiGLU requires zero accumulators.
+- The recovered family is one counted loop, one output store, and either one dot or two dots sharing the identical left-hand tile with the epilogue exactly `silu(gate) * up`.
 
 ## Milestone C — Torch capture and actual Inductor composition
 
