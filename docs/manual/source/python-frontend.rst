@@ -30,6 +30,18 @@ it in ``BackendCompilerFailed.inner_exception``. The backend never returns
 ``dynamic=False`` when a changed shape must produce a new concrete
 compilation. See the
 :source:`PF13 verification record <docs/reviews/2026-11-01-pf13-python-dynamo.md>`.
+
+PF14 (`#225 <https://github.com/skg7on/DSLCompiler/issues/225>`__) registers
+``llk::add``, ``llk::mul``, ``llk::matmul`` and ``llk::swiglu`` as functional
+CPU custom operators over the same request builder and bounded specialization
+cache. Their real kernels use the checked Torch buffer adapter and allocate
+fresh outputs; their fake kernels are metadata-only and never read a data
+pointer, compile a request or enter the native runtime. Unsupported views,
+subclasses, dtypes and ``requires_grad`` inputs fail explicitly, while a
+foreign owner of the ``llk`` operator namespace is reported instead of replaced.
+``torch.library.opcheck`` schema/fake checks and direct native numerical tests
+cover all four operators. See the
+:source:`PF14 verification record <docs/reviews/2026-11-01-pf14-python-ops.md>`.
 Inductor composition, training and genuine upstream Triton launches are not
 implemented. Registration alone does not establish model execution.
 
@@ -646,6 +658,9 @@ Run focused tests
    LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.dylib" \
      "$LLK_PYTHON" -m pytest test/python/test_dynamo_backend.py \
      test/python/test_fx_importer.py -q
+   LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.dylib" \
+     "$LLK_PYTHON" -m pytest test/python/test_torch_ops.py \
+     test/python/test_fake_tensor_contract.py -q
 
 The root :source:`pytest.ini <pytest.ini>` restricts default collection to
 ``test/python`` and adds the local ``python/`` source path. This avoids collecting
@@ -657,8 +672,10 @@ Torch-absent virtual environment outside the checkout. Real-Torch subprocesses
 test registration/reload identity, zero Dynamo resets, existing-owner protection,
 broken optional-dependency propagation and the missing-library diagnostic. The
 PF13 suites execute real ``torch.compile`` graphs when the CAPI library is
-loaded and count every native invocation. Missing test/build dependencies are
-setup failures, not successful or skipped coverage.
+loaded and count every native invocation. The PF14 suites run
+``torch.library.opcheck`` schema/fake checks and direct native operator calls,
+and spy on ``data_ptr``/compilation during FakeTensor execution. Missing
+test/build dependencies are setup failures, not successful or skipped coverage.
 
 These Python checks are separate from the compiler's ``check-llk`` target.
 C++ frontend tests are registered with CTest; required combined Python/native
@@ -679,7 +696,9 @@ After installing the package into the chosen environment:
 ``get_backend()`` returns the exact registered callable. Repeated registration
 and module reload preserve it without clearing Dynamo's global state. A foreign
 owner of the ``llk`` backend name is preserved and produces
-``backend_registration_conflict``. ``capabilities()`` remains the
+``backend_registration_conflict``. Importing ``llk.torch`` also exposes the
+checked functional operators as ``torch.ops.llk.add``, ``mul``, ``matmul`` and
+``swiglu``. ``capabilities()`` remains the
 compiler-free package report; it does not probe the native library, so it is
 not execution evidence either way. A decorated call with a loaded CAPI library
 compiles and invokes native code as described above, and the strict Dynamo
