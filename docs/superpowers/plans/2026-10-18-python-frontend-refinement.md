@@ -18,7 +18,7 @@
 from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
 at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
 PF04's checked steps record branch implementation and verification in the
-[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09 implements the bounded full-identity specialization cache, strong leases and real-artifact inspection; see the [PF09 evidence](../../reviews/2026-11-01-pf09-python-specialization-cache.md). PF10 implements proved bounded elementwise tails with static edge rectangles; see the [PF10 evidence](../../reviews/2026-11-01-pf10-python-frontend-tails.md). PF11 implements counted-contraction recovery and the uniform-f32 fused SwiGLU contract; see the [PF11 evidence](../../reviews/2026-11-01-pf11-python-frontend-contractions.md). PF12 exposes the shared frontend service through the compiler CLI's explicit `frontend-json` input mode; see the [PF12 evidence](../../reviews/2026-11-01-pf12-frontend-cli.md). PF13 compiles supported normalized ATen graphs through the native frontend in the strict Dynamo backend; see the [PF13 evidence](../../reviews/2026-11-01-pf13-python-dynamo.md). PF14–PF20 remain proposed and unchecked. Paths in those later tasks describe
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09 implements the bounded full-identity specialization cache, strong leases and real-artifact inspection; see the [PF09 evidence](../../reviews/2026-11-01-pf09-python-specialization-cache.md). PF10 implements proved bounded elementwise tails with static edge rectangles; see the [PF10 evidence](../../reviews/2026-11-01-pf10-python-frontend-tails.md). PF11 implements counted-contraction recovery and the uniform-f32 fused SwiGLU contract; see the [PF11 evidence](../../reviews/2026-11-01-pf11-python-frontend-contractions.md). PF12 exposes the shared frontend service through the compiler CLI's explicit `frontend-json` input mode; see the [PF12 evidence](../../reviews/2026-11-01-pf12-frontend-cli.md). PF13 compiles supported normalized ATen graphs through the native frontend in the strict Dynamo backend; see the [PF13 evidence](../../reviews/2026-11-01-pf13-python-dynamo.md). PF14 registers checked functional add/multiply/matmul/SwiGLU Torch operators with truthful fake metadata; see the [PF14 evidence](../../reviews/2026-11-01-pf14-python-ops.md). PF15–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -413,7 +413,7 @@ assert unsupported_fx_error.node_name == "sin"
 
 **Interfaces:** Register `llk::add(Tensor a, Tensor b) -> Tensor`, `llk::mul`, `llk::matmul`, `llk::swiglu(Tensor x, Tensor wg, Tensor wu) -> Tensor` with `mutates_args=()`. CPU implementations call the shared request/cache; fake implementations construct shape/dtype/device-correct fresh outputs without reading storage.
 
-- [ ] Run opcheck-schema/fake tests with representative static shapes, transposed/offset tensors and requires_grad policy. Spy on data_ptr/native functions during FakeTensor execution and assert zero calls. Assert real output allocation has no forbidden alias and matches the declared metadata.
+- [x] Run opcheck-schema/fake tests with representative static shapes, transposed/offset tensors and requires_grad policy. Spy on data_ptr/native functions during FakeTensor execution and assert zero calls. Assert real output allocation has no forbidden alias and matches the declared metadata.
 
 Pinned regression assertions (local test fixture names):
 
@@ -422,10 +422,10 @@ assert fake_data_ptr_spy.call_count == 0
 assert fake_native_compile_spy.call_count == 0
 ```
 
-- [ ] Run `python -m pytest test/python/test_torch_ops.py test/python/test_fake_tensor_contract.py -q`; verify missing schemas/fake implementations fail.
-- [ ] Register custom ops and fake implementations using Torch 2.9 APIs, with idempotent ownership and version checks. Use the same native buffer validation as the decorator; unsupported views/subclasses fail instead of copying silently.
-- [ ] Rerun `torch.library.opcheck` and direct numerical tests for all four operators; preserve explicit inference-only guards until training formulas land.
-- [ ] Commit `feat: register checked LLK external operators for PyTorch`.
+- [x] Run `python -m pytest test/python/test_torch_ops.py test/python/test_fake_tensor_contract.py -q`; verify missing schemas/fake implementations fail.
+- [x] Register custom ops and fake implementations using Torch 2.9 APIs, with idempotent ownership and version checks. Use the same native buffer validation as the decorator; unsupported views/subclasses fail instead of copying silently.
+- [x] Rerun `torch.library.opcheck` and direct numerical tests for all four operators; preserve explicit inference-only guards until training formulas land.
+- [x] Commit `feat: register checked LLK external operators for PyTorch`.
 
 ### PF15: Extend Inductor through scoped LLK external-kernel partitioning
 

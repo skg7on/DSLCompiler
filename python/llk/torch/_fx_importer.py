@@ -691,13 +691,18 @@ def _contraction_body(b: _Builder, pattern: _Pattern) -> None:
     )
 
 
-def _build_request(
-    graph: GraphModule,
+def _build_program(
     pattern: _Pattern,
-    index: int,
-    placeholder_index,
+    *,
+    entry: str,
+    source: str,
     options: CompileOptions,
-) -> ImportedFXOutput:
+) -> CompileRequest:
+    """Build the shared tile program for one recognized operator shape.
+
+    The decorator, Dynamo and custom-op routes all reach the native service
+    through this builder so their tile programs cannot drift apart.
+    """
     b = _Builder()
     if pattern.kind == "elementwise":
         _elementwise_body(b, pattern)
@@ -744,22 +749,112 @@ def _build_request(
         }
     b.emit("return")
     program = FrontendProgram(
-        entry=f"torch_output_{index}",
+        entry=entry,
         tensors=specs,
         constexprs=constexprs,
         launch=launch,
         operations=tuple(b.operations),
         numerical_contract=pattern.contract,
-        source=graph.code or "",
+        source=source,
     )
     compile_options = dataclasses.replace(
         options, numerical_contract=pattern.contract
     )
+    return CompileRequest(program, compile_options)
+
+
+def _build_request(
+    graph: GraphModule,
+    pattern: _Pattern,
+    index: int,
+    placeholder_index,
+    options: CompileOptions,
+) -> ImportedFXOutput:
     return ImportedFXOutput(
-        request=CompileRequest(program, compile_options),
+        request=_build_program(
+            pattern,
+            entry=f"torch_output_{index}",
+            source=graph.code or "",
+            options=options,
+        ),
         input_indices=tuple(placeholder_index(node) for node in pattern.input_nodes),
         output_shape=pattern.output_shape,
         device="cpu",
+    )
+
+
+def _op_pattern(kind: str, input_shapes) -> _Pattern:
+    """Validate one functional operator's extents and build its pattern."""
+
+    def fail(message):
+        raise TensorContractError(message, code="invalid_frontend_argument")
+
+    shapes = tuple(tuple(int(size) for size in shape) for shape in input_shapes)
+    if any(len(shape) != 2 or any(size < 1 for size in shape) for shape in shapes):
+        fail("LLK operators require positive rank-two input extents")
+    if kind in ("add", "mul"):
+        if len(shapes) != 2:
+            fail(f"llk::{kind} requires two tensor operands")
+        left, right = shapes
+        if left != right:
+            fail(f"llk::{kind} requires operands with one extent")
+        return _Pattern(
+            kind="elementwise",
+            input_nodes=(),
+            input_shapes=(left, right),
+            output_shape=left,
+            contract=DEFAULT_CONTRACT,
+            multiply=kind == "mul",
+        )
+    if kind == "matmul":
+        if len(shapes) != 2:
+            fail("llk::matmul requires two tensor operands")
+        left, right = shapes
+        if left[1] != right[0]:
+            fail("llk::matmul contraction extents must agree")
+        return _Pattern(
+            kind="matmul",
+            input_nodes=(),
+            input_shapes=(left, right),
+            output_shape=(left[0], right[1]),
+            contract=DEFAULT_CONTRACT,
+            reduction=left[1],
+        )
+    if kind == "swiglu":
+        if len(shapes) != 3:
+            fail("llk::swiglu requires x, wg and wu tensors")
+        x, gate, up = shapes
+        if x[1] != gate[0] or x[1] != up[0]:
+            fail("llk::swiglu contraction extents must agree")
+        if gate != up:
+            fail("llk::swiglu gate and up projections must have one extent")
+        return _Pattern(
+            kind="swiglu",
+            input_nodes=(),
+            input_shapes=(x, gate, up),
+            output_shape=(x[0], gate[1]),
+            contract=SWIGLU_CONTRACT,
+            reduction=x[1],
+        )
+    fail(f"unsupported LLK operator kind {kind!r}")
+
+
+def op_output_shape(kind: str, input_shapes) -> tuple[int, int]:
+    """Return the declared output extent for one functional operator."""
+    return _op_pattern(kind, input_shapes).output_shape
+
+
+def op_request(
+    kind: str, input_shapes, options: CompileOptions
+) -> CompileRequest:
+    """Build one supported functional operator's native request."""
+    if not isinstance(options, CompileOptions):
+        raise TypeError("op_request requires CompileOptions")
+    return _build_program(
+        _op_pattern(kind, input_shapes),
+        entry=f"llk_{kind}",
+        source=f"torch.ops.llk.{kind}",
+        options=options,
     )
 
 
