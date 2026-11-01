@@ -9,11 +9,11 @@ diagnostics. It does not execute the kernel, produce tensors, check numerical
 accuracy, or measure the host CPU. Use it to compare explicit Micro schedules
 under the same model and to inspect assumptions before attempting execution.
 
-This manual includes PR #133 and the concrete-sample dynamic analysis added by
-#191/#198. Complete-plan selection and materialized
+Concrete-sample dynamic analysis specializes symbolic kernels for explicit
+observations. Complete-plan selection and materialized
 analysis share normalized events/resources, per-engine DMA capacity and storage
 lifetimes. The :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
-records static parity controls. Measurements and calibration (#51/#52) remain
+records static parity controls. Measurements and calibration remain
 separate from the simulator.
 
 .. _tools-performance-first-report:
@@ -291,7 +291,7 @@ the profile schema and a runnable CLI smoke test.
 Current limits and contributor entry points
 -------------------------------------------
 
-Do not use these predictions as calibrated hardware measurements. PR #133 verifies selected-resource identity, per-hop storage, per-engine occupancy
+Do not use these predictions as calibrated hardware measurements. Acceptance tests verify selected-resource identity, per-hop storage, per-engine occupancy
 and static planner/perf parity for the supported acceptance chains. Preserve the
 exact machine and plan identity when comparing reports.
 Selected AVX2 width and layout metadata is not by itself evidence of selected

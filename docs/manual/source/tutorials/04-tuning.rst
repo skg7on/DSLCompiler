@@ -100,7 +100,7 @@ The :doc:`tuner manual </tools/tuning>` covers the legacy grid, supported option
 6. Tune and replay the original source
 --------------------------------------
 
-Use the small source-plus-space fixture validated by PR #133:
+Use the small source-plus-space validation fixture:
 
 .. code-block:: bash
 

@@ -10,18 +10,11 @@ declarative target mapping and performance exploration. The established CPU comp
 available while the newer mapped path is being strengthened. Use this page to
 choose a workflow and understand what a successful run proves.
 
-This summary reflects merged PR #133 (2026-10-11, merge ``5ee61b1``), the
-generic framework increments A–D, the bounded Arm SVE/SME static mapping
-increment E1–E7, the E10 executable f32 SVE subset, and the dynamic shape series
-(#191, PRs #260–#265, #270 and #271). See :doc:`dynamic-shapes` for the runtime
-M/N/K, ABI v2, analysis and replay contracts. The revision-pinned
-:source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
-records capability-based acceptance, exact test counts and retained limits.
-The :source:`Arm static acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`
-records the target-specific evidence and its exact accepted domain. The
-:source:`PR #133 acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
-records the earlier resource/runtime/tuner repairs. The October 7 gap assessment
-is historical.
+The summary follows the current source, runtime contracts and registered
+validation fixtures. :doc:`dynamic-shapes` explains runtime M/N/K, bounded tiles,
+ABI v2, sampled analysis and replay. :doc:`python-frontend` explains typed capture,
+checked static elementwise/contraction import, native launch and cache ownership. These paths
+share mapping and lowering, but expose different shape and operation envelopes.
 
 .. _features-what-you-can-do-today:
 
@@ -89,7 +82,7 @@ What you can do today
      - The tuner also retains its sampled plan report in variant identity, so cross-profile cache reuse is not guaranteed. Guarded specialization is validated data only and tuning selects the baseline
      - :doc:`Dynamic shapes </dynamic-shapes>`, :doc:`Tuner </tools/tuning>`
    * - Search a non-contraction source
-     - Versioned workload contract, source adapter registry, bounded rank-two f32 elementwise add/multiply with tiled spatial schedules
+     - Versioned workload contract, source adapter registry, bounded rank-two f32 elementwise add/multiply with tiled spatial schedules and importer-proved static masked edges
      - The bounded elementwise adapter is the first delivered non-contraction family; arbitrary Linalg import, broadcasting, reductions, dynamic shapes and approximation modes are rejected
      - :doc:`Tuner </tools/tuning>`, :doc:`Compiler </tools/compiler>`
    * - Report stage-specific capabilities
@@ -112,9 +105,9 @@ What you can do today
      - ``llk-bench`` runs a synthetic host loop and reports timing
      - It does not parse MLIR, load weights, invoke a compiled kernel or use the JIT; thread-pool setup occurs per invocation
      - :doc:`Benchmark </tools/benchmark>`
-   * - Install and inspect the Python frontend
-     - ``llk-compiler`` packaging, optional Torch imports, stable Dynamo registration, structured errors and explicit capability reporting (PF01)
-     - Backend calls report ``native_backend_unavailable``; native Python JIT, Inductor and upstream Triton execution remain later milestones
+   * - Capture and execute Python kernels
+     - Typed AST capture, checked schema-v1 import, shared native compilation and synchronous ``@llk.jit`` launches; positive static rank-two f32 add/multiply with proved masked edges and canonical counted matmul/SwiGLU with exact coverage; caller-owned buffers, bounded specialization cache, leases and IR inspection
+     - Requires ``LLKFrontendCAPI`` and target configuration. Python signatures remain static ABI v1; capture alone does not establish executable support. Dynamo calls report ``native_backend_unavailable``; model/Inductor/training/upstream Triton execution is not implemented
      - :doc:`Python frontend </python-frontend>`
    * - Explore a second target
      - Generic accelerator topology, layouts, rules and mapping through the same canonical IR; static f32 add/mul/sum coverage with operation-aware validation
@@ -240,34 +233,32 @@ conformance review records these checks and the library link boundary.
 Work planned separately
 -----------------------
 
-PR #133 completes the #129 resource, runtime, mapped tuning and acceptance
-repair series within the supported bounded contract. Phase D adds opt-in verified
-measurement persistence and exact reuse, plus held-out prediction-error reports;
-see :doc:`tools/tuning` and :doc:`tools/validation`. Calibration fitting and
-independently measured event attribution remain separate work.
-The generic accelerator package has static topology, movement and f32
-add/mul/sum conformance, not hardware execution. A direct MicroIR emulator and a
-broad Python/model execution frontend remain deferred. PF01's Python package and
-registration foundation is available separately; see :doc:`python-frontend` for
-its tested environment and explicit execution boundary.
+Verified measurement persistence, exact reuse and held-out prediction-error
+reports are available through :doc:`tools/tuning` and :doc:`tools/validation`.
+Calibration fitting and independently measured event attribution remain separate
+work. Model cycles and whole-kernel timings are different observations.
 
-Selected AVX2 acceptance for PR #133 passed 13/13 without required skips. The
-current framework review records the later increments and their exact local and
-CI counts; required selected execution remains a Linux ``x86_64`` AVX2 gate.
-Legacy JIT skips do not establish numerical legacy execution and are not host
-AVX2 capability skips. See the
+The generic accelerator package provides static topology, movement and f32
+add/mul/sum conformance. A direct MicroIR emulator and a general model frontend
+remain outside current support. The Python decorator path executes its bounded
+static elementwise/contraction subsets; Dynamo, Inductor, training, upstream Triton and symbolic
+Python invocation require further integration. Native dynamic contractions do not
+extend the Python importer automatically.
+
+Selected-target execution requires a compatible host and zero reference fallback.
+Static mappings, portable numerical tests and unavailable-host diagnostics each
+establish narrower facts. See the
 :source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
-for current evidence and the older
-:source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>` for the
-#133 diagnostics and revision.
+and target-specific tests for exact validation domains; do not treat a historical
+test count as an inventory of the current implementation.
 
 .. _features-reading-status-evidence:
 
 Reading status evidence
 -----------------------
 
-Historical milestone documents record substantial delivered work, but a merged
-component or passing portable numerical test does not settle every end-to-end
+Design documents explain intended contracts, but a component or passing
+portable numerical test does not settle every end-to-end
 contract. In particular:
 
 * Parsing proves the representation can be read; target verification resolves

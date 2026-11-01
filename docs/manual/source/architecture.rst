@@ -50,6 +50,16 @@ LLK-to-Linalg conversion; ``llk.matmul`` is left untouched by that pass and uses
 Micro export plus mapped compilation. RoPE and attention use the established
 CPU path and are not current ``LLKToMicro`` export roots.
 
+The :doc:`Python frontend <python-frontend>` is another input to the mapped
+framework. Typed AST capture freezes a schema-v1 request; the native importer
+proves rectangular f32 add/multiply or canonical counted contraction coverage.
+It emits structured Linalg for ``linalg-elementwise-v1`` or LLK matmul/SwiGLU for
+``llk-contraction-v1``. Elementwise source blocks and proved static edges, or a
+machine-derived static contraction anchor, feed shared search and compilation. A versioned C API
+returns an owned executable handle; Python checks providers and invokes it
+synchronously. Capture, import, compilation and invocation have distinct support
+boundaries. Dynamo registration does not yet compile model graphs.
+
 Target-aware search instantiates the original source, maps and analyzes candidates,
 and saves selected-plan artifacts for replay. The source supplies a versioned
 workload contract through a registered adapter; contraction keeps its explicit
@@ -106,6 +116,14 @@ capacities remain fixed; bounded movement and exact K tails preserve semantics.
 Dynamic analysis/ranking binds explicit samples on clones while the reusable
 artifact keeps its symbolic contract.
 
+Python ``TensorSpec`` records remain positive and static, using ABI v1. Their
+per-kernel LRU keys include concrete tensor metadata, constexprs, launch, frozen
+configuration and loaded native-library identity. This specialization cache is
+separate from symbolic compiled-variant identity: rounded Python edge tiles do
+not imply shape-polymorphic invocation. Native dynamic contractions and Python
+static elementwise/contraction programs share mapping/lowering infrastructure while exposing
+different source and runtime contracts.
+
 Conformance is reported per compiler stage. ``CapabilityReceipt`` records
 structure, interpretation, mapping, physical plan, reference lowering, selected
 lowering, ABI eligibility, preparation, host compatibility and invocation as
@@ -154,6 +172,12 @@ Components and ownership
    * - Workload contracts and source adapters
      - Rank-neutral port/axis contract, adapter registry, contraction compatibility wrapper, bounded elementwise family and binding receipts
      - :source:`WorkloadContract.h <include/LLK/Conversion/Workload/WorkloadContract.h>`, :source:`SourceAdapter.h <include/LLK/Conversion/Workload/SourceAdapter.h>`, :source:`implementation <lib/Conversion/Workload>`
+   * - Shape contracts
+     - Rank-neutral symbolic dimensions and semantic guards; runtime binding independent of sampled performance observations
+     - :source:`ShapeContract.h <include/LLK/Shape/ShapeContract.h>`, :source:`shape implementation <lib/Shape>`
+   * - Python frontend and C API
+     - Typed capture, checked structured import, shared native compilation, owned handles and synchronous buffer bridge
+     - :source:`Python package <python/llk>`, :source:`native service <lib/Frontend>`, :source:`native interfaces <include/LLK/Frontend>`
    * - CPU transforms
      - Scheduling, tiling, fusion, vectorization, packing and dispatch
      - :source:`transforms <lib/Transforms>`, :source:`schedule loader <lib/Transforms/Common/ScheduleLoader.cpp>`
@@ -270,10 +294,9 @@ The shipped packages are :source:`x86-avx2 <mapping/x86-avx2>`,
 :source:`arm-sve <mapping/arm-sve>` and :source:`arm-sme <mapping/arm-sme>`, with
 corresponding :source:`machine profiles <machines>`. The generic accelerator
 demonstrates mapping onto an accelerator-shaped topology. The Arm packages are
-static mapping and analysis targets at modeled VL=SVL=512, plus an executable
-``arm-sve`` f32 add/multiply subset that has an emulated (not native) acceptance
-path; SME, ZA, other signatures and timing remain non-executable, and none of
-these three packages supplies native hardware execution. The
+static mapping and analysis targets at modeled VL=SVL=512, with bounded
+executable subsets described in :doc:`features`. Static target coverage does not
+establish dynamic contraction execution or calibrated timing. The
 :source:`Arm acceptance ledger <docs/reviews/arm-mapping-targets-acceptance.md>`
 records their exact static domain and limits.
 See the :source:`formal LLKMap syntax <docs/design/llkmap-syntax.md>` and its
@@ -322,9 +345,8 @@ backend provides portable correctness. Both use checked invocation and per-call
 scratch ownership. Backend conversion registers MLIR dialect interfaces and uses
 the unified LLVM conversion pipeline after structural/vector lowering.
 
-The :source:`PR #133 acceptance matrix <docs/reviews/issue67-final-acceptance.md>`
-records selected x86_64 AVX2 execution, static parity and retained legacy skips.
-Phase D adds opt-in verified whole-kernel records and exact reuse through
+Selected x86_64 AVX2 execution, static parity and retained legacy limits are
+validated separately. Opt-in verified whole-kernel records and exact reuse use
 :doc:`tools/tuning`, with held-out prediction-error reports through
 :doc:`tools/validation`. These reports retain the uncalibrated static model;
 model fitting and independently measured event attribution remain separate work.

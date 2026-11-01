@@ -283,7 +283,7 @@ Mapped lowering reports verified selected groups, backend realization and refere
 lowering separately. ``--mapping-backend=reference`` provides portable correctness;
 ``--mapping-backend=selected-target`` preserves selected vector widths/fused groups,
 checks x86_64 AVX2 compatibility and rejects reference fallback. Dispatch counts
-alone do not prove numerical execution. PR #133's selected numerical gate and
+alone do not prove numerical execution. The selected numerical tests and
 exact LLVM/plan artifacts are recorded in the
 :source:`acceptance matrix <docs/reviews/issue67-final-acceptance.md>`.
 
