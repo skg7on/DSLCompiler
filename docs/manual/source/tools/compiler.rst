@@ -3,7 +3,7 @@
 ``llk-compile``: export and compile kernels
 ===========================================
 
-``llk-compile`` reads an MLIR module and either exports MicroIR, runs the legacy CPU lowering pipeline, or maps a concrete Micro kernel through a registered target package. It is a compilation and inspection driver: successful JIT compilation does **not** invoke the kernel or check its numerical result.
+``llk-compile`` reads an MLIR module or a canonical frontend request and either exports MicroIR, runs the legacy CPU lowering pipeline, or maps a concrete Micro kernel through a registered target package. It is a compilation and inspection driver: successful JIT compilation does **not** invoke the kernel or check its numerical result.
 
 Start with the :doc:`first-kernel tutorial </tutorials/01-first-kernel>` and :doc:`mapping tutorial </tutorials/02-mapping>`. All commands below run from the repository root after the :doc:`build instructions </getting-started>`; ``build/`` is the chosen build directory. See the :doc:`documentation index </index>` for the other tools.
 
@@ -76,6 +76,37 @@ Without ``--mapping-target``, ``--emit`` chooses the path:
 
 ``--emit=llvm`` does not print LLVM assembly, emit an object file, or save a standalone executable; use ``--emit=object`` for an AOT object. ``--emit=mlir`` means the fully lowered MLIR module, not an intermediate Linalg or Vector stage. Use :doc:`llk-opt </tools/optimizer>` to inspect those intermediate stages.
 
+.. _tools-compiler-frontend-json:
+
+Frontend requests
+-----------------
+
+``--input-format=frontend-json`` compiles a complete canonical ``CompileRequest``
+through the same native frontend service the Python package and the C API use.
+The request is self-contained: it names its target, backend, search policy and
+frozen configuration files, so it is not combined with ``--emit``,
+``--mapping-*`` or AOT flags. Supplying one of those options explicitly fails
+with ``conflicting_compile_options`` instead of silently overriding the request.
+
+.. code-block:: sh
+
+   build/bin/llk-compile --input-format=frontend-json request.json
+   build/bin/llk-compile --input-format=frontend-json --inspect=micro request.json
+
+The default output is the service's compilation report JSON. ``--inspect``
+prints one registered inspection stage (``frontend``, ``llk`` or ``micro``)
+instead; an unavailable stage fails with ``inspection_unavailable``. Malformed
+JSON, an unsupported schema version and an unknown opcode fail with
+``invalid_frontend_schema``. The report and inspections are byte-identical to
+the C API's for the same request, so identity-bearing fields (workload, target,
+plan and ABI) can be compared across entry paths.
+
+Legacy ``tt.*`` fixtures are an explicitly experimental ``llk-opt`` flow.
+``llk-compile`` rejects them with ``unsupported_input`` and points at
+``llk-opt --allow-unregistered-dialect`` plus the ``--triton-*`` passes, or at a
+canonical frontend request. There is no unregistered-dialect escape hatch in the
+production compiler.
+
 .. _tools-compiler-driver-options:
 
 Driver options
@@ -88,6 +119,12 @@ Driver options
    * - Option
      - Default
      - Meaning
+   * - ``--input-format=mlir\|frontend-json``
+     - ``mlir``
+     - Select an MLIR module or a canonical frontend request. A frontend request is compiled by the shared native service and carries its own compile options.
+   * - ``--inspect=frontend\|llk\|micro``
+     - Empty
+     - With ``--input-format=frontend-json``, print the named inspection stage instead of the compile report. Unavailable stages fail with ``inspection_unavailable``.
    * - ``--emit=llvm\|mlir\|micro\|micro-search\|object``
      - ``llvm``
      - Select the non-mapped path described above, or AOT object emission with ``object``.

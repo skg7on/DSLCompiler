@@ -40,7 +40,7 @@ target_link_libraries(llk-compile PRIVATE LLKBuildOptions
     LLKTargetMapping
     LLKMapping
     LLKRuntime
-    TritonToLLKPasses
+    LLKFrontend
     LLK::MLIR
 )
 
