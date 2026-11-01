@@ -16,11 +16,22 @@ in-bounds mask. Contractions have their own exact-coverage and numerical grammar
 synchronous through ``LLKFrontendCAPI`` over caller-owned buffers. The native
 library and target configuration must be supplied alongside the Python package.
 
-Dynamo registration is a separate integration. The registered ``llk`` backend
-raises ``UnsupportedFeatureError(code="native_backend_unavailable")``; real
-``torch.compile`` wraps it in ``BackendCompilerFailed.inner_exception``.
+Dynamo registration is a separate integration. PF13
+(`#224 <https://github.com/skg7on/DSLCompiler/issues/224>`__) makes
+``backend="llk"`` a strict compiling backend: real
+``torch.compile(backend="llk", fullgraph=True)`` graphs are normalized through
+AOTAutograd and the recognized ATen subset — elementwise add/multiply, ``mm``
+and fused ``silu(x @ wg) * (x @ wu)`` — is imported into the shared frontend
+and executed through the native service with fresh outputs. Any other FX node
+raises ``UnsupportedFXError`` with its ``node_name``; ``torch.compile`` wraps
+it in ``BackendCompilerFailed.inner_exception``. The backend never returns
+``gm.forward``. A missing native library still reports
+``native_backend_unavailable``. First-release specialization is concrete: pass
+``dynamic=False`` when a changed shape must produce a new concrete
+compilation. See the
+:source:`PF13 verification record <docs/reviews/2026-11-01-pf13-python-dynamo.md>`.
 Inductor composition, training and genuine upstream Triton launches are not
-implemented. Registration tests do not establish decorator or model execution.
+implemented. Registration alone does not establish model execution.
 
 .. _python-frontend-pipeline:
 
@@ -632,6 +643,9 @@ Run focused tests
 
    "$LLK_PYTHON" -m pytest test/python/test_torch_registration.py \
      test/python/test_package_install.py -q
+   LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.dylib" \
+     "$LLK_PYTHON" -m pytest test/python/test_dynamo_backend.py \
+     test/python/test_fx_importer.py -q
 
 The root :source:`pytest.ini <pytest.ini>` restricts default collection to
 ``test/python`` and adds the local ``python/`` source path. This avoids collecting
@@ -641,8 +655,10 @@ the current worktree so imports and fixtures use the edited source.
 The package tests build the actual wheel and install it offline into a fresh
 Torch-absent virtual environment outside the checkout. Real-Torch subprocesses
 test registration/reload identity, zero Dynamo resets, existing-owner protection,
-broken optional-dependency propagation and explicit execution rejection. Missing
-test/build dependencies are setup failures, not successful or skipped coverage.
+broken optional-dependency propagation and the missing-library diagnostic. The
+PF13 suites execute real ``torch.compile`` graphs when the CAPI library is
+loaded and count every native invocation. Missing test/build dependencies are
+setup failures, not successful or skipped coverage.
 
 These Python checks are separate from the compiler's ``check-llk`` target.
 C++ frontend tests are registered with CTest; required combined Python/native
@@ -663,11 +679,11 @@ After installing the package into the chosen environment:
 ``get_backend()`` returns the exact registered callable. Repeated registration
 and module reload preserve it without clearing Dynamo's global state. A foreign
 owner of the ``llk`` backend name is preserved and produces
-``backend_registration_conflict``. ``capabilities()`` remains compiler-free and
-conservative about the Torch/Dynamo backend, which is still unavailable; it is
-not evidence either way for a decorator invocation. ``frontend_ir`` returns
-checked metadata only, while a decorated call with a loaded CAPI library
-compiles and invokes native code as described above.
+``backend_registration_conflict``. ``capabilities()`` remains the
+compiler-free package report; it does not probe the native library, so it is
+not execution evidence either way. A decorated call with a loaded CAPI library
+compiles and invokes native code as described above, and the strict Dynamo
+backend uses the same service when the library is loaded.
 
 Native tail fixtures cover 33×65 and 1×7 add/multiply, canaries, unchanged inputs,
 mask/address rejection and source receipts. Selected-target checks require a
