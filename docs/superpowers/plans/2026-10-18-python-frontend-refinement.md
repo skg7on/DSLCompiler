@@ -18,7 +18,7 @@
 from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
 at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
 PF04's checked steps record branch implementation and verification in the
-[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09 implements the bounded full-identity specialization cache, strong leases and real-artifact inspection; see the [PF09 evidence](../../reviews/2026-11-01-pf09-python-specialization-cache.md). PF10–PF20 remain proposed and unchecked. Paths in those later tasks describe
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09 implements the bounded full-identity specialization cache, strong leases and real-artifact inspection; see the [PF09 evidence](../../reviews/2026-11-01-pf09-python-specialization-cache.md). PF10 implements proved bounded elementwise tails with static edge rectangles; see the [PF10 evidence](../../reviews/2026-11-01-pf10-python-frontend-tails.md). PF11–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -313,7 +313,7 @@ assert concurrent_successful_invocations == 8
 
 **Interfaces:** Extend the existing elementwise adapter contract with an explicit supported tail policy and receipt; do not silently remove its present divisibility gate. Reuse bounded movement contracts where delivered; otherwise implement static full-tile plus edge-fragment realization with exact static fragment sizes, keeping every access in bounds.
 
-- [ ] Add 33×65 and 1×7 add/mul with blocks 8×16 and declared masks, comparing exact outputs and guard regions. Test all-false masked lanes, negative/outside offsets and invalid masks. Before the extension, non-divisible inputs must raise `unsupported_tail_policy`.
+- [x] Add 33×65 and 1×7 add/mul with blocks 8×16 and declared masks, comparing exact outputs and guard regions. Test all-false masked lanes, negative/outside offsets and invalid masks. Before the extension, non-divisible inputs must raise `unsupported_tail_policy`.
 
 Pinned regression assertions (local test fixture names):
 
@@ -323,10 +323,10 @@ assert prefix_guard_after == prefix_guard_before
 assert suffix_guard_after == suffix_guard_before
 ```
 
-- [ ] Run `LLKFrontendTests --gtest_filter='FrontendTails.*'` plus `python -m pytest test/python/test_frontend_tails.py -q`; verify real tail cases initially fail.
-- [ ] Realize interior and statically sized edge fragments with explicit source receipts and native mapping verification. Combine semantic masks with valid bounds; do not create out-of-bounds subviews and rely on a later mask to repair them. Limit accepted masks to those whose memory safety and store coverage are proved.
-- [ ] Rerun reference and selected-target numerical/canary cases and source-adapter regressions. Selected-target acceptance must realize the chosen edge implementation with zero fallback or reject that target/shape explicitly.
-- [ ] Commit `feat: realize bounded elementwise tails in frontend kernels`.
+- [x] Run `LLKFrontendTests --gtest_filter='FrontendTails.*'` plus `python -m pytest test/python/test_frontend_tails.py -q`; verify real tail cases initially fail.
+- [x] Realize interior and statically sized edge fragments with explicit source receipts and native mapping verification. Combine semantic masks with valid bounds; do not create out-of-bounds subviews and rely on a later mask to repair them. Limit accepted masks to those whose memory safety and store coverage are proved.
+- [x] Rerun reference and selected-target numerical/canary cases and source-adapter regressions. Selected-target acceptance must realize the chosen edge implementation with zero fallback or reject that target/shape explicitly.
+- [x] Commit `feat: realize bounded elementwise tails in frontend kernels`.
 
 ### PF11: Add matmul accumulation and guarded SwiGLU recognition
 

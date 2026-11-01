@@ -6,9 +6,19 @@ endif()
 set(_llk_capture_dir "${CMAKE_CURRENT_BINARY_DIR}/captured")
 file(GLOB_RECURSE _llk_capture_sources CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/python/llk/*.py")
+set(_llk_tail_fixtures
+    "${_llk_capture_dir}/tail_add_33x65.json"
+    "${_llk_capture_dir}/tail_mul_33x65.json"
+    "${_llk_capture_dir}/tail_add_1x7.json"
+    "${_llk_capture_dir}/tail_mul_1x7.json"
+    "${_llk_capture_dir}/tail_unmasked_33x65.json"
+    "${_llk_capture_dir}/tail_false_mask_33x65.json"
+    "${_llk_capture_dir}/tail_short_mask_33x65.json"
+    "${_llk_capture_dir}/tail_wide_mask_33x65.json"
+    "${_llk_capture_dir}/tail_negative_offset_33x65.json")
 add_custom_command(
     OUTPUT "${_llk_capture_dir}/add.json" "${_llk_capture_dir}/mul.json"
-           "${_llk_capture_dir}/loop.json"
+           "${_llk_capture_dir}/loop.json" ${_llk_tail_fixtures}
     COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${PROJECT_SOURCE_DIR}/python"
             ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/capture_fixture.py"
             "${_llk_capture_dir}"
@@ -16,9 +26,10 @@ add_custom_command(
     VERBATIM)
 add_custom_target(LLKFrontendCaptureFixtures DEPENDS
     "${_llk_capture_dir}/add.json" "${_llk_capture_dir}/mul.json"
-    "${_llk_capture_dir}/loop.json")
+    "${_llk_capture_dir}/loop.json" ${_llk_tail_fixtures})
 add_llk_test_category(Frontend
     SOURCES legacy_typed_contract.cpp program.cpp importer.cpp compiler.cpp
+            tails.cpp
     LIBRARIES LLKFrontend TritonToLLKPasses LLKMappedTuning LLKTargetMapping ${_llk_frontend_execution_libs} LLK::MLIR
     DEFINITIONS LLK_FRONTEND_ENABLE_EXECUTION=$<BOOL:${LLK_BUILD_E2E_TESTS}>
                 LLK_FRONTEND_FIXTURE="${PROJECT_SOURCE_DIR}/test/python/frontend_add_v1.json"

@@ -266,17 +266,21 @@ elementwiseSchema(const perf::SearchSpace &space) {
   return schema;
 }
 
-/// The tile each source axis is realized at. The default is the full extent:
-/// a source that offers no tile choice is realized as one tile, not refused.
+/// The tile each source axis is realized at, plus the declared tail policy. The
+/// default is the full extent: a source that offers no tile choice is realized
+/// as one tile, not refused.
 struct ElementwiseTiles {
   int64_t t0 = 0;
   int64_t t1 = 0;
+  std::string tailPolicy = "none";
 };
 
 /// Resolves the source-owned tile choices by the axis each one names. A
 /// source-owned choice with no matching axis has no realization in this
-/// increment and is reported rather than ignored; a tile that does not divide
-/// its extent cannot be realized without inventing padding or masking.
+/// increment and is reported rather than ignored. A tile that does not divide
+/// its extent stays rejected unless the source carries the importer's proven
+/// tail declaration for exactly this block: the divisibility gate is not
+/// silently removed.
 llvm::Expected<ElementwiseTiles>
 resolveTiles(const ElementwiseProgram &program, const perf::SearchSpace &space,
              const perf::Candidate &candidate) {
@@ -285,9 +289,25 @@ resolveTiles(const ElementwiseProgram &program, const perf::SearchSpace &space,
     if (binding.owner != BindingOwner::Source)
       continue;
     const perf::SearchParam *param = space.findParam(binding.parameter);
+    if (!param)
+      return error("axis_not_realized: " + binding.parameter);
+    // A declared tail policy is a source fact this family realizes by
+    // decomposing the rounded domain into interior and exact edge rectangles.
+    if (param->kind == "tail_policy") {
+      std::optional<llvm::StringRef> value =
+          candidate.symbol(binding.parameter);
+      if (!value)
+        return error("source_binding: " + binding.parameter +
+                     " is not a symbolic binding");
+      if (*value != "masked-edge")
+        return error("tail_policy: unsupported tail policy '" + value->str() +
+                     "'");
+      tiles.tailPolicy = value->str();
+      continue;
+    }
     // A source-owned choice this family does not implement -- a fragment
-    // shape, a tail policy, an unrelated integer -- has no realization here.
-    if (!param || param->kind != "integer")
+    // shape, an unrelated integer -- has no realization here.
+    if (param->kind != "integer")
       return error("axis_not_realized: " + binding.parameter);
     std::optional<int64_t> value = candidate.integer(binding.parameter);
     if (!value)
@@ -300,9 +320,20 @@ resolveTiles(const ElementwiseProgram &program, const perf::SearchSpace &space,
     else
       return error("axis_not_realized: " + binding.parameter);
   }
-  if (tiles.t0 <= 0 || tiles.t1 <= 0 || program.d0 % tiles.t0 ||
-      program.d1 % tiles.t1)
+  if (tiles.t0 > 0 && tiles.t1 > 0 && !(program.d0 % tiles.t0) &&
+      !(program.d1 % tiles.t1))
+    return tiles;
+  if (tiles.tailPolicy == "none")
     return error("source_legality: tile_divisibility: T0/T1 must divide d0/d1");
+  // The policy is only realizable for the block the importer proved. A
+  // different candidate cannot inherit that proof.
+  auto proven = program.generic->getAttrOfType<StringAttr>("llk.tail_policy");
+  auto block =
+      program.generic->getAttrOfType<DenseI64ArrayAttr>("llk.tail_block");
+  if (!proven || proven.getValue() != tiles.tailPolicy || !block ||
+      block.size() != 2 || block[0] != tiles.t0 || block[1] != tiles.t1)
+    return error("tail_policy: the source did not prove this block's tail "
+                 "mask");
   return tiles;
 }
 
@@ -338,11 +369,16 @@ public:
     // The first supported numerical mode. Approximation stays an explicit
     // source fact, so this adapter never invents one.
     described.numericalContract = "strict-f32";
-    // The primitives realization actually emits: staged operand movement, the
-    // vector operation, and the tile store into the carried output. A required
-    // primitive the emitter does not produce would be a false contract.
-    described.requiredPrimitives = {"micro.tile_async_copy", "micro.vector",
-                                    "micro.tile_store"};
+    // The primitives realization actually emits: operand movement, the vector
+    // operation, and the tile store into the carried output. A rounded domain
+    // realizes every rectangle through the bounded `micro.tile_load`, whose
+    // `valid[...]` rectangle is clipped before any read, so the contract names
+    // that primitive instead of the unbounded tile copy. A required primitive
+    // the emitter does not produce would be a false contract.
+    described.requiredPrimitives = {"micro.vector", "micro.tile_store"};
+    described.requiredPrimitives.push_back(root->hasAttr("llk.tail_policy")
+                                               ? "micro.tile_load"
+                                               : "micro.tile_async_copy");
     return described;
   }
 
@@ -424,88 +460,176 @@ public:
     };
     Type tokenType = micro::AsyncTokenType::get(context);
     const SmallVector<int64_t, 2> outputShape{program->d0, program->d1};
-    const SmallVector<int64_t, 2> tileShape{tiles->t0, tiles->t1};
     Type outputTileType = tile(outputShape, sram);
 
-    // Tile-by-tile output is SSA-carried: the store updates the destination
-    // the inner loop hands on, and each loop yields what its body produced.
+    // Tile-by-tile output is SSA-carried: each rectangle updates the
+    // destination the next one hands on, and every loop yields what its body
+    // produced.
     Value output =
         micro::TileAllocOp::create(builder, loc, outputTileType).getResult();
-    auto openSpatialLoop = [&](int64_t extent, int64_t step, StringRef axis,
-                               ValueRange carried) -> micro::SpatialForOp {
-      Value lower = arith::ConstantIndexOp::create(builder, loc, 0).getResult();
-      Value upper =
-          arith::ConstantIndexOp::create(builder, loc, extent).getResult();
+    /// One tile loop and its body, whichever kind it is: an empty `map` makes
+    /// the iterations temporal, a named one makes them spatial.
+    struct TileLoop {
+      Block *body = nullptr;
+      ValueRange results;
+    };
+    auto openLoop = [&](int64_t lower, int64_t upper, int64_t step,
+                        StringRef map, ValueRange carried) -> TileLoop {
+      Value lb =
+          arith::ConstantIndexOp::create(builder, loc, lower).getResult();
+      Value ub =
+          arith::ConstantIndexOp::create(builder, loc, upper).getResult();
       Value by = arith::ConstantIndexOp::create(builder, loc, step).getResult();
-      auto loop = micro::SpatialForOp::create(
-          builder, loc, carried.getTypes(), lower, upper, by,
-          micro::MappingTargetAttr::get(context, axis), carried);
       llvm::SmallVector<Type> bodyTypes{IndexType::get(context)};
       bodyTypes.append(carried.getTypes().begin(), carried.getTypes().end());
-      Block *loopBody = builder.createBlock(
-          &loop.getBody(), {}, bodyTypes,
-          llvm::SmallVector<Location>(bodyTypes.size(), loc));
+      llvm::SmallVector<Location> bodyLocations(bodyTypes.size(), loc);
+      Block *loopBody = nullptr;
+      ValueRange results;
+      if (map.empty()) {
+        auto loop = micro::ForOp::create(builder, loc, carried.getTypes(), lb,
+                                         ub, by, carried);
+        loopBody =
+            builder.createBlock(&loop.getBody(), {}, bodyTypes, bodyLocations);
+        results = loop.getResults();
+      } else {
+        auto loop = micro::SpatialForOp::create(
+            builder, loc, carried.getTypes(), lb, ub, by,
+            micro::MappingTargetAttr::get(context, map), carried);
+        loopBody =
+            builder.createBlock(&loop.getBody(), {}, bodyTypes, bodyLocations);
+        results = loop.getResults();
+      }
       builder.setInsertionPointToEnd(loopBody);
       micro::YieldOp::create(builder, loc);
       builder.setInsertionPoint(loopBody->getTerminator());
-      return loop;
+      return {loopBody, results};
     };
 
-    micro::SpatialForOp d0Loop =
-        openSpatialLoop(program->d0, tiles->t0, "worker", ValueRange{output});
-    BlockArgument d0 = d0Loop.getBody().front().getArgument(0);
-    Value d0Carried = d0Loop.getBody().front().getArgument(1);
-    micro::SpatialForOp d1Loop =
-        openSpatialLoop(program->d1, tiles->t1, "lane", ValueRange{d0Carried});
-    BlockArgument d1 = d1Loop.getBody().front().getArgument(0);
-    Value d1Carried = d1Loop.getBody().front().getArgument(1);
+    // One block rectangle. An empty `valid` is a full interior tile, realized
+    // exactly as before. An edge rectangle keeps the block's compile-time
+    // capacity but states the exact static fraction of it that is real, so the
+    // bounded load copies only in-bounds source elements and the clipped store
+    // writes only the declared domain. No view is ever positioned outside its
+    // source and then repaired by a later mask.
+    // A rounded domain serializes its block walk: every rectangle reuses the
+    // previous one's staged, accumulator and carried-output storage, which is
+    // what keeps a 5x5 grid of 8x16 tiles -- and the whole rounded output tile
+    // each store versions -- inside the machine's capacities. A divisible
+    // source keeps the original worker-lane spatial nesting unchanged.
+    const bool temporalTiles = tiles->tailPolicy != "none";
+    auto emitRectangle =
+        [&](Value carried, int64_t rowLower, int64_t rowUpper, int64_t rowStep,
+            int64_t columnLower, int64_t columnUpper, int64_t columnStep,
+            ArrayRef<int64_t> tileShape, ArrayRef<int64_t> valid) -> Value {
+      TileLoop d0Loop = openLoop(rowLower, rowUpper, rowStep,
+                                 temporalTiles ? StringRef("") : "worker",
+                                 ValueRange{carried});
+      BlockArgument d0 = d0Loop.body->getArgument(0);
+      Value d0Carried = d0Loop.body->getArgument(1);
+      TileLoop d1Loop = openLoop(columnLower, columnUpper, columnStep,
+                                 temporalTiles ? StringRef("") : "lane",
+                                 ValueRange{d0Carried});
+      BlockArgument d1 = d1Loop.body->getArgument(0);
+      Value d1Carried = d1Loop.body->getArgument(1);
 
-    llvm::SmallVector<Value, 2> staged;
-    llvm::SmallVector<Value, 2> tokens;
-    for (unsigned i = 0; i < program->inputs.size(); ++i) {
-      // The kernel is IsolatedFromAbove, so the operands it reads are its own
-      // entry block arguments -- the source-local values are not in scope.
-      Value input = body->getArgument(i);
-      Value view = micro::TileViewOp::create(
-          builder, loc, tile(tileShape, dram), input, ValueRange{d0, d1},
-          DenseI64ArrayAttr::get(context, tileShape),
-          /*layout=*/micro::LayoutAttr());
-      auto copy = micro::TileAsyncCopyOp::create(
-          builder, loc, tile(tileShape, sram), tokenType, view, sram,
-          /*owner=*/micro::OwnerAttr());
-      staged.push_back(copy.getResult());
-      tokens.push_back(copy.getToken());
-    }
-    micro::WaitOp::create(builder, loc, tokens);
+      llvm::SmallVector<Value, 2> validSizes;
+      for (int64_t extent : valid)
+        validSizes.push_back(
+            arith::ConstantIndexOp::create(builder, loc, extent).getResult());
 
-    // The validated scalar operation decides the primitive key inside this
-    // adapter only.
-    Value result = micro::VectorOp::create(
-        builder, loc, tile(tileShape, acc),
-        StringAttr::get(context, program->multiply ? "mul" : "add"),
-        ValueRange{staged[0], staged[1]}, /*math_mode=*/StringAttr());
-    Value written =
-        micro::TileStoreOp::create(builder, loc, outputTileType, result,
-                                   d1Carried, ValueRange{d0, d1}, sram,
-                                   /*valid_sizes=*/ValueRange())
-            .getResult();
+      llvm::SmallVector<Value, 2> staged;
+      llvm::SmallVector<Value, 2> tokens;
+      for (unsigned i = 0; i < program->inputs.size(); ++i) {
+        // The kernel is IsolatedFromAbove, so the operands it reads are its own
+        // entry block arguments -- the source-local values are not in scope.
+        Value input = body->getArgument(i);
+        if (validSizes.empty()) {
+          Value view = micro::TileViewOp::create(
+              builder, loc, tile(tileShape, dram), input, ValueRange{d0, d1},
+              DenseI64ArrayAttr::get(context, tileShape),
+              /*layout=*/micro::LayoutAttr());
+          auto copy = micro::TileAsyncCopyOp::create(
+              builder, loc, tile(tileShape, sram), tokenType, view, sram,
+              /*owner=*/micro::OwnerAttr());
+          staged.push_back(copy.getResult());
+          tokens.push_back(copy.getToken());
+        } else {
+          auto load = micro::TileLoadOp::create(
+              builder, loc, tile(tileShape, sram), tokenType, input,
+              ValueRange{d0, d1}, validSizes, builder.getF32FloatAttr(0.0F),
+              sram, /*owner=*/micro::OwnerAttr());
+          staged.push_back(load.getResult());
+          tokens.push_back(load.getToken());
+        }
+      }
+      micro::WaitOp::create(builder, loc, tokens);
 
-    if (auto terminator = dyn_cast<micro::YieldOp>(
-            d1Loop.getBody().front().getTerminator())) {
-      builder.setInsertionPoint(terminator);
-      micro::YieldOp::create(builder, loc, ValueRange{written});
-      terminator.erase();
-    }
-    if (auto terminator = dyn_cast<micro::YieldOp>(
-            d0Loop.getBody().front().getTerminator())) {
-      builder.setInsertionPoint(terminator);
-      micro::YieldOp::create(builder, loc, d1Loop.getResults());
-      terminator.erase();
-    }
-    // The kernel body has no terminator yet: the loops were emitted into it in
-    // order, so the yielded value is what the outer loop left.
+      // The validated scalar operation decides the primitive key inside this
+      // adapter only.
+      Value result = micro::VectorOp::create(
+          builder, loc, tile(tileShape, acc),
+          StringAttr::get(context, program->multiply ? "mul" : "add"),
+          ValueRange{staged[0], staged[1]}, /*math_mode=*/StringAttr());
+      Value written = micro::TileStoreOp::create(
+                          builder, loc, outputTileType, result, d1Carried,
+                          ValueRange{d0, d1}, sram, validSizes)
+                          .getResult();
+
+      if (auto terminator =
+              dyn_cast<micro::YieldOp>(d1Loop.body->getTerminator())) {
+        builder.setInsertionPoint(terminator);
+        micro::YieldOp::create(builder, loc, ValueRange{written});
+        terminator.erase();
+      }
+      if (auto terminator =
+              dyn_cast<micro::YieldOp>(d0Loop.body->getTerminator())) {
+        builder.setInsertionPoint(terminator);
+        micro::YieldOp::create(builder, loc, d1Loop.results);
+        terminator.erase();
+      }
+      // The next rectangle is emitted into the kernel body, not into this
+      // loop's body.
+      builder.setInsertionPointToEnd(body);
+      return d0Loop.results.front();
+    };
+
+    // Interior blocks first, then the right, bottom and corner rectangles. The
+    // decomposition writes every element exactly once and each rectangle's
+    // offsets and static valid extents are inside the source and destination.
+    const int64_t fullRows = (program->d0 / tiles->t0) * tiles->t0;
+    const int64_t fullColumns = (program->d1 / tiles->t1) * tiles->t1;
+    const int64_t rowTail = program->d0 - fullRows;
+    const int64_t columnTail = program->d1 - fullColumns;
+    const SmallVector<int64_t, 2> blockShape{tiles->t0, tiles->t1};
+
+    // A rounded program realizes even its interior rectangles through the
+    // bounded primitive: the contract then names one movement primitive for
+    // every rectangle, and a full rectangle states `valid == capacity`.
+    ArrayRef<int64_t> fullValid;
+    if (temporalTiles)
+      fullValid = blockShape;
+
+    Value carried = output;
+    if (fullRows > 0 && fullColumns > 0)
+      carried = emitRectangle(carried, 0, fullRows, tiles->t0, 0, fullColumns,
+                              tiles->t1, blockShape, fullValid);
+    if (fullRows > 0 && columnTail > 0)
+      carried = emitRectangle(carried, 0, fullRows, tiles->t0, fullColumns,
+                              fullColumns + 1, 1, blockShape,
+                              ArrayRef<int64_t>{tiles->t0, columnTail});
+    if (rowTail > 0 && fullColumns > 0)
+      carried = emitRectangle(carried, fullRows, fullRows + 1, 1, 0,
+                              fullColumns, tiles->t1, blockShape,
+                              ArrayRef<int64_t>{rowTail, tiles->t1});
+    if (rowTail > 0 && columnTail > 0)
+      carried = emitRectangle(carried, fullRows, fullRows + 1, 1, fullColumns,
+                              fullColumns + 1, 1, blockShape,
+                              ArrayRef<int64_t>{rowTail, columnTail});
+
+    // The kernel body has no terminator yet: the rectangles were emitted into
+    // it in order, so the yielded value is what the last loop left.
     builder.setInsertionPointToEnd(body);
-    micro::YieldOp::create(builder, loc, d0Loop.getResults());
+    micro::YieldOp::create(builder, loc, ValueRange{carried});
 
     // Carry the canonical numerical semantics as an explicit IR fact.
     if (!contract.numericalContract.empty())
