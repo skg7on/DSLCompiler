@@ -18,7 +18,7 @@
 from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
 at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
 PF04's checked steps record branch implementation and verification in the
-[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09–PF20 remain proposed and unchecked. Paths in those later tasks describe
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09 implements the bounded full-identity specialization cache, strong leases and real-artifact inspection; see the [PF09 evidence](../../reviews/2026-11-01-pf09-python-specialization-cache.md). PF10–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -293,7 +293,7 @@ assert native_invoke_spy.call_count == 1
 
 **Interfaces:** Produce `CompilationCache(max_entries=128).get_or_compile(request, compile_fn) -> CompiledKernelLease`; leases own handles independently of cache membership. Add `JitFunction.cache_info()` returning hits/misses/compilations/evictions and inspection properties from the actual native artifact.
 
-- [ ] Assert same full identity compiles once; changed shape/dtype/constexpr/closure/grid/numerical/target contents/ABI version compiles separately. Force identical digest buckets with unequal full identities and require separate artifacts. Evict an active entry safely; deduplicate eight concurrent misses; retry after a failed compilation; close does not deadlock invocation.
+- [x] Assert same full identity compiles once; changed shape/dtype/constexpr/closure/grid/numerical/target contents/ABI version compiles separately. Force identical digest buckets with unequal full identities and require separate artifacts. Evict an active entry safely; deduplicate eight concurrent misses; retry after a failed compilation; close does not deadlock invocation.
 
 Pinned regression assertions (local test fixture names):
 
@@ -302,10 +302,10 @@ assert kernel.cache_info().compilations == 1
 assert concurrent_successful_invocations == 8
 ```
 
-- [ ] Run `python -m pytest test/python/test_specialization_cache.py test/python/test_jit_lifetime.py test/python/test_inspection.py -q` with the native library; verify missing cache behavior fails.
-- [ ] Implement pending/ready/failed state transitions, a bounded LRU and strong leases. Native environment identity is queried before lookup and final candidate/plan identity is stored in the artifact; changed config files cannot reuse a handle. Expose reached stages and native counters; unavailable disassembly returns its explicit error.
-- [ ] Rerun stress tests and assert compile counts, not timings. No active handle may be freed by eviction; no success report may come from an uncompiled request.
-- [ ] Commit `feat: add bounded frontend specialization and executable inspection`.
+- [x] Run `python -m pytest test/python/test_specialization_cache.py test/python/test_jit_lifetime.py test/python/test_inspection.py -q` with the native library; verify missing cache behavior fails. The pre-implementation run failed at collection because `llk.runtime._cache` did not exist.
+- [x] Implement pending/ready/failed state transitions, a bounded LRU and strong leases. Native environment identity is queried before lookup and final candidate/plan identity is stored in the artifact; changed config files cannot reuse a handle. Expose reached stages and native counters; unavailable disassembly returns its explicit error.
+- [x] Rerun stress tests and assert compile counts, not timings. No active handle may be freed by eviction; no success report may come from an uncompiled request.
+- [x] Commit `feat: add bounded frontend specialization and executable inspection`.
 
 ### PF10: Add proven bounded tails for elementwise kernels
 

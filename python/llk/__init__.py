@@ -7,11 +7,17 @@ from ._errors import (
     TensorContractError,
     UnsupportedFeatureError,
 )
-from .runtime._ffi import CompiledKernel, compile_request
+from .runtime._cache import CacheInfo, CompilationCache
+from .runtime._ffi import (
+    CompiledKernel,
+    CompiledKernelLease,
+    compile_request,
+)
 from .runtime._jit import JitFunction, jit
 
 __all__ = [
-    "jit", "JitFunction", "CompiledKernel", "compile_request", "capabilities",
+    "jit", "JitFunction", "CompiledKernel", "CompiledKernelLease",
+    "compile_request", "CompilationCache", "CacheInfo", "capabilities",
     "LLKError", "FrontendSyntaxError", "UnsupportedFeatureError",
     "TensorContractError", "CompilationError", "ExecutionError",
 ]
