@@ -4,8 +4,8 @@
 
 **Scope:** [issue #219](https://github.com/skg7on/DSLCompiler/issues/219), PF08 in
 [the frontend plan](../superpowers/plans/2026-10-18-python-frontend-refinement.md).
-Base `main` `b61c1a2` contains merged PF07 (PR #251). Implementation is on
-`feat/python-native-jit-launch` in the isolated worktree
+Base `main` `b61c1a2` contains merged PF07 (PR #251). Implementation commit
+`7bc2b5b` is on `feat/python-native-jit-launch` in the isolated worktree
 `.claude/worktrees/feat+dynamic-acceptance`, which owns its own `build/`.
 
 ## Delivered behavior

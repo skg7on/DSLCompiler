@@ -285,7 +285,7 @@ assert native_invoke_spy.call_count == 1
 - [x] Run `LLK_FRONTEND_LIBRARY=$PWD/build/lib/libLLKFrontendCAPI.so python -m pytest test/python/test_native_jit.py test/python/test_buffer_contract.py test/python/test_launch_contract.py -q` (use `.dylib` on macOS); confirm the current `native_backend_unavailable` rejection fails the real invocation assertion.
 - [x] Load the explicit development path or installed package resource, check API version, marshal Python exceptions and implement context-managed handle ownership. Use a strong reference plus lock through ctypes calls; never cache raw caller buffers. Preserve void pointer-output semantics and keep `.ttir()` explicitly unavailable for this frontend.
 - [x] Rerun all three suites with native-call counters. A test passes only if a caller-owned buffer changes through native code and the compilation report matches the executed handle.
-- [x] Commit `feat: execute llk decorators through the checked native bridge`.
+- [x] Commit `feat: execute llk decorators through the checked native bridge` (`7bc2b5b`).
 
 ### PF09: Implement bounded specialization cache and inspection reports
 
