@@ -90,11 +90,13 @@ def test_registration_does_not_replace_another_owner(tmp_path):
 
 def test_backend_execution_reports_unavailable_without_calling_graph(tmp_path):
     run_torch_case("""
+        import os
         from unittest.mock import patch
         import torch
         import llk
         import llk.torch
 
+        os.environ["LLK_FRONTEND_LIBRARY"] = "missing-libLLKFrontendCAPI.dylib"
         graph = torch.fx.symbolic_trace(lambda x: x + 1)
         with patch.object(graph, "forward", wraps=graph.forward) as forward:
             try:
@@ -110,11 +112,13 @@ def test_backend_execution_reports_unavailable_without_calling_graph(tmp_path):
 
 def test_real_torch_compile_preserves_the_unavailable_error(tmp_path):
     run_torch_case("""
+        import os
         import torch
         import llk
         import llk.torch
         from torch._dynamo.exc import BackendCompilerFailed
 
+        os.environ["LLK_FRONTEND_LIBRARY"] = "missing-libLLKFrontendCAPI.dylib"
         compiled = torch.compile(lambda x: x + 1, backend="llk", fullgraph=True)
         try:
             compiled(torch.ones(2))
