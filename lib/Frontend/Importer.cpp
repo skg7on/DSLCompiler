@@ -13,7 +13,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Verifier.h"
-#include <algorithm>
+#include "llvm/ADT/SmallVector.h"
 #include <array>
 #include <limits>
 #include <map>
@@ -28,15 +28,43 @@ struct Affine {
   int64_t constant = 0;
   bool operator==(const Affine &) const = default;
 };
+/// A linear residue that the caller's mask must bound: `expression < divisor`.
+/// A `div`/`rem` whose residue can leave the divisor range is only the true
+/// quotient/remainder on lanes a matching upper-bound selects. The requirement
+/// travels with the index facts and is discharged at the load or store that
+/// consumes the address.
+struct ResidueRequirement {
+  Affine expression;
+  int64_t divisor = 0;
+};
 struct Address {
   size_t port = 0;
   Affine rows;
   Affine columns;
+  llvm::SmallVector<ResidueRequirement, 2> requiresMaskBound{};
+};
+/// One in-bounds lane term: `program_id[axis] * block + lane < bound`.
+struct LaneBound {
+  Affine expression;
+  int64_t bound = 0;
+  bool operator==(const LaneBound &) const = default;
+};
+/// What is known about an i1 value. Constant facts are the whole-tile masks the
+/// first increment accepted; `Bounds` is a conjunction of lane bounds, which is
+/// exactly the tail predicate a rounded launch has to declare. Anything else is
+/// unknown and never proves memory safety.
+struct MaskFacts {
+  enum class Kind { Unknown, Constant, Bounds };
+  Kind kind = Kind::Unknown;
+  bool constant = false;
+  llvm::SmallVector<LaneBound, 2> bounds;
+  bool operator==(const MaskFacts &) const = default;
 };
 struct Facts {
   FrontendValue value;
   std::optional<Affine> index;
-  std::optional<bool> mask;
+  MaskFacts mask;
+  std::optional<ResidueRequirement> requiresMaskBound;
   std::optional<Address> address;
   bool load = false;
   std::string binary;
@@ -47,6 +75,9 @@ struct Recovery {
   size_t output = 0;
   std::array<unsigned, 2> scalarInputs{};
   bool multiply = false;
+  bool tail = false;
+  int64_t block0 = 0;
+  int64_t block1 = 0;
   SourceSpan span;
 };
 bool add(int64_t a, int64_t b, int64_t &result) {
@@ -74,6 +105,88 @@ std::optional<Affine> plus(Affine a, const Affine &b) {
 bool uniform(const Affine &value) {
   return llvm::all_of(value.coefficients, [](int64_t n) { return n == 0; });
 }
+MaskFacts unknownMask() { return MaskFacts{}; }
+MaskFacts constantMask(bool value) {
+  MaskFacts mask;
+  mask.kind = MaskFacts::Kind::Constant;
+  mask.constant = value;
+  return mask;
+}
+MaskFacts boundsMask(llvm::ArrayRef<LaneBound> bounds) {
+  MaskFacts mask;
+  mask.kind = MaskFacts::Kind::Bounds;
+  mask.bounds.assign(bounds.begin(), bounds.end());
+  return mask;
+}
+bool containsBound(llvm::ArrayRef<LaneBound> bounds, const LaneBound &term) {
+  return llvm::any_of(bounds,
+                      [&](const LaneBound &entry) { return entry == term; });
+}
+/// `a && b`. A false constant dominates, a true constant is neutral, and two
+/// conjunctions conjoin. An unknown operand leaves the result unknown unless
+/// the other side is already false.
+MaskFacts andMasks(const MaskFacts &a, const MaskFacts &b) {
+  auto isConstant = [](const MaskFacts &mask, bool value) {
+    return mask.kind == MaskFacts::Kind::Constant && mask.constant == value;
+  };
+  if (isConstant(a, false) || isConstant(b, false))
+    return constantMask(false);
+  if (isConstant(a, true))
+    return b;
+  if (isConstant(b, true))
+    return a;
+  if (a.kind != MaskFacts::Kind::Bounds || b.kind != MaskFacts::Kind::Bounds)
+    return unknownMask();
+  MaskFacts result = a;
+  for (const LaneBound &term : b.bounds)
+    if (!containsBound(result.bounds, term))
+      result.bounds.push_back(term);
+  return result;
+}
+/// `a || b`. Only the cases the AST's `|` lowering can produce are exact: a
+/// true constant dominates, a false constant is neutral, and a conjunction
+/// already contained in the other is redundant. Anything else is unknown,
+/// because a union of two different lane bounds is not a conjunction.
+MaskFacts orMasks(const MaskFacts &a, const MaskFacts &b) {
+  auto isConstant = [](const MaskFacts &mask, bool value) {
+    return mask.kind == MaskFacts::Kind::Constant && mask.constant == value;
+  };
+  if (isConstant(a, true) || isConstant(b, true))
+    return constantMask(true);
+  if (isConstant(a, false))
+    return b;
+  if (isConstant(b, false))
+    return a;
+  if (a.kind != MaskFacts::Kind::Bounds || b.kind != MaskFacts::Kind::Bounds)
+    return unknownMask();
+  auto subset = [](const MaskFacts &small, const MaskFacts &large) {
+    return llvm::all_of(small.bounds, [&](const LaneBound &term) {
+      return containsBound(large.bounds, term);
+    });
+  };
+  if (subset(a, b))
+    return b;
+  if (subset(b, a))
+    return a;
+  return unknownMask();
+}
+/// The condition-selected mask of `cond ? x : y`.
+MaskFacts selectMask(const MaskFacts &condition, const MaskFacts &x,
+                     const MaskFacts &y) {
+  if (condition.kind == MaskFacts::Kind::Constant)
+    return condition.constant ? x : y;
+  const auto isConstant = [](const MaskFacts &mask, bool value) {
+    return mask.kind == MaskFacts::Kind::Constant && mask.constant == value;
+  };
+  // `a & b` lowers to select(a, b, false); `a | b` to select(a, true, b).
+  if (isConstant(y, false))
+    return andMasks(condition, x);
+  if (isConstant(x, true))
+    return orMasks(condition, y);
+  if (x.kind != MaskFacts::Kind::Unknown && x == y)
+    return x;
+  return unknownMask();
+}
 class Proof {
 public:
   explicit Proof(const FrontendProgram &program) : program(program) {}
@@ -94,7 +207,7 @@ public:
       const auto &t = program.tensors[i];
       Facts fact;
       fact.value = {t.name, "ptr<" + t.dtype + ">", {}};
-      fact.address = Address{i, {}, {}};
+      fact.address = Address{i, {}, {}, {}};
       values[t.name] = std::move(fact);
       if (t.direction == "input") {
         if (inputs < 2)
@@ -112,12 +225,25 @@ public:
     for (const auto &tensor : program.tensors)
       if (tensor.shape != output.shape || tensor.dtype != "f32")
         return unsupported("all ports must have the same rank-two f32 shape");
-    if (program.launch.grid[2] != 1 || program.launch.block[2] != 1 ||
-        !productEquals(program.launch.grid[0], program.launch.block[0],
-                       output.shape[0]) ||
-        !productEquals(program.launch.grid[1], program.launch.block[1],
-                       output.shape[1]))
-      return coverage("grid/block does not cover the declared domain exactly");
+    if (program.launch.grid[2] != 1 || program.launch.block[2] != 1)
+      return coverage("grid z and block z must both be one");
+    // The grid must be exactly ceil(extent / block) on each axis. A divisible
+    // axis is the original exact-coverage contract; a rounded axis needs a
+    // declared tail mask, which the load/store proofs below discharge.
+    for (unsigned axis = 0; axis != 2; ++axis) {
+      const int64_t extent = output.shape[axis];
+      const int64_t block = program.launch.block[axis];
+      if (block <= 0)
+        return coverage("block extents must be positive");
+      const int64_t whole = extent / block + (extent % block != 0 ? 1 : 0);
+      int64_t span = 0;
+      if (program.launch.grid[axis] != whole ||
+          !multiply(program.launch.grid[axis], block, span) || span < extent)
+        return coverage("grid/block does not cover the declared domain with "
+                        "whole blocks");
+      if (span != extent)
+        tailRequired = true;
+    }
     unsigned stores = 0;
     for (const auto &op : program.operations) {
       const auto &code = op.opcode;
@@ -132,11 +258,25 @@ public:
         const auto &pointer = *operands[0];
         const auto &written = *operands[1];
         if (!pointer.address || pointer.address->port != recovered.output ||
-            !active(*operands[2]) ||
             !rectangular(*pointer.address, pointer.value.shape))
           return coverage(
-              "output address/mask is not an exact rectangular bijection",
-              op.span);
+              "output address is not an exact rectangular bijection", op.span);
+        if (!maskMatchesExpected(operands[2]->mask))
+          return tailRequired
+                     ? tailUnsupported(
+                           "the store mask does not prove the rounded domain's "
+                           "in-bounds lanes",
+                           op.span)
+                     : coverage("the store mask must be true on every lane",
+                                op.span);
+        if (!requirementsSatisfied(*pointer.address, operands[2]->mask))
+          return tailRequired
+                     ? tailUnsupported(
+                           "the store mask does not bound the decomposed "
+                           "row-major index",
+                           op.span)
+                     : coverage("the store address is not proven in bounds",
+                                op.span);
         if (written.binary != "add" && written.binary != "mul")
           return unsupported("output must be exactly one add/multiply",
                              op.span);
@@ -174,7 +314,8 @@ public:
           result.index =
               Affine{{}, op.attributes.getInteger("value").value_or(0)};
         else if (result.value.dtype == "i1")
-          result.mask = op.attributes.getBoolean("value");
+          result.mask =
+              constantMask(op.attributes.getBoolean("value").value_or(false));
       } else if (code == "program_id") {
         Affine index;
         index.coefficients[op.attributes.getInteger("axis").value_or(0)] = 1;
@@ -235,9 +376,15 @@ public:
                   result.index =
                       divide(*shifted, b.constant, result.value.shape, false);
               }
-            } else
-              result.index =
-                  divide(a, b.constant, result.value.shape, code == "rem");
+            } else {
+              bool provisional = false;
+              std::optional<Affine> residue;
+              result.index = divide(a, b.constant, result.value.shape,
+                                    code == "rem", &provisional, &residue);
+              if (result.index && provisional)
+                result.requiresMaskBound =
+                    ResidueRequirement{*residue, b.constant};
+            }
           }
           if (!result.index)
             return coverage(
@@ -265,64 +412,89 @@ public:
           return coverage("comparison bounds overflow", op.span);
         auto [lo, hi] = *bounds;
         auto predicate = op.attributes.getString("predicate").value_or("");
+        std::optional<bool> constant;
         if (predicate == "lt") {
           if (hi < 0)
-            result.mask = true;
+            constant = true;
           else if (lo >= 0)
-            result.mask = false;
-        }
-        if (predicate == "le") {
+            constant = false;
+        } else if (predicate == "le") {
           if (hi <= 0)
-            result.mask = true;
+            constant = true;
           else if (lo > 0)
-            result.mask = false;
-        }
-        if (predicate == "gt") {
+            constant = false;
+        } else if (predicate == "gt") {
           if (lo > 0)
-            result.mask = true;
+            constant = true;
           else if (hi <= 0)
-            result.mask = false;
-        }
-        if (predicate == "ge") {
+            constant = false;
+        } else if (predicate == "ge") {
           if (lo >= 0)
-            result.mask = true;
+            constant = true;
           else if (hi < 0)
-            result.mask = false;
-        }
-        if (predicate == "eq") {
+            constant = false;
+        } else if (predicate == "eq") {
           if (lo == 0 && hi == 0)
-            result.mask = true;
+            constant = true;
           else if (hi < 0 || lo > 0)
-            result.mask = false;
-        }
-        if (predicate == "ne") {
+            constant = false;
+        } else if (predicate == "ne") {
           if (lo == 0 && hi == 0)
-            result.mask = false;
+            constant = false;
           else if (hi < 0 || lo > 0)
-            result.mask = true;
+            constant = true;
         }
+        if (constant)
+          result.mask = constantMask(*constant);
+        else if (auto term =
+                     laneBound(*difference, result.value.shape, predicate))
+          result.mask = boundsMask({*term});
       } else if (code == "select") {
         if (result.value.dtype != "i1")
           return unsupported(
               "data selects are outside the add/multiply importer", op.span);
-        if (operands[0]->mask)
-          result.mask = operands[*operands[0]->mask ? 1 : 2]->mask;
-        else if (operands[1]->mask == operands[2]->mask)
-          result.mask = operands[1]->mask;
+        result.mask =
+            selectMask(operands[0]->mask, operands[1]->mask, operands[2]->mask);
       } else if (code == "address") {
         if (!operands[0]->address || !operands[1]->index || !operands[2]->index)
           return coverage("address is not affine", op.span);
-        result.address =
-            Address{operands[0]->address->port,
-                    promote(*operands[1]->index, operands[1]->value.shape,
-                            result.value.shape),
-                    promote(*operands[2]->index, operands[2]->value.shape,
-                            result.value.shape)};
+        Address address{operands[0]->address->port,
+                        promote(*operands[1]->index, operands[1]->value.shape,
+                                result.value.shape),
+                        promote(*operands[2]->index, operands[2]->value.shape,
+                                result.value.shape),
+                        {}};
+        for (const Facts *operand : {operands[1], operands[2]})
+          if (operand->requiresMaskBound)
+            address.requiresMaskBound.push_back(
+                {promote(operand->requiresMaskBound->expression,
+                         operand->value.shape, result.value.shape),
+                 operand->requiresMaskBound->divisor});
+        result.address = std::move(address);
       } else if (code == "load") {
         const auto &pointer = *operands[0];
-        if (!pointer.address || !active(*operands[1]) ||
-            !inBounds(*pointer.address, pointer.value.shape))
-          return coverage("load is not proven masked/in-bounds", op.span);
+        if (!pointer.address)
+          return coverage("load has no affine address", op.span);
+        if (!rectangular(*pointer.address, pointer.value.shape))
+          return coverage("load address is not an exact rectangular "
+                          "bijection",
+                          op.span);
+        if (!maskMatchesExpected(operands[1]->mask))
+          return tailRequired
+                     ? tailUnsupported(
+                           "the load mask does not prove the rounded "
+                           "domain's in-bounds lanes",
+                           op.span)
+                     : coverage("the load mask must be true on every lane",
+                                op.span);
+        if (!requirementsSatisfied(*pointer.address, operands[1]->mask))
+          return tailRequired
+                     ? tailUnsupported(
+                           "the load mask does not bound the decomposed "
+                           "row-major index",
+                           op.span)
+                     : coverage("the load address is not proven in bounds",
+                                op.span);
         result.load = true;
         result.address = pointer.address;
       } else
@@ -339,16 +511,18 @@ public:
     }
     if (stores != 1)
       return coverage("one complete output write is required");
+    recovered.tail = tailRequired;
+    recovered.block0 = program.launch.block[0];
+    recovered.block1 = program.launch.block[1];
     return recovered;
   }
 
 private:
   const FrontendProgram &program;
   std::map<std::string, Facts> values;
-  static bool productEquals(int64_t a, int64_t b, int64_t expected) {
-    int64_t result;
-    return multiply(a, b, result) && result == expected;
-  }
+  /// True when at least one axis rounds the domain up, so a declared mask is
+  /// required. Set before the operation loop; the load/store proofs read it.
+  bool tailRequired = false;
   llvm::Error coverage(llvm::Twine message,
                        std::optional<SourceSpan> span = {}) {
     return frontendError("invalid_launch_coverage", message, span, "import");
@@ -358,7 +532,10 @@ private:
     return frontendError("unsupported_frontend_program", message, span,
                          "import");
   }
-  static bool active(const Facts &fact) { return fact.mask.value_or(false); }
+  llvm::Error tailUnsupported(llvm::Twine message,
+                              std::optional<SourceSpan> span = {}) {
+    return frontendError("unsupported_tail_policy", message, span, "import");
+  }
   Affine normalize(Affine expression, const Shape &shape) const {
     for (size_t i = 0; i != 3; ++i)
       if (program.launch.grid[i] == 1)
@@ -394,8 +571,64 @@ private:
     }
     return std::pair<int64_t, int64_t>{lo, hi};
   }
-  std::optional<Affine> divide(const Affine &input, int64_t divisor,
-                               const Shape &shape, bool remainder) const {
+  /// Recognize `difference < 0` (or `<= 0`) as "one lane expression is below a
+  /// positive bound". The expression must be exactly
+  /// `program_id[axis] * block + lane` on its own axis, so the term means the
+  /// same thing as the expected in-bounds predicate -- not merely something
+  /// that happens to be true for this program.
+  std::optional<LaneBound> laneBound(const Affine &difference,
+                                     const Shape &shape,
+                                     llvm::StringRef predicate) const {
+    int64_t bound = 0;
+    if (predicate == "lt") {
+      if (difference.constant >= 0 ||
+          difference.constant == std::numeric_limits<int64_t>::min())
+        return {};
+      bound = -difference.constant;
+    } else if (predicate == "le") {
+      if (difference.constant == std::numeric_limits<int64_t>::min())
+        return {};
+      bound = 1 - difference.constant;
+    } else {
+      return {};
+    }
+    if (bound <= 0)
+      return {};
+    // The lane coefficient identifies the axis. The program-id coefficient was
+    // normalized to zero for a one-block axis before this point, so it is
+    // checked against the form normalization leaves rather than the raw block.
+    int axis = -1;
+    for (unsigned lane = 0; lane != 2; ++lane) {
+      if (difference.coefficients[3 + lane] == 0)
+        continue;
+      if (axis >= 0 || difference.coefficients[3 + lane] != 1)
+        return {};
+      axis = static_cast<int>(lane);
+    }
+    if (axis < 0)
+      return {};
+    for (unsigned program = 0; program != 3; ++program) {
+      if (program == static_cast<unsigned>(axis))
+        continue;
+      if (difference.coefficients[program] != 0)
+        return {};
+    }
+    const int64_t expectedProgram =
+        program.launch.grid[axis] == 1 ? 0 : program.launch.block[axis];
+    if (difference.coefficients[axis] != expectedProgram)
+      return {};
+    Affine expression = difference;
+    expression.constant = 0;
+    return LaneBound{normalize(expression, shape), bound};
+  }
+  std::optional<Affine>
+  divide(const Affine &input, int64_t divisor, const Shape &shape,
+         bool remainder, bool *provisional = nullptr,
+         std::optional<Affine> *residueExpression = nullptr) const {
+    if (provisional)
+      *provisional = false;
+    if (divisor <= 0)
+      return {};
     Affine quotient, residue;
     quotient.constant = input.constant / divisor;
     residue.constant = input.constant % divisor;
@@ -404,20 +637,73 @@ private:
       residue.coefficients[i] = input.coefficients[i] % divisor;
     }
     auto bounds = interval(residue, shape);
-    if (!bounds || bounds->first < 0 || bounds->second >= divisor)
+    if (!bounds || bounds->first < 0)
       return {};
+    // A residue that can leave [0, divisor) is the true remainder only on
+    // lanes an upper-bound mask selects. Keep the coefficient-wise answer and
+    // record the bound the consuming load/store must prove. The mask terms the
+    // tail contract accepts are exactly such bounds.
+    if (bounds->second >= divisor) {
+      if (residueExpression)
+        *residueExpression = normalize(residue, shape);
+      if (provisional)
+        *provisional = true;
+    }
     return normalize(remainder ? residue : quotient, shape);
   }
-  bool inBounds(const Address &address, const Shape &shape) const {
-    auto rows = interval(address.rows, shape),
-         cols = interval(address.columns, shape);
-    const auto &tensor = program.tensors[address.port];
-    return rows && cols && rows->first >= 0 && cols->first >= 0 &&
-           rows->second < tensor.shape[0] && cols->second < tensor.shape[1];
+  /// The mask a rounded launch must declare: for every axis whose blocks leave
+  /// a remainder, `program_id[axis] * block + lane < extent`. A divisible axis
+  /// contributes a constant-true term and disappears.
+  MaskFacts expectedMask() const {
+    const auto &shape = program.tensors.front().shape;
+    const Shape blockShape{program.launch.block[0], program.launch.block[1]};
+    MaskFacts expected = constantMask(true);
+    for (unsigned axis = 0; axis != 2; ++axis) {
+      int64_t span = 0;
+      if (!multiply(program.launch.grid[axis], program.launch.block[axis],
+                    span) ||
+          span == shape[axis])
+        continue;
+      Affine lane;
+      lane.coefficients[axis] = program.launch.block[axis];
+      lane.coefficients[3 + axis] = 1;
+      expected = andMasks(
+          expected,
+          boundsMask({LaneBound{normalize(lane, blockShape), shape[axis]}}));
+    }
+    return expected;
+  }
+  bool maskMatchesExpected(const MaskFacts &mask) const {
+    MaskFacts expected = expectedMask();
+    if (mask.kind == MaskFacts::Kind::Unknown ||
+        expected.kind == MaskFacts::Kind::Unknown)
+      return false;
+    if (mask.kind != expected.kind)
+      return false;
+    if (mask.kind == MaskFacts::Kind::Constant)
+      return mask.constant == expected.constant;
+    if (mask.bounds.size() != expected.bounds.size())
+      return false;
+    return llvm::all_of(mask.bounds, [&](const LaneBound &term) {
+      return containsBound(expected.bounds, term);
+    });
+  }
+  /// Discharge every decomposed row-major index: the mask must contain the
+  /// exact term `residue < divisor` the provisional division recorded.
+  bool requirementsSatisfied(const Address &address,
+                             const MaskFacts &mask) const {
+    for (const ResidueRequirement &requirement : address.requiresMaskBound) {
+      bool proven = llvm::any_of(mask.bounds, [&](const LaneBound &term) {
+        return term.expression == requirement.expression &&
+               term.bound == requirement.divisor;
+      });
+      if (!proven)
+        return false;
+    }
+    return true;
   }
   bool rectangular(const Address &address, const Shape &shape) const {
-    if (shape != Shape{program.launch.block[0], program.launch.block[1]} ||
-        !inBounds(address, shape))
+    if (shape != Shape{program.launch.block[0], program.launch.block[1]})
       return false;
     Affine rows, cols;
     rows.coefficients[0] = shape[0];
@@ -476,6 +762,17 @@ llvm::Expected<ImportedProgram> importProgram(const FrontendRequest &request,
                 : arith::AddFOp::create(nested, nestedLoc, a, b).getResult();
         linalg::YieldOp::create(nested, nestedLoc, result);
       });
+  // The tail proof is an explicit source fact: the rounded launch's mask is
+  // exactly the in-bounds predicate and every active lane is written once. The
+  // adapter may realize a non-dividing tile only when it can see that fact, and
+  // it records the block the proof was made for so a retuned candidate cannot
+  // inherit it.
+  if (proof->tail) {
+    generic->setAttr("llk.tail_policy", builder.getStringAttr("masked-edge"));
+    generic->setAttr(
+        "llk.tail_block",
+        DenseI64ArrayAttr::get(&context, {proof->block0, proof->block1}));
+  }
   func::ReturnOp::create(builder, loc, generic.getResults());
   (*imported.module)
       ->setAttr("llk.frontend.request",
@@ -506,6 +803,14 @@ llvm::Expected<ImportedProgram> importProgram(const FrontendRequest &request,
     parameter.kind = "integer";
     parameter.role = "axis:d" + std::to_string(axis);
     parameter.choices.emplace_back(program.launch.block[axis]);
+    imported.space.params.push_back(std::move(parameter));
+  }
+  if (proof->tail) {
+    mlir::llk::perf::SearchParam parameter;
+    parameter.name = "frontend_tail_policy";
+    parameter.kind = "tail_policy";
+    parameter.role = "tail_policy";
+    parameter.choices.emplace_back(std::string("masked-edge"));
     imported.space.params.push_back(std::move(parameter));
   }
   for (size_t i = 0; i < program.tensors.size(); ++i) {

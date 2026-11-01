@@ -24,7 +24,13 @@ def _options(options, changes):
 
 
 def _check_launch(binding):
-    """Require the launch to cover every public tensor domain exactly."""
+    """Require whole blocks to cover every public tensor domain.
+
+    A divisible domain needs exactly ``shape / block`` blocks. A rounded domain
+    needs ``ceil(shape / block)`` blocks: the extra lanes are the declared tail,
+    which the native importer must prove safe from the kernel's own mask before
+    any code is emitted. Partial or over-provisioned grids are still invalid.
+    """
     grid, block = binding.launch.grid, binding.launch.block
     if grid[2] != 1 or block[2] != 1:
         raise TensorContractError(
@@ -33,15 +39,16 @@ def _check_launch(binding):
             code="invalid_launch_coverage",
         )
     for spec in binding.tensors:
-        if (
-            grid[0] * block[0] != spec.shape[0]
-            or grid[1] * block[1] != spec.shape[1]
-        ):
-            raise TensorContractError(
-                f"launch grid {grid} with block {block} does not cover tensor "
-                f"{spec.name} of shape {spec.shape}",
-                code="invalid_launch_coverage",
-            )
+        for axis in (0, 1):
+            covered = grid[axis] * block[axis]
+            whole_blocks = -(-spec.shape[axis] // block[axis])
+            if covered < spec.shape[axis] or grid[axis] != whole_blocks:
+                raise TensorContractError(
+                    f"launch grid {grid} with block {block} does not cover "
+                    f"tensor {spec.name} of shape {spec.shape} with whole "
+                    "blocks",
+                    code="invalid_launch_coverage",
+                )
 
 
 def _providers(binding):
