@@ -7,10 +7,12 @@ Without Torch, import succeeds and registration is a no-op.
 """
 
 from ._dynamo_backend import LLKBackend, get_backend, register
+from ._ops import register_operators
 
 register()
+register_operators()
 
-__all__ = ["LLKBackend", "get_backend", "register"]
+__all__ = ["LLKBackend", "get_backend", "register", "register_operators"]
 
 _LAZY_EXPORTS = (
     "UnsupportedFXError",
