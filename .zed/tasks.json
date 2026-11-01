@@ -3,5 +3,10 @@
     "label": "Build LLK tools (Debug)",
     "command": "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DLLVM_PROJECT_BUILD_DIR=\"$HOME/Workspace/Projects/llvm-project/build\" && cmake --build build --target llk-compile llk-opt llk-tune --parallel 4",
     "cwd": "$ZED_WORKTREE_ROOT"
+  },
+  {
+    "label": "Build LLK tools + dynamic analysis machine (Debug)",
+    "command": "cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DLLVM_PROJECT_BUILD_DIR=\"$HOME/Workspace/Projects/llvm-project/build\" && cmake --build build --target llk-compile llk-opt llk-tune --parallel 4 && python3 - <<'PY'\nfrom pathlib import Path\n\noutput = Path(\"build/tutorial\")\noutput.mkdir(parents=True, exist_ok=True)\ntext = Path(\"machines/x86-avx2-v2.yaml\").read_text()\ntext = text.replace(\"capacity_bytes: 8192\", \"capacity_bytes: 1048576\")\ntext = text.replace(\"capacity_bytes: 32768\", \"capacity_bytes: 1048576\")\nfor name, source, destination in (\n    (\"dram_to_acc\", \"dram.0\", \"acc.0\"),\n    (\"acc_to_dram\", \"acc.0\", \"dram.0\"),\n):\n    text += (\n        f\"  - id: {name}.0\\n\"\n        f\"    source: {source}\\n\"\n        f\"    destination: {destination}\\n\"\n        \"    bandwidth_bytes_per_cycle: 64\\n\"\n        \"    latency_cycles: 220\\n\"\n        \"    transaction_bytes: 64\\n\"\n        \"    transfer_engines: [dma.0]\\n\"\n    )\n(output / \"dynamic-machine.yaml\").write_text(text)\nPY\n",
+    "cwd": "$ZED_WORKTREE_ROOT"
   }
 ]

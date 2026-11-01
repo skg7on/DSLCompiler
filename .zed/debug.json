@@ -67,6 +67,30 @@
     "stopOnEntry": false
   },
   {
+    "label": "Debug llk-compile (dynamic shape → Micro → search → LLVM IR)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "build": "Build LLK tools (Debug)",
+    "program": "$ZED_WORKTREE_ROOT/build/bin/llk-compile",
+    "args": [
+      "--mapping-target=x86-avx2",
+      "--mapping-root=$ZED_WORKTREE_ROOT",
+      "--mapping-stop=executable",
+      "--mapping-backend=reference",
+      "$ZED_WORKTREE_ROOT/docs/manual/source/examples/dynamic-matmul.mlir"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "preRunCommands": [
+      "breakpoint set --name 'runMicroExport'",
+      "breakpoint set --name 'mlir::llk::mapping::CoveringSearch::search()'",
+      "breakpoint set --name 'mlir::llk::mapping::finalizeStoragePlan'",
+      "breakpoint set --name 'llk::compileMappedKernel'",
+      "breakpoint set --name 'llk::prepareMappedKernelForInvocation'",
+      "breakpoint set --name 'mlir::translateModuleToLLVMIR'"
+    ],
+    "stopOnEntry": false
+  },
+  {
     "label": "Debug llk-tune (predicted Micro search)",
     "adapter": "CodeLLDB",
     "request": "launch",
@@ -85,6 +109,36 @@
       "--output=$ZED_WORKTREE_ROOT/build/llk-tune-debug.schedule.yaml"
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
+    "stopOnEntry": true
+  },
+  {
+    "label": "Debug llk-tune (dynamic shape profile sampling)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "build": "Build LLK tools + dynamic analysis machine (Debug)",
+    "program": "$ZED_WORKTREE_ROOT/build/bin/llk-tune",
+    "args": [
+      "--input=$ZED_WORKTREE_ROOT/test/Tuning/Inputs/issue198/dynamic_matmul.mlir",
+      "--machine=$ZED_WORKTREE_ROOT/build/tutorial/dynamic-machine.yaml",
+      "--shape-profile=$ZED_WORKTREE_ROOT/docs/manual/source/examples/dynamic-shape-profile.json",
+      "--mapping-target=x86-avx2",
+      "--mapping-root=$ZED_WORKTREE_ROOT",
+      "--mapping-mode=exact",
+      "--mapping-backend=reference",
+      "--candidate-source=semantic",
+      "--source-symbol=matmul",
+      "--top-k=1",
+      "--mapping-report=$ZED_WORKTREE_ROOT/build/tutorial/dynamic-tune.json",
+      "--candidate-artifacts=$ZED_WORKTREE_ROOT/build/tutorial/dynamic-candidates",
+      "--output=$ZED_WORKTREE_ROOT/build/tutorial/dynamic.schedule.yaml"
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "preRunCommands": [
+      "breakpoint set --name 'mlir::llk::shape::bindShapeValues'",
+      "breakpoint set --name 'mlir::llk::mapping::materializeShapeSample'",
+      "breakpoint set --name 'mlir::llk::mapping::evaluateSampledPlan'",
+      "breakpoint set --name 'mlir::llk::mapping::finalizeStoragePlan'"
+    ],
     "stopOnEntry": true
   }
 ]
