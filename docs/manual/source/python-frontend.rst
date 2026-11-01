@@ -317,15 +317,34 @@ the same coverage proof. ``@llk.jit`` and ``@llk.jit()`` both work; keyword
 options become a frozen ``CompileOptions``, for example
 ``@llk.jit(backend="reference", config_root=..., config_files=...)``.
 
-``kernel.compile(*args, grid=...)`` returns a ``CompiledKernel`` without
-invoking. It exposes ``report`` (the checked ``CompilationReport`` including
-``backend`` and ``source_adapter``), ``invoke(inputs, outputs)``, ``inspect``
-for the available native stages, and idempotent ``close``; it is also a context
-manager. ``llk.compile_request(request)`` provides the same handle for an
-explicit ``CompileRequest``. Every ``invoke`` holds a lock for the whole native
-call, so ``close`` waits for an in-flight invocation and later calls raise
-``ExecutionError`` with ``invalid_frontend_handle``. The caller must close a
-precompiled handle; a plain decorator call compiles, invokes and closes itself.
+``kernel.compile(*args, grid=...)`` returns a ``CompiledKernelLease`` without
+invoking. A lease is a ``CompiledKernel`` and exposes ``report`` (the checked
+``CompilationReport`` including ``backend``, ``source_adapter``,
+``inspection_stages``, ``native_counters`` and ``native_environment``),
+``invoke(inputs, outputs)``, ``inspect(stage)``, the ``frontend_ir``, ``llkir``
+and ``micro_ir`` inspection properties, and idempotent ``close``; it is also a
+context manager. ``asm`` is optional and raises ``UnsupportedFeatureError``
+with ``inspection_unavailable``. ``llk.compile_request(request)`` compiles an
+explicit ``CompileRequest`` directly and bypasses the cache. Every
+``invoke`` holds a lock for the whole native call, so ``close`` waits for an
+in-flight invocation and later calls raise ``ExecutionError`` with
+``invalid_frontend_handle``. The caller must close a lease; a plain decorator
+call obtains a lease, invokes it and closes it.
+
+Each ``JitFunction`` owns a process-local bounded LRU specialization cache
+(default 128 entries). A lookup identity contains the canonical request bytes
+(source, captured constants, concrete tensor signature, constexprs, launch,
+numerical policy and the target configuration snapshot by content) plus the
+loaded native environment: ABI version, library path and file identity. A
+SHA-256 digest indexes the buckets but a hit always compares the full identity,
+so a digest collision compiles a separate artifact. Concurrent misses for one
+identity share a single compilation; a failed compilation is discarded rather
+than cached, so a later call retries. ``kernel.cache_info()`` returns an
+immutable record with ``hits``, ``misses``, ``compilations`` and ``evictions``.
+Leases own a strong reference independently of cache membership: eviction drops
+only the cache's reference, so an active lease keeps invoking the same native
+executable safely, and changing the target configuration or native library
+cannot reuse a handle compiled for different content.
 
 Inputs and outputs are caller-owned providers wrapped in
 ``TensorArgument(TensorSpec, provider)``. A provider must expose the Python
@@ -364,11 +383,15 @@ tests exercise the same kernel, adapter and launch path at 16×16/8×16 tiled an
    export LLK_FRONTEND_LIBRARY=$PWD/build/lib/libLLKFrontendCAPI.dylib
    "$LLK_PYTHON" -m pytest test/python/test_native_jit.py \
      test/python/test_buffer_contract.py test/python/test_launch_contract.py -q
+   "$LLK_PYTHON" -m pytest test/python/test_specialization_cache.py \
+     test/python/test_jit_lifetime.py test/python/test_inspection.py -q
 
 Use ``libLLKFrontendCAPI.so`` on Linux. The library requires a build configured
 with ``-DLLK_BUILD_PYTHON_CAPI=ON``. See the
 :source:`PF08 verification record <docs/reviews/2026-11-01-pf08-python-native-jit.md>`
-for exact commands, counts, buffer guards and native identities.
+for exact commands, counts, buffer guards and native identities, and the
+:source:`PF09 verification record <docs/reviews/2026-11-01-pf09-python-specialization-cache.md>`
+for cache, lease and inspection evidence.
 
 Legacy Triton safety boundary
 -----------------------------

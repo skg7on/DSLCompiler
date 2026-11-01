@@ -73,12 +73,18 @@ state or replace another owner's backend. The `llk` Dynamo backend raises
 registration or eager execution as LLK compilation.
 
 PF04/PF05/PF06 deliver typed capture, checked native import and shared native
-compilation; PF07 adds the versioned `LLKFrontendCAPI` and PF08 the Python
-buffer/launch bridge. With `LLK_FRONTEND_LIBRARY` pointing at a
+compilation; PF07 adds the versioned `LLKFrontendCAPI`, PF08 the Python
+buffer/launch bridge and PF09 the bounded full-identity specialization cache and
+artifact inspection. With `LLK_FRONTEND_LIBRARY` pointing at a
 `-DLLK_BUILD_PYTHON_CAPI=ON` build, `@llk.jit` kernels execute synchronously over
 caller-owned buffer-protocol providers for the strict-f32 rank-two add/multiply
 subset; the `kernel[grid]` launch form equals the `grid=` keyword form. Missing grid,
-partial coverage and invalid buffers fail before JIT entry. The package
+partial coverage and invalid buffers fail before JIT entry. `JitFunction` owns a
+bounded LRU (default 128) keyed by canonical request bytes plus the loaded native
+environment; `kernel.cache_info()` reports hits/misses/compilations/evictions,
+leases keep native handles alive across eviction, and the compiled artifact
+exposes `frontend_ir`/`llkir`/`micro_ir` inspection (`asm` is explicitly
+unavailable). The package
 `capabilities()` report stays compiler-free. The stock x86-avx2 machine profile
 cannot compile a 32×64 launch with 8×16 blocks (shared storage capacity), which
 is a separate mapping follow-up. Inductor, training, real upstream Triton and

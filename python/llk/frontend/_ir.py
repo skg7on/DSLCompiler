@@ -419,15 +419,31 @@ class CompilationReport:
     stages: tuple[str, ...]
     backend: str = "reference"
     source_adapter: str = "linalg-elementwise-v1"
+    inspection_stages: tuple[str, ...] = ()
+    native_counters: Mapping = field(default_factory=dict)
+    native_environment: Mapping = field(default_factory=dict)
 
     def __post_init__(self):
         for name in self.__dataclass_fields__:
             value = getattr(self, name)
             if name.endswith("_count"):
                 integer(value, name, minimum=0)
-            elif name == "stages":
+            elif name in ("stages", "inspection_stages"):
                 if not isinstance(value, (tuple, list)):
-                    fail("stages must be an ordered array")
-                object.__setattr__(self, name, tuple(text(x, "stage") for x in value))
+                    fail(f"{name} must be an ordered array")
+                object.__setattr__(
+                    self, name, tuple(text(x, "stage") for x in value)
+                )
+            elif name in ("native_counters", "native_environment"):
+                # Native counters and environment identity come from the
+                # compiled artifact; never infer them from requested options.
+                if not isinstance(value, Mapping):
+                    fail(f"{name} must be a mapping")
+                for key, item in value.items():
+                    if not isinstance(key, str) or not key:
+                        fail(f"{name} keys must be nonempty strings")
+                    if not isinstance(item, (str, int)):
+                        fail(f"{name} values must be native counters or identifiers")
+                object.__setattr__(self, name, MappingProxyType(dict(value)))
             else:
                 text(value, name)

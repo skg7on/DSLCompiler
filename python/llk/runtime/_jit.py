@@ -9,6 +9,7 @@ from llk._errors import TensorContractError, UnsupportedFeatureError
 from llk.frontend import CompileOptions, CompileRequest, bind_kernel
 from llk.language._ast_compiler import compile_kernel
 
+from ._cache import CompilationCache
 from ._ffi import CompiledKernel, compile_request
 
 
@@ -82,9 +83,14 @@ class JitFunction:
     def __init__(self, fn: Callable, options=None, **changes):
         self._fn = fn
         self._options = _options(options, changes)
+        self._cache = CompilationCache()
 
     def __getitem__(self, grid):
         return _GridLauncher(self, grid)
+
+    def cache_info(self):
+        """Return this kernel's cache hits/misses/compilations/evictions."""
+        return self._cache.info()
 
     def __call__(self, *args, grid=None, **kwargs):
         compiled, providers = self._build(args, kwargs, grid)
@@ -94,10 +100,13 @@ class JitFunction:
             compiled.close()
 
     def compile(self, *args, grid=None, **kwargs) -> CompiledKernel:
-        """Compile without invoking; the caller owns the returned handle.
+        """Compile without invoking; the caller owns the returned lease.
 
-        Tensor arguments may be metadata-only ``TensorSpec`` records here; the
-        actual provider buffers are supplied to ``invoke``.
+        The full request identity is looked up in this kernel's bounded cache
+        first. A hit returns another strong lease on the cached native
+        executable, so closing it never frees an artifact the cache still
+        owns. Tensor arguments may be metadata-only ``TensorSpec`` records
+        here; the actual provider buffers are supplied to ``invoke``.
         """
         compiled, _ = self._build(args, kwargs, grid, require_providers=False)
         return compiled
@@ -113,7 +122,9 @@ class JitFunction:
         _check_launch(binding)
         program = compile_kernel(self._fn, binding)
         options = replace(binding.options, numerical_contract=program.numerical_contract)
-        compiled = compile_request(CompileRequest(program, options))
+        compiled = self._cache.get_or_compile(
+            CompileRequest(program, options), compile_request
+        )
         try:
             providers = _providers(binding) if require_providers else None
         except BaseException:

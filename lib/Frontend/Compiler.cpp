@@ -323,6 +323,15 @@ compileFrontend(const FrontendRequest &request) {
       {"execution_identity", compiled->executable->executionIdentity()},
       {"stages",
        llvm::json::Array{"frontend", "llk", "micro", "lowered", "executable"}},
+      {"inspection_stages", llvm::json::Array{"frontend", "llk", "micro"}},
+      // The environment that produced this artifact. Python's cache keys
+      // lookups on the loaded-library identity and records this snapshot with
+      // the final candidate/plan identity so a handle is never reused across
+      // toolchains.
+      {"native_environment",
+       llvm::json::Object{
+           {"compiler", LLK_COMPILER_VERSION},
+           {"host_triple", llvm::sys::getDefaultTargetTriple()}}},
       {"capabilities",
        native::framework::capabilityReceiptToJson(capabilities)},
       {"plan_report", selected.planReport},

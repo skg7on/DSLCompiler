@@ -137,6 +137,35 @@ def library_path():
     return _LIBRARY_PATH
 
 
+def native_environment():
+    """Identity of the loaded native environment, queried before cache lookup.
+
+    A specialization cache may only reuse a handle compiled by the same native
+    toolchain. The loaded library, its ABI version and its on-disk content
+    together identify that environment for a process-local cache; the final
+    candidate/plan identity is recorded in the artifact's report.
+    """
+    library()
+    path = Path(_LIBRARY_PATH)
+    try:
+        status = path.stat()
+    except OSError as error:
+        raise UnsupportedFeatureError(
+            f"cannot inspect LLKFrontendCAPI at {path}: {error}",
+            code="native_backend_unavailable",
+        ) from error
+    return json.dumps(
+        {
+            "api_version": API_VERSION,
+            "library": str(path.resolve()),
+            "size": status.st_size,
+            "mtime_ns": status.st_mtime_ns,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _string_value(value):
     if not value.data or not value.length:
         return ""
@@ -270,6 +299,9 @@ def _parse_report(text):
             stages=tuple(data["stages"]),
             backend=str(data["backend"]),
             source_adapter=str(data["source_adapter"]),
+            inspection_stages=tuple(data["inspection_stages"]),
+            native_counters=dict(data["search"]),
+            native_environment=dict(data["native_environment"]),
         )
     except (TypeError, ValueError, KeyError) as error:
         raise CompilationError(
@@ -279,21 +311,78 @@ def _parse_report(text):
         ) from error
 
 
+class _ExecutableHandle:
+    """Shared ownership of one native executable.
+
+    ``references`` counts every compiled-kernel wrapper that owns the handle:
+    the cache's owner plus every lease it handed out. The native executable is
+    released only with the last reference, so eviction can drop the cache's
+    reference without freeing storage an active lease is still using. This
+    refcount lock never guards a native call; wrappers serialize their own
+    invocations so closing the cache's unused wrapper cannot wait on a lease.
+    """
+
+    __slots__ = ("_lock", "_handle", "_references")
+
+    def __init__(self, handle):
+        self._lock = threading.Lock()
+        self._handle = handle
+        self._references = 1
+
+    def retain(self):
+        with self._lock:
+            if self._handle is None:
+                raise ExecutionError(
+                    "compiled kernel is closed", code="invalid_frontend_handle"
+                )
+            self._references += 1
+
+    def release(self):
+        with self._lock:
+            self._references -= 1
+            handle = None
+            if self._references == 0:
+                handle = self._handle
+                self._handle = None
+        if handle is not None:
+            native_release(handle)
+
+    def native_handle(self):
+        with self._lock:
+            if self._handle is None:
+                raise ExecutionError(
+                    "compiled kernel is closed", code="invalid_frontend_handle"
+                )
+            return self._handle
+
+
 class CompiledKernel:
     """An owned native executable and the port metadata it was compiled for.
 
-    ``invoke`` holds the instance lock for the whole ctypes call, so ``close``
-    cannot release the handle underneath an in-flight invocation and concurrent
-    calls are serialized. Closing twice is idempotent.
+    ``invoke`` holds the wrapper lock for the whole ctypes call, so ``close``
+    cannot release this wrapper's reference underneath an in-flight invocation
+    and calls through one wrapper are serialized. Closing twice is idempotent.
     """
 
     def __init__(self, handle, report, input_specs, output_specs):
-        self._handle = handle
+        self._executable = _ExecutableHandle(handle)
         self._lock = threading.RLock()
         self._closed = False
         self._report = report
         self._input_specs = tuple(input_specs)
         self._output_specs = tuple(output_specs)
+
+    @classmethod
+    def _shared(cls, executable, report, input_specs, output_specs):
+        """Wrap an already-retained executable; the caller owns the reference."""
+        wrapper = cls.__new__(cls)
+        wrapper._executable = executable
+        wrapper._lock = threading.RLock()
+        wrapper._closed = False
+        wrapper._report = report
+        wrapper._input_specs = tuple(input_specs)
+        wrapper._output_specs = tuple(output_specs)
+        return wrapper
 
     @property
     def report(self):
@@ -302,6 +391,41 @@ class CompiledKernel:
     @property
     def closed(self):
         return self._closed
+
+    @property
+    def frontend_ir(self):
+        """Canonical frontend request text captured by this artifact."""
+        return self.inspect("frontend")
+
+    @property
+    def llkir(self):
+        """Structured source after native import."""
+        return self.inspect("llk")
+
+    @property
+    def micro_ir(self):
+        """Verified bound MicroIR for the selected plan."""
+        return self.inspect("micro")
+
+    @property
+    def asm(self):
+        """Disassembly is optional; this frontend reports it as unavailable."""
+        return self.inspect("asm")
+
+    def lease(self):
+        """Retain an independent reference to the same native executable."""
+        with self._lock:
+            if self._closed:
+                raise ExecutionError(
+                    "compiled kernel is closed", code="invalid_frontend_handle"
+                )
+            self._executable.retain()
+        return CompiledKernelLease._shared(
+            self._executable,
+            self._report,
+            self._input_specs,
+            self._output_specs,
+        )
 
     def invoke(self, inputs, outputs):
         inputs, outputs = tuple(inputs), tuple(outputs)
@@ -314,7 +438,11 @@ class CompiledKernel:
                 inputs, self._input_specs, outputs, self._output_specs
             )
             try:
-                native_invoke(self._handle, invocation.inputs, invocation.outputs)
+                native_invoke(
+                    self._executable.native_handle(),
+                    invocation.inputs,
+                    invocation.outputs,
+                )
             finally:
                 invocation.release()
 
@@ -324,16 +452,14 @@ class CompiledKernel:
                 raise ExecutionError(
                     "compiled kernel is closed", code="invalid_frontend_handle"
                 )
-            return native_inspect(self._handle, stage)
+            return native_inspect(self._executable.native_handle(), stage)
 
     def close(self):
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            handle = self._handle
-            self._handle = None
-            native_release(handle)
+            self._executable.release()
 
     def __enter__(self):
         return self
@@ -351,6 +477,15 @@ class CompiledKernel:
     def __repr__(self):
         state = "closed" if self._closed else "open"
         return f"<CompiledKernel {state} backend={self._report.backend}>"
+
+
+class CompiledKernelLease(CompiledKernel):
+    """A caller-owned reference to a possibly cache-owned executable.
+
+    Closing a lease releases only that reference. The executable stays alive
+    while the cache or another lease still owns it, so a cache hit never hands
+    out an artifact that eviction can free under the caller.
+    """
 
 
 def compile_request(request):
