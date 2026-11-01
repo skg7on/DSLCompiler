@@ -136,6 +136,13 @@ requires the selected edge realization (`selected_group_count > 0`,
 `reference_group_count == 0`, exact values and intact guards) or no
 compilation at all.
 
+The qualified CI lane provided that evidence. In PR #276 run `41270469108` the
+x86_64 AVX2 host passed
+`FrontendTails.SelectedTargetRealizesEdgesOrReportsUnavailableHost` (0.35 s),
+so the selected backend realized the rounded 33x65 and 1x7 edge kernels with
+exact outputs, intact guards, `selected_group_count > 0` and
+`reference_group_count == 0` -- no reference fallback.
+
 ## Full suite
 
 The full serial CTest run registers 1,682 cases and passes 1,678 (99%). The four
@@ -162,3 +169,8 @@ Local toolchain: LLVM/MLIR 24.0.0git, Homebrew clang 20.1.8, macOS arm64
 the AVX2 machine profile. CI is the x86_64 AVX2 lane that can execute the
 selected path; the local selected check can only assert the explicit
 unavailable-host rejection.
+
+CI run `41270469108` (PR #276, Ubuntu 24.04 x86_64 AVX2, LLVM/MLIR 22.1.8)
+passed every job: license headers, docs html, build and test, selected AVX2
+acceptance, coverage and CodeQL. Its `ctest` run reported 100% -- 1,683 passed,
+0 failed -- with `FrontendTails.*` included as CTest 1658-1661.
