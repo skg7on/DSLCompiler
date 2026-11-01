@@ -18,7 +18,7 @@
 from main `29b00eb` and merged in [PR #242](https://github.com/skg7on/DSLCompiler/pull/242)
 at `08761f2`; see [PF03 evidence](../../reviews/2026-10-23-pf03-typed-frontend.md).
 PF04's checked steps record branch implementation and verification in the
-[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09 implements the bounded full-identity specialization cache, strong leases and real-artifact inspection; see the [PF09 evidence](../../reviews/2026-11-01-pf09-python-specialization-cache.md). PF10 implements proved bounded elementwise tails with static edge rectangles; see the [PF10 evidence](../../reviews/2026-11-01-pf10-python-frontend-tails.md). PF11 implements counted-contraction recovery and the uniform-f32 fused SwiGLU contract; see the [PF11 evidence](../../reviews/2026-11-01-pf11-python-frontend-contractions.md). PF12–PF20 remain proposed and unchecked. Paths in those later tasks describe
+[PF04 evidence](../../reviews/2026-10-23-pf04-typed-ast.md). PF05 implements checked native structured import; see the [PF05 evidence](../../reviews/2026-10-23-pf05-native-import.md). PF06 implements shared native compilation/invocation; see the [PF06 evidence](../../reviews/2026-10-24-pf06-native-compilation.md). PF07 adds the versioned C ABI in commit `ab7a33c`; see the [PF07 evidence](../../reviews/2026-10-24-pf07-frontend-capi.md). PF08 implements the Python buffer adapters, both launch forms and synchronous native invocation; see the [PF08 evidence](../../reviews/2026-11-01-pf08-python-native-jit.md). PF09 implements the bounded full-identity specialization cache, strong leases and real-artifact inspection; see the [PF09 evidence](../../reviews/2026-11-01-pf09-python-specialization-cache.md). PF10 implements proved bounded elementwise tails with static edge rectangles; see the [PF10 evidence](../../reviews/2026-11-01-pf10-python-frontend-tails.md). PF11 implements counted-contraction recovery and the uniform-f32 fused SwiGLU contract; see the [PF11 evidence](../../reviews/2026-11-01-pf11-python-frontend-contractions.md). PF12 exposes the shared frontend service through the compiler CLI's explicit `frontend-json` input mode; see the [PF12 evidence](../../reviews/2026-11-01-pf12-frontend-cli.md). PF13–PF20 remain proposed and unchecked. Paths in those later tasks describe
 future files unless marked Modify.
 
 **Current local environment:** use the project `.venv` (Python 3.14.8 / Torch
@@ -371,7 +371,7 @@ Delivered envelope, stated as limitations rather than assumed support:
 
 **Interfaces:** Add `--input-format=mlir|frontend-json`, default `mlir`; frontend-json parses a complete CompileRequest and uses `compileFrontend`. Preserve existing emit/mapping flags for MLIR; conflicting JSON/CLI option sources fail `conflicting_compile_options` rather than silently overriding one another.
 
-- [ ] Add CLI tests for registered IR inspection, compile reports and invalid JSON/version/opcode. Legacy `tt.*` input in default production mode must have an actionable unsupported-input message. No unregistered-dialect escape flag is introduced as production Triton support.
+- [x] Add CLI tests for registered IR inspection, compile reports and invalid JSON/version/opcode. Legacy `tt.*` input in default production mode must have an actionable unsupported-input message. No unregistered-dialect escape flag is introduced as production Triton support.
 
 Pinned regression assertions (local test fixture names):
 
@@ -380,10 +380,12 @@ assert cli_report["abi_hash"] == capi_report["abi_hash"]
 assert cli_report["plan_id"] == capi_report["plan_id"]
 ```
 
-- [ ] Run `ctest --test-dir build -R FrontendCLI --output-on-failure`; confirm the new input mode initially fails.
-- [ ] Route JSON through the same native service as Python, including target/identity and source-selection checks. Remove misleading implicit Triton detection from the production path; preserve legacy fixtures in llk-opt's explicitly experimental flow.
-- [ ] Rerun CLI tests; the same canonical request via CLI and C API must report equal workload/target/plan/ABI identities, ignoring process-local handles and timings.
-- [ ] Commit `feat: route frontend JSON through the shared compiler service`.
+> **Delivered by [PR #278](https://github.com/skg7on/DSLCompiler/pull/278)** (implementation `f3cf8cb`); evidence in [PF12 record](../../reviews/2026-11-01-pf12-frontend-cli.md). The C API comparison is registered when `LLK_BUILD_PYTHON_CAPI=ON`, so the identity check is not replaced with a skip.
+
+- [x] Run `ctest --test-dir build -R FrontendCLI --output-on-failure`; confirm the new input mode initially fails.
+- [x] Route JSON through the same native service as Python, including target/identity and source-selection checks. Remove misleading implicit Triton detection from the production path; preserve legacy fixtures in llk-opt's explicitly experimental flow.
+- [x] Rerun CLI tests; the same canonical request via CLI and C API must report equal workload/target/plan/ABI identities, ignoring process-local handles and timings.
+- [x] Commit `feat: route frontend JSON through the shared compiler service`.
 
 ### PF13: Implement strict normalized-ATen Dynamo compilation
 
