@@ -86,20 +86,28 @@ class LLKBackend:
             return _fx_importer.compile_graph(graph, inputs, options, cache)
 
         def training_compiler(graph, inputs):
-            # AOTAutograd selects the forward compiler only when autograd is
-            # required. PF16 registers the trained formulas; until then this is
-            # a concrete rejection instead of silently running an eager graph
-            # or narrowing parameters to inference.
-            raise UnsupportedFeatureError(
-                "LLK compiles inference graphs only; requires_grad inputs and "
-                "training graphs need the registered backward path (PF16)",
-                code="unsupported_training_contract",
-                stage="compile",
+            # AOTAutograd selects this compiler only when autograd is required.
+            # Its graph also returns saved primals, which pass through unchanged.
+            return _fx_importer.compile_graph(
+                graph,
+                inputs,
+                options,
+                cache,
+                allow_training=True,
+                allow_passthrough=True,
+                phase="forward",
             )
 
-        return _compat.aot_autograd_compiler(training_compiler, compiler)(
-            gm, example_inputs
-        )
+        def backward_compiler(graph, inputs):
+            from . import _autograd
+
+            return _autograd.compile_backward_graph(
+                graph, inputs, options, cache
+            )
+
+        return _compat.aot_autograd_compiler(
+            training_compiler, compiler, backward_compiler
+        )(gm, example_inputs)
 
 
 # reload retains the module dictionary. Preserve the lock and callable: a

@@ -184,8 +184,6 @@ def _operand_reason(node, values, materialized):
         return UNSUPPORTED_SHAPE
     if not value.is_contiguous() or int(value.storage_offset()) != 0:
         return UNSUPPORTED_LAYOUT
-    if value.requires_grad:
-        return UNSUPPORTED_TRAINING
     if node.op == "placeholder" or node in materialized:
         return None
     # A value computed by anything other than an accepted LLK region is not
@@ -265,6 +263,14 @@ def _region_reason(region, values, materialized):
     for reason in reasons:
         if reason is not None:
             return reason
+
+    if region.kind == "swiglu" and any(
+        values[operand].requires_grad for operand in region.operands
+    ):
+        # No gradient formula exists for the fused SwiGLU contract. Declining
+        # the region leaves it to Inductor and records the reason; it is never
+        # silently routed through an LLK training path.
+        return UNSUPPORTED_TRAINING
 
     shapes = [_shape(values[operand]) for operand in region.operands]
     if region.kind in ("add", "mul") and shapes[0] != shapes[1]:

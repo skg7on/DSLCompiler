@@ -99,6 +99,19 @@ class ImportedFXOutput:
     input_indices: tuple[int, ...]
     output_shape: tuple[int, int]
     device: str
+    operator: str = ""
+
+
+@dataclass(frozen=True)
+class ImportedFXPassthrough:
+    """A graph output returned unchanged from one boxed argument.
+
+    AOTAutograd training forward graphs return the saved primals after the user
+    output, and an identity backward (``add``) returns its incoming gradient.
+    Passing the argument through preserves the exact tensor the caller owns.
+    """
+
+    input_index: int
 
 
 @dataclass(frozen=True)
@@ -180,7 +193,7 @@ def _unsupported(node: Node, message: str, code: str) -> UnsupportedFXError:
     )
 
 
-def _tensor_metadata(tensor, node: Node):
+def _tensor_metadata(tensor, node: Node, *, allow_training=False):
     if not isinstance(tensor, torch.Tensor):
         if type(tensor).__name__ == "SymInt":
             raise UnsupportedFXError(
@@ -221,10 +234,10 @@ def _tensor_metadata(tensor, node: Node):
     shape = tuple(int(size) for size in tensor.shape)
     if any(size < 1 for size in shape):
         raise unsupported_shape(node, "graph inputs require positive extents")
-    if tensor.requires_grad:
+    if tensor.requires_grad and not allow_training:
         raise UnsupportedFXError(
-            "inference only: requires_grad inputs need the registered "
-            "training path (PF16)",
+            "the inference compiler accepts no requires_grad graph input; "
+            "training graphs use the AOTAutograd forward/backward compilers",
             code="unsupported_training_contract",
             node_name=node.name,
         )
@@ -763,6 +776,12 @@ def _build_program(
     return CompileRequest(program, compile_options)
 
 
+def _operator_name(pattern: _Pattern) -> str:
+    if pattern.kind == "elementwise":
+        return "mul" if pattern.multiply else "add"
+    return pattern.kind
+
+
 def _build_request(
     graph: GraphModule,
     pattern: _Pattern,
@@ -780,6 +799,7 @@ def _build_request(
         input_indices=tuple(placeholder_index(node) for node in pattern.input_nodes),
         output_shape=pattern.output_shape,
         device="cpu",
+        operator=_operator_name(pattern),
     )
 
 
@@ -887,9 +907,21 @@ def _roots(output: Node) -> tuple[Node, ...]:
 
 
 def import_fx_outputs(
-    graph, example_inputs, options: CompileOptions
-) -> tuple[ImportedFXOutput, ...]:
-    """Recognize every output of one normalized ATen graph, in graph order."""
+    graph,
+    example_inputs,
+    options: CompileOptions,
+    *,
+    allow_training=False,
+    allow_passthrough=False,
+) -> tuple[ImportedFXOutput | ImportedFXPassthrough, ...]:
+    """Recognize every output of one normalized ATen graph, in graph order.
+
+    ``allow_training`` selects the AOTAutograd training contract: gradients are
+    registered for add/multiply/matmul, while a recognized SwiGLU output is
+    rejected with ``unsupported_training_contract``. ``allow_passthrough`` lets
+    a placeholder output return its boxed argument unchanged, which is how the
+    training forward returns saved primals and how an identity backward works.
+    """
     if not isinstance(options, CompileOptions):
         raise TypeError("import_fx requires CompileOptions")
     reject_unsupported_graph(graph)
@@ -909,7 +941,9 @@ def import_fx_outputs(
                 "unsupported_fx_operation",
             )
     metadata = {
-        node: _tensor_metadata(example_inputs[index], node)
+        node: _tensor_metadata(
+            example_inputs[index], node, allow_training=allow_training
+        )
         for index, node in enumerate(placeholders)
     }
     outputs = [node for node in graph.graph.nodes if node.op == "output"]
@@ -924,6 +958,15 @@ def import_fx_outputs(
     imported = []
     consumed = set()
     for index, root in enumerate(roots):
+        if root.op == "placeholder":
+            if not allow_passthrough:
+                raise UnsupportedFXError(
+                    "aliasing a graph input as an output is unsupported",
+                    code="unsupported_fx_outputs",
+                    node_name=root.name,
+                )
+            imported.append(ImportedFXPassthrough(position[root]))
+            continue
         if root.op != "call_function":
             raise UnsupportedFXError(
                 "aliasing a graph input as an output is unsupported",
@@ -931,6 +974,14 @@ def import_fx_outputs(
                 node_name=root.name,
             )
         pattern = _recognize(root, metadata)
+        if allow_training and pattern.kind == "swiglu":
+            raise UnsupportedFXError(
+                "SwiGLU has no registered gradient formula; training requires "
+                "add, multiply or matmul",
+                code="unsupported_training_contract",
+                node_name=root.name,
+                node_target=root.target,
+            )
         consumed |= pattern.nodes
         imported.append(
             _build_request(
@@ -1058,9 +1109,16 @@ class TorchBuffer:
 class _Invoker:
     """One imported output, its compiled handle and its argument mapping."""
 
-    def __init__(self, imported: ImportedFXOutput, kernel: CompiledKernel):
+    def __init__(
+        self,
+        imported: ImportedFXOutput,
+        kernel: CompiledKernel,
+        *,
+        allow_training=False,
+    ):
         self._imported = imported
         self._kernel = kernel
+        self._allow_training = allow_training
 
     def __call__(self, arguments):
         inputs = []
@@ -1070,7 +1128,12 @@ class _Invoker:
                     "native invocation is missing a graph argument",
                     code="invalid_frontend_argument",
                 )
-            inputs.append(TorchBuffer(arguments[index]))
+            value = arguments[index]
+            if self._allow_training and value.requires_grad:
+                # The native kernel is inference work; the AOTAutograd backward
+                # owns differentiation. Detaching shares storage, never copies.
+                value = value.detach()
+            inputs.append(TorchBuffer(value))
         output = torch.empty(
             self._imported.output_shape,
             dtype=torch.float32,
@@ -1080,23 +1143,67 @@ class _Invoker:
         return output
 
 
+class _Passthrough:
+    """Return one boxed argument unchanged, preserving the caller's tensor."""
+
+    def __init__(self, input_index):
+        self._input_index = input_index
+
+    def __call__(self, arguments):
+        if self._input_index >= len(arguments):
+            raise TensorContractError(
+                "native invocation is missing a graph argument",
+                code="invalid_frontend_argument",
+            )
+        return arguments[self._input_index]
+
+
 def compile_graph(
     graph,
     example_inputs,
     options: CompileOptions,
     cache,
+    *,
+    allow_training=False,
+    allow_passthrough=False,
+    phase="forward",
 ) -> "object":
-    """Compile every output of one normalized graph into a boxed callable."""
+    """Compile every output of one normalized graph into a boxed callable.
+
+    ``allow_training`` selects the training forward contract,
+    ``allow_passthrough`` returns placeholder outputs unchanged, and ``phase``
+    tags the compiled native identities as forward or backward evidence.
+    """
     from llk.runtime._ffi import compile_request
 
-    imported = import_fx_outputs(graph, example_inputs, options)
-    invokers = tuple(
-        _Invoker(item, cache.get_or_compile(item.request, compile_request))
-        for item in imported
+    from . import _autograd, _compat
+
+    imported = import_fx_outputs(
+        graph,
+        example_inputs,
+        options,
+        allow_training=allow_training,
+        allow_passthrough=allow_passthrough,
     )
-    from . import _compat
+    invokers = []
+    native_reports = []
+    for item in imported:
+        if isinstance(item, ImportedFXPassthrough):
+            invokers.append(_Passthrough(item.input_index))
+            continue
+        kernel = cache.get_or_compile(item.request, compile_request)
+        invokers.append(
+            _Invoker(item, kernel, allow_training=allow_training)
+        )
+        native_reports.append((item.operator, kernel.report))
+        _autograd.record_native(item.operator, kernel.report, phase=phase)
 
     def run(*arguments):
         return tuple(invoker(arguments) for invoker in invokers)
 
-    return _compat.boxed_function(run)
+    compiled = _compat.boxed_function(run)
+    try:
+        compiled._llk_native_reports = tuple(native_reports)
+    except AttributeError:  # pragma: no cover - exotic boxed wrapper
+        pass
+    return compiled
