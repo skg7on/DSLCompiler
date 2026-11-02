@@ -42,8 +42,23 @@ foreign owner of the ``llk`` operator namespace is reported instead of replaced.
 ``torch.library.opcheck`` schema/fake checks and direct native numerical tests
 cover all four operators. See the
 :source:`PF14 verification record <docs/reviews/2026-11-01-pf14-python-ops.md>`.
-Inductor composition, training and genuine upstream Triton launches are not
-implemented. Registration alone does not establish model execution.
+Registration alone does not establish model execution.
+
+PF15 (`#226 <https://github.com/skg7on/DSLCompiler/issues/226>`__) adds
+``backend="llk_inductor"``. It clones the captured graph, replaces effect-safe
+regions whose operands satisfy the native f32 compact rank-two contract with
+the registered ``llk::*`` operators, and hands the rewritten graph to
+Inductor's ``compile_fx``. Unmatched nodes and declined regions stay with
+Inductor; a frozen ``PartitionReport`` names the accepted region roots and
+records a stable reason for every declined node. Symbolic extents, bf16
+storage, non-compact operands, training inputs and graphs containing in-place
+tensor effects decline partitioning instead of copying or converting data.
+``options`` are passed to Inductor as per-compilation config patches; no global
+Inductor, Dynamo or device-scheduler state changes. This is external-kernel
+composition, not a full Inductor codegen backend and not fusion across the
+external call. See the
+:source:`PF15 verification record <docs/reviews/2026-11-02-pf15-python-inductor.md>`.
+Training arrives in PF16; genuine upstream Triton launches remain unimplemented.
 
 .. _python-frontend-pipeline:
 
@@ -696,7 +711,8 @@ After installing the package into the chosen environment:
 ``get_backend()`` returns the exact registered callable. Repeated registration
 and module reload preserve it without clearing Dynamo's global state. A foreign
 owner of the ``llk`` backend name is preserved and produces
-``backend_registration_conflict``. Importing ``llk.torch`` also exposes the
+``backend_registration_conflict``. Importing ``llk.torch`` also registers
+``llk_inductor`` (exposed as ``llk.torch.inductor_backend``) and exposes the
 checked functional operators as ``torch.ops.llk.add``, ``mul``, ``matmul`` and
 ``swiglu``. ``capabilities()`` remains the
 compiler-free package report; it does not probe the native library, so it is

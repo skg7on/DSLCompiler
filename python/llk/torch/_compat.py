@@ -53,6 +53,25 @@ def aot_autograd_compiler(fw_compiler, inference_compiler):
     )
 
 
+def inductor_compile_fx():
+    """Return Torch's qualified Inductor graph compiler.
+
+    ``torch._inductor`` pulls in the whole code generation stack, so it is
+    resolved when the backend is invoked rather than at package import. A
+    missing Inductor is an explicit unsupported capability, never a silent
+    fallback to eager execution.
+    """
+    try:
+        import torch._inductor.compile_fx as module
+    except ModuleNotFoundError as error:
+        raise UnsupportedFeatureError(
+            "Torch Inductor is unavailable in this Torch installation.",
+            code="native_backend_unavailable",
+            stage="compile",
+        ) from error
+    return module.compile_fx
+
+
 def boxed_function(unboxed):
     """Return a callable taking the AOT boxed list of arguments.
 
