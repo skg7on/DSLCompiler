@@ -74,7 +74,7 @@ regions; the Inductor-compiled backward calls two native matmuls while Inductor
 owns the transpose copies and graph orchestration. ``record_native_calls()``
 exposes a ``TrainingReport`` with distinct forward and backward
 ``CompilationReport`` identities plus the explicit ATen materializations.
-Higher-order gradients are not supported. See the
+Higher-order gradients are outside the qualified contract. See the
 :source:`PF16 verification record <docs/reviews/2026-11-02-pf16-python-training.md>`.
 Genuine upstream Triton launches remain unimplemented.
 

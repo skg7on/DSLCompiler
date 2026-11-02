@@ -49,8 +49,8 @@ copy that remains outside LLK (incoming expanded gradient, transposed operand).
 The formulas save both operands with `ctx.save_for_backward`, so repeated
 `backward(retain_graph=True)` and backward after the caller drops its tensor
 references keep working. The native kernels receive detached storage: the
-formula, not the kernel, owns differentiation. Higher-order gradients are
-rejected explicitly rather than silently detached.
+formula, not the kernel, owns differentiation. First-order gradients are the
+qualified contract; higher-order numerics are not tested or claimed.
 
 ## Native identities
 
@@ -168,8 +168,9 @@ needs no such override.
 
 ## Limitations (explicit, not silent)
 
-- First-order gradients only. A `create_graph=True` backward through an LLK
-  operator raises `unsupported_training_contract`.
+- First-order gradients are the qualified contract. A `create_graph=True`
+  backward re-enters the registered formulas instead of being rejected, but
+  higher-order numerics are not tested or claimed here.
 - Reference execution only in this record; selected AVX2 training remains a
   separate qualified lane.
 - Float32, positive static rank-two, compact row-major, zero-offset CPU tensors.
