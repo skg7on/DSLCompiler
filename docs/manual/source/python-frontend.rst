@@ -58,7 +58,25 @@ Inductor, Dynamo or device-scheduler state changes. This is external-kernel
 composition, not a full Inductor codegen backend and not fusion across the
 external call. See the
 :source:`PF15 verification record <docs/reviews/2026-11-02-pf15-python-inductor.md>`.
-Training arrives in PF16; genuine upstream Triton launches remain unimplemented.
+
+PF16 (`#227 <https://github.com/skg7on/DSLCompiler/issues/227>`__) registers
+first-order autograd formulas for ``llk::add``, ``llk::mul`` and
+``llk::matmul``. The formulas keep ``ctx.save_for_backward`` operands alive,
+materialize any non-compact incoming gradient, and call the same native
+operators for the backward kernels. ``llk::swiglu`` still has no formula: a
+``requires_grad`` operand raises ``unsupported_training_contract`` before
+compilation, and the strict backend rejects a trained SwiGLU graph. The strict
+``llk`` backend adds AOTAutograd forward/backward compilers: an ``add``
+gradient passes through unchanged, a ``mul`` gradient runs two native kernels,
+and a ``matmul`` gradient is rejected because its transpose would need an
+unmodeled copy kernel. ``llk_inductor`` accepts trained add/multiply/matmul
+regions; the Inductor-compiled backward calls two native matmuls while Inductor
+owns the transpose copies and graph orchestration. ``record_native_calls()``
+exposes a ``TrainingReport`` with distinct forward and backward
+``CompilationReport`` identities plus the explicit ATen materializations.
+Higher-order gradients are outside the qualified contract. See the
+:source:`PF16 verification record <docs/reviews/2026-11-02-pf16-python-training.md>`.
+Genuine upstream Triton launches remain unimplemented.
 
 .. _python-frontend-pipeline:
 
@@ -676,6 +694,8 @@ Run focused tests
    LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.dylib" \
      "$LLK_PYTHON" -m pytest test/python/test_torch_ops.py \
      test/python/test_fake_tensor_contract.py -q
+   LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.dylib" \
+     "$LLK_PYTHON" -m pytest test/python/test_torch_training.py -q
 
 The root :source:`pytest.ini <pytest.ini>` restricts default collection to
 ``test/python`` and adds the local ``python/`` source path. This avoids collecting
@@ -689,8 +709,11 @@ broken optional-dependency propagation and the missing-library diagnostic. The
 PF13 suites execute real ``torch.compile`` graphs when the CAPI library is
 loaded and count every native invocation. The PF14 suites run
 ``torch.library.opcheck`` schema/fake checks and direct native operator calls,
-and spy on ``data_ptr``/compilation during FakeTensor execution. Missing
-test/build dependencies are setup failures, not successful or skipped coverage.
+and spy on ``data_ptr``/compilation during FakeTensor execution. The PF16 suite
+compares gradients with independent f64 finite differences and analytic f32
+references, counts distinct forward/backward native kernels, and runs the strict
+and Inductor training routes. Missing test/build dependencies are setup
+failures, not successful or skipped coverage.
 
 These Python checks are separate from the compiler's ``check-llk`` target.
 C++ frontend tests are registered with CTest; required combined Python/native

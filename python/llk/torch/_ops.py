@@ -72,16 +72,25 @@ def _options():
 
 
 def _execute(kind, tensors):
-    """Validate, compile and invoke one operator over caller-owned tensors."""
+    """Validate, compile and invoke one operator over caller-owned tensors.
+
+    A ``requires_grad`` operand follows the registered training path only for
+    the operators that have a formula. The native kernel itself is always
+    inference work over detached storage: the autograd formula, not the kernel,
+    owns the backward graph.
+    """
+    from . import _autograd
     from ._fx_importer import TorchBuffer, op_request
 
+    tensors = _autograd.require_trainable(kind, tensors)
     # TorchBuffer is the same checked adapter the decorator and Dynamo routes
-    # use. It rejects unsupported devices, dtypes, layouts, subclasses and
-    # training inputs before anything is compiled or invoked.
+    # use. It rejects unsupported devices, dtypes, layouts and subclasses
+    # before anything is compiled or invoked.
     providers = tuple(TorchBuffer(tensor) for tensor in tensors)
     shapes = tuple(tuple(int(size) for size in tensor.shape) for tensor in tensors)
     request = op_request(kind, shapes, _options())
     kernel = _llk_ops_cache.get_or_compile(request, _ffi.compile_request)
+    report = kernel.report
     try:
         output = torch.empty(
             _OUTPUTS[kind](*shapes), dtype=torch.float32, device="cpu"
@@ -89,10 +98,11 @@ def _execute(kind, tensors):
         kernel.invoke(providers, (TorchBuffer(output),))
     finally:
         kernel.close()
+    _autograd.record_native(kind, report)
     return output
 
 
-def _fake_shape(tensor, name):
+def _fake_shape(tensor, name, *, operator, allow_training):
     """Validate metadata only; never read storage, pointers or native state."""
     from torch._subclasses.fake_tensor import FakeTensor
 
@@ -122,16 +132,20 @@ def _fake_shape(tensor, name):
             "storage offset",
             code="invalid_frontend_buffer",
         )
-    if tensor.requires_grad:
+    if tensor.requires_grad and not allow_training:
+        from ._autograd import SUPPORTED_TRAINING_OPERATORS
+
+        supported = ", ".join(SUPPORTED_TRAINING_OPERATORS)
         raise TensorContractError(
-            "LLK native invocation is inference only; requires_grad operands "
-            "need the registered training path (PF16)",
+            f"llk::{operator} has no registered gradient formula; training "
+            f"requires {supported}",
             code="unsupported_training_contract",
         )
     return tuple(int(size) for size in tensor.shape)
 
 
 def _fake_metadata(kind, tensors):
+    from ._autograd import SUPPORTED_TRAINING_OPERATORS
     from ._fx_importer import op_output_shape
 
     names = _OPERAND_NAMES[kind]
@@ -140,8 +154,12 @@ def _fake_metadata(kind, tensors):
             f"llk::{kind} requires {len(names)} tensor operands",
             code="invalid_frontend_argument",
         )
+    allow_training = kind in SUPPORTED_TRAINING_OPERATORS
     shapes = tuple(
-        _fake_shape(tensor, name) for name, tensor in zip(names, tensors)
+        _fake_shape(
+            tensor, name, operator=kind, allow_training=allow_training
+        )
+        for name, tensor in zip(names, tensors)
     )
     return op_output_shape(kind, shapes)
 

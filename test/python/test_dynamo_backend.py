@@ -231,14 +231,17 @@ def test_view_dependent_graph_fails_with_node_identity():
     assert error.code == "unsupported_fx_view"
 
 
-def test_training_graphs_are_rejected_until_pf16():
+def test_training_add_runs_the_native_forward_and_identity_backward():
     function = compile(lambda a, b: a + b)
     a, b = values((4, 5), (4, 5))
     a.requires_grad_(True)
     b.requires_grad_(True)
-    error = backend_error(lambda: function(a, b))
-    assert isinstance(error, llk.UnsupportedFeatureError)
-    assert error.code == "unsupported_training_contract"
+    with invoke_spy() as calls:
+        output = function(a, b)
+        output.sum().backward()
+    assert calls.call_count == 1
+    torch.testing.assert_close(a.grad, torch.ones(4, 5), rtol=0, atol=0)
+    torch.testing.assert_close(b.grad, torch.ones(4, 5), rtol=0, atol=0)
 
 
 def test_invocation_reads_real_buffers_after_fake_metadata_compilation():

@@ -81,9 +81,11 @@ def test_fake_kernels_reject_unsupported_metadata_without_native_work():
                     op("add")(transposed, contiguous)
                 assert layout.value.code == "invalid_frontend_buffer"
 
-                training = torch.empty(4, 5, requires_grad=True)
+                training = torch.empty(3, 6, requires_grad=True)
                 with pytest.raises(TensorContractError) as gradient:
-                    op("add")(training, contiguous)
+                    op("swiglu")(
+                        training, torch.empty(6, 4), torch.empty(6, 4)
+                    )
                 assert gradient.value.code == "unsupported_training_contract"
 
                 with pytest.raises(TensorContractError) as dtype:

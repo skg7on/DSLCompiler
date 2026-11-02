@@ -7,6 +7,11 @@ regions with the registered ``llk::*`` operators and delegates the rest to
 Torch Inductor. Without Torch, import succeeds and registration is a no-op.
 """
 
+from ._autograd import (
+    TrainingReport,
+    record_native_calls,
+    register_autograd_formulas,
+)
 from ._dynamo_backend import LLKBackend, get_backend, register
 from ._inductor_backend import (
     PartitionReport,
@@ -18,14 +23,18 @@ from ._ops import register_operators
 
 register()
 register_operators()
+register_autograd_formulas()
 register_inductor_backend()
 
 __all__ = [
     "LLKBackend",
     "PartitionReport",
+    "TrainingReport",
     "get_backend",
     "inductor_backend",
+    "record_native_calls",
     "register",
+    "register_autograd_formulas",
     "register_inductor_backend",
     "register_operators",
     "rewrite_supported_subgraphs",

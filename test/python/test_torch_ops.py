@@ -186,13 +186,18 @@ def test_storage_offset_view_is_rejected():
     )
 
 
-def test_requires_grad_operand_reports_the_training_contract():
-    def binary():
-        a = torch.randn(4, 5)
-        a.requires_grad_(True)
-        return (a, torch.randn(4, 5))
+def test_training_add_executes_natively_and_records_the_formula():
+    a = torch.randn(4, 5, requires_grad=True)
+    b = torch.randn(4, 5, requires_grad=True)
+    with invoke_spy() as calls:
+        output = op("add")(a, b)
+    assert calls.call_count == 1
+    output.sum().backward()
+    torch.testing.assert_close(a.grad, torch.ones(4, 5), rtol=0, atol=0)
+    torch.testing.assert_close(b.grad, torch.ones(4, 5), rtol=0, atol=0)
 
-    rejected("unsupported_training_contract", "add", binary)
+
+def test_swiglu_training_reports_the_unsupported_contract():
     rejected(
         "unsupported_training_contract",
         "swiglu",

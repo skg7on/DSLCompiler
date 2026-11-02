@@ -184,7 +184,7 @@ def test_scalar_operand_identifies_the_node():
     assert caught.value.code == "unsupported_fx_operand"
 
 
-def test_requires_grad_inputs_are_rejected_until_training_is_qualified():
+def test_inference_import_rejects_requires_grad_inputs():
     gm = build_graph(
         ("a", "b"), lambda g, a, b: g.call_function(ATEN.add.Tensor, (a, b))
     )

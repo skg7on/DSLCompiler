@@ -38,19 +38,40 @@ def require_supported_version() -> tuple[int, int]:
     return version
 
 
-def aot_autograd_compiler(fw_compiler, inference_compiler):
+def aot_autograd_compiler(fw_compiler, inference_compiler, bw_compiler=None):
     """Return the version-qualified AOTAutograd backend callable.
 
-    Both compilers are the same strict native compiler. Training graphs are
-    rejected during import until PF16 registers a backward path, so the
-    forward compiler is never asked to produce a gradient.
+    ``fw_compiler`` handles the forward of a training graph, ``bw_compiler``
+    handles the AOTAutograd-generated backward graph, and
+    ``inference_compiler`` handles graphs that need no autograd. When no
+    backward compiler is supplied AOTAutograd reuses the forward compiler.
     """
     from torch._dynamo.backends.common import aot_autograd
 
-    return aot_autograd(
-        fw_compiler=fw_compiler,
-        inference_compiler=inference_compiler,
-    )
+    options = {
+        "fw_compiler": fw_compiler,
+        "inference_compiler": inference_compiler,
+    }
+    if bw_compiler is not None:
+        options["bw_compiler"] = bw_compiler
+    return aot_autograd(**options)
+
+
+def in_autograd_backward() -> bool:
+    """Whether the autograd engine is currently executing a backward task.
+
+    Custom-op CPU kernels run with grad mode disabled in both directions, so
+    grad mode cannot identify the phase. Torch exposes the active graph task
+    for exactly this distinction; when the internal probe is unavailable the
+    caller falls back to ``forward`` rather than guessing.
+    """
+    probe = getattr(torch._C, "_current_graph_task_id", None)
+    if probe is None:
+        return False
+    try:
+        return probe() >= 0
+    except Exception:  # pragma: no cover - defensive around an internal API
+        return False
 
 
 def inductor_compile_fx():
