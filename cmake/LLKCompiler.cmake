@@ -16,25 +16,54 @@ foreach(_llk_var IN ITEMS CC CXX)
   endif()
 endforeach()
 
-# On macOS, CMake's default search lands on /usr/bin/cc (Apple clang), while the
-# intended compiler is the clang on PATH: Homebrew's llvm kegs are keg-only yet
-# still symlink clang/clang++ into <prefix>/bin, which PATH places ahead of
-# /usr/bin. NO_DEFAULT_PATH restricts the search to PATH order. Pre-seeding the
-# cache is what actually selects it -- CMake otherwise prefers its own /usr/bin
-# search over PATH. An explicit -D or a still-valid $CC/$CXX wins.
+# Prefer clang on PATH on macOS and Linux (including Ubuntu), where CMake's
+# default compiler search can otherwise select Apple clang or GCC respectively.
+# Ubuntu also packages versioned executables without an unversioned symlink.
+# NO_DEFAULT_PATH and NAMES_PER_DIR preserve PATH order. Pre-seeding the cache
+# selects the compiler before project() enables the languages. An explicit -D
+# or a still-valid $CC/$CXX wins; without clang, keep CMake's default search.
+# Toolchain files are loaded by project(), so leave their compiler choice alone.
 #
 # These only apply to a fresh build tree. Once CMAKE_C_COMPILER/CMAKE_CXX_COMPILER
 # are cached they are kept, so an already-configured build/ must be removed to
 # re-resolve the compiler.
-if(APPLE)
+if((APPLE OR CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+   AND NOT CMAKE_TOOLCHAIN_FILE AND NOT DEFINED ENV{CMAKE_TOOLCHAIN_FILE})
+  set(_llk_clang_names clang)
+  set(_llk_clangxx_names clang++)
+  if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+    # Discover installed numeric suffixes rather than bounding the Clang
+    # versions this project can select. find_program still checks permissions.
+    file(TO_CMAKE_PATH "$ENV{PATH}" _llk_program_paths)
+    set(_llk_clang_versions)
+    foreach(_llk_directory IN LISTS _llk_program_paths)
+      file(GLOB _llk_candidates LIST_DIRECTORIES FALSE
+          "${_llk_directory}/clang-[0-9]*"
+          "${_llk_directory}/clang++-[0-9]*")
+      foreach(_llk_candidate IN LISTS _llk_candidates)
+        get_filename_component(_llk_name "${_llk_candidate}" NAME)
+        if(_llk_name MATCHES "^clang([+][+])?-([0-9]+)$")
+          list(APPEND _llk_clang_versions "${CMAKE_MATCH_2}")
+        endif()
+      endforeach()
+    endforeach()
+    list(REMOVE_DUPLICATES _llk_clang_versions)
+    list(SORT _llk_clang_versions COMPARE NATURAL ORDER DESCENDING)
+    foreach(_llk_version IN LISTS _llk_clang_versions)
+      list(APPEND _llk_clang_names "clang-${_llk_version}")
+      list(APPEND _llk_clangxx_names "clang++-${_llk_version}")
+    endforeach()
+  endif()
   if(NOT DEFINED CMAKE_C_COMPILER AND NOT DEFINED ENV{CC})
-    find_program(_llk_clang NAMES clang HINTS ENV PATH NO_DEFAULT_PATH)
+    find_program(_llk_clang NAMES ${_llk_clang_names}
+        NAMES_PER_DIR HINTS ENV PATH NO_DEFAULT_PATH)
     if(_llk_clang)
       set(CMAKE_C_COMPILER "${_llk_clang}" CACHE FILEPATH "C compiler")
     endif()
   endif()
   if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
-    find_program(_llk_clangxx NAMES clang++ HINTS ENV PATH NO_DEFAULT_PATH)
+    find_program(_llk_clangxx NAMES ${_llk_clangxx_names}
+        NAMES_PER_DIR HINTS ENV PATH NO_DEFAULT_PATH)
     if(_llk_clangxx)
       set(CMAKE_CXX_COMPILER "${_llk_clangxx}" CACHE FILEPATH "C++ compiler")
     endif()
