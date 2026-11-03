@@ -1,7 +1,11 @@
 # TableGen reads directory includes; compilers use the same package paths.
 include_directories(${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS}
     "${PROJECT_SOURCE_DIR}/include" "${PROJECT_BINARY_DIR}/include")
-add_definitions(${LLVM_DEFINITIONS})
+# LLVM_DEFINITIONS is a command-line string. Without splitting it, a leading
+# -DNAME=value makes add_definitions treat the remaining flags as part of that
+# macro's value (and conflict with HandleLLVMOptions' directory definitions).
+separate_arguments(_llk_llvm_definitions NATIVE_COMMAND "${LLVM_DEFINITIONS}")
+add_definitions(${_llk_llvm_definitions})
 
 # Match the LLVM build's ABI for every project library and its consumers.
 add_library(LLKBuildOptions INTERFACE)

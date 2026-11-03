@@ -71,6 +71,22 @@ Configure DSLCompiler
 
 Adjust ``LLVM_PROJECT_BUILD_DIR`` to your LLVM build's absolute path. It must contain ``LLVM_BUILD/lib/cmake/mlir`` and ``LLVM_BUILD/lib/cmake/llvm``, where ``LLVM_BUILD`` denotes that directory; this setting prevents accidental mixing with system packages. The setting is required; CMake replaces stale ``MLIR_DIR``/``LLVM_DIR`` cache entries with paths under this build. The exported packages supply both source and generated header paths. LLVM and MLIR link through the monolithic shared ``LLVM`` and ``MLIR`` targets; component archives are not a fallback. The project supplies its GTest dependency from :source:`third_party <third_party/CMakeLists.txt>`.
 
+On Ubuntu and other Linux hosts, a fresh configuration prefers ``clang`` and
+``clang++`` on ``PATH``, including numeric versioned names such as ``clang-20``.
+Within each directory, unversioned names win, followed by newer versions.
+If Clang is unavailable,
+CMake falls back to its normal compiler search. Explicit
+``-DCMAKE_C_COMPILER=...`` / ``-DCMAKE_CXX_COMPILER=...``, valid ``CC`` / ``CXX``
+environment settings, and toolchain files take precedence. An existing build
+directory keeps its cached compilers; use a new build directory to select Clang
+after installing it.
+
+With ``LLK_BUILD_PYTHON_CAPI=ON``, use the same C++ toolchain for LLVM/MLIR and
+DSLCompiler. MLIR's fallback trait identifiers depend on compiler-generated
+type names; mixing GCC-built MLIR with a Clang-built C API can cause valid
+``micro.yield`` terminators to fail verification. Rebuild LLVM/MLIR with the
+selected compiler when switching toolchains for the C API.
+
 Useful configuration choices:
 
 .. list-table::
