@@ -81,6 +81,12 @@ environment settings, and toolchain files take precedence. An existing build
 directory keeps its cached compilers; use a new build directory to select Clang
 after installing it.
 
+With ``LLK_BUILD_PYTHON_CAPI=ON``, use the same C++ toolchain for LLVM/MLIR and
+DSLCompiler. MLIR's fallback trait identifiers depend on compiler-generated
+type names; mixing GCC-built MLIR with a Clang-built C API can cause valid
+``micro.yield`` terminators to fail verification. Rebuild LLVM/MLIR with the
+selected compiler when switching toolchains for the C API.
+
 Useful configuration choices:
 
 .. list-table::

@@ -38,6 +38,8 @@ Fresh macOS and Linux configurations prefer `clang`/`clang++` on `PATH` — on m
 
 CI builds the tools, E2E tests, and the `FileCheck` utility from the same pinned LLVM source, so the full registered suite runs. Local LLVM builds must use `-DLLVM_BUILD_UTILS=ON`; configuration fails when `LLK_BUILD_TOOLS=ON` and a matching `FileCheck` is unavailable. `check-llk` is a thin wrapper over CTest, so it runs exactly the registered suite — run it locally before trusting a change.
 
+When enabling `LLK_BUILD_PYTHON_CAPI`, build LLVM/MLIR and this project with the same C++ toolchain. MLIR's fallback trait TypeIDs contain compiler-dependent type names; mixing a GCC-built MLIR with a Clang-built C API can make the verifier reject valid terminators. The C API deliberately hides its C++ symbols, so executable symbol interposition cannot unify those IDs. CI pins Clang 18 for both builds and uses a compiler-specific LLVM cache key, separate from the GCC coverage cache.
+
 ## Python frontend environment and tests
 
 Use the project-level `.venv` for Python frontend work, rather than an ambient
