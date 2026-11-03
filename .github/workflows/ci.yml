@@ -23,7 +23,8 @@ jobs:
 
   build-and-test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # A cold LLVM cache can take nearly two hours before the project build starts.
+    timeout-minutes: 180
 
     env:
       # MLIR trait TypeIDs use compiler-dependent type names. The hidden C API
