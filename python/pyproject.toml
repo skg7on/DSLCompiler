@@ -14,6 +14,9 @@ dependencies = []
 [project.optional-dependencies]
 test = ["pytest>=8,<10", "build>=1.2", "setuptools>=77", "wheel", "jsonschema>=4,<5"]
 torch-test = ["torch==2.9.0", "pytest>=8,<10"]
+# Triton 3.6.0 has no macOS wheel; a source checkout is qualified through
+# LLK_TRITON_PYTHONPATH instead of this extra.
+triton-test = ["triton==3.6.0", "pytest>=8,<10"]
 
 [project.urls]
 Repository = "https://github.com/skg7on/DSLCompiler"
@@ -25,3 +28,4 @@ include = ["llk", "llk.*"]
 
 [tool.setuptools.package-data]
 llk = ["compatibility.json"]
+"llk.triton" = ["toolchain-lock.json"]

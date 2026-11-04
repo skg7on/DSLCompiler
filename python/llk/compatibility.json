@@ -5,5 +5,6 @@
     "torch": "2.9.0"
   },
   "native_execution": "unavailable",
-  "upstream_triton": "unimplemented"
+  "upstream_triton": "ttir-export-only",
+  "upstream_triton_version": "3.6.0"
 }
