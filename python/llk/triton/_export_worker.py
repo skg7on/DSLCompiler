@@ -636,9 +636,15 @@ class Translator:
             return self._root_argument(record["operands"][0])
         return None
 
+    def _owned(self, index):
+        yield index
+        for child in self.children.get(index, []):
+            yield from self._owned(child)
+
     def _accesses(self):
         access = {}
-        for record in self.records:
+        for index in self._owned(self.function):
+            record = self.records[index]
             if record["name"] not in ("tt.load", "tt.store") or not record["operands"]:
                 continue
             argument = self._root_argument(record["operands"][0])
