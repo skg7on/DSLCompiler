@@ -52,3 +52,16 @@ with `upstream_toolchain_unqualified`. The finite source subset preserves SSA,
 masks, explicit casts and counted dot-accumulator loops, with source-located
 errors for unsupported semantics. These records do not establish native
 compilation or execution. See the manual for source syntax and request options.
+
+PF17 adds process-isolated export of genuine upstream Triton TTIR. Call
+`llk.triton.capture_kernel(module_path, function, signature, ...)` or
+`llk.triton.export_module(ExportRequest(...))`; the caller receives the TTIR
+text, an `UnboundFrontendTemplate` with `schema_version=1` and
+`required_runtime_grid=True`, and the observed toolchain identity. No Triton
+Python or MLIR object is imported into, or shared with, the calling process.
+The checked-in `python/llk/triton/toolchain-lock.json` records the qualified
+Triton 3.6.0 source revision, LLVM revision and target; a missing or different
+binary raises `upstream_toolchain_unqualified`. Set `LLK_TRITON_PYTHONPATH` to
+the directory containing the `triton` package to qualify a source checkout.
+Export does not compile or launch a kernel: template binding and CPU execution
+remain PF18's `bind_triton_template` contract.
