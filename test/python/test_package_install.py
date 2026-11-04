@@ -99,8 +99,13 @@ assert llk.capabilities()['compatibility']==manifest
 first=llk.capabilities()
 first['native_backend']['available']=True
 assert llk.capabilities()['native_backend']['available'] is False
+import llk.triton as triton_export
+lock=triton_export.toolchain_lock()
+assert lock['triton_version']=='3.6.0'
+assert lock['template_schema']==1
 dist=metadata.distribution('llk-compiler')
 assert any('torch==2.9.0' in r.replace(' ','') and 'extra' in r for r in dist.requires)
+assert any('triton==3.6.0' in r.replace(' ','') and 'extra' in r for r in dist.requires)
 assert not any(r.startswith('torch') and 'extra' not in r for r in dist.requires)
 """],
         cwd=root, env=env, capture_output=True, text=True, timeout=60,
