@@ -4,7 +4,8 @@ Date: 2026-11-05
 Issue: [#228](https://github.com/skg7on/DSLCompiler/issues/228)
 Parent: [#203](https://github.com/skg7on/DSLCompiler/issues/203)
 Plan: `docs/superpowers/plans/2026-10-18-python-frontend-refinement.md` §PF17
-Implementation commit: `0baf023`
+Implementation commits: `0baf023` (exporter and tests), `123cc6d` (function-scoped
+access attribution), `e99d89b` (clean-wheel packaging assertions)
 
 ## Delivered
 
@@ -126,6 +127,10 @@ Covered:
   mismatched export target qualification failures;
 - Torch→Triton→LLK and LLK→Triton→Torch import orders in subprocesses.
 
+The clean-wheel install lane in `test/python/test_package_install.py` now
+imports `llk.triton`, reads the packaged `toolchain-lock.json` and asserts the
+`triton-test` extra is declared.
+
 Absence lane — without `LLK_TRITON_PYTHONPATH`:
 
 ```sh
@@ -140,7 +145,7 @@ CXX=/usr/bin/clang++ CC=/usr/bin/clang \
 LLK_FRONTEND_LIBRARY=$PWD/build/lib/libLLKFrontendCAPI.dylib \
 LLK_TRITON_PYTHONPATH=/Users/skg7on/Workspace/Projects/triton/python \
     .venv/bin/python -m pytest -q
-# 308 passed
+# 309 passed
 ```
 
 Observed red/green cycles during implementation:
