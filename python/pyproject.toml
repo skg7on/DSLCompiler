@@ -18,6 +18,9 @@ torch-test = ["torch==2.9.0", "pytest>=8,<10"]
 # LLK_TRITON_PYTHONPATH instead of this extra.
 triton-test = ["triton==3.6.0", "pytest>=8,<10"]
 
+[project.entry-points."triton.backends"]
+llk_cpu = "llk.triton._plugin"
+
 [project.urls]
 Repository = "https://github.com/skg7on/DSLCompiler"
 Documentation = "https://skg7on.github.io/DSLCompiler/"
