@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sys
 from importlib.resources import files
 from pathlib import Path
 from types import MappingProxyType
@@ -88,3 +89,34 @@ def resolve_triton_python() -> str | None:
     if spec is None or not spec.origin:
         return None
     return str(Path(spec.origin).resolve().parent.parent)
+
+
+def ensure_triton_importable():
+    """Import the qualified upstream package, honouring the explicit path.
+
+    The in-process launcher needs genuine upstream Triton classes, unlike the
+    PF17 exporter which always uses a subprocess.  A source checkout named by
+    ``LLK_TRITON_PYTHONPATH`` is placed on ``sys.path`` exactly once; an
+    unqualified or unimportable package raises ``upstream_toolchain_unqualified``.
+    """
+    try:
+        import triton
+
+        return triton
+    except Exception as first:
+        path = resolve_triton_python()
+        if path and Path(path).is_dir() and path not in sys.path:
+            sys.path.insert(0, path)
+            try:
+                import triton
+
+                return triton
+            except Exception as second:  # pragma: no cover - native load failure
+                raise UnsupportedFeatureError(
+                    f"cannot import the qualified upstream Triton package: {second}",
+                    code="upstream_toolchain_unqualified",
+                ) from second
+        raise UnsupportedFeatureError(
+            f"cannot import the qualified upstream Triton package: {first}",
+            code="upstream_toolchain_unqualified",
+        ) from first

@@ -56,6 +56,14 @@ __all__ = [
     "TemplateRegion",
     "TemplateValue",
     "UnboundFrontendTemplate",
+    "activate",
+    "coexistence_status",
+    "last_launch_report",
+    "register_backend",
+    "CoexistenceStatus",
+    "TritonLaunchReport",
+    "LLKCPUBackend",
+    "LLKCPUDriver",
     "capture_kernel",
     "export_module",
     "generate_toolchain_lock",
@@ -64,6 +72,66 @@ __all__ = [
     "PROTOCOL_VERSION",
     "SCHEMA_VERSION",
 ]
+
+_LAZY = frozenset(
+    {
+        "CoexistenceStatus",
+        "TritonLaunchReport",
+        "LLKCPUBackend",
+        "LLKCPUDriver",
+    }
+)
+
+
+def __getattr__(name):
+    if name in _LAZY:
+        from . import _driver
+
+        return getattr(_driver, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def activate(options=None):
+    """Return a scoped activation of the LLK CPU Triton driver.
+
+    Importing upstream Triton happens on first activation (or first use of the
+    launch API), never when :mod:`llk.triton` itself is imported, so the PF17
+    exporter remains usable without an upstream runtime.
+    """
+    from ._driver import activate as _activate
+
+    return _activate(options)
+
+
+def last_launch_report():
+    """Return the most recent native launch report, or ``None``.
+
+    The launch module is only consulted if it has already been imported, so
+    calling this before any activation never imports upstream Triton.
+    """
+    module = sys.modules.get(f"{__name__}._driver")
+    if module is None:
+        return None
+    return module.last_launch_report()
+
+
+def coexistence_status(force=False):
+    """Qualify upstream/LLK native-library coexistence in subprocesses."""
+    try:
+        from ._driver import coexistence_status as _status
+    except Exception as error:
+        raise UnsupportedFeatureError(
+            f"cannot import the qualified upstream Triton package: {error}",
+            code="upstream_toolchain_unqualified",
+        ) from error
+    return _status(force=force)
+
+
+def register_backend():
+    """Register the ``llk_cpu`` backend with upstream Triton's registry."""
+    from ._driver import register_backend as _register
+
+    return _register()
 
 MARKER = "LLK-TRITON-EXPORT-V1"
 MAX_STDOUT_BYTES = 8 << 20

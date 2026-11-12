@@ -10,6 +10,7 @@ object strongly referenced only for the duration of one invocation.
 from __future__ import annotations
 
 import ctypes
+import sys
 from dataclasses import dataclass
 
 from llk._errors import TensorContractError
@@ -26,7 +27,7 @@ _FORMATS = {
     "f": {2: "f16", 4: "f32"},
     "e": {2: "f16"},
 }
-_ELEMENT_WIDTH = {"f32": 4, "f16": 2, "i32": 4, "i8": 1}
+_ELEMENT_WIDTH = {"f32": 4, "f16": 2, "bf16": 2, "i32": 4, "i8": 1}
 
 _PyBUF_STRIDES = 0x0018
 
@@ -184,10 +185,100 @@ def _buffer_layout(provider):
     return address, shape, strides, dtype, read_only, view.nbytes, view
 
 
+def _torch_dtype(torch, dtype):
+    mapping = {
+        torch.float32: "f32",
+        torch.float16: "f16",
+        torch.bfloat16: "bf16",
+        torch.int32: "i32",
+        torch.int8: "i8",
+    }
+    return mapping.get(dtype)
+
+
+def _torch_layout(provider):
+    """Explicit CPU-Torch adapter; never touches a non-CPU data pointer.
+
+    Torch tensors do not export the Python buffer protocol or an array
+    interface, so they need this explicit branch.  FakeTensor, meta, sparse and
+    every non-CPU device are rejected before ``data_ptr()`` is consulted.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None or not isinstance(provider, torch.Tensor):
+        return None
+    device = getattr(provider, "device", None)
+    if getattr(device, "type", None) != "cpu":
+        _fail(
+            f"LLK CPU execution accepts CPU tensors only; got device {device}"
+        )
+    if provider.layout != torch.strided:
+        _fail("LLK CPU execution requires dense strided tensors")
+    if provider.ndim != 2:
+        _fail("provider must expose rank two")
+    shape = tuple(int(size) for size in provider.shape)
+    if any(size < 1 for size in shape):
+        _fail("provider must expose a positive rank-two shape")
+    dtype = _torch_dtype(torch, provider.dtype)
+    if dtype is None:
+        _fail(f"unsupported element type: {provider.dtype}")
+    item = _ELEMENT_WIDTH[dtype]
+    element_strides = tuple(int(stride) for stride in provider.stride())
+    if element_strides != (shape[1], 1):
+        _fail("provider must expose compact row-major storage")
+    strides = (shape[1] * item, item)
+    if int(provider.storage_offset()) != 0:
+        _fail("tensor views with a storage offset are unsupported")
+    try:
+        address = int(provider.data_ptr())
+    except (RuntimeError, ValueError, NotImplementedError) as error:
+        _fail(f"provider has no usable data pointer: {error}")
+    if address <= 0:
+        _fail("provider has no valid data pointer")
+    allocation = int(provider.numel()) * int(provider.element_size())
+    read_only = bool(provider.requires_grad)
+    return address, shape, strides, dtype, read_only, allocation, None
+
+
 def _layout(provider):
+    torch_layout = _torch_layout(provider)
+    if torch_layout is not None:
+        return torch_layout
     if hasattr(provider, "__array_interface__"):
         return _array_interface_layout(provider)
     return _buffer_layout(provider)
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderLayout:
+    """A typed rank-two provider layout, without the tensor's declared spec."""
+
+    address: int
+    shape: tuple[int, int]
+    strides: tuple[int, int]
+    dtype: str
+    read_only: bool
+    allocation_bytes: int
+    owner: object
+
+
+def layout_of(provider) -> ProviderLayout:
+    """Inspect one typed provider without copying or retaining a pointer.
+
+    Byte buffers have no element type and are rejected here; the Triton launcher
+    binds typed tensors only.
+    """
+    address, shape, strides, dtype, read_only, allocation, _ = _layout(provider)
+    if shape is None or dtype is None:
+        _fail("provider must declare a typed rank-two element layout")
+    return ProviderLayout(
+        address,
+        tuple(shape),
+        tuple(strides),
+        dtype,
+        read_only,
+        int(allocation),
+        provider,
+    )
 
 
 @dataclass(frozen=True, slots=True)
