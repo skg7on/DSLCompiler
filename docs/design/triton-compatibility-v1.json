@@ -1,0 +1,584 @@
+{
+  "schema_version": 1,
+  "kind": "llk-triton-compatibility-corpus",
+  "description": "The fixed, source-attributed upstream Triton compatibility corpus for the LLK Python frontend. Every executable fixture is a genuine @triton.jit kernel exported through the qualified upstream compiler, bound to concrete rank-two CPU tensors, and invoked by the LLK native frontend. Rejected fixtures declare the construct at the documented boundary; a rejection is never counted as executed compatibility.",
+  "toolchain": {
+    "triton_version": "3.6.0",
+    "export_target": "cuda:80",
+    "template_schema": 1,
+    "import_protocol": 1,
+    "numerical_contract": "strict-f32",
+    "source_contract": "positive static rank-two compact row-major f32 tensors; zero storage offset; disjoint outputs"
+  },
+  "lanes": {
+    "reference": {
+      "required": true,
+      "note": "Portable host reference execution; every executable fixture must pass here."
+    },
+    "selected_target": {
+      "required_when_host_supports": true,
+      "target": "x86-avx2",
+      "requires": "x86_64 host with AVX2",
+      "note": "Selected execution never falls back to reference; an unsupported host records selected_target_unavailable instead of substituting reference results."
+    }
+  },
+  "fixtures": [
+    {
+      "id": "elementwise.add.full",
+      "operation": "add",
+      "source": "test/python/compat/kernels/elementwise.py",
+      "function": "add_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "y_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "tensors": {
+        "x_ptr": [
+          1,
+          64
+        ],
+        "y_ptr": [
+          1,
+          64
+        ],
+        "out_ptr": [
+          1,
+          64
+        ]
+      },
+      "scalars": {
+        "n": 64
+      },
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "coverage": "one block covers the whole declared domain"
+    },
+    {
+      "id": "elementwise.add.tiled",
+      "operation": "add",
+      "source": "test/python/compat/kernels/elementwise.py",
+      "function": "add_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "y_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "tensors": {
+        "x_ptr": [
+          4,
+          64
+        ],
+        "y_ptr": [
+          4,
+          64
+        ],
+        "out_ptr": [
+          4,
+          64
+        ]
+      },
+      "scalars": {
+        "n": 256
+      },
+      "grid": [
+        4,
+        1,
+        1
+      ],
+      "coverage": "four whole-row blocks"
+    },
+    {
+      "id": "elementwise.multiply.full",
+      "operation": "multiply",
+      "source": "test/python/compat/kernels/elementwise.py",
+      "function": "multiply_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "y_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "tensors": {
+        "x_ptr": [
+          1,
+          64
+        ],
+        "y_ptr": [
+          1,
+          64
+        ],
+        "out_ptr": [
+          1,
+          64
+        ]
+      },
+      "scalars": {
+        "n": 64
+      },
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "coverage": "one block covers the whole declared domain"
+    },
+    {
+      "id": "elementwise.multiply.tiled",
+      "operation": "multiply",
+      "source": "test/python/compat/kernels/elementwise.py",
+      "function": "multiply_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "y_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "tensors": {
+        "x_ptr": [
+          4,
+          64
+        ],
+        "y_ptr": [
+          4,
+          64
+        ],
+        "out_ptr": [
+          4,
+          64
+        ]
+      },
+      "scalars": {
+        "n": 256
+      },
+      "grid": [
+        4,
+        1,
+        1
+      ],
+      "coverage": "four whole-row blocks"
+    },
+    {
+      "id": "elementwise.add.masked-tail",
+      "operation": "add",
+      "source": "test/python/compat/kernels/elementwise.py",
+      "function": "bounded_add_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "y_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "BM": "constexpr",
+        "BN": "constexpr"
+      },
+      "constexprs": {
+        "BM": 8,
+        "BN": 16
+      },
+      "tensors": {
+        "x_ptr": [
+          33,
+          65
+        ],
+        "y_ptr": [
+          33,
+          65
+        ],
+        "out_ptr": [
+          33,
+          65
+        ]
+      },
+      "scalars": {
+        "M": 33,
+        "N": 65
+      },
+      "grid": [
+        5,
+        5,
+        1
+      ],
+      "tail": true,
+      "coverage": "a rounded 40x80 block grid over a 33x65 domain; the kernel's declared mask proves the in-bounds lanes"
+    },
+    {
+      "id": "elementwise.multiply.masked-tail",
+      "operation": "multiply",
+      "source": "test/python/compat/kernels/elementwise.py",
+      "function": "bounded_multiply_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "y_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "BM": "constexpr",
+        "BN": "constexpr"
+      },
+      "constexprs": {
+        "BM": 8,
+        "BN": 16
+      },
+      "tensors": {
+        "x_ptr": [
+          33,
+          65
+        ],
+        "y_ptr": [
+          33,
+          65
+        ],
+        "out_ptr": [
+          33,
+          65
+        ]
+      },
+      "scalars": {
+        "M": 33,
+        "N": 65
+      },
+      "grid": [
+        5,
+        5,
+        1
+      ],
+      "tail": true,
+      "coverage": "a rounded 40x80 block grid over a 33x65 domain; the kernel's declared mask proves the in-bounds lanes"
+    },
+    {
+      "id": "elementwise.add.flattened",
+      "operation": "add",
+      "source": "test/python/compat/kernels/elementwise.py",
+      "function": "add_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "y_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "tensors": {
+        "x_ptr": [
+          4,
+          16
+        ],
+        "y_ptr": [
+          4,
+          16
+        ],
+        "out_ptr": [
+          4,
+          16
+        ]
+      },
+      "scalars": {
+        "n": 64
+      },
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "coverage": "one flat 64-element block over rank-two declared storage"
+    },
+    {
+      "id": "contraction.matmul.f32",
+      "operation": "matmul",
+      "source": "test/python/compat/kernels/matmul.py",
+      "function": "matmul_kernel",
+      "signature": {
+        "a_ptr": "*fp32",
+        "b_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "BM": "constexpr",
+        "BN": "constexpr",
+        "BK": "constexpr"
+      },
+      "constexprs": {
+        "BM": 32,
+        "BN": 64,
+        "BK": 16
+      },
+      "tensors": {
+        "a_ptr": [
+          32,
+          16
+        ],
+        "b_ptr": [
+          16,
+          64
+        ],
+        "out_ptr": [
+          32,
+          64
+        ]
+      },
+      "scalars": {
+        "M": 32,
+        "N": 64,
+        "K": 16
+      },
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "coverage": "one 32x64 output block; K=16 is one 16-wide step"
+    },
+    {
+      "id": "contraction.matmul.accumulated",
+      "operation": "matmul_accumulated",
+      "source": "test/python/compat/kernels/matmul.py",
+      "function": "matmul_accumulate_kernel",
+      "signature": {
+        "a_ptr": "*fp32",
+        "b_ptr": "*fp32",
+        "init_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "BM": "constexpr",
+        "BN": "constexpr",
+        "BK": "constexpr"
+      },
+      "constexprs": {
+        "BM": 32,
+        "BN": 64,
+        "BK": 16
+      },
+      "tensors": {
+        "a_ptr": [
+          32,
+          16
+        ],
+        "b_ptr": [
+          16,
+          64
+        ],
+        "init_ptr": [
+          32,
+          64
+        ],
+        "out_ptr": [
+          32,
+          64
+        ]
+      },
+      "scalars": {
+        "M": 32,
+        "N": 64,
+        "K": 16
+      },
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "coverage": "the caller's [M, N] initializer is the accumulator seed"
+    },
+    {
+      "id": "contraction.swiglu.f32",
+      "operation": "swiglu",
+      "source": "test/python/compat/kernels/swiglu.py",
+      "function": "swiglu_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "gate_ptr": "*fp32",
+        "up_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "BM": "constexpr",
+        "BN": "constexpr",
+        "BK": "constexpr"
+      },
+      "constexprs": {
+        "BM": 16,
+        "BN": 64,
+        "BK": 16
+      },
+      "tensors": {
+        "x_ptr": [
+          16,
+          16
+        ],
+        "gate_ptr": [
+          16,
+          64
+        ],
+        "up_ptr": [
+          16,
+          64
+        ],
+        "out_ptr": [
+          16,
+          64
+        ]
+      },
+      "scalars": {
+        "M": 16,
+        "N": 64,
+        "K": 16
+      },
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "coverage": "shared left tile, two projections, exact silu(gate) * up epilogue"
+    }
+  ],
+  "rejections": [
+    {
+      "id": "atomic-memory-effect",
+      "construct": "atomic",
+      "stage": "frontend",
+      "source": "test/python/compat/kernels/unsupported.py",
+      "function": "atomic_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "expected_code": "unsupported_triton_memory_effect"
+    },
+    {
+      "id": "shared-async-pipeline",
+      "construct": "shared_async",
+      "stage": "frontend",
+      "source": "test/python/compat/kernels/unsupported.py",
+      "function": "pipelined_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "expected_code": "unsupported_triton_memory_effect",
+      "note": "The qualified upstream 3.6.0 language has no async/await entry; the request is expressed through tl.range(num_stages=...), which asks the compiler to stage loads asynchronously through shared memory. The LLK CPU executor has no such staging, so the exporter rejects the loop's tt.num_stages attribute."
+    },
+    {
+      "id": "arbitrary-reduce",
+      "construct": "reduce",
+      "stage": "frontend",
+      "source": "test/python/compat/kernels/unsupported.py",
+      "function": "reduce_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "expected_code": "unsupported_triton_operation"
+    },
+    {
+      "id": "runtime-while",
+      "construct": "runtime_while",
+      "stage": "frontend",
+      "source": "test/python/compat/kernels/unsupported.py",
+      "function": "while_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "expected_code": "unsupported_triton_operation"
+    },
+    {
+      "id": "runtime-stride",
+      "construct": "runtime_stride",
+      "stage": "binding",
+      "source": "test/python/compat/kernels/unsupported.py",
+      "function": "strided_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "n": "i32",
+        "step": "i32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "tensors": {
+        "x_ptr": [
+          2,
+          64
+        ],
+        "out_ptr": [
+          2,
+          64
+        ]
+      },
+      "scalars": {
+        "n": 128,
+        "step": 2
+      },
+      "grid": [
+        2,
+        1,
+        1
+      ],
+      "expected_code": "unsupported_triton_launch"
+    },
+    {
+      "id": "gpu-inline-assembly",
+      "construct": "gpu_only",
+      "stage": "frontend",
+      "source": "test/python/compat/kernels/unsupported.py",
+      "function": "inline_assembly_kernel",
+      "signature": {
+        "x_ptr": "*fp32",
+        "out_ptr": "*fp32",
+        "BLOCK": "constexpr"
+      },
+      "constexprs": {
+        "BLOCK": 64
+      },
+      "expected_code": "unsupported_triton_operation"
+    }
+  ]
+}

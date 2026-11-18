@@ -101,8 +101,18 @@ CASTS = frozenset(
         "index_castui",
     }
 )
-LAYOUT_OPS = frozenset({"tt.trans", "tt.reshape", "tt.expand_dims", "tt.broadcast"})
+# Rank-preserving views are translated. They only move data between tile
+# lanes, which the counted-contraction proof re-checks against the declared
+# row-major storage. Transposes and arbitrary reshapes stay outside the
+# contract.
+LAYOUT_OPS = frozenset({"tt.trans", "tt.reshape"})
 REGION_OPS = frozenset({"scf.while", "scf.if", "scf.index_switch"})
+# Upstream emits ``tt.reshape`` ahead of a 1-D reduction. Reporting the
+# reduction itself keeps the diagnostic about the construct the caller wrote.
+REDUCTION_OPS = ("tt.reduce", "tt.scan")
+CONSTANT_DENSE = re.compile(
+    r"arith\.constant dense<([^>]*)>\s*:\s*tensor<[^>]*>"
+)
 
 
 class ExportError(Exception):
@@ -392,11 +402,35 @@ def _parse_type(text):
     raise ExportError("unsupported_triton_layout", f"unsupported value type {text!r}")
 
 
-def _collect(module):
+def _dense_constants(text):
+    """Float values of ``arith.constant dense<...>`` tile constants, in order.
+
+    The qualified MLIR bindings expose integer, boolean and string attributes
+    but no dense-element accessor, so the printed module text is the only place
+    a tile constant's value is visible. A missing or non-numeric value is
+    rejected rather than guessed: the accumulator seed must be proven zero.
+    """
+    values = []
+    for raw in CONSTANT_DENSE.findall(str(text)):
+        token = raw.strip()
+        try:
+            values.append(float(token))
+        except ValueError as error:
+            raise ExportError(
+                "unsupported_triton_constant",
+                f"unsupported dense tile constant {token!r}",
+            ) from error
+    return values
+
+
+def _collect(module, text):
     records = []
     blocks = {}
+    dense = _dense_constants(text)
+    dense_index = 0
 
     def visit(op):
+        nonlocal dense_index
         name = op.get_name()
         block = op.get_block()
         block_id = block.id() if block is not None else None
@@ -414,7 +448,15 @@ def _collect(module):
         operands = [op.get_operand(index).id() for index in range(op.get_num_operands())]
         regions = [op.get_region(index).id() for index in range(op.get_num_regions())]
         attributes = {}
-        for key in ("axis", "value", "start", "end", "predicate"):
+        for key in (
+            "axis",
+            "value",
+            "start",
+            "end",
+            "predicate",
+            "inputPrecision",
+            "tt.num_stages",
+        ):
             item = op.get_int_attr(key)
             if item is not None:
                 attributes[key] = item
@@ -422,6 +464,19 @@ def _collect(module):
             boolean = op.get_bool_attr("value")
             if boolean is not None:
                 attributes["value"] = boolean
+        if (
+            name == "arith.constant"
+            and "value" not in attributes
+            and results
+            and results[0][1].startswith("tensor<")
+        ):
+            if dense_index >= len(dense):
+                raise ExportError(
+                    "unsupported_triton_constant",
+                    "a tile constant has no printable value",
+                )
+            attributes["value"] = dense[dense_index]
+            dense_index += 1
         records.append(
             {
                 "name": name,
@@ -436,6 +491,11 @@ def _collect(module):
         )
 
     module.walk(visit)
+    if dense_index != len(dense):
+        raise ExportError(
+            "unsupported_triton_constant",
+            "a printed tile constant was not attributable to an operation",
+        )
     return records, blocks
 
 
@@ -446,18 +506,125 @@ def _as_int(value, name):
 
 
 class Translator:
-    def __init__(self, records, blocks, entry, signature, specialization, constexprs):
+    def __init__(
+        self, records, blocks, entry, signature, specialization, constexprs, ieee
+    ):
         self.records = records
         self.blocks = blocks
         self.entry = entry
         self.signature = signature
         self.specialization = specialization
         self.constexprs = constexprs
+        self.ieee = ieee
         self.value_ids = {}
         self.values = []
         self.definer = {}
         self.op_counter = 0
+        self._fold_activation()
         self._index()
+
+    def _fold_activation(self):
+        """Recognize the qualified ``tl.sigmoid`` lowering as fused SiLU.
+
+        ``tl.sigmoid(x) * x`` prints as
+        ``mulf(divf(1, addf(exp(subf(0, x)), 1)), x)``. The framework's fused
+        activation is exactly ``x/(1+exp(-x))``, so the four intermediate
+        operations are replaced by one ``silu`` operation whose operand is the
+        original accumulator. Constant values are checked; a different chain is
+        left untouched and later rejected by name.
+        """
+        producer = {}
+        for index, record in enumerate(self.records):
+            for value_id, _ in record["results"]:
+                producer[value_id] = index
+
+        def constant_equals(value_id, wanted):
+            index = producer.get(value_id)
+            if index is None:
+                return False
+            record = self.records[index]
+            return (
+                record["name"] == "arith.constant"
+                and record["attributes"].get("value") == wanted
+            )
+
+        def matches_sigmoid(value_id, gate):
+            index = producer.get(value_id)
+            if index is None:
+                return False
+            divide = self.records[index]
+            if divide["name"] != "arith.divf" or len(divide["operands"]) != 2:
+                return False
+            numerator, total = divide["operands"]
+            if not constant_equals(numerator, 1.0):
+                return False
+            index = producer.get(total)
+            if index is None:
+                return False
+            add = self.records[index]
+            if add["name"] != "arith.addf" or len(add["operands"]) != 2:
+                return False
+            exponent, one = add["operands"]
+            if not constant_equals(one, 1.0):
+                return False
+            index = producer.get(exponent)
+            if index is None:
+                return False
+            exp = self.records[index]
+            if exp["name"] != "math.exp" or len(exp["operands"]) != 1:
+                return False
+            index = producer.get(exp["operands"][0])
+            if index is None:
+                return False
+            negated = self.records[index]
+            if negated["name"] != "arith.subf" or len(negated["operands"]) != 2:
+                return False
+            zero, operand = negated["operands"]
+            return constant_equals(zero, 0.0) and operand == gate
+
+        for record in self.records:
+            if record["name"] != "arith.mulf" or len(record["operands"]) != 2:
+                continue
+            left, right = record["operands"]
+            if matches_sigmoid(left, right):
+                gate = right
+            elif matches_sigmoid(right, left):
+                gate = left
+            else:
+                continue
+            record["name"] = "tt.silu"
+            record["operands"] = [gate]
+            record["attributes"] = {}
+        self._prune()
+
+    def _prune(self):
+        """Drop pure operations whose results nothing consumes any more."""
+        pure = {
+            "arith.constant",
+            "math.exp",
+            "tt.splat",
+            "arith.subf",
+            "arith.addf",
+            "arith.divf",
+            "arith.mulf",
+            "arith.negf",
+        }
+        while True:
+            used = set()
+            for record in self.records:
+                used.update(record["operands"])
+            kept = [
+                record
+                for record in self.records
+                if not (
+                    record["name"] in pure
+                    and record["results"]
+                    and not any(value in used for value, _ in record["results"])
+                )
+            ]
+            if len(kept) == len(self.records):
+                return
+            self.records = kept
 
     def _index(self):
         self.region_owner = {}
@@ -551,12 +718,17 @@ class Translator:
             raise ExportError(
                 "unsupported_triton_operation", f"{name} control flow is unsupported"
             )
-        if name.startswith("tt.reduce") or name.startswith("tt.scan"):
-            raise ExportError(
-                "unsupported_triton_operation", f"{name} reduction is unsupported"
-            )
         if name == "tt.get_program_id":
             return "program_id", {"axis": _as_int(attributes.get("axis"), "program axis")}
+        if name == "tt.expand_dims":
+            return "expand_dims", {
+                "axis": _as_int(attributes.get("axis"), "expand axis")
+            }
+        if name == "tt.broadcast":
+            return "broadcast", {}
+        if name == "tt.dot":
+            self._require_ieee_dot(attributes)
+            return "dot", {}
         if name == "arith.constant":
             if "value" not in attributes:
                 raise ExportError(
@@ -577,9 +749,17 @@ class Translator:
             return "load", {"masked": len(record["operands"]) >= 2}
         if name == "tt.store":
             return "store", {"masked": len(record["operands"]) >= 3}
+        if name == "tt.silu":
+            return "silu", {}
         if name == "tt.return":
             return "return", {}
         if name == "scf.for":
+            if attributes.get("tt.num_stages", 0):
+                raise ExportError(
+                    "unsupported_triton_memory_effect",
+                    "asynchronous software-pipeline staging requests are "
+                    "unsupported",
+                )
             return "for", {}
         if name == "scf.yield":
             return "yield", {}
@@ -616,6 +796,15 @@ class Translator:
             "unsupported_triton_operation", f"unsupported arithmetic operation {name!r}"
         )
 
+    def _require_ieee_dot(self, attributes):
+        precision = attributes.get("inputPrecision", self.ieee)
+        if precision != self.ieee:
+            raise ExportError(
+                "unsupported_triton_numerics",
+                "only IEEE f32 dot precision preserves the strict numerical "
+                "contract; reduced-precision dot modes are unsupported",
+            )
+
     def _value_dtype(self, value_id):
         for value in self.values:
             if value["id"] == self.value_ids.get(value_id):
@@ -630,7 +819,12 @@ class Translator:
             return None
         record = self.records[index]
         name = record["name"]
-        if name in ("tt.splat", "tt.addptr") and record["operands"]:
+        if name in (
+            "tt.splat",
+            "tt.addptr",
+            "tt.broadcast",
+            "tt.expand_dims",
+        ) and record["operands"]:
             return self._root_argument(record["operands"][0])
         if name.startswith("arith.") and name.split(".", 1)[1] in CASTS:
             return self._root_argument(record["operands"][0])
@@ -730,6 +924,15 @@ class Translator:
         return parameters
 
     def translate(self):
+        # A reduction's printed lowering includes a rank view that would
+        # otherwise be rejected first. Report the reduction the caller wrote.
+        for record in self.records:
+            if record["name"].startswith(REDUCTION_OPS):
+                raise ExportError(
+                    "unsupported_triton_operation",
+                    "tensor reductions are unsupported (the framework only "
+                    "recovers the counted K contraction)",
+                )
         for value_id, type_text in self.entry_arguments:
             self._declare(value_id, type_text)
         for child in self.children[self.function]:
@@ -859,8 +1062,11 @@ def _export(request, triton, identity):
             f"argument order {expected}",
         )
     module, text = _generate_ttir(triton, kernel, request)
-    records, blocks = _collect(module)
-    translator = Translator(records, blocks, function, signature, specialization, constexprs)
+    records, blocks = _collect(module, text)
+    ieee = int(triton._C.libtriton.ir.IEEE)
+    translator = Translator(
+        records, blocks, function, signature, specialization, constexprs, ieee
+    )
     graph = translator.translate()
 
     source_bytes = Path(module_path).read_bytes()
