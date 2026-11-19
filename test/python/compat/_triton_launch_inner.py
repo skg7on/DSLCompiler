@@ -796,3 +796,195 @@ def _compile_artifact(triton_path, tmp_path):
         result = stage(result, metadata)
     assert isinstance(result, bytes)
     return result
+
+
+# ---------------------------------------------------------------------------
+# PF19: contraction template binding.
+# ---------------------------------------------------------------------------
+
+KERNELS = Path(__file__).with_name("kernels")
+
+MATMUL_SIGNATURE = {
+    "a_ptr": "*fp32",
+    "b_ptr": "*fp32",
+    "out_ptr": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+}
+ACCUMULATE_SIGNATURE = {
+    "a_ptr": "*fp32",
+    "b_ptr": "*fp32",
+    "init_ptr": "*fp32",
+    "out_ptr": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+}
+SWIGLU_SIGNATURE = {
+    "x_ptr": "*fp32",
+    "gate_ptr": "*fp32",
+    "up_ptr": "*fp32",
+    "out_ptr": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+}
+TILE = {"BM": 32, "BN": 64, "BK": 16}
+
+STRIDE_SOURCE = """\
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def stride_kernel(x_ptr, out_ptr, n, step, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    x = tl.load(x_ptr + offs * step, mask=mask)
+    tl.store(out_ptr + offs, x, mask=mask)
+"""
+
+
+def _host(shape, value=0.0):
+    import numpy as np
+
+    return np.full(shape, value, dtype=np.float32)
+
+
+def _export_kernel(module, function, signature, constexprs):
+    return llk.triton.capture_kernel(
+        KERNELS / module,
+        function,
+        signature,
+        constexprs=constexprs,
+        triton_python=str(_triton_path_from_sys()),
+    )
+
+
+def test_bind_translates_matmul_into_a_counted_contraction(triton_path):
+    from llk.triton._driver import CPULauncher
+
+    template = _export_kernel(
+        "matmul.py", "matmul_kernel", MATMUL_SIGNATURE, TILE
+    ).template
+    a, b, out = _host((32, 16)), _host((16, 64)), _host((32, 64))
+    request = CPULauncher.bind_triton_template(
+        template, (a, b, out, 32, 64, 16, 32, 64, 16), (1, 1, 1), _options()
+    )
+    program = request.program
+    assert program.launch.grid == (1, 1, 1)
+    assert program.launch.block == (32, 64, 1)
+    loops = [op for op in program.operations if op.opcode == "counted_loop"]
+    assert len(loops) == 1
+    loop = loops[0]
+    assert loop.attributes["step"] == 16
+    assert len(loop.regions[0].operations) > 0
+    dots = [op for op in loop.regions[0].operations if op.opcode == "dot"]
+    assert len(dots) == 1
+    stores = [op for op in program.operations if op.opcode == "store"]
+    assert len(stores) == 1
+    assert stores[0].operands[1] == loop.results[0].id
+    # The zero accumulator is the loop's carried seed, not an invented value.
+    seeds = [op for op in program.operations if op.opcode == "constant"]
+    assert any(
+        op.results[0].dtype == "f32" and op.results[0].shape == (32, 64)
+        for op in seeds
+    )
+
+
+def test_bind_translates_an_accumulated_matmul_seed(triton_path):
+    from llk.triton._driver import CPULauncher
+
+    template = _export_kernel(
+        "matmul.py", "matmul_accumulate_kernel", ACCUMULATE_SIGNATURE, TILE
+    ).template
+    a, b = _host((32, 16)), _host((16, 64))
+    init, out = _host((32, 64), 1.0), _host((32, 64))
+    request = CPULauncher.bind_triton_template(
+        template,
+        (a, b, init, out, 32, 64, 16, 32, 64, 16),
+        (1, 1, 1),
+        _options(),
+    )
+    program = request.program
+    loads = [op for op in program.operations if op.opcode == "load"]
+    assert len(loads) == 1, "the caller accumulator is read once before the loop"
+    loop = next(op for op in program.operations if op.opcode == "counted_loop")
+    assert loads[0].results[0].id in loop.operands
+
+
+def test_bind_translates_fused_swiglu(triton_path):
+    from llk.triton._driver import CPULauncher
+
+    template = _export_kernel(
+        "swiglu.py", "swiglu_kernel", SWIGLU_SIGNATURE, {"BM": 16, "BN": 64, "BK": 16}
+    ).template
+    x, gate, up = _host((16, 16)), _host((16, 64)), _host((16, 64))
+    out = _host((16, 64))
+    request = CPULauncher.bind_triton_template(
+        template, (x, gate, up, out, 16, 64, 16, 16, 64, 16), (1, 1, 1), _options()
+    )
+    program = request.program
+    loop = next(op for op in program.operations if op.opcode == "counted_loop")
+    dots = [op for op in loop.regions[0].operations if op.opcode == "dot"]
+    assert len(dots) == 2
+    assert len(loop.results) == 2
+    silus = [op for op in program.operations if op.opcode == "silu"]
+    assert len(silus) == 1
+    products = [
+        op
+        for op in program.operations
+        if op.opcode == "mul"
+        and op.results
+        and op.results[0].dtype == "f32"
+    ]
+    assert len(products) == 1
+    store = next(op for op in program.operations if op.opcode == "store")
+    assert store.operands[1] == products[0].results[0].id
+    assert program.numerical_contract.activation_expression == "x/(1+exp(-x))"
+    assert program.numerical_contract.activation_approximation == "exact"
+
+
+def test_bind_rejects_inexact_contraction_coverage(triton_path):
+    from llk.triton._driver import CPULauncher
+
+    template = _export_kernel(
+        "matmul.py", "matmul_kernel", MATMUL_SIGNATURE, TILE
+    ).template
+    a, b, out = _host((32, 16)), _host((16, 64)), _host((32, 64))
+    with pytest.raises(TensorContractError) as caught:
+        CPULauncher.bind_triton_template(
+            template, (a, b, out, 32, 64, 16, 32, 64, 16), (2, 1, 1), _options()
+        )
+    assert caught.value.code == "invalid_launch_coverage"
+
+
+def test_bind_rejects_a_runtime_strided_access(tmp_path, triton_path):
+    from llk.triton._driver import CPULauncher
+
+    path = tmp_path / "stride kernel.py"
+    path.write_text(STRIDE_SOURCE, encoding="utf-8")
+    template = llk.triton.capture_kernel(
+        path,
+        "stride_kernel",
+        {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32", "step": "i32",
+         "BLOCK": "constexpr"},
+        constexprs={"BLOCK": 64},
+        triton_python=str(_triton_path_from_sys()),
+    ).template
+    x, out = _host((2, 64)), _host((2, 64))
+    with pytest.raises(UnsupportedFeatureError) as caught:
+        CPULauncher.bind_triton_template(
+            template, (x, out, 128, 2, 64), (2, 1, 1), _options()
+        )
+    assert caught.value.code == "unsupported_triton_launch"

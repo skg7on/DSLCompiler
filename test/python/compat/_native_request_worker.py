@@ -5,6 +5,11 @@ This worker never imports upstream Triton.  It is how the compatibility lane
 proves that a request bound from a genuine PF17 template is the exact native
 contract, even on hosts where Triton's LLVM and LLK's LLVM cannot share one
 process.
+
+Each case names a serialized ``CompileRequest``, its concrete input arrays and
+its output arrays. Every field of the native compilation report that identifies
+the frontend, the plan and the selected/reference groups is returned, so a
+report is evidence of what executed rather than of what was requested.
 """
 
 from __future__ import annotations
@@ -22,6 +27,13 @@ def _emit(payload):
     stream = sys.__stdout__
     stream.write(f"{MARKER}\n{body}\n")
     stream.flush()
+
+
+def _paths(case, key, legacy):
+    values = case.get(key)
+    if values is None:
+        values = [case[name] for name in legacy]
+    return [str(value) for value in values]
 
 
 def main(argv=None):
@@ -43,15 +55,20 @@ def main(argv=None):
             request = deserialize_request(
                 Path(spec["request"]).read_bytes()
             )
+            inputs = tuple(
+                np.load(path) for path in _paths(spec, "inputs", ("x", "y"))
+            )
+            outputs = tuple(
+                np.load(path) for path in _paths(spec, "outputs", ("out",))
+            )
             kernel = ffi.compile_request(request)
-            inputs = (np.load(spec["x"]), np.load(spec["y"]))
-            outputs = (np.load(spec["out"]),)
             try:
                 kernel.invoke(inputs, outputs)
             finally:
                 report = kernel.report
                 kernel.close()
-            np.save(spec["out"], outputs[0])
+            for path, value in zip(_paths(spec, "outputs", ("out",)), outputs):
+                np.save(path, value)
             results.append(
                 {
                     "name": spec["name"],
@@ -60,6 +77,16 @@ def main(argv=None):
                     "plan_id": report.plan_id,
                     "abi_hash": report.abi_hash,
                     "native_request_identity": report.native_request_identity,
+                    "frontend_identity": report.frontend_identity,
+                    "compiler_identity": report.compiler_identity,
+                    "workload_identity": report.workload_identity,
+                    "source_adapter_identity": report.source_adapter_identity,
+                    "target_hash": report.target_hash,
+                    "machine_hash": report.machine_hash,
+                    "rules_hash": report.rules_hash,
+                    "selected_group_count": report.selected_group_count,
+                    "reference_group_count": report.reference_group_count,
+                    "stages": list(report.stages),
                 }
             )
         _emit({"ok": True, "results": results})

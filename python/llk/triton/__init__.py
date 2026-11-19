@@ -144,6 +144,7 @@ _ERROR_TYPES = {
     "unsupported_triton_layout": UnsupportedFeatureError,
     "unsupported_triton_memory_effect": UnsupportedFeatureError,
     "unsupported_triton_constant": UnsupportedFeatureError,
+    "unsupported_triton_numerics": UnsupportedFeatureError,
     "invalid_triton_signature": FrontendSyntaxError,
     "invalid_triton_request": FrontendSyntaxError,
     "triton_compilation_failed": CompilationError,

@@ -415,3 +415,282 @@ def test_stdout_log_noise_does_not_corrupt_the_result(tmp_path, triton_path):
     )
     assert "upstream log noise" not in export.ttir
     assert "tt.func public @add_kernel" in export.ttir
+
+
+# ---------------------------------------------------------------------------
+# PF19: contraction and fused-activation export extensions.
+# ---------------------------------------------------------------------------
+
+KERNELS = Path(__file__).with_name("kernels")
+
+MATMUL_SIGNATURE = {
+    "a_ptr": "*fp32",
+    "b_ptr": "*fp32",
+    "out_ptr": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+}
+MATMUL_CONSTEXPRS = {"BM": 16, "BN": 16, "BK": 16}
+
+SWIGLU_SIGNATURE = {
+    "x_ptr": "*fp32",
+    "gate_ptr": "*fp32",
+    "up_ptr": "*fp32",
+    "out_ptr": "*fp32",
+    "M": "i32",
+    "N": "i32",
+    "K": "i32",
+    "BM": "constexpr",
+    "BN": "constexpr",
+    "BK": "constexpr",
+}
+
+
+def _export(tmp_path, triton_path, source, name, function, signature, constexprs=None):
+    path = _write(tmp_path, name, source)
+    return triton_export.capture_kernel(
+        path,
+        function,
+        signature,
+        constexprs=constexprs or {},
+        triton_python=str(triton_path),
+    )
+
+
+def _module_export(triton_path, module, function, signature, constexprs):
+    return triton_export.capture_kernel(
+        KERNELS / module,
+        function,
+        signature,
+        constexprs=constexprs,
+        triton_python=str(triton_path),
+    )
+
+
+def test_contraction_export_preserves_dot_and_rank_two_views(triton_path):
+    export = _module_export(
+        triton_path, "matmul.py", "matmul_kernel", MATMUL_SIGNATURE, MATMUL_CONSTEXPRS
+    )
+    assert "tt.dot" in export.ttir
+    assert "inputPrecision = tf32" not in export.ttir
+    operations = list(_flatten(export.template.operations))
+    opcodes = {operation.opcode for operation in operations}
+    assert {"dot", "expand_dims", "broadcast", "for", "load", "store"} <= opcodes
+    zeroes = [
+        operation
+        for operation in operations
+        if operation.opcode == "constant"
+        and operation.attributes.get("value") == 0.0
+    ]
+    assert zeroes, "the zero accumulator tile must survive as a typed constant"
+    loops = [operation for operation in operations if operation.opcode == "for"]
+    assert len(loops) == 1 and loops[0].regions[0].arguments
+
+
+def test_accumulated_matmul_seed_is_a_caller_tile(triton_path):
+    export = _module_export(
+        triton_path,
+        "matmul.py",
+        "matmul_accumulate_kernel",
+        {
+            "a_ptr": "*fp32",
+            "b_ptr": "*fp32",
+            "init_ptr": "*fp32",
+            "out_ptr": "*fp32",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "BM": "constexpr",
+            "BN": "constexpr",
+            "BK": "constexpr",
+        },
+        MATMUL_CONSTEXPRS,
+    )
+    parameters = {parameter.name: parameter for parameter in export.template.parameters}
+    assert parameters["init_ptr"].access == "read"
+    operations = list(_flatten(export.template.operations))
+    loop = next(operation for operation in operations if operation.opcode == "for")
+    assert loop.operands, "the caller tile must be the loop-carried seed"
+
+
+def test_fused_activation_export_preserves_silu(triton_path):
+    export = _module_export(
+        triton_path, "swiglu.py", "swiglu_kernel", SWIGLU_SIGNATURE, MATMUL_CONSTEXPRS
+    )
+    assert "math.exp" in export.ttir
+    operations = list(_flatten(export.template.operations))
+    opcodes = [operation.opcode for operation in operations]
+    assert "silu" in opcodes
+    # The recognized chain is replaced, not duplicated: no residual elementwise
+    # sigmoid survives in the neutral template.
+    assert "mulf" in opcodes
+    silus = [operation for operation in operations if operation.opcode == "silu"]
+    assert len(silus) == 1 and len(silus[0].operands) == 1
+
+
+TF32_SOURCE = """\
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_default_precision(a_ptr, b_ptr, out_ptr, M, N, K,
+                             BM: tl.constexpr, BN: tl.constexpr,
+                             BK: tl.constexpr):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM)
+    cols = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), tl.float32)
+    for kk in range(0, K, BK):
+        at = tl.load(a_ptr + rows[:, None] * K + (kk + rk)[None, :])
+        bt = tl.load(b_ptr + (kk + rk)[:, None] * N + cols[None, :])
+        acc = tl.dot(at, bt, acc)
+    tl.store(out_ptr + rows[:, None] * N + cols[None, :], acc)
+"""
+
+PIPELINE_SOURCE = """\
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def pipelined_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    acc = tl.zeros((BLOCK,), tl.float32)
+    for i in tl.range(0, 4, num_stages=2):
+        acc += tl.load(x_ptr + offs + i * BLOCK)
+    tl.store(out_ptr + offs, acc)
+"""
+
+REDUCE_SOURCE = """\
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def reduce_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    tl.store(out_ptr + pid, tl.sum(tl.load(x_ptr + offs)))
+"""
+
+INLINE_ASM_SOURCE = """\
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def asm_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    y = tl.inline_asm_elementwise(
+        "mov.b32 $0, $1;", "=r,r", [x], dtype=tl.float32, is_pure=True, pack=1
+    )
+    tl.store(out_ptr + offs, y)
+"""
+
+
+def test_tf32_dot_precision_is_rejected(tmp_path, triton_path):
+    with pytest.raises(UnsupportedFeatureError) as caught:
+        _export(
+            tmp_path,
+            triton_path,
+            TF32_SOURCE,
+            "tf32 matmul.py",
+            "matmul_default_precision",
+            MATMUL_SIGNATURE,
+            MATMUL_CONSTEXPRS,
+        )
+    assert caught.value.code == "unsupported_triton_numerics"
+
+
+def test_software_pipeline_request_is_rejected(tmp_path, triton_path):
+    with pytest.raises(UnsupportedFeatureError) as caught:
+        _export(
+            tmp_path,
+            triton_path,
+            PIPELINE_SOURCE,
+            "pipeline kernel.py",
+            "pipelined_kernel",
+            {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32", "BLOCK": "constexpr"},
+            {"BLOCK": 64},
+        )
+    assert caught.value.code == "unsupported_triton_memory_effect"
+
+
+def test_reduction_is_rejected(tmp_path, triton_path):
+    with pytest.raises(UnsupportedFeatureError) as caught:
+        _export(
+            tmp_path,
+            triton_path,
+            REDUCE_SOURCE,
+            "reduce kernel.py",
+            "reduce_kernel",
+            {"x_ptr": "*fp32", "out_ptr": "*fp32", "BLOCK": "constexpr"},
+            {"BLOCK": 64},
+        )
+    assert caught.value.code == "unsupported_triton_operation"
+
+
+def test_gpu_inline_assembly_is_rejected(tmp_path, triton_path):
+    with pytest.raises(UnsupportedFeatureError) as caught:
+        _export(
+            tmp_path,
+            triton_path,
+            INLINE_ASM_SOURCE,
+            "asm kernel.py",
+            "asm_kernel",
+            {"x_ptr": "*fp32", "out_ptr": "*fp32", "BLOCK": "constexpr"},
+            {"BLOCK": 64},
+        )
+    assert caught.value.code == "unsupported_triton_operation"
+
+
+SEED_ONE_SOURCE = """\
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def matmul_seeded_with_one(a_ptr, b_ptr, out_ptr, M, N, K,
+                           BM: tl.constexpr, BN: tl.constexpr,
+                           BK: tl.constexpr):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM)
+    cols = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.full((BM, BN), 1.0, tl.float32)
+    for kk in range(0, K, BK):
+        at = tl.load(a_ptr + rows[:, None] * K + (kk + rk)[None, :])
+        bt = tl.load(b_ptr + (kk + rk)[:, None] * N + cols[None, :])
+        acc = tl.dot(at, bt, acc, input_precision="ieee")
+    tl.store(out_ptr + rows[:, None] * N + cols[None, :], acc)
+"""
+
+
+def test_nonzero_accumulator_seed_is_preserved_not_zeroed(tmp_path, triton_path):
+    export = _export(
+        tmp_path,
+        triton_path,
+        SEED_ONE_SOURCE,
+        "seeded matmul.py",
+        "matmul_seeded_with_one",
+        MATMUL_SIGNATURE,
+        MATMUL_CONSTEXPRS,
+    )
+    operations = list(_flatten(export.template.operations))
+    tiles = [
+        operation
+        for operation in operations
+        if operation.opcode == "constant"
+        and operation.attributes.get("value") == 1.0
+    ]
+    assert tiles, "a one-initialized accumulator must not become a zero seed"

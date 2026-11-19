@@ -38,6 +38,7 @@ from llk.frontend import (
     LaunchSpec,
     NumericalContract,
     Operation,
+    Region,
     SourceSpan,
     TensorSpec,
     Value,
@@ -616,8 +617,643 @@ class _Binder:
 
 
 # ---------------------------------------------------------------------------
-# Binding: template + concrete arguments -> checked CompileRequest.
+# Rank-two tile binder: elementwise tiles, contractions and fused SwiGLU.
 # ---------------------------------------------------------------------------
+#
+# The upstream templates for these kernels address rank-two tiles with
+# ``rows[:, None]`` / ``cols[None, :]``, may run over a counted K loop and store
+# one tile.  The framework's native importers already prove those families, so
+# this binder replays the neutral template into exactly the program shape they
+# recover:
+#
+#   * index facts are affine forms over the two program ids, the two tile lanes
+#     and the counted loop's induction variable,
+#   * a pointer tile carries an explicit flat offset value; every load/store
+#     decomposes it into ``div``/``rem`` by the tensor's declared row stride,
+#   * per-axis masks are combined as the framework's ``select`` conjunction,
+#   * the counted loop is emitted with the concrete K bound and block step, and
+#   * ``silu`` comes from the exporter, which recognizes ``tl.sigmoid(x) * x``.
+#
+# No address, mask or accumulator is invented: a construct this replay does not
+# understand is rejected with ``unsupported_triton_launch``.
+
+_PID0, _PID1, _LANE0, _LANE1, _INDUCTION = range(5)
+
+
+@dataclass(frozen=True, slots=True)
+class _Affine:
+    """``pid0, pid1, lane0, lane1, induction`` coefficients plus a constant."""
+
+    coefficients: tuple[int, int, int, int, int] = (0, 0, 0, 0, 0)
+    constant: int = 0
+
+    def add(self, other):
+        return _Affine(
+            tuple(a + b for a, b in zip(self.coefficients, other.coefficients)),
+            self.constant + other.constant,
+        )
+
+    def subtract(self, other):
+        return _Affine(
+            tuple(a - b for a, b in zip(self.coefficients, other.coefficients)),
+            self.constant - other.constant,
+        )
+
+    def scale(self, factor):
+        return _Affine(
+            tuple(value * factor for value in self.coefficients),
+            self.constant * factor,
+        )
+
+    def uniform(self):
+        return all(value == 0 for value in self.coefficients)
+
+
+def _affine(symbol, amount=1):
+    coefficients = [0] * 5
+    coefficients[symbol] = amount
+    return _Affine(tuple(coefficients), 0)
+
+
+@dataclass(slots=True)
+class _CFact:
+    kind: str
+    shape: tuple = ()
+    value: Value | None = None
+    affine: _Affine | None = None
+    port: str | None = None
+    offset: Value | None = None
+
+
+class _TileBinder:
+    """Replay a rank-two tile template into the importer's accepted program."""
+
+    def __init__(self, template, layouts, scalars, runtime_grid, source):
+        self.template = template
+        self.layouts = layouts
+        self.scalars = scalars
+        self.runtime_grid = runtime_grid
+        self.source = source
+        self.specs = {value.id: value for value in template.values}
+        self.values: dict[str, _CFact] = {}
+        self._ops: list[Operation] = []
+        self._counter = 0
+        self._index_constants: dict[int, Value] = {}
+        self._float_constants: dict[tuple, Value] = {}
+        self._store_value: Value | None = None
+        self.store_shape: tuple | None = None
+        self.loop_upper: int | None = None
+        self.dot_lhs: list[str] = []
+        self.dot_rhs: list[str] = []
+        self.needs_activation = False
+        for parameter in template.parameters:
+            if parameter.kind == "pointer":
+                self.values[parameter.value_id] = _CFact("ptr", port=parameter.name)
+            elif parameter.kind == "scalar":
+                constant = scalars[parameter.name]
+                self.values[parameter.value_id] = _CFact(
+                    "index",
+                    value=self._index_constant(constant),
+                    affine=_Affine((0, 0, 0, 0, 0), constant),
+                )
+
+    # -- emission ---------------------------------------------------------
+
+    def _fresh(self, dtype, shape):
+        self._counter += 1
+        return Value(f"_c{self._counter}", dtype, tuple(shape))
+
+    def _emit(self, ops, opcode, operands=(), results=(), attributes=None,
+              regions=()):
+        ops.append(
+            Operation(
+                opcode,
+                tuple(value.id for value in operands),
+                tuple(results),
+                attributes or {},
+                tuple(regions),
+                _SPAN,
+            )
+        )
+
+    def _index_constant(self, value):
+        if value not in self._index_constants:
+            result = self._fresh("index", ())
+            self._emit(
+                self._ops, "constant", (), (result,), {"value": int(value)}
+            )
+            self._index_constants[value] = result
+        return self._index_constants[value]
+
+    def _float_constant(self, value, shape):
+        key = (round(float(value), 12), tuple(shape))
+        if key not in self._float_constants:
+            result = self._fresh("f32", shape)
+            self._emit(
+                self._ops, "constant", (), (result,), {"value": float(value)}
+            )
+            self._float_constants[key] = result
+        return self._float_constants[key]
+
+    def _true_mask(self, shape):
+        result = self._fresh("i1", shape)
+        self._emit(self._ops, "constant", (), (result,), {"value": True})
+        return result
+
+    # -- replay -----------------------------------------------------------
+
+    def run(self):
+        for operation in self.template.operations:
+            self._operation(operation)
+        if self._store_value is None or self.store_shape is None:
+            _unsupported("a tile kernel must write exactly one output tile")
+        self._emit(self._ops, "return")
+        return tuple(self._ops)
+
+    def _lookup(self, name):
+        fact = self.values.get(name)
+        if fact is None:
+            _unsupported(f"template value {name!r} has no definition")
+        return fact
+
+    def _spec(self, name):
+        spec = self.specs.get(name)
+        if spec is None:
+            _unsupported(f"template value {name!r} has no type")
+        return spec
+
+    def _index(self, fact):
+        if fact.kind != "index" or fact.affine is None or fact.value is None:
+            _unsupported("an integer index operand is required")
+        return fact.affine
+
+    def _uniform(self, fact):
+        if fact.kind != "index" or fact.affine is None or not fact.affine.uniform():
+            _unsupported("a uniform integer value is required")
+        return fact.affine.constant
+
+    def _set(self, name, fact):
+        self.values[name] = fact
+
+    def _operation(self, operation, ops=None):
+        ops = self._ops if ops is None else ops
+        code = operation.opcode
+        operands = [self._lookup(name) for name in operation.operands]
+        results = operation.results
+        attributes = operation.attributes
+        if code == "constant":
+            self._constant(results[0], attributes)
+        elif code == "program_id":
+            axis = attributes.get("axis")
+            if type(axis) is not int or axis not in (0, 1):
+                _unsupported("only the two program ids are supported")
+            result = self._fresh("index", ())
+            self._emit(ops, "program_id", (), (result,), {"axis": axis})
+            self._set(
+                results[0],
+                _CFact("index", (), result, _affine(_PID0 if axis == 0 else _PID1)),
+            )
+        elif code == "range":
+            start = attributes.get("start")
+            end = attributes.get("end")
+            spec = self._spec(results[0])
+            if type(start) is not int or type(end) is not int or start != 0 or end <= 0:
+                _unsupported("only a zero-based static range is supported")
+            result = self._fresh("index", spec.shape)
+            self._emit(ops, "range", (), (result,), {"start": start, "end": end})
+            self._set(results[0], _CFact("index", spec.shape, result, _affine(_LANE0)))
+        elif code == "splat":
+            operand = operands[0]
+            spec = self._spec(results[0])
+            if operand.kind == "index":
+                self._set(
+                    results[0],
+                    _CFact("index", spec.shape, operand.value, operand.affine),
+                )
+            elif operand.kind == "ptr":
+                self._set(
+                    results[0],
+                    _CFact(
+                        "ptr",
+                        spec.shape,
+                        port=operand.port,
+                        offset=operand.offset or self._index_constant(0),
+                    ),
+                )
+            else:
+                _unsupported("only index and pointer splats are supported")
+        elif code in ("addi", "subi", "muli"):
+            self._integer(ops, code, operands, results[0])
+        elif code == "expand_dims":
+            self._expand_dims(ops, operands[0], results[0], attributes)
+        elif code == "broadcast":
+            self._broadcast(ops, operands[0], results[0])
+        elif code == "add_ptr":
+            self._add_pointer(ops, operands, results[0])
+        elif code in ("cmpi", "cmpf"):
+            self._compare(ops, operands, results[0], attributes)
+        elif code == "andi":
+            self._mask_and(ops, operands, results[0])
+        elif code == "select":
+            self._select(ops, operands, results[0])
+        elif code == "load":
+            self._load(ops, operands, results[0])
+        elif code == "dot":
+            self._dot(ops, operands, results[0])
+        elif code == "silu":
+            self._float_unary(ops, "silu", operands, results[0], attributes)
+        elif code in ("addf", "subf", "mulf", "divf"):
+            self._float_binary(ops, code, operands, results[0])
+        elif code == "for":
+            self._loop(operation)
+        elif code == "store":
+            self._store(operands)
+        elif code == "return":
+            pass
+        else:
+            _unsupported(f"the tile binder replays no {code!r} operation")
+
+    def _constant(self, result_id, attributes):
+        spec = self._spec(result_id)
+        value = attributes.get("value")
+        if spec.dtype in _INDEX_DTYPES and not spec.shape:
+            if type(value) is not int:
+                _unsupported("an index constant must be an integer")
+            self._set(
+                result_id,
+                _CFact("index", (), self._index_constant(value),
+                       _Affine((0, 0, 0, 0, 0), value)),
+            )
+            return
+        if spec.dtype == "i1":
+            if type(value) is not bool:
+                _unsupported("a mask constant must be boolean")
+            mask = self._fresh("i1", spec.shape)
+            self._emit(self._ops, "constant", (), (mask,), {"value": value})
+            self._set(result_id, _CFact("mask", spec.shape, mask))
+            return
+        if spec.dtype == "f32" and type(value) in (int, float):
+            self._set(
+                result_id,
+                _CFact("float", spec.shape, self._float_constant(value, spec.shape)),
+            )
+            return
+        _unsupported(
+            "a contraction template may only carry integer, boolean and f32 "
+            "constants"
+        )
+
+    def _integer(self, ops, code, operands, result_id):
+        left, right = operands
+        spec = self._spec(result_id)
+        left_index, right_index = self._index(left), self._index(right)
+        if code == "muli":
+            if left_index.uniform():
+                affine = right_index.scale(left_index.constant)
+            elif right_index.uniform():
+                affine = left_index.scale(right_index.constant)
+            else:
+                _unsupported(
+                    "a runtime-scaled (strided) index is unsupported"
+                )
+            opcode = "mul"
+        elif code == "addi":
+            affine = left_index.add(right_index)
+            opcode = "add"
+        else:
+            affine = left_index.subtract(right_index)
+            opcode = "sub"
+        result = self._fresh("index", spec.shape)
+        self._emit(ops, opcode, (left.value, right.value), (result,))
+        self._set(result_id, _CFact("index", spec.shape, result, affine))
+
+    def _expand_dims(self, ops, operand, result_id, attributes):
+        axis = attributes.get("axis")
+        spec = self._spec(result_id)
+        source = operand.affine
+        if operand.kind != "index" or source is None:
+            _unsupported("only an index view can be expanded")
+        coefficients = [0] * 5
+        coefficients[:_LANE0] = list(source.coefficients[:_LANE0])
+        for lane in range(len(operand.shape)):
+            mapped = lane + (1 if lane >= axis else 0)
+            if mapped > 1:
+                _unsupported("an index view leaves the rank-two lane space")
+            coefficients[_LANE0 + mapped] += source.coefficients[_LANE0 + lane]
+        result = self._fresh("index", spec.shape)
+        self._emit(ops, "expand_dims", (operand.value,), (result,), {"axis": axis})
+        self._set(
+            result_id,
+            _CFact("index", spec.shape, result,
+                   _Affine(tuple(coefficients), source.constant)),
+        )
+
+    def _broadcast(self, ops, operand, result_id):
+        spec = self._spec(result_id)
+        if operand.kind == "ptr":
+            if operand.offset is None:
+                _unsupported("a pointer broadcast has no flat offset")
+            result = operand.offset
+            if operand.shape != spec.shape and operand.offset.shape != spec.shape:
+                result = self._fresh("index", spec.shape)
+                dimensions = tuple(range(len(spec.shape)))
+                self._emit(
+                    ops, "broadcast", (operand.offset,), (result,),
+                    {"dimensions": dimensions},
+                )
+            self._set(
+                result_id, _CFact("ptr", spec.shape, port=operand.port, offset=result)
+            )
+            return
+        if operand.kind == "mask":
+            if operand.value is None:
+                _unsupported("a mask broadcast has no value")
+            if operand.shape == spec.shape and operand.value.shape == spec.shape:
+                result = operand.value
+            elif len(operand.value.shape) == len(spec.shape):
+                result = self._fresh("i1", spec.shape)
+                self._emit(
+                    ops, "broadcast", (operand.value,), (result,),
+                    {"dimensions": tuple(range(len(spec.shape)))},
+                )
+            else:
+                _unsupported("a scalar mask cannot be broadcast into a tile")
+            self._set(result_id, _CFact("mask", spec.shape, result))
+            return
+        if operand.kind != "index" or operand.affine is None:
+            _unsupported("only index, pointer and mask tiles can be broadcast")
+        if operand.value.shape == spec.shape:
+            result = operand.value
+        elif len(operand.value.shape) == len(spec.shape):
+            result = self._fresh("index", spec.shape)
+            self._emit(
+                ops, "broadcast", (operand.value,), (result,),
+                {"dimensions": tuple(range(len(spec.shape)))},
+            )
+        else:
+            _unsupported("a scalar cannot be broadcast into a tile directly")
+        self._set(
+            result_id, _CFact("index", spec.shape, result, operand.affine)
+        )
+
+    def _add_pointer(self, ops, operands, result_id):
+        pointer, offset = operands
+        spec = self._spec(result_id)
+        if pointer.kind != "ptr" or pointer.port is None or pointer.offset is None:
+            _unsupported("only a kernel parameter pointer can be offset")
+        if offset.kind != "index" or offset.value is None or offset.affine is None:
+            _unsupported("a pointer offset must be an integer index")
+        result = self._fresh("index", spec.shape)
+        self._emit(ops, "add", (pointer.offset, offset.value), (result,))
+        base = pointer.affine if pointer.affine is not None else _Affine()
+        self._set(
+            result_id,
+            _CFact(
+                "ptr",
+                spec.shape,
+                port=pointer.port,
+                offset=result,
+                affine=base.add(offset.affine),
+            ),
+        )
+
+    def _address(self, ops, pointer):
+        if pointer.port is None or pointer.offset is None:
+            _unsupported("a memory access needs a bound kernel parameter")
+        shape = self.layouts[pointer.port].shape
+        if len(shape) != 2:
+            _unsupported("a contraction tensor must be rank two")
+        divisor = self._index_constant(int(shape[1]))
+        rows = self._fresh("index", pointer.shape)
+        columns = self._fresh("index", pointer.shape)
+        self._emit(ops, "div", (pointer.offset, divisor), (rows,))
+        self._emit(ops, "rem", (pointer.offset, divisor), (columns,))
+        dtype = self.layouts[pointer.port].dtype
+        address = self._fresh(f"ptr<{dtype}>", pointer.shape)
+        base = Value(pointer.port, f"ptr<{dtype}>", ())
+        self._emit(ops, "address", (base, rows, columns), (address,))
+        return address, dtype
+
+    def _compare(self, ops, operands, result_id, attributes):
+        spec = self._spec(result_id)
+        predicate = {
+            "eq": "eq",
+            "ne": "ne",
+            "slt": "lt",
+            "ult": "lt",
+            "sle": "le",
+            "ule": "le",
+            "sgt": "gt",
+            "ugt": "gt",
+            "sge": "ge",
+            "uge": "ge",
+            "oeq": "eq",
+            "one": "ne",
+            "olt": "lt",
+            "ole": "le",
+            "ogt": "gt",
+            "oge": "ge",
+        }.get(attributes.get("predicate"))
+        if predicate is None:
+            _unsupported("unsupported comparison predicate")
+        left, right = operands
+        if left.kind not in ("index", "float") or right.kind not in (
+            "index",
+            "float",
+        ):
+            _unsupported("a compare requires numeric tiles")
+        result = self._fresh("i1", spec.shape)
+        self._emit(ops, "compare", (left.value, right.value), (result,),
+                   {"predicate": predicate})
+        self._set(result_id, _CFact("mask", spec.shape, result))
+
+    def _mask_and(self, ops, operands, result_id):
+        spec = self._spec(result_id)
+        left, right = operands
+        if left.kind != "mask" or right.kind != "mask":
+            _unsupported("only boolean masks can be combined")
+        false = self._fresh("i1", ())
+        self._emit(self._ops, "constant", (), (false,), {"value": False})
+        result = self._fresh("i1", spec.shape)
+        self._emit(ops, "select", (left.value, right.value, false), (result,))
+        self._set(result_id, _CFact("mask", spec.shape, result))
+
+    def _select(self, ops, operands, result_id):
+        spec = self._spec(result_id)
+        condition, first, second = operands
+        if condition.kind != "mask":
+            _unsupported("a select requires a boolean condition")
+        if first.kind != second.kind:
+            _unsupported("both select arms must have the same kind")
+        result = self._fresh(
+            "i1" if first.kind == "mask" else "f32", spec.shape
+        )
+        self._emit(
+            ops, "select", (condition.value, first.value, second.value), (result,)
+        )
+        self._set(result_id, _CFact(first.kind, spec.shape, result))
+
+    def _load(self, ops, operands, result_id):
+        pointer = operands[0]
+        if pointer.kind != "ptr" or pointer.port is None:
+            _unsupported("a load requires a kernel parameter address")
+        spec = self._spec(result_id)
+        address, dtype = self._address(ops, pointer)
+        if len(operands) > 1:
+            if operands[1].kind != "mask" or operands[1].value is None:
+                _unsupported("a load mask must be a boolean tile")
+            mask = operands[1].value
+        else:
+            mask = self._true_mask(pointer.shape)
+        other = self._float_constant(0.0, ())
+        value = self._fresh(dtype, spec.shape)
+        self._emit(ops, "load", (address, mask, other), (value,))
+        self._set(
+            result_id,
+            _CFact("float", spec.shape, value, port=pointer.port),
+        )
+
+    def _dot(self, ops, operands, result_id):
+        left, right, accumulator = operands
+        spec = self._spec(result_id)
+        if left.kind != "float" or right.kind != "float":
+            _unsupported("a dot requires two loaded tiles")
+        if accumulator.kind != "float":
+            _unsupported("a dot requires a tile accumulator")
+        if not self._inside_loop:
+            _unsupported("a dot must be carried by the counted loop")
+        if left.port is None or right.port is None:
+            _unsupported("a dot operand must come from a kernel parameter")
+        result = self._fresh("f32", spec.shape)
+        self._emit(ops, "dot", (left.value, right.value, accumulator.value), (result,))
+        self._set(result_id, _CFact("float", spec.shape, result))
+        self.dot_lhs.append(left.port)
+        self.dot_rhs.append(right.port)
+
+    def _float_unary(self, ops, opcode, operands, result_id, attributes):
+        spec = self._spec(result_id)
+        operand = operands[0]
+        if operand.kind != "float":
+            _unsupported(f"{opcode} requires a floating tile")
+        result = self._fresh("f32", spec.shape)
+        self._emit(
+            ops, opcode, (operand.value,), (result,),
+            {"approximation": "exact"} if opcode == "silu" else {},
+        )
+        if opcode == "silu":
+            self.needs_activation = True
+        self._set(result_id, _CFact("float", spec.shape, result))
+
+    def _float_binary(self, ops, code, operands, result_id):
+        spec = self._spec(result_id)
+        left, right = operands
+        if left.kind != "float" or right.kind != "float":
+            _unsupported("floating arithmetic requires two tiles")
+        result = self._fresh("f32", spec.shape)
+        self._emit(
+            ops,
+            {"addf": "add", "subf": "sub", "mulf": "mul", "divf": "div"}[code],
+            (left.value, right.value),
+            (result,),
+        )
+        self._set(result_id, _CFact("float", spec.shape, result))
+
+    def _loop(self, operation):
+        operands = [self._lookup(name) for name in operation.operands]
+        if len(operands) < 3:
+            _unsupported("the counted loop needs bounds, a step and carried state")
+        if self._uniform(operands[0]) != 0:
+            _unsupported("the counted K loop must start at zero")
+        upper = self._uniform(operands[1])
+        step = self._uniform(operands[2])
+        if step <= 0 or upper <= 0 or upper % step:
+            _unsupported("the K extent must be a positive multiple of the block")
+        if self.loop_upper is not None:
+            _unsupported("exactly one counted contraction loop is supported")
+        self.loop_upper = upper
+        carried = operands[3:]
+        if not carried or any(fact.kind != "float" for fact in carried):
+            _unsupported("a contraction carries at least one float accumulator")
+        region = operation.regions[0]
+        results = operation.results
+        if len(region.arguments) != len(results) + 1:
+            _unsupported("the loop region must take an induction and one "
+                         "argument per accumulator")
+        result_values = []
+        for name in results:
+            spec = self._spec(name)
+            result_values.append(self._fresh(spec.dtype, spec.shape))
+        induction = self._fresh("index", ())
+        argument_values = [
+            self._fresh("f32", self._spec(results[index]).shape)
+            for index in range(len(results))
+        ]
+        body: list[Operation] = []
+        saved = self.values
+        self.values = dict(saved)
+        self._set(region.arguments[0],
+                  _CFact("index", (), induction, _affine(_INDUCTION)))
+        for index, name in enumerate(region.arguments[1:]):
+            self._set(name, _CFact("float", argument_values[index].shape,
+                                   argument_values[index]))
+        self._inside_loop = True
+        yielded = None
+        for nested in region.operations:
+            if nested.opcode == "yield":
+                yielded = [self._lookup(name) for name in nested.operands]
+                continue
+            self._operation(nested, body)
+        self._inside_loop = False
+        self.values = saved
+        if yielded is None or len(yielded) != len(results):
+            _unsupported("the counted loop must yield one value per accumulator")
+        for index, name in enumerate(results):
+            if yielded[index].value is None:
+                _unsupported("the loop yields an undefined accumulator")
+        self._emit(body, "yield", tuple(fact.value for fact in yielded))
+        self._emit(
+            self._ops,
+            "counted_loop",
+            (
+                operands[0].value,
+                operands[1].value,
+                *(fact.value for fact in carried),
+            ),
+            tuple(result_values),
+            {"step": step},
+            (
+                Region(
+                    (induction, *argument_values),
+                    tuple(body),
+                ),
+            ),
+        )
+        for index, name in enumerate(results):
+            spec = self._spec(name)
+            self._set(name, _CFact("float", spec.shape, result_values[index]))
+
+    def _store(self, operands):
+        pointer, written = operands[0], operands[1]
+        if self._store_value is not None:
+            _unsupported("a kernel writes exactly one output tile")
+        if pointer.kind != "ptr" or pointer.port is None or pointer.offset is None:
+            _unsupported("a store requires a kernel parameter address")
+        if written.kind != "float" or written.value is None:
+            _unsupported("a store requires a floating tile")
+        address, _ = self._address(self._ops, pointer)
+        if len(operands) > 2:
+            if operands[2].kind != "mask" or operands[2].value is None:
+                _unsupported("a store mask must be a boolean tile")
+            mask = operands[2].value
+        else:
+            mask = self._true_mask(pointer.shape)
+        self._emit(self._ops, "store", (address, written.value, mask))
+        self._store_value = written.value
+        self.store_shape = pointer.shape
+
+    _inside_loop = False
+
+
 
 
 def _fail(message, *, code="invalid_frontend_buffer"):
@@ -784,56 +1420,34 @@ def _bind(template, args, grid, options, source):
             "the accepted launch corpus binds at least one tensor and one "
             "scalar"
         )
+    if any(layout.dtype != "f32" for layout in layouts.values()):
+        _unsupported("the accepted launch corpus is strict f32")
+    operations = list(_walk_operations(template.operations))
+    contraction = any(operation.opcode == "dot" for operation in operations)
+    program_ids = [
+        operation for operation in operations if operation.opcode == "program_id"
+    ]
+    if contraction or len(program_ids) > 1:
+        return _bind_tile(
+            template,
+            layouts,
+            scalars,
+            runtime_grid,
+            options,
+            source,
+            contraction=contraction,
+        )
     shapes = {layout.shape for layout in layouts.values()}
     if len(shapes) != 1:
         _unsupported("every bound tensor must have the same rank-two shape")
     shape = shapes.pop()
-    if any(layout.dtype != "f32" for layout in layouts.values()):
-        _unsupported("the accepted launch corpus is strict f32")
     extent = _find_range(template)
     mode, block, native_grid = _tile_geometry(extent, shape, runtime_grid)
 
     binder = _Binder(template, layouts, scalars, block, mode, runtime_grid, source)
     operations = binder.run()
 
-    tensors = []
-    inputs, outputs = [], []
-    tensor_reports = []
-    for parameter in parameters:
-        if parameter.kind != "pointer":
-            continue
-        layout = layouts[parameter.name]
-        if parameter.access == "read":
-            direction, effect = "input", "read"
-            inputs.append(layout.owner)
-        elif parameter.access == "write":
-            direction, effect = "output", "write"
-            outputs.append(layout.owner)
-        else:
-            _unsupported(
-                f"pointer {parameter.name} must be a read input or a write output"
-            )
-        tensors.append(
-            TensorSpec(
-                parameter.name,
-                layout.shape,
-                layout.dtype,
-                (layout.shape[1], 1),
-                direction,
-                effect,
-            )
-        )
-        tensor_reports.append(
-            {
-                "name": parameter.name,
-                "shape": list(layout.shape),
-                "strides": list(layout.strides),
-                "dtype": layout.dtype,
-                "direction": direction,
-                "effect": effect,
-                "alignment_bytes": parameter.alignment_bytes,
-            }
-        )
+    tensors, inputs, outputs, tensor_reports = _tensor_metadata(parameters, layouts)
     if len(inputs) != 2 or len(outputs) != 1:
         _unsupported("the accepted elementwise importer needs two inputs and one output")
     scalar_reports = tuple(
@@ -875,6 +1489,174 @@ def _bind(template, args, grid, options, source):
         native_grid,
         block,
         tuple(tensor_reports),
+        scalar_reports,
+    )
+
+
+def _walk_operations(operations):
+    for operation in operations:
+        yield operation
+        for region in operation.regions:
+            yield from _walk_operations(region.operations)
+
+
+def _tensor_metadata(parameters, layouts):
+    tensors = []
+    inputs, outputs = [], []
+    reports = []
+    for parameter in parameters:
+        if parameter.kind != "pointer":
+            continue
+        layout = layouts[parameter.name]
+        if parameter.access == "read":
+            direction, effect = "input", "read"
+            inputs.append(layout.owner)
+        elif parameter.access == "write":
+            direction, effect = "output", "write"
+            outputs.append(layout.owner)
+        else:
+            _unsupported(
+                f"pointer {parameter.name} must be a read input or a write output"
+            )
+        tensors.append(
+            TensorSpec(
+                parameter.name,
+                layout.shape,
+                layout.dtype,
+                (layout.shape[1], 1),
+                direction,
+                effect,
+            )
+        )
+        reports.append(
+            {
+                "name": parameter.name,
+                "shape": list(layout.shape),
+                "strides": list(layout.strides),
+                "dtype": layout.dtype,
+                "direction": direction,
+                "effect": effect,
+                "alignment_bytes": parameter.alignment_bytes,
+            }
+        )
+    return tuple(tensors), tuple(inputs), tuple(outputs), tuple(reports)
+
+
+def _bind_tile(
+    template, layouts, scalars, runtime_grid, options, source, *, contraction
+):
+    """Bind a rank-two tile template into the frontend's accepted program.
+
+    A counted contraction must tile the output exactly; the elementwise tile
+    form may round an axis up when the kernel's own mask proves the in-bounds
+    lanes, which is the framework's bounded-tail contract.
+    """
+    binder = _TileBinder(template, layouts, scalars, runtime_grid, source)
+    operations = binder.run()
+    if binder.store_shape is None or len(binder.store_shape) != 2:
+        _unsupported("a tile kernel must store one rank-two output tile")
+    block_m, block_n = binder.store_shape
+    writes = [
+        parameter.name
+        for parameter in template.parameters
+        if parameter.kind == "pointer" and parameter.access == "write"
+    ]
+    if len(writes) != 1:
+        _unsupported("a tile kernel writes exactly one output tensor")
+    rows, columns = layouts[writes[0]].shape
+    if contraction:
+        if rows % block_m or columns % block_n:
+            _fail(
+                f"block {block_m}x{block_n} does not tile the declared "
+                f"{rows}x{columns} output exactly",
+                code="invalid_launch_coverage",
+            )
+        expected = (rows // block_m, columns // block_n, 1)
+    else:
+        expected = (
+            -(-rows // block_m),
+            -(-columns // block_n),
+            1,
+        )
+    if runtime_grid != expected:
+        _fail(
+            f"runtime grid {runtime_grid} does not cover a {rows}x{columns} "
+            f"domain with {block_m}x{block_n} blocks; expected {expected}",
+            code="invalid_launch_coverage",
+        )
+    if contraction:
+        if binder.loop_upper is None:
+            _unsupported("a contraction requires one counted K loop")
+        reduction = binder.loop_upper
+        for port in binder.dot_lhs:
+            if layouts[port].shape[1] != reduction:
+                _fail(
+                    f"the K extent {reduction} disagrees with {port}'s "
+                    f"{layouts[port].shape[1]} columns",
+                    code="invalid_launch_coverage",
+                )
+        for port in binder.dot_rhs:
+            if layouts[port].shape[0] != reduction:
+                _fail(
+                    f"the K extent {reduction} disagrees with {port}'s "
+                    f"{layouts[port].shape[0]} rows",
+                    code="invalid_launch_coverage",
+                )
+
+    block = (block_m, block_n, 1)
+    tensors, inputs, outputs, tensor_reports = _tensor_metadata(
+        template.parameters, layouts
+    )
+    if not contraction and (len(inputs) != 2 or len(outputs) != 1):
+        _unsupported(
+            "the elementwise tile importer needs two inputs and one output"
+        )
+    contract = NumericalContract()
+    if binder.needs_activation:
+        contract = NumericalContract(
+            activation_expression="x/(1+exp(-x))",
+            activation_approximation="exact",
+        )
+    scalar_reports = tuple(
+        {
+            "name": name,
+            "dtype": next(
+                parameter.dtype
+                for parameter in template.parameters
+                if parameter.name == name
+            ),
+            "value": value,
+        }
+        for name, value in scalars.items()
+    )
+    program = FrontendProgram(
+        template.entry,
+        tensors,
+        dict(template.constexprs),
+        LaunchSpec(runtime_grid, block),
+        operations,
+        numerical_contract=contract,
+        source=source,
+        captured_constants={
+            "triton_template_identity": template.identity(),
+            "triton_source_hash": template.source_hash,
+            "triton_ttir_hash": template.ttir_hash,
+            "triton_entry": template.entry,
+            "triton_runtime_grid": runtime_grid,
+            "triton_backend_version": BACKEND_VERSION,
+        },
+    )
+    request = CompileRequest(
+        program, replace(options, numerical_contract=program.numerical_contract)
+    )
+    return _PreparedLaunch(
+        request,
+        inputs,
+        outputs,
+        runtime_grid,
+        runtime_grid,
+        block,
+        tensor_reports,
         scalar_reports,
     )
 
