@@ -197,17 +197,26 @@ jobs:
       # The cache key matches build-and-test. A cache miss means the pinned
       # LLVM/MLIR build is unavailable and this job must fail rather than fall
       # back to an ambient LLVM.
+      - name: Download LLVM source
+        run: |
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz"
+          curl -fsSL -o llvm.tar.xz "$URL"
+          mkdir -p ${{ github.workspace }}/llvm-project
+          tar xf llvm.tar.xz -C ${{ github.workspace }}/llvm-project --strip-components=1
+          rm llvm.tar.xz
+
       - name: Restore LLVM build cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.LLVM_BUILD }}
           key: llvm-build-${{ env.LLVM_VERSION }}-shared-clang18-v1
 
-      - name: Install the package, test tools and Torch 2.9.0
+      - name: Install the package, test tools and Torch 2.9.0 (CPU)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "./python[test,torch-test]"
-          python -c "import torch; assert torch.__version__ == '2.9.0', torch.__version__"
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.9.0"
+          python -m pip install "./python[test]"
+          python -c "import torch; assert torch.__version__.split('+')[0] == '2.9.0', torch.__version__"
 
       - name: Build the frontend C ABI
         run: |
@@ -269,6 +278,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-18 ninja-build
 
+      - name: Download LLVM source
+        run: |
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz"
+          curl -fsSL -o llvm.tar.xz "$URL"
+          mkdir -p ${{ github.workspace }}/llvm-project
+          tar xf llvm.tar.xz -C ${{ github.workspace }}/llvm-project --strip-components=1
+          rm llvm.tar.xz
+
       - name: Restore LLVM build cache
         uses: actions/cache/restore@v4
         with:
@@ -325,16 +342,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang-18 ninja-build cmake g++ zlib1g-dev
 
+      - name: Download LLVM source
+        run: |
+          URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/llvm-project-${LLVM_VERSION}.src.tar.xz"
+          curl -fsSL -o llvm.tar.xz "$URL"
+          mkdir -p ${{ github.workspace }}/llvm-project
+          tar xf llvm.tar.xz -C ${{ github.workspace }}/llvm-project --strip-components=1
+          rm llvm.tar.xz
+
       - name: Restore LLVM build cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.LLVM_BUILD }}
           key: llvm-build-${{ env.LLVM_VERSION }}-shared-clang18-v1
 
-      - name: Install the package and Torch 2.9.0
+      - name: Install the package and Torch 2.9.0 (CPU)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "./python[test,torch-test]"
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.9.0"
+          python -m pip install "./python[test]"
+          python -c "import torch; assert torch.__version__.split('+')[0] == '2.9.0', torch.__version__"
 
       - name: Build the frontend C ABI
         run: |
