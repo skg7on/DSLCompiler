@@ -196,3 +196,30 @@ def test_missing_explicit_library_reports_unavailable_without_fallback(tmp_path)
         check=True,
     )
     assert completed.stdout.strip() == "native_backend_unavailable"
+
+
+def test_library_api_version_mismatch_fails_explicitly(monkeypatch, tmp_path):
+    library_file = tmp_path / "libLLKFrontendCAPI.so"
+    library_file.write_bytes(b"")
+
+    class FakeLibrary:
+        def __init__(self):
+            # Plain function attributes accept the argtypes/restype assignment
+            # performed by _configure.
+            self.llk_frontend_api_version = lambda: 2
+            self.llk_frontend_compile_v1 = lambda *args: 0
+            self.llk_frontend_invoke_v1 = lambda *args: 0
+            self.llk_frontend_report_v1 = lambda *args: 0
+            self.llk_frontend_inspect_v1 = lambda *args: 0
+            self.llk_frontend_error_json_v1 = lambda *args: None
+            self.llk_frontend_error_free_v1 = lambda *args: None
+            self.llk_frontend_release_v1 = lambda *args: None
+
+    monkeypatch.setenv("LLK_FRONTEND_LIBRARY", str(library_file))
+    monkeypatch.setattr(_ffi.ctypes, "CDLL", lambda path: FakeLibrary())
+    monkeypatch.setattr(_ffi, "_LIBRARY", None)
+    monkeypatch.setattr(_ffi, "_LIBRARY_PATH", None)
+    with pytest.raises(UnsupportedFeatureError) as caught:
+        _ffi.library()
+    assert caught.value.code == "frontend_api_version_mismatch"
+    assert _ffi._LIBRARY is None

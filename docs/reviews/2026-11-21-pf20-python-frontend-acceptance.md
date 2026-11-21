@@ -142,13 +142,70 @@ The five local failures are environmental, not product regressions:
 
 Three legacy JIT cases and `MappedAcceptance` remain the documented skips.
 The authoritative full compiler suite is the PR's Linux `build-and-test` job
-(LLVM/MLIR 22.1.8, Release): it passed at commit `71e8c25` in 9m17s.
+(LLVM/MLIR 22.1.8, Release): it passed in the final evidence run at
+`100e9e2` in 9m15s (and at `71e8c25` in 9m17s).
 
-CI evidence from the pull-request run follows. The `frontend-acceptance`
-artifact records the exact lane JUnit files, native counters and selected
-group counts.
+## CI evidence
 
-<!-- PF20-EVIDENCE-PENDING -->
+Run [44927853997](https://github.com/skg7on/DSLCompiler/actions/runs/44927853997)
+at `100e9e2f336fef1d8242196cc1c0893fabf0273b` (PR #288) is green on every
+check:
+
+| Check | Result |
+|---|---|
+| `Python frontend (Python 3.11)` | pass, 5m11s |
+| `Python frontend (Python 3.12)` | pass, 5m46s |
+| `Python frontend without optional dependencies` | pass, 5m02s |
+| `Python frontend (pinned Triton and selected AVX2)` | pass, 47m01s |
+| `Python frontend acceptance` | pass, 8s |
+| `build-and-test` (LLVM/MLIR 22.1.8, Release) | pass, 9m15s |
+| analyze, coverage, html, license-headers, CodeQL | pass |
+
+The `frontend-acceptance` job downloaded the lane artifacts, ran
+`check_required_python_execution.py`, and reported `errors: []` with:
+
+| Lane | Executed | Failed | Skipped | Native invocations |
+|---|---|---|---|---|
+| `frontend_unit` | 133 | 0 | 0 | 0 |
+| `frontend_native` | 64 | 0 | 0 | 43 |
+| `torch_integration` | 112 | 0 | 0 | 90 |
+| `triton_integration` | 33 | 0 | 0 | 20 |
+| `selected_avx2` | 2 | 0 | 0 | 20 |
+
+Selected evidence from the Linux x86_64/AVX2 job:
+`selected_backend = "selected-target"`, `selected_group_count = 19`,
+`reference_group_count = 0` for both the Triton and selected lanes. No required
+lane skipped, no expected failure was counted as execution, and no reference
+result was accepted for selected execution.
+
+Python 3.11 and 3.12 both ran the unit/native/Torch lanes; the dedicated
+dependency-free job ran the unit lane with neither Torch nor Triton installed.
+The Triton job built the pinned checkout at
+`93f05e19a8024938c320d82854e307d602b5a05d`, asserted AVX2, and executed both
+the upstream corpus and the selected lane. The corpus executes all ten genuine
+fixtures on the selected target with nonzero selected groups and zero
+reference groups.
+
+## In-process launch findings
+
+Enabling the required lane on Linux executed the PF18 in-process upstream launch
+tests for the first time; on macOS they skip because Triton's static LLVM and
+LLK's shared LLVM cannot coexist in one process. The qualification surfaced and
+fixed three boundaries:
+
+- Triton's entry-point discovery re-entered the partially initialized LLK
+  backend while Triton was being imported. LLK now registers `llk_cpu` only
+  through the documented scoped activation instead of a `triton.backends` entry
+  point.
+- `parse_options` received kernel constexprs in the same mapping as backend
+  options; it now consumes only backend fields and leaves argument validation
+  to upstream's binder.
+- Upstream specialization requires host objects exposing `data_ptr()`; raw
+  `memoryview` providers are rejected explicitly by the in-process lane. The
+  C API corpus lane remains the supported entry point for buffer-protocol
+  providers.
+- Template pointer comparison now normalizes Triton's `fp32`/`fp16` names to
+  the LLK `f32`/`f16` dtypes.
 
 ## Supported boundary
 
