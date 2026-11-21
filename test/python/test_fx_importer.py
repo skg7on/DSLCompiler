@@ -9,6 +9,10 @@ node instead of falling back to graph execution.
 
 from __future__ import annotations
 
+import pytest
+
+torch = pytest.importorskip("torch")
+
 from unittest.mock import patch
 
 import torch

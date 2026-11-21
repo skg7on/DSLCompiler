@@ -192,7 +192,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 ninja-build g++
+          sudo apt-get install -y clang-18 ninja-build g++ libomp-18-dev
 
       # The cache key matches build-and-test. A cache miss means the pinned
       # LLVM/MLIR build is unavailable and this job must fail rather than fall
@@ -340,7 +340,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 ninja-build cmake g++ zlib1g-dev
+          sudo apt-get install -y clang-18 ninja-build cmake g++ zlib1g-dev libomp-18-dev
 
       - name: Download LLVM source
         run: |
@@ -375,11 +375,15 @@ jobs:
 
       - name: Check out and build the pinned upstream Triton
         run: |
-          git init triton
-          git -C triton remote add origin https://github.com/triton-lang/triton.git
-          git -C triton fetch --depth 1 origin "$TRITON_REVISION"
-          git -C triton checkout --detach FETCH_HEAD
-          python -m pip install -e ./triton
+          # Keep the checkout outside the workspace: a top-level `triton/`
+          # directory would shadow the installed package during pytest
+          # collection and provide no `triton.language`.
+          TRITON_DIR="${{ runner.temp }}/triton"
+          git init "$TRITON_DIR"
+          git -C "$TRITON_DIR" remote add origin https://github.com/triton-lang/triton.git
+          git -C "$TRITON_DIR" fetch --depth 1 origin "$TRITON_REVISION"
+          git -C "$TRITON_DIR" checkout --detach FETCH_HEAD
+          python -m pip install -e "$TRITON_DIR"
 
       - name: Verify AVX2 is available
         run: grep -qm1 avx2 /proc/cpuinfo
@@ -388,7 +392,7 @@ jobs:
         run: |
           set -euo pipefail
           export LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.so"
-          export LLK_TRITON_PYTHONPATH="$PWD/triton/python"
+          export LLK_TRITON_PYTHONPATH="${{ runner.temp }}/triton/python"
           export LLK_PYTHON_EVIDENCE_DIR="$PWD/frontend-evidence"
           mkdir -p "$LLK_PYTHON_EVIDENCE_DIR/junit"
           run_lane() {

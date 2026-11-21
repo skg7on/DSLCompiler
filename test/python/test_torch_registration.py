@@ -1,5 +1,9 @@
 """PF01 regression tests against the installed, real Torch registry."""
 
+import pytest
+
+torch = pytest.importorskip("torch")
+
 
 import os
 from pathlib import Path

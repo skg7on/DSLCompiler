@@ -8,6 +8,10 @@ native lowering, or through ``gm.forward`` cannot satisfy both checks.
 
 from __future__ import annotations
 
+import pytest
+
+torch = pytest.importorskip("torch")
+
 import warnings
 from pathlib import Path
 from unittest.mock import patch

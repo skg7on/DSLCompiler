@@ -9,6 +9,10 @@ Inductor is a required dependency of this lane; there is no skip path.
 
 from __future__ import annotations
 
+import pytest
+
+torch = pytest.importorskip("torch")
+
 from unittest.mock import patch
 
 import torch

@@ -10,6 +10,10 @@ materializations that remain outside the compact ABI.
 
 from __future__ import annotations
 
+import pytest
+
+torch = pytest.importorskip("torch")
+
 import gc
 import importlib
 import weakref

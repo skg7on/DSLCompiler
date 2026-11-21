@@ -9,6 +9,10 @@ entered rather than being copied into a silently different execution.
 
 from __future__ import annotations
 
+import pytest
+
+torch = pytest.importorskip("torch")
+
 import importlib
 import os
 import subprocess

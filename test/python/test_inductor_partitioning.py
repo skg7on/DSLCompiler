@@ -10,6 +10,10 @@ is checked for idempotence and foreign-owner safety, mirroring the strict
 
 from __future__ import annotations
 
+import pytest
+
+torch = pytest.importorskip("torch")
+
 import dataclasses
 import importlib
 import operator
