@@ -379,6 +379,11 @@ jobs:
           ninja -C build LLKFrontendCAPI
 
       - name: Check out and build the pinned upstream Triton
+        env:
+          # Triton's source build is substantially faster with clang-18. This
+          # stays scoped to the build; pytest keeps the host compiler.
+          CC: clang-18
+          CXX: clang++-18
         run: |
           # Keep the checkout outside the workspace: a top-level `triton/`
           # directory would shadow the installed package during pytest
