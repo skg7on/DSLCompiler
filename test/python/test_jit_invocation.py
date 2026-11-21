@@ -1,8 +1,11 @@
 import ast_cases
 import llk
-import pytest
 from ast_cases import binding, masked_add
 from llk.frontend import FrontendProgram
+
+import pytest
+
+pytestmark = pytest.mark.frontend_unit
 
 
 def test_jit_metadata_is_explicitly_named_frontend_ir():

@@ -21,6 +21,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 from llk._errors import TensorContractError, UnsupportedFeatureError
+from llk._resources import packaged_config_root, validate_configuration
 from llk.frontend import (
     CompileOptions,
     CompileRequest,
@@ -1029,7 +1030,12 @@ _OPTION_FIELDS = frozenset(field.name for field in dataclasses.fields(CompileOpt
 
 
 def default_config_root() -> str | None:
-    """Find the repository configuration tree during source-tree development."""
+    """Prefer the validated installed resources, then the source tree."""
+    try:
+        validate_configuration()
+        return packaged_config_root()
+    except UnsupportedFeatureError:
+        pass
     candidates = list(Path(__file__).resolve().parents) + [Path.cwd()]
     for candidate in candidates:
         if (candidate / "machines" / "x86-avx2-v2.yaml").is_file():

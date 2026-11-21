@@ -1,0 +1,30 @@
+// Arm SVE target layouts.
+//
+// Layout ids are target-owned mapping results, not `#micro.layout` enumerants.
+// Machine facts are read only through machine queries, so nothing here names a
+// concrete executor. Both domains stay finite: VW enumerates exactly the three
+// widths the 512-bit profile advertises, so the solver's search is bounded and
+// a dtype the profile does not model has no answer instead of a guessed one.
+
+// Plain row-major: the logical index is the physical index. It deliberately
+// takes no size parameter -- a parameter no constraint reads would enlarge the
+// solve without adding legality.
+layout sve.row_major() {
+  require rank == 2;
+  implements row_major;
+  map (m, n) -> (m, n);
+}
+
+// Inner-dimension blocking whose VW follows the machine's vector width for the
+// operand's *own* element type: f32 selects 16, bf16 32, i8 64, and f64 has no
+// lane fact, so the solve errors rather than picking a width. VW describes
+// physical blocking; it is not an assertion that every logical tile dimension
+// equals a lane count. Small and remainder tiles can pad under this static map,
+// and no executable masking behavior is claimed.
+layout sve.blocked_2d(int VW) {
+  param VW in {16, 32, 64};
+  require rank == 2;
+  require VW == machine.compute("vector_engine").lanes(element_type);
+  implements blocked;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}

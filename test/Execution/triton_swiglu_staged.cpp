@@ -1,4 +1,4 @@
-//===- triton_swiglu_staged.cpp - Triton IR → LLK staged pipeline ---------===//
+//===- triton_swiglu_staged.cpp - Triton CPU boundary rejection -----------===//
 //
 // Part of the LLK Compiler Project, under the Apache License v2.0 with
 // LLVM Exceptions.
@@ -7,37 +7,51 @@
 //
 //===----------------------------------------------------------------------===//
 
-// Integration test that builds Triton IR for SwiGLU programmatically, runs it
-// through the staged lowering pipeline (TritonToStructured → GridToForall →
-// existing LLK pipeline), JIT-executes, and compares against a reference.
-//
-// SKELETON: For M8b, this starts as a manual IR construction test and evolves
-// into a full pipeline test once all stages are integrated.
+// The staged Triton dialect-to-LLK pipeline is not an executable entry point.
+// Its supported CPU boundary is enforced by the CPU verifier, which must reject
+// GPU-only constructs with the documented diagnostic instead of lowering them.
+// This replaces the former disabled SwiGLU staged-execution skeleton: the
+// capability is an explicit rejection, not native execution.
+
+#include "LLK/Conversion/TritonToLLK/TritonCPUVerifier.h"
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include <gtest/gtest.h>
+#include <string>
 
-TEST(TritonStagedExecution, DISABLED_SwiGLUCorrectness) {
-  // SKELETON: Full staged pipeline correctness test for Triton IR -> LLK.
-  //
-  // Prerequisites for implementation:
-  //   1. Triton dialect ops registered in MLIRContext (tt.load, tt.store,
-  //      tt.make_block_ptr, tt.dot, tt.advance, tt.arange).
-  //   2. TritonToStructured pass lowering tt.dot -> linalg.matmul,
-  //      tt.load/store -> vector.transfer_read/write.
-  //   3. GridToForall pass expanding tt.grid -> scf.forall with
-  //      program_id-based offsets.
-  //   4. BlockPointerToVector pass (exists) lowering block_ptr ->
-  //      memref.subview + transfer ops.
-  //   5. Integration with existing LLK pipeline (LLKToLinalg ->
-  //      TileAndVectorize -> OneShotBufferize -> JIT).
-  //
-  // Reference shapes: M=32, N=64, K=128 (medium batch, AVX2-friendly).
-  //
-  // Once all prerequisites are met, the test should:
-  //   a. Build Triton IR programmatically for SwiGLU.
-  //   b. Run the staged pipeline end-to-end.
-  //   c. JIT execute and compare against FP64 reference (same approach as
-  //      swiglu_vector_avx2.cpp).
-  GTEST_SKIP() << "Triton staged pipeline awaiting dialect ops (M8b "
-                  "prerequisites)";
+TEST(TritonStagedExecution, RejectsUnsupportedTritonInlineAssemblyOnCPU) {
+  mlir::MLIRContext context;
+  context.loadDialect<mlir::func::FuncDialect>();
+  context.allowUnregisteredDialects();
+  auto module = mlir::parseSourceString<mlir::ModuleOp>(R"mlir(
+func.func @unsupported_inline_asm(%ptr: !tt.ptr) {
+  "tt.inline_asm"(%ptr) : (!tt.ptr) -> ()
+  return
+}
+)mlir",
+                                                        &context);
+  ASSERT_TRUE(module);
+
+  llvm::SmallVector<std::string> diagnostics;
+  mlir::ScopedDiagnosticHandler handler(
+      &context, [&](mlir::Diagnostic &diagnostic) {
+        diagnostics.push_back(diagnostic.str());
+      });
+
+  mlir::PassManager passManager(&context);
+  passManager.addPass(mlir::llk::createTritonCPUVerifierPass());
+  ASSERT_TRUE(mlir::failed(passManager.run(*module)));
+
+  ASSERT_FALSE(diagnostics.empty());
+  const std::string &message = diagnostics.front();
+  EXPECT_NE(message.find("triton_unsupported_op"), std::string::npos)
+      << message;
+  EXPECT_NE(message.find("tt.inline_asm"), std::string::npos) << message;
 }

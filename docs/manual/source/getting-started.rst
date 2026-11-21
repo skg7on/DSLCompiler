@@ -102,6 +102,12 @@ Useful configuration choices:
    * - ``LLK_BUILD_E2E_TESTS``
      - ``ON``
      - Builds the JIT end-to-end test executables
+   * - ``LLK_BUILD_PYTHON_CAPI``
+     - ``OFF``
+     - Builds ``LLKFrontendCAPI`` and installs the machine/rule/layout resources used by the Python package
+   * - ``LLK_ENABLE_PYTHON_TESTS``
+     - ``OFF``
+     - Registers the five required Python frontend lanes and their acceptance checker with CTest; requires ``LLK_BUILD_PYTHON_CAPI=ON`` and ``BUILD_TESTING=ON``
    * - ``CMAKE_EXPORT_COMPILE_COMMANDS``
      - enabled for supported generators
      - Produces ``build/compile_commands.json`` for clangd

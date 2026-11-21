@@ -26,6 +26,12 @@ option(LLK_BUILD_TOOLS "Build the LLK command-line tools" ON)
 option(LLK_BUILD_E2E_TESTS "Build end-to-end JIT tests" ON)
 option(LLK_BUILD_PYTHON_CAPI
        "Build the shared C ABI the Python frontend loads with ctypes" OFF)
+option(LLK_ENABLE_PYTHON_TESTS
+       "Register the required Python frontend pytest lanes with CTest" OFF)
+if(LLK_ENABLE_PYTHON_TESTS AND NOT LLK_BUILD_PYTHON_CAPI)
+  message(FATAL_ERROR
+      "LLK_ENABLE_PYTHON_TESTS requires LLK_BUILD_PYTHON_CAPI=ON")
+endif()
 
 # LLKFrontendCAPI is a shared library over the project's static archives, and a
 # shared library can only link position-independent objects. Enable PIC for the
@@ -45,8 +51,28 @@ if(LLK_BUILD_TOOLS)
   add_subdirectory(tools)
 endif()
 
+# The Python frontend loads the shared C ABI and snapshots the target policy
+# from the installed package resources. Install both explicitly; the wheel
+# carries the same files under llk/config with resources.json hashes.
+if(LLK_BUILD_PYTHON_CAPI)
+  include(GNUInstallDirs)
+  install(TARGETS LLKFrontendCAPI
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(FILES
+      ${PROJECT_SOURCE_DIR}/python/llk/resources.json
+      ${PROJECT_SOURCE_DIR}/python/llk/compatibility.json
+      DESTINATION ${CMAKE_INSTALL_DATADIR}/llk)
+  install(DIRECTORY ${PROJECT_SOURCE_DIR}/python/llk/config/
+      DESTINATION ${CMAKE_INSTALL_DATADIR}/llk/config)
+endif()
+
 # CTest must be enabled at the root for ctest to find the entire suite.
 include(CTest)
+if(LLK_ENABLE_PYTHON_TESTS AND NOT BUILD_TESTING)
+  message(FATAL_ERROR
+      "LLK_ENABLE_PYTHON_TESTS requires BUILD_TESTING=ON")
+endif()
 if(BUILD_TESTING)
   add_subdirectory(third_party)
   add_subdirectory(test)

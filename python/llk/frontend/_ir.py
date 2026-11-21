@@ -5,12 +5,12 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from importlib.resources import files
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 from llk._errors import FrontendSyntaxError, TensorContractError
+from llk._resources import packaged_config_root, validate_configuration
 
 I64_MIN, I64_MAX = -(2**63), 2**63 - 1
 STORAGE_DTYPES = ("f32", "bf16", "f16", "i32", "i8")
@@ -354,7 +354,7 @@ class CompileOptions:
     max_candidates: int = 64
     top_k: int = 1
     numerical_contract: NumericalContract = field(default_factory=NumericalContract)
-    config_root: str = field(default_factory=lambda: str(files("llk")))
+    config_root: str = field(default_factory=packaged_config_root)
     config_files: Mapping | None = None
 
     def __post_init__(self):
@@ -371,11 +371,14 @@ class CompileOptions:
             self.numerical_contract, NumericalContract
         ):
             fail("invalid selection bounds or numerical contract")
-        data = (
-            config_snapshot(self.config_root)
-            if self.config_files is None
-            else self.config_files
-        )
+        if self.config_files is None:
+            if Path(self.config_root).resolve() == Path(
+                packaged_config_root()
+            ).resolve():
+                validate_configuration(self.config_root)
+            data = config_snapshot(self.config_root)
+        else:
+            data = self.config_files
         if not isinstance(data, Mapping) or any(
             not isinstance(k, str)
             or not k

@@ -1,0 +1,21 @@
+// Generic accelerator target layouts.
+//
+// This file exists to prove the layout language is not AVX2-shaped: the
+// accelerator declares its own ids, its own domains, and a three-dimensional
+// map, and nothing in LLK/Mapping changed to accept it.
+
+layout accel.row_major(int N) {
+  param N in [1..8];
+  require rank == 2;
+  map (m, n) -> (m, n);
+}
+
+// A three-dimensional tiling for MXU operands, blocked along N.
+layout accel.tiled_3d(int M, int N, int K) {
+  param M in [4..16];
+  param N in [4..16];
+  param K in [4..8];
+  require rank == 3;
+  require N % 4 == 0;
+  map (m, n, k) -> (m, n, k);
+}

@@ -1,4 +1,7 @@
+
 import pytest
+
+pytestmark = pytest.mark.frontend_unit
 
 
 def test_jit_decorator_returns_jit_function():

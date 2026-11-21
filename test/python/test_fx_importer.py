@@ -6,11 +6,15 @@ tensor metadata, and every unsupported graph must identify the offending FX
 node instead of falling back to graph execution.
 """
 
+
 from __future__ import annotations
+
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from unittest.mock import patch
 
-import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
@@ -20,6 +24,11 @@ from llk.torch._fx_importer import (
     import_fx,
     import_fx_requests,
 )
+
+import pytest
+
+pytestmark = pytest.mark.torch_integration
+
 
 ATEN = torch.ops.aten
 

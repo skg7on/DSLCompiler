@@ -1,5 +1,6 @@
 """PF09: bounded full-identity specialization cache behavior."""
 
+
 from __future__ import annotations
 
 import threading
@@ -8,10 +9,13 @@ from dataclasses import replace
 import frontend_cases as frontend
 import llk
 import native_cases as cases
-import pytest
 from llk.frontend import LaunchSpec, Operation, Region, Value
 from llk.runtime import _cache, _ffi
 from llk.runtime._cache import CompilationCache, request_identity
+
+import pytest
+
+pytestmark = pytest.mark.frontend_native
 
 
 def fresh_kernel():

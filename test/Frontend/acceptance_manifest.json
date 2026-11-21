@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "description": "Required Python frontend execution lanes. Each lane runs under its pytest marker expression, writes JUnit XML plus one evidence JSON file, and is rejected by check_required_python_execution.py when it collects or executes nothing, skips, fails, omits native-call counters, or substitutes reference results for selected-target execution.",
+  "lanes": [
+    {
+      "id": "frontend_unit",
+      "marker_expression": "frontend_unit and not frontend_native and not torch_integration and not triton_integration",
+      "required": true,
+      "minimum_executed": 1,
+      "require_native_invocations": false,
+      "require_selected_target": false,
+      "requires": [],
+      "description": "Compiler-free capture, schema, packaging and error contracts."
+    },
+    {
+      "id": "frontend_native",
+      "marker_expression": "frontend_native and not torch_integration and not triton_integration",
+      "required": true,
+      "minimum_executed": 1,
+      "require_native_invocations": true,
+      "require_selected_target": false,
+      "requires": ["native_library"],
+      "description": "Reference-backend native compilation and invocation through LLKFrontendCAPI."
+    },
+    {
+      "id": "torch_integration",
+      "marker_expression": "torch_integration",
+      "required": true,
+      "minimum_executed": 1,
+      "require_native_invocations": true,
+      "require_selected_target": false,
+      "requires": ["native_library", "torch"],
+      "description": "Real Torch registration, Dynamo, Inductor, operators and training execution."
+    },
+    {
+      "id": "triton_integration",
+      "marker_expression": "triton_integration",
+      "required": true,
+      "minimum_executed": 1,
+      "require_native_invocations": true,
+      "require_selected_target": false,
+      "requires": ["native_library", "triton"],
+      "description": "Pinned upstream Triton qualification, TTIR export and launch."
+    },
+    {
+      "id": "selected_avx2",
+      "marker_expression": "selected_avx2",
+      "required": true,
+      "minimum_executed": 1,
+      "require_native_invocations": true,
+      "require_selected_target": true,
+      "requires": ["native_library", "triton", "avx2"],
+      "description": "Linux x86_64/AVX2 selected-target execution; reference results are never accepted."
+    }
+  ]
+}

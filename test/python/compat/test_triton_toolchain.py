@@ -1,15 +1,20 @@
 """Qualification of the pinned upstream Triton toolchain."""
 
+
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 
 import llk.triton as triton_export
 from llk._errors import UnsupportedFeatureError
+
+import pytest
+
+pytestmark = pytest.mark.triton_integration
+
 
 LOCK_PATH = Path(triton_export.__file__).parent / "toolchain-lock.json"
 

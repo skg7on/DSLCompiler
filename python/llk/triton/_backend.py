@@ -277,7 +277,6 @@ class LLKCPUOptions:
 _TRITON_OPTION_FIELDS = frozenset(
     field.name for field in dataclasses.fields(LLKCPUOptions)
 )
-_IGNORED_TRITON_OPTIONS = frozenset({"instrumentation_mode"})
 
 
 def _unsupported_custom_type(*args, **kwargs):
@@ -381,11 +380,11 @@ def _make_backend_class():
             )
 
         def parse_options(self, opts):
-            unknown = set(opts) - _TRITON_OPTION_FIELDS - _IGNORED_TRITON_OPTIONS
-            if unknown:
-                raise ValueError(
-                    f"unsupported LLK Triton backend options {sorted(unknown)}"
-                )
+            # Triton packs launch kwargs and kernel constexprs into one
+            # mapping before asking the backend for options. Only the backend
+            # fields are consumed here; upstream's binder validates every
+            # remaining key against the kernel signature and rejects unknown
+            # arguments instead of silently accepting them.
             values = {
                 name: opts[name]
                 for name in _TRITON_OPTION_FIELDS

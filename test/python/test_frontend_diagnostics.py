@@ -3,10 +3,13 @@
 import inspect
 
 import llk.language as lang
-import pytest
 from ast_cases import binding, ports
 from llk import LLKError
 from llk.language._ast_compiler import compile_kernel
+
+import pytest
+
+pytestmark = pytest.mark.frontend_unit
 
 
 def test_unknown_call_cannot_equal_empty_kernel():

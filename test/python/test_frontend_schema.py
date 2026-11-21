@@ -1,10 +1,10 @@
 """PF03 wire contract and semantic validation, without any native execution."""
 
+
 import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
-import pytest
 from frontend_cases import make_add_program, make_loop_program, op, request
 from llk import LLKError
 from llk.frontend import (
@@ -17,6 +17,10 @@ from llk.frontend import (
     deserialize_request,
     serialize_request,
 )
+
+import pytest
+
+pytestmark = pytest.mark.frontend_unit
 
 
 def test_canonical_request_matches_literal_fixture():

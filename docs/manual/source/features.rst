@@ -106,9 +106,15 @@ What you can do today
      - It does not parse MLIR, load weights, invoke a compiled kernel or use the JIT; thread-pool setup occurs per invocation
      - :doc:`Benchmark </tools/benchmark>`
    * - Capture and execute Python kernels
-     - Typed AST capture, checked schema-v1 import, shared native compilation and synchronous ``@llk.jit`` launches; positive static rank-two f32 add/multiply with proved masked edges and canonical counted matmul/SwiGLU with exact coverage; caller-owned buffers, bounded specialization cache, leases and IR inspection
-     - Requires ``LLKFrontendCAPI`` and target configuration. Python signatures remain static ABI v1; capture alone does not establish executable support. Dynamo calls report ``native_backend_unavailable``; model/Inductor/training/upstream Triton execution is not implemented
-     - :doc:`Python frontend </python-frontend>`
+     - Typed AST capture, checked schema-v1 import, shared native compilation and synchronous ``@llk.jit`` launches; positive static rank-two f32 add/multiply with proved masked edges and canonical counted matmul/SwiGLU with exact coverage; caller-owned buffers, bounded specialization cache, leases and IR inspection. A clean wheel carries the machine/rule/layout resources with content hashes, so installed ``@llk.jit`` needs no repository checkout
+     - Requires ``LLKFrontendCAPI``. Python signatures remain static ABI v1; capture alone does not establish executable support. Unsupported graphs, dtypes, layouts and numerical modes fail explicitly rather than falling back to eager execution
+     - :doc:`Python frontend </python-frontend>`,
+       :doc:`Python frontend tutorial </tutorials/python-frontend>`
+   * - Integrate Python kernels with Torch, Triton and CI
+     - Strict ``torch.compile(backend="llk")``, checked ``llk::add/mul/matmul/swiglu`` operators, scoped ``llk_inductor`` composition, first-order autograd for add/multiply/matmul, and genuine upstream Triton 3.6.0 TTIR export/launch for the fixed ten-kernel corpus. Required ``frontend_unit``, ``frontend_native``, ``torch_integration``, ``triton_integration`` and ``selected_avx2`` lanes are declared in ``test/Frontend/acceptance_manifest.json`` and enforced by ``check_required_python_execution.py``
+     - Training covers add/multiply/matmul only; SwiGLU training, dynamic-shape Python graphs and additional upstream Triton releases remain rejected. Selected AVX2 execution requires a compatible Linux x86_64 host and never substitutes reference results. Upstream Triton is qualified only at its pinned source revision
+     - :doc:`Python frontend </python-frontend>`,
+       :doc:`Python frontend tutorial </tutorials/python-frontend>`
    * - Explore a second target
      - Generic accelerator topology, layouts, rules and mapping through the same canonical IR; static f32 add/mul/sum coverage with operation-aware validation
      - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered; accelerator mul/sum emitters verify only
@@ -240,10 +246,14 @@ work. Model cycles and whole-kernel timings are different observations.
 
 The generic accelerator package provides static topology, movement and f32
 add/mul/sum conformance. A direct MicroIR emulator and a general model frontend
-remain outside current support. The Python decorator path executes its bounded
-static elementwise/contraction subsets; Dynamo, Inductor, training, upstream Triton and symbolic
-Python invocation require further integration. Native dynamic contractions do not
-extend the Python importer automatically.
+remain outside current support. The Python path executes its bounded static
+elementwise/contraction subsets through the decorator, Torch Dynamo, Inductor
+composition and the pinned upstream Triton corpus; symbolic Python invocation,
+SwiGLU training and additional upstream Triton releases require further
+integration. Native dynamic contractions do not extend the Python importer
+automatically. The required Python lanes fail on zero execution, a skipped or
+failed lane, a missing native-call counter or reference results reported as
+selected-target execution.
 
 Selected-target execution requires a compatible host and zero reference fallback.
 Static mappings, portable numerical tests and unavailable-host diagnostics each

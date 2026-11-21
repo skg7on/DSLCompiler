@@ -1,5 +1,6 @@
 """Build and install the actual wheel outside the source checkout."""
 
+
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,8 @@ import sys
 import venv
 
 import pytest
+
+pytestmark = pytest.mark.frontend_unit
 
 
 PYTHON_ROOT = Path(__file__).resolve().parents[2] / "python"
@@ -111,6 +114,42 @@ assert not any(r.startswith('torch') and 'extra' not in r for r in dist.requires
         cwd=root, env=env, capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_installed_machine_rule_layout_resources_and_hashes(installed_python):
+    python, root, env = installed_python
+    result = subprocess.run(
+        [str(python), "-I", "-c", """
+import hashlib, json
+from pathlib import Path
+import llk
+from llk._resources import manifest, packaged_config_root, validate_configuration
+from llk.frontend import CompileOptions
+package = Path(llk.__file__).parent
+data = manifest()
+assert data['schema_version'] == 1
+assert data['root'] == 'config'
+for relative, digest in data['files'].items():
+    path = package / 'config' / relative
+    assert path.is_file(), relative
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, relative
+validate_configuration()
+options = CompileOptions()
+assert options.config_files['machines/x86-avx2-v2.yaml'].strip()
+assert options.config_files['mapping/x86-avx2/rules.llkmap'].strip()
+assert 'mapping/generic-ai-accel/rules.llkmap' in options.config_files
+print(json.dumps({'files': len(data['files']),
+                  'root': packaged_config_root(),
+                  'keys': sorted(options.config_files)}))
+"""],
+        cwd=root, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(result.stdout)
+    assert report["files"] == 12
+    assert "machines/x86-avx2-v2.yaml" in report["keys"]
+    assert "mapping/x86-avx2/layouts.llkmap" in report["keys"]
+    assert "mapping/x86-avx2/rules.llkmap" in report["keys"]
 
 
 @pytest.mark.parametrize("name", [
