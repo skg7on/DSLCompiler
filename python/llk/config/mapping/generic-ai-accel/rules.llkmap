@@ -1,0 +1,107 @@
+// Generic accelerator mapping rules.
+//
+// `require executor kind pe` is the interesting line: the AVX2 rules ask for
+// `worker`, and both are satisfied because each machine declares its own
+// refinement (an AVX2 `core` refines `worker`; the accelerator's `pe` does
+// too). No generic code knows either word.
+//
+// Layout ids refer to layouts.llkmap; capability kinds must be ones
+// machines/generic-ai-accel-v2.yaml declares, or the target refuses to load.
+
+rule accel.vector_add {
+  match micro.vector(op = "add");
+  require executor kind pe;
+  require compute kind vector_engine;
+  require layout operand0 satisfies accel.row_major;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "accel.vector.add";
+  emit "accel_vector_add";
+  cost 2;
+}
+
+// The multiply variant is the same vector-engine contract as add. The emitter
+// validates the variant and f32 operand/result tiles; the bundle key alone
+// cannot state either fact.
+rule accel.vector_mul {
+  match micro.vector(op = "mul");
+  require executor kind pe;
+  require compute kind vector_engine;
+  require layout operand0 satisfies accel.row_major;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "accel.vector.mul";
+  emit "accel_vector_mul";
+  cost 2;
+}
+
+// A reduction removes an axis, so this profile advertises the f32 sum fragment
+// only as an analysis/lowering capability. The emitter validates the sum
+// variant and f32 operand/result tiles; there is no hardware claim.
+rule accel.reduce_sum_f32 {
+  match micro.reduce(op = "sum");
+  require executor kind pe;
+  require compute kind vector_engine;
+  input "operand0";
+  output "result";
+  bundle "accel.reduce.sum.f32";
+  emit "accel_reduce_sum";
+  cost 3;
+}
+
+rule accel.mma_bf16 {
+  match micro.mma(input = bf16);
+  require executor kind pe;
+  require compute kind matrix_engine;
+  input "lhs";
+  input "rhs";
+  input "acc";
+  output "result";
+  bundle "accel.mma.bf16";
+  emit "accel_mxu";
+  cost 8;
+}
+
+// Like the AVX2 copy rule, `micro.async_copy` is the one operation here whose
+// boundary values are plain `tensor`s and therefore state no memory kind, so
+// the rule names the ports it governs -- DRAM source to SRAM destination, this
+// profile's load path. The compute rules below leave the memory to the tile
+// their operands and results already carry.
+rule accel.async_copy {
+  match micro.async_copy();
+  require executor kind pe;
+  require memory input "source" kind dram;
+  require memory output "result" kind sram;
+  input "source";
+  output "result";
+  bundle "accel.copy";
+  emit "accel_copy";
+  cost 1;
+}
+
+// Bounded tile movement. The source is a plain tensor/memref, so the rule names
+// the DRAM -> tile path; the result tile states its own memory. The movement
+// emitter is the package's declared implementation and its `verifyBoundary`
+// states the boundary limits explicitly: clipped load/store are modeled, a
+// partial-K contraction is not.
+rule accel.tile_load {
+  match micro.tile_load();
+  require executor kind pe;
+  require memory input "source" kind dram;
+  input "source";
+  output "result";
+  bundle "accel.tile.load";
+  emit "accel_copy";
+  cost 1;
+}
+
+rule accel.tile_store {
+  match micro.tile_store();
+  require executor kind pe;
+  input "source";
+  bundle "accel.tile.store";
+  emit "accel_copy";
+  cost 1;
+}

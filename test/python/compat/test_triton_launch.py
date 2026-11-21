@@ -8,11 +8,17 @@ pytest process; the lane itself then qualifies coexistence before installing
 the driver.
 """
 
+
 from __future__ import annotations
 
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.triton_integration
+
 
 INNER = Path(__file__).with_name("_triton_launch_inner.py")
 

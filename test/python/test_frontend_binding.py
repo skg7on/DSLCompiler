@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 import llk.language as renamed_language
-import pytest
 from frontend_cases import make_add_program, request
 from llk import LLKError
 from llk.frontend import (
@@ -14,6 +13,11 @@ from llk.frontend import (
     serialize_request,
 )
 from llk.language import constexpr as compile_time
+
+import pytest
+
+pytestmark = pytest.mark.frontend_unit
+
 
 SHIFT = 3
 MUTABLE = []

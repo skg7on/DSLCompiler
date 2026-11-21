@@ -570,6 +570,17 @@ assert acceptance_errors_for_selected_fallback == ["selected_reference_fallback"
 - [ ] At milestone exit run `cmake --build build --target check-llk`, all required pytest markers, strict Sphinx/reference checks and the clean-wheel examples. Record commit, dependency/toolchain locks, test counts, numerical errors, guard checks, native invocation identities and skip reasons in an acceptance report. Reconcile #156/#157 and #191 work without widening claims.
 - [ ] Commit `test: require frontend execution and publish capability acceptance`; update the parent issue with evidence only after these checks pass. Keep unfinished upstream/training/target rows open.
 
+**Status (2026-11-21):** the required-execution manifest
+(`test/Frontend/acceptance_manifest.json`), registered pytest markers and
+evidence collection, the checker, packaged machine/rule/layout resources with
+SHA-256 hashes, the `LLK_ENABLE_PYTHON_TESTS` CTest integration, the four CI
+jobs and the user-facing documentation are implemented. Synthetic fixtures
+prove every rejection path; local lanes execute 133 compiler-free, 64 native,
+33 Triton and 103 Torch cases (the nine local Torch failures are the
+pre-existing Inductor include-order issue reproduced on unmodified `main`).
+Selected AVX2 execution runs in the Linux CI job. See the
+[PF20 evidence](../../reviews/2026-11-21-pf20-python-frontend-acceptance.md).
+
 ## Review finding → task closure map
 
 | Finding in review | Tasks | Closure evidence |

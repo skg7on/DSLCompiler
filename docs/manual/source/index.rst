@@ -80,7 +80,10 @@ Choose a starting point
      - Symbolic export, checked invocation, sampled analysis and replay
    * - Develop the Python frontend
      - :doc:`Python frontend </python-frontend>`
-     - Typed capture, native launch, static edge tiles and specialization cache
+     - Typed capture, native launch, Torch/Triton boundaries and the required lane checker
+   * - Run and enforce the Python lanes
+     - :doc:`Python frontend tutorial </tutorials/python-frontend>`
+     - Packaged target resources, native-call evidence and the acceptance manifest
    * - Describe a machine or write target policy
      - :doc:`Machine models </models/machine-model>`
      - :doc:`Mapping policy </models/mapping-policy>` and

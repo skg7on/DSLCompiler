@@ -7,6 +7,7 @@ backward kernel that claims LLK execution and record the explicit transpose
 materializations that remain outside the compact ABI.
 """
 
+
 from __future__ import annotations
 
 import gc
@@ -15,7 +16,6 @@ import weakref
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 import torch
 import torch.nn.functional as F
 from torch._dynamo.exc import BackendCompilerFailed
@@ -23,6 +23,11 @@ from torch._dynamo.exc import BackendCompilerFailed
 from llk import TensorContractError, UnsupportedFeatureError
 from llk.runtime import _ffi
 from llk.torch import _autograd
+
+import pytest
+
+pytestmark = pytest.mark.torch_integration
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COMPILE_OPTIONS = {"config_root": str(REPO_ROOT)}

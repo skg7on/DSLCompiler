@@ -1,10 +1,15 @@
 """PF01 regression tests against the installed, real Torch registry."""
 
+
 import os
 from pathlib import Path
 import subprocess
 import sys
 import textwrap
+
+import pytest
+
+pytestmark = pytest.mark.torch_integration
 
 
 PYTHON_ROOT = Path(__file__).resolve().parents[2] / "python"

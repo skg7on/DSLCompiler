@@ -30,5 +30,11 @@ where = ["."]
 include = ["llk", "llk.*"]
 
 [tool.setuptools.package-data]
-llk = ["compatibility.json"]
+llk = [
+  "compatibility.json",
+  "resources.json",
+  "config/machines/*.yaml",
+  "config/mapping/*/layouts.llkmap",
+  "config/mapping/*/rules.llkmap",
+]
 "llk.triton" = ["toolchain-lock.json"]

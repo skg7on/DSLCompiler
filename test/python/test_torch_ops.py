@@ -6,6 +6,7 @@ Unsupported views, subclasses and training inputs must fail before the JIT is
 entered rather than being copied into a silently different execution.
 """
 
+
 from __future__ import annotations
 
 import importlib
@@ -17,13 +18,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 import torch.nn.functional as F
 
 from llk import TensorContractError, UnsupportedFeatureError
 from llk.runtime import _ffi
 from llk.torch import _compat, _ops
+
+import pytest
+
+pytestmark = pytest.mark.torch_integration
+
 
 PYTHON_ROOT = Path(__file__).resolve().parents[2] / "python"
 MM_TOLERANCE = {"rtol": 1e-4, "atol": 1e-5}

@@ -12,6 +12,7 @@ under ``build/tutorial/``. Commands run from the repository root.
    02-mapping
    03-performance
    04-tuning
+   python-frontend
 
 .. list-table::
    :header-rows: 1
@@ -32,6 +33,9 @@ under ``build/tutorial/``. Commands run from the repository root.
    * - Tuning
      - Predicted schedule YAML records
      - How to distinguish compatibility ranking from original-source mapping, replay and verified measurement
+   * - Python frontend
+     - Native reference execution and lane evidence
+     - How the package, C ABI, packaged target resources and required execution checker fit together
 
 Run the automated companion after building the five tools:
 

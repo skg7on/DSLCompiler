@@ -5,17 +5,22 @@ It must never request a data pointer, compile a request or enter the native
 runtime; those three events are spied on around every fake execution.
 """
 
+
 from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 
 import llk.torch  # noqa: F401 - importing the package registers the operators
 from llk import TensorContractError
 from llk.runtime import _ffi
+
+import pytest
+
+pytestmark = pytest.mark.torch_integration
+
 
 SHAPES = {
     "add": ((4, 5), (4, 5)),

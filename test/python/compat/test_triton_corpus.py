@@ -8,6 +8,7 @@ native compilation and invocation run in a Triton-free worker so this host's
 LLVM coexistence limitation cannot weaken the evidence.
 """
 
+
 from __future__ import annotations
 
 import json
@@ -17,6 +18,12 @@ import sys
 from pathlib import Path
 
 import llk
+from _acceptance import record as record_acceptance
+
+import pytest
+
+pytestmark = [pytest.mark.triton_integration, pytest.mark.selected_avx2]
+
 
 ROOT = Path(__file__).resolve().parents[3]
 MANIFEST = ROOT / "docs/design/triton-compatibility-v1.json"
@@ -117,6 +124,37 @@ def test_corpus_executes_ten_fixtures_natively_and_rejects_the_boundaries(
     executed_fixture_reports = [
         record for record in frame["fixtures"] if record["class"] == "executable"
     ]
+    reference_invocations = sum(
+        int(item["reference"]["native_invocations"])
+        for item in executed_fixture_reports
+    )
+    selected_records = [item["selected"] for item in executed_fixture_reports]
+    if frame["host"]["selected_target_supported"]:
+        selected_ok = all(
+            item["status"] == "ok" and item["backend"] == "selected-target"
+            for item in selected_records
+        )
+        record_acceptance(
+            native_invocations=reference_invocations
+            + sum(int(item.get("native_invocations", 0)) for item in selected_records),
+            selected_backend="selected-target" if selected_ok else "failed",
+            selected_group_count=sum(
+                int(item.get("selected_group_count", 0)) for item in selected_records
+            ),
+            reference_group_count=sum(
+                int(item.get("reference_group_count", 0)) for item in selected_records
+            ),
+        )
+    else:
+        # Natives ran in the Triton-free worker; this in-process lane can see
+        # them only through the frame, so record the worker's count.
+        record_acceptance(
+            native_invocations=reference_invocations,
+            selected_backend="unavailable",
+            selected_group_count=0,
+            reference_group_count=0,
+        )
+
     assert len(executed_fixture_ids) == 10
     assert all(
         item["reference"]["native_invocations"] > 0

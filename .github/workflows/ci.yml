@@ -161,3 +161,258 @@ jobs:
             build/test/ArmSVEExecutionEvidence/
             build/arm-sme-evidence.log
             build/test/ArmSMEExecutionEvidence/
+
+  # Required Python frontend lanes. Each job builds only the C ABI the package
+  # loads and runs the pytest markers declared in
+  # test/Frontend/acceptance_manifest.json. The final frontend-acceptance job
+  # rejects zero execution, skipped or failed lanes, absent native-call
+  # counters and reference results substituted for selected-target execution.
+  python-frontend:
+    name: Python frontend (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      LLVM_VERSION: 22.1.8
+      LLVM_BUILD: ${{ github.workspace }}/llvm-build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 ninja-build g++
+
+      # The cache key matches build-and-test. A cache miss means the pinned
+      # LLVM/MLIR build is unavailable and this job must fail rather than fall
+      # back to an ambient LLVM.
+      - name: Restore LLVM build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.LLVM_BUILD }}
+          key: llvm-build-${{ env.LLVM_VERSION }}-shared-clang18-v1
+
+      - name: Install the package, test tools and Torch 2.9.0
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "./python[test,torch-test]"
+          python -c "import torch; assert torch.__version__ == '2.9.0', torch.__version__"
+
+      - name: Build the frontend C ABI
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DLLVM_PROJECT_BUILD_DIR=$LLVM_BUILD \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLK_BUILD_TOOLS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DLLK_BUILD_PYTHON_CAPI=ON
+          ninja -C build LLKFrontendCAPI
+
+      - name: Run the required Python 3.11/3.12 lanes
+        run: |
+          set -euo pipefail
+          export LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.so"
+          export LLK_PYTHON_EVIDENCE_DIR="$PWD/frontend-evidence"
+          mkdir -p "$LLK_PYTHON_EVIDENCE_DIR/junit"
+          run_lane() {
+            local lane="$1" expression="$2"
+            LLK_PYTHON_LANE="$lane" python -m pytest test/python \
+              -m "$expression" -q \
+              --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/$lane.xml"
+          }
+          run_lane frontend_unit \
+            "frontend_unit and not frontend_native and not torch_integration and not triton_integration"
+          run_lane frontend_native \
+            "frontend_native and not torch_integration and not triton_integration"
+          run_lane torch_integration "torch_integration"
+
+      - name: Upload lane evidence
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-evidence-core
+          path: |
+            frontend-evidence/junit/*.xml
+            frontend-evidence/*.json
+
+  python-minimal:
+    name: Python frontend without optional dependencies
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      LLVM_VERSION: 22.1.8
+      LLVM_BUILD: ${{ github.workspace }}/llvm-build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 ninja-build
+
+      - name: Restore LLVM build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.LLVM_BUILD }}
+          key: llvm-build-${{ env.LLVM_VERSION }}-shared-clang18-v1
+
+      - name: Install the package without Torch or Triton
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "./python[test]"
+          python -c "import importlib.util; assert importlib.util.find_spec('torch') is None; assert importlib.util.find_spec('triton') is None"
+
+      - name: Build the frontend C ABI
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DLLVM_PROJECT_BUILD_DIR=$LLVM_BUILD \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLK_BUILD_TOOLS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DLLK_BUILD_PYTHON_CAPI=ON
+          ninja -C build LLKFrontendCAPI
+
+      - name: Run the compiler-free lane
+        run: |
+          set -euo pipefail
+          export LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.so"
+          export LLK_PYTHON_EVIDENCE_DIR="$PWD/frontend-evidence"
+          mkdir -p "$LLK_PYTHON_EVIDENCE_DIR/junit"
+          LLK_PYTHON_LANE=frontend_unit python -m pytest test/python \
+            -m "frontend_unit and not frontend_native and not torch_integration and not triton_integration" \
+            -q --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/frontend_unit.xml"
+
+  triton-frontend:
+    name: Python frontend (pinned Triton and selected AVX2)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    env:
+      CC: clang-18
+      CXX: clang++-18
+      LLVM_VERSION: 22.1.8
+      LLVM_BUILD: ${{ github.workspace }}/llvm-build
+      TRITON_REVISION: 93f05e19a8024938c320d82854e307d602b5a05d
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 ninja-build cmake g++ zlib1g-dev
+
+      - name: Restore LLVM build cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.LLVM_BUILD }}
+          key: llvm-build-${{ env.LLVM_VERSION }}-shared-clang18-v1
+
+      - name: Install the package and Torch 2.9.0
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "./python[test,torch-test]"
+
+      - name: Build the frontend C ABI
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DLLVM_PROJECT_BUILD_DIR=$LLVM_BUILD \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLK_BUILD_TOOLS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DLLK_BUILD_PYTHON_CAPI=ON
+          ninja -C build LLKFrontendCAPI
+
+      - name: Check out and build the pinned upstream Triton
+        run: |
+          git init triton
+          git -C triton remote add origin https://github.com/triton-lang/triton.git
+          git -C triton fetch --depth 1 origin "$TRITON_REVISION"
+          git -C triton checkout --detach FETCH_HEAD
+          python -m pip install -e ./triton
+
+      - name: Verify AVX2 is available
+        run: grep -qm1 avx2 /proc/cpuinfo
+
+      - name: Run the upstream Triton and selected AVX2 lanes
+        run: |
+          set -euo pipefail
+          export LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.so"
+          export LLK_TRITON_PYTHONPATH="$PWD/triton/python"
+          export LLK_PYTHON_EVIDENCE_DIR="$PWD/frontend-evidence"
+          mkdir -p "$LLK_PYTHON_EVIDENCE_DIR/junit"
+          run_lane() {
+            local lane="$1" expression="$2"
+            LLK_PYTHON_LANE="$lane" python -m pytest test/python \
+              -m "$expression" -q \
+              --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/$lane.xml"
+          }
+          run_lane triton_integration "triton_integration"
+          run_lane selected_avx2 "selected_avx2"
+
+      - name: Upload lane evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-evidence-triton
+          path: |
+            frontend-evidence/junit/*.xml
+            frontend-evidence/*.json
+
+  frontend-acceptance:
+    name: Python frontend acceptance
+    needs: [python-frontend, python-minimal, triton-frontend]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Collect lane evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: frontend-evidence-*
+          path: frontend-evidence
+          merge-multiple: true
+
+      - name: Enforce required execution
+        run: |
+          python test/python/check_required_python_execution.py \
+            --manifest test/Frontend/acceptance_manifest.json \
+            --junit-dir frontend-evidence/junit \
+            --evidence-dir frontend-evidence \
+            --json frontend-evidence/acceptance.json
+
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-acceptance-evidence
+          path: frontend-evidence/

@@ -1,5 +1,6 @@
 """PF08: declarative launch, option handling and precompiled-kernel lifetime."""
 
+
 from __future__ import annotations
 
 import os
@@ -11,11 +12,15 @@ from unittest import mock
 import llk
 import llk.language as tl
 import native_cases as cases
-import pytest
 from llk import TensorContractError, UnsupportedFeatureError
 from llk.frontend import CompileRequest, LaunchSpec, bind_kernel, serialize_request
 from llk.language._ast_compiler import compile_kernel
 from llk.runtime import _ffi
+
+import pytest
+
+pytestmark = pytest.mark.frontend_native
+
 
 def spy_on_native_invoke():
     return mock.patch.object(_ffi, "native_invoke", wraps=_ffi.native_invoke)

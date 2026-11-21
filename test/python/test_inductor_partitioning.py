@@ -7,6 +7,7 @@ is checked for idempotence and foreign-owner safety, mirroring the strict
 ``llk`` backend contract.
 """
 
+
 from __future__ import annotations
 
 import dataclasses
@@ -18,7 +19,6 @@ import sys
 import textwrap
 from pathlib import Path
 
-import pytest
 import torch
 import torch.nn.functional as F
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -30,6 +30,11 @@ from llk.torch._inductor_backend import (
     inductor_backend,
     rewrite_supported_subgraphs,
 )
+
+import pytest
+
+pytestmark = pytest.mark.torch_integration
+
 
 PYTHON_ROOT = Path(__file__).resolve().parents[2] / "python"
 

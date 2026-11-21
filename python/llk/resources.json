@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "root": "config",
+  "files": {
+    "machines/arm-sme-v2.yaml": "21f4058828cb44cd15ba3640ddb597c088d9b30c30eb5d70d707ee937ea0f2a9",
+    "machines/arm-sve-v2.yaml": "17603f40c751c37d3e05c66e4cab9b5162bea38b928d5ea4f03a79c38c4823e7",
+    "machines/generic-ai-accel-v2.yaml": "5b3d65be1eff9832df986f376b511043d92c98dac2e7dec69d088df24c9dba08",
+    "machines/x86-avx2-v2.yaml": "0ac407e8b83a2201497141445e95d6532041437281e0bb4659a39bbd7fc02ad3",
+    "mapping/arm-sme/layouts.llkmap": "a89571e9c5352c680b5b6a09467248a794042d4694e24e8f2c18ed68a1982c44",
+    "mapping/arm-sme/rules.llkmap": "55b6d4a9d5f857919f2a0c406bfdf68ec71b5e5cede0309752b752d2eab7e709",
+    "mapping/arm-sve/layouts.llkmap": "8dcafdfd125c7b476616eb542aa6ffaf143b53c07cbb70641a5fe312e8baa6b1",
+    "mapping/arm-sve/rules.llkmap": "bed12706e75c0ff44d54be89d6f738e51b052427fb0c56090de5826ece881353",
+    "mapping/generic-ai-accel/layouts.llkmap": "41ec76292cbbebb9ae54ec737fd9e5ab4a1f0d3d538c43245d386ea7ba276ebd",
+    "mapping/generic-ai-accel/rules.llkmap": "4dc7b98cbdc5eb052b9fdf3d55cbea11cbf6f13d8e4e3a68257405d0424ab5e3",
+    "mapping/x86-avx2/layouts.llkmap": "e991bf9fdf12b09d580ba41ac0f7b6756bfc271f6b68bc8dfc18b8eb02ff7b08",
+    "mapping/x86-avx2/rules.llkmap": "127311337fdc136d184f8c9c49e5d7078949dba9e24836ea0057fc33036f7643"
+  }
+}

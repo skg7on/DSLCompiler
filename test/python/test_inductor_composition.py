@@ -6,17 +6,22 @@ alone, or an Inductor result computed without LLK, fails the assertions.
 Inductor is a required dependency of this lane; there is no skip path.
 """
 
+
 from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
 import torch
 import torch.nn.functional as F
 from torch._inductor import compile_fx as inductor_module
 
 from llk.runtime import _ffi
 from llk.torch import _inductor_backend
+
+import pytest
+
+pytestmark = pytest.mark.torch_integration
+
 
 MM_TOLERANCE = {"rtol": 1e-4, "atol": 1e-5}
 SIN_TOLERANCE = {"rtol": 1e-6, "atol": 1e-6}

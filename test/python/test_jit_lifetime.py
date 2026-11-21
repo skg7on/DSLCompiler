@@ -1,5 +1,6 @@
 """PF09: leases, cache eviction and close/invoke races hold native ownership."""
 
+
 from __future__ import annotations
 
 import threading
@@ -8,10 +9,13 @@ from unittest import mock
 import frontend_cases as frontend
 import llk
 import native_cases as cases
-import pytest
 from llk import ExecutionError
 from llk.runtime import _ffi
 from llk.runtime._cache import CompilationCache
+
+import pytest
+
+pytestmark = pytest.mark.frontend_native
 
 
 def fresh_kernel():

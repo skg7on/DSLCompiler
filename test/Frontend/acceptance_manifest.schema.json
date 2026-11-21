@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/skg7on/DSLCompiler/test/Frontend/acceptance_manifest.schema.json",
+  "title": "LLK Python frontend required-execution manifest",
+  "description": "Declares the pytest lanes whose execution is required for frontend acceptance. check_required_python_execution.py enforces these entries against JUnit and evidence output.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "lanes"],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "lanes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "marker_expression",
+          "required",
+          "minimum_executed",
+          "require_native_invocations",
+          "require_selected_target",
+          "requires"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]+$"
+          },
+          "marker_expression": {
+            "type": "string",
+            "minLength": 1
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "minimum_executed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "require_native_invocations": {
+            "type": "boolean"
+          },
+          "require_selected_target": {
+            "type": "boolean"
+          },
+          "requires": {
+            "type": "array",
+            "items": {
+              "enum": ["native_library", "torch", "triton", "avx2"]
+            },
+            "uniqueItems": true
+          },
+          "description": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
