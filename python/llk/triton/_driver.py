@@ -1800,7 +1800,10 @@ def _validate_template(template, source_hash, signature, constants, specializati
                     stage="launch",
                 )
         elif parameter.kind == "pointer":
-            if signature[parameter.name] != f"*{parameter.dtype}":
+            expected_pointer = "*" + _SCALAR_SPEC.get(
+                parameter.dtype, parameter.dtype
+            )
+            if signature[parameter.name] != expected_pointer:
                 raise CompilationError(
                     f"pointer {parameter.name} disagrees with the template",
                     code="triton_artifact_mismatch",
