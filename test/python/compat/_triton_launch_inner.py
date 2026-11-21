@@ -733,20 +733,25 @@ def test_pointer_specialized_kernel_has_distinct_native_identities(
     assert report_32x64.template_identity == report_16x64.template_identity
 
 
-def test_real_launch_accepts_guarded_buffer_providers(triton_path, tmp_path):
+def test_real_launch_rejects_raw_memoryview_providers(triton_path, tmp_path):
+    """Upstream specialization requires host objects that expose data_ptr().
+
+    The in-process backend is an upstream Triton backend, so providers must
+    carry the upstream specialization surface (Torch tensors do). The C API
+    corpus lane is the entry point for raw buffer-protocol providers; that
+    boundary is exercised by test_triton_corpus.py.
+    """
     _qualified_lane_or_skip()
     module = _load_kernel_module(triton_path, _kernel_path(tmp_path))
-    values = [float(index % 17) - 8.0 for index in range(32 * 64)]
-    other = [float((index * 3) % 11) + 0.5 for index in range(32 * 64)]
-    x = _Guarded((32, 64), values)
-    y = _Guarded((32, 64), other)
+    x = _Guarded((32, 64), [1.0] * (32 * 64))
+    y = _Guarded((32, 64), [2.0] * (32 * 64))
     out = _Guarded((32, 64))
-    with llk.triton.activate(_options()):
-        module.add_kernel[(2,)](x.view, y.view, out.view, 2048, BLOCK=1024)
-        report = llk.triton.last_launch_report()
-    assert out.values() == [left + right for left, right in zip(values, other)]
+    with llk.triton.activate(_options()), _native_spy() as spy:
+        with pytest.raises(TypeError, match="memoryview"):
+            module.add_kernel[(2,)](x.view, y.view, out.view, 2048, BLOCK=1024)
+        assert spy.call_count == 0
+    assert out.values() == [0.0] * (32 * 64)
     assert x.guards_intact() and y.guards_intact() and out.guards_intact()
-    assert report is not None and report.native_invocations == 1
 
 
 # ---------------------------------------------------------------------------
