@@ -1,9 +1,9 @@
 """Typed capture tests assert dataflow, never textual opcode substrings."""
 
+
 from dataclasses import replace
 
 import llk.language as lang
-import pytest
 from ast_cases import binding, counted_dot, masked_add, ports
 from llk.frontend import (
     CompileRequest,
@@ -12,6 +12,10 @@ from llk.frontend import (
     serialize_request,
 )
 from llk.language._ast_compiler import compile_kernel
+
+import pytest
+
+pytestmark = pytest.mark.frontend_unit
 
 
 def capture(fn, args=None):

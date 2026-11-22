@@ -1,14 +1,19 @@
 """Genuine upstream TTIR export into neutral unbound templates."""
 
+
 import hashlib
 import json
 from pathlib import Path
 
-import pytest
 
 import llk.triton as triton_export
 from llk._errors import CompilationError, FrontendSyntaxError, UnsupportedFeatureError
 from llk.triton import UnboundFrontendTemplate
+
+import pytest
+
+pytestmark = pytest.mark.triton_integration
+
 
 ADD_SOURCE = """\
 import triton

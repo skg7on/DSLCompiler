@@ -7,14 +7,19 @@ with bounded movement, and the native executable writes exactly the declared
 domain. Guard words on both sides of every payload catch an out-of-bounds write.
 """
 
+
 from __future__ import annotations
 
 import llk
 import llk.language as tl
 import native_cases as cases
-import pytest
 from llk import LLKError, UnsupportedFeatureError
 from llk.frontend import LaunchSpec, TensorArgument, TensorSpec
+
+import pytest
+
+pytestmark = pytest.mark.frontend_native
+
 
 SHAPE_33X65 = (33, 65)
 SHAPE_1X7 = (1, 7)

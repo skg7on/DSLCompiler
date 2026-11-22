@@ -1,0 +1,328 @@
+// Arm SVE mapping rules.
+//
+// A rule names one Micro operation pattern and the bundle that implements it.
+// `bundle` and `emit` are opaque: this file names them, the SVE target package
+// gives them meaning. Layout ids refer to layouts.llkmap and are never
+// redefined here. Capability kinds must be ones machines/arm-sve-v2.yaml
+// declares -- `verifyMappingTarget` rejects the file otherwise.
+//
+// Every vector rule is typed on the ports it reads. The profile supports f32,
+// bf16 and i8 elementwise work, bf16<->f32 conversion, and f32 SiLU and
+// reduction; a dtype outside that table matches no rule rather than binding to
+// an implementation that does not exist. Layout requirements name one port
+// each, so a mixed-dtype program solves each operand against its own element
+// type instead of a graph-wide first value.
+//
+// There is no rule parameter for the vector width: the layout requirement is
+// what carries it, per port. A rule parameter that duplicated it would add an
+// assignment the solver does not need and could pin a mixed-dtype operand to
+// the wrong width.
+
+//===----------------------------------------------------------------------===//
+// Elementwise add and multiply
+//===----------------------------------------------------------------------===//
+
+rule sve.vector_add_f32 v1 {
+  match micro.vector(op = "add", input[0].element_type = f32,
+                     input[1].element_type = f32,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sve.vector.add.f32";
+  emit "sve_vector_add";
+  cost 4;
+}
+
+rule sve.vector_add_bf16 v1 {
+  match micro.vector(op = "add", input[0].element_type = bf16,
+                     input[1].element_type = bf16,
+                     output[0].element_type = bf16);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sve.vector.add.bf16";
+  emit "sve_vector_add";
+  cost 4;
+}
+
+rule sve.vector_add_i8 v1 {
+  match micro.vector(op = "add", input[0].element_type = i8,
+                     input[1].element_type = i8,
+                     output[0].element_type = i8);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sve.vector.add.i8";
+  emit "sve_vector_add";
+  cost 4;
+}
+
+rule sve.vector_mul_f32 v1 {
+  match micro.vector(op = "mul", input[0].element_type = f32,
+                     input[1].element_type = f32,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sve.vector.mul.f32";
+  emit "sve_vector_mul";
+  cost 4;
+}
+
+rule sve.vector_mul_bf16 v1 {
+  match micro.vector(op = "mul", input[0].element_type = bf16,
+                     input[1].element_type = bf16,
+                     output[0].element_type = bf16);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sve.vector.mul.bf16";
+  emit "sve_vector_mul";
+  cost 4;
+}
+
+rule sve.vector_mul_i8 v1 {
+  match micro.vector(op = "mul", input[0].element_type = i8,
+                     input[1].element_type = i8,
+                     output[0].element_type = i8);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.blocked_2d;
+  input "operand0";
+  input "operand1";
+  output "result";
+  bundle "sve.vector.mul.i8";
+  emit "sve_vector_mul";
+  cost 4;
+}
+
+//===----------------------------------------------------------------------===//
+// Conversion
+//===----------------------------------------------------------------------===//
+
+// Each direction has a blocked variant and a row-major initializer variant: a
+// GEMM initializer is read as a row-major tile before promotion, while an
+// accumulator/result conversion is read blocked. Both are explicit so the
+// legal path is stated rather than inferred from a default.
+
+rule sve.vector_convert_bf16_f32 v1 {
+  match micro.vector(op = "convert", input[0].element_type = bf16,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "sve.vector.convert.bf16_f32";
+  emit "sve_vector_convert";
+  cost 2;
+}
+
+rule sve.vector_convert_bf16_f32_row_major v1 {
+  match micro.vector(op = "convert", input[0].element_type = bf16,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.row_major;
+  input "operand0";
+  output "result";
+  bundle "sve.vector.convert.bf16_f32";
+  emit "sve_vector_convert";
+  cost 2;
+}
+
+rule sve.vector_convert_f32_bf16 v1 {
+  match micro.vector(op = "convert", input[0].element_type = f32,
+                     output[0].element_type = bf16);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "sve.vector.convert.f32_bf16";
+  emit "sve_vector_convert";
+  cost 2;
+}
+
+rule sve.vector_convert_f32_bf16_row_major v1 {
+  match micro.vector(op = "convert", input[0].element_type = f32,
+                     output[0].element_type = bf16);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.row_major;
+  input "operand0";
+  output "result";
+  bundle "sve.vector.convert.f32_bf16";
+  emit "sve_vector_convert";
+  cost 2;
+}
+
+//===----------------------------------------------------------------------===//
+// Activation and reduction (f32 only)
+//===----------------------------------------------------------------------===//
+
+rule sve.vector_silu_f32 v1 {
+  match micro.vector(op = "silu", input[0].element_type = f32,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout operand0 satisfies sve.blocked_2d;
+  input "operand0";
+  output "result";
+  bundle "sve.vector.silu.f32";
+  emit "sve_vector_silu";
+  cost 4;
+}
+
+rule sve.reduce_sum_f32 v1 {
+  match micro.reduce(op = "sum", input[0].element_type = f32,
+                     output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  input "operand0";
+  output "result";
+  bundle "sve.reduce.sum.f32";
+  emit "sve_reduce";
+  cost 3;
+}
+
+//===----------------------------------------------------------------------===//
+// Contraction
+//===----------------------------------------------------------------------===//
+
+// SVE has no matrix engine in this profile, so a contraction is implemented by
+// the vector engine. f32 and bf16 are the supported input pairs; an i8
+// contraction matches nothing. Both rules check the two operands plus the
+// accumulator and result, require the logical accumulator storage on the
+// `acc` input and `result` output, and keep every contraction operand
+// row-major. The modeled cost is a lower bound seed, not a claim that SVE beats
+// SME -- complete-plan analysis decides ranking.
+
+rule sve.mma_f32 v1 {
+  match micro.mma(input[0].element_type = f32, input[1].element_type = f32,
+                  input[2].element_type = f32, output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout lhs satisfies sve.row_major;
+  require layout rhs satisfies sve.row_major;
+  require layout acc satisfies sve.row_major;
+  require memory input "acc" kind acc;
+  require memory output "result" kind acc;
+  input "lhs";
+  input "rhs";
+  input "acc";
+  output "result";
+  bundle "sve.mma.f32";
+  emit "sve_mma";
+  cost 16;
+}
+
+rule sve.mma_bf16 v1 {
+  match micro.mma(input[0].element_type = bf16, input[1].element_type = bf16,
+                  input[2].element_type = f32, output[0].element_type = f32);
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout lhs satisfies sve.row_major;
+  require layout rhs satisfies sve.row_major;
+  require layout acc satisfies sve.row_major;
+  require memory input "acc" kind acc;
+  require memory output "result" kind acc;
+  input "lhs";
+  input "rhs";
+  input "acc";
+  output "result";
+  bundle "sve.mma.bf16";
+  emit "sve_mma";
+  cost 16;
+}
+
+//===----------------------------------------------------------------------===//
+// Movement
+//===----------------------------------------------------------------------===//
+
+// `micro.async_copy` boundary values carry no explicit memory kind, so the rule
+// names the ports it governs -- source DRAM to destination SRAM, the profile's
+// load path. The tile movement rules preserve the typed occurrences the tile
+// already carries and leave routing to shared code; naming a memory there would
+// fabricate an endpoint the program did not state.
+rule sve.async_copy v1 {
+  match micro.async_copy();
+  require executor kind worker;
+  require memory input "source" kind dram;
+  require memory output "result" kind sram;
+  input "source";
+  output "result";
+  bundle "sve.copy";
+  emit "sve_copy";
+  cost 2;
+}
+
+rule sve.tile_async_copy v1 {
+  match micro.tile_async_copy();
+  require executor kind worker;
+  input "source";
+  output "result";
+  bundle "sve.tile.copy";
+  emit "sve_tile_copy";
+  cost 2;
+}
+
+rule sve.tile_store v1 {
+  match micro.tile_store();
+  require executor kind worker;
+  input "source";
+  bundle "sve.tile.store";
+  emit "sve_tile_store";
+  cost 2;
+}
+
+//===----------------------------------------------------------------------===//
+// Fused convert -> SiLU -> multiply
+//===----------------------------------------------------------------------===//
+
+// The SwiGLU epilogue implemented as one unit: a bf16->f32 convert feeding an
+// f32 SiLU feeding the f32 gating multiply. The three operations are placed and
+// emitted together, so the intermediate tiles never cross a rule boundary. The
+// layout requirements are per boundary port: cv.operand0 is bf16 (width 32),
+// while gate.operand1 and gate.result are f32 (width 16). A single global
+// element type would have to pick one of those and mis-size the other.
+rule sve.fused_convert_silu_mul v1 {
+  match graph {
+    node cv: micro.vector(op = "convert", input[0].element_type = bf16,
+                          output[0].element_type = f32);
+    node act: micro.vector(op = "silu", input[0].element_type = f32,
+                           output[0].element_type = f32);
+    node gate: micro.vector(op = "mul", input[0].element_type = f32,
+                            input[1].element_type = f32,
+                            output[0].element_type = f32);
+    edge cv.result -> act.operand0;
+    edge act.result -> gate.operand0;
+  }
+  require executor kind worker;
+  require compute kind vector_engine;
+  require layout cv.operand0 satisfies sve.blocked_2d;
+  require layout gate.operand1 satisfies sve.blocked_2d;
+  require layout gate.result satisfies sve.blocked_2d;
+  input "cv.operand0";
+  input "gate.operand1";
+  output "gate.result";
+  bundle "sve.fused.convert_silu_mul";
+  emit "sve_fused_convert_silu_mul";
+  cost 3;
+}

@@ -1,13 +1,17 @@
 """PF09: reports and inspection come from the actual native artifact."""
 
+
 from __future__ import annotations
 
 import json
 
 import llk
 import native_cases as cases
-import pytest
 from llk import ExecutionError, UnsupportedFeatureError
+
+import pytest
+
+pytestmark = pytest.mark.frontend_native
 
 
 def fresh_kernel():

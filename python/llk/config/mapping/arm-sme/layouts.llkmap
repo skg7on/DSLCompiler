@@ -1,0 +1,27 @@
+// Arm SME target layouts.
+//
+// The same two layouts as arm-sve, under the SME prefix: streaming matrix work
+// does not introduce a physical-ZA layout in this increment, so there is no
+// `za_blocked_2d`. The blocked width still follows the ordinary vector width
+// for the operand's own element type, which the shared vector engine declares.
+//
+// Layout ids are target-owned mapping results, not `#micro.layout` enumerants.
+
+// Plain row-major: the logical index is the physical index, with no unused
+// size parameter.
+layout sme.row_major() {
+  require rank == 2;
+  implements row_major;
+  map (m, n) -> (m, n);
+}
+
+// Inner-dimension blocking solved per operand element type: f32 selects 16,
+// bf16 32 and i8 64; f64 has no lane fact and is rejected. VW is physical
+// blocking only -- small/remainder tiles may pad under the static map.
+layout sme.blocked_2d(int VW) {
+  param VW in {16, 32, 64};
+  require rank == 2;
+  require VW == machine.compute("vector_engine").lanes(element_type);
+  implements blocked;
+  map (m, n) -> (m, floordiv(n, VW), mod(n, VW));
+}

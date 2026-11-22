@@ -1,6 +1,9 @@
-import pytest
 from llk import UnsupportedFeatureError
 from llk.frontend import Value
+
+import pytest
+
+pytestmark = pytest.mark.frontend_unit
 
 
 def test_compatibility_value_is_a_typed_frontend_value():

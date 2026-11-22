@@ -9,6 +9,10 @@ from llk.frontend import (
 )
 from llk.language._ast_compiler import compile_kernel
 
+import pytest
+
+pytestmark = pytest.mark.frontend_unit
+
 
 def test_compile_elementwise_kernel():
     bound = binding(masked_add)

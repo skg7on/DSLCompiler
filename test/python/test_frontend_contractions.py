@@ -8,6 +8,7 @@ projection, a rounded intermediate, a reduction past K -- are rejected by name
 instead of being lowered approximately.
 """
 
+
 from __future__ import annotations
 
 import math
@@ -15,9 +16,13 @@ import math
 import llk
 import llk.language as tl
 import native_cases as cases
-import pytest
 from llk import LLKError, UnsupportedFeatureError
 from llk.frontend import LaunchSpec, NumericalContract, TensorArgument, TensorSpec
+
+import pytest
+
+pytestmark = pytest.mark.frontend_native
+
 
 MATMUL_SHAPE = (32, 64, 16)  # M, N, K
 MATMUL_TILE = (32, 64, 16)  # BM, BN, BK

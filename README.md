@@ -56,6 +56,28 @@ Mapping follows **extract → match → place → connect → cover → bind →
 - **Schedule exploration:** finite parameter spaces, original-source candidate instantiation, target-aware mapping, static ranking, frozen plan replay, and optional typed verified measurement.
 - **CPU validation:** scheduling, fusion, packing, specialization, parallel runtime, and JIT infrastructure for supported kernels, including SwiGLU, RoPE, and attention. Selected AVX2 mapped GEMM/SwiGLU, padded-tail, transform and multi-output numerical fixtures are verified.
 - **Target examples:** AVX2 and generic accelerator machine profiles and mapping packages.
+- **Python frontend:** typed `@llk.jit` capture, checked native compilation and synchronous execution over caller-owned buffers; strict `torch.compile(backend="llk")`, Inductor composition, registered operators and first-order autograd for add/multiply/matmul; and genuine upstream Triton 3.6.0 TTIR export/launch for a fixed ten-kernel corpus. Required unit/native/Torch/Triton/selected-AVX2 lanes are declared in one manifest and enforced by a checker that rejects zero execution, skips, missing native-call counters and reference-for-selected substitution.
+
+## Python frontend
+
+The `llk-compiler` package needs the `LLKFrontendCAPI` shared library built from the same toolchain as LLVM/MLIR. Target configuration ships inside the wheel with content hashes, so an installed kernel needs no repository checkout:
+
+```bash
+# In an isolated worktree with a matching LLVM build
+cmake -S . -B build -G Ninja \
+  -DLLVM_PROJECT_BUILD_DIR=/path/to/llvm-project/build \
+  -DLLK_BUILD_PYTHON_CAPI=ON -DLLK_ENABLE_PYTHON_TESTS=ON
+cmake --build build --target LLKFrontendCAPI
+
+python -m pip install "./python[test,torch-test]"
+export LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.so"
+python -m pytest test/python -m frontend_unit -q
+python test/python/check_required_python_execution.py \
+  --manifest test/Frontend/acceptance_manifest.json \
+  --junit-dir build/python-frontend/junit --evidence-dir build/python-frontend
+```
+
+See the [Python frontend guide](docs/manual/source/python-frontend.rst) and [tutorial](docs/manual/source/tutorials/python-frontend.rst) for the supported envelope, the five required lanes and the stable rejection codes.
 
 [PR #133](https://github.com/skg7on/DSLCompiler/pull/133) delivers selected resource identity, capacity-feasible search, per-hop storage/lifetimes, shared static scoring, typed invocation with scratch release, selected vector/fused lowering, and original-source mapped tuning. Its pinned LLVM 22.1.8 Linux CI passes selected AVX2 execution without required skips. Three legacy JIT cases remain skipped; the [acceptance matrix](docs/reviews/issue67-final-acceptance.md) records exact evidence and limits. Performance predictions are uncalibrated, and the generic accelerator package has no hardware execution backend. The [feature matrix](docs/manual/source/features.rst) records current support and limits.
 

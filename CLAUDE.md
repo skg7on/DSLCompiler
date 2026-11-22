@@ -96,8 +96,13 @@ native-lane CI registration remain later tasks under #203/PF20.
 `python/` package path. Do not run vendored GoogleTest Python tests as project
 frontend acceptance. The package tests build/install a real wheel in a clean
 Torch-absent environment; registration tests require real Torch and must not
-skip. Python frontend tests are separate from `check-llk`; required native/CI
-integration remains PF20. See the [frontend guide](docs/manual/source/python-frontend.rst)
+skip. Required Python lanes (`frontend_unit`, `frontend_native`,
+`torch_integration`, `triton_integration`, `selected_avx2`) are declared in
+`test/Frontend/acceptance_manifest.json` and enforced by
+`test/python/check_required_python_execution.py`; with
+`-DLLK_ENABLE_PYTHON_TESTS=ON` CTest registers them and `check-llk` includes
+them. See the [frontend guide](docs/manual/source/python-frontend.rst),
+[PF20 acceptance evidence](docs/reviews/2026-11-21-pf20-python-frontend-acceptance.md)
 and [PF01 environment evidence](docs/reviews/2026-10-19-pf01-python-environment.md).
 
 ## Architecture

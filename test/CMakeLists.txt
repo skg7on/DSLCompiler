@@ -76,6 +76,44 @@ endif()
 
 include(FileCheck.cmake)
 
+# Required Python frontend lanes. Ordinary compiler builds keep this OFF; the
+# qualified frontend CI job enables it after installing Torch and the pinned
+# Triton checkout. A lane that collects or executes nothing is a failure, and
+# PythonFrontendAcceptance rejects missing or substituted evidence.
+if(LLK_ENABLE_PYTHON_TESTS)
+  find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
+  set(_llk_python_evidence_dir "${CMAKE_BINARY_DIR}/python-frontend")
+  function(_llk_add_python_lane lane expression)
+    add_test(NAME PythonFrontend_${lane}
+        COMMAND ${Python3_EXECUTABLE} -m pytest
+            "${PROJECT_SOURCE_DIR}/test/python"
+            -m "${expression}" -q
+            "--junitxml=${_llk_python_evidence_dir}/junit/${lane}.xml")
+    set_tests_properties(PythonFrontend_${lane} PROPERTIES
+        WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+        TIMEOUT 7200
+        ENVIRONMENT
+            "LLK_FRONTEND_LIBRARY=$<TARGET_FILE:LLKFrontendCAPI>;LLK_PYTHON_LANE=${lane};LLK_PYTHON_EVIDENCE_DIR=${_llk_python_evidence_dir};LLK_TRITON_PYTHONPATH=$ENV{LLK_TRITON_PYTHONPATH}")
+  endfunction()
+  _llk_add_python_lane(frontend_unit
+      "frontend_unit and not frontend_native and not torch_integration and not triton_integration")
+  _llk_add_python_lane(frontend_native
+      "frontend_native and not torch_integration and not triton_integration")
+  _llk_add_python_lane(torch_integration "torch_integration")
+  _llk_add_python_lane(triton_integration "triton_integration")
+  _llk_add_python_lane(selected_avx2 "selected_avx2")
+  add_test(NAME PythonFrontendAcceptance
+      COMMAND ${Python3_EXECUTABLE}
+          "${PROJECT_SOURCE_DIR}/test/python/check_required_python_execution.py"
+          --manifest "${PROJECT_SOURCE_DIR}/test/Frontend/acceptance_manifest.json"
+          --junit-dir "${_llk_python_evidence_dir}/junit"
+          --evidence-dir "${_llk_python_evidence_dir}")
+  set_tests_properties(PythonFrontendAcceptance PROPERTIES
+      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+      TIMEOUT 60
+      DEPENDS "PythonFrontend_frontend_unit;PythonFrontend_frontend_native;PythonFrontend_torch_integration;PythonFrontend_triton_integration;PythonFrontend_selected_avx2")
+endif()
+
 # Tests registered here are the IR/CLI tests; GTests are discovered after build.
 get_property(_llk_ir_tests DIRECTORY PROPERTY TESTS)
 if(_llk_ir_tests)
@@ -91,6 +129,9 @@ foreach(_llk_tool IN LISTS _llk_check_deps)
     list(REMOVE_ITEM _llk_check_deps ${_llk_tool})
   endif()
 endforeach()
+if(LLK_ENABLE_PYTHON_TESTS)
+  list(APPEND _llk_check_deps LLKFrontendCAPI)
+endif()
 
 _llk_collect_test_targets("${CMAKE_CURRENT_SOURCE_DIR}")
 get_property(_llk_test_targets GLOBAL PROPERTY LLK_TEST_TARGETS)

@@ -1,14 +1,18 @@
 """PF08: Python buffer adapters checked before native JIT entry."""
 
+
 from __future__ import annotations
 
 import ctypes
 
 import native_cases as cases
-import pytest
 from llk import TensorContractError
 from llk.frontend import TensorSpec
 from llk.runtime import _buffers
+
+import pytest
+
+pytestmark = pytest.mark.frontend_unit
 
 
 def port(shape=(16, 16), dtype="f32", direction="input", effect="read"):

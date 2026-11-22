@@ -14,7 +14,13 @@ elementwise add/multiply, canonical counted matmul and fused SwiGLU. Elementwise
 kernels use two read inputs and one write output; rounded edges require a proven
 in-bounds mask. Contractions have their own exact-coverage and numerical grammar. Execution is
 synchronous through ``LLKFrontendCAPI`` over caller-owned buffers. The native
-library and target configuration must be supplied alongside the Python package.
+library must be supplied alongside the Python package (``LLK_FRONTEND_LIBRARY``
+or a library next to the package). Target configuration is packaged: the wheel
+carries ``llk/config/machines/*.yaml`` and ``llk/config/mapping/*/*.llkmap``
+with ``llk/resources.json`` content hashes, and ``CompileOptions()`` validates
+and snapshots those installed files. A missing or modified resource fails with
+``native_configuration_missing`` or ``native_configuration_corrupt`` before a
+compile request is built.
 
 Dynamo registration is a separate integration. PF13
 (`#224 <https://github.com/skg7on/DSLCompiler/issues/224>`__) makes
@@ -715,9 +721,68 @@ references, counts distinct forward/backward native kernels, and runs the strict
 and Inductor training routes. Missing test/build dependencies are setup
 failures, not successful or skipped coverage.
 
-These Python checks are separate from the compiler's ``check-llk`` target.
-C++ frontend tests are registered with CTest; required combined Python/native
-CI coverage remains incomplete. Continue to use :doc:`contributing` for C++/MLIR and selected-target acceptance.
+Required execution lanes
+------------------------
+
+The lanes whose execution is required are declared once in
+``test/Frontend/acceptance_manifest.json`` and selected by registered pytest
+markers:
+
+``frontend_unit``
+   Compiler-free capture, schema, packaging and error contracts.
+``frontend_native``
+   Reference-backend native compilation and invocation through
+   ``LLKFrontendCAPI``.
+``torch_integration``
+   Real Torch registration, Dynamo, Inductor, operators and training.
+``triton_integration``
+   Pinned upstream Triton qualification, TTIR export and launch.
+``selected_avx2``
+   Linux x86_64/AVX2 selected-target execution. Reference results are never
+   accepted for this lane.
+
+A lane run sets ``LLK_PYTHON_EVIDENCE_DIR`` and ``LLK_PYTHON_LANE``; the test
+session records its JUnit XML and one evidence JSON file containing the native
+call counter (and, for the selected lane, the executed backend and group
+counts). ``test/python/check_required_python_execution.py`` joins the two and
+fails with stable codes:
+
+``required_execution_missing``
+   A required lane collected or executed nothing.
+``required_lane_skipped``
+   A required lane skipped a case.
+``required_execution_failed``
+   A required lane reported failures or errors.
+``native_invocation_missing``
+   A lane that must execute native code recorded no call counter.
+``selected_reference_fallback``
+   The selected lane did not report ``selected-target`` execution, or it
+   reported reference groups.
+
+.. code-block:: sh
+
+   export LLK_PYTHON_EVIDENCE_DIR="$PWD/frontend-evidence"
+   mkdir -p "$LLK_PYTHON_EVIDENCE_DIR/junit"
+   LLK_PYTHON_LANE=frontend_native python -m pytest test/python \
+     -m "frontend_native and not torch_integration and not triton_integration" \
+     -q --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/frontend_native.xml"
+   python test/python/check_required_python_execution.py \
+     --manifest test/Frontend/acceptance_manifest.json \
+     --junit-dir "$LLK_PYTHON_EVIDENCE_DIR/junit" \
+     --evidence-dir "$LLK_PYTHON_EVIDENCE_DIR"
+
+With ``-DLLK_ENABLE_PYTHON_TESTS=ON`` (which requires
+``-DLLK_BUILD_PYTHON_CAPI=ON``) the five lanes and the checker are registered
+with CTest, and ``check-llk`` builds the shared library and enforces them. The
+option is off for ordinary compiler-only builds. The required CI jobs run the
+lanes on Python 3.11 and 3.12 with Torch 2.9.0, once without Torch or Triton to
+prove the optional-dependency-free import boundary, and once on Linux x86_64
+AVX2 with the pinned upstream Triton checkout for the Triton and selected
+lanes. The :doc:`Python frontend tutorial </tutorials/python-frontend>` gives
+the exact commands.
+
+C++ frontend tests remain registered with CTest. Continue to use
+:doc:`contributing` for C++/MLIR and selected-target acceptance.
 
 .. _python-frontend-inspect:
 

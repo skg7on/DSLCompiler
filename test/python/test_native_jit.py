@@ -1,5 +1,6 @@
 """PF08: execute LLK decorators through caller-owned buffers and native code."""
 
+
 from __future__ import annotations
 
 import threading
@@ -7,10 +8,13 @@ from unittest import mock
 
 import llk
 import native_cases as cases
-import pytest
 from llk import ExecutionError, LLKError
 from llk.frontend import LaunchSpec
 from llk.runtime import _ffi
+
+import pytest
+
+pytestmark = pytest.mark.frontend_native
 
 
 def spy_on_native_invoke():
@@ -146,3 +150,17 @@ def test_partial_coverage_fails_before_native_entry():
             cases.add_kernel(*args, grid=partial)
     assert caught.value.code == "invalid_launch_coverage"
     assert native_invoke_spy.call_count == 0
+
+
+def test_packaged_default_configuration_compiles_and_executes():
+    """An installed wheel needs no repository checkout for target policy."""
+    kernel = llk.jit(cases.add)
+    args, buffers = cases.arguments()
+    compiled = kernel.compile(*args, grid=cases.launch())
+    compiled.invoke(*cases.providers(buffers))
+    assert compiled.report.backend == "reference"
+    assert buffers[2].values() == cases.expected(
+        cases.TILED_SHAPE[0] * cases.TILED_SHAPE[1]
+    )
+    assert buffers[2].guards_intact()
+    compiled.close()
