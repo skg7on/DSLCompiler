@@ -58,7 +58,14 @@ It emits structured Linalg for ``linalg-elementwise-v1`` or LLK matmul/SwiGLU fo
 machine-derived static contraction anchor, feed shared search and compilation. A versioned C API
 returns an owned executable handle; Python checks providers and invokes it
 synchronously. Capture, import, compilation and invocation have distinct support
-boundaries. Dynamo registration does not yet compile model graphs.
+boundaries. Torch Dynamo imports supported normalized ATen graphs through the
+same service; functional Torch operators also support scoped Inductor
+composition and first-order training within the documented operation limits.
+The upstream Triton input path exports genuine specialized TTIR into a neutral
+template, then proves concrete launch metadata before native compilation.
+In-process Triton launches additionally qualify native-library coexistence.
+See :ref:`Torch integration <python-frontend-torch>` and
+:ref:`Triton integration <python-frontend-triton>` for APIs and support limits.
 
 Target-aware search instantiates the original source, maps and analyzes candidates,
 and saves selected-plan artifacts for replay. The source supplies a versioned
@@ -145,7 +152,7 @@ only the contracts and fixtures they exercise. The
 :source:`framework conformance review <docs/reviews/2026-10-12-framework-conformance.md>`
 records the current capability matrix. The
 :source:`operator registration proposal <docs/superpowers/specs/2026-10-11-conversion-kernel-lowering-framework-design.md>`
-and merged :source:`MicroDAG event-builder seam <docs/superpowers/specs/2026-10-04-micro-dag-ioc-design.md>`
+and :source:`MicroDAG event-builder seam <docs/superpowers/specs/2026-10-04-micro-dag-ioc-design.md>`
 advance extensibility without establishing arbitrary DNN coverage.
 
 .. _architecture-components-and-ownership:

@@ -7,7 +7,8 @@ DSLCompiler aims to **design a generic MicroIR-based, mapping- and search-based 
 
 The :source:`framework goal and design specification <docs/superpowers/specs/2026-10-12-generic-microir-dnn-compiler-framework-design.md>` defines project scope, extension contracts and capability-based acceptance. Current implementation coverage is narrower and is recorded in :doc:`features`.
 
-Start with the concepts, build the five tools, then follow the four tutorials.
+Start with the concepts, build the compiler tools, then follow the compiler
+tutorials or the Python execution tutorial.
 Each tutorial states what its result establishes; the tool reference explains
 the options, output contracts, and failure modes in detail.
 
@@ -81,6 +82,9 @@ Choose a starting point
    * - Develop the Python frontend
      - :doc:`Python frontend </python-frontend>`
      - Typed capture, native launch, Torch/Triton boundaries and the required lane checker
+   * - Compile a Torch graph or launch a Triton kernel
+     - :ref:`Torch integration <python-frontend-torch>`, :ref:`Triton integration <python-frontend-triton>`
+     - Backend selection, toolchain qualification, supported sources and launch reports
    * - Run and enforce the Python lanes
      - :doc:`Python frontend tutorial </tutorials/python-frontend>`
      - Packaged target resources, native-call evidence and the acceptance manifest

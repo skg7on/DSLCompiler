@@ -110,11 +110,14 @@ What you can do today
      - Requires ``LLKFrontendCAPI``. Python signatures remain static ABI v1; capture alone does not establish executable support. Unsupported graphs, dtypes, layouts and numerical modes fail explicitly rather than falling back to eager execution
      - :doc:`Python frontend </python-frontend>`,
        :doc:`Python frontend tutorial </tutorials/python-frontend>`
-   * - Integrate Python kernels with Torch, Triton and CI
-     - Strict ``torch.compile(backend="llk")``, checked ``llk::add/mul/matmul/swiglu`` operators, scoped ``llk_inductor`` composition, first-order autograd for add/multiply/matmul, and genuine upstream Triton 3.6.0 TTIR export/launch for the fixed ten-kernel corpus. Required ``frontend_unit``, ``frontend_native``, ``torch_integration``, ``triton_integration`` and ``selected_avx2`` lanes are declared in ``test/Frontend/acceptance_manifest.json`` and enforced by ``check_required_python_execution.py``
-     - Training covers add/multiply/matmul only; SwiGLU training, dynamic-shape Python graphs and additional upstream Triton releases remain rejected. Selected AVX2 execution requires a compatible Linux x86_64 host and never substitutes reference results. Upstream Triton is qualified only at its pinned source revision
-     - :doc:`Python frontend </python-frontend>`,
-       :doc:`Python frontend tutorial </tutorials/python-frontend>`
+   * - Compile Torch graphs and call native operators
+     - Strict ``torch.compile(backend="llk")``, checked ``llk::add/mul/matmul/swiglu`` operators and scoped ``llk_inductor`` composition. Functional operators and Inductor regions support first-order add/multiply/matmul training
+     - Strict Dynamo training supports add/multiply; matmul backward needs transpose copies owned by the functional/Inductor routes. SwiGLU training, symbolic Python shapes, unsupported layouts and dtypes are outside the native contract
+     - :ref:`Torch integration <python-frontend-torch>`
+   * - Export and launch upstream Triton kernels
+     - Pinned Triton 3.6.0 specialized TTIR export, neutral templates and checked CPU launch for bounded f32 add/multiply, masked static edges and counted matmul/SwiGLU patterns
+     - Exact source/LLVM qualification is required; in-process launch also requires native-library coexistence. Compact rank-two CPU storage and complete mapping checks apply. Selected AVX2 execution requires a compatible host and never substitutes reference results
+     - :ref:`Triton integration <python-frontend-triton>`
    * - Explore a second target
      - Generic accelerator topology, layouts, rules and mapping through the same canonical IR; static f32 add/mul/sum coverage with operation-aware validation
      - No generic accelerator hardware backend or directly interpreting MicroIR emulator is delivered; accelerator mul/sum emitters verify only
@@ -236,22 +239,23 @@ conformance review records these checks and the library link boundary.
 
 .. _features-work-planned-separately:
 
-Work planned separately
------------------------
+Support boundaries
+-------------------
 
 Verified measurement persistence, exact reuse and held-out prediction-error
 reports are available through :doc:`tools/tuning` and :doc:`tools/validation`.
-Calibration fitting and independently measured event attribution remain separate
-work. Model cycles and whole-kernel timings are different observations.
+Calibration fitting and independently measured event attribution are outside
+the supported workflow. Model cycles and whole-kernel timings are different
+observations.
 
 The generic accelerator package provides static topology, movement and f32
 add/mul/sum conformance. A direct MicroIR emulator and a general model frontend
 remain outside current support. The Python path executes its bounded static
 elementwise/contraction subsets through the decorator, Torch Dynamo, Inductor
 composition and the pinned upstream Triton corpus; symbolic Python invocation,
-SwiGLU training and additional upstream Triton releases require further
-integration. Native dynamic contractions do not extend the Python importer
-automatically. The required Python lanes fail on zero execution, a skipped or
+SwiGLU training and additional upstream Triton releases are unsupported.
+Native dynamic contractions do not extend the Python importer automatically.
+The required Python lanes fail on zero execution, a skipped or
 failed lane, a missing native-call counter or reference results reported as
 selected-target execution.
 
