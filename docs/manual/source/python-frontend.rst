@@ -22,67 +22,19 @@ and snapshots those installed files. A missing or modified resource fails with
 ``native_configuration_missing`` or ``native_configuration_corrupt`` before a
 compile request is built.
 
-Dynamo registration is a separate integration. PF13
-(`#224 <https://github.com/skg7on/DSLCompiler/issues/224>`__) makes
-``backend="llk"`` a strict compiling backend: real
-``torch.compile(backend="llk", fullgraph=True)`` graphs are normalized through
-AOTAutograd and the recognized ATen subset — elementwise add/multiply, ``mm``
-and fused ``silu(x @ wg) * (x @ wu)`` — is imported into the shared frontend
-and executed through the native service with fresh outputs. Any other FX node
-raises ``UnsupportedFXError`` with its ``node_name``; ``torch.compile`` wraps
-it in ``BackendCompilerFailed.inner_exception``. The backend never returns
-``gm.forward``. A missing native library still reports
-``native_backend_unavailable``. First-release specialization is concrete: pass
-``dynamic=False`` when a changed shape must produce a new concrete
-compilation. See the
-:source:`PF13 verification record <docs/reviews/2026-11-01-pf13-python-dynamo.md>`.
+Other Python entry points share this native service:
 
-PF14 (`#225 <https://github.com/skg7on/DSLCompiler/issues/225>`__) registers
-``llk::add``, ``llk::mul``, ``llk::matmul`` and ``llk::swiglu`` as functional
-CPU custom operators over the same request builder and bounded specialization
-cache. Their real kernels use the checked Torch buffer adapter and allocate
-fresh outputs; their fake kernels are metadata-only and never read a data
-pointer, compile a request or enter the native runtime. Unsupported views,
-subclasses, dtypes and ``requires_grad`` inputs fail explicitly, while a
-foreign owner of the ``llk`` operator namespace is reported instead of replaced.
-``torch.library.opcheck`` schema/fake checks and direct native numerical tests
-cover all four operators. See the
-:source:`PF14 verification record <docs/reviews/2026-11-01-pf14-python-ops.md>`.
-Registration alone does not establish model execution.
+* :ref:`Torch integration <python-frontend-torch>` provides strict
+  ``torch.compile(backend="llk")``, checked functional operators,
+  ``llk_inductor`` composition and bounded first-order autograd support.
+* :ref:`Upstream Triton integration <python-frontend-triton>` exports genuine
+  specialized TTIR and binds supported ``@triton.jit`` kernels to CPU execution.
+  It requires the pinned upstream toolchain; in-process launches also require
+  compatible native-library loading.
 
-PF15 (`#226 <https://github.com/skg7on/DSLCompiler/issues/226>`__) adds
-``backend="llk_inductor"``. It clones the captured graph, replaces effect-safe
-regions whose operands satisfy the native f32 compact rank-two contract with
-the registered ``llk::*`` operators, and hands the rewritten graph to
-Inductor's ``compile_fx``. Unmatched nodes and declined regions stay with
-Inductor; a frozen ``PartitionReport`` names the accepted region roots and
-records a stable reason for every declined node. Symbolic extents, bf16
-storage, non-compact operands, training inputs and graphs containing in-place
-tensor effects decline partitioning instead of copying or converting data.
-``options`` are passed to Inductor as per-compilation config patches; no global
-Inductor, Dynamo or device-scheduler state changes. This is external-kernel
-composition, not a full Inductor codegen backend and not fusion across the
-external call. See the
-:source:`PF15 verification record <docs/reviews/2026-11-02-pf15-python-inductor.md>`.
-
-PF16 (`#227 <https://github.com/skg7on/DSLCompiler/issues/227>`__) registers
-first-order autograd formulas for ``llk::add``, ``llk::mul`` and
-``llk::matmul``. The formulas keep ``ctx.save_for_backward`` operands alive,
-materialize any non-compact incoming gradient, and call the same native
-operators for the backward kernels. ``llk::swiglu`` still has no formula: a
-``requires_grad`` operand raises ``unsupported_training_contract`` before
-compilation, and the strict backend rejects a trained SwiGLU graph. The strict
-``llk`` backend adds AOTAutograd forward/backward compilers: an ``add``
-gradient passes through unchanged, a ``mul`` gradient runs two native kernels,
-and a ``matmul`` gradient is rejected because its transpose would need an
-unmodeled copy kernel. ``llk_inductor`` accepts trained add/multiply/matmul
-regions; the Inductor-compiled backward calls two native matmuls while Inductor
-owns the transpose copies and graph orchestration. ``record_native_calls()``
-exposes a ``TrainingReport`` with distinct forward and backward
-``CompilationReport`` identities plus the explicit ATen materializations.
-Higher-order gradients are outside the qualified contract. See the
-:source:`PF16 verification record <docs/reviews/2026-11-02-pf16-python-training.md>`.
-Genuine upstream Triton launches remain unimplemented.
+Native execution through these entry points uses concrete positive rank-two
+f32 signatures. Native symbolic contractions have a separate
+:doc:`dynamic-shapes` contract.
 
 .. _python-frontend-pipeline:
 
@@ -178,11 +130,11 @@ Compatibility and capability reporting
 
 The :source:`packaged compatibility manifest <python/llk/compatibility.json>`
 records the Python 3.11/3.12 + Torch 2.9.0 registration baseline. Its
-``native_execution: unavailable`` entry and ``llk.capabilities()`` remain
-conservative package/registration metadata. They do not probe a loaded C API
-library or certify decorator execution. Use the actual ``CompiledKernel.report``
-and invocation result for native support. A standalone Torch numerical result
-only establishes Torch behavior.
+``native_execution: unavailable`` and ``upstream_triton: ttir-export-only``
+entries are conservative package/registration metadata, as is
+``llk.capabilities()``. They do not probe the loaded C API or qualify the local
+Triton toolchain. Use ``CompiledKernel.report`` and checked invocation results
+for native execution, and the qualification and launch APIs below for Triton.
 
 .. _python-frontend-native-library:
 
@@ -280,9 +232,10 @@ under that root; an explicit ``config_files`` mapping supplies an existing
 snapshot. Canonical identity includes source, accepted constants, launch,
 numerical policy, options and configuration contents. Wire decoding requires an
 explicit snapshot object and does not read local files. The Python package does
-not bundle a native target package; options alone do not establish executable
-support. Set ``config_root`` to the worktree root or
-provide the required machine/layout/rule contents explicitly for compilation.
+not bundle the native shared library; options alone do not establish executable
+support. Installed machine/layout/rule resources are sufficient for default
+configuration. Set ``config_root`` to the worktree root when developing target
+policy, or provide the required file contents explicitly in ``config_files``.
 
 Run the compiler-independent contract checks with:
 
@@ -661,8 +614,9 @@ copy, dtype conversion or provider caching occurs. The adapter holds a live
 buffer export for every provider through the native call, so a resizable
 ``bytearray``/``array`` cannot move its storage mid-invocation, and the provider
 objects and native executable stay strongly referenced until the call finishes.
-``ttir()`` remains unavailable with ``upstream_toolchain_unqualified``;
-the checked metadata is exposed through ``frontend_ir(binding)``.
+For ``@llk.jit``, ``frontend_ir(binding)`` exposes checked metadata and
+``ttir()`` raises ``upstream_toolchain_unqualified``. Genuine upstream TTIR is
+available through the separate :ref:`Triton exporter <python-frontend-triton>`.
 
 The executable envelope is positive static rank-two compact row-major f32 with
 ABI v1 and explicit ``reference`` or ``selected-target`` execution. Elementwise
@@ -684,6 +638,276 @@ tests exercise the same kernel, adapter and launch path at 16×16/8×16 tiled an
      test/python/test_frontend_tails.py test/python/test_frontend_contractions.py -q
    "$LLK_PYTHON" -m pytest test/python/test_specialization_cache.py \
      test/python/test_jit_lifetime.py test/python/test_inspection.py -q
+
+.. _python-frontend-torch:
+
+Torch compilation and operators
+-------------------------------
+
+Import ``llk.torch`` to register the ``llk`` and ``llk_inductor`` backends and
+the functional ``torch.ops.llk`` operators. Torch is optional for package
+import, but these execution paths require real Torch and the native C API.
+Use CPU tensors with positive concrete rank-two shapes, f32 storage, compact
+row-major strides and zero storage offset. Outputs are freshly allocated;
+unsupported inputs are rejected before a data pointer is requested.
+
+Strict Dynamo compilation
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``backend="llk"`` when every computational node must be represented by the
+native frontend. AOTAutograd normalizes the captured graph to the recognized
+ATen subset: same-shape add/multiply, matrix multiplication and fused
+``silu(x @ wg) * (x @ wu)``. For example, with the native library selected:
+
+.. code-block:: python
+
+   import torch
+   import llk.torch
+
+   compiled_add = torch.compile(
+       lambda a, b: a + b, backend="llk", fullgraph=True, dynamic=False
+   )
+   a = torch.ones((4, 5), dtype=torch.float32)
+   b = torch.full((4, 5), 2.0, dtype=torch.float32)
+   torch.testing.assert_close(compiled_add(a, b), a + b)
+
+``dynamic=False`` requests concrete specialization when shapes change. It
+does not expose the native symbolic ABI. ``options={...}`` accepts
+``CompileOptions`` fields for that compilation, including
+``backend="reference"`` or ``"selected-target"``. The default is reference
+execution; selected mode requires the target ISA and permits no reference
+fallback.
+
+An unsupported graph raises ``UnsupportedFXError`` with its ``node_name``;
+``torch.compile`` wraps backend compilation errors in
+``BackendCompilerFailed.inner_exception``. A missing native library reports
+``native_backend_unavailable``. The strict backend never substitutes
+``gm.forward`` for native compilation.
+
+Functional operators and Inductor composition
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The registered operators are ``torch.ops.llk.add(a, b)``, ``mul(a, b)``,
+``matmul(a, b)`` and ``swiglu(x, wg, wu)``. They use the shared request builder,
+bounded specialization cache and checked Torch buffer adapter. Add/multiply
+require matching shapes; matmul uses ``[M, K] @ [K, N]``; SwiGLU uses one
+``[M, K]`` input and two ``[K, N]`` weights. FakeTensor implementations inspect
+metadata only: they do not read pointers, compile or invoke native code.
+Foreign ownership of the ``llk`` namespace is reported rather than replaced.
+
+Use ``backend="llk_inductor"`` to place supported regions inside an
+Inductor-compiled graph:
+
+.. code-block:: python
+
+   composed = torch.compile(
+       lambda a, b: torch.sin(a + b),
+       backend="llk_inductor", fullgraph=True, dynamic=False,
+   )
+   torch.testing.assert_close(composed(a, b), torch.sin(a + b))
+
+Here the addition uses an LLK operator and Inductor compiles the remainder.
+The partitioner clones the graph and replaces only effect-safe regions with
+native-compatible operands. Symbolic extents, bf16 storage, non-compact
+operands and graphs with in-place tensor effects decline LLK partitioning.
+Declined nodes remain for Inductor to compile; there is no implicit input copy
+or dtype conversion to make a region eligible. Fusion stops at the external
+LLK call. ``options`` for this backend are scoped Inductor configuration
+patches, rather than LLK ``CompileOptions`` fields.
+
+For an FX ``GraphModule``,
+``llk.torch.rewrite_supported_subgraphs(gm, example_inputs)`` returns the
+rewritten graph and a frozen ``PartitionReport``. Its ``matched_nodes`` names
+accepted region roots; ``declined`` pairs node names with stable reasons.
+See :source:`partitioning implementation <python/llk/torch/_inductor_backend.py>`
+and :source:`composition examples <test/python/test_inductor_composition.py>`.
+
+First-order training
+~~~~~~~~~~~~~~~~~~~~
+
+Training support depends on the entry point:
+
+.. list-table::
+   :header-rows: 1
+   :class: wide-table
+
+   * - Entry point
+     - Supported gradients
+     - Boundary
+   * - Functional ``llk::add/mul/matmul``
+     - First-order registered autograd formulas
+     - Saved operands stay alive; non-compact incoming gradients and required transpose copies are materialized explicitly before native calls
+   * - Strict ``backend="llk"``
+     - Add passes gradients through; multiply runs two native backward kernels
+     - Matmul backward is rejected because the strict importer cannot realize its transpose copies
+   * - ``backend="llk_inductor"``
+     - Add, multiply and matmul regions, including native matmul backward calls
+     - Inductor owns transpose copies and graph orchestration
+
+``llk::swiglu`` rejects ``requires_grad`` inputs with
+``unsupported_training_contract``; strict SwiGLU training is also rejected.
+Higher-order gradients are outside this contract.
+
+Wrap a training step in ``with llk.torch.record_native_calls() as recorder:``
+and inspect ``recorder.report`` afterward. Its ``TrainingReport`` separates
+forward/backward native ``CompilationReport`` identities and explicit ATen
+materializations. Recorders are process-visible so AOTAutograd worker threads
+are observed; unrelated concurrent training steps should use separate runs.
+See :source:`training tests <test/python/test_torch_training.py>` for gradient
+comparisons and native-call checks.
+
+.. _python-frontend-triton:
+
+Upstream Triton export and CPU launch
+------------------------------------------
+
+``llk.triton`` accepts genuine upstream ``@triton.jit`` sources through two
+checked stages: specialized TTIR export into an unbound template, then binding
+of concrete tensors, scalar values and a runtime grid into the shared native
+frontend. Template export can succeed for constructs that native binding does
+not support. Importing ``llk.triton`` itself does not import upstream Triton.
+
+Qualify the upstream toolchain
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The :source:`toolchain lock <python/llk/triton/toolchain-lock.json>` pins Triton
+3.6.0 at source revision ``93f05e19a8024938c320d82854e307d602b5a05d``, LLVM
+revision ``27d654c4c4e6eb7c19e46af20500200e793da7c7``, export target
+``cuda:80`` and template/protocol version 1. The export target selects upstream
+frontend semantics; CPU execution uses LLK's ``llk_cpu`` target and requires no
+GPU. Set ``LLK_TRITON_PYTHONPATH`` to the directory containing the built
+upstream ``triton`` package, for example a qualified source checkout's
+``python/`` directory:
+
+.. code-block:: sh
+
+   export LLK_TRITON_PYTHONPATH=/absolute/path/to/triton/python
+   "$LLK_PYTHON" -c 'import llk.triton; print(llk.triton.qualify_toolchain())'
+
+The ``triton-test`` extra selects version 3.6.0 where a wheel is available,
+but a version match alone does not satisfy the exact source/LLVM checks.
+Missing, unreadable or mismatched toolchains raise
+``upstream_toolchain_unqualified``. ``LLK_TRITON_TOOLCHAIN_LOCK`` selects an
+explicit lock for an embedded or test environment; it does not bypass
+qualification.
+
+Export a neutral template
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``capture_kernel(module_path, function, signature, ...)`` is the convenience
+form of ``export_module(ExportRequest(...))``. For the checked-in add kernel:
+
+.. code-block:: python
+
+   from llk.triton import capture_kernel
+
+   exported = capture_kernel(
+       "test/python/compat/kernels/elementwise.py", "add_kernel",
+       {"x_ptr": "*fp32", "y_ptr": "*fp32", "out_ptr": "*fp32",
+        "n": "i32", "BLOCK": "constexpr"},
+       constexprs={"BLOCK": 64},
+   )
+   print(exported.ttir)
+   print(exported.template.identity())
+
+The isolated worker runs upstream's own TTIR compiler stage and typed MLIR
+bindings, returning only JSON. ``TritonExport`` contains genuine ``ttir``, an
+``UnboundFrontendTemplate`` and observed ``toolchain`` identity. The template
+records parameter kinds/access, constexprs, alignment constraints, typed
+dataflow and source/TTIR hashes. Runtime tensor shapes and grid are deliberately
+absent. No native kernel is compiled or invoked during export.
+
+Launch with the CPU driver
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+With Torch, the qualified upstream package and ``LLK_FRONTEND_LIBRARY``
+available, the same fixture can be launched over CPU tensors:
+
+.. code-block:: python
+
+   import torch
+   import llk.triton
+   from llk.frontend import CompileOptions
+
+   with llk.triton.activate(CompileOptions(backend="reference")) as active:
+       from test.python.compat.kernels.elementwise import add_kernel
+
+       x = torch.ones((1, 64), dtype=torch.float32)
+       y = torch.full((1, 64), 2.0, dtype=torch.float32)
+       out = torch.empty_like(x)
+       launch = add_kernel[(1,)]
+       launch(x, y, out, x.numel(), BLOCK=64)
+       torch.testing.assert_close(out, x + y)
+       report = active.last_launch_report()
+       assert report is not None and report.native_invocations > 0
+
+Run this example from the repository root so the fixture module is importable.
+``activate`` serializes access to Triton's process-global driver and restores
+the previous driver on success or error. It first probes native-library
+coexistence in subprocesses in both load orders. Conflicting LLVM images can
+prevent in-process launches, including on macOS; the diagnostic is
+``upstream_toolchain_unqualified``. ``coexistence_status()`` exposes the probe
+results. Process-isolated export and native request execution are separate
+paths; their success does not establish in-process driver compatibility.
+
+At launch, the driver checks artifact/template identity, CPU tensor metadata,
+pointer alignment, scalar types and coverage before native compilation. Buffers
+are caller-owned compact rank-two f32 with zero storage offset and disjoint
+outputs. Calls are synchronous. The native cache includes concrete shape,
+scalars, launch, template identity, numerical/configuration contents and loaded
+library identity; upstream pointer specialization alone cannot reuse a native
+handle for another shape.
+
+``active.last_launch_report()`` and ``llk.triton.last_launch_report()`` return
+launch evidence, or ``None`` before a launch. ``TritonLaunchReport`` records
+template and native request identities, plan/ABI/backend identity, runtime and
+native grids, block shape and native-call count. To require AVX2 execution,
+select ``CompileOptions(backend="selected-target")`` on a compatible x86_64
+host. Reference execution does not establish selected-target support.
+
+Supported source patterns
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The :source:`compatibility corpus <docs/design/triton-compatibility-v1.json>`
+defines concrete executable fixtures for these patterns:
+
+* Flat f32 add/multiply with full or tiled coverage, including a flattened
+  lane block over declared rank-two storage.
+* Two-axis f32 add/multiply with proved
+  ``(rows < M) & (cols < N)`` masks for rounded static edges.
+* Counted f32 matmul, zero or caller-seeded accumulation, and fused
+  ``silu(gate) * up`` with a common left operand. Dot precision must be
+  ``input_precision="ieee"``; output tiling is exact, K is a positive multiple
+  of the reduction block, and contraction loads are fully in bounds.
+
+Rank views from ``expand_dims``/``broadcast`` and the exact SiLU epilogue are
+recognized within these proofs. General broadcasting, arbitrary layouts,
+symbolic shapes and reduced-precision dot modes are not admitted. Machine
+capacity and backend realizability still constrain each concrete launch.
+
+Unsupported source reports a structured diagnostic:
+
+.. list-table::
+   :header-rows: 1
+   :class: wide-table
+
+   * - Construct
+     - Diagnostic
+   * - Atomics, read/write alias effects or asynchronous staging
+     - ``unsupported_triton_memory_effect``
+   * - Reductions, runtime control flow or GPU-only inline assembly
+     - ``unsupported_triton_operation``
+   * - Transposes or arbitrary reshapes
+     - ``unsupported_triton_layout``
+   * - Non-IEEE dot precision
+     - ``unsupported_triton_numerics``
+   * - Runtime strides or an unproved launch/access pattern
+     - ``unsupported_triton_launch``
+
+Use :source:`upstream kernel fixtures <test/python/compat/kernels>` and
+:source:`compatibility tests <test/python/compat/test_triton_corpus.py>` for
+complete sources and exact checked shapes. The experimental quoted ``tt.*``
+passes described below have a separate input contract.
 
 .. _python-frontend-testing:
 
@@ -712,12 +936,12 @@ The package tests build the actual wheel and install it offline into a fresh
 Torch-absent virtual environment outside the checkout. Real-Torch subprocesses
 test registration/reload identity, zero Dynamo resets, existing-owner protection,
 broken optional-dependency propagation and the missing-library diagnostic. The
-PF13 suites execute real ``torch.compile`` graphs when the CAPI library is
-loaded and count every native invocation. The PF14 suites run
+Torch compilation suites execute real ``torch.compile`` graphs when the CAPI
+library is loaded and count every native invocation. Operator suites run
 ``torch.library.opcheck`` schema/fake checks and direct native operator calls,
-and spy on ``data_ptr``/compilation during FakeTensor execution. The PF16 suite
-compares gradients with independent f64 finite differences and analytic f32
-references, counts distinct forward/backward native kernels, and runs the strict
+and spy on ``data_ptr``/compilation during FakeTensor execution. Training tests
+compare gradients with independent f64 finite differences and analytic f32
+references, count distinct forward/backward native kernels, and run the strict
 and Inductor training routes. Missing test/build dependencies are setup
 failures, not successful or skipped coverage.
 
@@ -761,15 +985,17 @@ fails with stable codes:
 
 .. code-block:: sh
 
-   export LLK_PYTHON_EVIDENCE_DIR="$PWD/frontend-evidence"
+   export LLK_PYTHON_EVIDENCE_DIR="$PWD/build/frontend-evidence"
    mkdir -p "$LLK_PYTHON_EVIDENCE_DIR/junit"
-   LLK_PYTHON_LANE=frontend_native python -m pytest test/python \
+   LLK_PYTHON_LANE=frontend_native "$LLK_PYTHON" -m pytest test/python \
      -m "frontend_native and not torch_integration and not triton_integration" \
      -q --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/frontend_native.xml"
-   python test/python/check_required_python_execution.py \
-     --manifest test/Frontend/acceptance_manifest.json \
-     --junit-dir "$LLK_PYTHON_EVIDENCE_DIR/junit" \
-     --evidence-dir "$LLK_PYTHON_EVIDENCE_DIR"
+
+This runs one focused lane. The checker requires matching JUnit and evidence
+from all five lanes in a fresh directory; a partial run fails with
+``required_execution_missing``. Follow the
+:doc:`Python frontend tutorial </tutorials/python-frontend>` for the complete
+sequence and the final checker command.
 
 With ``-DLLK_ENABLE_PYTHON_TESTS=ON`` (which requires
 ``-DLLK_BUILD_PYTHON_CAPI=ON``) the five lanes and the checker are registered

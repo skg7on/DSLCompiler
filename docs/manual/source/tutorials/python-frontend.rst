@@ -3,11 +3,24 @@
 Run a Python kernel and enforce the frontend lanes
 ==================================================
 
-This tutorial builds the checked C ABI, installs the ``llk`` package, executes a
-typed kernel on the reference backend, and runs the lane checker that CI
-enforces. It establishes native reference execution and packaging behavior.
-It does **not** establish selected-target AVX2 execution; that lane requires an
-x86_64 host with AVX2 and is described separately below.
+This tutorial builds the checked C ABI, installs the ``llk`` package and executes
+a typed kernel on the reference backend. It also shows how to run the required
+frontend test lanes on a fully provisioned Linux x86_64/AVX2 host. Run every
+command from the isolated worktree root; generated files stay under ``build/``.
+
+The reference example needs Python 3.11 or newer and no Torch or Triton.
+Use the project ``.venv`` interpreter, or create one in the worktree:
+
+.. code-block:: sh
+
+   python3 -m venv .venv
+   export LLK_PYTHON="$PWD/.venv/bin/python"
+   "$LLK_PYTHON" -m pip install -e './python[test]'
+
+An existing project environment can be shared by setting ``LLK_PYTHON`` to its
+absolute interpreter path instead. Torch integration is qualified against the
+Python 3.11/3.12 + Torch 2.9.0 reference matrix; upstream Triton requires the
+exact :ref:`toolchain qualification <python-frontend-triton>`.
 
 Build the C ABI
 ---------------
@@ -17,26 +30,25 @@ LLVM/MLIR and this project, as described in :doc:`/getting-started`:
 
 .. code-block:: sh
 
-   mkdir -p build && cd build
-   cmake .. -G Ninja \
+   cmake -S . -B build -G Ninja \
      -DLLVM_PROJECT_BUILD_DIR=/path/to/llvm-project/build \
-     -DLLK_BUILD_PYTHON_CAPI=ON \
-     -DLLK_ENABLE_PYTHON_TESTS=ON
-   ninja LLKFrontendCAPI
+     -DLLK_BUILD_PYTHON_CAPI=ON
+   cmake --build build --target LLKFrontendCAPI
 
-``LLK_ENABLE_PYTHON_TESTS`` registers the required pytest lanes with CTest and
-is off for ordinary compiler-only builds. It requires
-``LLK_BUILD_PYTHON_CAPI=ON`` and ``BUILD_TESTING=ON``.
+Keep ``LLK_ENABLE_PYTHON_TESTS`` off for this reference-only example. The
+full-lane configuration is shown below after its prerequisites.
 
-Install the package
--------------------
+Select the native library
+--------------------------
 
-Use project Python 3.11 or 3.12. Torch is only needed for the Torch lane:
+On Linux, select the shared library built in this worktree:
 
 .. code-block:: sh
 
-   python -m pip install "./python[test,torch-test]"
    export LLK_FRONTEND_LIBRARY="$PWD/build/lib/libLLKFrontendCAPI.so"
+
+On macOS use ``libLLKFrontendCAPI.dylib`` instead. The Python wheel does not
+include this native library.
 
 The wheel carries ``llk/config/machines/*.yaml`` and
 ``llk/config/mapping/*/*.llkmap`` together with ``llk/resources.json`` hashes,
@@ -48,8 +60,10 @@ file fails before compilation with ``native_configuration_missing`` or
 Execute a kernel
 ----------------
 
-The decorator captures the typed body; the native frontend proves the
-program, selects a plan, compiles it and invokes it over caller-owned buffers.
+Save the following as ``build/python-add.py``, then run it with
+``"$LLK_PYTHON" build/python-add.py``. Source capture needs a real file rather
+than an interactive definition. The native frontend proves the program,
+selects a plan, compiles it and invokes it over caller-owned buffers.
 
 .. code-block:: python
 
@@ -94,34 +108,70 @@ program, selects a plan, compiles it and invokes it over caller-owned buffers.
    assert list(out_storage) == [3.0] * (M * N)
    compiled.close()
 
-Run the required lanes
-----------------------
+Run focused lanes
+------------------
 
 The required lanes are declared once in
 ``test/Frontend/acceptance_manifest.json`` and selected by pytest markers:
 ``frontend_unit`` (compiler-free), ``frontend_native`` (reference execution),
 ``torch_integration``, ``triton_integration`` and ``selected_avx2``.
+The first two can be run with the reference setup above:
 
 .. code-block:: sh
 
-   export LLK_PYTHON_EVIDENCE_DIR="$PWD/frontend-evidence"
+   export LLK_PYTHON_EVIDENCE_DIR="$PWD/build/frontend-evidence"
    mkdir -p "$LLK_PYTHON_EVIDENCE_DIR/junit"
 
-   LLK_PYTHON_LANE=frontend_unit python -m pytest test/python \
+   LLK_PYTHON_LANE=frontend_unit "$LLK_PYTHON" -m pytest test/python \
      -m "frontend_unit and not frontend_native and not torch_integration and not triton_integration" \
      -q --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/frontend_unit.xml"
 
-   LLK_PYTHON_LANE=frontend_native python -m pytest test/python \
+   LLK_PYTHON_LANE=frontend_native "$LLK_PYTHON" -m pytest test/python \
      -m "frontend_native and not torch_integration and not triton_integration" \
      -q --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/frontend_native.xml"
 
 Each lane writes ``<evidence-dir>/<lane>.json`` with the number of native calls
-made through ``LLKFrontendCAPI``. The Triton corpus reports calls made in its
-isolated worker. Enforce the declared results with:
+made through ``LLKFrontendCAPI``. These two focused runs do not satisfy the
+five-lane acceptance manifest.
+
+Enforce all required lanes
+--------------------------
+
+Full acceptance requires Linux x86_64 with AVX2, the native library, real Torch,
+Inductor's host C++ compiler and the pinned built Triton source checkout. Use a
+Python 3.11 or 3.12 environment for the Torch 2.9.0 reference matrix:
 
 .. code-block:: sh
 
-   python test/python/check_required_python_execution.py \
+   "$LLK_PYTHON" -m pip install -e './python[test,torch-test]'
+   export LLK_TRITON_PYTHONPATH=/absolute/path/to/triton/python
+   "$LLK_PYTHON" -c 'import llk.triton; print(llk.triton.qualify_toolchain())'
+
+After the two focused lanes above, run the other three in the same evidence
+directory:
+
+.. code-block:: sh
+
+   LLK_PYTHON_LANE=torch_integration "$LLK_PYTHON" -m pytest test/python \
+     -m torch_integration \
+     -q --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/torch_integration.xml"
+
+   LLK_PYTHON_LANE=triton_integration "$LLK_PYTHON" -m pytest test/python \
+     -m triton_integration \
+     -q --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/triton_integration.xml"
+
+   LLK_PYTHON_LANE=selected_avx2 "$LLK_PYTHON" -m pytest test/python \
+     -m selected_avx2 \
+     -q --junitxml="$LLK_PYTHON_EVIDENCE_DIR/junit/selected_avx2.xml"
+
+The Triton corpus reports native calls made in its isolated worker. The checker
+requires JUnit and evidence files from **all five** lanes; missing lanes fail.
+Use a fresh evidence directory for each complete run to avoid stale results.
+Enforce the declared results with:
+
+.. code-block:: sh
+
+   "$LLK_PYTHON" test/python/check_required_python_execution.py \
      --manifest test/Frontend/acceptance_manifest.json \
      --junit-dir "$LLK_PYTHON_EVIDENCE_DIR/junit" \
      --evidence-dir "$LLK_PYTHON_EVIDENCE_DIR"
@@ -140,12 +190,18 @@ The checker prints one stable code per failure and exits nonzero:
    The selected lane did not report ``selected-target`` execution, or it
    reported reference groups.
 
-With ``LLK_ENABLE_PYTHON_TESTS=ON`` the same lanes and the checker are
-registered with CTest, so ``cmake --build build --target check-llk`` enforces
-them alongside the compiler suite:
+As an alternative to the manual pytest commands, register all five lanes and
+the checker with CTest after provisioning the same dependencies. Export
+``LLK_TRITON_PYTHONPATH`` before configuration; CMake records it for the tests.
+``LLK_ENABLE_PYTHON_TESTS`` requires both the C API and ``BUILD_TESTING``:
 
 .. code-block:: sh
 
+   cmake -S . -B build \
+     -DBUILD_TESTING=ON \
+     -DLLK_BUILD_PYTHON_CAPI=ON \
+     -DLLK_ENABLE_PYTHON_TESTS=ON \
+     -DPython3_EXECUTABLE="$LLK_PYTHON"
    cmake --build build --target check-llk -j 4
 
 Selected AVX2 execution
